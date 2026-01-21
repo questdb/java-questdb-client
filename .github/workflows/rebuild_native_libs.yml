@@ -221,9 +221,7 @@ jobs:
       - name: Print file sizes before
         run: |
           mkdir -p ./core/src/main/resources/io/questdb/bin/
-          mkdir -p ./core/src/test/resources/io/questdb/bin/
           find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \; || true
-          find ./core/src/main/bin/ -type f -exec ls -l {} \; || true
       - name: Restore darwin-aarch64 Libraries from Cache
         uses: actions/cache/restore@v3
         with:
@@ -280,7 +278,6 @@ jobs:
       - name: Print file sizes after
         run: |
           find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
-          find ./core/src/main/bin/ -type f -exec ls -l {} \;
       - name: Push the files to the current branch
         uses: ad-m/github-push-action@d91a481090679876dfc4178fef17f286781251df
         # Why do we use a commit hash instead of a tag for the github-push-action?
