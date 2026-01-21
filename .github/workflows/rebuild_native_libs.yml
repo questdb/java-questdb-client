@@ -222,8 +222,8 @@ jobs:
         run: |
           mkdir -p ./core/src/main/resources/io/questdb/bin/
           mkdir -p ./core/src/test/resources/io/questdb/bin/
-          find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \;
-          find ./core/src/main/bin/ -type f -exec ls -l {} \;
+          find ./core/src/main/resources/io/questdb/bin/ -type f -exec ls -l {} \; || true
+          find ./core/src/main/bin/ -type f -exec ls -l {} \; || true
       - name: Restore darwin-aarch64 Libraries from Cache
         uses: actions/cache/restore@v3
         with:
