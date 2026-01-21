@@ -150,6 +150,42 @@ else ()
     set(ASMLIB_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/asmlib/)
     include(${ASMLIB_SOURCE_DIR}CMakeLists.txt)
 
+    set(
+        VCL_FILES
+        src/main/c/share/ooo_dispatch.cpp
+    )
+
+    set(
+        VCL_FILES_SSE2
+        src/main/c/share/ooo_dispatch.cpp
+        src/main/c/share/vcl/instrset_detect.cpp
+    )
+
+    #SSE2 lib
+    add_library(questdb-sse2 OBJECT ${VCL_FILES_SSE2})
+
+    #AVX512 lib
+    add_library(questdb-avx512 OBJECT ${VCL_FILES})
+    # A_memset, A_memcpy are faster on avx512 but slower on other CPU's on Linux
+    target_compile_definitions(questdb-avx512 PRIVATE ENABLE_ASMLIB)
+    target_compile_options(questdb-avx512 PRIVATE "-m64;-mavx512f;-fPIC;-mfma;-mavx512vl;-mavx512bw;-mavx512dq"
+            "$<$<CONFIG:DEBUG>:${DEBUG_OPTIONS}>"
+            "$<$<CONFIG:RELEASE>:${RELEASE_OPTIONS}>")
+
+    target_link_libraries(
+            questdb-sse2
+            questdb-avx512
+    )
+
+    if (WIN32)
+        target_compile_options(questdb-sse2 PRIVATE "-m64;-march=core2;-msse2;-Wno-attributes"
+                "$<$<CONFIG:DEBUG>:${DEBUG_OPTIONS}>"
+                "$<$<CONFIG:RELEASE>:${RELEASE_OPTIONS}>")
+    else ()
+        target_compile_options(questdb-sse2 PRIVATE "-m64;-march=core2;-msse2;-fPIC"
+                "$<$<CONFIG:DEBUG>:${DEBUG_OPTIONS}>"
+                "$<$<CONFIG:RELEASE>:${RELEASE_OPTIONS}>")
+    endif (WIN32)
     target_compile_options(questdb PRIVATE "-m64"
             "$<$<CONFIG:DEBUG>:${DEBUG_OPTIONS}>"
             "$<$<CONFIG:RELEASE>:${RELEASE_OPTIONS}>")

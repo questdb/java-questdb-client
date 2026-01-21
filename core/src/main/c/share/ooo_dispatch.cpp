@@ -22,39 +22,24 @@
  *
  ******************************************************************************/
 
-#ifndef QUESTDB_DISPATCHER_H
-#define QUESTDB_DISPATCHER_H
 
-#include "vec_dispatch.h"
+#include "util.h"
+#include "simd.h"
 
-#ifdef __aarch64__
+#include "ooo_dispatch.h"
 
-#define DECLARE_DISPATCHER(FUNCNAME)
-#define DECLARE_DISPATCHER_TYPE(FUNCNAME, ...)  void FUNCNAME(__VA_ARGS__);
-
-#else // __aarch64__
-
-#include "vcl/vectorclass.h"
-
-#define DECLARE_DISPATCHER(FUNCNAME) TF_##FUNCNAME *FUNCNAME = dispatch_to_ptr(&F_AVX512(FUNCNAME), &F_VANILLA(FUNCNAME))
-
-#define DECLARE_DISPATCHER_TYPE(FUNCNAME, ...) \
-typedef void TF_ ## FUNCNAME(__VA_ARGS__);\
-TF_ ## FUNCNAME F_AVX512(FUNCNAME), F_VANILLA(FUNCNAME)
-
-template<typename T>
-T *dispatch_to_ptr(T *avx512, T *vanilla) {
-    const int iset = instrset_detect();
-    if (iset == 10) return avx512;
-    return vanilla;
+void MULTI_VERSION_NAME (platform_memcpy)(void *dst, const void *src, const size_t len) {
+    __MEMCPY(dst, src, len);
 }
 
-#if INSTRSET == 10
-#define MULTI_VERSION_NAME F_AVX512
-#else
-#define MULTI_VERSION_NAME F_VANILLA
-#endif
+void MULTI_VERSION_NAME (platform_memcmp)(const void *a, const void *b, const size_t len, int *res) {
+    *res = __MEMCMP(a, b, len);
+}
 
-#endif
+void MULTI_VERSION_NAME (platform_memset)(void *dst, const int val, const size_t len) {
+    __MEMSET(dst, val, len);
+}
 
-#endif //QUESTDB_DISPATCHER_H
+void MULTI_VERSION_NAME (platform_memmove)(void *dst, const void *src, const size_t len) {
+    __MEMMOVE(dst, src, len);
+}
