@@ -195,6 +195,8 @@ else ()
 
     target_link_libraries(
             questdb
+            questdb-sse2
+            questdb-avx512
             asm
     )
 endif (ARCH_AARCH64)
