@@ -1,0 +1,39 @@
+steps:
+  - bash: |
+      echo "Stopping QuestDB server..."
+      kill -TERM "$(cat questdb.pid)" || true
+      rm -f questdb.pid
+      rm -rf questdb-data
+    displayName: "Stop QuestDB server (non-Windows)"
+    condition: ne(variables['Agent.OS'], 'Windows_NT')
+  - pwsh: |
+      Write-Host "Stopping QuestDB server..."
+      if (Test-Path "questdb.pid") {
+        $questdbPid = Get-Content "questdb.pid" | Select-Object -First 1
+        if ($questdbPid) {
+          Stop-Process -Id $questdbPid -ErrorAction SilentlyContinue
+          try {
+            Wait-Process -Id $questdbPid -Timeout 30 -ErrorAction Stop
+          } catch {
+            Stop-Process -Id $questdbPid -Force -ErrorAction SilentlyContinue
+          }
+        }
+        Remove-Item -Force "questdb.pid" -ErrorAction SilentlyContinue
+      }
+      if (Test-Path "questdb-data") {
+        $deleted = $false
+        for ($i = 0; $i -lt 10; $i++) {
+          try {
+            Remove-Item -Recurse -Force "questdb-data" -ErrorAction Stop
+            $deleted = $true
+            break
+          } catch {
+            Start-Sleep -Seconds 1
+          }
+        }
+        if (-not $deleted) {
+          Remove-Item -Recurse -Force "questdb-data"
+        }
+      }
+    displayName: "Stop QuestDB server (Windows)"
+    condition: eq(variables['Agent.OS'], 'Windows_NT')

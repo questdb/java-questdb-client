@@ -1,0 +1,81 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.std;
+
+import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Single-threaded object pool based on ObjList. The goal is to optimise intermediate allocation of objects.
+ * <p>
+ * There is 1 way to use this pool:
+ * <ul>
+ *     <li>Mass release: You keep acquiring objects via @link {@link #next()} and then release them all at once via
+ *     {@link #clear()}. This is the fastest way to use the pool.</li>
+ * </ul>
+ */
+public class ObjectPool<T extends Mutable> implements Mutable {
+    private static final Logger LOG = LoggerFactory.getLogger(ObjectPool.class);
+    private final ObjectFactory<T> factory;
+
+    private ObjList<T> list;
+    private int pos = 0;
+    private int size;
+
+    public ObjectPool(@NotNull ObjectFactory<T> factory, int size) {
+        this.list = new ObjList<>(size);
+        this.factory = factory;
+        this.size = size;
+        fill();
+    }
+
+    @Override
+    public void clear() {
+        pos = 0;
+    }
+
+    public T next() {
+        if (pos == size) {
+            expand();
+        }
+
+        T o = list.getQuick(pos++);
+        o.clear();
+        return o;
+    }
+
+    private void expand() {
+        fill();
+        size <<= 1;
+        LOG.debug("pool resize [class={}, size={}]", factory.getClass().getName(), size);
+    }
+
+    private void fill() {
+        for (int i = 0; i < size; i++) {
+            list.add(factory.newInstance());
+        }
+    }
+}

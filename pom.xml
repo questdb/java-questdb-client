@@ -1,0 +1,93 @@
+<!--~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  ~     ___                  _   ____  ____
+  ~    / _ \ _   _  ___  ___| |_|  _ \| __ )
+  ~   | | | | | | |/ _ \/ __| __| | | |  _ \
+  ~   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+  ~    \__\_\\__,_|\___||___/\__|____/|____/
+  ~
+  ~  Copyright (c) 2014-2019 Appsicle
+  ~  Copyright (c) 2019-2026 QuestDB
+  ~
+  ~  Licensed under the Apache License, Version 2.0 (the "License");
+  ~  you may not use this file except in compliance with the License.
+  ~  You may obtain a copy of the License at
+  ~
+  ~  http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~  Unless required by applicable law or agreed to in writing, software
+  ~  distributed under the License is distributed on an "AS IS" BASIS,
+  ~  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~  See the License for the specific language governing permissions and
+  ~  limitations under the License.
+  ~
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~-->
+
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <version>1.0.0-SNAPSHOT</version>
+    <groupId>org.questdb</groupId>
+    <artifactId>client-parent</artifactId>
+    <packaging>pom</packaging>
+    <name>QuestDB</name>
+
+    <scm>
+        <connection>scm:git:https://github.com/questdb/java-questdb-client.git</connection>
+        <developerConnection>scm:git:https://github.com/questdb/java-questdb-client.git</developerConnection>
+        <url>https://github.com/questdb/java-questdb-client</url>
+        <tag>9.3.1</tag>
+    </scm>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-deploy-plugin</artifactId>
+                <version>3.1.4</version>
+                <configuration>
+                    <skip>true</skip>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.8</version>
+                <executions>
+                    <execution>
+                        <id>default-prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>default-report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-release-plugin</artifactId>
+                <version>3.1.1</version>
+                <configuration>
+                    <tagNameFormat>@{project.version}</tagNameFormat>
+                    <arguments>-Dmaven.test.skipTests=true -Dmaven.test.skip=true</arguments>
+                    <releaseProfiles>maven-central-release</releaseProfiles>
+                    <scmCommentPrefix>[maven-release-plugin]</scmCommentPrefix>
+                    <scmReleaseCommitComment>[maven-release-plugin] prepare release @{releaseLabel}
+                    </scmReleaseCommitComment>
+                    <scmDevelopmentCommitComment>[maven-release-plugin] prepare for next development iteration
+                    </scmDevelopmentCommitComment>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+    <modules>
+        <module>core</module>
+        <module>examples</module>
+    </modules>
+</project>

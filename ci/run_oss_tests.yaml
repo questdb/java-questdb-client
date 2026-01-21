@@ -1,0 +1,27 @@
+# Run the tests from OSS using the current client version
+steps:
+  - task: Maven@3
+    displayName: "Run OSS line tests"
+    inputs:
+      mavenPOMFile: "questdb/pom.xml"
+      jdkVersionOption: "default"
+      goals: "test"
+      options: "--batch-mode --quiet
+        -Dtest.include=**/cutlass/http/line/*,**/cutlass/line/**/*
+        -DfailIfNoTests=false
+        -Dsurefire.failIfNoSpecifiedTests=false
+        -Dout=$(Build.SourcesDirectory)/questdb/ci/qlog.conf
+        -Dhttp.keepAlive=false"
+  - task: ArchiveFiles@2
+    displayName: "Tests failed -- Compress logs"
+    condition: failed()
+    inputs:
+      rootFolderOrFile: "logs"
+      includeRootFolder: false
+      archiveFile: $(ARCHIVED_LOGS)
+  - task: PublishBuildArtifacts@1
+    displayName: "Tests failed -- Upload logs"
+    condition: failed()
+    inputs:
+      pathToPublish: $(ARCHIVED_LOGS)
+      artifactName: MavenFailedTestsLogs

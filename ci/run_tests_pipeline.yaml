@@ -1,0 +1,95 @@
+trigger: none
+
+variables:
+  ARCHIVED_LOGS: "$(Build.ArtifactStagingDirectory)/questdb-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS).zip"
+  QUESTDB_RUNNING: true
+  QUESTDB_ILP_TCP_AUTH_ENABLE: false
+
+stages:
+  - stage: BuildAndTest
+    displayName: "Building and testing"
+    jobs:
+      - job: RunOn
+        displayName: "on"
+        strategy:
+          matrix:
+            linux-x64:
+              imageName: "ubuntu-latest"
+              poolName: "Azure Pipelines"
+              jdkArch: "x64"
+            mac-aarch64:
+              imageName: "macos-15-arm64"
+              poolName: "Azure Pipelines"
+              jdkArch: "arm64"
+            mac-x64:
+              imageName: "macos-15"
+              poolName: "Azure Pipelines"
+              jdkArch: "x64"
+            windows-msvc-2022-x64:
+              imageName: "windows-2022"
+              poolName: "Azure Pipelines"
+              jdkArch: "x64"
+        pool:
+          name: $(poolName)
+          vmImage: $(imageName)
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: setup.yaml
+          # TODO: remove branch once rd_strip_ilp_sender is merged
+          - script: git clone --depth 1 -b rd_strip_ilp_sender https://github.com/questdb/questdb.git ./questdb
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Update client version"
+            inputs:
+              mavenPOMFile: "core/pom.xml"
+              jdkVersionOption: "default"
+              goals: "versions:set"
+              options: "-DnewVersion=9.9.9 -DgenerateBackupPoms=false --batch-mode"
+          - task: Maven@3
+            displayName: "Install client to local repo"
+            inputs:
+              mavenPOMFile: "core/pom.xml"
+              jdkVersionOption: "default"
+              goals: "install"
+              options: "-DskipTests --batch-mode"
+          - task: Maven@3
+            displayName: "Update QuestDB client version: core"
+            inputs:
+              mavenPOMFile: "questdb/core/pom.xml"
+              jdkVersionOption: "default"
+              goals: "versions:use-dep-version"
+              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
+          - task: Maven@3
+            displayName: "Update QuestDB client version: benchmarks"
+            inputs:
+              mavenPOMFile: "questdb/benchmarks/pom.xml"
+              jdkVersionOption: "default"
+              goals: "versions:use-dep-version"
+              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
+          - task: Maven@3
+            displayName: "Update QuestDB client version: utils"
+            inputs:
+              mavenPOMFile: "questdb/utils/pom.xml"
+              jdkVersionOption: "default"
+              goals: "versions:use-dep-version"
+              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              jdkVersionOption: "default"
+              options: "-DskipTests -Pbuild-web-console --batch-mode"
+          - template: run_client_tests.yaml
+            parameters:
+              configPath: "ci/confs/default"
+          - bash: |
+              echo "##vso[task.setvariable variable=QUESTDB_ILP_TCP_AUTH_ENABLE]true"
+            displayName: "Enable ILP TCP Auth"
+          - template: run_client_tests.yaml
+            parameters:
+              configPath: "ci/confs/authenticated"
+          - template: run_oss_tests.yaml

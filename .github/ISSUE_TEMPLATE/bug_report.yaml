@@ -1,0 +1,77 @@
+name: Bug report
+description: Create a bug report to help us improve QuestDB
+labels: [ bug ]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting the bug.  
+        ❗ Please provide all the required information to receive faster responses from the maintainers.
+  - type: textarea
+    attributes:
+      label: To reproduce
+      description: Steps to reproduce this behavior.
+      placeholder: |
+        1. Go to '...'
+        2. Click on '....'
+        3. Run this SQL '....'
+        4. See error
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: "QuestDB version:"
+      placeholder: e.g., 7.3.5
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: "OS, in case of Docker specify Docker and the Host OS:"
+      placeholder: e.g., Ubuntu 22.04 (Docker)
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: "File System, in case of Docker specify Host File System:"
+      placeholder: e.g., ext4
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: "# Identity Disclosure:"
+  - type: input
+    attributes:
+      label: "Full Name:"
+      placeholder: e.g., John Doe
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: "Affiliation:"
+      placeholder: e.g., Oracle
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        If the above is not given and is not obvious from your GitHub profile page, we might close your issue without further review. Please refer to the [reasoning behind this rule](https://berthub.eu/articles/posts/anonymous-help/) if you have questions.
+  - type: checkboxes
+    attributes:
+      label: "Have you followed Linux, MacOs kernel configuration steps to increase Maximum open files and Maximum virtual memory areas limit?"
+      options:
+        - label: Yes, I have
+          required: true
+  - type: markdown
+    attributes:
+      value: |          
+        [OS configuration](https://questdb.io/docs/deployment/capacity-planning/#os-configuration)
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: |
+        Please add screenshots, logs files, links, or details that provide context about the issue.
+
+        Tip: You can attach images or log files by clicking this area to highlight it and then dragging files in.
+    validations:
+      required: false

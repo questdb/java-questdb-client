@@ -1,0 +1,28 @@
+parameters:
+  - name: configPath
+    type: string
+
+steps:
+  - template: questdb_start.yaml
+    parameters:
+      configPath: ${{ parameters.configPath }}
+  - task: Maven@3
+    displayName: "Run Client Tests"
+    inputs:
+      mavenPOMFile: "core/pom.xml"
+      jdkVersionOption: "default"
+      goals: "test --batch-mode"
+  - task: ArchiveFiles@2
+    displayName: "Tests failed -- Compress logs"
+    condition: failed()
+    inputs:
+      rootFolderOrFile: "logs"
+      includeRootFolder: false
+      archiveFile: $(ARCHIVED_LOGS)
+  - task: PublishBuildArtifacts@1
+    displayName: "Tests failed -- Upload logs"
+    condition: failed()
+    inputs:
+      pathToPublish: $(ARCHIVED_LOGS)
+      artifactName: MavenFailedTestsLogs
+  - template: questdb_stop.yaml

@@ -1,0 +1,11 @@
+steps:
+  - task: JavaToolInstaller@0
+    displayName: "Install Java 17"
+    inputs:
+      versionSpec: "17"
+      jdkArchitectureOption: "$(jdkArch)"
+      jdkSourceOption: "PreInstalled"
+
+  - bash: sudo sysctl -w fs.file-max=500000
+    displayName: "Increase file count on Linux"
+    condition: startsWith(variables['imageName'], 'ubuntu')
