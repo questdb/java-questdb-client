@@ -201,6 +201,16 @@ else ()
     )
 endif (ARCH_AARCH64)
 
+if (OS_WINDOWS)
+    target_link_libraries(questdb wsock32 ws2_32 secur32 shlwapi psapi -s -static-libgcc -static-libstdc++)
+    target_compile_options(questdb PRIVATE -fno-threadsafe-statics)
+elseif (OS_DARWIN)
+    target_link_libraries(questdb -nostdlib++ -dead_strip -lc++)
+else ()
+    target_compile_options(questdb PRIVATE -fno-threadsafe-statics -ffunction-sections -fdata-sections)
+    target_link_libraries(questdb rt -Wl,--gc-sections -Wl,--exclude-libs=ALL -static-libgcc)
+endif ()
+
 # Define the secondary output directory
 
 set(SECONDARY_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/questdb/bin-local/)
