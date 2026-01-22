@@ -24,11 +24,7 @@
 
 package io.questdb.cairo;
 
-import io.questdb.std.Decimals;
-import io.questdb.std.IntHashSet;
-import io.questdb.std.IntObjHashMap;
-import io.questdb.std.Long256;
-import io.questdb.std.Numbers;
+import io.questdb.std.*;
 import io.questdb.std.str.StringSink;
 
 // ColumnType layout - 32bit
@@ -141,8 +137,217 @@ public final class ColumnType {
     private static final int TYPE_FLAG_GEO_HASH = (1 << 16);
     private static final IntHashSet arrayTypeSet = new IntHashSet();
     private static final IntObjHashMap<String> typeNameMap = new IntObjHashMap<>();
+    private static final LowerCaseAsciiCharSequenceIntHashMap nameTypeMap = new LowerCaseAsciiCharSequenceIntHashMap();
+
+    static {
+        assert MIGRATION_VERSION >= VERSION;
+        GEO_TYPE_SIZE_POW2 = new int[GEOLONG_MAX_BITS + 1];
+        for (int bits = 1; bits <= GEOLONG_MAX_BITS; bits++) {
+            GEO_TYPE_SIZE_POW2[bits] = Numbers.msb(Numbers.ceilPow2(((bits + Byte.SIZE) & -Byte.SIZE)) >> 3);
+        }
+
+        typeNameMap.put(BOOLEAN, "BOOLEAN");
+        typeNameMap.put(BYTE, "BYTE");
+        typeNameMap.put(DOUBLE, "DOUBLE");
+        typeNameMap.put(FLOAT, "FLOAT");
+        typeNameMap.put(INT, "INT");
+        typeNameMap.put(LONG, "LONG");
+        typeNameMap.put(SHORT, "SHORT");
+        typeNameMap.put(CHAR, "CHAR");
+        typeNameMap.put(STRING, "STRING");
+        typeNameMap.put(VARCHAR, "VARCHAR");
+        typeNameMap.put(ARRAY, "ARRAY");
+        typeNameMap.put(SYMBOL, "SYMBOL");
+        typeNameMap.put(BINARY, "BINARY");
+        typeNameMap.put(DATE, "DATE");
+        typeNameMap.put(PARAMETER, "PARAMETER");
+        typeNameMap.put(TIMESTAMP_MICRO, "TIMESTAMP");
+        typeNameMap.put(TIMESTAMP_NANO, "TIMESTAMP_NS");
+        typeNameMap.put(LONG256, "LONG256");
+        typeNameMap.put(UUID, "UUID");
+        typeNameMap.put(LONG128, "LONG128");
+        typeNameMap.put(CURSOR, "CURSOR");
+        typeNameMap.put(RECORD, "RECORD");
+        typeNameMap.put(VAR_ARG, "VARARG");
+        typeNameMap.put(GEOHASH, "GEOHASH");
+        typeNameMap.put(REGCLASS, "regclass");
+        typeNameMap.put(REGPROCEDURE, "regprocedure");
+        typeNameMap.put(ARRAY_STRING, "text[]");
+        typeNameMap.put(IPv4, "IPv4");
+        typeNameMap.put(INTERVAL, "INTERVAL");
+        typeNameMap.put(INTERVAL_RAW, "INTERVAL");
+        typeNameMap.put(INTERVAL_TIMESTAMP_MICRO, "INTERVAL");
+        typeNameMap.put(INTERVAL_TIMESTAMP_NANO, "INTERVAL");
+        typeNameMap.put(DECIMAL, "DECIMAL");
+        typeNameMap.put(NULL, "NULL");
+
+        arrayTypeSet.add(DOUBLE);
+
+        TYPE_SIZE_POW2[UNDEFINED] = -1;
+        TYPE_SIZE_POW2[BOOLEAN] = 0;
+        TYPE_SIZE_POW2[BYTE] = 0;
+        TYPE_SIZE_POW2[SHORT] = 1;
+        TYPE_SIZE_POW2[CHAR] = 1;
+        TYPE_SIZE_POW2[FLOAT] = 2;
+        TYPE_SIZE_POW2[INT] = 2;
+        TYPE_SIZE_POW2[IPv4] = 2;
+        TYPE_SIZE_POW2[SYMBOL] = 2;
+        TYPE_SIZE_POW2[DOUBLE] = 3;
+        TYPE_SIZE_POW2[STRING] = -1;
+        TYPE_SIZE_POW2[VARCHAR] = -1;
+        TYPE_SIZE_POW2[ARRAY] = -1;
+        TYPE_SIZE_POW2[LONG] = 3;
+        TYPE_SIZE_POW2[DATE] = 3;
+        TYPE_SIZE_POW2[TIMESTAMP] = 3;
+        TYPE_SIZE_POW2[LONG256] = 5;
+        TYPE_SIZE_POW2[GEOBYTE] = 0;
+        TYPE_SIZE_POW2[GEOSHORT] = 1;
+        TYPE_SIZE_POW2[GEOINT] = 2;
+        TYPE_SIZE_POW2[GEOLONG] = 3;
+        TYPE_SIZE_POW2[BINARY] = -1;
+        TYPE_SIZE_POW2[PARAMETER] = -1;
+        TYPE_SIZE_POW2[CURSOR] = -1;
+        TYPE_SIZE_POW2[VAR_ARG] = -1;
+        TYPE_SIZE_POW2[RECORD] = -1;
+        TYPE_SIZE_POW2[NULL] = -1;
+        TYPE_SIZE_POW2[LONG128] = 4;
+        TYPE_SIZE_POW2[UUID] = 4;
+        TYPE_SIZE_POW2[DECIMAL8] = 0;
+        TYPE_SIZE_POW2[DECIMAL16] = 1;
+        TYPE_SIZE_POW2[DECIMAL32] = 2;
+        TYPE_SIZE_POW2[DECIMAL64] = 3;
+        TYPE_SIZE_POW2[DECIMAL128] = 4;
+        TYPE_SIZE_POW2[DECIMAL256] = 5;
+        TYPE_SIZE_POW2[INTERVAL] = 4;
+
+        TYPE_SIZE[UNDEFINED] = -1;
+        TYPE_SIZE[BOOLEAN] = Byte.BYTES;
+        TYPE_SIZE[BYTE] = Byte.BYTES;
+        TYPE_SIZE[SHORT] = Short.BYTES;
+        TYPE_SIZE[CHAR] = Character.BYTES;
+        TYPE_SIZE[FLOAT] = Float.BYTES;
+        TYPE_SIZE[INT] = Integer.BYTES;
+        TYPE_SIZE[IPv4] = Integer.BYTES;
+        TYPE_SIZE[SYMBOL] = Integer.BYTES;
+        TYPE_SIZE[STRING] = 0;
+        TYPE_SIZE[VARCHAR] = 0;
+        TYPE_SIZE[ARRAY] = 0;
+        TYPE_SIZE[DOUBLE] = Double.BYTES;
+        TYPE_SIZE[LONG] = Long.BYTES;
+        TYPE_SIZE[DATE] = Long.BYTES;
+        TYPE_SIZE[TIMESTAMP] = Long.BYTES;
+        TYPE_SIZE[LONG256] = Long256.BYTES;
+        TYPE_SIZE[GEOBYTE] = Byte.BYTES;
+        TYPE_SIZE[GEOSHORT] = Short.BYTES;
+        TYPE_SIZE[GEOINT] = Integer.BYTES;
+        TYPE_SIZE[GEOLONG] = Long.BYTES;
+        TYPE_SIZE[BINARY] = 0;
+        TYPE_SIZE[PARAMETER] = -1;
+        TYPE_SIZE[CURSOR] = -1;
+        TYPE_SIZE[VAR_ARG] = -1;
+        TYPE_SIZE[RECORD] = -1;
+        TYPE_SIZE[UUID] = 2 * Long.BYTES;
+        TYPE_SIZE[NULL] = 0;
+        TYPE_SIZE[LONG128] = 2 * Long.BYTES;
+        TYPE_SIZE[DECIMAL8] = Byte.BYTES;
+        TYPE_SIZE[DECIMAL16] = Short.BYTES;
+        TYPE_SIZE[DECIMAL32] = Integer.BYTES;
+        TYPE_SIZE[DECIMAL64] = Long.BYTES;
+        TYPE_SIZE[DECIMAL128] = 2 * Long.BYTES;
+        TYPE_SIZE[DECIMAL256] = 4 * Long.BYTES;
+        TYPE_SIZE[INTERVAL] = 2 * Long.BYTES;
+
+        nameTypeMap.put("boolean", BOOLEAN);
+        nameTypeMap.put("byte", BYTE);
+        nameTypeMap.put("double", DOUBLE);
+        nameTypeMap.put("float", FLOAT);
+        nameTypeMap.put("int", INT);
+        nameTypeMap.put("integer", INT);
+        nameTypeMap.put("long", LONG);
+        nameTypeMap.put("short", SHORT);
+        nameTypeMap.put("char", CHAR);
+        nameTypeMap.put("string", STRING);
+        nameTypeMap.put("varchar", VARCHAR);
+        nameTypeMap.put("array", ARRAY);
+        nameTypeMap.put("symbol", SYMBOL);
+        nameTypeMap.put("binary", BINARY);
+        nameTypeMap.put("date", DATE);
+        nameTypeMap.put("parameter", PARAMETER);
+        nameTypeMap.put("timestamp", TIMESTAMP_MICRO);
+        nameTypeMap.put("cursor", CURSOR);
+        nameTypeMap.put("long256", LONG256);
+        nameTypeMap.put("uuid", UUID);
+        nameTypeMap.put("long128", LONG128);
+        nameTypeMap.put("geohash", GEOHASH);
+        nameTypeMap.put("text", STRING);
+        nameTypeMap.put("smallint", SHORT);
+        nameTypeMap.put("bigint", LONG);
+        nameTypeMap.put("real", FLOAT);
+        nameTypeMap.put("bytea", STRING);
+        nameTypeMap.put("regclass", REGCLASS);
+        nameTypeMap.put("regprocedure", REGPROCEDURE);
+        nameTypeMap.put("text[]", ARRAY_STRING);
+        nameTypeMap.put("IPv4", IPv4);
+        nameTypeMap.put("interval", INTERVAL);
+        nameTypeMap.put("interval", INTERVAL_TIMESTAMP_MICRO);
+        nameTypeMap.put("timestamp_ns", TIMESTAMP_NANO);
+        nameTypeMap.put("decimal", DECIMAL);
+
+        StringSink sink = new StringSink();
+        for (int b = 1; b <= GEOLONG_MAX_BITS; b++) {
+            sink.clear();
+            if (b % 5 != 0) {
+                sink.put("GEOHASH(").put(b).put("b)");
+            } else {
+                sink.put("GEOHASH(").put(b / 5).put("c)");
+            }
+            String name = sink.toString();
+            int type = getGeoHashTypeWithBits(b);
+            typeNameMap.put(type, name);
+            nameTypeMap.put(name, type);
+        }
+
+        addArrayTypeName(sink, ColumnType.BOOLEAN);
+        addArrayTypeName(sink, ColumnType.BYTE);
+        addArrayTypeName(sink, ColumnType.SHORT);
+        addArrayTypeName(sink, ColumnType.INT);
+        addArrayTypeName(sink, ColumnType.LONG);
+        addArrayTypeName(sink, ColumnType.FLOAT);
+        addArrayTypeName(sink, ColumnType.DOUBLE);
+        addArrayTypeName(sink, ColumnType.LONG256);
+        addArrayTypeName(sink, ColumnType.VARCHAR);
+        addArrayTypeName(sink, ColumnType.STRING);
+        addArrayTypeName(sink, ColumnType.IPv4);
+        addArrayTypeName(sink, ColumnType.TIMESTAMP);
+        addArrayTypeName(sink, ColumnType.UUID);
+        addArrayTypeName(sink, ColumnType.DATE);
+
+        // Stored decimals
+        for (int precision = 1; precision <= Decimals.MAX_PRECISION; precision++) {
+            for (int scale = 0; scale <= Decimals.MAX_SCALE; scale++) {
+                int type = getDecimalType(precision, scale);
+                sink.clear();
+                sink.put("DECIMAL(").put(precision).put(',').put(scale).put(")");
+                String name = sink.toString();
+                typeNameMap.put(type, name);
+                nameTypeMap.put(name, type);
+            }
+        }
+    }
 
     private ColumnType() {
+    }
+
+    private static void addArrayTypeName(StringSink sink, short type) {
+        sink.clear();
+        sink.put(nameOf(type));
+        for (int d = 1; d <= ARRAY_NDIMS_LIMIT; d++) {
+            sink.put("[]");
+            int arrayType = encodeArrayType(type, d, false);
+            String name = sink.toString();
+            typeNameMap.put(arrayType, name);
+            nameTypeMap.put(name, arrayType);
+        }
     }
 
     public static int decodeArrayDimensionality(int encodedType) {
@@ -243,6 +448,19 @@ public final class ColumnType {
         return ColumnType.tagOf(columnType) == ColumnType.ARRAY;
     }
 
+    /**
+     * Encodes an array type with weak dimensionality. The dimensionality is still
+     * encoded but marked as tentative and can be updated based on actual data.
+     * This is useful for PostgreSQL wire protocol where type information doesn't
+     * include array dimensions.
+     * <p>
+     * The number of dimensions of this type is undefined, so the decoded number on
+     * dimensions for the returned column type will be -1.
+     */
+    public static int encodeArrayTypeWithWeakDims(short elemType, boolean checkSupportedElementTypes) {
+        return encodeArrayType(elemType, 1, checkSupportedElementTypes) | TYPE_FLAG_ARRAY_WEAK_DIMS;
+    }
+
     public static boolean isNull(int columnType) {
         return columnType == NULL;
     }
@@ -291,152 +509,7 @@ public final class ColumnType {
         return (baseType & ~(0xFF << BYTE_BITS)) | (bits << BYTE_BITS) | TYPE_FLAG_GEO_HASH; // bit 16 is GeoHash flag
     }
 
-    static {
-        assert MIGRATION_VERSION >= VERSION;
-        GEO_TYPE_SIZE_POW2 = new int[GEOLONG_MAX_BITS + 1];
-        for (int bits = 1; bits <= GEOLONG_MAX_BITS; bits++) {
-            GEO_TYPE_SIZE_POW2[bits] = Numbers.msb(Numbers.ceilPow2(((bits + Byte.SIZE) & -Byte.SIZE)) >> 3);
-        }
-
-        typeNameMap.put(BOOLEAN, "BOOLEAN");
-        typeNameMap.put(BYTE, "BYTE");
-        typeNameMap.put(DOUBLE, "DOUBLE");
-        typeNameMap.put(FLOAT, "FLOAT");
-        typeNameMap.put(INT, "INT");
-        typeNameMap.put(LONG, "LONG");
-        typeNameMap.put(SHORT, "SHORT");
-        typeNameMap.put(CHAR, "CHAR");
-        typeNameMap.put(STRING, "STRING");
-        typeNameMap.put(VARCHAR, "VARCHAR");
-        typeNameMap.put(ARRAY, "ARRAY");
-        typeNameMap.put(SYMBOL, "SYMBOL");
-        typeNameMap.put(BINARY, "BINARY");
-        typeNameMap.put(DATE, "DATE");
-        typeNameMap.put(PARAMETER, "PARAMETER");
-        typeNameMap.put(TIMESTAMP_MICRO, "TIMESTAMP");
-        typeNameMap.put(TIMESTAMP_NANO, "TIMESTAMP_NS");
-        typeNameMap.put(LONG256, "LONG256");
-        typeNameMap.put(UUID, "UUID");
-        typeNameMap.put(LONG128, "LONG128");
-        typeNameMap.put(CURSOR, "CURSOR");
-        typeNameMap.put(RECORD, "RECORD");
-        typeNameMap.put(VAR_ARG, "VARARG");
-        typeNameMap.put(GEOHASH, "GEOHASH");
-        typeNameMap.put(REGCLASS, "regclass");
-        typeNameMap.put(REGPROCEDURE, "regprocedure");
-        typeNameMap.put(ARRAY_STRING, "text[]");
-        typeNameMap.put(IPv4, "IPv4");
-        typeNameMap.put(INTERVAL, "INTERVAL");
-        typeNameMap.put(INTERVAL_RAW, "INTERVAL");
-        typeNameMap.put(INTERVAL_TIMESTAMP_MICRO, "INTERVAL");
-        typeNameMap.put(INTERVAL_TIMESTAMP_NANO, "INTERVAL");
-        typeNameMap.put(DECIMAL, "DECIMAL");
-        typeNameMap.put(NULL, "NULL");
-
-        arrayTypeSet.add(DOUBLE);
-
-        StringSink sink = new StringSink();
-        for (int b = 1; b <= GEOLONG_MAX_BITS; b++) {
-            sink.clear();
-            if (b % 5 != 0) {
-                sink.put("GEOHASH(").put(b).put("b)");
-            } else {
-                sink.put("GEOHASH(").put(b / 5).put("c)");
-            }
-            String name = sink.toString();
-            int type = getGeoHashTypeWithBits(b);
-            typeNameMap.put(type, name);
-        }
-
-        TYPE_SIZE_POW2[UNDEFINED] = -1;
-        TYPE_SIZE_POW2[BOOLEAN] = 0;
-        TYPE_SIZE_POW2[BYTE] = 0;
-        TYPE_SIZE_POW2[SHORT] = 1;
-        TYPE_SIZE_POW2[CHAR] = 1;
-        TYPE_SIZE_POW2[FLOAT] = 2;
-        TYPE_SIZE_POW2[INT] = 2;
-        TYPE_SIZE_POW2[IPv4] = 2;
-        TYPE_SIZE_POW2[SYMBOL] = 2;
-        TYPE_SIZE_POW2[DOUBLE] = 3;
-        TYPE_SIZE_POW2[STRING] = -1;
-        TYPE_SIZE_POW2[VARCHAR] = -1;
-        TYPE_SIZE_POW2[ARRAY] = -1;
-        TYPE_SIZE_POW2[LONG] = 3;
-        TYPE_SIZE_POW2[DATE] = 3;
-        TYPE_SIZE_POW2[TIMESTAMP] = 3;
-        TYPE_SIZE_POW2[LONG256] = 5;
-        TYPE_SIZE_POW2[GEOBYTE] = 0;
-        TYPE_SIZE_POW2[GEOSHORT] = 1;
-        TYPE_SIZE_POW2[GEOINT] = 2;
-        TYPE_SIZE_POW2[GEOLONG] = 3;
-        TYPE_SIZE_POW2[BINARY] = -1;
-        TYPE_SIZE_POW2[PARAMETER] = -1;
-        TYPE_SIZE_POW2[CURSOR] = -1;
-        TYPE_SIZE_POW2[VAR_ARG] = -1;
-        TYPE_SIZE_POW2[RECORD] = -1;
-        TYPE_SIZE_POW2[NULL] = -1;
-        TYPE_SIZE_POW2[LONG128] = 4;
-        TYPE_SIZE_POW2[UUID] = 4;
-        TYPE_SIZE_POW2[DECIMAL8] = 0;
-        TYPE_SIZE_POW2[DECIMAL16] = 1;
-        TYPE_SIZE_POW2[DECIMAL32] = 2;
-        TYPE_SIZE_POW2[DECIMAL64] = 3;
-        TYPE_SIZE_POW2[DECIMAL128] = 4;
-        TYPE_SIZE_POW2[DECIMAL256] = 5;
-        TYPE_SIZE_POW2[INTERVAL] = 4;
-
-        TYPE_SIZE[UNDEFINED] = -1;
-        TYPE_SIZE[BOOLEAN] = Byte.BYTES;
-        TYPE_SIZE[BYTE] = Byte.BYTES;
-        TYPE_SIZE[SHORT] = Short.BYTES;
-        TYPE_SIZE[CHAR] = Character.BYTES;
-        TYPE_SIZE[FLOAT] = Float.BYTES;
-        TYPE_SIZE[INT] = Integer.BYTES;
-        TYPE_SIZE[IPv4] = Integer.BYTES;
-        TYPE_SIZE[SYMBOL] = Integer.BYTES;
-        TYPE_SIZE[STRING] = 0;
-        TYPE_SIZE[VARCHAR] = 0;
-        TYPE_SIZE[ARRAY] = 0;
-        TYPE_SIZE[DOUBLE] = Double.BYTES;
-        TYPE_SIZE[LONG] = Long.BYTES;
-        TYPE_SIZE[DATE] = Long.BYTES;
-        TYPE_SIZE[TIMESTAMP] = Long.BYTES;
-        TYPE_SIZE[LONG256] = Long256.BYTES;
-        TYPE_SIZE[GEOBYTE] = Byte.BYTES;
-        TYPE_SIZE[GEOSHORT] = Short.BYTES;
-        TYPE_SIZE[GEOINT] = Integer.BYTES;
-        TYPE_SIZE[GEOLONG] = Long.BYTES;
-        TYPE_SIZE[BINARY] = 0;
-        TYPE_SIZE[PARAMETER] = -1;
-        TYPE_SIZE[CURSOR] = -1;
-        TYPE_SIZE[VAR_ARG] = -1;
-        TYPE_SIZE[RECORD] = -1;
-        TYPE_SIZE[UUID] = 2 * Long.BYTES;
-        TYPE_SIZE[NULL] = 0;
-        TYPE_SIZE[LONG128] = 2 * Long.BYTES;
-        TYPE_SIZE[DECIMAL8] = Byte.BYTES;
-        TYPE_SIZE[DECIMAL16] = Short.BYTES;
-        TYPE_SIZE[DECIMAL32] = Integer.BYTES;
-        TYPE_SIZE[DECIMAL64] = Long.BYTES;
-        TYPE_SIZE[DECIMAL128] = 2 * Long.BYTES;
-        TYPE_SIZE[DECIMAL256] = 4 * Long.BYTES;
-        TYPE_SIZE[INTERVAL] = 2 * Long.BYTES;
-
-        sink.clear();
-        for (int i = 0, n = ARRAY_NDIMS_LIMIT + 1; i < n; i++) {
-            ARRAY_DIM_SUFFIX[i] = sink.toString();
-            sink.put("[]");
-        }
-
-        // Stored decimals
-        for (int precision = 1; precision <= Decimals.MAX_PRECISION; precision++) {
-            for (int scale = 0; scale <= Decimals.MAX_SCALE; scale++) {
-                int type = getDecimalType(precision, scale);
-                sink.clear();
-                sink.put("DECIMAL(").put(precision).put(',').put(scale).put(")");
-                String name = sink.toString();
-                typeNameMap.put(type, name);
-            }
-        }
+    public static int typeOf(CharSequence name) {
+        return nameTypeMap.get(name);
     }
 }

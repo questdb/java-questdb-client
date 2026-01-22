@@ -56,14 +56,14 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
         System.arraycopy(other, 0, this.buffer, 0, pos);
     }
 
-    public void setPos(int newPos) {
-        checkCapacity(newPos);
-        pos = newPos;
-    }
-
     @SuppressWarnings("unchecked")
     public ObjList(int capacity) {
         this.buffer = (T[]) new Object[Math.max(capacity, DEFAULT_ARRAY_SIZE)];
+    }
+
+    public void setPos(int newPos) {
+        checkCapacity(newPos);
+        pos = newPos;
     }
 
     public void add(T value) {
@@ -96,6 +96,16 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
             Arrays.fill(buffer, null);
         }
         pos = 0;
+    }
+
+    public void remove(int from, int to) {
+        assert from <= to : "start index is greater than end index, " + from + " > " + to;
+        int move = pos - from - (to - from) - 1;
+        if (move > 0) {
+            System.arraycopy(buffer, to + 1, buffer, from, move);
+        }
+        pos = Math.max(0, pos - (to - from + 1));
+        Arrays.fill(buffer, pos, buffer.length - 1, null);
     }
 
     /**

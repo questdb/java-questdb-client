@@ -22,18 +22,28 @@
  *
  ******************************************************************************/
 
-package io.questdb.cairo;
+package io.questdb.test.std;
 
-import io.questdb.std.Rnd;
+import io.questdb.std.Os;
+import org.junit.Test;
 
-public interface CairoConfiguration {
+import static org.junit.Assert.assertTrue;
 
-    int O_ASYNC = 0x40;
-    int O_DIRECT = 0x4000;
-    int O_NONE = 0;
-    int O_SYNC = 0x80;
-    ThreadLocal<Rnd> RANDOM = new ThreadLocal<>();
+public class OsTest {
+    @Test
+    public void testCurrentTimeMicros() {
+        long reference = System.currentTimeMillis();
+        long actual = Os.currentTimeMicros();
+        long delta = actual / 1000 - reference;
+        assertTrue(delta < 200);
+    }
 
-    int maxArrayElementCount();
-
+    @Test
+    public void testCurrentTimeNanos() {
+        long reference = System.currentTimeMillis();
+        long actual = Os.currentTimeNanos();
+        assertTrue(actual > 0);
+        long delta = actual / 1_000_000 - reference;
+        assertTrue(delta < 200);
+    }
 }

@@ -26,7 +26,9 @@ package io.questdb.network;
 
 import io.questdb.std.Files;
 import io.questdb.std.Os;
-import io.questdb.std.str.*;
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.DirectUtf8Sink;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,6 +53,20 @@ public final class Net {
     // value causes problems in some environments. If it does not cause problems then this option should be removed after a few releases.
     // It's not exposed as PropertyKey, because it would become a supported and hard to remove API.
     private static final int TCP_KEEPALIVE_SECONDS = Integer.getInteger("questdb.unsupported.tcp.keepalive.seconds", 30);
+
+    static {
+        Os.init();
+        EWOULDBLOCK = getEwouldblock();
+        if (Os.isLinux()) {
+            MMSGHDR_SIZE = getMsgHeaderSize();
+            MMSGHDR_BUFFER_ADDRESS_OFFSET = getMsgHeaderBufferAddressOffset();
+            MMSGHDR_BUFFER_LENGTH_OFFSET = getMsgHeaderBufferLengthOffset();
+        } else {
+            MMSGHDR_SIZE = -1L;
+            MMSGHDR_BUFFER_ADDRESS_OFFSET = -1L;
+            MMSGHDR_BUFFER_LENGTH_OFFSET = -1L;
+        }
+    }
 
     private Net() {
     }
@@ -109,6 +125,9 @@ public final class Net {
         return addrInfo;
     }
 
+    public static void init() {
+        // no-op
+    }
 
     public static int send(long fd, long ptr, int len) {
         return send(fd, ptr, len);
@@ -159,17 +178,11 @@ public final class Net {
 
     public native static int socketTcp(boolean blocking);
 
-    static {
-        Os.init();
-        EWOULDBLOCK = getEwouldblock();
-        if (Os.isLinux()) {
-            MMSGHDR_SIZE = getMsgHeaderSize();
-            MMSGHDR_BUFFER_ADDRESS_OFFSET = getMsgHeaderBufferAddressOffset();
-            MMSGHDR_BUFFER_LENGTH_OFFSET = getMsgHeaderBufferLengthOffset();
-        } else {
-            MMSGHDR_SIZE = -1L;
-            MMSGHDR_BUFFER_ADDRESS_OFFSET = -1L;
-            MMSGHDR_BUFFER_LENGTH_OFFSET = -1L;
-        }
-    }
+    public native static int socketUdp();
+
+    public native static int setMulticastTtl(int fd, int ttl);
+
+    public native static int setMulticastInterface(int fd, int ipv4address);
+
+    public native static int sendTo(int fd, long ptr, int len, long sockaddr);
 }

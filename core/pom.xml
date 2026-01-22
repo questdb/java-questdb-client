@@ -22,7 +22,8 @@
   ~
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~-->
 
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <name>QuestDB</name>
     <description>QuestDB is high performance SQL time series database</description>
@@ -36,14 +37,6 @@
         <argLine>-ea -Dfile.encoding=UTF-8 -XX:+UseParallelGC</argLine>
         <test.exclude>None</test.exclude>
         <test.include>%regex[.*[^o].class]</test.include><!-- exclude module-info.class-->
-        <web.console.version>1.1.12</web.console.version>
-        <qdbr.path>rust/qdbr</qdbr.path>
-        <qdbr.release>false</qdbr.release>
-
-        <!--
-        For production builds, use -P qdbr-release
-        -->
-        <qdbr.rustflags>-D warnings</qdbr.rustflags>
     </properties>
 
     <version>9.3.2-SNAPSHOT</version>
@@ -192,7 +185,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.3</version>
                 <configuration>
-                    <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
+                    <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory"/>
                     <useModulePath>true</useModulePath>
                     <includes>
                         <include>${test.include}</include>
@@ -200,12 +193,6 @@
                     <excludes>
                         <exclude>${test.exclude}</exclude>
                     </excludes>
-                    <properties>
-                        <property>
-                            <name>listener</name>
-                            <value>io.questdb.test.TestListener</value>
-                        </property>
-                    </properties>
                     <environmentVariables>
                         <!-- needed for testing Sender.fromEnv() -->
                         <QDB_CLIENT_CONF>
@@ -265,6 +252,9 @@
                     <arch>amd64</arch>
                 </os>
             </activation>
+            <properties>
+                <platform.dir.name>linux-x86-64</platform.dir.name>
+            </properties>
         </profile>
         <profile>
             <id>platform-freebsd-x86-64</id>
@@ -283,6 +273,9 @@
                     <arch>aarch64</arch>
                 </os>
             </activation>
+            <properties>
+                <platform.dir.name>linux-aarch64</platform.dir.name>
+            </properties>
         </profile>
         <profile>
             <id>platform-osx-x86-64</id>
@@ -292,6 +285,9 @@
                     <arch>amd64</arch>
                 </os>
             </activation>
+            <properties>
+                <platform.dir.name>darwin-x86-64</platform.dir.name>
+            </properties>
         </profile>
         <profile>
             <id>platform-osx-aarch64</id>
@@ -301,6 +297,9 @@
                     <arch>aarch64</arch>
                 </os>
             </activation>
+            <properties>
+                <platform.dir.name>darwin-aarch64</platform.dir.name>
+            </properties>
         </profile>
         <profile>
             <id>maven-central-release</id>
@@ -434,60 +433,6 @@
                 </dependency>
             </dependencies>
         </profile>
-        <profile>
-            <id>qdbr-release</id>
-            <properties>
-                <qdbr.release>true</qdbr.release>
-            </properties>
-        </profile>
-        <profile>
-            <id>qdbr-coverage</id>
-            <properties>
-                <qdr.release>false</qdr.release>
-                <qdbr.rustflags>-D warnings -C instrument-coverage</qdbr.rustflags>
-            </properties>
-            <build>
-                <plugins>
-                    <plugin>
-                        <groupId>org.questdb</groupId>
-                        <artifactId>rust-maven-plugin</artifactId>
-                        <version>1.2.0</version>
-                        <executions>
-                            <execution>
-                                <id>qdbr-build</id>
-                                <goals>
-                                    <goal>build</goal>
-                                </goals>
-                                <configuration>
-                                    <path>rust/qdbr</path>
-                                    <release>${qdbr.release}</release>
-                                    <copyTo>${project.build.directory}/classes/io/questdb/bin</copyTo>
-                                    <copyWithPlatformDir>true</copyWithPlatformDir>
-                                    <environmentVariables>
-                                        <RUSTFLAGS>${qdbr.rustflags}</RUSTFLAGS>
-                                    </environmentVariables>
-                                </configuration>
-                            </execution>
-                            <execution>
-                                <id>qdbr-test</id>
-                                <goals>
-                                    <goal>test</goal>
-                                </goals>
-                                <phase>test</phase>
-                                <configuration>
-                                    <path>rust/qdbr</path>
-                                    <release>${qdbr.release}</release>
-                                    <environmentVariables>
-                                        <RUSTFLAGS>${qdbr.rustflags}</RUSTFLAGS>
-                                        <LLVM_PROFILE_FILE>questdbr-cargo-test.profraw</LLVM_PROFILE_FILE>
-                                    </environmentVariables>
-                                </configuration>
-                            </execution>
-                        </executions>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
     </profiles>
 
     <dependencies>
@@ -496,6 +441,12 @@
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
             <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.9</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

@@ -25,24 +25,9 @@
 package io.questdb.cutlass.http;
 
 import io.questdb.cairo.Reopenable;
-import io.questdb.std.LowerCaseUtf8SequenceObjHashMap;
-import io.questdb.std.MemoryTag;
-import io.questdb.std.Mutable;
-import io.questdb.std.Numbers;
-import io.questdb.std.NumericException;
-import io.questdb.std.ObjList;
-import io.questdb.std.ObjectPool;
-import io.questdb.std.QuietCloseable;
-import io.questdb.std.Unsafe;
-import io.questdb.std.Utf8SequenceObjHashMap;
-import io.questdb.std.Vect;
+import io.questdb.std.*;
 import io.questdb.std.datetime.microtime.MicrosFormatUtils;
-import io.questdb.std.str.DirectUtf8Sequence;
-import io.questdb.std.str.DirectUtf8Sink;
-import io.questdb.std.str.DirectUtf8String;
-import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8String;
-import io.questdb.std.str.Utf8s;
+import io.questdb.std.str.*;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -50,7 +35,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Comparator;
 
-import static io.questdb.cutlass.http.HttpConstants.*;
+import static io.questdb.cutlass.http.HttpConstants.HEADER_CONTENT_LENGTH;
 
 public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHeader {
     private static final Comparator<HttpCookie> COOKIE_COMPARATOR = HttpHeaderParser::cookieComparator;
@@ -96,6 +81,61 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
         clear();
     }
 
+    private static int cookieComparator(HttpCookie o1, HttpCookie o2) {
+        int pathLen1 = o1.path == null ? 0 : o1.path.size();
+        int pathLen2 = o2.path == null ? 0 : o2.path.size();
+        int diff = pathLen2 - pathLen1;
+        return diff != 0 ? diff : Long.compare(o2.expires, o1.expires);
+    }
+
+    private static long cookieSkipBytes(long p, long hi) {
+        while (p < hi && Unsafe.getUnsafe().getByte(p) != ';') {
+            p++;
+        }
+        return p;
+    }
+
+    private static boolean isEquals(long p) {
+        return Unsafe.getUnsafe().getByte(p) == '=';
+    }
+
+    private static int lowercaseByte(long p) {
+        return Unsafe.getUnsafe().getByte(p) | 0x20;
+    }
+
+    private static int swarLowercaseInt(long p) {
+        return Unsafe.getUnsafe().getInt(p) | 0x20202020;
+    }
+
+    private static long swarLowercaseLong(long p) {
+        return Unsafe.getUnsafe().getLong(p) | 0x2020202020202020L;
+    }
+
+    private static int swarLowercaseShort(long p) {
+        return Unsafe.getUnsafe().getShort(p) | 0x2020;
+    }
+
+    private static DirectUtf8String unquote(CharSequence key, DirectUtf8String that) {
+        int len = that.size();
+        if (len == 0) {
+            throw HttpException.instance("missing value [key=").put(key).put(']');
+        }
+
+        if (that.byteAt(0) == '"') {
+            if (that.byteAt(len - 1) == '"') {
+                return that.of(that.lo() + 1, that.hi() - 1);
+            } else {
+                throw HttpException.instance("unclosed quote [key=").put(key).put(']');
+            }
+        } else {
+            return that;
+        }
+    }
+
+    public DirectUtf8Sequence getUrlParam(Utf8Sequence name) {
+        return urlParams.get(name);
+    }
+
     @Override
     public void clear() {
         this.needMethod = true;
@@ -124,6 +164,10 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
         // this.pool.clear();
     }
 
+    public @NotNull ObjList<HttpCookie> getCookieList() {
+        return cookieList;
+    }
+
     @Override
     public void close() {
         clear();
@@ -133,6 +177,10 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
         }
         sink.close();
         csPool.clear();
+    }
+
+    public @Nullable DirectUtf8String getQuery() {
+        return query;
     }
 
     @Override
@@ -157,6 +205,14 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
 
     public DirectUtf8Sequence getStatusCode() {
         return statusCode;
+    }
+
+    public HttpCookie getCookie(Utf8Sequence cookieName) {
+        return cookies.get(cookieName);
+    }
+
+    public DirectUtf8String getUrl() {
+        return url;
     }
 
     public boolean isIncomplete() {
@@ -214,57 +270,6 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
             }
         }
         return p;
-    }
-
-    private static int cookieComparator(HttpCookie o1, HttpCookie o2) {
-        int pathLen1 = o1.path == null ? 0 : o1.path.size();
-        int pathLen2 = o2.path == null ? 0 : o2.path.size();
-        int diff = pathLen2 - pathLen1;
-        return diff != 0 ? diff : Long.compare(o2.expires, o1.expires);
-    }
-
-    private static long cookieSkipBytes(long p, long hi) {
-        while (p < hi && Unsafe.getUnsafe().getByte(p) != ';') {
-            p++;
-        }
-        return p;
-    }
-
-    private static boolean isEquals(long p) {
-        return Unsafe.getUnsafe().getByte(p) == '=';
-    }
-
-    private static int lowercaseByte(long p) {
-        return Unsafe.getUnsafe().getByte(p) | 0x20;
-    }
-
-    private static int swarLowercaseInt(long p) {
-        return Unsafe.getUnsafe().getInt(p) | 0x20202020;
-    }
-
-    private static long swarLowercaseLong(long p) {
-        return Unsafe.getUnsafe().getLong(p) | 0x2020202020202020L;
-    }
-
-    private static int swarLowercaseShort(long p) {
-        return Unsafe.getUnsafe().getShort(p) | 0x2020;
-    }
-
-    private static DirectUtf8String unquote(CharSequence key, DirectUtf8String that) {
-        int len = that.size();
-        if (len == 0) {
-            throw HttpException.instance("missing value [key=").put(key).put(']');
-        }
-
-        if (that.byteAt(0) == '"') {
-            if (that.byteAt(len - 1) == '"') {
-                return that.of(that.lo() + 1, that.hi() - 1);
-            } else {
-                throw HttpException.instance("unclosed quote [key=").put(key).put(']');
-            }
-        } else {
-            return that;
-        }
     }
 
     private long cookieLogUnknownAttributeError(long p, long lo, long hi) {

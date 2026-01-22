@@ -25,7 +25,6 @@
 package io.questdb.std;
 
 import io.questdb.std.ex.FatalError;
-
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -33,7 +32,6 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-
 import java.net.URL;
 import java.nio.file.Paths;
 import java.security.CodeSource;
@@ -50,6 +48,65 @@ public final class Os {
     public static final String archName;
     public static final String name;
     public static final int type;
+
+    static {
+        if ("aarch64".equals(System.getProperty("os.arch"))) {
+            arch = ARCH_AARCH64;
+            archName = "aarch64";
+        } else {
+            arch = ARCH_X86_64;
+            archName = "x86-64";
+        }
+
+        if ("64".equals(System.getProperty("sun.arch.data.model"))) {
+            String osName = System.getProperty("os.name");
+            String outputLibExt;
+
+            if (osName.contains("Linux")) {
+                name = "linux";
+                outputLibExt = ".so";
+                type = LINUX;
+            } else if (osName.contains("Mac")) {
+                name = "darwin";
+                outputLibExt = ".dylib";
+                type = DARWIN;
+            } else if (osName.contains("Windows")) {
+                name = "windows";
+                outputLibExt = ".dll";
+                type = WINDOWS;
+            } else if (osName.contains("FreeBSD")) {
+                name = "freebsd";
+                outputLibExt = ".so";
+                type = FREEBSD; // darwin is based on FreeBSD, so things that work for OSX will probably work
+                // for FreeBSD
+            } else {
+                throw new Error("Unsupported OS: " + osName);
+            }
+
+            String prdLibRoot = "/io/questdb/bin/" + name + '-' + archName + '/';
+            String devCXXLibRoot = "/io/questdb/bin-local/";
+            String cxxLibName = "libquestdb" + outputLibExt;
+            String devCXXLib = devCXXLibRoot + cxxLibName;
+
+
+            // questdb distribution can override libs dir
+            boolean loaded = tryLoadFromDistribution(cxxLibName);
+            if (!loaded) {
+                // not a binary distribution, let's try to load libraries from the jar
+                // try dev CXX lib first
+                InputStream libCXXStream = Os.class.getResourceAsStream(devCXXLib);
+                if (libCXXStream == null) {
+                    loadLib(prdLibRoot + cxxLibName);
+                } else {
+                    System.err.println("Loading DEV CXX library: " + devCXXLib);
+                    loadLib(devCXXLib, libCXXStream);
+                }
+            }
+        } else {
+            type = _32Bit;
+            name = System.getProperty("os.name");
+        }
+    }
 
     private Os() {
     }
@@ -176,7 +233,7 @@ public final class Os {
         return libDir.toString();
     }
 
-    private static boolean tryLoadFromDistribution(String cxxLibName, String rustLibName) {
+    private static boolean tryLoadFromDistribution(String cxxLibName) {
         String libsDir = getNativeLibsDir(cxxLibName);
         if (libsDir == null) {
             return false;
@@ -185,7 +242,6 @@ public final class Os {
         try {
             // we are in a binary distribution, let's load libraries from the libs dir
             System.load(Paths.get(libsDir, cxxLibName).toAbsolutePath().toString());
-            System.load(Paths.get(libsDir, rustLibName).toAbsolutePath().toString());
         } catch (Throwable e) {
             // if we fail to load distribution libraries, we will try to load them from the
             // jar
@@ -193,80 +249,5 @@ public final class Os {
             return false;
         }
         return true;
-    }
-
-    static {
-        if ("aarch64".equals(System.getProperty("os.arch"))) {
-            arch = ARCH_AARCH64;
-            archName = "aarch64";
-        } else {
-            arch = ARCH_X86_64;
-            archName = "x86-64";
-        }
-
-        if ("64".equals(System.getProperty("sun.arch.data.model"))) {
-            String osName = System.getProperty("os.name");
-            String outputLibExt;
-
-            if (osName.contains("Linux")) {
-                name = "linux";
-                outputLibExt = ".so";
-                type = LINUX;
-            } else if (osName.contains("Mac")) {
-                name = "darwin";
-                outputLibExt = ".dylib";
-                type = DARWIN;
-            } else if (osName.contains("Windows")) {
-                name = "windows";
-                outputLibExt = ".dll";
-                type = WINDOWS;
-            } else if (osName.contains("FreeBSD")) {
-                name = "freebsd";
-                outputLibExt = ".so";
-                type = FREEBSD; // darwin is based on FreeBSD, so things that work for OSX will probably work
-                                // for FreeBSD
-            } else {
-                throw new Error("Unsupported OS: " + osName);
-            }
-
-            String prdLibRoot = "/io/questdb/bin/" + name + '-' + archName + '/';
-            String devCXXLibRoot = "/io/questdb/bin-local/";
-            String cxxLibName = "libquestdb" + outputLibExt;
-            String devCXXLib = devCXXLibRoot + cxxLibName;
-
-            // The Rust library file is missing "lib" prefix on Windows
-            String devRustLibRoot = "/io/questdb/rust/";
-            final String rustLibName;
-            if (type == WINDOWS) {
-                rustLibName = "questdbr" + outputLibExt;
-            } else {
-                rustLibName = "libquestdbr" + outputLibExt;
-            }
-
-            // questdb distribution can override libs dir
-            boolean loaded = tryLoadFromDistribution(cxxLibName, rustLibName);
-            if (!loaded) {
-                // not a binary distribution, let's try to load libraries from the jar
-                // try dev CXX lib first
-                InputStream libCXXStream = Os.class.getResourceAsStream(devCXXLib);
-                if (libCXXStream == null) {
-                    loadLib(prdLibRoot + cxxLibName);
-                } else {
-                    System.err.println("Loading DEV CXX library: " + devCXXLib);
-                    loadLib(devCXXLib, libCXXStream);
-                }
-
-                final String devRustLib = devRustLibRoot + rustLibName;
-                InputStream libRustStream = Os.class.getResourceAsStream(devRustLib);
-                if (libRustStream == null) {
-                    loadLib(prdLibRoot + rustLibName);
-                } else {
-                    loadLib(devRustLib, libRustStream);
-                }
-            }
-        } else {
-            type = _32Bit;
-            name = System.getProperty("os.name");
-        }
     }
 }

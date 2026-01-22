@@ -24,13 +24,7 @@
 
 package io.questdb.cutlass.json;
 
-import io.questdb.std.IntHashSet;
-import io.questdb.std.IntStack;
-import io.questdb.std.MemoryTag;
-import io.questdb.std.Mutable;
-import io.questdb.std.Numbers;
-import io.questdb.std.Unsafe;
-import io.questdb.std.Vect;
+import io.questdb.std.*;
 import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf8s;
 
@@ -51,6 +45,19 @@ public class JsonLexer implements Mutable, Closeable {
     private static final int S_EXPECT_VALUE = 2;
     private static final int S_START = 0;
     private static final IntHashSet unquotedTerminators = new IntHashSet(256);
+
+    static {
+        unquotedTerminators.add(' ');
+        unquotedTerminators.add('\t');
+        unquotedTerminators.add('\n');
+        unquotedTerminators.add('\r');
+        unquotedTerminators.add(',');
+        unquotedTerminators.add('}');
+        unquotedTerminators.add(']');
+        unquotedTerminators.add('{');
+        unquotedTerminators.add('[');
+    }
+
     private final IntStack arrayDepthStack = new IntStack(64);
     private final int cacheSizeLimit;
     private final IntStack objDepthStack = new IntStack(64);
@@ -76,6 +83,14 @@ public class JsonLexer implements Mutable, Closeable {
         }
     }
 
+    private static boolean isNotATerminator(char c) {
+        return unquotedTerminators.excludes(c);
+    }
+
+    private static JsonException unsupportedEncoding(int position) {
+        return JsonException.$(position, "Unsupported encoding");
+    }
+
     @Override
     public void clear() {
         objDepthStack.clear();
@@ -95,6 +110,20 @@ public class JsonLexer implements Mutable, Closeable {
         if (cacheCapacity > 0 && cache != 0) {
             Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_TEXT_PARSER_RSS);
             cache = 0;
+        }
+    }
+
+    public void parseLast() throws JsonException {
+        if (cacheSize > 0) {
+            throw JsonException.$(position, "Unterminated string");
+        }
+
+        if (arrayDepth > 0) {
+            throw JsonException.$(position, "Unterminated array");
+        }
+
+        if (objDepth > 0 || arrayDepthStack.size() > 0 || objDepthStack.size() > 0) {
+            throw JsonException.$(position, "Unterminated object");
         }
     }
 
@@ -268,14 +297,6 @@ public class JsonLexer implements Mutable, Closeable {
         this.useCache = useCache;
     }
 
-    private static boolean isNotATerminator(char c) {
-        return unquotedTerminators.excludes(c);
-    }
-
-    private static JsonException unsupportedEncoding(int position) {
-        return JsonException.$(position, "Unsupported encoding");
-    }
-
     private void addToStash(long lo, long hi) throws JsonException {
         if (cacheSizeLimit < 1) {
             throw JsonException.$(position, "JSON lexer cache is disabled");
@@ -372,17 +393,5 @@ public class JsonLexer implements Mutable, Closeable {
                 ++p;
             }
         }
-    }
-
-    static {
-        unquotedTerminators.add(' ');
-        unquotedTerminators.add('\t');
-        unquotedTerminators.add('\n');
-        unquotedTerminators.add('\r');
-        unquotedTerminators.add(',');
-        unquotedTerminators.add('}');
-        unquotedTerminators.add(']');
-        unquotedTerminators.add('{');
-        unquotedTerminators.add('[');
     }
 }

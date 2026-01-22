@@ -24,18 +24,11 @@
 
 package io.questdb.std;
 
-import io.questdb.cairo.MicrosTimestampDriver;
-import io.questdb.cairo.NanosTimestampDriver;
-import io.questdb.cairo.TimestampDriver;
-import io.questdb.std.datetime.millitime.Dates;
 import io.questdb.std.fastdouble.FastDoubleParser;
 import io.questdb.std.fastdouble.FastFloatParser;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8s;
 import jdk.internal.math.FDBigInteger;
-import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
 
@@ -67,7 +60,257 @@ public final class Numbers {
     private static final LongHexAppender[] longHexAppenderPad64 = new LongHexAppender[Long.SIZE + 1];
     private final static ThreadLocal<char[]> tlDoubleDigitsBuffer = new ThreadLocal<>(() -> new char[21]);
 
+    static {
+        Module currentModule = Numbers.class.getModule();
+        Unsafe.addExports(Unsafe.JAVA_BASE_MODULE, currentModule, "jdk.internal.math");
+    }
+
+    static {
+        pow10 = new long[20];
+        pow10max = 18;
+        pow10[0] = 1;
+        for (int i = 1; i < pow10.length; i++) {
+            pow10[i] = pow10[i - 1] * 10;
+        }
+
+        hexNumbers = new int[128];
+        Arrays.fill(hexNumbers, -1);
+        hexNumbers['0'] = 0;
+        hexNumbers['1'] = 1;
+        hexNumbers['2'] = 2;
+        hexNumbers['3'] = 3;
+        hexNumbers['4'] = 4;
+        hexNumbers['5'] = 5;
+        hexNumbers['6'] = 6;
+        hexNumbers['7'] = 7;
+        hexNumbers['8'] = 8;
+        hexNumbers['9'] = 9;
+        hexNumbers['A'] = 10;
+        hexNumbers['a'] = 10;
+        hexNumbers['B'] = 11;
+        hexNumbers['b'] = 11;
+        hexNumbers['C'] = 12;
+        hexNumbers['c'] = 12;
+        hexNumbers['D'] = 13;
+        hexNumbers['d'] = 13;
+        hexNumbers['E'] = 14;
+        hexNumbers['e'] = 14;
+        hexNumbers['F'] = 15;
+        hexNumbers['f'] = 15;
+    }
+
+    static {
+        final LongHexAppender a4 = Numbers::appendLongHex4;
+        longHexAppender[0] = a4;
+        longHexAppender[1] = a4;
+        longHexAppender[2] = a4;
+        longHexAppender[3] = a4;
+        longHexAppender[4] = a4;
+
+        final LongHexAppender a8 = Numbers::appendLongHex8;
+        longHexAppender[5] = a8;
+        longHexAppender[6] = a8;
+        longHexAppender[7] = a8;
+        longHexAppender[8] = a8;
+
+        LongHexAppender a12 = Numbers::appendLongHex12;
+        longHexAppender[9] = a12;
+        longHexAppender[10] = a12;
+        longHexAppender[11] = a12;
+        longHexAppender[12] = a12;
+
+        LongHexAppender a16 = Numbers::appendLongHex16;
+        longHexAppender[13] = a16;
+        longHexAppender[14] = a16;
+        longHexAppender[15] = a16;
+        longHexAppender[16] = a16;
+
+        LongHexAppender a20 = Numbers::appendLongHex20;
+        longHexAppender[17] = a20;
+        longHexAppender[18] = a20;
+        longHexAppender[19] = a20;
+        longHexAppender[20] = a20;
+
+        LongHexAppender a24 = Numbers::appendLongHex24;
+        longHexAppender[21] = a24;
+        longHexAppender[22] = a24;
+        longHexAppender[23] = a24;
+        longHexAppender[24] = a24;
+
+        LongHexAppender a28 = Numbers::appendLongHex28;
+        longHexAppender[25] = a28;
+        longHexAppender[26] = a28;
+        longHexAppender[27] = a28;
+        longHexAppender[28] = a28;
+
+        LongHexAppender a32 = Numbers::appendLongHex32;
+        longHexAppender[29] = a32;
+        longHexAppender[30] = a32;
+        longHexAppender[31] = a32;
+        longHexAppender[32] = a32;
+
+        LongHexAppender a36 = Numbers::appendLongHex36;
+        longHexAppender[33] = a36;
+        longHexAppender[34] = a36;
+        longHexAppender[35] = a36;
+        longHexAppender[36] = a36;
+
+        LongHexAppender a40 = Numbers::appendLongHex40;
+        longHexAppender[37] = a40;
+        longHexAppender[38] = a40;
+        longHexAppender[39] = a40;
+        longHexAppender[40] = a40;
+
+        LongHexAppender a44 = Numbers::appendLongHex44;
+        longHexAppender[41] = a44;
+        longHexAppender[42] = a44;
+        longHexAppender[43] = a44;
+        longHexAppender[44] = a44;
+
+        LongHexAppender a48 = Numbers::appendLongHex48;
+        longHexAppender[45] = a48;
+        longHexAppender[46] = a48;
+        longHexAppender[47] = a48;
+        longHexAppender[48] = a48;
+
+        LongHexAppender a52 = Numbers::appendLongHex52;
+        longHexAppender[49] = a52;
+        longHexAppender[50] = a52;
+        longHexAppender[51] = a52;
+        longHexAppender[52] = a52;
+
+        LongHexAppender a56 = Numbers::appendLongHex56;
+        longHexAppender[53] = a56;
+        longHexAppender[54] = a56;
+        longHexAppender[55] = a56;
+        longHexAppender[56] = a56;
+
+        LongHexAppender a60 = Numbers::appendLongHex60;
+        longHexAppender[57] = a60;
+        longHexAppender[58] = a60;
+        longHexAppender[59] = a60;
+        longHexAppender[60] = a60;
+
+        LongHexAppender a64 = Numbers::appendLongHex64;
+        longHexAppender[61] = a64;
+        longHexAppender[62] = a64;
+        longHexAppender[63] = a64;
+        longHexAppender[64] = a64;
+    }
+
+    static {
+        final LongHexAppender a4 = Numbers::appendLongHex4Pad64;
+        longHexAppenderPad64[0] = a4;
+        longHexAppenderPad64[1] = a4;
+        longHexAppenderPad64[2] = a4;
+        longHexAppenderPad64[3] = a4;
+        longHexAppenderPad64[4] = a4;
+
+        final LongHexAppender a8 = Numbers::appendLongHex8Pad64;
+        longHexAppenderPad64[5] = a8;
+        longHexAppenderPad64[6] = a8;
+        longHexAppenderPad64[7] = a8;
+        longHexAppenderPad64[8] = a8;
+
+        LongHexAppender a12 = Numbers::appendLongHex12Pad64;
+        longHexAppenderPad64[9] = a12;
+        longHexAppenderPad64[10] = a12;
+        longHexAppenderPad64[11] = a12;
+        longHexAppenderPad64[12] = a12;
+
+        LongHexAppender a16 = Numbers::appendLongHex16Pad64;
+        longHexAppenderPad64[13] = a16;
+        longHexAppenderPad64[14] = a16;
+        longHexAppenderPad64[15] = a16;
+        longHexAppenderPad64[16] = a16;
+
+        LongHexAppender a20 = Numbers::appendLongHex20Pad64;
+        longHexAppenderPad64[17] = a20;
+        longHexAppenderPad64[18] = a20;
+        longHexAppenderPad64[19] = a20;
+        longHexAppenderPad64[20] = a20;
+
+        LongHexAppender a24 = Numbers::appendLongHex24Pad64;
+        longHexAppenderPad64[21] = a24;
+        longHexAppenderPad64[22] = a24;
+        longHexAppenderPad64[23] = a24;
+        longHexAppenderPad64[24] = a24;
+
+        LongHexAppender a28 = Numbers::appendLongHex28Pad64;
+        longHexAppenderPad64[25] = a28;
+        longHexAppenderPad64[26] = a28;
+        longHexAppenderPad64[27] = a28;
+        longHexAppenderPad64[28] = a28;
+
+        LongHexAppender a32 = Numbers::appendLongHex32Pad64;
+        longHexAppenderPad64[29] = a32;
+        longHexAppenderPad64[30] = a32;
+        longHexAppenderPad64[31] = a32;
+        longHexAppenderPad64[32] = a32;
+
+        LongHexAppender a36 = Numbers::appendLongHex36Pad64;
+        longHexAppenderPad64[33] = a36;
+        longHexAppenderPad64[34] = a36;
+        longHexAppenderPad64[35] = a36;
+        longHexAppenderPad64[36] = a36;
+
+        LongHexAppender a40 = Numbers::appendLongHex40Pad64;
+        longHexAppenderPad64[37] = a40;
+        longHexAppenderPad64[38] = a40;
+        longHexAppenderPad64[39] = a40;
+        longHexAppenderPad64[40] = a40;
+
+        LongHexAppender a44 = Numbers::appendLongHex44Pad64;
+        longHexAppenderPad64[41] = a44;
+        longHexAppenderPad64[42] = a44;
+        longHexAppenderPad64[43] = a44;
+        longHexAppenderPad64[44] = a44;
+
+        LongHexAppender a48 = Numbers::appendLongHex48Pad64;
+        longHexAppenderPad64[45] = a48;
+        longHexAppenderPad64[46] = a48;
+        longHexAppenderPad64[47] = a48;
+        longHexAppenderPad64[48] = a48;
+
+        LongHexAppender a52 = Numbers::appendLongHex52Pad64;
+        longHexAppenderPad64[49] = a52;
+        longHexAppenderPad64[50] = a52;
+        longHexAppenderPad64[51] = a52;
+        longHexAppenderPad64[52] = a52;
+
+        LongHexAppender a56 = Numbers::appendLongHex56Pad64;
+        longHexAppenderPad64[53] = a56;
+        longHexAppenderPad64[54] = a56;
+        longHexAppenderPad64[55] = a56;
+        longHexAppenderPad64[56] = a56;
+
+        LongHexAppender a60 = Numbers::appendLongHex60;
+        longHexAppenderPad64[57] = a60;
+        longHexAppenderPad64[58] = a60;
+        longHexAppenderPad64[59] = a60;
+        longHexAppenderPad64[60] = a60;
+
+        LongHexAppender a64 = Numbers::appendLongHex64;
+        longHexAppenderPad64[61] = a64;
+        longHexAppenderPad64[62] = a64;
+        longHexAppenderPad64[63] = a64;
+        longHexAppenderPad64[64] = a64;
+    }
+
     private Numbers() {
+    }
+
+    public static long spreadBits(long v) {
+        v = (v | (v << 16)) & 0X0000FFFF0000FFFFL;
+        v = (v | (v << 8)) & 0X00FF00FF00FF00FFL;
+        v = (v | (v << 4)) & 0X0F0F0F0F0F0F0F0FL;
+        v = (v | (v << 2)) & 0x3333333333333333L;
+        v = (v | (v << 1)) & 0x5555555555555555L;
+        return v;
+    }
+
+    public static long interleaveBits(long x, long y) {
+        return spreadBits(x) | (spreadBits(y) << 1);
     }
 
     public static void append(CharSink<?> sink, final float value, int scale) {
@@ -1727,242 +1970,5 @@ public final class Numbers {
     @FunctionalInterface
     private interface LongHexAppender {
         void append(CharSink<?> sink, long value);
-    }
-
-    static {
-        Module currentModule = Numbers.class.getModule();
-        Unsafe.addExports(Unsafe.JAVA_BASE_MODULE, currentModule, "jdk.internal.math");
-    }
-
-    static {
-        pow10 = new long[20];
-        pow10max = 18;
-        pow10[0] = 1;
-        for (int i = 1; i < pow10.length; i++) {
-            pow10[i] = pow10[i - 1] * 10;
-        }
-
-        hexNumbers = new int[128];
-        Arrays.fill(hexNumbers, -1);
-        hexNumbers['0'] = 0;
-        hexNumbers['1'] = 1;
-        hexNumbers['2'] = 2;
-        hexNumbers['3'] = 3;
-        hexNumbers['4'] = 4;
-        hexNumbers['5'] = 5;
-        hexNumbers['6'] = 6;
-        hexNumbers['7'] = 7;
-        hexNumbers['8'] = 8;
-        hexNumbers['9'] = 9;
-        hexNumbers['A'] = 10;
-        hexNumbers['a'] = 10;
-        hexNumbers['B'] = 11;
-        hexNumbers['b'] = 11;
-        hexNumbers['C'] = 12;
-        hexNumbers['c'] = 12;
-        hexNumbers['D'] = 13;
-        hexNumbers['d'] = 13;
-        hexNumbers['E'] = 14;
-        hexNumbers['e'] = 14;
-        hexNumbers['F'] = 15;
-        hexNumbers['f'] = 15;
-    }
-
-    static {
-        final LongHexAppender a4 = Numbers::appendLongHex4;
-        longHexAppender[0] = a4;
-        longHexAppender[1] = a4;
-        longHexAppender[2] = a4;
-        longHexAppender[3] = a4;
-        longHexAppender[4] = a4;
-
-        final LongHexAppender a8 = Numbers::appendLongHex8;
-        longHexAppender[5] = a8;
-        longHexAppender[6] = a8;
-        longHexAppender[7] = a8;
-        longHexAppender[8] = a8;
-
-        LongHexAppender a12 = Numbers::appendLongHex12;
-        longHexAppender[9] = a12;
-        longHexAppender[10] = a12;
-        longHexAppender[11] = a12;
-        longHexAppender[12] = a12;
-
-        LongHexAppender a16 = Numbers::appendLongHex16;
-        longHexAppender[13] = a16;
-        longHexAppender[14] = a16;
-        longHexAppender[15] = a16;
-        longHexAppender[16] = a16;
-
-        LongHexAppender a20 = Numbers::appendLongHex20;
-        longHexAppender[17] = a20;
-        longHexAppender[18] = a20;
-        longHexAppender[19] = a20;
-        longHexAppender[20] = a20;
-
-        LongHexAppender a24 = Numbers::appendLongHex24;
-        longHexAppender[21] = a24;
-        longHexAppender[22] = a24;
-        longHexAppender[23] = a24;
-        longHexAppender[24] = a24;
-
-        LongHexAppender a28 = Numbers::appendLongHex28;
-        longHexAppender[25] = a28;
-        longHexAppender[26] = a28;
-        longHexAppender[27] = a28;
-        longHexAppender[28] = a28;
-
-        LongHexAppender a32 = Numbers::appendLongHex32;
-        longHexAppender[29] = a32;
-        longHexAppender[30] = a32;
-        longHexAppender[31] = a32;
-        longHexAppender[32] = a32;
-
-        LongHexAppender a36 = Numbers::appendLongHex36;
-        longHexAppender[33] = a36;
-        longHexAppender[34] = a36;
-        longHexAppender[35] = a36;
-        longHexAppender[36] = a36;
-
-        LongHexAppender a40 = Numbers::appendLongHex40;
-        longHexAppender[37] = a40;
-        longHexAppender[38] = a40;
-        longHexAppender[39] = a40;
-        longHexAppender[40] = a40;
-
-        LongHexAppender a44 = Numbers::appendLongHex44;
-        longHexAppender[41] = a44;
-        longHexAppender[42] = a44;
-        longHexAppender[43] = a44;
-        longHexAppender[44] = a44;
-
-        LongHexAppender a48 = Numbers::appendLongHex48;
-        longHexAppender[45] = a48;
-        longHexAppender[46] = a48;
-        longHexAppender[47] = a48;
-        longHexAppender[48] = a48;
-
-        LongHexAppender a52 = Numbers::appendLongHex52;
-        longHexAppender[49] = a52;
-        longHexAppender[50] = a52;
-        longHexAppender[51] = a52;
-        longHexAppender[52] = a52;
-
-        LongHexAppender a56 = Numbers::appendLongHex56;
-        longHexAppender[53] = a56;
-        longHexAppender[54] = a56;
-        longHexAppender[55] = a56;
-        longHexAppender[56] = a56;
-
-        LongHexAppender a60 = Numbers::appendLongHex60;
-        longHexAppender[57] = a60;
-        longHexAppender[58] = a60;
-        longHexAppender[59] = a60;
-        longHexAppender[60] = a60;
-
-        LongHexAppender a64 = Numbers::appendLongHex64;
-        longHexAppender[61] = a64;
-        longHexAppender[62] = a64;
-        longHexAppender[63] = a64;
-        longHexAppender[64] = a64;
-    }
-
-    static {
-        final LongHexAppender a4 = Numbers::appendLongHex4Pad64;
-        longHexAppenderPad64[0] = a4;
-        longHexAppenderPad64[1] = a4;
-        longHexAppenderPad64[2] = a4;
-        longHexAppenderPad64[3] = a4;
-        longHexAppenderPad64[4] = a4;
-
-        final LongHexAppender a8 = Numbers::appendLongHex8Pad64;
-        longHexAppenderPad64[5] = a8;
-        longHexAppenderPad64[6] = a8;
-        longHexAppenderPad64[7] = a8;
-        longHexAppenderPad64[8] = a8;
-
-        LongHexAppender a12 = Numbers::appendLongHex12Pad64;
-        longHexAppenderPad64[9] = a12;
-        longHexAppenderPad64[10] = a12;
-        longHexAppenderPad64[11] = a12;
-        longHexAppenderPad64[12] = a12;
-
-        LongHexAppender a16 = Numbers::appendLongHex16Pad64;
-        longHexAppenderPad64[13] = a16;
-        longHexAppenderPad64[14] = a16;
-        longHexAppenderPad64[15] = a16;
-        longHexAppenderPad64[16] = a16;
-
-        LongHexAppender a20 = Numbers::appendLongHex20Pad64;
-        longHexAppenderPad64[17] = a20;
-        longHexAppenderPad64[18] = a20;
-        longHexAppenderPad64[19] = a20;
-        longHexAppenderPad64[20] = a20;
-
-        LongHexAppender a24 = Numbers::appendLongHex24Pad64;
-        longHexAppenderPad64[21] = a24;
-        longHexAppenderPad64[22] = a24;
-        longHexAppenderPad64[23] = a24;
-        longHexAppenderPad64[24] = a24;
-
-        LongHexAppender a28 = Numbers::appendLongHex28Pad64;
-        longHexAppenderPad64[25] = a28;
-        longHexAppenderPad64[26] = a28;
-        longHexAppenderPad64[27] = a28;
-        longHexAppenderPad64[28] = a28;
-
-        LongHexAppender a32 = Numbers::appendLongHex32Pad64;
-        longHexAppenderPad64[29] = a32;
-        longHexAppenderPad64[30] = a32;
-        longHexAppenderPad64[31] = a32;
-        longHexAppenderPad64[32] = a32;
-
-        LongHexAppender a36 = Numbers::appendLongHex36Pad64;
-        longHexAppenderPad64[33] = a36;
-        longHexAppenderPad64[34] = a36;
-        longHexAppenderPad64[35] = a36;
-        longHexAppenderPad64[36] = a36;
-
-        LongHexAppender a40 = Numbers::appendLongHex40Pad64;
-        longHexAppenderPad64[37] = a40;
-        longHexAppenderPad64[38] = a40;
-        longHexAppenderPad64[39] = a40;
-        longHexAppenderPad64[40] = a40;
-
-        LongHexAppender a44 = Numbers::appendLongHex44Pad64;
-        longHexAppenderPad64[41] = a44;
-        longHexAppenderPad64[42] = a44;
-        longHexAppenderPad64[43] = a44;
-        longHexAppenderPad64[44] = a44;
-
-        LongHexAppender a48 = Numbers::appendLongHex48Pad64;
-        longHexAppenderPad64[45] = a48;
-        longHexAppenderPad64[46] = a48;
-        longHexAppenderPad64[47] = a48;
-        longHexAppenderPad64[48] = a48;
-
-        LongHexAppender a52 = Numbers::appendLongHex52Pad64;
-        longHexAppenderPad64[49] = a52;
-        longHexAppenderPad64[50] = a52;
-        longHexAppenderPad64[51] = a52;
-        longHexAppenderPad64[52] = a52;
-
-        LongHexAppender a56 = Numbers::appendLongHex56Pad64;
-        longHexAppenderPad64[53] = a56;
-        longHexAppenderPad64[54] = a56;
-        longHexAppenderPad64[55] = a56;
-        longHexAppenderPad64[56] = a56;
-
-        LongHexAppender a60 = Numbers::appendLongHex60;
-        longHexAppenderPad64[57] = a60;
-        longHexAppenderPad64[58] = a60;
-        longHexAppenderPad64[59] = a60;
-        longHexAppenderPad64[60] = a60;
-
-        LongHexAppender a64 = Numbers::appendLongHex64;
-        longHexAppenderPad64[61] = a64;
-        longHexAppenderPad64[62] = a64;
-        longHexAppenderPad64[63] = a64;
-        longHexAppenderPad64[64] = a64;
     }
 }

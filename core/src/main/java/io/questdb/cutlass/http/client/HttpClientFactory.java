@@ -25,7 +25,7 @@
 package io.questdb.cutlass.http.client;
 
 import io.questdb.ClientTlsConfiguration;
-
+import io.questdb.DefaultHttpClientConfiguration;
 import io.questdb.HttpClientConfiguration;
 import io.questdb.network.JavaTlsClientSocketFactory;
 import io.questdb.network.PlainSocketFactory;
@@ -46,6 +46,10 @@ public class HttpClientFactory {
             default:
                 throw new UnsupportedOperationException();
         }
+    }
+
+    public static HttpClient newPlainTextInstance() {
+        return newPlainTextInstance(DefaultHttpClientConfiguration.INSTANCE);
     }
 
     public static HttpClient newPlainTextInstance(HttpClientConfiguration configuration) {

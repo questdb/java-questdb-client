@@ -22,10 +22,20 @@
  *
  ******************************************************************************/
 
-package io.questdb.std.str;
+package io.questdb.test.std.fastdouble;
 
-/**
- * NULL-terminated UTF-8 sequence.
- */
-public interface LPSZ extends DirectUtf8Sequence {
+import io.questdb.std.NumericException;
+import io.questdb.std.fastdouble.FastFloatParser;
+
+public class FastFloatParserFromCharSequenceHandPickedTest extends AbstractFloatHandPickedTest {
+
+    @Override
+    float parse(CharSequence str, boolean rejectOverflow) throws NumericException {
+        return FastFloatParser.parseFloat(str, rejectOverflow);
+    }
+
+    @Override
+    protected float parse(String str, int offset, int length, boolean rejectOverflow) throws NumericException {
+        return FastFloatParser.parseFloat(str, offset, length, rejectOverflow);
+    }
 }

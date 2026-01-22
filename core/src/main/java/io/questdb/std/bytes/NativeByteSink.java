@@ -33,5 +33,5 @@ import io.questdb.std.QuietCloseable;
  * update its memory bookkeeping. The underlying memory is not released.
  */
 public interface NativeByteSink extends QuietCloseable {
-
+    long ptr();
 }

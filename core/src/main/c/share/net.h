@@ -150,6 +150,38 @@ JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_getMsgHeaderBufferLengthOffs
 JNIEXPORT jint JNICALL Java_io_questdb_network_Net_getEwouldblock
         (JNIEnv *, jclass);
 
+/*
+ * Class:     com_questdb_network_Net
+ * Method:    socketUdp
+ * Signature: ()I
+ */
+JNIEXPORT jint JNICALL Java_io_questdb_network_Net_socketUdp
+        (JNIEnv *, jclass);
+
+/*
+ * Class:     com_questdb_network_Net
+ * Method:    setMulticastInterface
+ * Signature: (II)I
+ */
+JNIEXPORT jint JNICALL Java_io_questdb_network_Net_setMulticastInterface
+        (JNIEnv *, jclass, jint, jint);
+
+/*
+ * Class:     com_questdb_network_Net
+ * Method:    setMulticastTtl
+ * Signature: (II)I
+ */
+JNIEXPORT jint JNICALL Java_io_questdb_network_Net_setMulticastTtl
+        (JNIEnv *, jclass, jint, jint);
+
+/*
+ * Class:     com_questdb_network_Net
+ * Method:    sendTo
+ * Signature: (IJIJ)I
+ */
+JNIEXPORT jint JNICALL Java_io_questdb_network_Net_sendTo
+        (JNIEnv *, jclass, jint, jlong, jint, jlong);
+
 #ifdef __cplusplus
 }
 #endif

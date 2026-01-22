@@ -29,7 +29,7 @@ import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
 import io.questdb.std.datetime.DateFormat;
 import io.questdb.std.datetime.DateLocale;
-
+import io.questdb.std.datetime.DateLocaleFactory;
 import io.questdb.std.str.CharSink;
 import org.jetbrains.annotations.NotNull;
 
@@ -37,9 +37,25 @@ import static io.questdb.std.datetime.CommonUtils.*;
 import static io.questdb.std.datetime.TimeZoneRuleFactory.RESOLUTION_MILLIS;
 
 public class DateFormatUtils {
+    public static final DateFormat UTC_FORMAT;
     static long referenceYear;
     static int thisCenturyLimit;
     static int thisCenturyLow;
+
+    static {
+        updateReferenceYear(System.currentTimeMillis());
+    }
+
+    static {
+        updateReferenceYear(System.currentTimeMillis());
+        final DateFormatCompiler compiler = new DateFormatCompiler();
+        UTC_FORMAT = compiler.compile(UTC_PATTERN);
+    }
+
+    // YYYY-MM-DDThh:mm:ss.mmm
+    public static long parseUTCDate(@NotNull CharSequence value) throws NumericException {
+        return UTC_FORMAT.parse(value, 0, value.length(), DateLocaleFactory.EN_LOCALE);
+    }
 
     public static int adjustYear(int year) {
         return thisCenturyLow + year;
@@ -54,6 +70,14 @@ public class DateFormatUtils {
             sink.putAscii('0');
         }
         sink.put(val);
+    }
+
+    // YYYY-MM-DDThh:mm:ss.mmmmZ
+    public static void appendDateTime(@NotNull CharSink<?> sink, long millis) {
+        if (millis == Long.MIN_VALUE) {
+            return;
+        }
+        UTC_FORMAT.format(millis, DateLocaleFactory.EN_LOCALE, "Z", sink);
     }
 
     public static void append00(@NotNull CharSink<?> sink, int val) {
@@ -243,9 +267,5 @@ public class DateFormatUtils {
         } else {
             thisCenturyLow = referenceYear - centuryOffset;
         }
-    }
-
-    static {
-        updateReferenceYear(System.currentTimeMillis());
     }
 }

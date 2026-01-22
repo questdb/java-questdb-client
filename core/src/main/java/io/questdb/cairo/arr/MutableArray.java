@@ -35,7 +35,7 @@ public class MutableArray extends ArrayView {
      * <strong>IMPORTANT:</strong> if you are calling this as the first step in populating
      * the array with new data, you must call {@code applyShape()} before adding the data.
      * A method of that name is defined on subclasses such as {@link DirectArray#applyShape()
-     * DirectArray} and {@link FunctionArray#applyShape FunctionArray}.
+     * DirectArray}.
      * <p>
      * If you're calling this while not changing the data, it is most likely an error
      * and may result in a segmentation fault when accessing the data. If your goal is

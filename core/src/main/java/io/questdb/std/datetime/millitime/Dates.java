@@ -25,9 +25,10 @@
 package io.questdb.std.datetime.millitime;
 
 import io.questdb.std.Chars;
-
+import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
+import io.questdb.std.str.StringSink;
 
 public final class Dates {
 
@@ -62,7 +63,25 @@ public final class Dates {
     private static final long[] MIN_MONTH_OF_YEAR_MILLIS = new long[12];
     private static final long YEAR_MILLIS = 365 * DAY_MILLIS;
 
+    static {
+        long minSum = 0;
+        long maxSum = 0;
+        for (int i = 0; i < 11; i++) {
+            minSum += DAYS_PER_MONTH[i] * DAY_MILLIS;
+            MIN_MONTH_OF_YEAR_MILLIS[i + 1] = minSum;
+            maxSum += getDaysPerMonth(i + 1, true) * DAY_MILLIS;
+            MAX_MONTH_OF_YEAR_MILLIS[i + 1] = maxSum;
+        }
+    }
+
+
     private Dates() {
+    }
+
+    public static String toString(long millis) {
+        StringSink sink = Misc.getThreadLocalSink();
+        DateFormatUtils.appendDateTime(sink, millis);
+        return sink.toString();
     }
 
     public static long addDays(long millis, int days) {
@@ -417,17 +436,6 @@ public final class Dates {
 
     private static boolean isDigit(char c) {
         return c > BEFORE_ZERO && c < AFTER_NINE;
-    }
-
-    static {
-        long minSum = 0;
-        long maxSum = 0;
-        for (int i = 0; i < 11; i++) {
-            minSum += DAYS_PER_MONTH[i] * DAY_MILLIS;
-            MIN_MONTH_OF_YEAR_MILLIS[i + 1] = minSum;
-            maxSum += getDaysPerMonth(i + 1, true) * DAY_MILLIS;
-            MAX_MONTH_OF_YEAR_MILLIS[i + 1] = maxSum;
-        }
     }
 
 }

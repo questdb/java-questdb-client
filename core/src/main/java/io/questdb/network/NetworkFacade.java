@@ -27,6 +27,7 @@ package io.questdb.network;
 import org.slf4j.Logger;
 
 public interface NetworkFacade {
+    int close(int fd);
 
     void close(int fd, Logger logger);
 
@@ -59,6 +60,14 @@ public interface NetworkFacade {
     long sockaddr(int address, int port);
 
     int socketTcp(boolean blocking);
+
+    int socketUdp();
+
+    int setMulticastInterface(int fd, int ipv4Address);
+
+    int setMulticastTtl(int fd, int ttl);
+
+    int sendToRaw(int fd, long lo, int len, long socketAddress);
 
     /**
      * Returns true if a disconnect happened, false otherwise.

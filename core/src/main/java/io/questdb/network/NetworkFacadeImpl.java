@@ -24,18 +24,18 @@
 
 package io.questdb.network;
 
-import io.questdb.std.Files;
 import io.questdb.std.Os;
-import io.questdb.std.str.LPSZ;
 import org.slf4j.Logger;
 
 public class NetworkFacadeImpl implements NetworkFacade {
     public static final NetworkFacade INSTANCE = new NetworkFacadeImpl();
 
+    @Override
     public int close(int fd) {
         return Net.close(fd);
     }
 
+    @Override
     public void close(int fd, Logger logger) {
         if (close(fd) != 0) {
             logger.error("could not close [fd={}, errno={}]", fd, errno());
@@ -115,6 +115,26 @@ public class NetworkFacadeImpl implements NetworkFacade {
     @Override
     public int socketTcp(boolean blocking) {
         return Net.socketTcp(blocking);
+    }
+
+    @Override
+    public int socketUdp() {
+        return Net.socketUdp();
+    }
+
+    @Override
+    public int setMulticastInterface(int fd, int ipv4Address) {
+        return Net.setMulticastInterface(fd, ipv4Address);
+    }
+
+    @Override
+    public int setMulticastTtl(int fd, int ttl) {
+        return Net.setMulticastTtl(fd, ttl);
+    }
+
+    @Override
+    public int sendToRaw(int fd, long ptr, int len, long socketAddress) {
+        return Net.sendTo(fd, ptr, len, socketAddress);
     }
 
     /**

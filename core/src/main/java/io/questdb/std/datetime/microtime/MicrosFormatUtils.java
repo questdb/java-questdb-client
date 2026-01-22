@@ -62,6 +62,68 @@ public class MicrosFormatUtils {
     @SuppressWarnings({"FieldCanBeLocal", "unused"})
     private static long newYear;
 
+    static {
+        updateReferenceYear(Os.currentTimeMicros());
+
+        final MicrosFormatCompiler compiler = new MicrosFormatCompiler();
+        PG_TIMESTAMP_FORMAT = compiler.compile("y-MM-dd HH:mm:ss.SSSUUU");
+        PG_TIMESTAMP_TIME_Z_FORMAT = compiler.compile("y-MM-dd HH:mm:ssz");
+        NANOS_UTC_FORMAT = compiler.compile("yyyy-MM-ddTHH:mm:ss.SSSUUUNNNz");
+
+        final String[] httpPatterns = new String[]{ // priority sorted
+                "E, d MMM yyyy HH:mm:ss Z",     // HTTP standard (RFC 1123)
+                "E, d-MMM-yyyy HH:mm:ss Z",     // Microsoft EntraID
+                "E, d-MMM-yy HH:mm:ss Z",       // HTTP 1.0 (2-digit year)
+                "E MMM dd HH:mm:ss yyyy",       // ANSI C asctime format (2-digit day)
+                "E MMM  d HH:mm:ss yyyy"        // ANSI C asctime format (1-digit day with space)
+        };
+        HTTP_FORMATS = new DateFormat[httpPatterns.length];
+        for (int i = 0; i < httpPatterns.length; i++) {
+            HTTP_FORMATS[i] = compiler.compile(httpPatterns[i]);
+        }
+
+        final String[] patterns = new String[]{ // priority sorted
+                CommonUtils.PG_TIMESTAMP_MILLI_TIME_Z_PATTERN, // y-MM-dd HH:mm:ss.SSSz
+                CommonUtils.GREEDY_MILLIS1_UTC_PATTERN,        // yyyy-MM-ddTHH:mm:ss.Sz
+                CommonUtils.USEC_UTC_PATTERN,                  // yyyy-MM-ddTHH:mm:ss.SSSUUUz
+                CommonUtils.SEC_UTC_PATTERN,                   // yyyy-MM-ddTHH:mm:ssz
+                CommonUtils.GREEDY_MILLIS2_UTC_PATTERN,        // yyyy-MM-ddTHH:mm:ss.SSz
+                CommonUtils.UTC_PATTERN,                       // yyyy-MM-ddTHH:mm:ss.SSSz
+                CommonUtils.HOUR_PATTERN,                      // yyyy-MM-ddTHH
+                CommonUtils.DAY_PATTERN,                       // yyyy-MM-dd
+                CommonUtils.WEEK_PATTERN,                      // YYYY-Www
+                CommonUtils.MONTH_PATTERN,                     // yyyy-MM
+                CommonUtils.YEAR_PATTERN                       // yyyy
+        };
+        FORMATS = new DateFormat[patterns.length];
+        CharSequenceObjHashMap<DateFormat> dateFormats = new CharSequenceObjHashMap<>();
+        for (int i = 0; i < patterns.length; i++) {
+            String pattern = patterns[i];
+            DateFormat format = compiler.compile(pattern);
+            dateFormats.put(pattern, format);
+            FORMATS[i] = format;
+        }
+        PG_TIMESTAMP_MILLI_TIME_Z_FORMAT = dateFormats.get(CommonUtils.PG_TIMESTAMP_MILLI_TIME_Z_PATTERN);
+        GREEDY_MILLIS1_UTC_FORMAT = dateFormats.get(CommonUtils.GREEDY_MILLIS1_UTC_PATTERN);
+        USEC_UTC_FORMAT = dateFormats.get(CommonUtils.USEC_UTC_PATTERN);
+        SEC_UTC_FORMAT = dateFormats.get(CommonUtils.SEC_UTC_PATTERN);
+        GREEDY_MILLIS2_UTC_FORMAT = dateFormats.get(CommonUtils.GREEDY_MILLIS2_UTC_PATTERN);
+        UTC_FORMAT = dateFormats.get(CommonUtils.UTC_PATTERN);
+        HOUR_FORMAT = dateFormats.get(CommonUtils.HOUR_PATTERN);
+        DAY_FORMAT = dateFormats.get(CommonUtils.DAY_PATTERN);
+        WEEK_FORMAT = dateFormats.get(CommonUtils.WEEK_PATTERN);
+        MONTH_FORMAT = dateFormats.get(CommonUtils.MONTH_PATTERN);
+        YEAR_FORMAT = dateFormats.get(CommonUtils.YEAR_PATTERN);
+    }
+
+    // YYYY-MM-DDThh:mm:ss.mmmZ
+    public static void appendDateTime(@NotNull CharSink<?> sink, long micros) {
+        if (micros == Long.MIN_VALUE) {
+            return;
+        }
+        UTC_FORMAT.format(micros, EN_LOCALE, "Z", sink);
+    }
+
     public static int adjustYear(int year) {
         return thisCenturyLow + year;
     }
@@ -322,57 +384,19 @@ public class MicrosFormatUtils {
         newYear = Micros.endOfYear(referenceYear);
     }
 
-    static {
-        updateReferenceYear(Os.currentTimeMicros());
+    // YYYY-MM-DDThh:mm:ss.mmmZ
+    public static long parseTimestamp(@NotNull CharSequence seq) throws NumericException {
+        return parseTimestamp(seq, 0, seq.length());
+    }
 
-        final MicrosFormatCompiler compiler = new MicrosFormatCompiler();
-        PG_TIMESTAMP_FORMAT = compiler.compile("y-MM-dd HH:mm:ss.SSSUUU");
-        PG_TIMESTAMP_TIME_Z_FORMAT = compiler.compile("y-MM-dd HH:mm:ssz");
-        NANOS_UTC_FORMAT = compiler.compile("yyyy-MM-ddTHH:mm:ss.SSSUUUNNNz");
-
-        final String[] httpPatterns = new String[]{ // priority sorted
-                "E, d MMM yyyy HH:mm:ss Z",     // HTTP standard (RFC 1123)
-                "E, d-MMM-yyyy HH:mm:ss Z",     // Microsoft EntraID
-                "E, d-MMM-yy HH:mm:ss Z",       // HTTP 1.0 (2-digit year)
-                "E MMM dd HH:mm:ss yyyy",       // ANSI C asctime format (2-digit day)
-                "E MMM  d HH:mm:ss yyyy"        // ANSI C asctime format (1-digit day with space)
-        };
-        HTTP_FORMATS = new DateFormat[httpPatterns.length];
-        for (int i = 0; i < httpPatterns.length; i++) {
-            HTTP_FORMATS[i] = compiler.compile(httpPatterns[i]);
+    public static long parseTimestamp(@NotNull CharSequence value, int lo, int hi) throws NumericException {
+        for (int i = 0, n = FORMATS.length; i < n; i++) {
+            try {
+                return FORMATS[i].parse(value, lo, hi, EN_LOCALE);
+            } catch (NumericException ignore) {
+                // try next
+            }
         }
-
-        final String[] patterns = new String[]{ // priority sorted
-                CommonUtils.PG_TIMESTAMP_MILLI_TIME_Z_PATTERN, // y-MM-dd HH:mm:ss.SSSz
-                CommonUtils.GREEDY_MILLIS1_UTC_PATTERN,        // yyyy-MM-ddTHH:mm:ss.Sz
-                CommonUtils.USEC_UTC_PATTERN,                  // yyyy-MM-ddTHH:mm:ss.SSSUUUz
-                CommonUtils.SEC_UTC_PATTERN,                   // yyyy-MM-ddTHH:mm:ssz
-                CommonUtils.GREEDY_MILLIS2_UTC_PATTERN,        // yyyy-MM-ddTHH:mm:ss.SSz
-                CommonUtils.UTC_PATTERN,                       // yyyy-MM-ddTHH:mm:ss.SSSz
-                CommonUtils.HOUR_PATTERN,                      // yyyy-MM-ddTHH
-                CommonUtils.DAY_PATTERN,                       // yyyy-MM-dd
-                CommonUtils.WEEK_PATTERN,                      // YYYY-Www
-                CommonUtils.MONTH_PATTERN,                     // yyyy-MM
-                CommonUtils.YEAR_PATTERN                       // yyyy
-        };
-        FORMATS = new DateFormat[patterns.length];
-        CharSequenceObjHashMap<DateFormat> dateFormats = new CharSequenceObjHashMap<>();
-        for (int i = 0; i < patterns.length; i++) {
-            String pattern = patterns[i];
-            DateFormat format = compiler.compile(pattern);
-            dateFormats.put(pattern, format);
-            FORMATS[i] = format;
-        }
-        PG_TIMESTAMP_MILLI_TIME_Z_FORMAT = dateFormats.get(CommonUtils.PG_TIMESTAMP_MILLI_TIME_Z_PATTERN);
-        GREEDY_MILLIS1_UTC_FORMAT = dateFormats.get(CommonUtils.GREEDY_MILLIS1_UTC_PATTERN);
-        USEC_UTC_FORMAT = dateFormats.get(CommonUtils.USEC_UTC_PATTERN);
-        SEC_UTC_FORMAT = dateFormats.get(CommonUtils.SEC_UTC_PATTERN);
-        GREEDY_MILLIS2_UTC_FORMAT = dateFormats.get(CommonUtils.GREEDY_MILLIS2_UTC_PATTERN);
-        UTC_FORMAT = dateFormats.get(CommonUtils.UTC_PATTERN);
-        HOUR_FORMAT = dateFormats.get(CommonUtils.HOUR_PATTERN);
-        DAY_FORMAT = dateFormats.get(CommonUtils.DAY_PATTERN);
-        WEEK_FORMAT = dateFormats.get(CommonUtils.WEEK_PATTERN);
-        MONTH_FORMAT = dateFormats.get(CommonUtils.MONTH_PATTERN);
-        YEAR_FORMAT = dateFormats.get(CommonUtils.YEAR_PATTERN);
+        throw NumericException.instance();
     }
 }

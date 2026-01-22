@@ -31,13 +31,10 @@ import org.slf4j.LoggerFactory;
 /**
  * Single-threaded object pool based on ObjList. The goal is to optimise intermediate allocation of objects.
  * <p>
- * There are 2 ways to use this pool:
+ * There is 1 way to use this pool:
  * <ul>
  *     <li>Mass release: You keep acquiring objects via @link {@link #next()} and then release them all at once via
  *     {@link #clear()}. This is the fastest way to use the pool.</li>
- *     <li>Individual release: You acquire objects via @link {@link #next()} and then release them individually via
- *     {@link #release(Mutable)}. This method has complexity O(n) where n is the number of objects in the pool thus
- *     should be used with care.</li>
  * </ul>
  */
 public class ObjectPool<T extends Mutable> implements Mutable {

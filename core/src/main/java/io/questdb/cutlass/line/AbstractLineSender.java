@@ -27,11 +27,7 @@ package io.questdb.cutlass.line;
 import io.questdb.cairo.TableUtils;
 import io.questdb.client.Sender;
 import io.questdb.cutlass.auth.AuthUtils;
-import io.questdb.std.MemoryTag;
-import io.questdb.std.Misc;
-import io.questdb.std.Numbers;
-import io.questdb.std.Unsafe;
-import io.questdb.std.Vect;
+import io.questdb.std.*;
 import io.questdb.std.bytes.DirectByteSlice;
 import io.questdb.std.str.Utf8Sequence;
 import io.questdb.std.str.Utf8Sink;
@@ -40,11 +36,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
-import java.security.PrivateKey;
-import java.security.Signature;
-import java.security.SignatureException;
+import java.security.*;
 import java.util.Base64;
 
 public abstract class AbstractLineSender implements Utf8Sink, Closeable, Sender {
@@ -78,6 +70,16 @@ public abstract class AbstractLineSender implements Utf8Sink, Closeable, Sender 
         hi = lo + capacity;
         ptr = lo;
         lineStart = lo;
+    }
+
+    private static int findEOL(long ptr, int len) {
+        for (int i = 0; i < len; i++) {
+            byte b = Unsafe.getUnsafe().getByte(ptr + i);
+            if (b == (byte) '\n') {
+                return i;
+            }
+        }
+        return -1;
     }
 
     @Override
@@ -152,6 +154,11 @@ public abstract class AbstractLineSender implements Utf8Sink, Closeable, Sender 
         quoted = false;
         putAsciiInternal('"');
         return this;
+    }
+
+    public void $(long timestamp) {
+        putAsciiInternal(' ').put(timestamp);
+        atNow();
     }
 
     public AbstractLineSender field(CharSequence name, double value) {
@@ -347,19 +354,9 @@ public abstract class AbstractLineSender implements Utf8Sink, Closeable, Sender 
         return this;
     }
 
-    private static int findEOL(long ptr, int len) {
-        for (int i = 0; i < len; i++) {
-            byte b = Unsafe.getUnsafe().getByte(ptr + i);
-            if (b == (byte) '\n') {
-                return i;
-            }
-        }
-        return -1;
-    }
-
     private byte[] receiveChallengeBytes() {
         int n = 0;
-        for (;;) {
+        for (; ; ) {
             int rc = lineChannel.receive(ptr + n, capacity - n);
             if (rc < 0) {
                 int errno = lineChannel.errno();

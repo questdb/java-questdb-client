@@ -57,4 +57,5 @@ open module io.questdb {
     exports io.questdb.client.impl;
     exports io.questdb.cairo.arr;
     exports io.questdb.cutlass.line.array;
+    exports io.questdb.cutlass.line.udp;
 }

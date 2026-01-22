@@ -24,7 +24,6 @@
 
 package io.questdb.cairo.arr;
 
-import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.vm.api.MemoryA;
@@ -41,19 +40,12 @@ public final class DirectArray extends MutableArray implements Mutable {
     private static final long DOUBLE_BYTES = 8;
     private static final long LONG_BYTES = 8;
     private static final int MEM_TAG = MemoryTag.NATIVE_ND_ARRAY;
-    private final CairoConfiguration configuration;
     private final FlatViewMemory flatViewMemory = new FlatViewMemory();
     private long ptr = 0;
     private long size;
 
-    public DirectArray(CairoConfiguration configuration) {
-        this.flatView = new BorrowedFlatArrayView();
-        this.configuration = configuration;
-    }
-
     public DirectArray() {
         this.flatView = new BorrowedFlatArrayView();
-        this.configuration = null;
     }
 
     public void applyShape() {
@@ -62,8 +54,7 @@ public final class DirectArray extends MutableArray implements Mutable {
 
     public void applyShape(int errorPosition) {
         short elemType = getElemType();
-        int maxArrayElementCount = configuration != null ? configuration.maxArrayElementCount() :
-                Integer.MAX_VALUE >> ColumnType.pow2SizeOf(elemType);
+        int maxArrayElementCount = Integer.MAX_VALUE >> ColumnType.pow2SizeOf(elemType);
         resetToDefaultStrides(maxArrayElementCount, errorPosition);
         int byteSize = flatViewLength << ColumnType.pow2SizeOf(elemType);
         ensureSize(byteSize);

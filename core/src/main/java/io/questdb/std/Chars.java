@@ -25,9 +25,7 @@
 package io.questdb.std;
 
 import io.questdb.std.str.CharSink;
-
 import io.questdb.std.str.Utf16Sink;
-
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -43,7 +41,18 @@ public final class Chars {
     static final char[] base64Url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toCharArray();
     static final int[] base64UrlInverted = base64CreateInvertedAlphabet(base64Url);
 
+    static {
+        CHAR_STRINGS = new String[128];
+        for (char c = 0; c < 128; c++) {
+            CHAR_STRINGS[c] = Character.toString(c);
+        }
+    }
+
     private Chars() {
+    }
+
+    public static boolean contains(@NotNull CharSequence sequence, @NotNull CharSequence term) {
+        return indexOf(sequence, 0, sequence.length(), term) != -1;
     }
 
     public static void base64Encode(@Nullable BinarySequence sequence, int maxLength, @NotNull CharSink<?> buffer) {
@@ -211,6 +220,55 @@ public final class Chars {
      */
     public static int indexOf(CharSequence seq, int seqLo, int seqHi, char c) {
         return indexOf(seq, seqLo, seqHi, c, 1);
+    }
+
+    /**
+     * Searches for the first occurrence of a character sequence within the specified bounds of another character sequence.
+     * This method performs a case-sensitive search using an optimized string matching algorithm.
+     * <p>
+     * The search bounds are defined as {@code [seqLo, seqHi)} where {@code seqLo} is inclusive and
+     * {@code seqHi} is exclusive. The method searches for the complete term within these bounds.
+     * <p>
+     * If the term is empty (length 0), the method returns 0 as an empty string is considered to be
+     * found at the beginning of any sequence.
+     *
+     * @param seq   the character sequence to search within (must not be null)
+     * @param seqLo the lower bound (inclusive) of the search range
+     * @param seqHi the upper bound (exclusive) of the search range
+     * @param term  the character sequence to search for (must not be null)
+     * @return the index of the first occurrence of the term, or -1 if not found within bounds
+     * @throws StringIndexOutOfBoundsException if bounds are invalid for the given sequence
+     */
+    public static int indexOf(@NotNull CharSequence seq, int seqLo, int seqHi, @NotNull CharSequence term) {
+        int termLen = term.length();
+        if (termLen == 0) {
+            return 0;
+        }
+
+        char first = term.charAt(0);
+        int max = seqHi - termLen;
+
+        for (int i = seqLo; i <= max; ++i) {
+            if (seq.charAt(i) != first) {
+                do {
+                    ++i;
+                } while (i <= max && seq.charAt(i) != first);
+            }
+
+            if (i <= max) {
+                int j = i + 1;
+                int end = j + termLen - 1;
+
+                for (int k = 1; j < end && seq.charAt(j) == term.charAt(k); ++k) {
+                    ++j;
+                }
+
+                if (j == end) {
+                    return i;
+                }
+            }
+        }
+        return -1;
     }
 
     /**
@@ -409,12 +467,5 @@ public final class Chars {
             }
         }
         return true;
-    }
-
-    static {
-        CHAR_STRINGS = new String[128];
-        for (char c = 0; c < 128; c++) {
-            CHAR_STRINGS[c] = Character.toString(c);
-        }
     }
 }

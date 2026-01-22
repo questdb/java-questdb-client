@@ -25,17 +25,11 @@
 package io.questdb.std.str;
 
 import io.questdb.cairo.CairoException;
-import io.questdb.cairo.TableUtils;
-
 import io.questdb.std.Chars;
-import io.questdb.std.Numbers;
 import io.questdb.std.ThreadLocal;
 import io.questdb.std.Unsafe;
-
-import io.questdb.std.Vect;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-import org.jetbrains.annotations.TestOnly;
 
 import static io.questdb.std.Misc.getThreadLocalUtf8Sink;
 
@@ -65,6 +59,23 @@ public final class Utf8s {
             sink.put((byte) (128 | c & 63));
         }
         return i;
+    }
+
+    public static String toString(@Nullable Utf8Sequence s) {
+        return s == null ? null : s.toString();
+    }
+
+    public static String toString(@NotNull Utf8Sequence us, int start, int end, byte unescapeAscii) {
+        final Utf8Sink sink = getThreadLocalUtf8Sink();
+        final int lastChar = end - 1;
+        for (int i = start; i < end; i++) {
+            byte b = us.byteAt(i);
+            sink.putAny(b);
+            if (b == unescapeAscii && i < lastChar && us.byteAt(i + 1) == unescapeAscii) {
+                i++;
+            }
+        }
+        return sink.toString();
     }
 
     public static boolean equals(@Nullable Utf8Sequence l, @Nullable Utf8Sequence r) {
@@ -173,6 +184,12 @@ public final class Utf8s {
     public static void strCpy(@NotNull Utf8Sequence src, int destLen, long destAddr) {
         for (int i = 0; i < destLen; i++) {
             Unsafe.getUnsafe().putByte(destAddr + i, src.byteAt(i));
+        }
+    }
+
+    public static void strCpy(long srcLo, long srcHi, @NotNull Utf8Sink dest) {
+        for (long i = srcLo; i < srcHi; i++) {
+            dest.putAny(Unsafe.getUnsafe().getByte(i));
         }
     }
 

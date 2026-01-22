@@ -25,11 +25,7 @@
 package io.questdb.std.bytes;
 
 import io.questdb.cairo.CairoException;
-import io.questdb.std.Mutable;
-import io.questdb.std.Os;
-import io.questdb.std.QuietCloseable;
-import io.questdb.std.Unsafe;
-import io.questdb.std.Vect;
+import io.questdb.std.*;
 import org.jetbrains.annotations.NotNull;
 
 public class DirectByteSink implements DirectByteSequence, BorrowableAsNativeByteSink, QuietCloseable, Mutable {
@@ -38,6 +34,11 @@ public class DirectByteSink implements DirectByteSequence, BorrowableAsNativeByt
     private static final int BYTE_SINK_HI_OFFSET = BYTE_SINK_LO_OFFSET + 8;  // 16
     private static final int BYTE_SINK_OVERFLOW_OFFSET = BYTE_SINK_HI_OFFSET + 8;  // 24
     private static final int BYTE_SINK_ASCII_OFFSET = BYTE_SINK_OVERFLOW_OFFSET + 4;  // 28
+
+    static {
+        Os.init();
+    }
+
     private final long initialCapacity;
     private final int memoryTag;
     /**
@@ -64,6 +65,11 @@ public class DirectByteSink implements DirectByteSequence, BorrowableAsNativeByt
         @Override
         public void close() {
             closeByteSink();
+        }
+
+        @Override
+        public long ptr() {
+            return impl;
         }
     };
 
@@ -164,6 +170,10 @@ public class DirectByteSink implements DirectByteSequence, BorrowableAsNativeByt
         return Unsafe.getUnsafe().getByte(impl + BYTE_SINK_ASCII_OFFSET) != 0;
     }
 
+    public void setAscii(boolean ascii) {
+        Unsafe.getUnsafe().putByte(impl + BYTE_SINK_ASCII_OFFSET, (byte) (ascii ? 1 : 0));
+    }
+
     /**
      * First readable byte in the sequence.
      */
@@ -179,16 +189,31 @@ public class DirectByteSink implements DirectByteSequence, BorrowableAsNativeByt
         return this;
     }
 
+    public DirectByteSink put(ByteSequence bs) {
+        if (bs != null) {
+            final int bsSize = bs.size();
+            final long dest = ensureCapacity(bsSize);
+            for (int i = 0; i < bsSize; i++) {
+                Unsafe.getUnsafe().putByte(dest + i, bs.byteAt(i));
+            }
+            advance(bsSize);
+        }
+        return this;
+    }
+
+    public DirectByteSink put(DirectByteSequence dbs) {
+        if (dbs == null) {
+            return this;
+        }
+        return put(dbs.lo(), dbs.hi());
+    }
+
     public DirectByteSink put(long lo, long hi) {
         final long len = hi - lo;
         final long dest = ensureCapacity(len);
         Vect.memcpy(dest, lo, len);
         advance(len);
         return this;
-    }
-
-    public void setAscii(boolean ascii) {
-        Unsafe.getUnsafe().putByte(impl + BYTE_SINK_ASCII_OFFSET, (byte) (ascii ? 1 : 0));
     }
 
     /**
@@ -236,6 +261,10 @@ public class DirectByteSink implements DirectByteSequence, BorrowableAsNativeByt
         return Unsafe.getUnsafe().getLong(impl + BYTE_SINK_PTR_OFFSET);
     }
 
+    private void setImplPtr(long ptr) {
+        Unsafe.getUnsafe().putLong(impl + BYTE_SINK_PTR_OFFSET, ptr);
+    }
+
     private void inflate() {
         impl = implCreate(initialCapacity);
         if (impl == 0) {
@@ -243,13 +272,5 @@ public class DirectByteSink implements DirectByteSequence, BorrowableAsNativeByt
         }
         Unsafe.recordMemAlloc(this.allocatedCapacity(), memoryTag);
         Unsafe.incrMallocCount();
-    }
-
-    private void setImplPtr(long ptr) {
-        Unsafe.getUnsafe().putLong(impl + BYTE_SINK_PTR_OFFSET, ptr);
-    }
-
-    static {
-        Os.init();
     }
 }

@@ -24,10 +24,12 @@
 
 package io.questdb.std.datetime.microtime;
 
+import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
 import io.questdb.std.Os;
 import io.questdb.std.datetime.CommonUtils;
+import io.questdb.std.str.Utf16Sink;
 
 import static io.questdb.std.datetime.CommonUtils.DAYS_PER_MONTH;
 
@@ -56,7 +58,25 @@ public final class Micros {
     private static final long YEAR_MICROS_LEAP = 366 * DAY_MICROS;
     public static final int EPOCH_YEAR_0 = getYear(0);
 
+    static {
+        STARTUP_TIMESTAMP = Os.currentTimeMicros();
+        long minSum = 0;
+        long maxSum = 0;
+        for (int i = 0; i < 11; i++) {
+            minSum += DAYS_PER_MONTH[i] * DAY_MICROS;
+            MIN_MONTH_OF_YEAR_MICROS[i + 1] = minSum;
+            maxSum += CommonUtils.getDaysPerMonth(i + 1, true) * DAY_MICROS;
+            MAX_MONTH_OF_YEAR_MICROS[i + 1] = maxSum;
+        }
+    }
+
     private Micros() {
+    }
+
+    public static String toString(long micros) {
+        Utf16Sink sink = Misc.getThreadLocalSink();
+        MicrosFormatUtils.appendDateTime(sink, micros);
+        return sink.toString();
     }
 
     public static long addDays(long micros, int days) {
@@ -79,6 +99,15 @@ public final class Micros {
         int y = getYear(micros);
         boolean l = CommonUtils.isLeapYear(y);
         return yearMicros(y, l) + monthOfYearMicros(getMonthOfYear(micros, y, l), l);
+    }
+
+    public static long floorNS(long micros) {
+        return micros;
+    }
+
+    public static long floorNS(long micros, int stride) {
+        final long nanos = micros * MICRO_NANOS;
+        return (nanos - getRemainderMicros(nanos, stride)) / MICRO_NANOS;
     }
 
     public static long floorWW(long micros) {
@@ -424,17 +453,5 @@ public final class Micros {
 
     private static long getTimeMicros(long micros) {
         return getRemainderMicros(micros, DAY_MICROS);
-    }
-
-    static {
-        STARTUP_TIMESTAMP = Os.currentTimeMicros();
-        long minSum = 0;
-        long maxSum = 0;
-        for (int i = 0; i < 11; i++) {
-            minSum += DAYS_PER_MONTH[i] * DAY_MICROS;
-            MIN_MONTH_OF_YEAR_MICROS[i + 1] = minSum;
-            maxSum += CommonUtils.getDaysPerMonth(i + 1, true) * DAY_MICROS;
-            MAX_MONTH_OF_YEAR_MICROS[i + 1] = maxSum;
-        }
     }
 }

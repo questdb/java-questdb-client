@@ -24,6 +24,7 @@
 
 package io.questdb.std.datetime.microtime;
 
+
 import io.questdb.cairo.ColumnType;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.CharSequenceIntHashMap;
@@ -154,6 +155,18 @@ public class MicrosFormatCompiler {
         for (int i = 0, n = opList.size(); i < n; i++) {
             lexer.defineSymbol(opList.getQuick(i));
         }
+    }
+
+    public static int getOpCode(String opName) {
+        return opMap.get(opName);
+    }
+
+    public static int getOpCount() {
+        return opList.size();
+    }
+
+    public static String getOpName(int index) {
+        return opList.getQuick(index);
     }
 
     public DateFormat compile(CharSequence pattern) {
