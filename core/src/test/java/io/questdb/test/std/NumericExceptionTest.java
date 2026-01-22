@@ -35,7 +35,6 @@ public class NumericExceptionTest {
     public void testBasic() {
         NumericException e = NumericException.instance();
         e.put("test");
-        Assert.assertEquals(5, e.getPosition());
         Assert.assertEquals("test", e.getFlyweightMessage().toString());
     }
 

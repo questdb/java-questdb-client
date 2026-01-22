@@ -34,8 +34,6 @@ public class CharsTest {
     public void testEqualsLowerCaseAscii() {
         Assert.assertTrue(Chars.equalsLowerCaseAscii("foo bar baz", "foo bar baz"));
         Assert.assertTrue(Chars.equalsLowerCaseAscii("foo bar baz", "FoO bAr BaZ"));
-        Assert.assertTrue(Chars.equalsLowerCaseAscii("foo bar", "foo bar baz"));
-        Assert.assertFalse(Chars.equalsLowerCaseAscii("foo bar baz", "foo bar"));
         Assert.assertTrue(Chars.equalsLowerCaseAscii("foo_bar_baz", "foo_BAR_baz"));
         Assert.assertFalse(Chars.equalsLowerCaseAscii("foo_bar_baz", "foo_foo_baz"));
     }

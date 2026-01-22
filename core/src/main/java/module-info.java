@@ -43,7 +43,6 @@ open module io.questdb {
     exports io.questdb.std;
     exports io.questdb.std.datetime;
     exports io.questdb.std.datetime.microtime;
-    exports io.questdb.std.datetime.millitime;
     exports io.questdb.std.datetime.nanotime;
     exports io.questdb.std.str;
     exports io.questdb.std.ex;

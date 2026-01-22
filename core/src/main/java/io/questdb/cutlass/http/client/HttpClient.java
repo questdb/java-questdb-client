@@ -28,7 +28,11 @@ import io.questdb.HttpClientConfiguration;
 import io.questdb.cutlass.http.HttpHeaderParser;
 import io.questdb.cutlass.http.HttpKeywords;
 import io.questdb.cutlass.line.array.ArrayBufferAppender;
-import io.questdb.network.*;
+import io.questdb.network.IOOperation;
+import io.questdb.network.NetworkFacade;
+import io.questdb.network.Socket;
+import io.questdb.network.SocketFactory;
+import io.questdb.network.TlsSessionInitFailedException;
 import io.questdb.std.BinarySequence;
 import io.questdb.std.Chars;
 import io.questdb.std.MemoryTag;
@@ -53,7 +57,7 @@ import org.slf4j.LoggerFactory;
 
 import java.net.HttpURLConnection;
 
-import static io.questdb.cutlass.http.HttpConstants.*;
+import static io.questdb.cutlass.http.HttpConstants.HEADER_TRANSFER_ENCODING;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 public abstract class HttpClient implements QuietCloseable {
@@ -62,7 +66,6 @@ public abstract class HttpClient implements QuietCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(HttpClient.class);
     protected final NetworkFacade nf;
     protected final Socket socket;
-    private final HttpClientCookieHandler cookieHandler;
     private final ObjectPool<DirectUtf8String> csPool = new ObjectPool<>(DirectUtf8String.FACTORY, 64);
     private final int defaultTimeout;
     private final boolean fixBrokenConnection;
@@ -82,7 +85,6 @@ public abstract class HttpClient implements QuietCloseable {
         this.nf = configuration.getNetworkFacade();
         this.socket = socketFactory.newInstance(nf, LOG);
         this.defaultTimeout = configuration.getTimeout();
-        this.cookieHandler = configuration.getCookieHandlerFactory().getInstance();
         this.bufferSize = configuration.getInitialRequestBufferSize();
         this.maxBufferSize = configuration.getMaximumRequestBufferSize();
         this.responseParserBufSize = configuration.getResponseBufferSize();
@@ -312,20 +314,14 @@ public abstract class HttpClient implements QuietCloseable {
             binarySequenceAdapter.put(username).colon().put(password);
             Chars.base64Encode(binarySequenceAdapter, (int) binarySequenceAdapter.length(), this);
             eol();
-            if (cookieHandler != null) {
-                cookieHandler.setCookies(this, username);
-            }
             return this;
         }
 
-        public Request authToken(CharSequence username, CharSequence token) {
+        public Request authToken(CharSequence token) {
             beforeHeader();
             putAsciiInternal("Authorization: Bearer ");
             putAsciiInternal(token);
             eol();
-            if (cookieHandler != null) {
-                cookieHandler.setCookies(this, username);
-            }
             return this;
         }
 
@@ -544,27 +540,6 @@ public abstract class HttpClient implements QuietCloseable {
 
         public ResponseHeaders send(int timeout) {
             return send(host, port, timeout);
-        }
-
-        public void sendPartialContent(int maxContentLen, int timeout) {
-            if (state != STATE_CONTENT || contentStart == -1) {
-                throw new IllegalStateException("No content to send");
-            }
-            if (socket == null || socket.isClosed()) {
-                connect(host, port);
-            }
-
-            sendHeaderAndContent(maxContentLen, timeout);
-        }
-
-        public Request setCookie(CharSequence name, CharSequence value) {
-            beforeHeader();
-            put(HEADER_COOKIE).putAscii(": ").put(name);
-            if (value != null) {
-                putAscii(COOKIE_VALUE_SEPARATOR).put(value);
-            }
-            eol();
-            return this;
         }
 
         @Override
@@ -894,10 +869,6 @@ public abstract class HttpClient implements QuietCloseable {
                         }
                     }
                 }
-            }
-
-            if (cookieHandler != null) {
-                cookieHandler.processCookies(this);
             }
         }
 

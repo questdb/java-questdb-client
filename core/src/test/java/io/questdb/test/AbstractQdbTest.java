@@ -29,12 +29,7 @@ import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
 
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.sql.*;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -72,18 +67,6 @@ public class AbstractQdbTest extends AbstractTest {
     public static void tearDownStatic() {
         closePgConnection();
     }
-
-    @Before
-    public void setUp() {
-        super.setUp();
-    }
-
-    @After
-    public void tearDown() throws Exception {
-        super.tearDown();
-    }
-
-    // ==================== Configuration Getters ====================
 
     /**
      * Normalize line endings to LF for comparison.
@@ -171,8 +154,6 @@ public class AbstractQdbTest extends AbstractTest {
         return getConfig("QUESTDB_PG_PASSWORD", "questdb.pg.password", DEFAULT_PG_PASSWORD);
     }
 
-    // ==================== PostgreSQL Connection Management ====================
-
     /**
      * Get PostgreSQL wire protocol port.
      */
@@ -194,8 +175,6 @@ public class AbstractQdbTest extends AbstractTest {
         return getConfig("QUESTDB_HOST", "questdb.host", DEFAULT_HOST);
     }
 
-    // ==================== Query Execution Helpers ====================
-
     /**
      * Initialize a new PostgreSQL connection to QuestDB.
      */
@@ -209,6 +188,16 @@ public class AbstractQdbTest extends AbstractTest {
         LOG.info("Connecting to QuestDB via PostgreSQL wire protocol: {}", url);
 
         return DriverManager.getConnection(url, user, password);
+    }
+
+    @Before
+    public void setUp() {
+        super.setUp();
+    }
+
+    @After
+    public void tearDown() throws Exception {
+        super.tearDown();
     }
 
     /**
@@ -374,8 +363,6 @@ public class AbstractQdbTest extends AbstractTest {
     protected String generateTableName(String prefix) {
         return prefix + "_" + TABLE_NAME_COUNTER.incrementAndGet();
     }
-
-    // ==================== Test Isolation Helpers ====================
 
     /**
      * Get the row count for a table.

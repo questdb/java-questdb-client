@@ -24,20 +24,10 @@
 
 package io.questdb.cairo;
 
-import io.questdb.std.Numbers;
-import io.questdb.std.NumericException;
-
-import io.questdb.std.str.CharSink;
-
-import org.jetbrains.annotations.Nullable;
-
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
 public interface TimestampDriver {
-
-    void append(CharSink<?> sink, long timestamp);
-
     /**
      * Converts a value from the specified {@link ChronoUnit} to the timestamp value.
      *
@@ -54,10 +44,4 @@ public interface TimestampDriver {
      * @return the timestamp value
      */
     long from(Instant instant);
-
-    long parseFloor(CharSequence str, int lo, int hi) throws NumericException;
-
-    default long parseFloorLiteral(@Nullable CharSequence timestampLiteral) throws NumericException {
-        return timestampLiteral != null ? parseFloor(timestampLiteral, 0, timestampLiteral.length()) : Numbers.LONG_NULL;
-    }
 }

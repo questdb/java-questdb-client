@@ -480,7 +480,7 @@ public class TestHttpClient implements QuietCloseable {
             if (password != null) {
                 req.authBasic(username, password);
             } else if (token != null) {
-                req.authToken(username, token);
+                req.authToken(token);
             } else {
                 throw new RuntimeException("username specified without pwd or token");
             }

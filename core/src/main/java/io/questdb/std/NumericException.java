@@ -27,19 +27,12 @@ package io.questdb.std;
 import io.questdb.std.str.CharSink;
 import io.questdb.std.str.Sinkable;
 import io.questdb.std.str.StringSink;
-
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class NumericException extends RuntimeException implements Sinkable, FlyweightMessageContainer {
-    /**
-     * @deprecated use {@link #instance()}
-     */
-    @Deprecated
-    public static final NumericException INSTANCE = new NumericException();
     private static final io.questdb.std.ThreadLocal<NumericException> tlInstance = new ThreadLocal<>(NumericException::new);
     private final StringSink message = new StringSink();
-    private int messagePosition = 0;
 
     private NumericException() {
     }
@@ -63,11 +56,6 @@ public class NumericException extends RuntimeException implements Sinkable, Flyw
     @Override
     public String getMessage() {
         return message.toString();
-    }
-
-    @Override
-    public int getPosition() {
-        return messagePosition;
     }
 
     public NumericException put(long value) {
@@ -97,6 +85,5 @@ public class NumericException extends RuntimeException implements Sinkable, Flyw
 
     private void clear() {
         message.clear();
-        messagePosition = 0;
     }
 }

@@ -50,13 +50,13 @@ public class GeoHashes {
 
     public static long fromCoordinatesDeg(double lat, double lon, int bits) throws NumericException {
         if (lat < -90.0 || lat > 90.0) {
-            throw NumericException.INSTANCE;
+            throw NumericException.instance();
         }
         if (lon < -180.0 || lon > 180.0) {
-            throw NumericException.INSTANCE;
+            throw NumericException.instance();
         }
         if (bits < 0 || bits > ColumnType.GEOLONG_MAX_BITS) {
-            throw NumericException.INSTANCE;
+            throw NumericException.instance();
         }
         return fromCoordinatesDegUnsafe(lat, lon, bits);
     }

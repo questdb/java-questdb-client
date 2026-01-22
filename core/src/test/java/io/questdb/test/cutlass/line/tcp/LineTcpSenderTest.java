@@ -28,7 +28,6 @@ import io.questdb.client.Sender;
 import io.questdb.cutlass.line.LineChannel;
 import io.questdb.cutlass.line.LineSenderException;
 import io.questdb.cutlass.line.LineTcpSenderV2;
-import io.questdb.std.datetime.microtime.MicrosFormatUtils;
 import org.junit.Test;
 
 import java.time.Instant;
@@ -52,6 +51,25 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     private static final Consumer<Sender> SET_TABLE_NAME_ACTION = s -> s.table("mytable");
 
     // ==================== Unit Tests (no server needed) ====================
+
+    private static void assertExceptionOnClosedSender(Consumer<Sender> beforeCloseAction, Consumer<Sender> afterCloseAction) {
+        DummyLineChannel channel = new DummyLineChannel();
+        Sender sender = new LineTcpSenderV2(channel, 1000, 127);
+        beforeCloseAction.accept(sender);
+        sender.close();
+        try {
+            afterCloseAction.accept(sender);
+            fail("use-after-close must throw exception");
+        } catch (LineSenderException e) {
+            assertContains(e.getMessage(), "sender already closed");
+        }
+    }
+
+    private static void assertNoControlCharacter(CharSequence m) {
+        for (int i = 0, n = m.length(); i < n; i++) {
+            assertFalse(Character.isISOControl(m.charAt(i)));
+        }
+    }
 
     @Test
     public void testAllColumnTypes() throws Exception {
@@ -204,7 +222,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     @Test
     public void testExplicitTimestamp() throws Exception {
         String tableName = createTrackedTable("explicit_ts");
-        long ts = MicrosFormatUtils.parseTimestamp("2025-01-15T12:30:00.000000Z");
+        long ts = Instant.parse("2025-01-15T12:30:00.000000Z").toEpochMilli() * 1000;
         try (Sender sender = createTcpSender()) {
             sender.table(tableName)
                     .symbol("city", "paris")
@@ -247,6 +265,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         assertTableRowCount(tableName, 1);
     }
 
+    // ==================== Integration Tests (require external QuestDB) ====================
+
     @Test
     public void testLargeStringValue() throws Exception {
         String tableName = createTrackedTable("large_string");
@@ -279,8 +299,6 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
             }
         }
     }
-
-    // ==================== Integration Tests (require external QuestDB) ====================
 
     @Test
     public void testMultipleFlushes() throws Exception {
@@ -447,6 +465,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
     }
 
+    // ==================== Helper Methods ====================
+
     @Test
     public void testTimestampColumnNameCannotBeEmpty() {
         ByteChannel channel = new ByteChannel();
@@ -472,27 +492,6 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
             sender.flush();
         }
         assertTableRowCount(tableName, 1);
-    }
-
-    // ==================== Helper Methods ====================
-
-    private static void assertExceptionOnClosedSender(Consumer<Sender> beforeCloseAction, Consumer<Sender> afterCloseAction) {
-        DummyLineChannel channel = new DummyLineChannel();
-        Sender sender = new LineTcpSenderV2(channel, 1000, 127);
-        beforeCloseAction.accept(sender);
-        sender.close();
-        try {
-            afterCloseAction.accept(sender);
-            fail("use-after-close must throw exception");
-        } catch (LineSenderException e) {
-            assertContains(e.getMessage(), "sender already closed");
-        }
-    }
-
-    private static void assertNoControlCharacter(CharSequence m) {
-        for (int i = 0, n = m.length(); i < n; i++) {
-            assertFalse(Character.isISOControl(m.charAt(i)));
-        }
     }
 
     // ==================== Mock Channel Classes ====================

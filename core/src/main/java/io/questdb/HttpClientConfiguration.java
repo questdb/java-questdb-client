@@ -24,7 +24,6 @@
 
 package io.questdb;
 
-import io.questdb.cutlass.http.client.HttpClientCookieHandlerFactory;
 import io.questdb.network.EpollFacade;
 import io.questdb.network.EpollFacadeImpl;
 import io.questdb.network.KqueueFacade;
@@ -38,8 +37,6 @@ public interface HttpClientConfiguration {
     default boolean fixBrokenConnection() {
         return true;
     }
-
-    HttpClientCookieHandlerFactory getCookieHandlerFactory();
 
     default EpollFacade getEpollFacade() {
         return EpollFacadeImpl.INSTANCE;

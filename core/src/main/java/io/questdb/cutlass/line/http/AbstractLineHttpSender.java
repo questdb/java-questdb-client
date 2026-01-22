@@ -730,7 +730,7 @@ public abstract class AbstractLineHttpSender implements Sender {
         if (username != null) {
             r.authBasic(username, password);
         } else if (authToken != null) {
-            r.authToken(null, authToken);
+            r.authToken(authToken);
         }
         r.withContent();
         rowBookmark = r.getContentLength();

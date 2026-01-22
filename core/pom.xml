@@ -137,22 +137,6 @@
                     </execution>
                 </executions>
             </plugin>
-            <!-- remove web console package on "clean" -->
-            <plugin>
-                <artifactId>maven-clean-plugin</artifactId>
-                <version>3.2.0</version>
-                <configuration>
-                    <filesets>
-                        <fileset>
-                            <directory>src/main/resources/io/questdb/site/</directory>
-                            <includes>
-                                <include>public.zip</include>
-                            </includes>
-                            <followSymlinks>false</followSymlinks>
-                        </fileset>
-                    </filesets>
-                </configuration>
-            </plugin>
             <!-- disable stock deploy plugin -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -186,6 +170,7 @@
                 <version>3.5.3</version>
                 <configuration>
                     <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory"/>
+                    <argLine>-Dslf4j.provider=ch.qos.logback.classic.spi.LogbackServiceProvider</argLine>
                     <useModulePath>true</useModulePath>
                     <includes>
                         <include>${test.include}</include>
@@ -193,14 +178,6 @@
                     <excludes>
                         <exclude>${test.exclude}</exclude>
                     </excludes>
-                    <environmentVariables>
-                        <!-- needed for testing Sender.fromEnv() -->
-                        <QDB_CLIENT_CONF>
-                            tcp::addr=localhost:9002;user=testUser1;token=UvuVb1USHGRRT08gEnwN2zGZrvM4MsLQ5brgF6SVkAw=;
-                        </QDB_CLIENT_CONF>
-                        <!-- Used by cargo when running a test with code coverage -->
-                        <LLVM_PROFILE_FILE>questdbr-junit.profraw</LLVM_PROFILE_FILE>
-                    </environmentVariables>
                 </configuration>
             </plugin>
         </plugins>
@@ -447,6 +424,12 @@
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <version>42.7.9</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>1.5.25</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

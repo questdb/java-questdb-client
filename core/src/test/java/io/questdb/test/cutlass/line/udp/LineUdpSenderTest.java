@@ -25,7 +25,6 @@
 package io.questdb.test.cutlass.line.udp;
 
 import io.questdb.cutlass.line.AbstractLineSender;
-import io.questdb.std.datetime.microtime.MicrosFormatUtils;
 import org.junit.Test;
 
 import java.time.Instant;
@@ -73,7 +72,7 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
     @Test
     public void testExplicitTimestamp() throws Exception {
         String tableName = createTrackedTable("udp_ts");
-        long ts = MicrosFormatUtils.parseTimestamp("2025-01-15T12:30:00.000000Z");
+        long ts = Instant.now().toEpochMilli() * 1000;
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
                     .symbol("city", "paris")
