@@ -45,11 +45,11 @@ jobs:
         run: |
           mkdir -p core/src/main/resources/io/questdb/client/bin/darwin-aarch64/
           mkdir -p core/src/main/bin/darwin-aarch64/
-          cp core/target/classes/io/questdb/client/bin-local/libquestdb.dylib core/src/main/resources/io/questdb/bin/darwin-aarch64/
+          cp core/target/classes/io/questdb/client/bin-local/libquestdb.dylib core/src/main/resources/io/questdb/client/bin/darwin-aarch64/
       - name: Copy darwin-x86-64 CXX Library to the final directory
         if: ${{ matrix.os == 'macos-15-intel' }}
         run: |
-          mkdir -p core/src/main/resources/io/questdb/bin/darwin-x86-64/
+          mkdir -p core/src/main/resources/io/questdb/client/bin/darwin-x86-64/
           mkdir -p core/src/main/bin/darwin-x86-64/
           cp core/target/classes/io/questdb/client/bin-local/libquestdb.dylib core/src/main/resources/io/questdb/client/bin/darwin-x86-64/
       - name: Save darwin-aarch64 Libraries to Cache
