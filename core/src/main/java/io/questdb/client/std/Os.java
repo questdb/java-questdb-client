@@ -226,8 +226,8 @@ public final class Os {
                 throw new Error("Unsupported OS: " + osName);
             }
 
-            String prdLibRoot = "/io/questdb/bin/" + name + '-' + archName + '/';
-            String devCXXLibRoot = "/io/questdb/bin-local/";
+            String prdLibRoot = "/io/questdb/client/bin/" + name + '-' + archName + '/';
+            String devCXXLibRoot = "/io/questdb/client/bin-local/";
             String cxxLibName = "libquestdb" + outputLibExt;
             String devCXXLib = devCXXLibRoot + cxxLibName;
 

@@ -103,7 +103,7 @@ else ()
     )
 endif ()
 
-set(OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/bin-local/)
+set(OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/client/bin-local/)
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${OUTPUT})
@@ -213,8 +213,8 @@ endif ()
 
 # Define the secondary output directory
 
-set(SECONDARY_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/questdb/bin-local/)
-set(SECONDARY_OUTPUT2 ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/bin-local/)
+set(SECONDARY_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/questdb/client/bin-local/)
+set(SECONDARY_OUTPUT2 ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/client/bin-local/)
 
 add_custom_command(TARGET questdb POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SECONDARY_OUTPUT}

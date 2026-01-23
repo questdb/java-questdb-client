@@ -28,6 +28,8 @@ import io.questdb.client.std.Os;
 import org.junit.runner.Description;
 import org.junit.runner.notification.Failure;
 import org.junit.runner.notification.RunListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
@@ -35,7 +37,7 @@ import java.lang.management.ThreadMXBean;
 
 @RunListener.ThreadSafe
 public class TestListener extends RunListener {
-    //    private static final Logger LOG = LoggerFactory.getLogger(TestListener.class);
+    private static final Logger LOG = LoggerFactory.getLogger(TestListener.class);
     long testStartMs = -1;
 
     public static void dumpThreadStacks() {
@@ -64,13 +66,13 @@ public class TestListener extends RunListener {
     @Override
     public void testAssumptionFailure(Failure failure) {
         Description description = failure.getDescription();
-//        LOG.error("***** Test Assumption Violated ***** {}.{} duration_ms={} : {}", description.getClassName(), description.getMethodName(), getTestDuration(), failure.getException().toString());
+        LOG.error("***** Test Assumption Violated ***** {}.{} duration_ms={} : {}", description.getClassName(), description.getMethodName(), getTestDuration(), failure.getException().toString());
     }
 
     @Override
     public void testFailure(Failure failure) {
         Description description = failure.getDescription();
-//        LOG.error("***** Test Failed ***** {}.{} duration_ms={} : {}", description.getClassName(), description.getMethodName(), getTestDuration(), failure.getException().toString());
+        LOG.error("***** Test Failed ***** {}.{} duration_ms={} : {}", description.getClassName(), description.getMethodName(), getTestDuration(), failure.getException().toString());
     }
 
     @Override
