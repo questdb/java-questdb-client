@@ -25,7 +25,7 @@
 #include <unistd.h>
 #include "files.h"
 
-JNIEXPORT jint JNICALL Java_io_questdb_std_Files_close0
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_close0
         (JNIEnv *e, jclass cl, jint fd) {
     return close((int) fd);
 }

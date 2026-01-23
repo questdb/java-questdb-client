@@ -30,7 +30,7 @@
 #include <stddef.h>
 #include <string.h>
 
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_msgHeaders
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_msgHeaders
         (JNIEnv *e, jclass cl, jint blockSize, jint blockCount) {
     struct mmsghdr *msgs = malloc(sizeof(struct mmsghdr) * blockCount);
     struct iovec *iovecs = malloc(sizeof(struct iovec) * blockCount);
@@ -48,22 +48,22 @@ JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_msgHeaders
     return (jlong) msgs;
 }
 
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_getMsgHeaderSize
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_getMsgHeaderSize
         (JNIEnv *e, jclass cl) {
     return sizeof(struct mmsghdr);
 }
 
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_getMsgHeaderBufferAddressOffset
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_getMsgHeaderBufferAddressOffset
         (JNIEnv *e, jclass cl) {
     return offsetof(struct mmsghdr, msg_hdr) + offsetof(struct msghdr, msg_iov);
 }
 
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_getMsgHeaderBufferLengthOffset
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_getMsgHeaderBufferLengthOffset
         (JNIEnv *e, jclass cl) {
     return (jint) offsetof(struct mmsghdr, msg_len);
 }
 
-JNIEXPORT void JNICALL Java_io_questdb_network_Net_freeMsgHeaders
+JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_freeMsgHeaders
         (JNIEnv *e, jclass cl, jlong address) {
     struct mmsghdr *msgs = (struct mmsghdr *) address;
     free(msgs[0].msg_hdr.msg_iov->iov_base);

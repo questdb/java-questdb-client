@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-open module io.questdb {
+open module io.questdb.client {
     requires transitive jdk.unsupported;
     requires static org.jetbrains.annotations;
     requires static java.management;
@@ -31,30 +31,29 @@ open module io.questdb {
     requires java.sql;
     requires org.slf4j;
 
-    exports io.questdb;
-    exports io.questdb.cairo;
-
-    exports io.questdb.cutlass.http;
-    exports io.questdb.cutlass.json;
-    exports io.questdb.cutlass.line;
-    exports io.questdb.cutlass.line.tcp;
-    exports io.questdb.cutlass.line.http;
-
-    exports io.questdb.std;
-    exports io.questdb.std.datetime;
-    exports io.questdb.std.datetime.microtime;
-    exports io.questdb.std.datetime.nanotime;
-    exports io.questdb.std.str;
-    exports io.questdb.std.ex;
-    exports io.questdb.std.fastdouble;
-    exports io.questdb.network;
-    exports io.questdb.cairo.vm.api;
-    exports io.questdb.cutlass.http.client;
-    exports io.questdb.cutlass.auth;
     exports io.questdb.client;
-    exports io.questdb.std.bytes;
+    exports io.questdb.client.cairo;
+
+    exports io.questdb.client.cutlass.http;
+    exports io.questdb.client.cutlass.json;
+    exports io.questdb.client.cutlass.line;
+    exports io.questdb.client.cutlass.line.tcp;
+    exports io.questdb.client.cutlass.line.http;
+
+    exports io.questdb.client.std;
+    exports io.questdb.client.std.datetime;
+    exports io.questdb.client.std.datetime.microtime;
+    exports io.questdb.client.std.datetime.nanotime;
+    exports io.questdb.client.std.str;
+    exports io.questdb.client.std.ex;
+    exports io.questdb.client.std.fastdouble;
+    exports io.questdb.client.network;
+    exports io.questdb.client.cairo.vm.api;
+    exports io.questdb.client.cutlass.http.client;
+    exports io.questdb.client.cutlass.auth;
+    exports io.questdb.client.std.bytes;
     exports io.questdb.client.impl;
-    exports io.questdb.cairo.arr;
-    exports io.questdb.cutlass.line.array;
-    exports io.questdb.cutlass.line.udp;
+    exports io.questdb.client.cairo.arr;
+    exports io.questdb.client.cutlass.line.array;
+    exports io.questdb.client.cutlass.line.udp;
 }

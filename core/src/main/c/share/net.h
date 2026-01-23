@@ -15,171 +15,171 @@ extern "C" {
 #define com_questdb_network_Net_EOTHERDISCONNECT -2L
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    configureNonBlocking
  * Signature: (I)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_configureNonBlocking
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_configureNonBlocking
         (JNIEnv *, jclass, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    connect
  * Signature: (IJ)J
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_connect
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_connect
         (JNIEnv *, jclass, jint, jlong);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    freeMsgHeaders
  * Signature: (J)V
  */
-JNIEXPORT void JNICALL Java_io_questdb_network_Net_freeMsgHeaders
+JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_freeMsgHeaders
         (JNIEnv *, jclass, jlong);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    freeSockAddr0
  * Signature: (J)V
  */
-JNIEXPORT void JNICALL Java_io_questdb_network_Net_freeSockAddr0
+JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_freeSockAddr0
         (JNIEnv *, jclass, jlong);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    join
  * Signature: (III)Z
  */
-JNIEXPORT jboolean JNICALL Java_io_questdb_network_Net_join
+JNIEXPORT jboolean JNICALL Java_io_questdb_client_network_Net_join
         (JNIEnv *, jclass, jint, jint, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    msgHeaders
  * Signature: (II)J
  */
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_msgHeaders
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_msgHeaders
         (JNIEnv *, jclass, jint, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    recv
  * Signature: (IJI)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_recv
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_recv
         (JNIEnv *, jclass, jint, jlong, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    send
  * Signature: (IJI)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_send
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_send
         (JNIEnv *, jclass, jint, jlong, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    getSndBuf
  * Signature: (I)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_getSndBuf
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_getSndBuf
         (JNIEnv *, jclass, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    setSndBuf
  * Signature: (II)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_setSndBuf
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_setSndBuf
         (JNIEnv *, jclass, jint, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    setTcpNoDelay
  * Signature: (IZ)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_setTcpNoDelay
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_setTcpNoDelay
         (JNIEnv *, jclass, jint, jboolean);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    sockaddr0
  * Signature: (II)J
  */
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_sockaddr0
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_sockaddr0
         (JNIEnv *, jclass, jint, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    socketTcp
  * Signature: (Z)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_socketTcp
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_socketTcp
         (JNIEnv *, jclass, jboolean);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    getMsgHeaderSize
  * Signature: ()J
  */
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_getMsgHeaderSize
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_getMsgHeaderSize
         (JNIEnv *, jclass);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    getMsgHeaderBufferAddressOffset
  * Signature: ()J
  */
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_getMsgHeaderBufferAddressOffset
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_getMsgHeaderBufferAddressOffset
         (JNIEnv *, jclass);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    getMsgHeaderBufferLengthOffset
  * Signature: ()J
  */
-JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_getMsgHeaderBufferLengthOffset
+JNIEXPORT jlong JNICALL Java_io_questdb_client_network_Net_getMsgHeaderBufferLengthOffset
         (JNIEnv *, jclass);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    getEwouldblock
  * Signature: ()I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_getEwouldblock
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_getEwouldblock
         (JNIEnv *, jclass);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    socketUdp
  * Signature: ()I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_socketUdp
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_socketUdp
         (JNIEnv *, jclass);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    setMulticastInterface
  * Signature: (II)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_setMulticastInterface
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_setMulticastInterface
         (JNIEnv *, jclass, jint, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    setMulticastTtl
  * Signature: (II)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_setMulticastTtl
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_setMulticastTtl
         (JNIEnv *, jclass, jint, jint);
 
 /*
- * Class:     com_questdb_network_Net
+ * Class:     io_questdb_client_network_Net
  * Method:    sendTo
  * Signature: (IJIJ)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_sendTo
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendTo
         (JNIEnv *, jclass, jint, jlong, jint, jlong);
 
 #ifdef __cplusplus

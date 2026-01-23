@@ -132,38 +132,38 @@ std::byte* questdb_byte_sink_book(questdb_byte_sink_t* sink, size_t min_len) {
 }
 
 extern "C" {
-    JNIEXPORT jlong JNICALL Java_io_questdb_std_bytes_DirectByteSink_implCreate(
+    JNIEXPORT jlong JNICALL Java_io_questdb_client_std_bytes_DirectByteSink_implCreate(
             JNIEnv *env,
             jclass cl,
             jlong capacity);
 
-    JNIEXPORT void JNICALL Java_io_questdb_std_bytes_DirectByteSink_implDestroy(
+    JNIEXPORT void JNICALL Java_io_questdb_client_std_bytes_DirectByteSink_implDestroy(
             JNIEnv *env,
             jclass cl,
             jlong impl);
 
-    JNIEXPORT jlong JNICALL Java_io_questdb_std_bytes_DirectByteSink_implBook(
+    JNIEXPORT jlong JNICALL Java_io_questdb_client_std_bytes_DirectByteSink_implBook(
             JNIEnv *env,
             jclass cl,
             jlong impl,
             jlong min_len);
 }
 
-JNIEXPORT jlong JNICALL Java_io_questdb_std_bytes_DirectByteSink_implCreate(
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_bytes_DirectByteSink_implCreate(
         JNIEnv *env,
         jclass cl,
         jlong capacity) {
     return (jlong) create(capacity);
 }
 
-JNIEXPORT void JNICALL Java_io_questdb_std_bytes_DirectByteSink_implDestroy(
+JNIEXPORT void JNICALL Java_io_questdb_client_std_bytes_DirectByteSink_implDestroy(
         JNIEnv *env,
         jclass cl,
         jlong impl) {
     destroy((questdb_byte_sink_t*) impl);
 }
 
-JNIEXPORT jlong JNICALL Java_io_questdb_std_bytes_DirectByteSink_implBook(
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_bytes_DirectByteSink_implBook(
         JNIEnv *env,
         jclass cl,
         jlong impl,

@@ -32,7 +32,7 @@
 extern "C" {
 
 DECLARE_DISPATCHER(platform_memcpy);
-JNIEXPORT void JNICALL Java_io_questdb_std_Vect_memcpy0
+JNIEXPORT void JNICALL Java_io_questdb_client_std_Vect_memcpy0
         (JNIEnv *e, jclass cl, jlong src, jlong dst, jlong len) {
     platform_memcpy(
             reinterpret_cast<void *>(dst),
@@ -42,7 +42,7 @@ JNIEXPORT void JNICALL Java_io_questdb_std_Vect_memcpy0
 }
 
 DECLARE_DISPATCHER(platform_memmove);
-JNIEXPORT void JNICALL Java_io_questdb_std_Vect_memmove
+JNIEXPORT void JNICALL Java_io_questdb_client_std_Vect_memmove
         (JNIEnv *e, jclass cl, jlong dst, jlong src, jlong len) {
     platform_memmove(
             reinterpret_cast<void *>(dst),
@@ -52,7 +52,7 @@ JNIEXPORT void JNICALL Java_io_questdb_std_Vect_memmove
 }
 
 DECLARE_DISPATCHER(platform_memset);
-JNIEXPORT void JNICALL Java_io_questdb_std_Vect_memset
+JNIEXPORT void JNICALL Java_io_questdb_client_std_Vect_memset
         (JNIEnv *e, jclass cl, jlong dst, jlong len, jint value) {
     platform_memset(
             reinterpret_cast<void *>(dst),

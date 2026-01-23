@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 open module io.questdb.test {
-    requires transitive io.questdb;
+    requires transitive io.questdb.client;
     requires static junit;
     requires transitive jdk.unsupported;
     requires static org.jetbrains.annotations;
@@ -31,7 +31,8 @@ open module io.questdb.test {
     requires jdk.management;
     requires org.slf4j;
     requires java.sql;
+    requires org.postgresql.jdbc;
 
-    exports io.questdb.test;
-    exports io.questdb.test.cairo;
+    exports io.questdb.client.test;
+    exports io.questdb.client.test.cairo;
 }

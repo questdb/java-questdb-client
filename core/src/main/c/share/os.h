@@ -22,10 +22,10 @@ extern "C" {
  * Method:    currentTimeMicros
  * Signature: ()J
  */
-JNIEXPORT jlong JNICALL Java_io_questdb_std_Os_currentTimeMicros
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Os_currentTimeMicros
         (JNIEnv *, jclass);
 
-JNIEXPORT jlong JNICALL Java_io_questdb_std_Os_currentTimeNanos
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Os_currentTimeNanos
         (JNIEnv *e, jclass cl);
 
 /*
@@ -33,7 +33,7 @@ JNIEXPORT jlong JNICALL Java_io_questdb_std_Os_currentTimeNanos
  * Method:    errno
  * Signature: ()I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_std_Os_errno
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Os_errno
         (JNIEnv *, jclass);
 
 #ifdef __cplusplus

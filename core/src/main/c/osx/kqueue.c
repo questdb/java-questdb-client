@@ -31,57 +31,57 @@
 #include "jni.h"
 #include "../share/sysutil.h"
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getEvfiltRead
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getEvfiltRead
         (JNIEnv *e, jclass cl) {
     return EVFILT_READ;
 }
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getEvfiltWrite
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getEvfiltWrite
         (JNIEnv *e, jclass cl) {
     return EVFILT_WRITE;
 }
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getSizeofKevent
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getSizeofKevent
         (JNIEnv *e, jclass cl) {
     return (short) sizeof(struct kevent);
 }
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getFdOffset
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getFdOffset
         (JNIEnv *e, jclass cl) {
     return (short) offsetof(struct kevent, ident);
 }
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getFilterOffset
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getFilterOffset
         (JNIEnv *e, jclass cl) {
     return (short) offsetof(struct kevent, filter);
 }
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getDataOffset
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getDataOffset
         (JNIEnv *e, jclass cl) {
     return (short) offsetof(struct kevent, udata);
 }
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getFlagsOffset
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getFlagsOffset
         (JNIEnv *e, jclass cl) {
     return (short) offsetof(struct kevent, flags);
 }
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getEvAdd
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getEvAdd
         (JNIEnv *e, jclass cl) {
     return EV_ADD;
 }
 
-JNIEXPORT jshort JNICALL Java_io_questdb_KqueueAccessor_getEvOneshot
+JNIEXPORT jshort JNICALL Java_io_questdb_client_KqueueAccessor_getEvOneshot
         (JNIEnv *e, jclass cl) {
     return EV_ONESHOT;
 }
 
-JNIEXPORT jint JNICALL Java_io_questdb_KqueueAccessor_kqueue
+JNIEXPORT jint JNICALL Java_io_questdb_client_KqueueAccessor_kqueue
         (JNIEnv *e, jclass cl) {
     return kqueue();
 }
 
-JNIEXPORT jint JNICALL Java_io_questdb_KqueueAccessor_kevent
+JNIEXPORT jint JNICALL Java_io_questdb_client_KqueueAccessor_kevent
         (JNIEnv *e, jclass cl, jint kq, jlong changelist, jint nChanges, jlong eventlist, jint nEvents, jint timeout_msec) {
     long MILLION = 1000 * 1000;
     long BILLION = 1000 * MILLION;

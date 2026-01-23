@@ -24,7 +24,7 @@
 
 package io.questdb.client.impl;
 
-import io.questdb.std.str.StringSink;
+import io.questdb.client.std.str.StringSink;
 
 /**
  * Zero allocation configuration string parser.

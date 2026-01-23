@@ -12,7 +12,7 @@ extern "C" {
  * Method:    close0
  * Signature: (I)I
  */
-JNIEXPORT jint JNICALL Java_io_questdb_std_Files_close0
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_close0
         (JNIEnv *, jclass, jint);
 
 #ifdef __cplusplus

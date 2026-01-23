@@ -36,7 +36,7 @@
 #include <stdio.h>
 #include <ntdef.h>
 
-JNIEXPORT jint JNICALL Java_io_questdb_std_Files_close0
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_close0
         (JNIEnv *e, jclass cl, jint fd) {
     jint r = CloseHandle(FD_TO_HANDLE(fd));
     if (!r) {

@@ -24,8 +24,8 @@
 
 package io.questdb.client;
 
-import io.questdb.cutlass.line.array.DoubleArray;
-import io.questdb.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.line.array.DoubleArray;
+import io.questdb.client.cutlass.line.array.LongArray;
 import org.jetbrains.annotations.NotNull;
 
 public interface ArraySender<T> {
