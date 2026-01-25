@@ -39,7 +39,7 @@
         <test.include>%regex[.*[^o].class]</test.include><!-- exclude module-info.class-->
     </properties>
 
-    <version>9.3.2-SNAPSHOT</version>
+    <version>1.0.0-SNAPSHOT</version>
     <groupId>org.questdb</groupId>
     <artifactId>client</artifactId>
     <packaging>jar</packaging>

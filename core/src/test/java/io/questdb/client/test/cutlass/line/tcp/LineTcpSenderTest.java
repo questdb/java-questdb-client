@@ -26,7 +26,6 @@ package io.questdb.client.test.cutlass.line.tcp;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cairo.ColumnType;
-import io.questdb.client.cutlass.auth.AuthUtils;
 import io.questdb.client.cutlass.line.AbstractLineTcpSender;
 import io.questdb.client.cutlass.line.LineChannel;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -35,7 +34,6 @@ import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
 import io.questdb.client.network.NetworkFacadeImpl;
 import io.questdb.client.std.Decimal256;
-import io.questdb.client.std.Numbers;
 import io.questdb.client.std.datetime.microtime.Micros;
 import io.questdb.client.std.datetime.microtime.MicrosecondClockImpl;
 import io.questdb.client.std.datetime.nanotime.Nanos;
@@ -44,7 +42,6 @@ import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
 
-import java.security.PrivateKey;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Random;
@@ -62,14 +59,6 @@ import static org.junit.Assert.*;
  * Integration tests use external QuestDB via AbstractLineTcpSenderTest infrastructure.
  */
 public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
-
-    private final static String AUTH_KEY_ID1 = "testUser1";
-    private final static String AUTH_KEY_ID2_INVALID = "invalid";
-    private final static int HOST = Numbers.parseIPv4("127.0.0.1");
-    private static final Consumer<Sender> SET_TABLE_NAME_ACTION = s -> s.table("test_mytable");
-    private final static String TOKEN = "UvuVb1USHGRRT08gEnwN2zGZrvM4MsLQ5brgF6SVkAw=";
-    private final static PrivateKey AUTH_PRIVATE_KEY1 = AuthUtils.toPrivateKey(TOKEN);
-
     @Test
     public void testArrayAtNow() throws Exception {
         String table = "test_array_at_now";
