@@ -1,0 +1,30 @@
+# Run the Java client tests against local instances of QuestDB
+variables:
+  QUESTDB_ILP_TCP_AUTH_ENABLE: "false"
+
+steps:
+  - script: |
+      git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
+    displayName: git clone questdb
+  - task: Maven@3
+    displayName: "Compile QuestDB"
+    inputs:
+      mavenPOMFile: "questdb/pom.xml"
+      jdkVersionOption: "1.17"
+      options: "-DskipTests -Pbuild-web-console"
+  - template: ci/questdb_start.yaml
+    parameters:
+      configPath: "ci/server.conf"
+  - task: Maven@3
+    displayName: "Run Client Tests"
+    inputs:
+      mavenPOMFile: "pom.xml"
+      jdkVersionOption: "1.17"
+      goals: "test"
+  - template: ci/questdb_start.yaml
+    parameters:
+      configPath: "ci/server_auth.conf"
+  - script: |
+      echo "Stopping QuestDB server..."
+      pkill -f io.questdb.ServerMain || true
+    displayName: "Stop QuestDB server"

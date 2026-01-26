@@ -1,0 +1,33 @@
+trigger: none
+
+stages:
+  - stage: BuildAndTest
+    displayName: "Building and testing"
+    jobs:
+      - job: RunOn
+        displayName: "on"
+        strategy:
+          matrix:
+            linux-x64:
+              imageName: "ubuntu-latest"
+              poolName: "Azure Pipelines"
+            mac-arm:
+              imageName: "macos-15-arm64"
+              poolName: "Azure Pipelines"
+            mac-x64:
+              imageName: "macos-15"
+              poolName: "Azure Pipelines"
+            windows-msvc-2019-x64:
+              imageName: "windows-2019"
+              poolName: "Azure Pipelines"
+        pool:
+          name: $(poolName)
+          vmImage: $(imageName)
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: setup.yaml
+          - template: local_tests.yaml

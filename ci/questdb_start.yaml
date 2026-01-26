@@ -1,0 +1,29 @@
+parameters:
+  - name: configPath
+    type: string
+
+steps:
+  - script: |
+      echo "Stopping QuestDB server..."
+      pkill -f io.questdb.ServerMain || true
+
+      # Remove any existing data
+      rm -rf questdb-data
+      mkdir -p questdb-data/conf
+      cp -r ${{ parameters.configPath }} questdb-data/conf
+
+      # Start QuestDB in the background
+      java -p core/target/questdb-*-SNAPSHOT.jar -m io.questdb/io.questdb.ServerMain -d questdb-data > questdb.log 2>&1 &
+
+      # Wait for QuestDB to start
+      echo "Waiting for QuestDB to start..."
+      for i in {1..30}; do
+        if grep -q "Server online" questdb.log; then
+          echo "server-main enjoy"
+          break
+        else
+          echo "Waiting..."
+          sleep 2
+        fi
+      done
+    displayName: "Start QuestDB server"
