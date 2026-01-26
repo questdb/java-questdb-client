@@ -474,7 +474,8 @@ public class Decimal64 implements Sinkable, Decimal {
     @Override
     public boolean equals(Object obj) {
         if (this == obj) return true;
-        if (!(obj instanceof Decimal64 other)) return false;
+        if (!(obj instanceof Decimal64)) return false;
+        Decimal64 other = (Decimal64) obj;
 
         final boolean isNull = isNull();
         final boolean otherIsNull = other.isNull();
@@ -932,11 +933,14 @@ public class Decimal64 implements Sinkable, Decimal {
                 if (cmp > 0) {
                     return true;
                 } else if (cmp == 0) {
-                    return switch (roundingMode) {
-                        case HALF_UP -> true;
-                        case HALF_EVEN -> oddQuotient;
-                        default -> false;
-                    };
+                    switch (roundingMode) {
+                        case HALF_UP:
+                            return true;
+                        case HALF_EVEN:
+                            return oddQuotient;
+                        default:
+                            return false;
+                    }
                 } else {
                     return false;
                 }

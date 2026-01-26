@@ -334,66 +334,70 @@ public abstract class AbstractLineHttpSender implements Sender {
             throw new LineSenderException("Failed to detect server line protocol version");
         }
 
-        return switch (protocolVersion) {
-            case PROTOCOL_VERSION_V1 -> new LineHttpSenderV1(
-                    hosts,
-                    ports,
-                    path,
-                    clientConfiguration,
-                    tlsConfig,
-                    cli,
-                    autoFlushRows,
-                    authToken,
-                    username,
-                    password,
-                    maxNameLength,
-                    maxRetriesNanos,
-                    maxBackoffMillis,
-                    minRequestThroughput,
-                    flushIntervalNanos,
-                    currentAddressIndex,
-                    rnd
-            );
-            case PROTOCOL_VERSION_V2 -> new LineHttpSenderV2(
-                    hosts,
-                    ports,
-                    path,
-                    clientConfiguration,
-                    tlsConfig,
-                    cli,
-                    autoFlushRows,
-                    authToken,
-                    username,
-                    password,
-                    maxNameLength,
-                    maxRetriesNanos,
-                    maxBackoffMillis,
-                    minRequestThroughput,
-                    flushIntervalNanos,
-                    currentAddressIndex,
-                    rnd
-            );
-            case PROTOCOL_VERSION_V3 -> new LineHttpSenderV3(
-                    hosts,
-                    ports,
-                    path,
-                    clientConfiguration,
-                    tlsConfig,
-                    cli,
-                    autoFlushRows,
-                    authToken,
-                    username,
-                    password,
-                    maxNameLength,
-                    maxRetriesNanos,
-                    maxBackoffMillis,
-                    minRequestThroughput,
-                    flushIntervalNanos,
-                    currentAddressIndex,
-                    rnd
-            );
-            default -> throw new LineSenderException("Unsupported protocol version: " + protocolVersion);
-        };
+        switch (protocolVersion) {
+            case PROTOCOL_VERSION_V1:
+                return new LineHttpSenderV1(
+                        hosts,
+                        ports,
+                        path,
+                        clientConfiguration,
+                        tlsConfig,
+                        cli,
+                        autoFlushRows,
+                        authToken,
+                        username,
+                        password,
+                        maxNameLength,
+                        maxRetriesNanos,
+                        maxBackoffMillis,
+                        minRequestThroughput,
+                        flushIntervalNanos,
+                        currentAddressIndex,
+                        rnd
+                );
+            case PROTOCOL_VERSION_V2:
+                return new LineHttpSenderV2(
+                        hosts,
+                        ports,
+                        path,
+                        clientConfiguration,
+                        tlsConfig,
+                        cli,
+                        autoFlushRows,
+                        authToken,
+                        username,
+                        password,
+                        maxNameLength,
+                        maxRetriesNanos,
+                        maxBackoffMillis,
+                        minRequestThroughput,
+                        flushIntervalNanos,
+                        currentAddressIndex,
+                        rnd
+                );
+            case PROTOCOL_VERSION_V3:
+                return new LineHttpSenderV3(
+                        hosts,
+                        ports,
+                        path,
+                        clientConfiguration,
+                        tlsConfig,
+                        cli,
+                        autoFlushRows,
+                        authToken,
+                        username,
+                        password,
+                        maxNameLength,
+                        maxRetriesNanos,
+                        maxBackoffMillis,
+                        minRequestThroughput,
+                        flushIntervalNanos,
+                        currentAddressIndex,
+                        rnd
+                );
+            default:
+                throw new LineSenderException("Unsupported protocol version: " + protocolVersion);
+        }
     }
 
     public static boolean isNotFound(DirectUtf8Sequence statusCode) {

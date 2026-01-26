@@ -183,9 +183,15 @@ public interface Utf8Sink extends CharSink<Utf8Sink> {
 
     private void escapeAscii(char c) {
         switch (c) {
-            case '"' -> putAscii("\"\"");
-            case '\\' -> putAscii("\\\\");
-            default -> putAscii(c);
+            case '"':
+                putAscii("\"\"");
+                break;
+            case '\\':
+                putAscii("\\\\");
+                break;
+            default:
+                putAscii(c);
+                break;
         }
     }
 }

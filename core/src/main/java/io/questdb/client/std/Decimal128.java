@@ -756,7 +756,8 @@ public class Decimal128 implements Sinkable, Decimal {
     @Override
     public boolean equals(Object obj) {
         if (this == obj) return true;
-        if (!(obj instanceof Decimal128 other)) return false;
+        if (!(obj instanceof Decimal128)) return false;
+        Decimal128 other = (Decimal128) obj;
 
         final boolean isNull = isNull();
         final boolean otherIsNull = other.isNull();

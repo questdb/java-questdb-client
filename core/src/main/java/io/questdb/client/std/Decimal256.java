@@ -1093,38 +1093,36 @@ public class Decimal256 implements Sinkable, Decimal {
      * @return true if the value fits within the storage size, false otherwise
      */
     public boolean fitsInStorageSizePow2(int size) {
-        return switch (size) {
-            case 0 -> // 1 byte - max magnitude 127
-                    (hh == 0 || hh == -1) &&
-                            (hl == 0 || hl == -1) &&
-                            (lh == 0 || lh == -1) &&
-                            Math.abs(ll) <= 0x7FL;
-            case 1 -> // 2 bytes - max magnitude 32,767
-                    (hh == 0 || hh == -1) &&
-                            (hl == 0 || hl == -1) &&
-                            (lh == 0 || lh == -1) &&
-                            Math.abs(ll) <= 0x7FFFL;
-            case 2 -> // 4 bytes - max magnitude 2,147,483,647
-                    (hh == 0 || hh == -1) &&
-                            (hl == 0 || hl == -1) &&
-                            (lh == 0 || lh == -1) &&
-                            Math.abs(ll) <= 0x7FFFFFFFL;
-            case 3 -> // 8 bytes - max magnitude 9,223,372,036,854,775,807
-                    (hh == 0 || hh == -1) &&
-                            (hl == 0 || hl == -1) &&
-                            (lh == 0 || lh == -1);
-            // ll can use full long range
-
-            case 4 -> // 128-bit storage
-                    (hh == 0 || hh == -1) &&
-                            (hl == 0 || hl == -1);
-            // lh and ll can use full range
-
-            case 5 -> // 256-bit storage
-                    true; // Always fits in 256-bit
-
-            default -> false;
-        };
+        switch (size) {
+            case 0: // 1 byte - max magnitude 127
+                return (hh == 0 || hh == -1) &&
+                        (hl == 0 || hl == -1) &&
+                        (lh == 0 || lh == -1) &&
+                        Math.abs(ll) <= 0x7FL;
+            case 1: // 2 bytes - max magnitude 32,767
+                return (hh == 0 || hh == -1) &&
+                        (hl == 0 || hl == -1) &&
+                        (lh == 0 || lh == -1) &&
+                        Math.abs(ll) <= 0x7FFFL;
+            case 2: // 4 bytes - max magnitude 2,147,483,647
+                return (hh == 0 || hh == -1) &&
+                        (hl == 0 || hl == -1) &&
+                        (lh == 0 || lh == -1) &&
+                        Math.abs(ll) <= 0x7FFFFFFFL;
+            case 3: // 8 bytes - max magnitude 9,223,372,036,854,775,807
+                // ll can use full long range
+                return (hh == 0 || hh == -1) &&
+                        (hl == 0 || hl == -1) &&
+                        (lh == 0 || lh == -1);
+            case 4: // 128-bit storage
+                // lh and ll can use full range
+                return (hh == 0 || hh == -1) &&
+                        (hl == 0 || hl == -1);
+            case 5: // 256-bit storage
+                return true; // Always fits in 256-bit
+            default:
+                return false;
+        }
     }
 
     /**

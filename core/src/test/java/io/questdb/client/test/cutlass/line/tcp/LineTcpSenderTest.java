@@ -56,7 +56,8 @@ import static org.junit.Assert.*;
  * Tests for LineTcpSender.
  * <p>
  * Unit tests use DummyLineChannel/ByteChannel (no server needed).
- * Integration tests use external QuestDB via AbstractLineTcpSenderTest infrastructure.
+ * Integration tests use external QuestDB via AbstractLineTcpSenderTest
+ * infrastructure.
  */
 public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     @Test
@@ -65,11 +66,10 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         useTable(table);
 
         try (Sender sender = createTcpSender(PROTOCOL_VERSION_V2);
-             DoubleArray a1 = new DoubleArray(1, 1, 2, 1).setAll(1)
-        ) {
+                DoubleArray a1 = new DoubleArray(1, 1, 2, 1).setAll(1)) {
             sender.table(table)
                     .symbol("x", "42i")
-                    .symbol("y", "[6f1.0,2.5,3.0,4.5,5.0]")  // ensuring no array parsing for symbol
+                    .symbol("y", "[6f1.0,2.5,3.0,4.5,5.0]") // ensuring no array parsing for symbol
                     .longColumn("l1", 23452345)
                     .doubleArray("a1", a1)
                     .atNow();
@@ -85,17 +85,16 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         useTable(table);
 
         try (Sender sender = createTcpSender(PROTOCOL_VERSION_V2);
-             DoubleArray a4 = new DoubleArray(1, 1, 2, 1).setAll(4);
-             DoubleArray a5 = new DoubleArray(3, 2, 1, 4, 1).setAll(5);
-             DoubleArray a6 = new DoubleArray(1, 3, 4, 2, 1, 1).setAll(6)
-        ) {
+                DoubleArray a4 = new DoubleArray(1, 1, 2, 1).setAll(4);
+                DoubleArray a5 = new DoubleArray(3, 2, 1, 4, 1).setAll(5);
+                DoubleArray a6 = new DoubleArray(1, 3, 4, 2, 1, 1).setAll(6)) {
             long ts = Micros.floor("2025-02-22T00:00:00.000000000Z");
             double[] arr1d = createDoubleArray(5);
             double[][] arr2d = createDoubleArray(2, 3);
             double[][][] arr3d = createDoubleArray(1, 2, 3);
             sender.table(table)
                     .symbol("x", "42i")
-                    .symbol("y", "[6f1.0,2.5,3.0,4.5,5.0]")  // ensuring no array parsing for symbol
+                    .symbol("y", "[6f1.0,2.5,3.0,4.5,5.0]") // ensuring no array parsing for symbol
                     .longColumn("l1", 23452345)
                     .doubleArray("a1", arr1d)
                     .doubleArray("a2", arr2d)
@@ -128,7 +127,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testAuthWrongKey() throws Exception {
         try (AbstractLineTcpSender sender = LineTcpSenderV2.newSender(HOST, getIlpTcpPort(), 2048)) {
             sender.authenticate(AUTH_KEY_ID2_INVALID, AUTH_PRIVATE_KEY1);
-            //30 seconds should be enough even on a slow CI server
+            // 30 seconds should be enough even on a slow CI server
             long deadline = System.nanoTime() + SECONDS.toNanos(30);
             while (System.nanoTime() < deadline) {
                 sender.metric("test_auth_wrong_key").field("my int field", 42).$();
@@ -162,7 +161,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         Assume.assumeTrue(getIlpTcpAuthEnabled());
         useTable("test_builder_auth_success_conf_string");
 
-        try (Sender sender = Sender.fromConfig("tcp::addr=" + HOST + ":" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1 + ";token=" + TOKEN + ";protocol_version=2;")) {
+        try (Sender sender = Sender.fromConfig("tcp::addr=" + HOST + ":" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1
+                + ";token=" + TOKEN + ";protocol_version=2;")) {
             sender.table("test_builder_auth_success_conf_string").longColumn("my int field", 42).atNow();
             sender.flush();
         }
@@ -230,7 +230,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
                 assertContains(e.getMessage(), "duplicated table");
             }
         }
-        assertFalse(channel.contain(new byte[]{(byte) '\n'}));
+        assertFalse(channel.contain(new byte[] { (byte) '\n' }));
     }
 
     @Test
@@ -258,7 +258,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         Assume.assumeTrue(getIlpTcpAuthEnabled());
         useTable("test_conf_string");
 
-        String confString = "tcp::addr=" + HOST + ":" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1 + ";token=" + TOKEN + ";protocol_version=2;";
+        String confString = "tcp::addr=" + HOST + ":" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1 + ";token=" + TOKEN
+                + ";protocol_version=2;";
         try (Sender sender = Sender.fromConfig(confString)) {
             long tsMicros = Micros.floor("2022-02-25");
             sender.table("test_conf_string")
@@ -272,10 +273,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_conf_string", 1);
-        assertSqlEventually("""
-                        int_field\tbool_field\tstring_field\tdouble_field\tts_field\ttimestamp
-                        42\ttrue\tfoo\t42.0\t2022-02-25T00:00:00.000000000Z\t2022-02-25T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "int_field\tbool_field\tstring_field\tdouble_field\tts_field\ttimestamp\n" +
+                        "42\ttrue\tfoo\t42.0\t2022-02-25T00:00:00.000000000Z\t2022-02-25T00:00:00.000000000Z\n",
                 "select int_field, bool_field, string_field, double_field, ts_field, timestamp from test_conf_string");
     }
 
@@ -283,10 +283,15 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testConfString_autoFlushBytes() throws Exception {
         useTable("test_conf_string_auto_flush_bytes");
 
-        String confString = "tcp::addr=localhost:" + getIlpTcpPort() + ";auto_flush_bytes=1;protocol_version=2;"; // the minimal allowed buffer size
+        String confString = "tcp::addr=localhost:" + getIlpTcpPort() + ";auto_flush_bytes=1;protocol_version=2;"; // the
+                                                                                                                  // minimal
+                                                                                                                  // allowed
+                                                                                                                  // buffer
+                                                                                                                  // size
         try (Sender sender = Sender.fromConfig(confString)) {
             // just 2 rows must be enough to trigger flush
-            // why not 1? the first byte of the 2nd row will flush the last byte of the 1st row
+            // why not 1? the first byte of the 2nd row will flush the last byte of the 1st
+            // row
             sender.table("test_conf_string_auto_flush_bytes").longColumn("my int field", 42).atNow();
             sender.table("test_conf_string_auto_flush_bytes").longColumn("my int field", 42).atNow();
 
@@ -309,74 +314,77 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     @Test
     public void testCreateTimestampColumnsWithDesignatedInstantV1() throws Exception {
         testCreateTimestampColumns(Nanos.floor("2025-11-20T10:55:24.123123123Z"), null, PROTOCOL_VERSION_V1,
-                new int[]{ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP},
+                new int[] { ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP },
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123123000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedInstantV2() throws Exception {
         testCreateTimestampColumns(Nanos.floor("2025-11-20T10:55:24.123123123Z"), null, PROTOCOL_VERSION_V2,
-                new int[]{ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO},
+                new int[] { ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO },
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123123000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedMicrosV1() throws Exception {
-        testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z"), ChronoUnit.MICROS, PROTOCOL_VERSION_V1,
-                new int[]{ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP},
+        testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z"), ChronoUnit.MICROS,
+                PROTOCOL_VERSION_V1,
+                new int[] { ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP },
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123456000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedMicrosV2() throws Exception {
-        testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z"), ChronoUnit.MICROS, PROTOCOL_VERSION_V2,
-                new int[]{ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP},
+        testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z"), ChronoUnit.MICROS,
+                PROTOCOL_VERSION_V2,
+                new int[] { ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP },
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123456000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedMillisV1() throws Exception {
-        testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z") / 1000, ChronoUnit.MILLIS, PROTOCOL_VERSION_V1,
-                new int[]{ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP},
+        testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z") / 1000, ChronoUnit.MILLIS,
+                PROTOCOL_VERSION_V1,
+                new int[] { ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP },
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123000000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedMillisV2() throws Exception {
-        testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z") / 1000, ChronoUnit.MILLIS, PROTOCOL_VERSION_V2,
-                new int[]{ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP},
+        testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z") / 1000, ChronoUnit.MILLIS,
+                PROTOCOL_VERSION_V2,
+                new int[] { ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP },
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123000000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedNanosV1() throws Exception {
         testCreateTimestampColumns(Nanos.floor("2025-11-20T10:55:24.123456789Z"), ChronoUnit.NANOS, PROTOCOL_VERSION_V1,
-                new int[]{ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP},
+                new int[] { ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP },
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123456000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedNanosV2() throws Exception {
         testCreateTimestampColumns(Nanos.floor("2025-11-20T10:55:24.123456789Z"), ChronoUnit.NANOS, PROTOCOL_VERSION_V2,
-                new int[]{ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO},
+                new int[] { ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO },
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123456000Z");
     }
 
     @Test
     public void testDecimalDefaultValuesWithoutWal() throws Exception {
         useTable("test_decimal_default_values_without_wal");
-        execute("""
-                CREATE TABLE test_decimal_default_values_without_wal (
-                    dec8 DECIMAL(2, 0),
-                    dec16 DECIMAL(4, 1),
-                    dec32 DECIMAL(8, 2),
-                    dec64 DECIMAL(16, 4),
-                    dec128 DECIMAL(34, 8),
-                    dec256 DECIMAL(64, 16),
-                    value INT,
-                    ts TIMESTAMP
-                ) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_decimal_default_values_without_wal (\n" +
+                        "    dec8 DECIMAL(2, 0),\n" +
+                        "    dec16 DECIMAL(4, 1),\n" +
+                        "    dec32 DECIMAL(8, 2),\n" +
+                        "    dec64 DECIMAL(16, 4),\n" +
+                        "    dec128 DECIMAL(34, 8),\n" +
+                        "    dec256 DECIMAL(64, 16),\n" +
+                        "    value INT,\n" +
+                        "    ts TIMESTAMP\n" +
+                        ") TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL\n");
 
         assertTableExistsEventually("test_decimal_default_values_without_wal");
 
@@ -388,10 +396,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_decimal_default_values_without_wal", 1);
-        assertSqlEventually("""
-                        dec8\tdec16\tdec32\tdec64\tdec128\tdec256\tvalue\tts
-                        null\tnull\tnull\tnull\tnull\tnull\t1\t1970-01-01T00:00:00.100000000Z
-                        """,
+        assertSqlEventually(
+                "dec8\tdec16\tdec32\tdec64\tdec128\tdec256\tvalue\tts\n" +
+                        "null\tnull\tnull\tnull\tnull\tnull\t1\t1970-01-01T00:00:00.100000000Z\n",
                 "select dec8, dec16, dec32, dec64, dec128, dec256, value, ts from test_decimal_default_values_without_wal");
     }
 
@@ -412,10 +419,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_double_edge_values", 1);
-        assertSqlEventually("""
-                        negative_inf\tpositive_inf\tnan\tmax_value\tmin_value\ttimestamp
-                        null\tnull\tnull\t1.7976931348623157E308\t4.9E-324\t2022-02-25T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "negative_inf\tpositive_inf\tnan\tmax_value\tmin_value\ttimestamp\n" +
+                        "null\tnull\tnull\t1.7976931348623157E308\t4.9E-324\t2022-02-25T00:00:00.000000000Z\n",
                 "select negative_inf, positive_inf, nan, max_value, min_value, timestamp from test_double_edge_values");
     }
 
@@ -454,14 +460,13 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     @Test
     public void testInsertBinaryToOtherColumns() throws Exception {
         useTable("test_insert_binary_to_other_columns");
-        execute("""
-                CREATE TABLE test_insert_binary_to_other_columns (
-                    x SYMBOL,
-                    y VARCHAR,
-                    a1 DOUBLE,
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_insert_binary_to_other_columns (\n" +
+                        "    x SYMBOL,\n" +
+                        "    y VARCHAR,\n" +
+                        "    a1 DOUBLE,\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL\n");
 
         assertTableExistsEventually("test_insert_binary_to_other_columns");
 
@@ -501,17 +506,16 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
             sender.table("test_insert_binary_to_other_columns")
                     .symbol("x", "x1")
                     .stringColumn("y", "ystr")
-                    .doubleArray("a1", new double[]{1.0, 2.0})
+                    .doubleArray("a1", new double[] { 1.0, 2.0 })
                     .at(100000000000L, ChronoUnit.MICROS);
             sender.flush();
         }
 
         assertTableSizeEventually("test_insert_binary_to_other_columns", 2);
-        assertSqlEventually("""
-                        x\ty\ta1\ttimestamp
-                        9999.0\tystr\t1.0\t1970-01-02T03:46:40.000000000Z
-                        10000.0\tystr\t1.0\t1970-01-02T03:46:40.000001000Z
-                        """,
+        assertSqlEventually(
+                "x\ty\ta1\ttimestamp\n" +
+                        "9999.0\tystr\t1.0\t1970-01-02T03:46:40.000000000Z\n" +
+                        "10000.0\tystr\t1.0\t1970-01-02T03:46:40.000001000Z\n",
                 "select x, y, a1, timestamp from test_insert_binary_to_other_columns order by timestamp");
     }
 
@@ -519,14 +523,13 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testInsertDecimalTextFormatBasic() throws Exception {
         String tableName = "test_decimal_text_format_basic";
         useTable(tableName);
-        execute("""
-                CREATE TABLE test_decimal_text_format_basic (
-                    price DECIMAL(10, 2),
-                    quantity DECIMAL(15, 4),
-                    rate DECIMAL(8, 5),
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_decimal_text_format_basic (\n" +
+                        "    price DECIMAL(10, 2),\n" +
+                        "    quantity DECIMAL(15, 4),\n" +
+                        "    rate DECIMAL(8, 5),\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually(tableName);
 
@@ -563,13 +566,12 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(tableName, 4);
-        assertSqlEventually("""
-                        price\tquantity\trate\ttimestamp
-                        123.45\t100.0000\t0.12345\t1970-01-02T03:46:40.000000000Z
-                        -45.67\t-10.5000\t-0.00001\t1970-01-02T03:46:40.000001000Z
-                        0.01\t0.0001\t0.00000\t1970-01-02T03:46:40.000002000Z
-                        999.00\t42.0000\t1.00000\t1970-01-02T03:46:40.000003000Z
-                        """,
+        assertSqlEventually(
+                "price\tquantity\trate\ttimestamp\n" +
+                        "123.45\t100.0000\t0.12345\t1970-01-02T03:46:40.000000000Z\n" +
+                        "-45.67\t-10.5000\t-0.00001\t1970-01-02T03:46:40.000001000Z\n" +
+                        "0.01\t0.0001\t0.00000\t1970-01-02T03:46:40.000002000Z\n" +
+                        "999.00\t42.0000\t1.00000\t1970-01-02T03:46:40.000003000Z\n",
                 "select price, quantity, rate, timestamp from " + tableName + " order by timestamp");
     }
 
@@ -577,12 +579,11 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testInsertDecimalTextFormatEdgeCases() throws Exception {
         String tableName = "test_decimal_text_format_edge_cases";
         useTable(tableName);
-        execute("""
-                CREATE TABLE test_decimal_text_format_edge_cases (
-                    value DECIMAL(20, 10),
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_decimal_text_format_edge_cases (\n" +
+                        "    value DECIMAL(20, 10),\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually(tableName);
 
@@ -616,14 +617,13 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(tableName, 5);
-        assertSqlEventually("""
-                        value\ttimestamp
-                        123.4560000000\t1970-01-02T03:46:40.000000000Z
-                        123.4500000000\t1970-01-02T03:46:40.000001000Z
-                        0.0000000001\t1970-01-02T03:46:40.000002000Z
-                        0.0000000000\t1970-01-02T03:46:40.000003000Z
-                        0.0000000000\t1970-01-02T03:46:40.000004000Z
-                        """,
+        assertSqlEventually(
+                "value\ttimestamp\n" +
+                        "123.4560000000\t1970-01-02T03:46:40.000000000Z\n" +
+                        "123.4500000000\t1970-01-02T03:46:40.000001000Z\n" +
+                        "0.0000000001\t1970-01-02T03:46:40.000002000Z\n" +
+                        "0.0000000000\t1970-01-02T03:46:40.000003000Z\n" +
+                        "0.0000000000\t1970-01-02T03:46:40.000004000Z\n",
                 "select value, timestamp from " + tableName + " order by timestamp");
     }
 
@@ -631,13 +631,12 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testInsertDecimalTextFormatEquivalence() throws Exception {
         String tableName = "test_decimal_text_format_equivalence";
         useTable(tableName);
-        execute("""
-                CREATE TABLE test_decimal_text_format_equivalence (
-                    text_format DECIMAL(10, 3),
-                    binary_format DECIMAL(10, 3),
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_decimal_text_format_equivalence (\n" +
+                        "    text_format DECIMAL(10, 3),\n" +
+                        "    binary_format DECIMAL(10, 3),\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually(tableName);
 
@@ -662,12 +661,11 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(tableName, 3);
-        assertSqlEventually("""
-                        text_format\tbinary_format\ttimestamp
-                        123.450\t123.450\t1970-01-02T03:46:40.000000000Z
-                        -45.670\t-45.670\t1970-01-02T03:46:40.000001000Z
-                        0.001\t0.001\t1970-01-02T03:46:40.000002000Z
-                        """,
+        assertSqlEventually(
+                "text_format\tbinary_format\ttimestamp\n" +
+                        "123.450\t123.450\t1970-01-02T03:46:40.000000000Z\n" +
+                        "-45.670\t-45.670\t1970-01-02T03:46:40.000001000Z\n" +
+                        "0.001\t0.001\t1970-01-02T03:46:40.000002000Z\n",
                 "select text_format, binary_format, timestamp from " + tableName + " order by timestamp");
     }
 
@@ -737,12 +735,11 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testInsertDecimalTextFormatPrecisionOverflow() throws Exception {
         String tableName = "test_decimal_text_format_precision_overflow";
         useTable(tableName);
-        execute("""
-                CREATE TABLE test_decimal_text_format_precision_overflow (
-                    x DECIMAL(6, 3),
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_decimal_text_format_precision_overflow (\n" +
+                        "    x DECIMAL(6, 3),\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually(tableName);
 
@@ -761,9 +758,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
             sender.flush();
         }
 
-        assertSqlEventually("""
-                        x\ttimestamp
-                        """,
+        assertSqlEventually(
+                "x\ttimestamp\n",
                 "select x, timestamp from " + tableName);
     }
 
@@ -771,13 +767,12 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testInsertDecimalTextFormatScientificNotation() throws Exception {
         String tableName = "test_decimal_text_format_scientific_notation";
         useTable(tableName);
-        execute("""
-                CREATE TABLE test_decimal_text_format_scientific_notation (
-                    large DECIMAL(15, 2),
-                    small DECIMAL(20, 15),
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_decimal_text_format_scientific_notation (\n" +
+                        "    large DECIMAL(15, 2),\n" +
+                        "    small DECIMAL(20, 15),\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually(tableName);
 
@@ -804,12 +799,11 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(tableName, 3);
-        assertSqlEventually("""
-                        large\tsmall\ttimestamp
-                        123000.00\t0.000000000123000\t1970-01-02T03:46:40.000000000Z
-                        4560.00\t0.000000045600000\t1970-01-02T03:46:40.000001000Z
-                        -999.00\t-0.000000000001500\t1970-01-02T03:46:40.000002000Z
-                        """,
+        assertSqlEventually(
+                "large\tsmall\ttimestamp\n" +
+                        "123000.00\t0.000000000123000\t1970-01-02T03:46:40.000000000Z\n" +
+                        "4560.00\t0.000000045600000\t1970-01-02T03:46:40.000001000Z\n" +
+                        "-999.00\t-0.000000000001500\t1970-01-02T03:46:40.000002000Z\n",
                 "select large, small, timestamp from " + tableName + " order by timestamp");
     }
 
@@ -817,13 +811,12 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testInsertDecimalTextFormatTrailingZeros() throws Exception {
         String tableName = "test_decimal_text_format_trailing_zeros";
         useTable(tableName);
-        execute("""
-                CREATE TABLE test_decimal_text_format_trailing_zeros (
-                    value1 DECIMAL(10, 3),
-                    value2 DECIMAL(12, 5),
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_decimal_text_format_trailing_zeros (\n" +
+                        "    value1 DECIMAL(10, 3),\n" +
+                        "    value2 DECIMAL(12, 5),\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually(tableName);
 
@@ -848,12 +841,11 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(tableName, 3);
-        assertSqlEventually("""
-                        value1\tvalue2\ttimestamp
-                        100.000\t50.00000\t1970-01-02T03:46:40.000000000Z
-                        1.200\t0.12300\t1970-01-02T03:46:40.000001000Z
-                        0.100\t0.00100\t1970-01-02T03:46:40.000002000Z
-                        """,
+        assertSqlEventually(
+                "value1\tvalue2\ttimestamp\n" +
+                        "100.000\t50.00000\t1970-01-02T03:46:40.000000000Z\n" +
+                        "1.200\t0.12300\t1970-01-02T03:46:40.000001000Z\n" +
+                        "0.100\t0.00100\t1970-01-02T03:46:40.000002000Z\n",
                 "select value1, value2, timestamp from " + tableName + " order by timestamp");
     }
 
@@ -861,13 +853,12 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testInsertDecimals() throws Exception {
         String tableName = "test_insert_decimals";
         useTable(tableName);
-        execute("""
-                CREATE TABLE test_insert_decimals (
-                    a DECIMAL(9, 0),
-                    b DECIMAL(9, 3),
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_insert_decimals (\n" +
+                        "    a DECIMAL(9, 0),\n" +
+                        "    b DECIMAL(9, 3),\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually(tableName);
 
@@ -916,16 +907,15 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(tableName, 7);
-        assertSqlEventually("""
-                        a\tb\ttimestamp
-                        12345\t123.450\t1970-01-02T03:46:40.000000000Z
-                        null\t123.456\t1970-01-02T03:46:40.000001000Z
-                        42\t42.000\t1970-01-02T03:46:40.000002000Z
-                        42\t42.123\t1970-01-02T03:46:40.000003000Z
-                        42\t42.100\t1970-01-02T03:46:40.000004000Z
-                        42\t42.100\t1970-01-02T03:46:40.000005000Z
-                        null\tnull\t1970-01-02T03:46:40.000006000Z
-                        """,
+        assertSqlEventually(
+                "a\tb\ttimestamp\n" +
+                        "12345\t123.450\t1970-01-02T03:46:40.000000000Z\n" +
+                        "null\t123.456\t1970-01-02T03:46:40.000001000Z\n" +
+                        "42\t42.000\t1970-01-02T03:46:40.000002000Z\n" +
+                        "42\t42.123\t1970-01-02T03:46:40.000003000Z\n" +
+                        "42\t42.100\t1970-01-02T03:46:40.000004000Z\n" +
+                        "42\t42.100\t1970-01-02T03:46:40.000005000Z\n" +
+                        "null\tnull\t1970-01-02T03:46:40.000006000Z\n",
                 "select a, b, timestamp from " + tableName + " order by timestamp");
     }
 
@@ -933,18 +923,18 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testInsertInvalidDecimals() throws Exception {
         String tableName = "test_invalid_decimal_test";
         useTable(tableName);
-        execute("""
-                CREATE TABLE test_invalid_decimal_test (
-                    x DECIMAL(6, 3),
-                    y DECIMAL(76, 73),
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_invalid_decimal_test (\n" +
+                        "    x DECIMAL(6, 3),\n" +
+                        "    y DECIMAL(76, 73),\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually(tableName);
 
         try (Sender sender = createTcpSender(PROTOCOL_VERSION_V3)) {
-            // Integers out of bound (with scaling, 1234 becomes 1234.000 which have a precision of 7).
+            // Integers out of bound (with scaling, 1234 becomes 1234.000 which have a
+            // precision of 7).
             sender.table(tableName)
                     .longColumn("x", 1234)
                     .at(100000000000L, ChronoUnit.MICROS);
@@ -992,9 +982,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
             sender.flush();
         }
 
-        assertSqlEventually("""
-                        x\ty\ttimestamp
-                        """,
+        assertSqlEventually(
+                "x\ty\ttimestamp\n",
                 "select x, y, timestamp from " + tableName);
     }
 
@@ -1019,13 +1008,12 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         // this is to check that a non-ASCII string will not prevent
         // parsing a subsequent UUID
         useTable("test_insert_non_ascii_string_and_uuid");
-        execute("""
-                CREATE TABLE test_insert_non_ascii_string_and_uuid (
-                    s STRING,
-                    u UUID,
-                    ts TIMESTAMP
-                ) TIMESTAMP(ts) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_insert_non_ascii_string_and_uuid (\n" +
+                        "    s STRING,\n" +
+                        "    u UUID,\n" +
+                        "    ts TIMESTAMP\n" +
+                        ") TIMESTAMP(ts) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually("test_insert_non_ascii_string_and_uuid");
 
@@ -1039,30 +1027,30 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_insert_non_ascii_string_and_uuid", 1);
-        assertSqlEventually("""
-                        s\tu\tts
-                        non-ascii äöü\t11111111-2222-3333-4444-555555555555\t2022-02-25T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "s\tu\tts\n" +
+                        "non-ascii äöü\t11111111-2222-3333-4444-555555555555\t2022-02-25T00:00:00.000000000Z\n",
                 "select s, u, ts from test_insert_non_ascii_string_and_uuid");
     }
 
     @Test
     public void testInsertNonAsciiStringIntoUuidColumn() throws Exception {
-        // carefully crafted value so when encoded as UTF-8 it has the same byte length as a proper UUID
-        testValueCannotBeInsertedToUuidColumn("test_insert_non_ascii_string_into_uuid_column", "11111111-1111-1111-1111-1111111111ü");
+        // carefully crafted value so when encoded as UTF-8 it has the same byte length
+        // as a proper UUID
+        testValueCannotBeInsertedToUuidColumn("test_insert_non_ascii_string_into_uuid_column",
+                "11111111-1111-1111-1111-1111111111ü");
     }
 
     @Test
     public void testInsertStringIntoUuidColumn() throws Exception {
         useTable("test_insert_string_into_uuid_column");
-        execute("""
-                CREATE TABLE test_insert_string_into_uuid_column (
-                    u1 UUID,
-                    u2 UUID,
-                    u3 UUID,
-                    ts TIMESTAMP
-                ) TIMESTAMP(ts) PARTITION BY NONE BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_insert_string_into_uuid_column (\n" +
+                        "    u1 UUID,\n" +
+                        "    u2 UUID,\n" +
+                        "    u3 UUID,\n" +
+                        "    ts TIMESTAMP\n" +
+                        ") TIMESTAMP(ts) PARTITION BY NONE BYPASS WAL\n");
 
         assertTableExistsEventually("test_insert_string_into_uuid_column");
 
@@ -1077,22 +1065,20 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_insert_string_into_uuid_column", 1);
-        assertSqlEventually("""
-                        u1\tu3\tts
-                        11111111-1111-1111-1111-111111111111\t33333333-3333-3333-3333-333333333333\t2022-02-25T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "u1\tu3\tts\n" +
+                        "11111111-1111-1111-1111-111111111111\t33333333-3333-3333-3333-333333333333\t2022-02-25T00:00:00.000000000Z\n",
                 "select u1, u3, ts from test_insert_string_into_uuid_column");
     }
 
     @Test
     public void testInsertTimestampAsInstant() throws Exception {
         useTable("test_insert_timestamp_as_instant");
-        execute("""
-                CREATE TABLE test_insert_timestamp_as_instant (
-                    ts_col TIMESTAMP,
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_insert_timestamp_as_instant (\n" +
+                        "    ts_col TIMESTAMP,\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL\n");
 
         assertTableExistsEventually("test_insert_timestamp_as_instant");
 
@@ -1104,23 +1090,21 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_insert_timestamp_as_instant", 1);
-        assertSqlEventually("""
-                        ts_col\ttimestamp
-                        2023-02-11T12:30:11.350000000Z\t2022-01-10T20:40:22.540000000Z
-                        """,
+        assertSqlEventually(
+                "ts_col\ttimestamp\n" +
+                        "2023-02-11T12:30:11.350000000Z\t2022-01-10T20:40:22.540000000Z\n",
                 "select ts_col, timestamp from test_insert_timestamp_as_instant");
     }
 
     @Test
     public void testInsertTimestampMiscUnits() throws Exception {
         useTable("test_insert_timestamp_misc_units");
-        execute("""
-                CREATE TABLE test_insert_timestamp_misc_units (
-                    unit STRING,
-                    ts TIMESTAMP,
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_insert_timestamp_misc_units (\n" +
+                        "    unit STRING,\n" +
+                        "    ts TIMESTAMP,\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL\n");
 
         assertTableExistsEventually("test_insert_timestamp_misc_units");
 
@@ -1150,26 +1134,24 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_insert_timestamp_misc_units", 5);
-        assertSqlEventually("""
-                        unit\tts\ttimestamp
-                        m\t2023-09-18T12:01:00.000000000Z\t2023-09-18T12:01:00.000000000Z
-                        s\t2023-09-18T12:01:01.000000000Z\t2023-09-18T12:01:01.000000000Z
-                        ns\t2023-09-18T12:01:01.010000000Z\t2023-09-18T12:01:01.010000000Z
-                        us\t2023-09-18T12:01:01.010000000Z\t2023-09-18T12:01:01.010000000Z
-                        ms\t2023-09-18T12:01:01.010000000Z\t2023-09-18T12:01:01.010000000Z
-                        """,
+        assertSqlEventually(
+                "unit\tts\ttimestamp\n" +
+                        "m\t2023-09-18T12:01:00.000000000Z\t2023-09-18T12:01:00.000000000Z\n" +
+                        "s\t2023-09-18T12:01:01.000000000Z\t2023-09-18T12:01:01.000000000Z\n" +
+                        "ns\t2023-09-18T12:01:01.010000000Z\t2023-09-18T12:01:01.010000000Z\n" +
+                        "us\t2023-09-18T12:01:01.010000000Z\t2023-09-18T12:01:01.010000000Z\n" +
+                        "ms\t2023-09-18T12:01:01.010000000Z\t2023-09-18T12:01:01.010000000Z\n",
                 "select unit, ts, timestamp from test_insert_timestamp_misc_units order by timestamp");
     }
 
     @Test
     public void testInsertTimestampNanoOverflow() throws Exception {
         useTable("test_insert_timestamp_nano_overflow");
-        execute("""
-                CREATE TABLE test_insert_timestamp_nano_overflow (
-                    ts TIMESTAMP,
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_insert_timestamp_nano_overflow (\n" +
+                        "    ts TIMESTAMP,\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL\n");
 
         assertTableExistsEventually("test_insert_timestamp_nano_overflow");
 
@@ -1182,23 +1164,21 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_insert_timestamp_nano_overflow", 1);
-        assertSqlEventually("""
-                        ts\ttimestamp
-                        2323-09-18T12:01:01.011568000Z\t2323-09-18T12:01:01.011568000Z
-                        """,
+        assertSqlEventually(
+                "ts\ttimestamp\n" +
+                        "2323-09-18T12:01:01.011568000Z\t2323-09-18T12:01:01.011568000Z\n",
                 "select ts, timestamp from test_insert_timestamp_nano_overflow");
     }
 
     @Test
     public void testInsertTimestampNanoUnits() throws Exception {
         useTable("test_insert_timestamp_nano_units");
-        execute("""
-                CREATE TABLE test_insert_timestamp_nano_units (
-                    unit STRING,
-                    ts TIMESTAMP,
-                    timestamp TIMESTAMP
-                ) TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL
-                """);
+        execute(
+                "CREATE TABLE test_insert_timestamp_nano_units (\n" +
+                        "    unit STRING,\n" +
+                        "    ts TIMESTAMP,\n" +
+                        "    timestamp TIMESTAMP\n" +
+                        ") TIMESTAMP(timestamp) PARTITION BY YEAR BYPASS WAL\n");
 
         assertTableExistsEventually("test_insert_timestamp_nano_units");
 
@@ -1212,10 +1192,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_insert_timestamp_nano_units", 1);
-        assertSqlEventually("""
-                        unit\tts\ttimestamp
-                        ns\t2023-09-18T12:01:01.011568000Z\t2023-09-18T12:01:01.011568000Z
-                        """,
+        assertSqlEventually(
+                "unit\tts\ttimestamp\n" +
+                        "ns\t2023-09-18T12:01:01.011568000Z\t2023-09-18T12:01:01.011568000Z\n",
                 "select unit, ts, timestamp from test_insert_timestamp_nano_units");
     }
 
@@ -1227,7 +1206,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
                 sender.table("table_with_long______________________name");
                 fail();
             } catch (LineSenderException e) {
-                assertContains(e.getMessage(), "table name is too long: [name = table_with_long______________________name, maxNameLength=20]");
+                assertContains(e.getMessage(),
+                        "table name is too long: [name = table_with_long______________________name, maxNameLength=20]");
             }
 
             try {
@@ -1235,7 +1215,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
                         .doubleColumn("column_with_long______________________name", 1.0);
                 fail();
             } catch (LineSenderException e) {
-                assertContains(e.getMessage(), "column name is too long: [name = column_with_long______________________name, maxNameLength=20]");
+                assertContains(e.getMessage(),
+                        "column name is too long: [name = column_with_long______________________name, maxNameLength=20]");
             }
         }
     }
@@ -1268,10 +1249,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(table, 1);
-        assertSqlEventually("""
-                        string1\tstring2\tstring3\ttimestamp
-                        some string\tanother string\tyet another string\t2024-02-27T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "string1\tstring2\tstring3\ttimestamp\n" +
+                        "some string\tanother string\tyet another string\t2024-02-27T00:00:00.000000000Z\n",
                 "select string1, string2, string3, timestamp from " + table);
     }
 
@@ -1343,55 +1323,47 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
 
     @Test
     public void testTimestampIngestV1() throws Exception {
-        testTimestampIngest("TIMESTAMP", PROTOCOL_VERSION_V1,
-                """
-                        ts\tdts
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z
-                        """,
-                null
-        );
+        testTimestampIngest("test_timestamp_ingest_v1", "TIMESTAMP", PROTOCOL_VERSION_V1,
+                "ts\tdts\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z\n",
+                null);
     }
 
     @Test
     public void testTimestampIngestV2() throws Exception {
-        testTimestampIngest("TIMESTAMP", PROTOCOL_VERSION_V2,
-                """
-                        ts\tdts
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z
-                        """,
-                """
-                        ts\tdts
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834000000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z
-                        2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z
-                        2300-11-19T10:55:24.123456000Z\t2300-11-20T10:55:24.834129000Z
-                        """
-        );
+        testTimestampIngest("test_timestamp_ingest_v2", "TIMESTAMP", PROTOCOL_VERSION_V2,
+                "ts\tdts\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z\n",
+                "ts\tdts\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834000000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2025-11-19T10:55:24.123000000Z\t2025-11-20T10:55:24.834129000Z\n" +
+                        "2300-11-19T10:55:24.123456000Z\t2300-11-20T10:55:24.834129000Z\n");
     }
 
     @Test
@@ -1403,7 +1375,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         } catch (LineSenderException e) {
             assertContains(e.getMessage(), "name contains an illegal char");
         }
-        assertFalse(channel.contain(new byte[]{(byte) '\n'}));
+        assertFalse(channel.contain(new byte[] { (byte) '\n' }));
     }
 
     @Test
@@ -1477,10 +1449,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(table, 1);
-        assertSqlEventually("""
-                        string1\ttimestamp
-                        čćžšđçğéíáýůř\t2024-02-27T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "string1\ttimestamp\n" +
+                        "čćžšđçğéíáýůř\t2024-02-27T00:00:00.000000000Z\n",
                 "select string1, timestamp from " + table);
     }
 
@@ -1501,10 +1472,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually("test_write_all_types", 1);
-        assertSqlEventually("""
-                        int_field\tbool_field\tstring_field\tdouble_field\tts_field\ttimestamp
-                        42\ttrue\tfoo\t42.0\t2022-02-25T00:00:00.000000000Z\t2022-02-25T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "int_field\tbool_field\tstring_field\tdouble_field\tts_field\ttimestamp\n" +
+                        "42\ttrue\tfoo\t42.0\t2022-02-25T00:00:00.000000000Z\t2022-02-25T00:00:00.000000000Z\n",
                 "select int_field, bool_field, string_field, double_field, ts_field, timestamp from test_write_all_types");
     }
 
@@ -1523,10 +1493,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(table, 1);
-        assertSqlEventually("""
-                        max\tmin\ttimestamp
-                        9223372036854775807\tnull\t2023-02-22T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "max\tmin\ttimestamp\n" +
+                        "9223372036854775807\tnull\t2023-02-22T00:00:00.000000000Z\n",
                 "select max, min, timestamp from " + table);
     }
 
@@ -1543,7 +1512,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
     }
 
-    private static void assertExceptionOnClosedSender(Consumer<Sender> beforeCloseAction, Consumer<Sender> afterCloseAction) {
+    private static void assertExceptionOnClosedSender(Consumer<Sender> beforeCloseAction,
+            Consumer<Sender> afterCloseAction) {
         DummyLineChannel channel = new DummyLineChannel();
         Sender sender = new LineTcpSenderV2(channel, 1000, 127);
         beforeCloseAction.accept(sender);
@@ -1581,7 +1551,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
     }
 
-    private void testCreateTimestampColumns(long timestamp, ChronoUnit unit, int protocolVersion, int[] expectedColumnTypes, String expected) throws Exception {
+    private void testCreateTimestampColumns(long timestamp, ChronoUnit unit, int protocolVersion,
+            int[] expectedColumnTypes, String expected) throws Exception {
         useTable("test_tab1");
 
         try (Sender sender = createTcpSender(protocolVersion)) {
@@ -1613,22 +1584,23 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
 
         assertTableSizeEventually("test_tab1", 1);
         assertSqlEventually("column\ttype\n" +
-                        "col1\tDOUBLE\n" +
-                        "timestamp\t" + ColumnType.nameOf(expectedColumnTypes[2]) + "\n" +
-                        "ts_instant\t" + ColumnType.nameOf(expectedColumnTypes[1]) + "\n" +
-                        "ts_ms\tTIMESTAMP\n" +
-                        "ts_ns\t" + ColumnType.nameOf(expectedColumnTypes[0]) + "\n" +
-                        "ts_us\tTIMESTAMP\n",
-                "select \"column\", \"type\" from table_columns('test_tab1') order by \"column\""
-        );
+                "col1\tDOUBLE\n" +
+                "timestamp\t" + ColumnType.nameOf(expectedColumnTypes[2]) + "\n" +
+                "ts_instant\t" + ColumnType.nameOf(expectedColumnTypes[1]) + "\n" +
+                "ts_ms\tTIMESTAMP\n" +
+                "ts_ns\t" + ColumnType.nameOf(expectedColumnTypes[0]) + "\n" +
+                "ts_us\tTIMESTAMP\n",
+                "select \"column\", \"type\" from table_columns('test_tab1') order by \"column\"");
         assertSqlEventually("col1\tts_ns\tts_us\tts_ms\tts_instant\ttimestamp\n" + expected + "\n",
                 "test_tab1");
     }
 
-    private void testTimestampIngest(String timestampType, int protocolVersion, String expected1, String expected2) throws Exception {
-        useTable("test_tab");
-        execute("create table test_tab (ts " + timestampType + ", dts " + timestampType + ") timestamp(dts) partition by DAY BYPASS WAL");
-        assertTableExistsEventually("tab");
+    private void testTimestampIngest(String tableName, String timestampType, int protocolVersion, String expected1,
+            String expected2) throws Exception {
+        useTable(tableName);
+        execute("create table " + tableName + " (ts " + timestampType + ", dts " + timestampType
+                + ") timestamp(dts) partition by DAY BYPASS WAL");
+        assertTableExistsEventually(tableName);
 
         try (Sender sender = createTcpSender(protocolVersion)) {
             long ts_ns = Micros.floor("2025-11-19T10:55:24.123456000Z") * 1000;
@@ -1640,50 +1612,50 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
             Instant tsInstant_ns = Instant.ofEpochSecond(ts_ns / 1_000_000_000, ts_ns % 1_000_000_000 + 10);
             Instant dtsInstant_ns = Instant.ofEpochSecond(dts_ns / 1_000_000_000, dts_ns % 1_000_000_000 + 10);
 
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_ns, ChronoUnit.NANOS)
                     .at(dts_ns, ChronoUnit.NANOS);
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_us, ChronoUnit.MICROS)
                     .at(dts_ns, ChronoUnit.NANOS);
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_ms, ChronoUnit.MILLIS)
                     .at(dts_ns, ChronoUnit.NANOS);
 
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_ns, ChronoUnit.NANOS)
                     .at(dts_us, ChronoUnit.MICROS);
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_us, ChronoUnit.MICROS)
                     .at(dts_us, ChronoUnit.MICROS);
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_ms, ChronoUnit.MILLIS)
                     .at(dts_us, ChronoUnit.MICROS);
 
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_ns, ChronoUnit.NANOS)
                     .at(dts_ms, ChronoUnit.MILLIS);
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_us, ChronoUnit.MICROS)
                     .at(dts_ms, ChronoUnit.MILLIS);
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", ts_ms, ChronoUnit.MILLIS)
                     .at(dts_ms, ChronoUnit.MILLIS);
 
-            sender.table("test_tab")
+            sender.table(tableName)
                     .timestampColumn("ts", tsInstant_ns)
                     .at(dtsInstant_ns);
 
             sender.flush();
 
-            assertTableSizeEventually("test_tab", 10);
-            assertSqlEventually(expected1, "select ts, dts from tab");
+            assertTableSizeEventually(tableName, 10);
+            assertSqlEventually(expected1, "select ts, dts from " + tableName);
 
             try {
                 // fails for nanos, long overflow
                 long ts_tooLargeForNanos_us = Micros.floor("2300-11-19T10:55:24.123456000Z");
                 long dts_tooLargeForNanos_us = Micros.floor("2300-11-20T10:55:24.834129000Z");
-                sender.table("test_tab")
+                sender.table(tableName)
                         .timestampColumn("ts", ts_tooLargeForNanos_us, ChronoUnit.MICROS)
                         .at(dts_tooLargeForNanos_us, ChronoUnit.MICROS);
                 sender.flush();
@@ -1699,8 +1671,8 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
                 }
             }
 
-            assertTableSizeEventually("test_tab", expected2 == null ? 10 : 11);
-            assertSqlEventually(expected2 == null ? expected1 : expected2, "select ts, dts from test_tab");
+            assertTableSizeEventually(tableName, expected2 == null ? 10 : 11);
+            assertSqlEventually(expected2 == null ? expected1 : expected2, "select ts, dts from " + tableName);
         }
     }
 
@@ -1732,10 +1704,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableSizeEventually(tableName, 1);
-        assertSqlEventually("""
-                        u1\tts
-                        11111111-1111-1111-1111-111111111111\t2022-02-25T00:00:00.000000000Z
-                        """,
+        assertSqlEventually(
+                "u1\tts\n" +
+                        "11111111-1111-1111-1111-111111111111\t2022-02-25T00:00:00.000000000Z\n",
                 "select u1, ts from " + tableName);
     }
 
