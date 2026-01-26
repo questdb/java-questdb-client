@@ -44,7 +44,7 @@ stages:
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "default"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console --batch-mode"
           - template: questdb_start.yaml
             parameters:
               configPath: "confs/default"
@@ -53,7 +53,7 @@ stages:
             inputs:
               mavenPOMFile: "pom.xml"
               jdkVersionOption: "default"
-              goals: "test"
+              goals: "test --batch-mode"
           - task: ArchiveFiles@2
             displayName: "Tests failed -- Compress logs"
             condition: failed()
