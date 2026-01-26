@@ -7,7 +7,7 @@ steps:
     displayName: "Compile QuestDB"
     inputs:
       mavenPOMFile: "questdb/pom.xml"
-      jdkVersionOption: "1.17"
+      jdkVersionOption: "default"
       options: "-DskipTests -Pbuild-web-console"
   - template: questdb_start.yaml
     parameters:
@@ -16,7 +16,7 @@ steps:
     displayName: "Run Client Tests"
     inputs:
       mavenPOMFile: "pom.xml"
-      jdkVersionOption: "1.17"
+      jdkVersionOption: "default"
       goals: "test"
   - script: |
       echo "Stopping QuestDB server..."

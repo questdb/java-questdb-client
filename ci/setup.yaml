@@ -8,4 +8,4 @@ steps:
 
   - bash: sudo sysctl -w fs.file-max=500000
     displayName: "Increase file count on Linux"
-    condition: eq(variables['os'], 'Linux')
+    condition: startsWith(variables['imageName'], 'ubuntu')

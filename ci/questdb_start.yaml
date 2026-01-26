@@ -33,7 +33,7 @@ steps:
         exit 1
       fi
     displayName: "Start QuestDB server"
-    condition: eq(variables['os'], 'Linux')
+    condition: not(startsWith(variables['imageName'], 'windows'))
 
   - powershell: |
       Write-Host "Stopping QuestDB server..."
@@ -75,4 +75,4 @@ steps:
         exit 1
       }
     displayName: "Start QuestDB server"
-    condition: eq(variables['os'], 'Windows')
+    condition: startsWith(variables['imageName'], 'windows')
