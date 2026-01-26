@@ -9,7 +9,7 @@ steps:
       mavenPOMFile: "questdb/pom.xml"
       jdkVersionOption: "1.17"
       options: "-DskipTests -Pbuild-web-console"
-  - template: ci/questdb_start.yaml
+  - template: questdb_start.yaml
     parameters:
       configPath: "ci/server.conf"
   - task: Maven@3
@@ -18,9 +18,6 @@ steps:
       mavenPOMFile: "pom.xml"
       jdkVersionOption: "1.17"
       goals: "test"
-  - template: ci/questdb_start.yaml
-    parameters:
-      configPath: "ci/server_auth.conf"
   - script: |
       echo "Stopping QuestDB server..."
       pkill -f io.questdb.ServerMain || true
