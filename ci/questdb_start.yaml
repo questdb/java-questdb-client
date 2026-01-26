@@ -9,16 +9,18 @@ steps:
 
       # Remove any existing data
       rm -rf questdb-data
-      mkdir -p questdb-data/conf
+      mkdir -p questdb-data
       cp -r ${{ parameters.configPath }} questdb-data/conf
 
+      mkdir -p logs
+
       # Start QuestDB in the background
-      java -p questdb/core/target/questdb-*-SNAPSHOT.jar -m io.questdb/io.questdb.ServerMain -d questdb-data > questdb.log 2>&1 &
+      java -p questdb/core/target/questdb-*-SNAPSHOT.jar -m io.questdb/io.questdb.ServerMain -d questdb-data > logs/questdb.log 2>&1 &
 
       # Wait for QuestDB to start
       echo "Waiting for QuestDB to start..."
       for i in {1..30}; do
-        if grep -q "server-main enjoy" questdb.log; then
+        if grep -q "server-main enjoy" logs/questdb.log; then
           echo "Server started."
           break
         else
@@ -27,9 +29,9 @@ steps:
         fi
       done
 
-      if ! grep -q "server-main enjoy" questdb.log; then
+      if ! grep -q "server-main enjoy" logs/questdb.log; then
         echo "QuestDB failed to start:"
-        cat questdb.log
+        cat logs/questdb.log
         exit 1
       fi
     displayName: "Start QuestDB server"
@@ -43,21 +45,23 @@ steps:
       if (Test-Path "questdb-data") {
         Remove-Item -Recurse -Force "questdb-data"
       }
-      New-Item -ItemType Directory -Path "questdb-data/conf" -Force | Out-Null
+      New-Item -ItemType Directory -Path "questdb-data" -Force | Out-Null
       Copy-Item -Recurse -Path "${{ parameters.configPath }}" -Destination "questdb-data/conf"
+
+      New-Item -ItemType Directory -Path "logs" -Force | Out-Null
 
       # Find the QuestDB jar
       $jarPath = Get-ChildItem -Path "questdb/core/target" -Filter "questdb-*-SNAPSHOT.jar" | Select-Object -First 1 -ExpandProperty FullName
 
       # Start QuestDB in the background
-      Start-Process -FilePath "java" -ArgumentList "-p", $jarPath, "-m", "io.questdb/io.questdb.ServerMain", "-d", "questdb-data" -RedirectStandardOutput "questdb.log" -RedirectStandardError "questdb-error.log" -NoNewWindow
+      Start-Process -FilePath "java" -ArgumentList "-p", $jarPath, "-m", "io.questdb/io.questdb.ServerMain", "-d", "questdb-data" -RedirectStandardOutput "logs/questdb.log" -RedirectStandardError "logs/questdb-error.log" -NoNewWindow
 
       # Wait for QuestDB to start
       Write-Host "Waiting for QuestDB to start..."
       $started = $false
       for ($i = 1; $i -le 30; $i++) {
-        if (Test-Path "questdb.log") {
-          $content = Get-Content "questdb.log" -Raw -ErrorAction SilentlyContinue
+        if (Test-Path "logs/questdb.log") {
+          $content = Get-Content "logs/questdb.log" -Raw -ErrorAction SilentlyContinue
           if ($content -match "server-main enjoy") {
             Write-Host "Server started."
             $started = $true
@@ -70,8 +74,8 @@ steps:
 
       if (-not $started) {
         Write-Host "QuestDB failed to start:"
-        if (Test-Path "questdb.log") { Get-Content "questdb.log" }
-        if (Test-Path "questdb-error.log") { Get-Content "questdb-error.log" }
+        if (Test-Path "logs/questdb.log") { Get-Content "logs/questdb.log" }
+        if (Test-Path "logs/questdb-error.log") { Get-Content "logs/questdb-error.log" }
         exit 1
       }
     displayName: "Start QuestDB server"

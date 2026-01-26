@@ -11,14 +11,27 @@ steps:
       options: "-DskipTests -Pbuild-web-console"
   - template: questdb_start.yaml
     parameters:
-      configPath: "ci/server.conf"
+      configPath: "ci/default"
   - task: Maven@3
     displayName: "Run Client Tests"
     inputs:
       mavenPOMFile: "pom.xml"
       jdkVersionOption: "default"
       goals: "test"
+  - task: ArchiveFiles@2
+    displayName: "Tests failed -- Compress logs"
+    condition: failed()
+    inputs:
+      rootFolderOrFile: "logs"
+      includeRootFolder: false
+      archiveFile: $(ARCHIVED_LOGS)
   - script: |
       echo "Stopping QuestDB server..."
       pkill -f io.questdb.ServerMain || true
     displayName: "Stop QuestDB server"
+    condition: not(startsWith(variables['imageName'], 'windows'))
+  - powershell: |
+      Write-Host "Stopping QuestDB server..."
+      Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*io.questdb.ServerMain*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+    displayName: "Stop QuestDB server on Windows"
+    condition: startsWith(variables['imageName'], 'windows')

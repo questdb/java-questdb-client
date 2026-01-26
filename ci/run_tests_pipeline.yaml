@@ -1,5 +1,8 @@
 trigger: none
 
+variables:
+  ARCHIVED_LOGS: "$(Build.ArtifactStagingDirectory)/questdb-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS).zip"
+
 stages:
   - stage: BuildAndTest
     displayName: "Building and testing"
