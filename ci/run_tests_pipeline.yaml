@@ -11,15 +11,19 @@ stages:
             linux-x64:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
-            mac-arm:
+              jdkArch: "x64"
+            mac-aarch64:
               imageName: "macos-15-arm64"
               poolName: "Azure Pipelines"
+              jdkArch: "arm64"
             mac-x64:
               imageName: "macos-15"
               poolName: "Azure Pipelines"
+              jdkArch: "x64"
             windows-msvc-2022-x64:
               imageName: "windows-2022"
               poolName: "Azure Pipelines"
+              jdkArch: "x64"
         pool:
           name: $(poolName)
           vmImage: $(imageName)
