@@ -18,12 +18,18 @@ steps:
       # Wait for QuestDB to start
       echo "Waiting for QuestDB to start..."
       for i in {1..30}; do
-        if grep -q "Server online" questdb.log; then
-          echo "server-main enjoy"
+        if grep -q "server-main enjoy" questdb.log; then
+          echo "Server started."
           break
         else
           echo "Waiting..."
           sleep 2
         fi
       done
+
+      if ! grep -q "server-main enjoy" questdb.log; then
+        echo "QuestDB failed to start:"
+        cat questdb.log
+        exit 1
+      fi
     displayName: "Start QuestDB server"
