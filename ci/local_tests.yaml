@@ -1,7 +1,4 @@
 # Run the Java client tests against local instances of QuestDB
-variables:
-  QUESTDB_ILP_TCP_AUTH_ENABLE: "false"
-
 steps:
   - script: |
       git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
