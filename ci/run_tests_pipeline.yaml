@@ -37,4 +37,43 @@ stages:
             lfs: false
             submodules: false
           - template: setup.yaml
-          - template: local_tests.yaml
+          - script: git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              jdkVersionOption: "default"
+              options: "-DskipTests -Pbuild-web-console"
+          - template: questdb_start.yaml
+            parameters:
+              configPath: "ci/default"
+          - task: Maven@3
+            displayName: "Run Client Tests"
+            inputs:
+              mavenPOMFile: "pom.xml"
+              jdkVersionOption: "default"
+              goals: "test"
+          - task: ArchiveFiles@2
+            displayName: "Tests failed -- Compress logs"
+            condition: failed()
+            inputs:
+              rootFolderOrFile: "logs"
+              includeRootFolder: false
+              archiveFile: $(ARCHIVED_LOGS)
+          - task: PublishBuildArtifacts@1
+            displayName: "Tests failed -- Upload logs"
+            condition: failed()
+            inputs:
+              pathToPublish: $(ARCHIVED_LOGS)
+              artifactName: MavenFailedTestsLogs
+          - script: |
+              echo "Stopping QuestDB server..."
+              pkill -f io.questdb.ServerMain || true
+            displayName: "Stop QuestDB server"
+            condition: not(startsWith(variables['imageName'], 'windows'))
+          - powershell: |
+              Write-Host "Stopping QuestDB server..."
+              Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*io.questdb.ServerMain*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+            displayName: "Stop QuestDB server on Windows"
+            condition: startsWith(variables['imageName'], 'windows')
