@@ -47,7 +47,7 @@ stages:
               options: "-DskipTests -Pbuild-web-console"
           - template: questdb_start.yaml
             parameters:
-              configPath: "ci/default"
+              configPath: "confs/default"
           - task: Maven@3
             displayName: "Run Client Tests"
             inputs:
