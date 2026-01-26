@@ -13,7 +13,7 @@ steps:
       cp -r ${{ parameters.configPath }} questdb-data/conf
 
       # Start QuestDB in the background
-      java -p core/target/questdb-*-SNAPSHOT.jar -m io.questdb/io.questdb.ServerMain -d questdb-data > questdb.log 2>&1 &
+      java -p questdb/core/target/questdb-*-SNAPSHOT.jar -m io.questdb/io.questdb.ServerMain -d questdb-data > questdb.log 2>&1 &
 
       # Wait for QuestDB to start
       echo "Waiting for QuestDB to start..."
