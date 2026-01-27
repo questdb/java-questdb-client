@@ -37,8 +37,14 @@ steps:
       New-Item -ItemType Directory -Force -Path logs | Out-Null
       Copy-Item -Recurse -Force -Path "${{ parameters.configPath }}" -Destination "questdb-data/conf"
 
+      $jar = Get-ChildItem -Path "questdb/core/target" -Filter "questdb-*-SNAPSHOT.jar" | Select-Object -First 1
+      if (-not $jar) {
+        Write-Host "QuestDB jar not found in questdb/core/target"
+        exit 1
+      }
+
       $proc = Start-Process -FilePath "java" -ArgumentList @(
-        "-p", "questdb/core/target/questdb-*-SNAPSHOT.jar",
+        "-p", $jar.FullName,
         "-m", "io.questdb/io.questdb.ServerMain",
         "-d", "questdb-data"
       ) -RedirectStandardOutput "logs/questdb.log" -RedirectStandardError "logs/questdb.err" -PassThru
