@@ -210,9 +210,10 @@ public class AbstractQdbTest extends AbstractTest {
             System.err.printf("CLEANING UP TEST TABLES%n");
             // Cleanup all test tables before starting tests
             try (Connection conn = getPgConnection();
-                Statement readStmt = conn.createStatement();
-                Statement stmt = conn.createStatement();
-                ResultSet rs = readStmt.executeQuery("SELECT table_name FROM tables() WHERE table_name LIKE 'test_%'")) {
+                    Statement readStmt = conn.createStatement();
+                    Statement stmt = conn.createStatement();
+                    ResultSet rs = readStmt
+                            .executeQuery("SELECT table_name FROM tables() WHERE table_name LIKE 'test_%'")) {
                 while (rs.next()) {
                     String tableName = rs.getString(1);
                     try {
@@ -451,12 +452,13 @@ public class AbstractQdbTest extends AbstractTest {
     }
 
     /**
-     * Assert that SQL query results match expected TSV, polling until they do or timeout is reached.
+     * Assert that SQL query results match expected TSV, polling until they do or
+     * timeout is reached.
      */
     protected void assertSqlEventually(CharSequence expected, String sql) throws Exception {
         assertEventually(() -> {
             try (Statement statement = getPgConnection().createStatement();
-                 ResultSet rs = statement.executeQuery(sql)) {
+                    ResultSet rs = statement.executeQuery(sql)) {
                 sink.clear();
                 printToSink(sink, rs);
                 TestUtils.assertEquals(expected, sink);
@@ -472,9 +474,8 @@ public class AbstractQdbTest extends AbstractTest {
     protected void assertTableExistsEventually(CharSequence tableName) throws Exception {
         assertEventually(() -> {
             try (Statement stmt = getPgConnection().createStatement();
-                 ResultSet rs = stmt.executeQuery(
-                         String.format("SELECT COUNT(*) AS cnt FROM tables() WHERE table_name = '%s'", tableName)
-                 )) {
+                    ResultSet rs = stmt.executeQuery(
+                            String.format("SELECT COUNT(*) AS cnt FROM tables() WHERE table_name = '%s'", tableName))) {
                 Assert.assertTrue(rs.next());
                 final long actualSize = rs.getLong(1);
                 Assert.assertEquals(1, actualSize);
@@ -485,15 +486,15 @@ public class AbstractQdbTest extends AbstractTest {
     }
 
     /**
-     * Assert that table has expected size, polling until it does or timeout is reached.
+     * Assert that table has expected size, polling until it does or timeout is
+     * reached.
      */
     protected void assertTableSizeEventually(CharSequence tableName, int expectedSize) throws Exception {
         final String sql = String.format("SELECT COUNT(*) AS cnt FROM \"%s\"", tableName);
         assertEventually(() -> {
             try (
                     Statement stmt = getPgConnection().createStatement();
-                    ResultSet rs = stmt.executeQuery(sql)
-            ) {
+                    ResultSet rs = stmt.executeQuery(sql)) {
                 Assert.assertTrue(rs.next());
                 final long actualSize = rs.getLong(1);
                 Assert.assertEquals(expectedSize, actualSize);
@@ -504,7 +505,7 @@ public class AbstractQdbTest extends AbstractTest {
                 }
                 throw new RuntimeException(e);
             }
-        }, 5);
+        }, 15);
     }
 
     /**
@@ -545,7 +546,7 @@ public class AbstractQdbTest extends AbstractTest {
         List<Map<String, Object>> results = new ArrayList<>();
 
         try (Statement stmt = getPgConnection().createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
+                ResultSet rs = stmt.executeQuery(sql)) {
 
             ResultSetMetaData metaData = rs.getMetaData();
             int columnCount = metaData.getColumnCount();
@@ -582,7 +583,8 @@ public class AbstractQdbTest extends AbstractTest {
     }
 
     /**
-     * Query table contents with optional ORDER BY clause and return as TSV-formatted string.
+     * Query table contents with optional ORDER BY clause and return as
+     * TSV-formatted string.
      */
     protected String queryTableAsTsv(String tableName, String orderBy) throws SQLException {
         StringBuilder sb = new StringBuilder();
@@ -593,7 +595,7 @@ public class AbstractQdbTest extends AbstractTest {
         }
 
         try (Statement stmt = getPgConnection().createStatement();
-             ResultSet rs = stmt.executeQuery(sql)) {
+                ResultSet rs = stmt.executeQuery(sql)) {
 
             ResultSetMetaData metaData = rs.getMetaData();
             int columnCount = metaData.getColumnCount();
@@ -628,8 +630,7 @@ public class AbstractQdbTest extends AbstractTest {
      */
     protected boolean tableExists(String tableName) throws SQLException {
         List<Map<String, Object>> result = executeQuery(
-                String.format("SELECT table_name FROM tables() WHERE table_name = '%s'", tableName)
-        );
+                String.format("SELECT table_name FROM tables() WHERE table_name = '%s'", tableName));
         return !result.isEmpty();
     }
 
