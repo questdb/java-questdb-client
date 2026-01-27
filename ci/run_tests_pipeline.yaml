@@ -39,7 +39,8 @@ stages:
             lfs: false
             submodules: false
           - template: setup.yaml
-          - script: git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
+          # TODO: remove branch once rd_strip_ilp_sender is merged
+          - script: git clone --depth 1 -b rd_strip_ilp_sender https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
@@ -57,3 +58,4 @@ stages:
             parameters:
               configPath: "ci/confs/authenticated"
           - template: questdb_stop.yaml
+          - template: run_oss_tests.yaml
