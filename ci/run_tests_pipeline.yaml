@@ -2,6 +2,8 @@ trigger: none
 
 variables:
   ARCHIVED_LOGS: "$(Build.ArtifactStagingDirectory)/questdb-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS).zip"
+  QUESTDB_RUNNING: true
+  QUESTDB_ILP_TCP_AUTH_ENABLE: false
 
 stages:
   - stage: BuildAndTest
@@ -45,35 +47,13 @@ stages:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "default"
               options: "-DskipTests -Pbuild-web-console --batch-mode"
-          - template: questdb_start.yaml
+          - template: run_client_tests.yaml
             parameters:
               configPath: "ci/confs/default"
-          - task: Maven@3
-            displayName: "Run Client Tests"
-            inputs:
-              mavenPOMFile: "pom.xml"
-              jdkVersionOption: "default"
-              goals: "test --batch-mode"
-          - task: ArchiveFiles@2
-            displayName: "Tests failed -- Compress logs"
-            condition: failed()
-            inputs:
-              rootFolderOrFile: "logs"
-              includeRootFolder: false
-              archiveFile: $(ARCHIVED_LOGS)
-          - task: PublishBuildArtifacts@1
-            displayName: "Tests failed -- Upload logs"
-            condition: failed()
-            inputs:
-              pathToPublish: $(ARCHIVED_LOGS)
-              artifactName: MavenFailedTestsLogs
-          - script: |
-              echo "Stopping QuestDB server..."
-              pkill -f io.questdb.ServerMain || true
-            displayName: "Stop QuestDB server"
-            condition: not(startsWith(variables['imageName'], 'windows'))
-          - powershell: |
-              Write-Host "Stopping QuestDB server..."
-              Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*io.questdb.ServerMain*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-            displayName: "Stop QuestDB server on Windows"
-            condition: startsWith(variables['imageName'], 'windows')
+          - bash: |
+              echo "##vso[task.setvariable variable=QUESTDB_ILP_TCP_AUTH_ENABLE]true"
+            displayName: "Enable ILP TCP Auth"
+          - template: run_client_tests.yaml
+            parameters:
+              configPath: "ci/confs/authenticated"
+          - template: questdb_stop.yaml
