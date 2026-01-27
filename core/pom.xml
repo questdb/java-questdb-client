@@ -104,9 +104,6 @@
                 </executions>
                 <configuration>
                     <archive>
-                        <manifest>
-                            <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
-                        </manifest>
                         <manifestEntries>
                             <Build-Commit-Hash>${buildNumber}</Build-Commit-Hash>
                         </manifestEntries>
