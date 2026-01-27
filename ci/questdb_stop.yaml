@@ -9,13 +9,13 @@ steps:
   - pwsh: |
       Write-Host "Stopping QuestDB server..."
       if (Test-Path "questdb.pid") {
-        $pid = Get-Content "questdb.pid" | Select-Object -First 1
-        if ($pid) {
-          Stop-Process -Id $pid -ErrorAction SilentlyContinue
+        $questdbPid = Get-Content "questdb.pid" | Select-Object -First 1
+        if ($questdbPid) {
+          Stop-Process -Id $questdbPid -ErrorAction SilentlyContinue
           try {
-            Wait-Process -Id $pid -Timeout 30 -ErrorAction Stop
+            Wait-Process -Id $questdbPid -Timeout 30 -ErrorAction Stop
           } catch {
-            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $questdbPid -Force -ErrorAction SilentlyContinue
           }
         }
         Remove-Item -Force "questdb.pid" -ErrorAction SilentlyContinue
