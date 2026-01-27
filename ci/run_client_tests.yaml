@@ -9,7 +9,7 @@ steps:
   - task: Maven@3
     displayName: "Run Client Tests"
     inputs:
-      mavenPOMFile: "pom.xml"
+      mavenPOMFile: "core/pom.xml"
       jdkVersionOption: "default"
       goals: "test --batch-mode"
   - task: ArchiveFiles@2

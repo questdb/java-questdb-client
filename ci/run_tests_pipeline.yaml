@@ -52,7 +52,7 @@ stages:
           - task: Maven@3
             displayName: "Install client to local repo"
             inputs:
-              mavenPOMFile: "pom.xml"
+              mavenPOMFile: "core/pom.xml"
               jdkVersionOption: "default"
               goals: "install"
               options: "-DskipTests --batch-mode"
