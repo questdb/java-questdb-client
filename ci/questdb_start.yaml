@@ -41,6 +41,9 @@ steps:
       Write-Host "Stopping QuestDB server..."
       Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*io.questdb.ServerMain*" } | Stop-Process -Force -ErrorAction SilentlyContinue
 
+      # Sleep for a moment to ensure the process has fully terminated
+      Start-Sleep -Seconds 2
+
       # Remove any existing data
       if (Test-Path "questdb-data") {
         Remove-Item -Recurse -Force "questdb-data"
