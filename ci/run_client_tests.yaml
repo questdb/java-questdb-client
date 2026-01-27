@@ -5,7 +5,7 @@ parameters:
 steps:
   - template: questdb_start.yaml
     parameters:
-      configPath: "${ parameters.configPath }"
+      configPath: ${{ parameters.configPath }}
   - task: Maven@3
     displayName: "Run Client Tests"
     inputs:
