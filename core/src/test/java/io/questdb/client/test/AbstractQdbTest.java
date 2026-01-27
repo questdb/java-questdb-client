@@ -31,6 +31,7 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.BeforeClass;
 
@@ -205,23 +206,25 @@ public class AbstractQdbTest extends AbstractTest {
     @BeforeClass
     public static void setUpStatic() {
         AbstractTest.setUpStatic();
-        System.err.printf("CLEANING UP TEST TABLES%n");
-        // Cleanup all test tables before starting tests
-        try (Connection conn = getPgConnection();
-             Statement readStmt = conn.createStatement();
-             Statement stmt = conn.createStatement();
-             ResultSet rs = readStmt.executeQuery("SELECT table_name FROM tables() WHERE table_name LIKE 'test_%'")) {
-            while (rs.next()) {
-                String tableName = rs.getString(1);
-                try {
-                    stmt.execute(String.format("DROP TABLE IF EXISTS '%s'", tableName));
-                    LOG.info("Dropped test table: {}", tableName);
-                } catch (SQLException e) {
-                    LOG.warn("Failed to drop test table {}: {}", tableName, e.getMessage());
+        if (getQuestDBRunning()) {
+            System.err.printf("CLEANING UP TEST TABLES%n");
+            // Cleanup all test tables before starting tests
+            try (Connection conn = getPgConnection();
+                Statement readStmt = conn.createStatement();
+                Statement stmt = conn.createStatement();
+                ResultSet rs = readStmt.executeQuery("SELECT table_name FROM tables() WHERE table_name LIKE 'test_%'")) {
+                while (rs.next()) {
+                    String tableName = rs.getString(1);
+                    try {
+                        stmt.execute(String.format("DROP TABLE IF EXISTS '%s'", tableName));
+                        LOG.info("Dropped test table: {}", tableName);
+                    } catch (SQLException e) {
+                        LOG.warn("Failed to drop test table {}: {}", tableName, e.getMessage());
+                    }
                 }
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
             }
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -238,13 +241,6 @@ public class AbstractQdbTest extends AbstractTest {
     @After
     public void tearDown() throws Exception {
         super.tearDown();
-    }
-
-    /**
-     * Normalize line endings to LF for comparison.
-     */
-    private static String normalizeLineEndings(String s) {
-        return s == null ? null : s.replace("\r\n", "\n").replace("\r", "\n");
     }
 
     private static void toSink(InputStream is, Utf16Sink sink) {
