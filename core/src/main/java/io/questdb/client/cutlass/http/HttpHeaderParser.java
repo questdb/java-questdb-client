@@ -30,7 +30,6 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Mutable;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
-import io.questdb.client.std.ObjList;
 import io.questdb.client.std.ObjectPool;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
@@ -42,7 +41,6 @@ import io.questdb.client.std.str.DirectUtf8String;
 import io.questdb.client.std.str.Utf8Sequence;
 import io.questdb.client.std.str.Utf8String;
 import io.questdb.client.std.str.Utf8s;
-import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import static io.questdb.client.cutlass.http.HttpConstants.HEADER_CONTENT_LENGTH;
@@ -50,9 +48,6 @@ import static io.questdb.client.cutlass.http.HttpConstants.HEADER_CONTENT_TYPE;
 
 public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHeader {
     private final BoundaryAugmenter boundaryAugmenter = new BoundaryAugmenter();
-    private final ObjList<HttpCookie> cookieList = new ObjList<>();
-    private final ObjectPool<HttpCookie> cookiePool;
-    private final Utf8SequenceObjHashMap<HttpCookie> cookies = new Utf8SequenceObjHashMap<>();
     private final ObjectPool<DirectUtf8String> csPool;
     private final LowerCaseUtf8SequenceObjHashMap<DirectUtf8String> headers = new LowerCaseUtf8SequenceObjHashMap<>();
     private final DirectUtf8Sink sink = new DirectUtf8Sink(0);
@@ -85,7 +80,6 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
         this.headerPtr = this._wptr = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_HTTP_CONN);
         this.hi = headerPtr + bufferSize;
         this.csPool = csPool;
-        this.cookiePool = new ObjectPool<>(HttpCookie::new, 16);
         clear();
     }
 
@@ -111,8 +105,6 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
         this.isStatusText = true;
         this.needProtocol = true;
         this.contentLength = -1;
-        this.cookieList.clear();
-        this.cookiePool.clear();
         // do not clear the pool
         // this.pool.clear();
     }
@@ -136,14 +128,6 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
     @Override
     public DirectUtf8Sequence getContentType() {
         return contentType;
-    }
-
-    public HttpCookie getCookie(Utf8Sequence cookieName) {
-        return cookies.get(cookieName);
-    }
-
-    public @NotNull ObjList<HttpCookie> getCookieList() {
-        return cookieList;
     }
 
     @Override

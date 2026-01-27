@@ -24,7 +24,6 @@
 
 package io.questdb.client.test.cutlass.http;
 
-import io.questdb.client.cutlass.http.HttpCookie;
 import io.questdb.client.cutlass.http.HttpException;
 import io.questdb.client.cutlass.http.HttpHeaderParser;
 import io.questdb.client.std.MemoryTag;
@@ -32,7 +31,6 @@ import io.questdb.client.std.ObjectPool;
 import io.questdb.client.std.Rnd;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.DirectUtf8String;
-import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf8String;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -296,99 +294,6 @@ public class HttpHeaderParserTest {
             } finally {
                 Unsafe.free(p, request.length(), MemoryTag.NATIVE_DEFAULT);
             }
-        }
-    }
-
-    private static void assertCaseInsensitivity(String request) {
-        long p = TestUtils.toMemory(request);
-        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
-            hp.parse(p, p + request.length(), true, false);
-            HttpCookie cookie = hp.getCookie(new Utf8String("_gh_sess"));
-            Assert.assertNotNull(cookie);
-            TestUtils.assertEquals("HSVQNiqqkeSqpG%2B7x9fBrnGqXk4nI%2BW2j9BITSM7WLy53vJNNeFqLpfiDH9TyA%2BUa%2FX3%2FrfzQgidqybd36Lh9wsADt3GQP2VQh7pBSAlsGicsqSe2oYK9%2F2y1K3L8gCiYDNtSNk4zdBsTYNLRG72D82X2JvK3ArL79zLkBg6qys45Fou39r33iNH9DxfCisqGS2zvDw0MiJ2H%2FzVD85GB7iXeuznThBI107uPHLJxzpgUAgqj4gLr8ocbDgkFeBuiiWHYRaT9b4wZmHIHMnDz%2BU0Pu45spvs6PLSvCoePzpIazmAqvVvvh5SQ1hqZuCn5ffl3x777xHiUU9z--akaypyDbIgToO26U--D%2BUL6IEkoc6dkRNuUkoosQ%3D%3D", cookie.value);
-            Assert.assertNull(cookie.domain);
-            TestUtils.assertEquals("/", cookie.path);
-            Assert.assertTrue(cookie.secure);
-            Assert.assertFalse(cookie.partitioned);
-            Assert.assertTrue(cookie.httpOnly);
-            Assert.assertEquals(0, cookie.maxAge);
-            TestUtils.assertEquals("Lax", cookie.sameSite);
-            Assert.assertEquals(-1, cookie.expires);
-
-        } finally {
-            Unsafe.free(p, request.length(), MemoryTag.NATIVE_DEFAULT);
-        }
-    }
-
-    private static void assertCookieVanilla(String v) {
-        long p = TestUtils.toMemory(v);
-        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
-            hp.parse(p, p + v.length(), true, false);
-            HttpCookie cookie = hp.getCookie(new Utf8String("id"));
-            Assert.assertNotNull(cookie);
-            TestUtils.assertEquals("123", cookie.value);
-            TestUtils.assertEquals("hello.com", cookie.domain);
-            TestUtils.assertEquals("/", cookie.path);
-            Assert.assertTrue(cookie.secure);
-            Assert.assertTrue(cookie.partitioned);
-            Assert.assertTrue(cookie.httpOnly);
-            Assert.assertEquals(1234545, cookie.maxAge);
-            TestUtils.assertEquals("strict", cookie.sameSite);
-            Assert.assertEquals(1445412480000000L, cookie.expires);
-
-        } finally {
-            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
-        }
-    }
-
-    private static void assertCookies(CharSequence expected, String response, StringSink sink) {
-        sink.clear();
-        response = "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" + response + "\r\n";
-        long p = TestUtils.toMemory(response);
-        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
-            hp.parse(p, p + response.length(), true, false);
-            hp.getCookieList().toSink(sink);
-            TestUtils.assertEquals(expected, sink);
-        } finally {
-            Unsafe.free(p, response.length(), MemoryTag.NATIVE_DEFAULT);
-        }
-    }
-
-    private static void assertMalformedCookieIgnored(String malformedCookie) {
-        String v = "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
-                "Set-Cookie: a=123; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n" +
-                malformedCookie +
-                "Set-Cookie: b=123; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n" +
-                "\r\n";
-        long p = TestUtils.toMemory(v);
-        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
-            hp.parse(p, p + v.length(), true, false);
-            Assert.assertEquals(2, hp.getCookieList().size());
-            Assert.assertNotNull(hp.getCookie(new Utf8String("a")));
-            Assert.assertNotNull(hp.getCookie(new Utf8String("b")));
-        } finally {
-            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
-        }
-    }
-
-    private static void assertPreferredCookie(String v, long expiresTimestamp) {
-        long p = TestUtils.toMemory(v);
-        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
-            hp.parse(p, p + v.length(), true, false);
-            HttpCookie cookie = hp.getCookie(new Utf8String("id"));
-            Assert.assertNotNull(cookie);
-            TestUtils.assertEquals("124", cookie.value);
-            TestUtils.assertEquals("hello.com", cookie.domain);
-            TestUtils.assertEquals("/aaaa", cookie.path);
-            Assert.assertTrue(cookie.secure);
-            Assert.assertTrue(cookie.partitioned);
-            Assert.assertTrue(cookie.httpOnly);
-            Assert.assertEquals(1234545, cookie.maxAge);
-            TestUtils.assertEquals("strict", cookie.sameSite);
-            Assert.assertEquals(expiresTimestamp, cookie.expires);
-
-        } finally {
-            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
         }
     }
 

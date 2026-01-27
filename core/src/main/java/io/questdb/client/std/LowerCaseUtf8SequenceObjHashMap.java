@@ -68,8 +68,7 @@ public class LowerCaseUtf8SequenceObjHashMap<V> extends AbstractLowerCaseUtf8Seq
     /**
      * Stores a key-value pair in the map without creating a defensive copy of the key.
      * <p>
-     * Unlike {@link #put(Utf8Sequence, Object)}, this method stores the exact key instance provided,
-     * preserving its identity.
+     * This method stores the exact key instance provided, preserving its identity.
      * <p>
      * <b>Important lifecycle requirement:</b> The caller must guarantee that:
      * <ul>
@@ -78,7 +77,6 @@ public class LowerCaseUtf8SequenceObjHashMap<V> extends AbstractLowerCaseUtf8Seq
      *     <li>The key instance will not be reused or returned to a pool until removed from the map</li>
      * </ul>
      * <p>
-     * Use {@link #put(Utf8Sequence, Object)} instead when the key lifecycle cannot be guaranteed.
      *
      * @param key   the immutable key whose exact instance will be stored (must not be null)
      * @param value the value to associate with the key (must not be null)
