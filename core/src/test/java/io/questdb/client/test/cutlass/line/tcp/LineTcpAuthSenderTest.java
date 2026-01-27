@@ -89,7 +89,7 @@ public class LineTcpAuthSenderTest extends AbstractLineTcpSenderTest {
         useTable("test_builder_auth_success");
 
         try (Sender sender = Sender.builder(Transport.TCP)
-                .address(HOST + ":" + getIlpTcpPort())
+                .address("127.0.0.1:" + getIlpTcpPort())
                 .enableAuth(AUTH_KEY_ID1).authToken(TOKEN)
                 .protocolVersion(PROTOCOL_VERSION_V2)
                 .build()) {
@@ -104,7 +104,7 @@ public class LineTcpAuthSenderTest extends AbstractLineTcpSenderTest {
     public void testBuilderAuthSuccess_confString() throws Exception {
         useTable("test_builder_auth_success_conf_string");
 
-        try (Sender sender = Sender.fromConfig("tcp::addr=" + HOST + ":" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1
+        try (Sender sender = Sender.fromConfig("tcp::addr=127.0.0.1:" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1
                 + ";token=" + TOKEN + ";protocol_version=2;")) {
             sender.table("test_builder_auth_success_conf_string").longColumn("my int field", 42).atNow();
             sender.flush();
@@ -117,7 +117,7 @@ public class LineTcpAuthSenderTest extends AbstractLineTcpSenderTest {
     public void testConfString() throws Exception {
         useTable("test_conf_string");
 
-        String confString = "tcp::addr=" + HOST + ":" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1 + ";token=" + TOKEN
+        String confString = "tcp::addr=127.0.0.1:" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1 + ";token=" + TOKEN
                 + ";protocol_version=2;";
         try (Sender sender = Sender.fromConfig(confString)) {
             long tsMicros = Micros.floor("2022-02-25");
