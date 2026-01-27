@@ -21,7 +21,19 @@ steps:
         Remove-Item -Force "questdb.pid" -ErrorAction SilentlyContinue
       }
       if (Test-Path "questdb-data") {
-        Remove-Item -Recurse -Force "questdb-data"
+        $deleted = $false
+        for ($i = 0; $i -lt 10; $i++) {
+          try {
+            Remove-Item -Recurse -Force "questdb-data" -ErrorAction Stop
+            $deleted = $true
+            break
+          } catch {
+            Start-Sleep -Seconds 1
+          }
+        }
+        if (-not $deleted) {
+          Remove-Item -Recurse -Force "questdb-data"
+        }
       }
     displayName: "Stop QuestDB server (Windows)"
     condition: eq(variables['Agent.OS'], 'Windows_NT')
