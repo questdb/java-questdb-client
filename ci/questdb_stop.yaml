@@ -1,7 +1,3 @@
-parameters:
-  - name: configPath
-    type: string
-
 steps:
   - script: |
       echo "Stopping QuestDB server..."
