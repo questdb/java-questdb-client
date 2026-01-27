@@ -46,6 +46,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import static io.questdb.client.cutlass.http.HttpConstants.HEADER_CONTENT_LENGTH;
+import static io.questdb.client.cutlass.http.HttpConstants.HEADER_CONTENT_TYPE;
 
 public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHeader {
     private final BoundaryAugmenter boundaryAugmenter = new BoundaryAugmenter();
@@ -238,8 +239,33 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
         }
     }
 
+    private void parseContentType() {
+        DirectUtf8Sequence seq = getHeader(HEADER_CONTENT_TYPE);
+        if (seq == null) {
+            return;
+        }
+
+        long p = seq.lo();
+        final long hi = seq.hi();
+
+        long lo = HttpSemantics.swallowOWS(p, hi);
+        p = parseMediaType(lo, hi);
+        this.contentType = csPool.next().of(lo, p);
+    }
+
     private void parseKnownHeaders() {
+        parseContentType();
         parseContentLength();
+    }
+
+    private long parseMediaType(long lo, long hi) {
+        // media-type format is: type "/" subtype
+        // type and subtype are tokens
+        long p = HttpSemantics.swallowTokens(lo, hi);
+        if (p > hi || ((char) Unsafe.getUnsafe().getByte(p) != '/')) {
+            return p;
+        }
+        return HttpSemantics.swallowTokens(p + 1, hi);
     }
 
     private int parseMethod(long lo, long hi) {

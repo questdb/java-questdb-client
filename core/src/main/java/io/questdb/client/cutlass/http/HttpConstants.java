@@ -27,12 +27,8 @@ package io.questdb.client.cutlass.http;
 import io.questdb.client.std.str.Utf8String;
 
 public final class HttpConstants {
-    public static final char COOKIE_VALUE_SEPARATOR = '=';
     public static final Utf8String HEADER_CONNECTION = new Utf8String("Connection");
-    public static final Utf8String HEADER_CONTENT_DISPOSITION = new Utf8String("Content-Disposition");
     public static final Utf8String HEADER_CONTENT_LENGTH = new Utf8String("Content-Length");
     public static final Utf8String HEADER_CONTENT_TYPE = new Utf8String("Content-Type");
-    public static final Utf8String HEADER_COOKIE = new Utf8String("Cookie");
-    public static final Utf8String HEADER_STATEMENT_TIMEOUT = new Utf8String("Statement-Timeout");
     public static final Utf8String HEADER_TRANSFER_ENCODING = new Utf8String("Transfer-Encoding");
 }
