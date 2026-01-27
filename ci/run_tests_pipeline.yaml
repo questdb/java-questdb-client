@@ -48,7 +48,7 @@ stages:
               mavenPOMFile: "core/pom.xml"
               jdkVersionOption: "default"
               goals: "versions:set"
-              options: "-DnewVersion=9.9.9 -DgenerateBackupPoms=false"
+              options: "-DnewVersion=9.9.9 -DgenerateBackupPoms=false --batch-mode"
           - task: Maven@3
             displayName: "Install client to local repo"
             inputs:
@@ -62,21 +62,21 @@ stages:
               mavenPOMFile: "questdb/core/pom.xml"
               jdkVersionOption: "default"
               goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true"
+              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
           - task: Maven@3
             displayName: "Update QuestDB client version: benchmarks"
             inputs:
               mavenPOMFile: "questdb/benchmarks/pom.xml"
               jdkVersionOption: "default"
               goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true"
+              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
           - task: Maven@3
             displayName: "Update QuestDB client version: utils"
             inputs:
               mavenPOMFile: "questdb/utils/pom.xml"
               jdkVersionOption: "default"
               goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true"
+              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:

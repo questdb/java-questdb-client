@@ -1,11 +1,5 @@
 steps:
-  - script: |
+  - bash: |
       echo "Stopping QuestDB server..."
       pkill -f io.questdb.ServerMain || true
     displayName: "Stop QuestDB server"
-    condition: not(startsWith(variables['imageName'], 'windows'))
-  - powershell: |
-      Write-Host "Stopping QuestDB server..."
-      Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*io.questdb.ServerMain*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-    displayName: "Stop QuestDB server on Windows"
-    condition: startsWith(variables['imageName'], 'windows')

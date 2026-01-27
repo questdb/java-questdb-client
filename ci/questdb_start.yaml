@@ -3,7 +3,7 @@ parameters:
     type: string
 
 steps:
-  - script: |
+  - bash: |
       echo "Stopping QuestDB server..."
       pkill -f io.questdb.ServerMain || true
 
@@ -35,51 +35,3 @@ steps:
         exit 1
       fi
     displayName: "Start QuestDB server"
-    condition: not(startsWith(variables['imageName'], 'windows'))
-
-  - powershell: |
-      Write-Host "Stopping QuestDB server..."
-      Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*io.questdb.ServerMain*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-
-      # Sleep for a moment to ensure the process has fully terminated
-      Start-Sleep -Seconds 2
-
-      # Remove any existing data
-      if (Test-Path "questdb-data") {
-        Remove-Item -Recurse -Force "questdb-data"
-      }
-      New-Item -ItemType Directory -Path "questdb-data" -Force | Out-Null
-      Copy-Item -Recurse -Path "${{ parameters.configPath }}" -Destination "questdb-data/conf"
-
-      New-Item -ItemType Directory -Path "logs" -Force | Out-Null
-
-      # Find the QuestDB jar
-      $jarPath = Get-ChildItem -Path "questdb/core/target" -Filter "questdb-*-SNAPSHOT.jar" | Select-Object -First 1 -ExpandProperty FullName
-
-      # Start QuestDB in the background
-      Start-Process -FilePath "java" -ArgumentList "-p", $jarPath, "-m", "io.questdb/io.questdb.ServerMain", "-d", "questdb-data" -RedirectStandardOutput "logs/questdb.log" -RedirectStandardError "logs/questdb-error.log" -NoNewWindow
-
-      # Wait for QuestDB to start
-      Write-Host "Waiting for QuestDB to start..."
-      $started = $false
-      for ($i = 1; $i -le 30; $i++) {
-        if (Test-Path "logs/questdb.log") {
-          $content = Get-Content "logs/questdb.log" -Raw -ErrorAction SilentlyContinue
-          if ($content -match "server-main enjoy") {
-            Write-Host "Server started."
-            $started = $true
-            break
-          }
-        }
-        Write-Host "Waiting..."
-        Start-Sleep -Seconds 2
-      }
-
-      if (-not $started) {
-        Write-Host "QuestDB failed to start:"
-        if (Test-Path "logs/questdb.log") { Get-Content "logs/questdb.log" }
-        if (Test-Path "logs/questdb-error.log") { Get-Content "logs/questdb-error.log" }
-        exit 1
-      }
-    displayName: "Start QuestDB server"
-    condition: startsWith(variables['imageName'], 'windows')
