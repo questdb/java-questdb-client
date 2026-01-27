@@ -25,3 +25,4 @@ steps:
     inputs:
       pathToPublish: $(ARCHIVED_LOGS)
       artifactName: MavenFailedTestsLogs
+  - template: questdb_stop.yaml

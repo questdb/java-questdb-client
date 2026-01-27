@@ -9,7 +9,3 @@ steps:
   - bash: sudo sysctl -w fs.file-max=500000
     displayName: "Increase file count on Linux"
     condition: startsWith(variables['imageName'], 'ubuntu')
-
-  - bash: yum install -y procps-ng
-    displayName: "Install pkill"
-    condition: startsWith(variables['imageName'], 'windows')

@@ -92,5 +92,4 @@ stages:
           - template: run_client_tests.yaml
             parameters:
               configPath: "ci/confs/authenticated"
-          - template: questdb_stop.yaml
           - template: run_oss_tests.yaml

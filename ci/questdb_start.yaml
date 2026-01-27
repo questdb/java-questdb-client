@@ -4,11 +4,6 @@ parameters:
 
 steps:
   - bash: |
-      echo "Stopping QuestDB server..."
-      pkill -f io.questdb.ServerMain
-
-      # Remove any existing data
-      rm -rf questdb-data
       mkdir -p questdb-data
       cp -r ${{ parameters.configPath }} questdb-data/conf
 

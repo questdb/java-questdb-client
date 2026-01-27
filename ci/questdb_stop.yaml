@@ -1,5 +1,6 @@
 steps:
   - bash: |
       echo "Stopping QuestDB server..."
-      pkill -f io.questdb.ServerMain
+      kill -TERM $(pgrep -f 'io.questdb.ServerMain')
+      rm -rf questdb-data
     displayName: "Stop QuestDB server"
