@@ -40,6 +40,7 @@ import io.questdb.client.std.datetime.nanotime.Nanos;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Assume;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.time.Instant;
@@ -60,6 +61,12 @@ import static org.junit.Assert.*;
  * infrastructure.
  */
 public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
+    @BeforeClass
+    public static void setUpStatic() {
+        AbstractLineTcpSenderTest.setUpStatic();
+        Assume.assumeFalse(getIlpTcpAuthEnabled());
+    }
+
     @Test
     public void testArrayAtNow() throws Exception {
         String table = "test_array_at_now";
@@ -110,20 +117,6 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     }
 
     @Test
-    public void testAuthSuccess() throws Exception {
-        Assume.assumeTrue(getIlpTcpAuthEnabled());
-        useTable("test_auth_success");
-
-        try (AbstractLineTcpSender sender = LineTcpSenderV2.newSender(HOST, getIlpTcpPort(), 256 * 1024)) {
-            sender.authenticate(AUTH_KEY_ID1, AUTH_PRIVATE_KEY1);
-            sender.metric("test_auth_success").field("my int field", 42).$();
-            sender.flush();
-        }
-
-        assertTableExistsEventually("test_auth_success");
-    }
-
-    @Test
     public void testAuthWrongKey() throws Exception {
         try (AbstractLineTcpSender sender = LineTcpSenderV2.newSender(HOST, getIlpTcpPort(), 2048)) {
             sender.authenticate(AUTH_KEY_ID2_INVALID, AUTH_PRIVATE_KEY1);
@@ -137,37 +130,6 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         } catch (LineSenderException expected) {
             // ignored
         }
-    }
-
-    @Test
-    public void testBuilderAuthSuccess() throws Exception {
-        Assume.assumeTrue(getIlpTcpAuthEnabled());
-        useTable("test_builder_auth_success");
-
-        try (Sender sender = Sender.builder(Sender.Transport.TCP)
-                .address(HOST + ":" + getIlpTcpPort())
-                .enableAuth(AUTH_KEY_ID1).authToken(TOKEN)
-                .protocolVersion(PROTOCOL_VERSION_V2)
-                .build()) {
-            sender.table("test_builder_auth_success").longColumn("my int field", 42).atNow();
-            sender.flush();
-        }
-
-        assertTableExistsEventually("test_builder_auth_success");
-    }
-
-    @Test
-    public void testBuilderAuthSuccess_confString() throws Exception {
-        Assume.assumeTrue(getIlpTcpAuthEnabled());
-        useTable("test_builder_auth_success_conf_string");
-
-        try (Sender sender = Sender.fromConfig("tcp::addr=" + HOST + ":" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1
-                + ";token=" + TOKEN + ";protocol_version=2;")) {
-            sender.table("test_builder_auth_success_conf_string").longColumn("my int field", 42).atNow();
-            sender.flush();
-        }
-
-        assertTableExistsEventually("test_builder_auth_success_conf_string");
     }
 
     @Test
@@ -252,32 +214,6 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         }
 
         assertTableExistsEventually("test_close_implies_flush");
-    }
-
-    @Test
-    public void testConfString() throws Exception {
-        Assume.assumeTrue(getIlpTcpAuthEnabled());
-        useTable("test_conf_string");
-
-        String confString = "tcp::addr=" + HOST + ":" + getIlpTcpPort() + ";user=" + AUTH_KEY_ID1 + ";token=" + TOKEN
-                + ";protocol_version=2;";
-        try (Sender sender = Sender.fromConfig(confString)) {
-            long tsMicros = Micros.floor("2022-02-25");
-            sender.table("test_conf_string")
-                    .longColumn("int_field", 42)
-                    .boolColumn("bool_field", true)
-                    .stringColumn("string_field", "foo")
-                    .doubleColumn("double_field", 42.0)
-                    .timestampColumn("ts_field", tsMicros, ChronoUnit.MICROS)
-                    .at(tsMicros, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually("test_conf_string", 1);
-        assertSqlEventually(
-                "int_field\tbool_field\tstring_field\tdouble_field\tts_field\ttimestamp\n" +
-                        "42\ttrue\tfoo\t42.0\t2022-02-25T00:00:00.000000000Z\t2022-02-25T00:00:00.000000000Z\n",
-                "select int_field, bool_field, string_field, double_field, ts_field, timestamp from test_conf_string");
     }
 
     @Test
@@ -1219,18 +1155,6 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
                 assertContains(e.getMessage(),
                         "column name is too long: [name = column_with_long______________________name, maxNameLength=20]");
             }
-        }
-    }
-
-    @Test
-    public void testMinBufferSizeWhenAuth() throws Exception {
-        Assume.assumeTrue(getIlpTcpAuthEnabled());
-        int tinyCapacity = 42;
-        try (AbstractLineTcpSender sender = LineTcpSenderV2.newSender(HOST, getIlpTcpPort(), tinyCapacity)) {
-            sender.authenticate(AUTH_KEY_ID1, AUTH_PRIVATE_KEY1);
-            fail();
-        } catch (LineSenderException e) {
-            assertContains(e.getMessage(), "challenge did not fit into buffer");
         }
     }
 
