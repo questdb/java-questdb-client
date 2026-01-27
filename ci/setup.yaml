@@ -11,7 +11,7 @@ steps:
     condition: startsWith(variables['imageName'], 'ubuntu')
 
   - bash: |
-      sudo apt-get update
-      sudo apt-get install -y procps
+      apt-get update
+      apt-get install -y procps
     displayName: "Install pkill"
     condition: startsWith(variables['imageName'], 'windows')
