@@ -64,6 +64,13 @@ stages:
               goals: "versions:use-dep-version"
               options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true"
           - task: Maven@3
+            displayName: "Update QuestDB client version"
+            inputs:
+              mavenPOMFile: "questdb/benchmarks/pom.xml"
+              jdkVersionOption: "default"
+              goals: "versions:use-dep-version"
+              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true"
+          - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
