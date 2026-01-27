@@ -24,19 +24,13 @@
 
 package io.questdb.client;
 
-import org.jetbrains.annotations.NotNull;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.jar.Attributes;
 import java.util.jar.Manifest;
 
-public class BuildInformationHolder implements BuildInformation, CharSequence {
+public class BuildInformationHolder implements BuildInformation {
     private static final String UNKNOWN = "unknown";
-    private final String buildKey;
-    private final String commitHash;
-    private final String jdkVersion;
-    private final String swName;
     private final String swVersion;
 
     public BuildInformationHolder() {
@@ -45,75 +39,22 @@ public class BuildInformationHolder implements BuildInformation, CharSequence {
 
     public BuildInformationHolder(Class<?> clazz) {
         String swVersion;
-        String swName;
-        String commitHash;
-        String jdkVersion;
         try {
             final Attributes manifestAttributes = getManifestAttributes(clazz);
-            swVersion = getAttr(manifestAttributes, "Implementation-Version", "[DEVELOPMENT]");
-            swName = getAttr(manifestAttributes, "Implementation-Title", UNKNOWN);
-            commitHash = getAttr(manifestAttributes, "Build-Commit-Hash", UNKNOWN);
-            jdkVersion = getAttr(manifestAttributes, "Build-Jdk", UNKNOWN);
+            swVersion = getAttr(manifestAttributes, "QuestDB-Client-Version", "[DEVELOPMENT]");
         } catch (IOException e) {
             swVersion = UNKNOWN;
-            swName = UNKNOWN;
-            commitHash = UNKNOWN;
-            jdkVersion = UNKNOWN;
         }
         this.swVersion = swVersion;
-        this.swName = swName;
-        this.commitHash = commitHash;
-        this.jdkVersion = jdkVersion;
-        buildKey = makeBuildKey(swVersion, commitHash, jdkVersion);
     }
 
-    public BuildInformationHolder(String swVersion, String commitHash, String jdkVersion, String swName) {
+    public BuildInformationHolder(String swVersion) {
         this.swVersion = swVersion;
-        this.commitHash = commitHash;
-        this.jdkVersion = jdkVersion;
-        this.swName = swName;
-        buildKey = makeBuildKey(swVersion, commitHash, jdkVersion);
-    }
-
-    @Override
-    public char charAt(int index) {
-        return buildKey.charAt(index);
-    }
-
-    @Override
-    public String getCommitHash() {
-        return commitHash;
-    }
-
-    @Override
-    public String getJdkVersion() {
-        return jdkVersion;
-    }
-
-    @Override
-    public String getSwName() {
-        return swName;
     }
 
     @Override
     public String getSwVersion() {
         return swVersion;
-    }
-
-    @Override
-    public int length() {
-        return buildKey.length();
-    }
-
-    @NotNull
-    @Override
-    public CharSequence subSequence(int start, int end) {
-        return buildKey.subSequence(start, end);
-    }
-
-    @Override
-    public String toString() {
-        return buildKey;
     }
 
     private static String getAttr(final Attributes manifestAttributes, String attributeName, String defaultValue) {
@@ -135,9 +76,5 @@ public class BuildInformationHolder implements BuildInformation, CharSequence {
             }
         }
         return new Attributes();
-    }
-
-    private String makeBuildKey(CharSequence swVersion, CharSequence commitHash, CharSequence jdkVersion) {
-        return swVersion + ":" + commitHash + ":" + jdkVersion;
     }
 }

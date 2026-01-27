@@ -25,11 +25,5 @@
 package io.questdb.client;
 
 public interface BuildInformation {
-    String getCommitHash();
-
-    String getJdkVersion();
-
-    String getSwName();
-
     String getSwVersion();
 }

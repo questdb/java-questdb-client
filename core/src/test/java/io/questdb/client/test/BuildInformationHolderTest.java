@@ -25,31 +25,13 @@
 package io.questdb.client.test;
 
 import io.questdb.client.BuildInformationHolder;
-import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
 public class BuildInformationHolderTest {
-
     @Test
     public void testAsCharSequence() {
-        TestUtils.assertEquals("[DEVELOPMENT]:unknown:unknown", new BuildInformationHolder());
-        BuildInformationHolder holder = new BuildInformationHolder("a", "b", "c", "d");
-        TestUtils.assertEquals("a:b:c", holder);
+        BuildInformationHolder holder = new BuildInformationHolder("a");
         Assert.assertEquals("a", holder.getSwVersion());
-        Assert.assertEquals("b", holder.getCommitHash());
-        Assert.assertEquals("c", holder.getJdkVersion());
-        Assert.assertEquals("d", holder.getSwName());
-        char[] expected = {'a', ':', 'b', ':', 'c'};
-        Assert.assertEquals(expected.length, holder.length());
-        for (int i = 0; i < expected.length; i++) {
-            Assert.assertEquals(expected[i], holder.charAt(i));
-        }
-        Assert.assertEquals("a:b:c", holder.subSequence(0, 5));
-    }
-
-    @Test
-    public void testAsCharSequenceDefault() {
-        TestUtils.assertEquals("[DEVELOPMENT]:unknown:unknown", new BuildInformationHolder());
     }
 }

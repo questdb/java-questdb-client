@@ -105,7 +105,8 @@
                 <configuration>
                     <archive>
                         <manifestEntries>
-                            <Build-Commit-Hash>${buildNumber}</Build-Commit-Hash>
+                            <QuestDB-Client-Build-Commit-Hash>${buildNumber}</QuestDB-Client-Build-Commit-Hash>
+                            <QuestDB-Client-Version>${project.version}</QuestDB-Client-Version>
                         </manifestEntries>
                     </archive>
                 </configuration>
