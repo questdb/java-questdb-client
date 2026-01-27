@@ -5,7 +5,7 @@ parameters:
 steps:
   - bash: |
       echo "Stopping QuestDB server..."
-      pkill -f io.questdb.ServerMain || true
+      pkill -f io.questdb.ServerMain
 
       # Remove any existing data
       rm -rf questdb-data

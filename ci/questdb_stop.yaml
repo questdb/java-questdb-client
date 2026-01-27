@@ -1,5 +1,5 @@
 steps:
   - bash: |
       echo "Stopping QuestDB server..."
-      pkill -f io.questdb.ServerMain || true
+      pkill -f io.questdb.ServerMain
     displayName: "Stop QuestDB server"

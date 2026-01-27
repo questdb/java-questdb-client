@@ -9,3 +9,9 @@ steps:
   - bash: sudo sysctl -w fs.file-max=500000
     displayName: "Increase file count on Linux"
     condition: startsWith(variables['imageName'], 'ubuntu')
+
+  - bash: |
+      sudo apt-get update
+      sudo apt-get install -y procps
+    displayName: "Install pkill"
+    condition: startsWith(variables['imageName'], 'windows')
