@@ -83,7 +83,7 @@ public final class TestUtils {
 
     public static void assertContains(String message, CharSequence sequence, CharSequence term) {
         // Assume that "" is contained in any string.
-        if (term.isEmpty()) {
+        if (term.length() == 0) {
             return;
         }
         if (Chars.contains(sequence, term)) {
@@ -343,7 +343,7 @@ public final class TestUtils {
      * @param term     the {@code CharSequence} to search for (and assert its absence).
      */
     public static void assertNotContains(String message, CharSequence sequence, CharSequence term) {
-        if (term.isEmpty()) {
+        if (term.length() == 0) {
             String formatted = "";
             if (message != null) {
                 formatted = message + " ";
