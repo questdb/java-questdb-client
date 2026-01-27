@@ -201,8 +201,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testBuilderPlainText_addressWithIpAndPort() throws Exception {
         useTable("test_builder_plain_text_ip_port");
 
+        String address = "127.0.0.1:" + getIlpTcpPort();
         try (Sender sender = Sender.builder(Sender.Transport.TCP)
-                .address(HOST + ":" + getIlpTcpPort())
+                .address(address)
                 .protocolVersion(PROTOCOL_VERSION_V2)
                 .build()) {
             sender.table("test_builder_plain_text_ip_port").longColumn("my int field", 42).atNow();
