@@ -101,15 +101,16 @@ public final class Net {
     public static long getAddrInfo(CharSequence host, int port) {
         try (DirectUtf8Sink sink = new DirectUtf8Sink(host.length())) {
             sink.put(host);
+            sink.putAny((byte) 0);
             return getAddrInfo(sink, port);
         }
     }
 
-    public static long getAddrInfo(DirectUtf8Sequence host, int port) {
+    private static long getAddrInfo(DirectUtf8Sequence host, int port) {
         return getAddrInfo(host.ptr(), port);
     }
 
-    public static long getAddrInfo(long lpszHost, int port) {
+    private static long getAddrInfo(long lpszHost, int port) {
         long addrInfo = getAddrInfo0(lpszHost, port);
         if (addrInfo != -1) {
             ADDR_INFO_COUNTER.incrementAndGet();
