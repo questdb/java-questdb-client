@@ -43,6 +43,26 @@ stages:
           - script: git clone --depth 1 -b rd_strip_ilp_sender https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
           - task: Maven@3
+            displayName: "Update client version"
+            inputs:
+              mavenPOMFile: "core/pom.xml"
+              jdkVersionOption: "default"
+              goals: "versions:set"
+              options: "-DnewVersion=9.9.9 -DgenerateBackupPoms=false"
+          - task: Maven@3
+            displayName: "Install client to local repo"
+            inputs:
+              mavenPOMFile: "pom.xml"
+              jdkVersionOption: "default"
+              goals: "install"
+          - task: Maven@3
+            displayName: "Update QuestDB client version"
+            inputs:
+              mavenPOMFile: "questdb/core/pom.xml"
+              jdkVersionOption: "default"
+              goals: "versions:use-dep-version"
+              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true"
+          - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
