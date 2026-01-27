@@ -12,6 +12,11 @@ steps:
         $pid = Get-Content "questdb.pid" | Select-Object -First 1
         if ($pid) {
           Stop-Process -Id $pid -ErrorAction SilentlyContinue
+          try {
+            Wait-Process -Id $pid -Timeout 30 -ErrorAction Stop
+          } catch {
+            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+          }
         }
         Remove-Item -Force "questdb.pid" -ErrorAction SilentlyContinue
       }
