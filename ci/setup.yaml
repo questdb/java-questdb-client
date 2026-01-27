@@ -10,7 +10,6 @@ steps:
     displayName: "Increase file count on Linux"
     condition: startsWith(variables['imageName'], 'ubuntu')
 
-  - bash: |
-      apk add --no-cache procps
+  - bash: yum install -y procps-ng
     displayName: "Install pkill"
     condition: startsWith(variables['imageName'], 'windows')
