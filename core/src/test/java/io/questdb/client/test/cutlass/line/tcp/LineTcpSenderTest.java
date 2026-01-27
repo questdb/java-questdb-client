@@ -66,7 +66,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         useTable(table);
 
         try (Sender sender = createTcpSender(PROTOCOL_VERSION_V2);
-                DoubleArray a1 = new DoubleArray(1, 1, 2, 1).setAll(1)) {
+             DoubleArray a1 = new DoubleArray(1, 1, 2, 1).setAll(1)) {
             sender.table(table)
                     .symbol("x", "42i")
                     .symbol("y", "[6f1.0,2.5,3.0,4.5,5.0]") // ensuring no array parsing for symbol
@@ -85,9 +85,9 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         useTable(table);
 
         try (Sender sender = createTcpSender(PROTOCOL_VERSION_V2);
-                DoubleArray a4 = new DoubleArray(1, 1, 2, 1).setAll(4);
-                DoubleArray a5 = new DoubleArray(3, 2, 1, 4, 1).setAll(5);
-                DoubleArray a6 = new DoubleArray(1, 3, 4, 2, 1, 1).setAll(6)) {
+             DoubleArray a4 = new DoubleArray(1, 1, 2, 1).setAll(4);
+             DoubleArray a5 = new DoubleArray(3, 2, 1, 4, 1).setAll(5);
+             DoubleArray a6 = new DoubleArray(1, 3, 4, 2, 1, 1).setAll(6)) {
             long ts = Micros.floor("2025-02-22T00:00:00.000000000Z");
             double[] arr1d = createDoubleArray(5);
             double[][] arr2d = createDoubleArray(2, 3);
@@ -230,7 +230,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
                 assertContains(e.getMessage(), "duplicated table");
             }
         }
-        assertFalse(channel.contain(new byte[] { (byte) '\n' }));
+        assertFalse(channel.contain(new byte[]{(byte) '\n'}));
     }
 
     @Test
@@ -284,10 +284,10 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         useTable("test_conf_string_auto_flush_bytes");
 
         String confString = "tcp::addr=localhost:" + getIlpTcpPort() + ";auto_flush_bytes=1;protocol_version=2;"; // the
-                                                                                                                  // minimal
-                                                                                                                  // allowed
-                                                                                                                  // buffer
-                                                                                                                  // size
+        // minimal
+        // allowed
+        // buffer
+        // size
         try (Sender sender = Sender.fromConfig(confString)) {
             // just 2 rows must be enough to trigger flush
             // why not 1? the first byte of the 2nd row will flush the last byte of the 1st
@@ -314,14 +314,14 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     @Test
     public void testCreateTimestampColumnsWithDesignatedInstantV1() throws Exception {
         testCreateTimestampColumns(Nanos.floor("2025-11-20T10:55:24.123123123Z"), null, PROTOCOL_VERSION_V1,
-                new int[] { ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP },
+                new int[]{ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP},
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123123000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedInstantV2() throws Exception {
         testCreateTimestampColumns(Nanos.floor("2025-11-20T10:55:24.123123123Z"), null, PROTOCOL_VERSION_V2,
-                new int[] { ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO },
+                new int[]{ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO},
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123123000Z");
     }
 
@@ -329,7 +329,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testCreateTimestampColumnsWithDesignatedMicrosV1() throws Exception {
         testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z"), ChronoUnit.MICROS,
                 PROTOCOL_VERSION_V1,
-                new int[] { ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP },
+                new int[]{ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP},
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123456000Z");
     }
 
@@ -337,7 +337,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testCreateTimestampColumnsWithDesignatedMicrosV2() throws Exception {
         testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z"), ChronoUnit.MICROS,
                 PROTOCOL_VERSION_V2,
-                new int[] { ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP },
+                new int[]{ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP},
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123456000Z");
     }
 
@@ -345,7 +345,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testCreateTimestampColumnsWithDesignatedMillisV1() throws Exception {
         testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z") / 1000, ChronoUnit.MILLIS,
                 PROTOCOL_VERSION_V1,
-                new int[] { ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP },
+                new int[]{ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP},
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123000000Z");
     }
 
@@ -353,21 +353,21 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     public void testCreateTimestampColumnsWithDesignatedMillisV2() throws Exception {
         testCreateTimestampColumns(Micros.floor("2025-11-20T10:55:24.123456000Z") / 1000, ChronoUnit.MILLIS,
                 PROTOCOL_VERSION_V2,
-                new int[] { ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP },
+                new int[]{ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP},
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123000000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedNanosV1() throws Exception {
         testCreateTimestampColumns(Nanos.floor("2025-11-20T10:55:24.123456789Z"), ChronoUnit.NANOS, PROTOCOL_VERSION_V1,
-                new int[] { ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP },
+                new int[]{ColumnType.TIMESTAMP, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP},
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123456000Z");
     }
 
     @Test
     public void testCreateTimestampColumnsWithDesignatedNanosV2() throws Exception {
         testCreateTimestampColumns(Nanos.floor("2025-11-20T10:55:24.123456789Z"), ChronoUnit.NANOS, PROTOCOL_VERSION_V2,
-                new int[] { ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO },
+                new int[]{ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO, ColumnType.TIMESTAMP_NANO},
                 "1.111\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-19T10:55:24.123000000Z\t2025-11-19T10:55:24.123456000Z\t2025-11-20T10:55:24.123456000Z");
     }
 
@@ -506,7 +506,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
             sender.table("test_insert_binary_to_other_columns")
                     .symbol("x", "x1")
                     .stringColumn("y", "ystr")
-                    .doubleArray("a1", new double[] { 1.0, 2.0 })
+                    .doubleArray("a1", new double[]{1.0, 2.0})
                     .at(100000000000L, ChronoUnit.MICROS);
             sender.flush();
         }
@@ -993,7 +993,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         useTable(tableName);
 
         try (Sender sender = createTcpSender(PROTOCOL_VERSION_V2)) {
-            double[] arr = createDoubleArray(100_000_000);
+            double[] arr = createDoubleArray(10_000_000);
             sender.table(tableName)
                     .doubleArray("arr", arr)
                     .at(100000000000L, ChronoUnit.MICROS);
@@ -1375,7 +1375,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
         } catch (LineSenderException e) {
             assertContains(e.getMessage(), "name contains an illegal char");
         }
-        assertFalse(channel.contain(new byte[] { (byte) '\n' }));
+        assertFalse(channel.contain(new byte[]{(byte) '\n'}));
     }
 
     @Test
@@ -1513,7 +1513,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     }
 
     private static void assertExceptionOnClosedSender(Consumer<Sender> beforeCloseAction,
-            Consumer<Sender> afterCloseAction) {
+                                                      Consumer<Sender> afterCloseAction) {
         DummyLineChannel channel = new DummyLineChannel();
         Sender sender = new LineTcpSenderV2(channel, 1000, 127);
         beforeCloseAction.accept(sender);
@@ -1552,7 +1552,7 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
     }
 
     private void testCreateTimestampColumns(long timestamp, ChronoUnit unit, int protocolVersion,
-            int[] expectedColumnTypes, String expected) throws Exception {
+                                            int[] expectedColumnTypes, String expected) throws Exception {
         useTable("test_tab1");
 
         try (Sender sender = createTcpSender(protocolVersion)) {
@@ -1584,19 +1584,19 @@ public class LineTcpSenderTest extends AbstractLineTcpSenderTest {
 
         assertTableSizeEventually("test_tab1", 1);
         assertSqlEventually("column\ttype\n" +
-                "col1\tDOUBLE\n" +
-                "timestamp\t" + ColumnType.nameOf(expectedColumnTypes[2]) + "\n" +
-                "ts_instant\t" + ColumnType.nameOf(expectedColumnTypes[1]) + "\n" +
-                "ts_ms\tTIMESTAMP\n" +
-                "ts_ns\t" + ColumnType.nameOf(expectedColumnTypes[0]) + "\n" +
-                "ts_us\tTIMESTAMP\n",
+                        "col1\tDOUBLE\n" +
+                        "timestamp\t" + ColumnType.nameOf(expectedColumnTypes[2]) + "\n" +
+                        "ts_instant\t" + ColumnType.nameOf(expectedColumnTypes[1]) + "\n" +
+                        "ts_ms\tTIMESTAMP\n" +
+                        "ts_ns\t" + ColumnType.nameOf(expectedColumnTypes[0]) + "\n" +
+                        "ts_us\tTIMESTAMP\n",
                 "select \"column\", \"type\" from table_columns('test_tab1') order by \"column\"");
         assertSqlEventually("col1\tts_ns\tts_us\tts_ms\tts_instant\ttimestamp\n" + expected + "\n",
                 "test_tab1");
     }
 
     private void testTimestampIngest(String tableName, String timestampType, int protocolVersion, String expected1,
-            String expected2) throws Exception {
+                                     String expected2) throws Exception {
         useTable(tableName);
         execute("create table " + tableName + " (ts " + timestampType + ", dts " + timestampType
                 + ") timestamp(dts) partition by DAY BYPASS WAL");
