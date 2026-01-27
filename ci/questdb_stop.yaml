@@ -1,6 +1,22 @@
 steps:
   - bash: |
       echo "Stopping QuestDB server..."
-      ps aux | awk '/io\.questdb\.ServerMain/ && !/awk/ {print $2}' | xargs -r kill -TERM
+      kill -TERM "$(cat questdb.pid)" || true
+      rm -f questdb.pid
       rm -rf questdb-data
-    displayName: "Stop QuestDB server"
+    displayName: "Stop QuestDB server (non-Windows)"
+    condition: ne(variables['Agent.OS'], 'Windows_NT')
+  - pwsh: |
+      Write-Host "Stopping QuestDB server..."
+      if (Test-Path "questdb.pid") {
+        $pid = Get-Content "questdb.pid" | Select-Object -First 1
+        if ($pid) {
+          Stop-Process -Id $pid -ErrorAction SilentlyContinue
+        }
+        Remove-Item -Force "questdb.pid" -ErrorAction SilentlyContinue
+      }
+      if (Test-Path "questdb-data") {
+        Remove-Item -Recurse -Force "questdb-data"
+      }
+    displayName: "Stop QuestDB server (Windows)"
+    condition: eq(variables['Agent.OS'], 'Windows_NT')
