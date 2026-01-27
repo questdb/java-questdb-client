@@ -28,11 +28,7 @@ import io.questdb.client.cutlass.line.AbstractLineSender;
 import io.questdb.client.cutlass.line.LineUdpSender;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
-import io.questdb.client.test.AbstractQdbTest;
-import org.junit.After;
-
-import java.util.ArrayList;
-import java.util.List;
+import io.questdb.client.test.cutlass.line.AbstractLineSenderTest;
 
 /**
  * Base class for UDP sender integration tests.
@@ -41,25 +37,13 @@ import java.util.List;
  * Note: UDP is a fire-and-forget protocol, so tests need extra delays
  * to account for network latency and server processing time.
  */
-public abstract class AbstractLineUdpSenderTest extends AbstractQdbTest {
+public abstract class AbstractLineUdpSenderTest extends AbstractLineSenderTest {
 
     // Default buffer capacity for UDP sender
     protected static final int DEFAULT_BUFFER_CAPACITY = 2048;
 
     // Default TTL for multicast
     protected static final int DEFAULT_TTL = 1;
-
-    // Extra delay for UDP to account for fire-and-forget nature
-    protected static final long UDP_SETTLE_DELAY_MS = 5;
-
-    // List of tables created during the test for cleanup
-    private final List<String> createdTables = new ArrayList<>();
-
-    @After
-    public void cleanupTables() {
-        dropTables(createdTables);
-        createdTables.clear();
-    }
 
     /**
      * Get localhost IPv4 address as integer.
@@ -77,21 +61,6 @@ public abstract class AbstractLineUdpSenderTest extends AbstractQdbTest {
         } catch (NumericException e) {
             throw new IllegalArgumentException("Invalid IPv4 address: " + address, e);
         }
-    }
-
-    /**
-     * Send data using the sender, close it, and assert the expected row count.
-     * This method closes the sender (which flushes), waits for UDP to settle, and polls for the expected row count.
-     *
-     * @param sender           the sender to close
-     * @param tableName        the table to check
-     * @param expectedRowCount the expected number of rows
-     */
-    protected void closeAndAssertRowCount(AbstractLineSender sender, String tableName, int expectedRowCount) throws Exception {
-        sender.close();
-        // Extra delay for UDP to ensure data reaches the server
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
-        assertTableSizeEventually(tableName, expectedRowCount);
     }
 
     /**
@@ -118,18 +87,6 @@ public abstract class AbstractLineUdpSenderTest extends AbstractQdbTest {
     }
 
     /**
-     * Generate a unique table name with the given prefix and track it for cleanup.
-     *
-     * @param prefix the table name prefix
-     * @return the generated unique table name
-     */
-    protected String createTrackedTable(String prefix) {
-        String tableName = generateTableName(prefix);
-        trackTable(tableName);
-        return tableName;
-    }
-
-    /**
      * Create a UDP sender with specified buffer size.
      *
      * @param bufferCapacity the buffer capacity in bytes
@@ -153,35 +110,9 @@ public abstract class AbstractLineUdpSenderTest extends AbstractQdbTest {
     }
 
     /**
-     * Send data using the sender and assert the expected row count.
-     * This method flushes the sender, waits for UDP to settle, and polls for the expected row count.
-     * <p>
-     * UDP is fire-and-forget, so we need extra delay to ensure the server has processed the data.
-     *
-     * @param sender           the sender to flush
-     * @param tableName        the table to check
-     * @param expectedRowCount the expected number of rows
-     */
-    protected void flushAndAssertRowCount(AbstractLineSender sender, String tableName, int expectedRowCount) throws Exception {
-        sender.flush();
-        // Extra delay for UDP to ensure data reaches the server
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
-        assertTableSizeEventually(tableName, expectedRowCount);
-    }
-
-    /**
      * Get target IPv4 address for UDP sender.
      */
     protected int getTargetIPv4() {
         return parseIPv4(getQuestDbHost());
-    }
-
-    /**
-     * Track a table for cleanup after the test.
-     *
-     * @param tableName the name of the table to track
-     */
-    protected void trackTable(String tableName) {
-        createdTables.add(tableName);
     }
 }

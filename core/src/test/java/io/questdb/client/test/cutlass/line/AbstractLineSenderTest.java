@@ -1,13 +1,25 @@
 package io.questdb.client.test.cutlass.line;
 
+import io.questdb.client.cutlass.line.AbstractLineSender;
 import io.questdb.client.test.AbstractQdbTest;
+import org.junit.Assume;
+import org.junit.BeforeClass;
 
 import java.lang.reflect.Array;
 
 public class AbstractLineSenderTest extends AbstractQdbTest {
+    private static final int DEFAULT_ILP_TCP_PORT = 9009;
+    private static final int DEFAULT_ILP_UDP_PORT = 9009;
+
     public static <T> T createDoubleArray(int... shape) {
         int[] indices = new int[shape.length];
         return buildNestedArray(ArrayDataType.DOUBLE, shape, 0, indices);
+    }
+
+    @BeforeClass
+    public static void setUpStatic() {
+        AbstractQdbTest.setUpStatic();
+        Assume.assumeTrue(getQuestDBRunning());
     }
 
     @SuppressWarnings("unchecked")
@@ -29,6 +41,35 @@ public class AbstractLineSenderTest extends AbstractQdbTest {
             }
             return (T) arr;
         }
+    }
+
+    /**
+     * Get ILP TCP port.
+     */
+    protected static int getIlpTcpPort() {
+        return getConfigInt("QUESTDB_ILP_TCP_PORT", "questdb.ilp.tcp.port", DEFAULT_ILP_TCP_PORT);
+    }
+
+    /**
+     * Get ILP UDP port.
+     */
+    protected static int getIlpUdpPort() {
+        return getConfigInt("QUESTDB_ILP_UDP_PORT", "questdb.ilp.udp.port", DEFAULT_ILP_UDP_PORT);
+    }
+
+    /**
+     * Send data using the sender and assert the expected row count.
+     * This method flushes the sender, waits for UDP to settle, and polls for the expected row count.
+     * <p>
+     * UDP is fire-and-forget, so we need extra delay to ensure the server has processed the data.
+     *
+     * @param sender           the sender to flush
+     * @param tableName        the table to check
+     * @param expectedRowCount the expected number of rows
+     */
+    protected void flushAndAssertRowCount(AbstractLineSender sender, String tableName, int expectedRowCount) throws Exception {
+        sender.flush();
+        assertTableSizeEventually(tableName, expectedRowCount);
     }
 
     private enum ArrayDataType {

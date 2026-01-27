@@ -41,7 +41,8 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
 
     @Test
     public void testAllColumnTypes() throws Exception {
-        String tableName = createTrackedTable("udp_types");
+        String tableName = "test_udp_types";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
                     .symbol("sym", "abc")
@@ -53,25 +54,26 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
                     .atNow();
             sender.flush();
         }
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
         assertTableSizeEventually(tableName, 1);
     }
 
     @Test
     public void testCloseAndAssertHelper() throws Exception {
-        String tableName = createTrackedTable("udp_close");
+        String tableName = "test_udp_close";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
                     .symbol("device", "dev1")
                     .longColumn("reading", 100)
                     .atNow();
-            closeAndAssertRowCount(sender, tableName, 1);
         }
+        assertTableSizeEventually(tableName, 1);
     }
 
     @Test
     public void testExplicitTimestamp() throws Exception {
-        String tableName = createTrackedTable("udp_ts");
+        String tableName = "test_udp_ts";
+        useTable(tableName);
         long ts = Instant.now().toEpochMilli() * 1000;
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
@@ -80,13 +82,13 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
                     .at(ts, ChronoUnit.MICROS);
             sender.flush();
         }
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
         assertTableSizeEventually(tableName, 1);
     }
 
     @Test
     public void testFlushAndAssertHelper() throws Exception {
-        String tableName = createTrackedTable("udp_helper");
+        String tableName = "udp_helper";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
                     .symbol("sensor", "s1")
@@ -104,7 +106,8 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
 
     @Test
     public void testInstantTimestamp() throws Exception {
-        String tableName = createTrackedTable("udp_instant");
+        String tableName = "udp_instant";
+        useTable(tableName);
         Instant now = Instant.now();
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
@@ -113,13 +116,13 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
                     .at(now);
             sender.flush();
         }
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
         assertTableSizeEventually(tableName, 1);
     }
 
     @Test
     public void testMultipleFlushes() throws Exception {
-        String tableName = createTrackedTable("udp_multiflush");
+        String tableName = "udp_multiflush";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             for (int batch = 0; batch < 5; batch++) {
                 for (int i = 0; i < 10; i++) {
@@ -128,8 +131,7 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
                             .longColumn("idx", i)
                             .atNow();
                 }
-                sender.flush();
-                Thread.sleep(UDP_SETTLE_DELAY_MS); // Wait between batches
+                sender.flush();// Wait between batches
             }
         }
         assertTableSizeEventually(tableName, 50);
@@ -137,7 +139,8 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
 
     @Test
     public void testMultipleRows() throws Exception {
-        String tableName = createTrackedTable("udp_multi");
+        String tableName = "udp_multi";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             for (int i = 0; i < 10; i++) {
                 sender.table(tableName)
@@ -147,13 +150,13 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
             }
             sender.flush();
         }
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
         assertTableSizeEventually(tableName, 10);
     }
 
     @Test
     public void testNullStringValue() throws Exception {
-        String tableName = createTrackedTable("udp_nullstr");
+        String tableName = "udp_nullstr";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
                     .symbol("id", "1")
@@ -161,13 +164,13 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
                     .atNow();
             sender.flush();
         }
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
         assertTableSizeEventually(tableName, 1);
     }
 
     @Test
     public void testSimpleInsert() throws Exception {
-        String tableName = createTrackedTable("udp_simple");
+        String tableName = "udp_simple";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
                     .symbol("city", "london")
@@ -175,13 +178,13 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
                     .atNow();
             sender.flush();
         }
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
         assertTableSizeEventually(tableName, 1);
     }
 
     @Test
     public void testSpecialCharactersInSymbol() throws Exception {
-        String tableName = createTrackedTable("udp_special");
+        String tableName = "udp_special";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
                     .symbol("name", "hello world")
@@ -190,13 +193,13 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
                     .atNow();
             sender.flush();
         }
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
         assertTableSizeEventually(tableName, 1);
     }
 
     @Test
     public void testUnicodeInString() throws Exception {
-        String tableName = createTrackedTable("udp_unicode");
+        String tableName = "udp_unicode";
+        useTable(tableName);
         try (AbstractLineSender sender = createUdpSender()) {
             sender.table(tableName)
                     .symbol("lang", "ja")
@@ -204,7 +207,6 @@ public class LineUdpSenderTest extends AbstractLineUdpSenderTest {
                     .atNow();
             sender.flush();
         }
-        Thread.sleep(UDP_SETTLE_DELAY_MS);
         assertTableSizeEventually(tableName, 1);
     }
 }

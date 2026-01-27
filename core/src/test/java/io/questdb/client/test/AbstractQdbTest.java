@@ -64,8 +64,6 @@ public class AbstractQdbTest extends AbstractTest {
     // Configuration defaults
     private static final String DEFAULT_HOST = "127.0.0.1";
     private static final int DEFAULT_HTTP_PORT = 9000;
-    private static final int DEFAULT_ILP_TCP_PORT = 9009;
-    private static final int DEFAULT_ILP_UDP_PORT = 9009;
     private static final String DEFAULT_PG_PASSWORD = "quest";
     private static final int DEFAULT_PG_PORT = 8812;
     private static final String DEFAULT_PG_USER = "admin";
@@ -397,20 +395,6 @@ public class AbstractQdbTest extends AbstractTest {
     }
 
     /**
-     * Get ILP TCP port.
-     */
-    protected static int getIlpTcpPort() {
-        return getConfigInt("QUESTDB_ILP_TCP_PORT", "questdb.ilp.tcp.port", DEFAULT_ILP_TCP_PORT);
-    }
-
-    /**
-     * Get ILP UDP port.
-     */
-    protected static int getIlpUdpPort() {
-        return getConfigInt("QUESTDB_ILP_UDP_PORT", "questdb.ilp.udp.port", DEFAULT_ILP_UDP_PORT);
-    }
-
-    /**
      * Get or create the shared PostgreSQL connection.
      */
     protected static synchronized Connection getPgConnection() throws SQLException {
@@ -439,6 +423,13 @@ public class AbstractQdbTest extends AbstractTest {
      */
     protected static String getPgUser() {
         return getConfig("QUESTDB_PG_USER", "questdb.pg.user", DEFAULT_PG_USER);
+    }
+
+    /**
+     * Get whether a QuestDB instance is running locally.
+     */
+    protected static boolean getQuestDBRunning() {
+        return getConfigBool("QUESTDB_RUNNING", "questdb.running", false);
     }
 
     /**
