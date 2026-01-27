@@ -55,6 +55,7 @@ stages:
               mavenPOMFile: "pom.xml"
               jdkVersionOption: "default"
               goals: "install"
+              options: "-DskipTests --batch-mode"
           - task: Maven@3
             displayName: "Update QuestDB client version"
             inputs:
