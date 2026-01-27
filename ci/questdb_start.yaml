@@ -41,7 +41,7 @@ steps:
         "-p", "questdb/core/target/questdb-*-SNAPSHOT.jar",
         "-m", "io.questdb/io.questdb.ServerMain",
         "-d", "questdb-data"
-      ) -RedirectStandardOutput "logs/questdb.log" -RedirectStandardError "logs/questdb.log" -PassThru
+      ) -RedirectStandardOutput "logs/questdb.log" -RedirectStandardError "logs/questdb.err" -PassThru
 
       $proc.Id | Out-File -FilePath questdb.pid -Encoding ascii
 
