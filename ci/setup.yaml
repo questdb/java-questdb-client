@@ -11,7 +11,6 @@ steps:
     condition: startsWith(variables['imageName'], 'ubuntu')
 
   - bash: |
-      apt-get update
-      apt-get install -y procps
+      apk add --no-cache procps
     displayName: "Install pkill"
     condition: startsWith(variables['imageName'], 'windows')
