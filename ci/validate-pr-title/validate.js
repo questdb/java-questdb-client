@@ -13,18 +13,12 @@ const allowedTypes = [
 
 const allowedSubTypes = [
   "build",
-  "sql",
   "log",
-  "mig",
   "core",
   "ilp",
-  "pgwire",
   "http",
   "conf",
-  "ui",
-  "wal",
-  "parquet",
-    "utils"
+  "utils",
 ];
 
 const errorMessage = `
@@ -52,8 +46,8 @@ perf(sql): improve pattern matching performance for SELECT sub-queries
  * */
 const prTitleRegex = new RegExp(
   `^(((?:${allowedTypes.join("|")})\\((?:${allowedSubTypes.join(
-    "|"
-  )})\\))|build): .*`
+    "|",
+  )})\\))|build): .*`,
 );
 
 function validate({ title, onError }) {
