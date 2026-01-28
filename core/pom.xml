@@ -22,8 +22,7 @@
   ~
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~-->
 
-<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <name>QuestDB</name>
     <description>QuestDB is high performance SQL time series database</description>
@@ -39,7 +38,7 @@
         <test.include>%regex[.*[^o].class]</test.include><!-- exclude module-info.class-->
     </properties>
 
-    <version>1.0.0-SNAPSHOT</version>
+    <version>1.0.0</version>
     <groupId>org.questdb</groupId>
     <artifactId>client</artifactId>
     <packaging>jar</packaging>
@@ -63,7 +62,7 @@
     <scm>
         <url>scm:git:https://github.com/questdb/java-questdb-client.git</url>
         <connection>scm:git:https://github.com/questdb/java-questdb-client.git</connection>
-        <tag>9.3.1</tag>
+        <tag>1.0.0</tag>
     </scm>
 
 
@@ -166,7 +165,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.3</version>
                 <configuration>
-                    <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory"/>
+                    <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                     <argLine>-Dslf4j.provider=ch.qos.logback.classic.spi.LogbackServiceProvider</argLine>
                     <useModulePath>true</useModulePath>
                     <includes>
