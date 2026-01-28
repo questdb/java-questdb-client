@@ -6,6 +6,7 @@ steps:
       mavenPOMFile: "questdb/pom.xml"
       jdkVersionOption: "default"
       goals: "test"
+      mavenOptions: "-Xlog:gc -Dfile.encoding=UTF-8 -Xmx3072m -XX:+UseParallelGC"
       options: "--batch-mode --quiet
         -Dtest.include=**/cutlass/http/line/*,**/cutlass/line/**/*
         -DfailIfNoTests=false
