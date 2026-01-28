@@ -192,7 +192,7 @@ public abstract class AbstractLineSender implements Utf8Sink, Closeable, Sender 
             throw new LineSenderException(
                     "duplicated table. call sender.at() or sender.atNow() to finish the current row first");
         }
-        if (metric.isEmpty()) {
+        if (metric.length() == 0) {
             throw new LineSenderException("table name cannot be empty");
         }
         quoted = false;
@@ -368,7 +368,7 @@ public abstract class AbstractLineSender implements Utf8Sink, Closeable, Sender 
 
     private byte[] receiveChallengeBytes() {
         int n = 0;
-        for (; ; ) {
+        for (;;) {
             int rc = lineChannel.receive(ptr + n, capacity - n);
             if (rc < 0) {
                 int errno = lineChannel.errno();
