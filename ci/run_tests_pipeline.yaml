@@ -1,5 +1,10 @@
 trigger: none
 
+pr:
+  branches:
+    include:
+      - main
+
 variables:
   ARCHIVED_LOGS: "$(Build.ArtifactStagingDirectory)/questdb-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS).zip"
   QUESTDB_RUNNING: true
