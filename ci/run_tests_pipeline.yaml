@@ -30,13 +30,8 @@ stages:
               versionSpec: "17"
               jdkArchitectureOption: "x64"
               jdkSourceOption: "PreInstalled"
-          - task: Maven@3
+          - bash: mvn -f core/pom.xml javadoc:javadoc -Pjavadoc --batch-mode
             displayName: "Verify Javadoc"
-            inputs:
-              mavenPOMFile: "core/pom.xml"
-              jdkVersionOption: "default"
-              goals: "javadoc:javadoc"
-              options: "-Pjavadoc --batch-mode"
 
   - stage: BuildAndTest
     displayName: "Building and testing"
