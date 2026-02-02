@@ -21,9 +21,14 @@ stages:
           vmImage: "ubuntu-latest"
         steps:
           - checkout: self
-            fetchDepth: 1
+            fetchDepth: 0
             lfs: false
             submodules: false
+          - bash: |
+              git fetch origin $(System.PullRequest.SourceBranch)
+              git checkout FETCH_HEAD
+            displayName: "Checkout PR source branch"
+            condition: eq(variables['Build.Reason'], 'PullRequest')
           - task: JavaToolInstaller@0
             displayName: "Install Java 11"
             inputs:
