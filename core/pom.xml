@@ -199,7 +199,8 @@
                         <configuration>
                             <doclint>none</doclint>
                             <source>11</source>
-                            <legacyMode>true</legacyMode>
+                            <detectJavaApiLink>false</detectJavaApiLink>
+                            <additionalOptions>--no-module-directories</additionalOptions>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
                                 <additionalJOption>${compilerArg2}</additionalJOption>
@@ -296,7 +297,8 @@
                         <configuration>
                             <doclint>none</doclint>
                             <source>11</source>
-                            <legacyMode>true</legacyMode>
+                            <detectJavaApiLink>false</detectJavaApiLink>
+                            <additionalOptions>--no-module-directories</additionalOptions>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
                                 <additionalJOption>${compilerArg2}</additionalJOption>
