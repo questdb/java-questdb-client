@@ -198,6 +198,8 @@
                         </executions>
                         <configuration>
                             <doclint>none</doclint>
+                            <source>11</source>
+                            <legacyMode>true</legacyMode>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
                                 <additionalJOption>${compilerArg2}</additionalJOption>
@@ -293,6 +295,8 @@
                         </executions>
                         <configuration>
                             <doclint>none</doclint>
+                            <source>11</source>
+                            <legacyMode>true</legacyMode>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
                                 <additionalJOption>${compilerArg2}</additionalJOption>
