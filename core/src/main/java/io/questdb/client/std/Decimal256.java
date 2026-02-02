@@ -1089,7 +1089,7 @@ public class Decimal256 implements Sinkable, Decimal {
      * Checks if this Decimal256 value fits within the specified storage size (pow 2).
      * The value fits if its absolute magnitude can be represented with the given number of digits.
      *
-     * @param size the target size (number of bytes available pow 2, e.g., 4 bytes -> 2)
+     * @param size the target size (number of bytes available pow 2, e.g., 4 bytes {@code ->} 2)
      * @return true if the value fits within the storage size, false otherwise
      */
     public boolean fitsInStorageSizePow2(int size) {
@@ -1615,7 +1615,7 @@ public class Decimal256 implements Sinkable, Decimal {
     /**
      * Rescale this Decimal256 in place
      *
-     * @param newScale The new scale (must be >= current scale)
+     * @param newScale The new scale (must be {@code >=} current scale)
      */
     public void rescale(int newScale) {
         if (isNull()) {
@@ -2869,7 +2869,7 @@ public class Decimal256 implements Sinkable, Decimal {
     /**
      * Rescale this Decimal256 in place without checks
      *
-     * @param newScale The new scale (must be >= current scale)
+     * @param newScale The new scale (must be {@code >=} current scale)
      */
     private void rescale0(int newScale) {
         int scaleDiff = newScale - this.scale;

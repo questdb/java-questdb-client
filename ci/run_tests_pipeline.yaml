@@ -11,8 +11,36 @@ variables:
   QUESTDB_ILP_TCP_AUTH_ENABLE: false
 
 stages:
+  - stage: Validate
+    displayName: "Validation"
+    jobs:
+      - job: Javadoc
+        displayName: "Javadoc"
+        pool:
+          name: "Azure Pipelines"
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            lfs: false
+            submodules: false
+          - bash: |
+              git fetch origin $(System.PullRequest.SourceBranch)
+              git checkout FETCH_HEAD
+            displayName: "Checkout PR source branch"
+            condition: eq(variables['Build.Reason'], 'PullRequest')
+          - task: JavaToolInstaller@0
+            displayName: "Install Java 11"
+            inputs:
+              versionSpec: "11"
+              jdkArchitectureOption: "x64"
+              jdkSourceOption: "PreInstalled"
+          - bash: mvn -f core/pom.xml javadoc:javadoc -Pjavadoc --batch-mode
+            displayName: "Verify Javadoc"
+
   - stage: BuildAndTest
     displayName: "Building and testing"
+    dependsOn: Validate
     jobs:
       - job: RunOn
         displayName: "on"
