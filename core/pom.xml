@@ -197,6 +197,7 @@
                             </execution>
                         </executions>
                         <configuration>
+                            <doclint>none</doclint>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
                                 <additionalJOption>${compilerArg2}</additionalJOption>
@@ -291,6 +292,7 @@
                             </execution>
                         </executions>
                         <configuration>
+                            <doclint>none</doclint>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
                                 <additionalJOption>${compilerArg2}</additionalJOption>

@@ -28,11 +28,11 @@ package io.questdb.client;
 public class ParanoiaState {
     /**
      * <pre>
-     * BASIC -> validates UTF-8 in log records (throws a LogError if invalid),
+     * BASIC -&gt; validates UTF-8 in log records (throws a LogError if invalid),
      *          throws a LogError on abandoned log records (missing .$() at the end of log statement),
      *          detects closed stdout in LogConsoleWriter.
      *          This introduces a low overhead to logging.
-     * AGGRESSIVE -> BASIC + holds recent history of log lines to help diagnose closed stdout,
+     * AGGRESSIVE -&gt; BASIC + holds recent history of log lines to help diagnose closed stdout,
      *               holds the stack trace of abandoned log record.
      *               This introduces a significant overhead to logging.
      *

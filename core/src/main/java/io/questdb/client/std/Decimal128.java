@@ -333,7 +333,7 @@ public class Decimal128 implements Sinkable, Decimal {
     }
 
     /**
-     * Divide two Decimal128 numbers and store the result in sink (a / b -> sink)
+     * Divide two Decimal128 numbers and store the result in sink (a / b {@code ->} sink)
      * Uses optimal precision calculation up to MAX_SCALE
      *
      * @param a            First operand (dividend)
@@ -477,7 +477,7 @@ public class Decimal128 implements Sinkable, Decimal {
     }
 
     /**
-     * Calculate modulo of two Decimal128 numbers and store the result in sink (a % b -> sink)
+     * Calculate modulo of two Decimal128 numbers and store the result in sink (a % b {@code ->} sink)
      *
      * @param a    First operand (dividend)
      * @param b    Second operand (divisor)
@@ -526,7 +526,7 @@ public class Decimal128 implements Sinkable, Decimal {
     }
 
     /**
-     * Subtract two Decimal128 numbers and store the result in sink (a - b -> sink)
+     * Subtract two Decimal128 numbers and store the result in sink (a - b {@code ->} sink)
      *
      * @param a    First operand (minuend)
      * @param b    Second operand (subtrahend)
@@ -1043,7 +1043,7 @@ public class Decimal128 implements Sinkable, Decimal {
     /**
      * Rescale this Decimal128 in place
      *
-     * @param newScale The new scale (must be >= current scale)
+     * @param newScale The new scale (must be {@code >=} current scale)
      */
     public void rescale(int newScale) {
         validateScale(newScale);

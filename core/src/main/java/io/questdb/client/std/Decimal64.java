@@ -112,7 +112,7 @@ public class Decimal64 implements Sinkable, Decimal {
     }
 
     /**
-     * Divide two Decimal64 numbers and store the result in sink (a / b -> sink)
+     * Divide two Decimal64 numbers and store the result in sink (a / b {@code ->} sink)
      */
     public static void divide(Decimal64 a, Decimal64 b, Decimal64 sink, int resultScale, RoundingMode roundingMode) {
         sink.copyFrom(a);
@@ -218,7 +218,7 @@ public class Decimal64 implements Sinkable, Decimal {
     }
 
     /**
-     * Calculate modulo of two Decimal64 numbers and store the result in sink (a % b -> sink)
+     * Calculate modulo of two Decimal64 numbers and store the result in sink (a % b {@code ->} sink)
      */
     public static void modulo(Decimal64 a, Decimal64 b, Decimal64 sink) {
         sink.copyFrom(a);
@@ -242,7 +242,7 @@ public class Decimal64 implements Sinkable, Decimal {
     }
 
     /**
-     * Subtract two Decimal64 numbers and store the result in sink (a - b -> sink)
+     * Subtract two Decimal64 numbers and store the result in sink (a - b {@code ->} sink)
      */
     public static void subtract(Decimal64 a, Decimal64 b, Decimal64 sink) {
         sink.copyFrom(a);
@@ -704,7 +704,7 @@ public class Decimal64 implements Sinkable, Decimal {
     /**
      * Rescale this Decimal64 in place
      *
-     * @param newScale The new scale (must be >= current scale)
+     * @param newScale The new scale (must be {@code >=} current scale)
      */
     public void rescale(int newScale) {
         validateScale(newScale);
