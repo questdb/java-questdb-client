@@ -40,7 +40,7 @@
 
     <version>1.0.1-SNAPSHOT</version>
     <groupId>org.questdb</groupId>
-    <artifactId>client</artifactId>
+    <artifactId>questdb-client</artifactId>
     <packaging>jar</packaging>
 
     <url>https://questdb.io/</url>

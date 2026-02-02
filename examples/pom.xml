@@ -33,7 +33,7 @@
     <dependencies>
         <dependency>
             <groupId>org.questdb</groupId>
-            <artifactId>client</artifactId>
+            <artifactId>questdb-client</artifactId>
             <version>${project.version}</version>
         </dependency>
     </dependencies>
