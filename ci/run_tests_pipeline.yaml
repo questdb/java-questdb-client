@@ -24,6 +24,7 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
+            ref: $(System.PullRequest.SourceBranch)
           - task: JavaToolInstaller@0
             displayName: "Install Java 17"
             inputs:
