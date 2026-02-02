@@ -11,8 +11,36 @@ variables:
   QUESTDB_ILP_TCP_AUTH_ENABLE: false
 
 stages:
+  - stage: Validate
+    displayName: "Validation"
+    jobs:
+      - job: Javadoc
+        displayName: "Javadoc"
+        pool:
+          name: "Azure Pipelines"
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - task: JavaToolInstaller@0
+            displayName: "Install Java 17"
+            inputs:
+              versionSpec: "17"
+              jdkArchitectureOption: "x64"
+              jdkSourceOption: "PreInstalled"
+          - task: Maven@3
+            displayName: "Verify Javadoc"
+            inputs:
+              mavenPOMFile: "core/pom.xml"
+              jdkVersionOption: "default"
+              goals: "javadoc:javadoc"
+              options: "-Pjavadoc --batch-mode"
+
   - stage: BuildAndTest
     displayName: "Building and testing"
+    dependsOn: Validate
     jobs:
       - job: RunOn
         displayName: "on"
