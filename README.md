@@ -238,6 +238,85 @@ cd java-questdb-client
 mvn clean package -DskipTests
 ```
 
+### Building Native Libraries
+
+The client includes native libraries (C/C++ and assembly) for performance-critical operations. Pre-built binaries are included in the repository, but you can rebuild them locally if needed.
+
+#### Prerequisites
+
+| Tool           | Version              | Notes                               |
+| -------------- | -------------------- | ----------------------------------- |
+| CMake          | 3.5+                 | Build system generator              |
+| NASM           | 2.14+                | Netwide Assembler for assembly code |
+| C/C++ Compiler | GCC, Clang, or MinGW | C++17 support required              |
+| Make           | Any                  | Build tool                          |
+| JDK            | 11+                  | For JNI headers                     |
+
+#### macOS (ARM64 or x86-64)
+
+```bash
+# Install build tools
+brew install cmake nasm
+
+# Set deployment target
+export MACOSX_DEPLOYMENT_TARGET=13.0
+
+# Build native library
+cd core
+cmake -B cmake-build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-release --config Release
+```
+
+#### Linux x86-64
+
+```bash
+# Install build tools (Debian/Ubuntu)
+sudo apt-get install cmake nasm build-essential
+
+# Build native library
+cd core
+cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S.
+cmake --build cmake-build-release --config Release
+```
+
+#### Linux ARM64
+
+```bash
+# Install build tools (Debian/Ubuntu)
+sudo apt-get install cmake nasm build-essential
+
+# Build using ARM64 toolchain
+cd core
+cmake -DCMAKE_TOOLCHAIN_FILE=./src/main/c/toolchains/linux-arm64.cmake \
+      -DCMAKE_BUILD_TYPE=Release -B cmake-build-release-arm64 -S.
+cmake --build cmake-build-release-arm64 --config Release
+```
+
+#### Windows x86-64 (Cross-compilation from Linux)
+
+```bash
+# Install cross-compilation tools (Debian/Ubuntu)
+sudo apt-get install cmake nasm gcc-mingw-w64 g++-mingw-w64
+
+# Build using Windows toolchain
+cd core
+cmake -DCMAKE_TOOLCHAIN_FILE=./src/main/c/toolchains/windows-x86_64.cmake \
+      -DCMAKE_CROSSCOMPILING=True -DCMAKE_BUILD_TYPE=Release \
+      -B cmake-build-release-win64
+cmake --build cmake-build-release-win64 --config Release
+```
+
+#### Native Library Output Locations
+
+Built libraries are placed in the resources directory for each platform:
+
+```
+core/target/classes/io/questdb/client/bin-local/
+├── libquestdb.dylib  # macOS
+├── libquestdb.so     # Linux
+└── libquestdb.dll    # Windows
+```
+
 ## Community
 
 - [QuestDB Documentation](https://questdb.com/docs/)
