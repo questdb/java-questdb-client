@@ -26,9 +26,9 @@ stages:
             submodules: false
             ref: $(System.PullRequest.SourceBranch)
           - task: JavaToolInstaller@0
-            displayName: "Install Java 17"
+            displayName: "Install Java 11"
             inputs:
-              versionSpec: "17"
+              versionSpec: "11"
               jdkArchitectureOption: "x64"
               jdkSourceOption: "PreInstalled"
           - bash: mvn -f core/pom.xml javadoc:javadoc -Pjavadoc --batch-mode
