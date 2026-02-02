@@ -200,7 +200,6 @@
                             <doclint>none</doclint>
                             <source>11</source>
                             <detectJavaApiLink>false</detectJavaApiLink>
-                            <additionalOptions>--no-module-directories</additionalOptions>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
                                 <additionalJOption>${compilerArg2}</additionalJOption>
@@ -299,7 +298,6 @@
                             <doclint>none</doclint>
                             <source>11</source>
                             <detectJavaApiLink>false</detectJavaApiLink>
-                            <additionalOptions>--no-module-directories</additionalOptions>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
                                 <additionalJOption>${compilerArg2}</additionalJOption>
