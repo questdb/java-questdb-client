@@ -25,18 +25,8 @@ stages:
             lfs: false
             submodules: false
           - bash: |
-              echo "=== Before checkout ==="
-              echo "Current commit: $(git rev-parse HEAD)"
-              echo "Branch: $(git branch --show-current)"
-              git log --oneline -3
-              echo ""
-              echo "=== Fetching PR branch ==="
               git fetch origin $(System.PullRequest.SourceBranch)
               git checkout FETCH_HEAD
-              echo ""
-              echo "=== After checkout ==="
-              echo "Current commit: $(git rev-parse HEAD)"
-              git log --oneline -3
             displayName: "Checkout PR source branch"
             condition: eq(variables['Build.Reason'], 'PullRequest')
           - task: JavaToolInstaller@0
