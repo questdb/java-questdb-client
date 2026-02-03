@@ -72,8 +72,21 @@ stages:
             lfs: false
             submodules: false
           - template: setup.yaml
-          # TODO: remove branch once rd_strip_ilp_sender is merged
-          - script: git clone --depth 1 -b rd_strip_ilp_sender https://github.com/questdb/questdb.git ./questdb
+          - bash: |
+              BRANCH_NAME="$(Build.SourceBranchName)"
+              if [ "$(Build.Reason)" = "PullRequest" ]; then
+                BRANCH_NAME="$(System.PullRequest.SourceBranch)"
+                BRANCH_NAME="${BRANCH_NAME#refs/heads/}"
+              fi
+
+              if git ls-remote --heads https://github.com/questdb/questdb.git "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+                TARGET_BRANCH="$BRANCH_NAME"
+              else
+                TARGET_BRANCH="rd_strip_ilp_sender"
+              fi
+
+              echo "Cloning questdb branch: $TARGET_BRANCH"
+              git clone --depth 1 -b "$TARGET_BRANCH" https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Update client version"
