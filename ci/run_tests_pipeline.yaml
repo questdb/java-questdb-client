@@ -88,13 +88,11 @@ stages:
               echo "Cloning questdb branch: $TARGET_BRANCH"
               git clone --depth 1 -b "$TARGET_BRANCH" https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
-          - task: Maven@3
-            displayName: "Update client version"
-            inputs:
-              mavenPOMFile: "core/pom.xml"
-              jdkVersionOption: "default"
-              goals: "versions:set"
-              options: "-DnewVersion=9.9.9 -DgenerateBackupPoms=false --batch-mode"
+          - bash: |
+              CLIENT_VERSION=$(mvn -f core/pom.xml help:evaluate -Dexpression=project.version -q -DforceStdout)
+              echo "Client version: $CLIENT_VERSION"
+              echo "##vso[task.setvariable variable=CLIENT_VERSION]$CLIENT_VERSION"
+            displayName: "Get client version"
           - task: Maven@3
             displayName: "Install client to local repo"
             inputs:
@@ -108,21 +106,21 @@ stages:
               mavenPOMFile: "questdb/core/pom.xml"
               jdkVersionOption: "default"
               goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:questdb-client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
+              options: "-Dincludes=org.questdb:questdb-client -DdepVersion=$(CLIENT_VERSION) -DforceVersion=true --batch-mode"
           - task: Maven@3
             displayName: "Update QuestDB client version: benchmarks"
             inputs:
               mavenPOMFile: "questdb/benchmarks/pom.xml"
               jdkVersionOption: "default"
               goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:questdb-client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
+              options: "-Dincludes=org.questdb:questdb-client -DdepVersion=$(CLIENT_VERSION) -DforceVersion=true --batch-mode"
           - task: Maven@3
             displayName: "Update QuestDB client version: utils"
             inputs:
               mavenPOMFile: "questdb/utils/pom.xml"
               jdkVersionOption: "default"
               goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:questdb-client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
+              options: "-Dincludes=org.questdb:questdb-client -DdepVersion=$(CLIENT_VERSION) -DforceVersion=true --batch-mode"
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
