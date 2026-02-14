@@ -46,12 +46,61 @@ import io.questdb.client.std.Unsafe;
  */
 public class IlpV4GorillaEncoder {
 
+    private static final int BUCKET_12BIT_MAX = 2048;
+    private static final int BUCKET_12BIT_MIN = -2047;
+    private static final int BUCKET_7BIT_MAX = 64;
+    // Bucket boundaries (two's complement signed ranges)
+    private static final int BUCKET_7BIT_MIN = -63;
+    private static final int BUCKET_9BIT_MAX = 256;
+    private static final int BUCKET_9BIT_MIN = -255;
     private final IlpV4BitWriter bitWriter = new IlpV4BitWriter();
 
     /**
      * Creates a new Gorilla encoder.
      */
     public IlpV4GorillaEncoder() {
+    }
+
+    /**
+     * Returns the number of bits required to encode a delta-of-delta value.
+     *
+     * @param deltaOfDelta the delta-of-delta value
+     * @return bits required
+     */
+    public static int getBitsRequired(long deltaOfDelta) {
+        int bucket = getBucket(deltaOfDelta);
+        switch (bucket) {
+            case 0:
+                return 1;
+            case 1:
+                return 9;
+            case 2:
+                return 12;
+            case 3:
+                return 16;
+            default:
+                return 36;
+        }
+    }
+
+    /**
+     * Determines which bucket a delta-of-delta value falls into.
+     *
+     * @param deltaOfDelta the delta-of-delta value
+     * @return bucket number (0 = 1-bit, 1 = 9-bit, 2 = 12-bit, 3 = 16-bit, 4 = 36-bit)
+     */
+    public static int getBucket(long deltaOfDelta) {
+        if (deltaOfDelta == 0) {
+            return 0; // 1-bit
+        } else if (deltaOfDelta >= BUCKET_7BIT_MIN && deltaOfDelta <= BUCKET_7BIT_MAX) {
+            return 1; // 9-bit (2 prefix + 7 value)
+        } else if (deltaOfDelta >= BUCKET_9BIT_MIN && deltaOfDelta <= BUCKET_9BIT_MAX) {
+            return 2; // 12-bit (3 prefix + 9 value)
+        } else if (deltaOfDelta >= BUCKET_12BIT_MIN && deltaOfDelta <= BUCKET_12BIT_MAX) {
+            return 3; // 16-bit (4 prefix + 12 value)
+        } else {
+            return 4; // 36-bit (4 prefix + 32 value)
+        }
     }
 
     /**
@@ -69,7 +118,7 @@ public class IlpV4GorillaEncoder {
      * @param deltaOfDelta the delta-of-delta value to encode
      */
     public void encodeDoD(long deltaOfDelta) {
-        int bucket = IlpV4GorillaDecoder.getBucket(deltaOfDelta);
+        int bucket = getBucket(deltaOfDelta);
         switch (bucket) {
             case 0: // DoD == 0
                 bitWriter.writeBit(0);
@@ -221,7 +270,7 @@ public class IlpV4GorillaEncoder {
             long delta = timestamps[i] - prevTimestamp;
             long deltaOfDelta = delta - prevDelta;
 
-            totalBits += IlpV4GorillaDecoder.getBitsRequired(deltaOfDelta);
+            totalBits += getBitsRequired(deltaOfDelta);
 
             prevDelta = delta;
             prevTimestamp = timestamps[i];

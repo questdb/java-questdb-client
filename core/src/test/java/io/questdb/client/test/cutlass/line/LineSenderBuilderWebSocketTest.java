@@ -22,10 +22,11 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.test;
+package io.questdb.client.test.cutlass.line;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.test.AbstractTest;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Ignore;

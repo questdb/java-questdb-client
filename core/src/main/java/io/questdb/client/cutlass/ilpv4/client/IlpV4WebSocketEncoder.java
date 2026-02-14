@@ -24,12 +24,9 @@
 
 package io.questdb.client.cutlass.ilpv4.client;
 
-import io.questdb.client.cutlass.ilpv4.protocol.*;
-
 import io.questdb.client.cutlass.ilpv4.protocol.IlpV4ColumnDef;
 import io.questdb.client.cutlass.ilpv4.protocol.IlpV4GorillaEncoder;
-
-import io.questdb.client.cutlass.ilpv4.protocol.IlpV4TimestampDecoder;
+import io.questdb.client.cutlass.ilpv4.protocol.IlpV4TableBuffer;
 import io.questdb.client.std.QuietCloseable;
 
 import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
@@ -55,10 +52,18 @@ import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
  */
 public class IlpV4WebSocketEncoder implements QuietCloseable {
 
-    private NativeBufferWriter ownedBuffer;
-    private IlpBufferWriter buffer;
+    /**
+     * Encoding flag for Gorilla-encoded timestamps.
+     */
+    public static final byte ENCODING_GORILLA = 0x01;
+    /**
+     * Encoding flag for uncompressed timestamps.
+     */
+    public static final byte ENCODING_UNCOMPRESSED = 0x00;
     private final IlpV4GorillaEncoder gorillaEncoder = new IlpV4GorillaEncoder();
+    private IlpBufferWriter buffer;
     private byte flags;
+    private NativeBufferWriter ownedBuffer;
 
     public IlpV4WebSocketEncoder() {
         this.ownedBuffer = new NativeBufferWriter();
@@ -72,66 +77,12 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         this.flags = 0;
     }
 
-    /**
-     * Returns the underlying buffer.
-     * <p>
-     * If an external buffer was set via {@link #setBuffer(IlpBufferWriter)},
-     * that buffer is returned. Otherwise, returns the internal buffer.
-     */
-    public IlpBufferWriter getBuffer() {
-        return buffer;
-    }
-
-    /**
-     * Sets an external buffer for encoding.
-     * <p>
-     * When set, the encoder writes directly to this buffer instead of its internal buffer.
-     * The caller is responsible for managing the external buffer's lifecycle.
-     * <p>
-     * Pass {@code null} to revert to using the internal buffer.
-     *
-     * @param externalBuffer the external buffer to use, or null to use internal buffer
-     */
-    public void setBuffer(IlpBufferWriter externalBuffer) {
-        this.buffer = externalBuffer != null ? externalBuffer : ownedBuffer;
-    }
-
-    /**
-     * Returns true if currently using an external buffer.
-     */
-    public boolean isUsingExternalBuffer() {
-        return buffer != ownedBuffer;
-    }
-
-    /**
-     * Resets the encoder for a new message.
-     * <p>
-     * If using an external buffer, this only resets the internal state (flags).
-     * The external buffer's reset is the caller's responsibility.
-     * If using the internal buffer, resets both the buffer and internal state.
-     */
-    public void reset() {
-        if (!isUsingExternalBuffer()) {
-            buffer.reset();
+    @Override
+    public void close() {
+        if (ownedBuffer != null) {
+            ownedBuffer.close();
+            ownedBuffer = null;
         }
-    }
-
-    /**
-     * Sets whether Gorilla timestamp encoding is enabled.
-     */
-    public void setGorillaEnabled(boolean enabled) {
-        if (enabled) {
-            flags |= FLAG_GORILLA;
-        } else {
-            flags &= ~FLAG_GORILLA;
-        }
-    }
-
-    /**
-     * Returns true if Gorilla encoding is enabled.
-     */
-    public boolean isGorillaEnabled() {
-        return (flags & FLAG_GORILLA) != 0;
     }
 
     /**
@@ -164,11 +115,11 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * This method sends only new symbols (delta) since the last confirmed watermark,
      * and uses global symbol IDs instead of per-column local indices.
      *
-     * @param tableBuffer     the table buffer containing row data
-     * @param globalDict      the global symbol dictionary
-     * @param confirmedMaxId  the highest symbol ID the server has confirmed (from ConnectionSymbolState)
-     * @param batchMaxId      the highest symbol ID used in this batch
-     * @param useSchemaRef    whether to use schema reference mode
+     * @param tableBuffer    the table buffer containing row data
+     * @param globalDict     the global symbol dictionary
+     * @param confirmedMaxId the highest symbol ID the server has confirmed (from ConnectionSymbolState)
+     * @param batchMaxId     the highest symbol ID used in this batch
+     * @param useSchemaRef   whether to use schema reference mode
      * @return the number of bytes written
      */
     public int encodeWithDeltaDict(
@@ -214,6 +165,64 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
     }
 
     /**
+     * Returns the underlying buffer.
+     * <p>
+     * If an external buffer was set via {@link #setBuffer(IlpBufferWriter)},
+     * that buffer is returned. Otherwise, returns the internal buffer.
+     */
+    public IlpBufferWriter getBuffer() {
+        return buffer;
+    }
+
+    /**
+     * Returns true if delta symbol dictionary encoding is enabled.
+     */
+    public boolean isDeltaSymbolDictEnabled() {
+        return (flags & FLAG_DELTA_SYMBOL_DICT) != 0;
+    }
+
+    /**
+     * Returns true if Gorilla encoding is enabled.
+     */
+    public boolean isGorillaEnabled() {
+        return (flags & FLAG_GORILLA) != 0;
+    }
+
+    /**
+     * Returns true if currently using an external buffer.
+     */
+    public boolean isUsingExternalBuffer() {
+        return buffer != ownedBuffer;
+    }
+
+    /**
+     * Resets the encoder for a new message.
+     * <p>
+     * If using an external buffer, this only resets the internal state (flags).
+     * The external buffer's reset is the caller's responsibility.
+     * If using the internal buffer, resets both the buffer and internal state.
+     */
+    public void reset() {
+        if (!isUsingExternalBuffer()) {
+            buffer.reset();
+        }
+    }
+
+    /**
+     * Sets an external buffer for encoding.
+     * <p>
+     * When set, the encoder writes directly to this buffer instead of its internal buffer.
+     * The caller is responsible for managing the external buffer's lifecycle.
+     * <p>
+     * Pass {@code null} to revert to using the internal buffer.
+     *
+     * @param externalBuffer the external buffer to use, or null to use internal buffer
+     */
+    public void setBuffer(IlpBufferWriter externalBuffer) {
+        this.buffer = externalBuffer != null ? externalBuffer : ownedBuffer;
+    }
+
+    /**
      * Sets the delta symbol dictionary flag.
      */
     public void setDeltaSymbolDictEnabled(boolean enabled) {
@@ -225,10 +234,14 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
     }
 
     /**
-     * Returns true if delta symbol dictionary encoding is enabled.
+     * Sets whether Gorilla timestamp encoding is enabled.
      */
-    public boolean isDeltaSymbolDictEnabled() {
-        return (flags & FLAG_DELTA_SYMBOL_DICT) != 0;
+    public void setGorillaEnabled(boolean enabled) {
+        if (enabled) {
+            flags |= FLAG_GORILLA;
+        } else {
+            flags &= ~FLAG_GORILLA;
+        }
     }
 
     /**
@@ -255,104 +268,6 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
 
         // Payload length (uint32, little-endian)
         buffer.putInt(payloadLength);
-    }
-
-    /**
-     * Encodes a single table from the buffer.
-     */
-    private void encodeTable(IlpV4TableBuffer tableBuffer, boolean useSchemaRef) {
-        IlpV4ColumnDef[] columnDefs = tableBuffer.getColumnDefs();
-        int rowCount = tableBuffer.getRowCount();
-
-        if (useSchemaRef) {
-            writeTableHeaderWithSchemaRef(
-                    tableBuffer.getTableName(),
-                    rowCount,
-                    tableBuffer.getSchemaHash(),
-                    columnDefs.length
-            );
-        } else {
-            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, columnDefs);
-        }
-
-        // Write each column's data
-        boolean useGorilla = isGorillaEnabled();
-        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
-            IlpV4TableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
-            IlpV4ColumnDef colDef = columnDefs[i];
-            encodeColumn(col, colDef, rowCount, useGorilla);
-        }
-    }
-
-    /**
-     * Encodes a single table from the buffer using global symbol IDs.
-     * This is used with delta dictionary encoding.
-     */
-    private void encodeTableWithGlobalSymbols(IlpV4TableBuffer tableBuffer, boolean useSchemaRef) {
-        IlpV4ColumnDef[] columnDefs = tableBuffer.getColumnDefs();
-        int rowCount = tableBuffer.getRowCount();
-
-        if (useSchemaRef) {
-            writeTableHeaderWithSchemaRef(
-                    tableBuffer.getTableName(),
-                    rowCount,
-                    tableBuffer.getSchemaHash(),
-                    columnDefs.length
-            );
-        } else {
-            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, columnDefs);
-        }
-
-        // Write each column's data
-        boolean useGorilla = isGorillaEnabled();
-        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
-            IlpV4TableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
-            IlpV4ColumnDef colDef = columnDefs[i];
-            encodeColumnWithGlobalSymbols(col, colDef, rowCount, useGorilla);
-        }
-    }
-
-    /**
-     * Writes a table header with full schema.
-     */
-    private void writeTableHeaderWithSchema(String tableName, int rowCount, IlpV4ColumnDef[] columns) {
-        // Table name
-        buffer.putString(tableName);
-
-        // Row count (varint)
-        buffer.putVarint(rowCount);
-
-        // Column count (varint)
-        buffer.putVarint(columns.length);
-
-        // Schema mode: full schema (0x00)
-        buffer.putByte(SCHEMA_MODE_FULL);
-
-        // Column definitions (name + type for each)
-        for (IlpV4ColumnDef col : columns) {
-            buffer.putString(col.getName());
-            buffer.putByte(col.getWireTypeCode());
-        }
-    }
-
-    /**
-     * Writes a table header with schema reference.
-     */
-    private void writeTableHeaderWithSchemaRef(String tableName, int rowCount, long schemaHash, int columnCount) {
-        // Table name
-        buffer.putString(tableName);
-
-        // Row count (varint)
-        buffer.putVarint(rowCount);
-
-        // Column count (varint)
-        buffer.putVarint(columnCount);
-
-        // Schema mode: reference (0x01)
-        buffer.putByte(SCHEMA_MODE_REFERENCE);
-
-        // Schema hash (8 bytes)
-        buffer.putLong(schemaHash);
     }
 
     /**
@@ -513,16 +428,57 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
     }
 
     /**
-     * Writes a null bitmap from bit-packed long array.
+     * Encodes a single table from the buffer.
      */
-    private void writeNullBitmapPacked(long[] nullsPacked, int count) {
-        int bitmapSize = (count + 7) / 8;
+    private void encodeTable(IlpV4TableBuffer tableBuffer, boolean useSchemaRef) {
+        IlpV4ColumnDef[] columnDefs = tableBuffer.getColumnDefs();
+        int rowCount = tableBuffer.getRowCount();
 
-        for (int byteIdx = 0; byteIdx < bitmapSize; byteIdx++) {
-            int longIndex = byteIdx >>> 3;
-            int byteInLong = byteIdx & 7;
-            byte b = (byte) ((nullsPacked[longIndex] >>> (byteInLong * 8)) & 0xFF);
-            buffer.putByte(b);
+        if (useSchemaRef) {
+            writeTableHeaderWithSchemaRef(
+                    tableBuffer.getTableName(),
+                    rowCount,
+                    tableBuffer.getSchemaHash(),
+                    columnDefs.length
+            );
+        } else {
+            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, columnDefs);
+        }
+
+        // Write each column's data
+        boolean useGorilla = isGorillaEnabled();
+        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
+            IlpV4TableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
+            IlpV4ColumnDef colDef = columnDefs[i];
+            encodeColumn(col, colDef, rowCount, useGorilla);
+        }
+    }
+
+    /**
+     * Encodes a single table from the buffer using global symbol IDs.
+     * This is used with delta dictionary encoding.
+     */
+    private void encodeTableWithGlobalSymbols(IlpV4TableBuffer tableBuffer, boolean useSchemaRef) {
+        IlpV4ColumnDef[] columnDefs = tableBuffer.getColumnDefs();
+        int rowCount = tableBuffer.getRowCount();
+
+        if (useSchemaRef) {
+            writeTableHeaderWithSchemaRef(
+                    tableBuffer.getTableName(),
+                    rowCount,
+                    tableBuffer.getSchemaHash(),
+                    columnDefs.length
+            );
+        } else {
+            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, columnDefs);
+        }
+
+        // Write each column's data
+        boolean useGorilla = isGorillaEnabled();
+        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
+            IlpV4TableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
+            IlpV4ColumnDef colDef = columnDefs[i];
+            encodeColumnWithGlobalSymbols(col, colDef, rowCount, useGorilla);
         }
     }
 
@@ -550,27 +506,52 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         }
     }
 
-    private void writeShortColumn(short[] values, int count) {
+    private void writeDecimal128Column(byte scale, long[] high, long[] low, int count) {
+        buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
-            buffer.putShort(values[i]);
+            buffer.putLongBE(high[i]);
+            buffer.putLongBE(low[i]);
         }
     }
 
-    private void writeIntColumn(int[] values, int count) {
+    private void writeDecimal256Column(byte scale, long[] hh, long[] hl, long[] lh, long[] ll, int count) {
+        buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
-            buffer.putInt(values[i]);
+            buffer.putLongBE(hh[i]);
+            buffer.putLongBE(hl[i]);
+            buffer.putLongBE(lh[i]);
+            buffer.putLongBE(ll[i]);
         }
     }
 
-    private void writeLongColumn(long[] values, int count) {
+    private void writeDecimal64Column(byte scale, long[] values, int count) {
+        buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
-            buffer.putLong(values[i]);
+            buffer.putLongBE(values[i]);
         }
     }
 
-    private void writeFloatColumn(float[] values, int count) {
-        for (int i = 0; i < count; i++) {
-            buffer.putFloat(values[i]);
+    private void writeDoubleArrayColumn(IlpV4TableBuffer.ColumnBuffer col, int count) {
+        byte[] dims = col.getArrayDims();
+        int[] shapes = col.getArrayShapes();
+        double[] data = col.getDoubleArrayData();
+
+        int shapeIdx = 0;
+        int dataIdx = 0;
+        for (int row = 0; row < count; row++) {
+            int nDims = dims[row];
+            buffer.putByte((byte) nDims);
+
+            int elemCount = 1;
+            for (int d = 0; d < nDims; d++) {
+                int dimLen = shapes[shapeIdx++];
+                buffer.putInt(dimLen);
+                elemCount *= dimLen;
+            }
+
+            for (int e = 0; e < elemCount; e++) {
+                buffer.putDouble(data[dataIdx++]);
+            }
         }
     }
 
@@ -580,36 +561,73 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         }
     }
 
-    /**
-     * Writes a timestamp column with optional Gorilla compression.
-     * <p>
-     * When Gorilla encoding is enabled and applicable (3+ timestamps with
-     * delta-of-deltas fitting in 32-bit range), uses delta-of-delta compression.
-     * Otherwise, falls back to uncompressed encoding.
-     */
-    private void writeTimestampColumn(long[] values, int count, boolean useGorilla) {
-        if (useGorilla && count > 2 && IlpV4GorillaEncoder.canUseGorilla(values, count)) {
-            // Write Gorilla encoding flag
-            buffer.putByte(IlpV4TimestampDecoder.ENCODING_GORILLA);
+    private void writeFloatColumn(float[] values, int count) {
+        for (int i = 0; i < count; i++) {
+            buffer.putFloat(values[i]);
+        }
+    }
 
-            // Calculate size needed and ensure buffer has capacity
-            int encodedSize = IlpV4GorillaEncoder.calculateEncodedSize(values, count);
-            buffer.ensureCapacity(encodedSize);
+    private void writeIntColumn(int[] values, int count) {
+        for (int i = 0; i < count; i++) {
+            buffer.putInt(values[i]);
+        }
+    }
 
-            // Encode timestamps to buffer
-            int bytesWritten = gorillaEncoder.encodeTimestamps(
-                    buffer.getBufferPtr() + buffer.getPosition(),
-                    buffer.getCapacity() - buffer.getPosition(),
-                    values,
-                    count
-            );
-            buffer.skip(bytesWritten);
-        } else {
-            // Write uncompressed
-            if (useGorilla) {
-                buffer.putByte(IlpV4TimestampDecoder.ENCODING_UNCOMPRESSED);
+    private void writeLong256Column(long[] values, int count) {
+        // Flat array: 4 longs per value, little-endian (least significant first)
+        // values layout: [long0, long1, long2, long3] per row
+        for (int i = 0; i < count * 4; i++) {
+            buffer.putLong(values[i]);
+        }
+    }
+
+    private void writeLongArrayColumn(IlpV4TableBuffer.ColumnBuffer col, int count) {
+        byte[] dims = col.getArrayDims();
+        int[] shapes = col.getArrayShapes();
+        long[] data = col.getLongArrayData();
+
+        int shapeIdx = 0;
+        int dataIdx = 0;
+        for (int row = 0; row < count; row++) {
+            int nDims = dims[row];
+            buffer.putByte((byte) nDims);
+
+            int elemCount = 1;
+            for (int d = 0; d < nDims; d++) {
+                int dimLen = shapes[shapeIdx++];
+                buffer.putInt(dimLen);
+                elemCount *= dimLen;
             }
-            writeLongColumn(values, count);
+
+            for (int e = 0; e < elemCount; e++) {
+                buffer.putLong(data[dataIdx++]);
+            }
+        }
+    }
+
+    private void writeLongColumn(long[] values, int count) {
+        for (int i = 0; i < count; i++) {
+            buffer.putLong(values[i]);
+        }
+    }
+
+    /**
+     * Writes a null bitmap from bit-packed long array.
+     */
+    private void writeNullBitmapPacked(long[] nullsPacked, int count) {
+        int bitmapSize = (count + 7) / 8;
+
+        for (int byteIdx = 0; byteIdx < bitmapSize; byteIdx++) {
+            int longIndex = byteIdx >>> 3;
+            int byteInLong = byteIdx & 7;
+            byte b = (byte) ((nullsPacked[longIndex] >>> (byteInLong * 8)) & 0xFF);
+            buffer.putByte(b);
+        }
+    }
+
+    private void writeShortColumn(short[] values, int count) {
+        for (int i = 0; i < count; i++) {
+            buffer.putShort(values[i]);
         }
     }
 
@@ -691,100 +709,87 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         }
     }
 
+    /**
+     * Writes a table header with full schema.
+     */
+    private void writeTableHeaderWithSchema(String tableName, int rowCount, IlpV4ColumnDef[] columns) {
+        // Table name
+        buffer.putString(tableName);
+
+        // Row count (varint)
+        buffer.putVarint(rowCount);
+
+        // Column count (varint)
+        buffer.putVarint(columns.length);
+
+        // Schema mode: full schema (0x00)
+        buffer.putByte(SCHEMA_MODE_FULL);
+
+        // Column definitions (name + type for each)
+        for (IlpV4ColumnDef col : columns) {
+            buffer.putString(col.getName());
+            buffer.putByte(col.getWireTypeCode());
+        }
+    }
+
+    /**
+     * Writes a table header with schema reference.
+     */
+    private void writeTableHeaderWithSchemaRef(String tableName, int rowCount, long schemaHash, int columnCount) {
+        // Table name
+        buffer.putString(tableName);
+
+        // Row count (varint)
+        buffer.putVarint(rowCount);
+
+        // Column count (varint)
+        buffer.putVarint(columnCount);
+
+        // Schema mode: reference (0x01)
+        buffer.putByte(SCHEMA_MODE_REFERENCE);
+
+        // Schema hash (8 bytes)
+        buffer.putLong(schemaHash);
+    }
+
+    /**
+     * Writes a timestamp column with optional Gorilla compression.
+     * <p>
+     * When Gorilla encoding is enabled and applicable (3+ timestamps with
+     * delta-of-deltas fitting in 32-bit range), uses delta-of-delta compression.
+     * Otherwise, falls back to uncompressed encoding.
+     */
+    private void writeTimestampColumn(long[] values, int count, boolean useGorilla) {
+        if (useGorilla && count > 2 && IlpV4GorillaEncoder.canUseGorilla(values, count)) {
+            // Write Gorilla encoding flag
+            buffer.putByte(ENCODING_GORILLA);
+
+            // Calculate size needed and ensure buffer has capacity
+            int encodedSize = IlpV4GorillaEncoder.calculateEncodedSize(values, count);
+            buffer.ensureCapacity(encodedSize);
+
+            // Encode timestamps to buffer
+            int bytesWritten = gorillaEncoder.encodeTimestamps(
+                    buffer.getBufferPtr() + buffer.getPosition(),
+                    buffer.getCapacity() - buffer.getPosition(),
+                    values,
+                    count
+            );
+            buffer.skip(bytesWritten);
+        } else {
+            // Write uncompressed
+            if (useGorilla) {
+                buffer.putByte(ENCODING_UNCOMPRESSED);
+            }
+            writeLongColumn(values, count);
+        }
+    }
+
     private void writeUuidColumn(long[] highBits, long[] lowBits, int count) {
         // Little-endian: lo first, then hi
         for (int i = 0; i < count; i++) {
             buffer.putLong(lowBits[i]);
             buffer.putLong(highBits[i]);
-        }
-    }
-
-    private void writeLong256Column(long[] values, int count) {
-        // Flat array: 4 longs per value, little-endian (least significant first)
-        // values layout: [long0, long1, long2, long3] per row
-        for (int i = 0; i < count * 4; i++) {
-            buffer.putLong(values[i]);
-        }
-    }
-
-    private void writeDoubleArrayColumn(IlpV4TableBuffer.ColumnBuffer col, int count) {
-        byte[] dims = col.getArrayDims();
-        int[] shapes = col.getArrayShapes();
-        double[] data = col.getDoubleArrayData();
-
-        int shapeIdx = 0;
-        int dataIdx = 0;
-        for (int row = 0; row < count; row++) {
-            int nDims = dims[row];
-            buffer.putByte((byte) nDims);
-
-            int elemCount = 1;
-            for (int d = 0; d < nDims; d++) {
-                int dimLen = shapes[shapeIdx++];
-                buffer.putInt(dimLen);
-                elemCount *= dimLen;
-            }
-
-            for (int e = 0; e < elemCount; e++) {
-                buffer.putDouble(data[dataIdx++]);
-            }
-        }
-    }
-
-    private void writeLongArrayColumn(IlpV4TableBuffer.ColumnBuffer col, int count) {
-        byte[] dims = col.getArrayDims();
-        int[] shapes = col.getArrayShapes();
-        long[] data = col.getLongArrayData();
-
-        int shapeIdx = 0;
-        int dataIdx = 0;
-        for (int row = 0; row < count; row++) {
-            int nDims = dims[row];
-            buffer.putByte((byte) nDims);
-
-            int elemCount = 1;
-            for (int d = 0; d < nDims; d++) {
-                int dimLen = shapes[shapeIdx++];
-                buffer.putInt(dimLen);
-                elemCount *= dimLen;
-            }
-
-            for (int e = 0; e < elemCount; e++) {
-                buffer.putLong(data[dataIdx++]);
-            }
-        }
-    }
-
-    private void writeDecimal64Column(byte scale, long[] values, int count) {
-        buffer.putByte(scale);
-        for (int i = 0; i < count; i++) {
-            buffer.putLongBE(values[i]);
-        }
-    }
-
-    private void writeDecimal128Column(byte scale, long[] high, long[] low, int count) {
-        buffer.putByte(scale);
-        for (int i = 0; i < count; i++) {
-            buffer.putLongBE(high[i]);
-            buffer.putLongBE(low[i]);
-        }
-    }
-
-    private void writeDecimal256Column(byte scale, long[] hh, long[] hl, long[] lh, long[] ll, int count) {
-        buffer.putByte(scale);
-        for (int i = 0; i < count; i++) {
-            buffer.putLongBE(hh[i]);
-            buffer.putLongBE(hl[i]);
-            buffer.putLongBE(lh[i]);
-            buffer.putLongBE(ll[i]);
-        }
-    }
-
-    @Override
-    public void close() {
-        if (ownedBuffer != null) {
-            ownedBuffer.close();
-            ownedBuffer = null;
         }
     }
 }
