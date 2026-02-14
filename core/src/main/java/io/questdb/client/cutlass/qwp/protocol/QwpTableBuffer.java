@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
@@ -38,7 +38,7 @@ import io.questdb.client.std.Unsafe;
 
 import java.util.Arrays;
 
-import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 /**
  * Buffers rows for a single table in columnar format.
@@ -46,7 +46,7 @@ import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
  * This buffer accumulates row data column by column, allowing efficient
  * encoding to the ILP v4 wire format.
  */
-public class IlpV4TableBuffer {
+public class QwpTableBuffer {
 
     private final String tableName;
     private final ObjList<ColumnBuffer> columns;
@@ -56,10 +56,10 @@ public class IlpV4TableBuffer {
     private int rowCount;
     private long schemaHash;
     private boolean schemaHashComputed;
-    private IlpV4ColumnDef[] cachedColumnDefs;
+    private QwpColumnDef[] cachedColumnDefs;
     private boolean columnDefsCacheValid;
 
-    public IlpV4TableBuffer(String tableName) {
+    public QwpTableBuffer(String tableName) {
         this.tableName = tableName;
         this.columns = new ObjList<>();
         this.columnNameToIndex = new CharSequenceIntHashMap();
@@ -100,12 +100,12 @@ public class IlpV4TableBuffer {
     /**
      * Returns the column definitions (cached for efficiency).
      */
-    public IlpV4ColumnDef[] getColumnDefs() {
+    public QwpColumnDef[] getColumnDefs() {
         if (!columnDefsCacheValid || cachedColumnDefs == null || cachedColumnDefs.length != columns.size()) {
-            cachedColumnDefs = new IlpV4ColumnDef[columns.size()];
+            cachedColumnDefs = new QwpColumnDef[columns.size()];
             for (int i = 0; i < columns.size(); i++) {
                 ColumnBuffer col = columns.get(i);
-                cachedColumnDefs[i] = new IlpV4ColumnDef(col.name, col.type, col.nullable);
+                cachedColumnDefs[i] = new QwpColumnDef(col.name, col.type, col.nullable);
             }
             columnDefsCacheValid = true;
         }
@@ -204,14 +204,14 @@ public class IlpV4TableBuffer {
     /**
      * Returns the schema hash for this table.
      * <p>
-     * The hash is computed to match what IlpV4Schema.computeSchemaHash() produces:
+     * The hash is computed to match what QwpSchema.computeSchemaHash() produces:
      * - Uses wire type codes (with nullable bit)
      * - Hash is over name bytes + type code for each column
      */
     public long getSchemaHash() {
         if (!schemaHashComputed) {
             // Compute hash directly from column buffers without intermediate arrays
-            schemaHash = IlpV4SchemaHash.computeSchemaHashDirect(columns);
+            schemaHash = QwpSchemaHash.computeSchemaHashDirect(columns);
             schemaHashComputed = true;
         }
         return schemaHash;

@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 import io.questdb.client.std.Unsafe;
 
@@ -36,14 +36,14 @@ import io.questdb.client.std.Unsafe;
  * <p>
  * Usage pattern:
  * <pre>
- * IlpV4BitReader reader = new IlpV4BitReader();
+ * QwpBitReader reader = new QwpBitReader();
  * reader.reset(address, length);
  * int bit = reader.readBit();
  * long value = reader.readBits(numBits);
  * long signedValue = reader.readSigned(numBits);
  * </pre>
  */
-public class IlpV4BitReader {
+public class QwpBitReader {
 
     private long startAddress;
     private long currentAddress;
@@ -61,7 +61,7 @@ public class IlpV4BitReader {
     /**
      * Creates a new bit reader. Call {@link #reset} before use.
      */
-    public IlpV4BitReader() {
+    public QwpBitReader() {
     }
 
     /**

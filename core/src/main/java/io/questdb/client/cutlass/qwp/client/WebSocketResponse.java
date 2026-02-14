@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.client;
+package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.std.Unsafe;
 

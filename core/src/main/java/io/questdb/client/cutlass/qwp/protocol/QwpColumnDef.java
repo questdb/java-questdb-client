@@ -22,16 +22,16 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
-import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 /**
  * Represents a column definition in an ILP v4 schema.
  * <p>
  * This class is immutable and safe for caching.
  */
-public final class IlpV4ColumnDef {
+public final class QwpColumnDef {
     private final String name;
     private final byte typeCode;
     private final boolean nullable;
@@ -42,7 +42,7 @@ public final class IlpV4ColumnDef {
      * @param name     the column name (UTF-8)
      * @param typeCode the ILP v4 type code (0x01-0x0F, optionally OR'd with 0x80 for nullable)
      */
-    public IlpV4ColumnDef(String name, byte typeCode) {
+    public QwpColumnDef(String name, byte typeCode) {
         this.name = name;
         // Extract nullable flag (high bit) and base type
         this.nullable = (typeCode & 0x80) != 0;
@@ -56,7 +56,7 @@ public final class IlpV4ColumnDef {
      * @param typeCode the base type code (0x01-0x0F)
      * @param nullable whether the column is nullable
      */
-    public IlpV4ColumnDef(String name, byte typeCode, boolean nullable) {
+    public QwpColumnDef(String name, byte typeCode, boolean nullable) {
         this.name = name;
         this.typeCode = (byte) (typeCode & 0x7F);
         this.nullable = nullable;
@@ -98,7 +98,7 @@ public final class IlpV4ColumnDef {
      * Returns true if this is a fixed-width type.
      */
     public boolean isFixedWidth() {
-        return IlpV4Constants.isFixedWidthType(typeCode);
+        return QwpConstants.isFixedWidthType(typeCode);
     }
 
     /**
@@ -107,14 +107,14 @@ public final class IlpV4ColumnDef {
      * @return width in bytes, or -1 for variable-width types
      */
     public int getFixedWidth() {
-        return IlpV4Constants.getFixedTypeSize(typeCode);
+        return QwpConstants.getFixedTypeSize(typeCode);
     }
 
     /**
      * Gets the type name for display purposes.
      */
     public String getTypeName() {
-        return IlpV4Constants.getTypeName(typeCode);
+        return QwpConstants.getTypeName(typeCode);
     }
 
     /**
@@ -137,7 +137,7 @@ public final class IlpV4ColumnDef {
     public boolean equals(Object o) {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
-        IlpV4ColumnDef that = (IlpV4ColumnDef) o;
+        QwpColumnDef that = (QwpColumnDef) o;
         return typeCode == that.typeCode &&
                 nullable == that.nullable &&
                 name.equals(that.name);

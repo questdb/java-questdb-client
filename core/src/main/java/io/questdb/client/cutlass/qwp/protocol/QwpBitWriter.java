@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 import io.questdb.client.std.Unsafe;
 
@@ -37,7 +37,7 @@ import io.questdb.client.std.Unsafe;
  * <p>
  * Usage pattern:
  * <pre>
- * IlpV4BitWriter writer = new IlpV4BitWriter();
+ * QwpBitWriter writer = new QwpBitWriter();
  * writer.reset(address, capacity);
  * writer.writeBits(value, numBits);
  * writer.writeBits(value2, numBits2);
@@ -45,7 +45,7 @@ import io.questdb.client.std.Unsafe;
  * long bytesWritten = writer.getPosition() - address;
  * </pre>
  */
-public class IlpV4BitWriter {
+public class QwpBitWriter {
 
     private long startAddress;
     private long currentAddress;
@@ -59,7 +59,7 @@ public class IlpV4BitWriter {
     /**
      * Creates a new bit writer. Call {@link #reset} before use.
      */
-    public IlpV4BitWriter() {
+    public QwpBitWriter() {
     }
 
     /**

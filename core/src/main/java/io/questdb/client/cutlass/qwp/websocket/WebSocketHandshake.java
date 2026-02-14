@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.websocket;
+package io.questdb.client.cutlass.qwp.websocket;
 
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.Utf8Sequence;

@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 import io.questdb.client.std.Unsafe;
 
@@ -42,9 +42,9 @@ import io.questdb.client.std.Unsafe;
  * Byte 1: 0b00000010 (bit 1 set, which is row 9)
  * </pre>
  */
-public final class IlpV4NullBitmap {
+public final class QwpNullBitmap {
 
-    private IlpV4NullBitmap() {
+    private QwpNullBitmap() {
         // utility class
     }
 

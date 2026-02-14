@@ -22,13 +22,13 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.client;
+package io.questdb.client.cutlass.qwp.client;
 
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketCloseCode;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketFrameParser;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketFrameWriter;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketHandshake;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketOpcode;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketHandshake;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;

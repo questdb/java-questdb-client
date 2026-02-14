@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.websocket;
+package io.questdb.client.cutlass.qwp.websocket;
 
 /**
  * WebSocket close status codes as defined in RFC 6455.

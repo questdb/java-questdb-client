@@ -34,7 +34,7 @@ import io.questdb.client.cutlass.line.LineTcpSenderV3;
 import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.cutlass.line.tcp.DelegatingTlsChannel;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
-import io.questdb.client.cutlass.ilpv4.client.IlpV4WebSocketSender;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
@@ -881,7 +881,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 int actualSendQueueCapacity = sendQueueCapacity == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_SEND_QUEUE_CAPACITY : sendQueueCapacity;
 
                 if (asyncMode) {
-                    return IlpV4WebSocketSender.connectAsync(
+                    return QwpWebSocketSender.connectAsync(
                             hosts.getQuick(0),
                             ports.getQuick(0),
                             tlsEnabled,
@@ -892,7 +892,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualSendQueueCapacity
                     );
                 } else {
-                    return IlpV4WebSocketSender.connect(
+                    return QwpWebSocketSender.connect(
                             hosts.getQuick(0),
                             ports.getQuick(0),
                             tlsEnabled

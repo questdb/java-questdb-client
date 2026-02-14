@@ -22,12 +22,12 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 /**
  * Constants for the ILP v4 binary protocol.
  */
-public final class IlpV4Constants {
+public final class QwpConstants {
 
     // ==================== Magic Bytes ====================
 
@@ -360,7 +360,7 @@ public final class IlpV4Constants {
      */
     public static final int CAPABILITY_RESPONSE_SIZE = 8;
 
-    private IlpV4Constants() {
+    private QwpConstants() {
         // utility class
     }
 

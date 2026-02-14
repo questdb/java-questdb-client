@@ -22,9 +22,9 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.client;
+package io.questdb.client.cutlass.qwp.client;
 
-import io.questdb.client.cutlass.ilpv4.protocol.*;
+import io.questdb.client.cutlass.qwp.protocol.*;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
@@ -50,7 +50,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.TimeUnit;
 
-import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 /**
  * ILP v4 WebSocket client sender for streaming data to QuestDB.
@@ -72,7 +72,7 @@ import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
  * <p>
  * Example usage:
  * <pre>
- * try (IlpV4WebSocketSender sender = IlpV4WebSocketSender.connect("localhost", 9000)) {
+ * try (QwpWebSocketSender sender = QwpWebSocketSender.connect("localhost", 9000)) {
  *     for (int i = 0; i &lt; 100_000; i++) {
  *         sender.table("metrics")
  *               .symbol("host", "server-" + (i % 10))
@@ -85,9 +85,9 @@ import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
  * }
  * </pre>
  */
-public class IlpV4WebSocketSender implements Sender {
+public class QwpWebSocketSender implements Sender {
 
-    private static final Logger LOG = LoggerFactory.getLogger(IlpV4WebSocketSender.class);
+    private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
 
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
@@ -101,15 +101,15 @@ public class IlpV4WebSocketSender implements Sender {
     private final String host;
     private final int port;
     private final boolean tlsEnabled;
-    private final CharSequenceObjHashMap<IlpV4TableBuffer> tableBuffers;
-    private IlpV4TableBuffer currentTableBuffer;
+    private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
+    private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
     // Cached column references to avoid repeated hashmap lookups
-    private IlpV4TableBuffer.ColumnBuffer cachedTimestampColumn;
-    private IlpV4TableBuffer.ColumnBuffer cachedTimestampNanosColumn;
+    private QwpTableBuffer.ColumnBuffer cachedTimestampColumn;
+    private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
 
     // Encoder for ILP v4 messages
-    private final IlpV4WebSocketEncoder encoder;
+    private final QwpWebSocketEncoder encoder;
 
     // WebSocket client (zero-GC native implementation)
     private WebSocketClient client;
@@ -159,13 +159,13 @@ public class IlpV4WebSocketSender implements Sender {
     // Combined key = schemaHash XOR (tableNameHash << 32) to include table name in lookup.
     private final LongHashSet sentSchemaHashes = new LongHashSet();
 
-    private IlpV4WebSocketSender(String host, int port, boolean tlsEnabled, int bufferSize,
+    private QwpWebSocketSender(String host, int port, boolean tlsEnabled, int bufferSize,
                                  int autoFlushRows, int autoFlushBytes, long autoFlushIntervalNanos,
                                  int inFlightWindowSize, int sendQueueCapacity) {
         this.host = host;
         this.port = port;
         this.tlsEnabled = tlsEnabled;
-        this.encoder = new IlpV4WebSocketEncoder(bufferSize);
+        this.encoder = new QwpWebSocketEncoder(bufferSize);
         this.tableBuffers = new CharSequenceObjHashMap<>();
         this.currentTableBuffer = null;
         this.currentTableName = null;
@@ -197,7 +197,7 @@ public class IlpV4WebSocketSender implements Sender {
      * @param port server HTTP port (WebSocket upgrade happens on same port)
      * @return connected sender
      */
-    public static IlpV4WebSocketSender connect(String host, int port) {
+    public static QwpWebSocketSender connect(String host, int port) {
         return connect(host, port, false);
     }
 
@@ -210,8 +210,8 @@ public class IlpV4WebSocketSender implements Sender {
      * @param tlsEnabled whether to use TLS
      * @return connected sender
      */
-    public static IlpV4WebSocketSender connect(String host, int port, boolean tlsEnabled) {
-        IlpV4WebSocketSender sender = new IlpV4WebSocketSender(
+    public static QwpWebSocketSender connect(String host, int port, boolean tlsEnabled) {
+        QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
                 0, 0, 0, // No auto-flush in sync mode
                 1, 1    // window=1 for sync behavior, queue=1 (not used)
@@ -231,7 +231,7 @@ public class IlpV4WebSocketSender implements Sender {
      * @param autoFlushIntervalNanos  age before flush in nanos (0 = no limit)
      * @return connected sender
      */
-    public static IlpV4WebSocketSender connectAsync(String host, int port, boolean tlsEnabled,
+    public static QwpWebSocketSender connectAsync(String host, int port, boolean tlsEnabled,
                                                     int autoFlushRows, int autoFlushBytes,
                                                     long autoFlushIntervalNanos) {
         return connectAsync(host, port, tlsEnabled, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -251,11 +251,11 @@ public class IlpV4WebSocketSender implements Sender {
      * @param sendQueueCapacity       max batches waiting to send (default: 16)
      * @return connected sender
      */
-    public static IlpV4WebSocketSender connectAsync(String host, int port, boolean tlsEnabled,
+    public static QwpWebSocketSender connectAsync(String host, int port, boolean tlsEnabled,
                                                     int autoFlushRows, int autoFlushBytes,
                                                     long autoFlushIntervalNanos,
                                                     int inFlightWindowSize, int sendQueueCapacity) {
-        IlpV4WebSocketSender sender = new IlpV4WebSocketSender(
+        QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 inFlightWindowSize, sendQueueCapacity
@@ -272,7 +272,7 @@ public class IlpV4WebSocketSender implements Sender {
      * @param tlsEnabled whether to use TLS
      * @return connected sender
      */
-    public static IlpV4WebSocketSender connectAsync(String host, int port, boolean tlsEnabled) {
+    public static QwpWebSocketSender connectAsync(String host, int port, boolean tlsEnabled) {
         return connectAsync(host, port, tlsEnabled,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS);
     }
@@ -280,7 +280,7 @@ public class IlpV4WebSocketSender implements Sender {
     /**
      * Factory method for SenderBuilder integration.
      */
-    public static IlpV4WebSocketSender create(
+    public static QwpWebSocketSender create(
             String host,
             int port,
             boolean tlsEnabled,
@@ -289,7 +289,7 @@ public class IlpV4WebSocketSender implements Sender {
             String username,
             String password
     ) {
-        IlpV4WebSocketSender sender = new IlpV4WebSocketSender(
+        QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, bufferSize,
                 0, 0, 0,
                 1, 1    // window=1 for sync behavior
@@ -309,8 +309,8 @@ public class IlpV4WebSocketSender implements Sender {
      * @param inFlightWindowSize window size: 1 for sync behavior, >1 for async
      * @return unconnected sender
      */
-    public static IlpV4WebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
-        return new IlpV4WebSocketSender(
+    public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
+        return new QwpWebSocketSender(
                 host, port, false, DEFAULT_BUFFER_SIZE,
                 0, 0, 0,
                 inFlightWindowSize, DEFAULT_SEND_QUEUE_CAPACITY
@@ -330,11 +330,11 @@ public class IlpV4WebSocketSender implements Sender {
      * @param sendQueueCapacity      max batches waiting to send
      * @return unconnected sender
      */
-    public static IlpV4WebSocketSender createForTesting(
+    public static QwpWebSocketSender createForTesting(
             String host, int port,
             int autoFlushRows, int autoFlushBytes, long autoFlushIntervalNanos,
             int inFlightWindowSize, int sendQueueCapacity) {
-        return new IlpV4WebSocketSender(
+        return new QwpWebSocketSender(
                 host, port, false, DEFAULT_BUFFER_SIZE,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 inFlightWindowSize, sendQueueCapacity
@@ -395,7 +395,7 @@ public class IlpV4WebSocketSender implements Sender {
     /**
      * Sets whether to use Gorilla timestamp encoding.
      */
-    public IlpV4WebSocketSender setGorillaEnabled(boolean enabled) {
+    public QwpWebSocketSender setGorillaEnabled(boolean enabled) {
         this.gorillaEnabled = enabled;
         this.encoder.setGorillaEnabled(enabled);
         return this;
@@ -469,9 +469,9 @@ public class IlpV4WebSocketSender implements Sender {
     //
     // Usage:
     //   // Setup (once)
-    //   IlpV4TableBuffer tableBuffer = sender.getTableBuffer("q");
-    //   IlpV4TableBuffer.ColumnBuffer colSymbol = tableBuffer.getOrCreateColumn("s", TYPE_SYMBOL, true);
-    //   IlpV4TableBuffer.ColumnBuffer colBid = tableBuffer.getOrCreateColumn("b", TYPE_DOUBLE, false);
+    //   QwpTableBuffer tableBuffer = sender.getTableBuffer("q");
+    //   QwpTableBuffer.ColumnBuffer colSymbol = tableBuffer.getOrCreateColumn("s", TYPE_SYMBOL, true);
+    //   QwpTableBuffer.ColumnBuffer colBid = tableBuffer.getOrCreateColumn("b", TYPE_DOUBLE, false);
     //
     //   // Hot path (per row)
     //   colSymbol.addSymbolWithGlobalId(symbol, sender.getOrAddGlobalSymbol(symbol));
@@ -483,10 +483,10 @@ public class IlpV4WebSocketSender implements Sender {
      * Gets or creates a table buffer for direct access.
      * For high-throughput generators that want to bypass fluent API overhead.
      */
-    public IlpV4TableBuffer getTableBuffer(String tableName) {
-        IlpV4TableBuffer buffer = tableBuffers.get(tableName);
+    public QwpTableBuffer getTableBuffer(String tableName) {
+        QwpTableBuffer buffer = tableBuffers.get(tableName);
         if (buffer == null) {
-            buffer = new IlpV4TableBuffer(tableName);
+            buffer = new QwpTableBuffer(tableName);
             tableBuffers.put(tableName, buffer);
         }
         currentTableBuffer = buffer;
@@ -531,7 +531,7 @@ public class IlpV4WebSocketSender implements Sender {
     // ==================== Sender interface implementation ====================
 
     @Override
-    public IlpV4WebSocketSender table(CharSequence tableName) {
+    public QwpWebSocketSender table(CharSequence tableName) {
         checkNotClosed();
         // Fast path: if table name matches current, skip hashmap lookup
         if (currentTableName != null && currentTableBuffer != null && Chars.equals(tableName, currentTableName)) {
@@ -543,7 +543,7 @@ public class IlpV4WebSocketSender implements Sender {
         currentTableName = tableName.toString();
         currentTableBuffer = tableBuffers.get(currentTableName);
         if (currentTableBuffer == null) {
-            currentTableBuffer = new IlpV4TableBuffer(currentTableName);
+            currentTableBuffer = new QwpTableBuffer(currentTableName);
             tableBuffers.put(currentTableName, currentTableBuffer);
         }
         // Both modes accumulate rows until flush
@@ -551,10 +551,10 @@ public class IlpV4WebSocketSender implements Sender {
     }
 
     @Override
-    public IlpV4WebSocketSender symbol(CharSequence columnName, CharSequence value) {
+    public QwpWebSocketSender symbol(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_SYMBOL, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_SYMBOL, true);
 
         if (value != null) {
             // Register symbol in global dictionary and track max ID for delta calculation
@@ -572,19 +572,19 @@ public class IlpV4WebSocketSender implements Sender {
     }
 
     @Override
-    public IlpV4WebSocketSender boolColumn(CharSequence columnName, boolean value) {
+    public QwpWebSocketSender boolColumn(CharSequence columnName, boolean value) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_BOOLEAN, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_BOOLEAN, false);
         col.addBoolean(value);
         return this;
     }
 
     @Override
-    public IlpV4WebSocketSender longColumn(CharSequence columnName, long value) {
+    public QwpWebSocketSender longColumn(CharSequence columnName, long value) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_LONG, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_LONG, false);
         col.addLong(value);
         return this;
     }
@@ -596,28 +596,28 @@ public class IlpV4WebSocketSender implements Sender {
      * @param value      the int value
      * @return this sender for method chaining
      */
-    public IlpV4WebSocketSender intColumn(CharSequence columnName, int value) {
+    public QwpWebSocketSender intColumn(CharSequence columnName, int value) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_INT, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_INT, false);
         col.addInt(value);
         return this;
     }
 
     @Override
-    public IlpV4WebSocketSender doubleColumn(CharSequence columnName, double value) {
+    public QwpWebSocketSender doubleColumn(CharSequence columnName, double value) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_DOUBLE, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_DOUBLE, false);
         col.addDouble(value);
         return this;
     }
 
     @Override
-    public IlpV4WebSocketSender stringColumn(CharSequence columnName, CharSequence value) {
+    public QwpWebSocketSender stringColumn(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_STRING, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_STRING, true);
         col.addString(value != null ? value.toString() : null);
         return this;
     }
@@ -629,10 +629,10 @@ public class IlpV4WebSocketSender implements Sender {
      * @param value      the short value
      * @return this sender for method chaining
      */
-    public IlpV4WebSocketSender shortColumn(CharSequence columnName, short value) {
+    public QwpWebSocketSender shortColumn(CharSequence columnName, short value) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_SHORT, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_SHORT, false);
         col.addShort(value);
         return this;
     }
@@ -646,10 +646,10 @@ public class IlpV4WebSocketSender implements Sender {
      * @param value      the character value
      * @return this sender for method chaining
      */
-    public IlpV4WebSocketSender charColumn(CharSequence columnName, char value) {
+    public QwpWebSocketSender charColumn(CharSequence columnName, char value) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_CHAR, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_CHAR, false);
         col.addShort((short) value);
         return this;
     }
@@ -662,10 +662,10 @@ public class IlpV4WebSocketSender implements Sender {
      * @param hi         the high 64 bits of the UUID
      * @return this sender for method chaining
      */
-    public IlpV4WebSocketSender uuidColumn(CharSequence columnName, long lo, long hi) {
+    public QwpWebSocketSender uuidColumn(CharSequence columnName, long lo, long hi) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_UUID, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_UUID, true);
         col.addUuid(hi, lo);
         return this;
     }
@@ -680,35 +680,35 @@ public class IlpV4WebSocketSender implements Sender {
      * @param l3         the most significant 64 bits
      * @return this sender for method chaining
      */
-    public IlpV4WebSocketSender long256Column(CharSequence columnName, long l0, long l1, long l2, long l3) {
+    public QwpWebSocketSender long256Column(CharSequence columnName, long l0, long l1, long l2, long l3) {
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_LONG256, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_LONG256, true);
         col.addLong256(l0, l1, l2, l3);
         return this;
     }
 
     @Override
-    public IlpV4WebSocketSender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
+    public QwpWebSocketSender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
         checkNotClosed();
         checkTableSelected();
         if (unit == ChronoUnit.NANOS) {
-            IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP_NANOS, true);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP_NANOS, true);
             col.addLong(value);
         } else {
             long micros = toMicros(value, unit);
-            IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP, true);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP, true);
             col.addLong(micros);
         }
         return this;
     }
 
     @Override
-    public IlpV4WebSocketSender timestampColumn(CharSequence columnName, Instant value) {
+    public QwpWebSocketSender timestampColumn(CharSequence columnName, Instant value) {
         checkNotClosed();
         checkTableSelected();
         long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP, true);
         col.addLong(micros);
         return this;
     }
@@ -832,7 +832,7 @@ public class IlpV4WebSocketSender implements Sender {
             if (tableName == null) {
                 continue; // Skip null entries (shouldn't happen but be safe)
             }
-            IlpV4TableBuffer tableBuffer = tableBuffers.get(tableName);
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
             if (tableBuffer == null) {
                 continue;
             }
@@ -859,7 +859,7 @@ public class IlpV4WebSocketSender implements Sender {
                 if (!useSchemaRef) {
                     sentSchemaHashes.add(schemaKey);
                 }
-                IlpBufferWriter buffer = encoder.getBuffer();
+                QwpBufferWriter buffer = encoder.getBuffer();
 
                 // Copy to microbatch buffer and seal immediately
                 // Each ILP v4 message must be in its own WebSocket frame
@@ -1031,7 +1031,7 @@ public class IlpV4WebSocketSender implements Sender {
             if (tableName == null) {
                 continue;
             }
-            IlpV4TableBuffer tableBuffer = tableBuffers.get(tableName);
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
             if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
                 continue;
             }
@@ -1057,7 +1057,7 @@ public class IlpV4WebSocketSender implements Sender {
             }
 
             if (messageSize > 0) {
-                IlpBufferWriter buffer = encoder.getBuffer();
+                QwpBufferWriter buffer = encoder.getBuffer();
 
                 // Track batch in InFlightWindow before sending
                 long batchSequence = nextBatchSequence++;
@@ -1192,7 +1192,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
         col.addDoubleArray(values);
         return this;
     }
@@ -1202,7 +1202,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
         col.addDoubleArray(values);
         return this;
     }
@@ -1212,7 +1212,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
         col.addDoubleArray(values);
         return this;
     }
@@ -1222,7 +1222,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (array == null) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
         col.addDoubleArray(array);
         return this;
     }
@@ -1232,7 +1232,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
         col.addLongArray(values);
         return this;
     }
@@ -1242,7 +1242,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
         col.addLongArray(values);
         return this;
     }
@@ -1252,7 +1252,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
         col.addLongArray(values);
         return this;
     }
@@ -1262,7 +1262,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (array == null) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
         col.addLongArray(array);
         return this;
     }
@@ -1274,7 +1274,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL64, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL64, true);
         col.addDecimal64(value);
         return this;
     }
@@ -1284,7 +1284,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL128, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL128, true);
         col.addDecimal128(value);
         return this;
     }
@@ -1294,7 +1294,7 @@ public class IlpV4WebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
         col.addDecimal256(value);
         return this;
     }
@@ -1307,7 +1307,7 @@ public class IlpV4WebSocketSender implements Sender {
         try {
             java.math.BigDecimal bd = new java.math.BigDecimal(value.toString());
             Decimal256 decimal = Decimal256.fromBigDecimal(bd);
-            IlpV4TableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
             col.addDecimal256(decimal);
         } catch (Exception e) {
             throw new LineSenderException("Failed to parse decimal value: " + value, e);
@@ -1392,7 +1392,7 @@ public class IlpV4WebSocketSender implements Sender {
             encoder.close();
             tableBuffers.clear();
 
-            LOG.info("IlpV4WebSocketSender closed");
+            LOG.info("QwpWebSocketSender closed");
         }
     }
 }

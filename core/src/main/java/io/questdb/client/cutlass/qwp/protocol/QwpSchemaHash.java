@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 
 import io.questdb.client.std.Unsafe;
@@ -41,7 +41,7 @@ import io.questdb.client.std.str.Utf8Sequence;
  *
  * @see <a href="https://github.com/Cyan4973/xxHash">xxHash</a>
  */
-public final class IlpV4SchemaHash {
+public final class QwpSchemaHash {
 
     // XXHash64 constants
     private static final long PRIME64_1 = 0x9E3779B185EBCA87L;
@@ -56,7 +56,7 @@ public final class IlpV4SchemaHash {
     // Thread-local Hasher to avoid allocation on every computeSchemaHash call
     private static final ThreadLocal<Hasher> HASHER_POOL = ThreadLocal.withInitial(Hasher::new);
 
-    private IlpV4SchemaHash() {
+    private QwpSchemaHash() {
         // utility class
     }
 
@@ -340,13 +340,13 @@ public final class IlpV4SchemaHash {
      * @param columns list of column buffers
      * @return the schema hash
      */
-    public static long computeSchemaHashDirect(io.questdb.client.std.ObjList<IlpV4TableBuffer.ColumnBuffer> columns) {
+    public static long computeSchemaHashDirect(io.questdb.client.std.ObjList<QwpTableBuffer.ColumnBuffer> columns) {
         // Use pooled hasher to avoid allocation
         Hasher hasher = HASHER_POOL.get();
         hasher.reset(DEFAULT_SEED);
 
         for (int i = 0, n = columns.size(); i < n; i++) {
-            IlpV4TableBuffer.ColumnBuffer col = columns.get(i);
+            QwpTableBuffer.ColumnBuffer col = columns.get(i);
             String name = col.getName();
             // Encode UTF-8 directly without allocating byte array
             for (int j = 0, len = name.length(); j < len; j++) {

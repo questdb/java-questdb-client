@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 import io.questdb.client.std.Unsafe;
 
@@ -44,7 +44,7 @@ import io.questdb.client.std.Unsafe;
  * The encoder writes first two timestamps uncompressed, then encodes
  * remaining timestamps using delta-of-delta compression.
  */
-public class IlpV4GorillaEncoder {
+public class QwpGorillaEncoder {
 
     private static final int BUCKET_12BIT_MAX = 2048;
     private static final int BUCKET_12BIT_MIN = -2047;
@@ -53,12 +53,12 @@ public class IlpV4GorillaEncoder {
     private static final int BUCKET_7BIT_MIN = -63;
     private static final int BUCKET_9BIT_MAX = 256;
     private static final int BUCKET_9BIT_MIN = -255;
-    private final IlpV4BitWriter bitWriter = new IlpV4BitWriter();
+    private final QwpBitWriter bitWriter = new QwpBitWriter();
 
     /**
      * Creates a new Gorilla encoder.
      */
-    public IlpV4GorillaEncoder() {
+    public QwpGorillaEncoder() {
     }
 
     /**
@@ -166,7 +166,7 @@ public class IlpV4GorillaEncoder {
             return 0;
         }
 
-        int pos = 0;
+        int pos;
 
         // Write first timestamp uncompressed
         if (capacity < 8) {

@@ -25,10 +25,10 @@
 package io.questdb.client.cutlass.http.client;
 
 import io.questdb.client.HttpClientConfiguration;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketCloseCode;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketFrameParser;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketHandshake;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketOpcode;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketHandshake;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import io.questdb.client.network.IOOperation;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.Socket;

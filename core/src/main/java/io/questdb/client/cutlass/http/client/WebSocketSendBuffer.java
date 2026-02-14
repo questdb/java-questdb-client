@@ -24,9 +24,9 @@
 
 package io.questdb.client.cutlass.http.client;
 
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketFrameWriter;
-import io.questdb.client.cutlass.ilpv4.websocket.WebSocketOpcode;
-import io.questdb.client.cutlass.ilpv4.client.IlpBufferWriter;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
+import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Numbers;
@@ -55,7 +55,7 @@ import io.questdb.client.std.Vect;
  * <p>
  * Thread safety: This class is NOT thread-safe. Each connection should have its own buffer.
  */
-public class WebSocketSendBuffer implements IlpBufferWriter, QuietCloseable {
+public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
 
     // Maximum header size: 2 (base) + 8 (64-bit length) + 4 (mask key)
     private static final int MAX_HEADER_SIZE = 14;
@@ -244,7 +244,7 @@ public class WebSocketSendBuffer implements IlpBufferWriter, QuietCloseable {
         writePos += len;
     }
 
-    // === IlpBufferWriter Implementation ===
+    // === QwpBufferWriter Implementation ===
 
     /**
      * Writes an unsigned variable-length integer (LEB128 encoding).
@@ -267,7 +267,7 @@ public class WebSocketSendBuffer implements IlpBufferWriter, QuietCloseable {
             putVarint(0);
             return;
         }
-        int utf8Len = IlpBufferWriter.utf8Length(value);
+        int utf8Len = QwpBufferWriter.utf8Length(value);
         putVarint(utf8Len);
         putUtf8(value);
     }

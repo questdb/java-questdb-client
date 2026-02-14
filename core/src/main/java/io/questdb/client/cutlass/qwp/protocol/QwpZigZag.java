@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 /**
  * ZigZag encoding/decoding for signed integers.
@@ -50,9 +50,9 @@ package io.questdb.client.cutlass.ilpv4.protocol;
  * negative numbers like -1 become small positive numbers (1), which
  * encode efficiently as varints.
  */
-public final class IlpV4ZigZag {
+public final class QwpZigZag {
 
-    private IlpV4ZigZag() {
+    private QwpZigZag() {
         // utility class
     }
 

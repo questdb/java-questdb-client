@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.client;
+package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 
@@ -42,7 +42,7 @@ import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
  * All multi-byte values are written in little-endian format unless the method
  * name explicitly indicates big-endian (e.g., {@link #putLongBE}).
  */
-public interface IlpBufferWriter extends ArrayBufferAppender {
+public interface QwpBufferWriter extends ArrayBufferAppender {
 
     // === Primitive writes (little-endian) ===
 

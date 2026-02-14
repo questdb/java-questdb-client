@@ -22,20 +22,20 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.client;
+package io.questdb.client.cutlass.qwp.client;
 
-import io.questdb.client.cutlass.ilpv4.protocol.IlpV4ColumnDef;
-import io.questdb.client.cutlass.ilpv4.protocol.IlpV4GorillaEncoder;
-import io.questdb.client.cutlass.ilpv4.protocol.IlpV4TableBuffer;
+import io.questdb.client.cutlass.qwp.protocol.QwpColumnDef;
+import io.questdb.client.cutlass.qwp.protocol.QwpGorillaEncoder;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.QuietCloseable;
 
-import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 /**
  * Encodes ILP v4 messages for WebSocket transport.
  * <p>
  * This encoder can write to either an internal {@link NativeBufferWriter} (default)
- * or an external {@link IlpBufferWriter} such as {@link io.questdb.client.cutlass.http.client.WebSocketSendBuffer}.
+ * or an external {@link QwpBufferWriter} such as {@link io.questdb.client.cutlass.http.client.WebSocketSendBuffer}.
  * <p>
  * When using an external buffer, the encoder writes directly to it without intermediate copies,
  * enabling zero-copy WebSocket frame construction.
@@ -50,7 +50,7 @@ import static io.questdb.client.cutlass.ilpv4.protocol.IlpV4Constants.*;
  * client.sendFrame(frame);
  * </pre>
  */
-public class IlpV4WebSocketEncoder implements QuietCloseable {
+public class QwpWebSocketEncoder implements QuietCloseable {
 
     /**
      * Encoding flag for Gorilla-encoded timestamps.
@@ -60,18 +60,18 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * Encoding flag for uncompressed timestamps.
      */
     public static final byte ENCODING_UNCOMPRESSED = 0x00;
-    private final IlpV4GorillaEncoder gorillaEncoder = new IlpV4GorillaEncoder();
-    private IlpBufferWriter buffer;
+    private final QwpGorillaEncoder gorillaEncoder = new QwpGorillaEncoder();
+    private QwpBufferWriter buffer;
     private byte flags;
     private NativeBufferWriter ownedBuffer;
 
-    public IlpV4WebSocketEncoder() {
+    public QwpWebSocketEncoder() {
         this.ownedBuffer = new NativeBufferWriter();
         this.buffer = ownedBuffer;
         this.flags = 0;
     }
 
-    public IlpV4WebSocketEncoder(int bufferSize) {
+    public QwpWebSocketEncoder(int bufferSize) {
         this.ownedBuffer = new NativeBufferWriter(bufferSize);
         this.buffer = ownedBuffer;
         this.flags = 0;
@@ -92,7 +92,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * @param useSchemaRef whether to use schema reference mode
      * @return the number of bytes written
      */
-    public int encode(IlpV4TableBuffer tableBuffer, boolean useSchemaRef) {
+    public int encode(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
         buffer.reset();
 
         // Write message header with placeholder for payload length
@@ -123,7 +123,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * @return the number of bytes written
      */
     public int encodeWithDeltaDict(
-            IlpV4TableBuffer tableBuffer,
+            QwpTableBuffer tableBuffer,
             GlobalSymbolDictionary globalDict,
             int confirmedMaxId,
             int batchMaxId,
@@ -167,10 +167,10 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
     /**
      * Returns the underlying buffer.
      * <p>
-     * If an external buffer was set via {@link #setBuffer(IlpBufferWriter)},
+     * If an external buffer was set via {@link #setBuffer(QwpBufferWriter)},
      * that buffer is returned. Otherwise, returns the internal buffer.
      */
-    public IlpBufferWriter getBuffer() {
+    public QwpBufferWriter getBuffer() {
         return buffer;
     }
 
@@ -218,7 +218,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      *
      * @param externalBuffer the external buffer to use, or null to use internal buffer
      */
-    public void setBuffer(IlpBufferWriter externalBuffer) {
+    public void setBuffer(QwpBufferWriter externalBuffer) {
         this.buffer = externalBuffer != null ? externalBuffer : ownedBuffer;
     }
 
@@ -273,7 +273,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
     /**
      * Encodes a single column.
      */
-    private void encodeColumn(IlpV4TableBuffer.ColumnBuffer col, IlpV4ColumnDef colDef, int rowCount, boolean useGorilla) {
+    private void encodeColumn(QwpTableBuffer.ColumnBuffer col, QwpColumnDef colDef, int rowCount, boolean useGorilla) {
         int valueCount = col.getValueCount();
 
         // Write null bitmap if column is nullable
@@ -351,7 +351,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * Encodes a single column using global symbol IDs for SYMBOL type.
      * All other column types are encoded the same as encodeColumn.
      */
-    private void encodeColumnWithGlobalSymbols(IlpV4TableBuffer.ColumnBuffer col, IlpV4ColumnDef colDef, int rowCount, boolean useGorilla) {
+    private void encodeColumnWithGlobalSymbols(QwpTableBuffer.ColumnBuffer col, QwpColumnDef colDef, int rowCount, boolean useGorilla) {
         int valueCount = col.getValueCount();
 
         // Write null bitmap if column is nullable
@@ -430,8 +430,8 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
     /**
      * Encodes a single table from the buffer.
      */
-    private void encodeTable(IlpV4TableBuffer tableBuffer, boolean useSchemaRef) {
-        IlpV4ColumnDef[] columnDefs = tableBuffer.getColumnDefs();
+    private void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
+        QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
         int rowCount = tableBuffer.getRowCount();
 
         if (useSchemaRef) {
@@ -448,8 +448,8 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         // Write each column's data
         boolean useGorilla = isGorillaEnabled();
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
-            IlpV4TableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
-            IlpV4ColumnDef colDef = columnDefs[i];
+            QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
+            QwpColumnDef colDef = columnDefs[i];
             encodeColumn(col, colDef, rowCount, useGorilla);
         }
     }
@@ -458,8 +458,8 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * Encodes a single table from the buffer using global symbol IDs.
      * This is used with delta dictionary encoding.
      */
-    private void encodeTableWithGlobalSymbols(IlpV4TableBuffer tableBuffer, boolean useSchemaRef) {
-        IlpV4ColumnDef[] columnDefs = tableBuffer.getColumnDefs();
+    private void encodeTableWithGlobalSymbols(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
+        QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
         int rowCount = tableBuffer.getRowCount();
 
         if (useSchemaRef) {
@@ -476,8 +476,8 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         // Write each column's data
         boolean useGorilla = isGorillaEnabled();
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
-            IlpV4TableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
-            IlpV4ColumnDef colDef = columnDefs[i];
+            QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
+            QwpColumnDef colDef = columnDefs[i];
             encodeColumnWithGlobalSymbols(col, colDef, rowCount, useGorilla);
         }
     }
@@ -531,7 +531,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         }
     }
 
-    private void writeDoubleArrayColumn(IlpV4TableBuffer.ColumnBuffer col, int count) {
+    private void writeDoubleArrayColumn(QwpTableBuffer.ColumnBuffer col, int count) {
         byte[] dims = col.getArrayDims();
         int[] shapes = col.getArrayShapes();
         double[] data = col.getDoubleArrayData();
@@ -581,7 +581,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         }
     }
 
-    private void writeLongArrayColumn(IlpV4TableBuffer.ColumnBuffer col, int count) {
+    private void writeLongArrayColumn(QwpTableBuffer.ColumnBuffer col, int count) {
         byte[] dims = col.getArrayDims();
         int[] shapes = col.getArrayShapes();
         long[] data = col.getLongArrayData();
@@ -639,7 +639,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         int totalDataLen = 0;
         for (int i = 0; i < count; i++) {
             if (strings[i] != null) {
-                totalDataLen += IlpBufferWriter.utf8Length(strings[i]);
+                totalDataLen += QwpBufferWriter.utf8Length(strings[i]);
             }
         }
 
@@ -648,7 +648,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         buffer.putInt(0);
         for (int i = 0; i < count; i++) {
             if (strings[i] != null) {
-                runningOffset += IlpBufferWriter.utf8Length(strings[i]);
+                runningOffset += QwpBufferWriter.utf8Length(strings[i]);
             }
             buffer.putInt(runningOffset);
         }
@@ -668,7 +668,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * - Dictionary entries (length-prefixed UTF-8 strings)
      * - Symbol indices (varints, one per value)
      */
-    private void writeSymbolColumn(IlpV4TableBuffer.ColumnBuffer col, int count) {
+    private void writeSymbolColumn(QwpTableBuffer.ColumnBuffer col, int count) {
         // Get symbol data from column buffer
         int[] symbolIndices = col.getSymbolIndices();
         String[] dictionary = col.getSymbolDictionary();
@@ -693,7 +693,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * The dictionary is not included here because it's written at the message level
      * in delta format.
      */
-    private void writeSymbolColumnWithGlobalIds(IlpV4TableBuffer.ColumnBuffer col, int count) {
+    private void writeSymbolColumnWithGlobalIds(QwpTableBuffer.ColumnBuffer col, int count) {
         int[] globalIds = col.getGlobalSymbolIds();
         if (globalIds == null) {
             // Fall back to local indices if no global IDs stored
@@ -712,7 +712,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
     /**
      * Writes a table header with full schema.
      */
-    private void writeTableHeaderWithSchema(String tableName, int rowCount, IlpV4ColumnDef[] columns) {
+    private void writeTableHeaderWithSchema(String tableName, int rowCount, QwpColumnDef[] columns) {
         // Table name
         buffer.putString(tableName);
 
@@ -726,7 +726,7 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
         buffer.putByte(SCHEMA_MODE_FULL);
 
         // Column definitions (name + type for each)
-        for (IlpV4ColumnDef col : columns) {
+        for (QwpColumnDef col : columns) {
             buffer.putString(col.getName());
             buffer.putByte(col.getWireTypeCode());
         }
@@ -760,12 +760,12 @@ public class IlpV4WebSocketEncoder implements QuietCloseable {
      * Otherwise, falls back to uncompressed encoding.
      */
     private void writeTimestampColumn(long[] values, int count, boolean useGorilla) {
-        if (useGorilla && count > 2 && IlpV4GorillaEncoder.canUseGorilla(values, count)) {
+        if (useGorilla && count > 2 && QwpGorillaEncoder.canUseGorilla(values, count)) {
             // Write Gorilla encoding flag
             buffer.putByte(ENCODING_GORILLA);
 
             // Calculate size needed and ensure buffer has capacity
-            int encodedSize = IlpV4GorillaEncoder.calculateEncodedSize(values, count);
+            int encodedSize = QwpGorillaEncoder.calculateEncodedSize(values, count);
             buffer.ensureCapacity(encodedSize);
 
             // Encode timestamps to buffer

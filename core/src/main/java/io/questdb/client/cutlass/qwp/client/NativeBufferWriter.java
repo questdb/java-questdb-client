@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.client;
+package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
@@ -36,7 +36,7 @@ import io.questdb.client.std.Unsafe;
  * <p>
  * All multi-byte values are written in little-endian format unless otherwise specified.
  */
-public class NativeBufferWriter implements IlpBufferWriter, QuietCloseable {
+public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
 
     private static final int DEFAULT_CAPACITY = 8192;
 

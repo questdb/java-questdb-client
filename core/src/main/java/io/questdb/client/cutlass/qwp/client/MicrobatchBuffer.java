@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.client;
+package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
@@ -35,7 +35,7 @@ import java.util.concurrent.TimeUnit;
  * A buffer for accumulating ILP data into microbatches before sending.
  * <p>
  * This class implements a state machine for buffer lifecycle management in the
- * double-buffering scheme used by {@link IlpV4WebSocketSender}:
+ * double-buffering scheme used by {@link QwpWebSocketSender}:
  * <pre>
  * Buffer States:
  * ┌─────────────┐    seal()     ┌─────────────┐    markSending()  ┌─────────────┐

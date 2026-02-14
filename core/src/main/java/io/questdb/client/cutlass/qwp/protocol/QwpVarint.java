@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.ilpv4.protocol;
+package io.questdb.client.cutlass.qwp.protocol;
 
 import io.questdb.client.std.Unsafe;
 
@@ -38,7 +38,7 @@ import io.questdb.client.std.Unsafe;
  * <p>
  * This implementation is designed for zero-allocation on hot paths.
  */
-public final class IlpV4Varint {
+public final class QwpVarint {
 
     /**
      * Maximum number of bytes needed to encode a 64-bit varint.
@@ -56,7 +56,7 @@ public final class IlpV4Varint {
      */
     private static final int DATA_MASK = 0x7F;
 
-    private IlpV4Varint() {
+    private QwpVarint() {
         // utility class
     }
 
