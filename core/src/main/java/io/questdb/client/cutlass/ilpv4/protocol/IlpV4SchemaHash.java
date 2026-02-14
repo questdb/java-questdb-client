@@ -29,8 +29,6 @@ import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.DirectUtf8Sequence;
 import io.questdb.client.std.str.Utf8Sequence;
 
-import java.nio.charset.StandardCharsets;
-
 /**
  * XXHash64 implementation for schema hashing in ILP v4 protocol.
  * <p>

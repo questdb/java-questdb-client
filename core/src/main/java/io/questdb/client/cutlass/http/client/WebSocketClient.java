@@ -29,8 +29,6 @@ import io.questdb.client.cutlass.ilpv4.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.ilpv4.websocket.WebSocketFrameParser;
 import io.questdb.client.cutlass.ilpv4.websocket.WebSocketHandshake;
 import io.questdb.client.cutlass.ilpv4.websocket.WebSocketOpcode;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import io.questdb.client.network.IOOperation;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.Socket;
@@ -42,7 +40,8 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Rnd;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
-import io.questdb.client.std.str.Utf8String;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;

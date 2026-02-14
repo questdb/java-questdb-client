@@ -24,7 +24,6 @@
 
 package io.questdb.client.cutlass.ilpv4.client;
 
-import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 
 import java.nio.charset.StandardCharsets;

@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.http.client;
 import io.questdb.client.cutlass.ilpv4.websocket.WebSocketFrameWriter;
 import io.questdb.client.cutlass.ilpv4.websocket.WebSocketOpcode;
 import io.questdb.client.cutlass.ilpv4.client.IlpBufferWriter;
+import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.QuietCloseable;
@@ -137,7 +138,7 @@ public class WebSocketSendBuffer implements IlpBufferWriter, QuietCloseable {
                     .put(maxBufferSize)
                     .put(']');
         }
-        int newCapacity = (int) Math.min(
+        int newCapacity = Math.min(
                 Numbers.ceilPow2((int) requiredCapacity),
                 maxBufferSize
         );
