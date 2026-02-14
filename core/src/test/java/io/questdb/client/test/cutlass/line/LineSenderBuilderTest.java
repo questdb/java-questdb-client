@@ -338,7 +338,7 @@ public class LineSenderBuilderTest {
     @Test
     public void testMaxRequestBufferSizeCannotBeLessThanDefault() throws Exception {
         assertMemoryLeak(() -> assertThrows("maximum buffer capacity cannot be less than initial buffer capacity [maximumBufferCapacity=65535, initialBufferCapacity=65536]",
-                Sender.builder(Sender.Transport.HTTP).address("localhost:1").maxBufferCapacity(65535)));
+                () -> Sender.builder(Sender.Transport.HTTP).address("localhost:1").maxBufferCapacity(65535)));
     }
 
     @Test
@@ -350,13 +350,13 @@ public class LineSenderBuilderTest {
     @Test
     public void testMaxRetriesNotSupportedForTcp() throws Exception {
         assertMemoryLeak(() -> assertThrows("retrying is not supported for TCP protocol",
-                Sender.builder(Sender.Transport.TCP).address(LOCALHOST).retryTimeoutMillis(100)));
+                () -> Sender.builder(Sender.Transport.TCP).address(LOCALHOST).retryTimeoutMillis(100)));
     }
 
     @Test
     public void testMinRequestThroughputCannotBeNegative() throws Exception {
         assertMemoryLeak(() -> assertThrows("minimum request throughput must not be negative [minRequestThroughput=-100]",
-                Sender.builder(Sender.Transport.HTTP).address(LOCALHOST).minRequestThroughput(-100)));
+                () -> Sender.builder(Sender.Transport.HTTP).address(LOCALHOST).minRequestThroughput(-100)));
     }
 
     @Test
