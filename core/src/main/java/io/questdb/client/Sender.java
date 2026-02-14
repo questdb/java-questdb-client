@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.line.LineTcpSenderV3;
 import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.cutlass.line.tcp.DelegatingTlsChannel;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
+import io.questdb.client.cutlass.ilpv4.client.IlpV4WebSocketSender;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
@@ -144,7 +145,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @return Builder object to create a new Sender instance.
      */
     static LineSenderBuilder builder(Transport transport) {
-        return new LineSenderBuilder(transport == Transport.HTTP ? LineSenderBuilder.PROTOCOL_HTTP : LineSenderBuilder.PROTOCOL_TCP);
+        int protocol;
+        switch (transport) {
+            case HTTP:
+                protocol = LineSenderBuilder.PROTOCOL_HTTP;
+                break;
+            case TCP:
+                protocol = LineSenderBuilder.PROTOCOL_TCP;
+                break;
+            case WEBSOCKET:
+                protocol = LineSenderBuilder.PROTOCOL_WEBSOCKET;
+                break;
+            default:
+                throw new LineSenderException("unknown transport: " + transport);
+        }
+        return new LineSenderBuilder(protocol);
     }
 
     /**
@@ -461,7 +476,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * and for use-cases where HTTP transport is not suitable, when communicating with a QuestDB server over a high-latency
          * network
          */
-        TCP
+        TCP,
+
+        /**
+         * Use WebSocket transport to communicate with a QuestDB server.
+         * <p>
+         * WebSocket transport uses the ILP v4 binary protocol for efficient data ingestion.
+         * It supports both synchronous and asynchronous modes with flow control.
+         */
+        WEBSOCKET
     }
 
     /**
@@ -522,6 +545,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PARAMETER_NOT_SET_EXPLICITLY = -1;
         private static final int PROTOCOL_HTTP = 1;
         private static final int PROTOCOL_TCP = 0;
+        private static final int PROTOCOL_WEBSOCKET = 2;
+        private static final int DEFAULT_WEBSOCKET_PORT = 9000;
+        private static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 8;
+        private static final int DEFAULT_SEND_QUEUE_CAPACITY = 16;
+        private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 500;
+        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 1024 * 1024; // 1MB
+        private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
@@ -568,6 +598,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private char[] trustStorePassword;
         private String trustStorePath;
         private String username;
+        // WebSocket-specific fields
+        private int inFlightWindowSize = PARAMETER_NOT_SET_EXPLICITLY;
+        private int sendQueueCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean asyncMode = false;
+        private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
 
         private LineSenderBuilder() {
 
@@ -734,6 +769,47 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Set the maximum number of bytes per batch before auto-flushing.
+         * <br>
+         * This is only used when communicating over WebSocket transport.
+         * <br>
+         * Default value is 1MB.
+         *
+         * @param bytes maximum bytes per batch
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder autoFlushBytes(int bytes) {
+            if (this.autoFlushBytes != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("auto flush bytes was already configured")
+                        .put("[bytes=").put(this.autoFlushBytes).put("]");
+            }
+            if (bytes < 0) {
+                throw new LineSenderException("auto flush bytes cannot be negative")
+                        .put("[bytes=").put(bytes).put("]");
+            }
+            this.autoFlushBytes = bytes;
+            return this;
+        }
+
+        /**
+         * Enable asynchronous mode for WebSocket transport.
+         * <br>
+         * In async mode, rows are batched and sent asynchronously with flow control.
+         * This provides higher throughput at the cost of more complex error handling.
+         * <br>
+         * This is only used when communicating over WebSocket transport.
+         * <br>
+         * Default is synchronous mode (false).
+         *
+         * @param enabled whether to enable async mode
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder asyncMode(boolean enabled) {
+            this.asyncMode = enabled;
+            return this;
+        }
+
+        /**
          * Configure capacity of an internal buffer.
          * <p>
          * When communicating over HTTP protocol this buffer size is treated as the initial buffer capacity. Buffer can
@@ -789,6 +865,39 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 return AbstractLineHttpSender.createLineSender(hosts, ports, httpPath, httpClientConfiguration, tlsConfig, actualAutoFlushRows, httpToken,
                         username, password, maxNameLength, actualMaxRetriesNanos, maxBackoffMillis, actualMinRequestThroughput, actualAutoFlushIntervalMillis, protocolVersion);
+            }
+
+            if (protocol == PROTOCOL_WEBSOCKET) {
+                if (hosts.size() != 1 || ports.size() != 1) {
+                    throw new LineSenderException("only a single address (host:port) is supported for WebSocket transport");
+                }
+
+                int actualAutoFlushRows = autoFlushRows == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_ROWS : autoFlushRows;
+                int actualAutoFlushBytes = autoFlushBytes == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_BYTES : autoFlushBytes;
+                long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
+                        ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
+                        : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
+                int actualInFlightWindowSize = inFlightWindowSize == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_IN_FLIGHT_WINDOW_SIZE : inFlightWindowSize;
+                int actualSendQueueCapacity = sendQueueCapacity == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_SEND_QUEUE_CAPACITY : sendQueueCapacity;
+
+                if (asyncMode) {
+                    return IlpV4WebSocketSender.connectAsync(
+                            hosts.getQuick(0),
+                            ports.getQuick(0),
+                            tlsEnabled,
+                            actualAutoFlushRows,
+                            actualAutoFlushBytes,
+                            actualAutoFlushIntervalNanos,
+                            actualInFlightWindowSize,
+                            actualSendQueueCapacity
+                    );
+                } else {
+                    return IlpV4WebSocketSender.connect(
+                            hosts.getQuick(0),
+                            ports.getQuick(0),
+                            tlsEnabled
+                    );
+                }
             }
 
             assert protocol == PROTOCOL_TCP;
@@ -1049,6 +1158,29 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Set the maximum number of batches that can be in-flight awaiting server acknowledgment.
+         * <br>
+         * This is only used when communicating over WebSocket transport with async mode enabled.
+         * <br>
+         * Default value is 8.
+         *
+         * @param size maximum number of in-flight batches
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder inFlightWindowSize(int size) {
+            if (this.inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("in-flight window size was already configured")
+                        .put("[size=").put(this.inFlightWindowSize).put("]");
+            }
+            if (size < 1) {
+                throw new LineSenderException("in-flight window size must be positive")
+                        .put("[size=").put(size).put("]");
+            }
+            this.inFlightWindowSize = size;
+            return this;
+        }
+
+        /**
          * Configures the maximum backoff time between retry attempts when the Sender encounters recoverable errors.
          * <br>
          * This setting is applicable only when communicating over the HTTP transport, and it is illegal to invoke this
@@ -1239,6 +1371,29 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
+        /**
+         * Set the capacity of the send queue for batches waiting to be sent.
+         * <br>
+         * This is only used when communicating over WebSocket transport with async mode enabled.
+         * <br>
+         * Default value is 16.
+         *
+         * @param capacity send queue capacity
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder sendQueueCapacity(int capacity) {
+            if (this.sendQueueCapacity != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("send queue capacity was already configured")
+                        .put("[capacity=").put(this.sendQueueCapacity).put("]");
+            }
+            if (capacity < 1) {
+                throw new LineSenderException("send queue capacity must be positive")
+                        .put("[capacity=").put(capacity).put("]");
+            }
+            this.sendQueueCapacity = capacity;
+            return this;
+        }
+
         private static int getValue(CharSequence configurationString, int pos, StringSink sink, String name) {
             if ((pos = ConfStringParser.value(configurationString, pos, sink)) < 0) {
                 throw new LineSenderException("invalid ").put(name).put(" [error=").put(sink).put("]");
@@ -1275,7 +1430,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 maximumBufferCapacity = protocol == PROTOCOL_HTTP ? DEFAULT_MAXIMUM_BUFFER_CAPACITY : bufferCapacity;
             }
             if (ports.size() == 0) {
-                ports.add(protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT : DEFAULT_TCP_PORT);
+                if (protocol == PROTOCOL_HTTP) {
+                    ports.add(DEFAULT_HTTP_PORT);
+                } else if (protocol == PROTOCOL_WEBSOCKET) {
+                    ports.add(DEFAULT_WEBSOCKET_PORT);
+                } else {
+                    ports.add(DEFAULT_TCP_PORT);
+                }
             }
             if (tlsValidationMode == null) {
                 tlsValidationMode = TlsValidationMode.DEFAULT;
@@ -1334,8 +1495,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             } else if (Chars.equals("tcps", sink)) {
                 tcp();
                 tlsEnabled = true;
+            } else if (Chars.equals("ws", sink)) {
+                if (tlsEnabled) {
+                    throw new LineSenderException("cannot use ws protocol when TLS is enabled. use wss instead");
+                }
+                websocket();
+            } else if (Chars.equals("wss", sink)) {
+                websocket();
+                tlsEnabled = true;
             } else {
-                throw new LineSenderException("invalid schema [schema=").put(sink).put(", supported-schemas=[http, https, tcp, tcps]]");
+                throw new LineSenderException("invalid schema [schema=").put(sink).put(", supported-schemas=[http, https, tcp, tcps, ws, wss]]");
             }
 
             String tcpToken = null;
@@ -1557,6 +1726,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             protocol = PROTOCOL_TCP;
         }
 
+        private void websocket() {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("protocol was already configured ")
+                        .put("[protocol=").put(protocol).put("]");
+            }
+            protocol = PROTOCOL_WEBSOCKET;
+        }
+
         private void validateParameters() {
             if (hosts.size() == 0) {
                 throw new LineSenderException("questdb server address not set");
@@ -1616,6 +1793,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (autoFlushIntervalMillis != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("auto flush interval is not supported for TCP protocol");
+                }
+            } else if (protocol == PROTOCOL_WEBSOCKET) {
+                if (privateKey != null) {
+                    throw new LineSenderException("TCP authentication is not supported for WebSocket protocol");
+                }
+                if (httpToken != null || username != null || password != null) {
+                    // TODO: WebSocket auth not yet implemented
+                    throw new LineSenderException("Authentication is not yet supported for WebSocket protocol");
+                }
+                if (inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY && !asyncMode) {
+                    throw new LineSenderException("in-flight window size requires async mode");
+                }
+                if (sendQueueCapacity != PARAMETER_NOT_SET_EXPLICITLY && !asyncMode) {
+                    throw new LineSenderException("send queue capacity requires async mode");
                 }
             } else {
                 throw new LineSenderException("unsupported protocol ")

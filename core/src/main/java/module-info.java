@@ -56,4 +56,7 @@ open module io.questdb.client {
     exports io.questdb.client.cairo.arr;
     exports io.questdb.client.cutlass.line.array;
     exports io.questdb.client.cutlass.line.udp;
+    exports io.questdb.client.cutlass.ilpv4.client;
+    exports io.questdb.client.cutlass.ilpv4.protocol;
+    exports io.questdb.client.cutlass.ilpv4.websocket;
 }
