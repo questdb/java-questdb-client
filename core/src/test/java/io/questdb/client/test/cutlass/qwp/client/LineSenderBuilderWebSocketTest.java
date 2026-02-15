@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.test.cutlass.line;
+package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;

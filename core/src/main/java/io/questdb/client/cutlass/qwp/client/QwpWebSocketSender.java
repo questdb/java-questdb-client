@@ -613,6 +613,21 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    /**
+     * Adds a FLOAT column value to the current row.
+     *
+     * @param columnName the column name
+     * @param value      the float value
+     * @return this sender for method chaining
+     */
+    public QwpWebSocketSender floatColumn(CharSequence columnName, float value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_FLOAT, false);
+        col.addFloat(value);
+        return this;
+    }
+
     @Override
     public QwpWebSocketSender stringColumn(CharSequence columnName, CharSequence value) {
         checkNotClosed();
@@ -1258,7 +1273,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     @Override
-    public Sender longArray(CharSequence name, LongArray array) {
+    public Sender longArray(@NotNull CharSequence name, LongArray array) {
         if (array == null) return this;
         checkNotClosed();
         checkTableSelected();
