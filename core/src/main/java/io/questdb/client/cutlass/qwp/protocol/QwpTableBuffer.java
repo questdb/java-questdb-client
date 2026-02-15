@@ -299,6 +299,7 @@ public class QwpTableBuffer {
         // For Decimal128: two longs per value (128-bit unscaled: high, low)
         // For Decimal256: four longs per value (256-bit unscaled: hh, hl, lh, ll)
         private byte decimalScale = -1;   // Shared scale for column (-1 = not set)
+        private final Decimal256 rescaleTemp = new Decimal256(); // Reusable temp for rescaling
         private long[] decimal64Values;   // Decimal64: one long per value
         private long[] decimal128High;    // Decimal128: high 64 bits
         private long[] decimal128Low;     // Decimal128: low 64 bits
@@ -722,10 +723,10 @@ public class QwpTableBuffer {
 
         /**
          * Adds a Decimal64 value.
-         * All values in a decimal column must share the same scale.
+         * If the value's scale differs from the column's established scale,
+         * the value is automatically rescaled to match.
          *
          * @param value the Decimal64 value to add
-         * @throws LineSenderException if the scale doesn't match previous values
          */
         public void addDecimal64(Decimal64 value) {
             if (value == null || value.isNull()) {
@@ -733,17 +734,26 @@ public class QwpTableBuffer {
                 return;
             }
             ensureCapacity();
-            validateAndSetScale((byte) value.getScale());
-            decimal64Values[valueCount++] = value.getValue();
+            if (decimalScale == -1) {
+                decimalScale = (byte) value.getScale();
+                decimal64Values[valueCount++] = value.getValue();
+            } else if (decimalScale != value.getScale()) {
+                rescaleTemp.ofRaw(value.getValue());
+                rescaleTemp.setScale(value.getScale());
+                rescaleTemp.rescale(decimalScale);
+                decimal64Values[valueCount++] = rescaleTemp.getLl();
+            } else {
+                decimal64Values[valueCount++] = value.getValue();
+            }
             size++;
         }
 
         /**
          * Adds a Decimal128 value.
-         * All values in a decimal column must share the same scale.
+         * If the value's scale differs from the column's established scale,
+         * the value is automatically rescaled to match.
          *
          * @param value the Decimal128 value to add
-         * @throws LineSenderException if the scale doesn't match previous values
          */
         public void addDecimal128(Decimal128 value) {
             if (value == null || value.isNull()) {
@@ -751,7 +761,18 @@ public class QwpTableBuffer {
                 return;
             }
             ensureCapacity();
-            validateAndSetScale((byte) value.getScale());
+            if (decimalScale == -1) {
+                decimalScale = (byte) value.getScale();
+            } else if (decimalScale != value.getScale()) {
+                rescaleTemp.ofRaw(value.getHigh(), value.getLow());
+                rescaleTemp.setScale(value.getScale());
+                rescaleTemp.rescale(decimalScale);
+                decimal128High[valueCount] = rescaleTemp.getLh();
+                decimal128Low[valueCount] = rescaleTemp.getLl();
+                valueCount++;
+                size++;
+                return;
+            }
             decimal128High[valueCount] = value.getHigh();
             decimal128Low[valueCount] = value.getLow();
             valueCount++;
@@ -760,10 +781,10 @@ public class QwpTableBuffer {
 
         /**
          * Adds a Decimal256 value.
-         * All values in a decimal column must share the same scale.
+         * If the value's scale differs from the column's established scale,
+         * the value is automatically rescaled to match.
          *
          * @param value the Decimal256 value to add
-         * @throws LineSenderException if the scale doesn't match previous values
          */
         public void addDecimal256(Decimal256 value) {
             if (value == null || value.isNull()) {
@@ -771,32 +792,20 @@ public class QwpTableBuffer {
                 return;
             }
             ensureCapacity();
-            validateAndSetScale((byte) value.getScale());
-            decimal256Hh[valueCount] = value.getHh();
-            decimal256Hl[valueCount] = value.getHl();
-            decimal256Lh[valueCount] = value.getLh();
-            decimal256Ll[valueCount] = value.getLl();
+            Decimal256 src = value;
+            if (decimalScale == -1) {
+                decimalScale = (byte) value.getScale();
+            } else if (decimalScale != value.getScale()) {
+                rescaleTemp.copyFrom(value);
+                rescaleTemp.rescale(decimalScale);
+                src = rescaleTemp;
+            }
+            decimal256Hh[valueCount] = src.getHh();
+            decimal256Hl[valueCount] = src.getHl();
+            decimal256Lh[valueCount] = src.getLh();
+            decimal256Ll[valueCount] = src.getLl();
             valueCount++;
             size++;
-        }
-
-        /**
-         * Validates that the given scale matches the column's scale.
-         * If this is the first value, sets the column scale.
-         *
-         * @param scale the scale of the value being added
-         * @throws LineSenderException if the scale doesn't match
-         */
-        private void validateAndSetScale(byte scale) {
-            if (decimalScale == -1) {
-                decimalScale = scale;
-            } else if (decimalScale != scale) {
-                throw new LineSenderException(
-                        "decimal scale mismatch in column '" + name + "': expected " +
-                                decimalScale + " but got " + scale +
-                                ". All values in a decimal column must have the same scale."
-                );
-            }
         }
 
         // ==================== Array methods ====================

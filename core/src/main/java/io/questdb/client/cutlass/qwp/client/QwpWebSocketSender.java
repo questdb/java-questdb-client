@@ -596,6 +596,21 @@ public class QwpWebSocketSender implements Sender {
      * @param value      the int value
      * @return this sender for method chaining
      */
+    /**
+     * Adds a BYTE column value to the current row.
+     *
+     * @param columnName the column name
+     * @param value      the byte value
+     * @return this sender for method chaining
+     */
+    public QwpWebSocketSender byteColumn(CharSequence columnName, byte value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_BYTE, false);
+        col.addByte(value);
+        return this;
+    }
+
     public QwpWebSocketSender intColumn(CharSequence columnName, int value) {
         checkNotClosed();
         checkTableSelected();
