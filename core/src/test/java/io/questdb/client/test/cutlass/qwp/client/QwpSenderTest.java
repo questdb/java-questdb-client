@@ -111,10 +111,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                     .charColumn("c", 'A')
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.table(table)
-                    .charColumn("c", '\u00FC') // ü
+                    .charColumn("c", 'ü') // ü
                     .at(2_000_000, ChronoUnit.MICROS);
             sender.table(table)
-                    .charColumn("c", '\u4E2D') // 中
+                    .charColumn("c", '中') // 中
                     .at(3_000_000, ChronoUnit.MICROS);
             sender.flush();
         }
@@ -123,8 +123,8 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         assertSqlEventually(
                 "c\ttimestamp\n" +
                         "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "\u00FC\t1970-01-01T00:00:02.000000000Z\n" +
-                        "\u4E2D\t1970-01-01T00:00:03.000000000Z\n",
+                        "ü\t1970-01-01T00:00:02.000000000Z\n" +
+                        "中\t1970-01-01T00:00:03.000000000Z\n",
                 "SELECT c, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -378,6 +378,166 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testIntToDecimal128() throws Exception {
+        String table = "test_qwp_int_to_decimal128";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(38, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .intColumn("d", 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", 0)
+                    .at(3_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 3);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.00\t1970-01-01T00:00:02.000000000Z\n" +
+                        "0.00\t1970-01-01T00:00:03.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testIntToDecimal16() throws Exception {
+        String table = "test_qwp_int_to_decimal16";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(4, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .intColumn("d", 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", 0)
+                    .at(3_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 3);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.0\t1970-01-01T00:00:02.000000000Z\n" +
+                        "0.0\t1970-01-01T00:00:03.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testIntToDecimal256() throws Exception {
+        String table = "test_qwp_int_to_decimal256";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(76, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .intColumn("d", 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", 0)
+                    .at(3_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 3);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.00\t1970-01-01T00:00:02.000000000Z\n" +
+                        "0.00\t1970-01-01T00:00:03.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testIntToDecimal64() throws Exception {
+        String table = "test_qwp_int_to_decimal64";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(18, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .intColumn("d", Integer.MAX_VALUE)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", 0)
+                    .at(3_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 3);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "2147483647.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.00\t1970-01-01T00:00:02.000000000Z\n" +
+                        "0.00\t1970-01-01T00:00:03.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testIntToDecimal8() throws Exception {
+        String table = "test_qwp_int_to_decimal8";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(2, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .intColumn("d", 5)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", -9)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .intColumn("d", 0)
+                    .at(3_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 3);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "5.0\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-9.0\t1970-01-01T00:00:02.000000000Z\n" +
+                        "0.0\t1970-01-01T00:00:03.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testIntToDouble() throws Exception {
         String table = "test_qwp_int_to_double";
         useTable(table);
@@ -514,6 +674,146 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testLongToDecimal128() throws Exception {
+        String table = "test_qwp_long_to_decimal128";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(38, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .longColumn("d", 1_000_000_000L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .longColumn("d", -1_000_000_000L)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "1000000000.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-1000000000.00\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testLongToDecimal16() throws Exception {
+        String table = "test_qwp_long_to_decimal16";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(4, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .longColumn("d", 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .longColumn("d", -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testLongToDecimal256() throws Exception {
+        String table = "test_qwp_long_to_decimal256";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(76, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .longColumn("d", Long.MAX_VALUE)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .longColumn("d", -1_000_000_000_000L)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "9223372036854775807.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-1000000000000.00\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testLongToDecimal32() throws Exception {
+        String table = "test_qwp_long_to_decimal32";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(6, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .longColumn("d", 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .longColumn("d", -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testLongToDecimal8() throws Exception {
+        String table = "test_qwp_long_to_decimal8";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(2, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .longColumn("d", 5)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .longColumn("d", -9)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "5.0\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-9.0\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testLongToInt() throws Exception {
         String table = "test_qwp_long_to_int";
         useTable(table);
@@ -609,6 +909,174 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testShortToDecimal128() throws Exception {
+        String table = "test_qwp_short_to_decimal128";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(38, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("d", Short.MAX_VALUE)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("d", Short.MIN_VALUE)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "32767.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-32768.00\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testShortToDecimal16() throws Exception {
+        String table = "test_qwp_short_to_decimal16";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(4, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("d", (short) 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("d", (short) -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testShortToDecimal256() throws Exception {
+        String table = "test_qwp_short_to_decimal256";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(76, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("d", (short) 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("d", (short) -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testShortToDecimal32() throws Exception {
+        String table = "test_qwp_short_to_decimal32";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(6, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("d", (short) 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("d", (short) -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testShortToDecimal64() throws Exception {
+        String table = "test_qwp_short_to_decimal64";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(18, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("d", (short) 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("d", (short) -100)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testShortToDecimal8() throws Exception {
+        String table = "test_qwp_short_to_decimal8";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(2, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("d", (short) 5)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("d", (short) -9)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "5.0\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-9.0\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testShortToInt() throws Exception {
         String table = "test_qwp_short_to_int";
         useTable(table);
@@ -674,7 +1142,7 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                     .stringColumn("s", "hello world")
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.table(table)
-                    .stringColumn("s", "non-ascii \u00E4\u00F6\u00FC")
+                    .stringColumn("s", "non-ascii äöü")
                     .at(2_000_000, ChronoUnit.MICROS);
             sender.table(table)
                     .stringColumn("s", "")
@@ -689,7 +1157,7 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         assertSqlEventually(
                 "s\ttimestamp\n" +
                         "hello world\t1970-01-01T00:00:01.000000000Z\n" +
-                        "non-ascii \u00E4\u00F6\u00FC\t1970-01-01T00:00:02.000000000Z\n" +
+                        "non-ascii äöü\t1970-01-01T00:00:02.000000000Z\n" +
                         "\t1970-01-01T00:00:03.000000000Z\n" +
                         "null\t1970-01-01T00:00:04.000000000Z\n",
                 "SELECT s, timestamp FROM " + table + " ORDER BY timestamp");
