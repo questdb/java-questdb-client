@@ -8,15 +8,15 @@
     Maven
     ```
     <dependency>
-        <groupId>org.questdb</groupId>
-        <artifactId>questdb</artifactId>
-        <version>7.4.0</version>
+      <groupId>org.questdb</groupId>
+      <artifactId>questdb-client</artifactId>
+      <version>1.0.1</version>
     </dependency>
     ```
 
     Gradle
     ```
-    compile group: 'org.questdb', name: 'questdb', version: '7.4.0'
+    compile group: 'org.questdb', name: 'questdb-client', version: '1.0.1'
     ```
 - name: ilp-http-auth
   lang: java
@@ -28,15 +28,15 @@
     Maven
     ```
     <dependency>
-        <groupId>org.questdb</groupId>
-        <artifactId>questdb</artifactId>
-        <version>7.4.0</version>
+      <groupId>org.questdb</groupId>
+      <artifactId>questdb-client</artifactId>
+      <version>1.0.1</version>
     </dependency>
     ```
 
     Gradle
     ```
-    compile group: 'org.questdb', name: 'questdb', version: '7.4.0'
+    compile group: 'org.questdb', name: 'questdb-client', version: '1.0.1'
     ```
 - name: ilp
   lang: java
@@ -48,15 +48,15 @@
     Maven
     ```
     <dependency>
-        <groupId>org.questdb</groupId>
-        <artifactId>questdb</artifactId>
-        <version>7.4.0</version>
+      <groupId>org.questdb</groupId>
+      <artifactId>questdb-client</artifactId>
+      <version>1.0.1</version>
     </dependency>
     ```
 
     Gradle
     ```
-    compile group: 'org.questdb', name: 'questdb', version: '7.4.0'
+    compile group: 'org.questdb', name: 'questdb-client', version: '1.0.1'
     ```
 - name: ilp-auth-tls
   lang: java
@@ -68,15 +68,15 @@
     Maven
     ```
     <dependency>
-        <groupId>org.questdb</groupId>
-        <artifactId>questdb</artifactId>
-        <version>7.4.0</version>
+      <groupId>org.questdb</groupId>
+      <artifactId>questdb-client</artifactId>
+      <version>1.0.1</version>
     </dependency>
     ```
 
     Gradle
     ```
-    compile group: 'org.questdb', name: 'questdb', version: '7.4.0'
+    compile group: 'org.questdb', name: 'questdb-client', version: '1.0.1'
     ```
   auth:
     kid: admin
@@ -94,15 +94,15 @@
     Maven
     ```
     <dependency>
-        <groupId>org.questdb</groupId>
-        <artifactId>questdb</artifactId>
-        <version>7.4.0</version>
+      <groupId>org.questdb</groupId>
+      <artifactId>questdb-client</artifactId>
+      <version>1.0.1</version>
     </dependency>
     ```
 
     Gradle
     ```
-    compile group: 'org.questdb', name: 'questdb', version: '7.4.0'
+    compile group: 'org.questdb', name: 'questdb-client', version: '1.0.1'
     ```
   auth:
     kid: testUser1
@@ -120,14 +120,14 @@
     Maven
     ```
     <dependency>
-        <groupId>org.questdb</groupId>
-        <artifactId>questdb</artifactId>
-        <version>7.4.0</version>
+      <groupId>org.questdb</groupId>
+      <artifactId>questdb-client</artifactId>
+      <version>1.0.1</version>
     </dependency>
     ```
 
     Gradle
     ```
-    compile group: 'org.questdb', name: 'questdb', version: '7.4.0'
+    compile group: 'org.questdb', name: 'questdb-client', version: '1.0.1'
     ```
   conf: tcp::addr=localhost:9009;
