@@ -27,13 +27,13 @@
 
     <groupId>org.questdb</groupId>
     <artifactId>client-examples</artifactId>
-    <version>1.0.1-SNAPSHOT</version>
+    <version>1.0.2-SNAPSHOT</version>
     <name>Examples for QuestDB</name>
 
     <dependencies>
         <dependency>
             <groupId>org.questdb</groupId>
-            <artifactId>client</artifactId>
+            <artifactId>questdb-client</artifactId>
             <version>${project.version}</version>
         </dependency>
     </dependencies>

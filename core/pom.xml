@@ -38,9 +38,9 @@
         <test.include>%regex[.*[^o].class]</test.include><!-- exclude module-info.class-->
     </properties>
 
-    <version>1.0.1-SNAPSHOT</version>
+    <version>1.0.2-SNAPSHOT</version>
     <groupId>org.questdb</groupId>
-    <artifactId>client</artifactId>
+    <artifactId>questdb-client</artifactId>
     <packaging>jar</packaging>
 
     <url>https://questdb.io/</url>

@@ -72,6 +72,7 @@ stages:
             lfs: false
             submodules: false
           - template: setup.yaml
+<<<<<<< rd_ci_client
           - bash: |
               BRANCH_NAME="$(Build.SourceBranchName)"
               if [ "$(Build.Reason)" = "PullRequest" ]; then
@@ -87,6 +88,9 @@ stages:
 
               echo "Cloning questdb branch: $TARGET_BRANCH"
               git clone --depth 1 -b "$TARGET_BRANCH" https://github.com/questdb/questdb.git ./questdb
+=======
+          - script: git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
+>>>>>>> main
             displayName: git clone questdb
           - bash: |
               CLIENT_VERSION=$(mvn -f core/pom.xml help:evaluate -Dexpression=project.version -q -DforceStdout)
