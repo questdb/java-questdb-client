@@ -24,27 +24,25 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
-import io.questdb.client.cutlass.qwp.protocol.*;
-
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
-
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import io.questdb.client.std.Chars;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.CharSequenceObjHashMap;
-import io.questdb.client.std.LongHashSet;
-import io.questdb.client.std.ObjList;
+import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.LongHashSet;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -87,81 +85,74 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  */
 public class QwpWebSocketSender implements Sender {
 
-    private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
-
-    private static final int DEFAULT_BUFFER_SIZE = 8192;
-    private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
-    public static final int DEFAULT_AUTO_FLUSH_ROWS = 500;
     public static final int DEFAULT_AUTO_FLUSH_BYTES = 1024 * 1024; // 1MB
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
+    public static final int DEFAULT_AUTO_FLUSH_ROWS = 500;
     public static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = InFlightWindow.DEFAULT_WINDOW_SIZE; // 8
     public static final int DEFAULT_SEND_QUEUE_CAPACITY = WebSocketSendQueue.DEFAULT_QUEUE_CAPACITY; // 16
+    private static final int DEFAULT_BUFFER_SIZE = 8192;
+    private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
+    private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
     private static final String WRITE_PATH = "/write/v4";
-
-    private final String host;
-    private final int port;
-    private final boolean tlsEnabled;
-    private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
-    private QwpTableBuffer currentTableBuffer;
-    private String currentTableName;
-    // Cached column references to avoid repeated hashmap lookups
-    private QwpTableBuffer.ColumnBuffer cachedTimestampColumn;
-    private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
-
-    // Encoder for ILP v4 messages
-    private final QwpWebSocketEncoder encoder;
-
-    // WebSocket client (zero-GC native implementation)
-    private WebSocketClient client;
-    private boolean connected;
-    private boolean closed;
-
-    // Double-buffering for async I/O
-    private MicrobatchBuffer buffer0;
-    private MicrobatchBuffer buffer1;
-    private MicrobatchBuffer activeBuffer;
-    private WebSocketSendQueue sendQueue;
-
-    // Flow control
-    private InFlightWindow inFlightWindow;
-
-    // Auto-flush configuration
-    private final int autoFlushRows;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
-
-    // Flow control configuration
-    private final int inFlightWindowSize;
-    private final int sendQueueCapacity;
-
-    // Configuration
-    private boolean gorillaEnabled = true;
-
-    // Async mode: pending row tracking
-    private int pendingRowCount;
-    private long firstPendingRowTimeNanos;
-
-    // Batch sequence counter (must match server's messageSequence)
-    private long nextBatchSequence = 0;
-
+    // Auto-flush configuration
+    private final int autoFlushRows;
+    // Encoder for ILP v4 messages
+    private final QwpWebSocketEncoder encoder;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
-
-    // Track max global symbol ID used in current batch (for delta calculation)
-    private int currentBatchMaxSymbolId = -1;
-
-    // Track highest symbol ID sent to server (for delta encoding)
-    // Once sent over TCP, server is guaranteed to receive it (or connection dies)
-    private volatile int maxSentSymbolId = -1;
-
+    private final String host;
+    // Flow control configuration
+    private final int inFlightWindowSize;
+    private final int port;
+    private final int sendQueueCapacity;
     // Track schema hashes that have been sent to the server (for schema reference mode)
     // First time we send a schema: full schema. Subsequent times: 8-byte hash reference.
     // Combined key = schemaHash XOR (tableNameHash << 32) to include table name in lookup.
     private final LongHashSet sentSchemaHashes = new LongHashSet();
+    private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
+    private final boolean tlsEnabled;
+    private MicrobatchBuffer activeBuffer;
+    // Double-buffering for async I/O
+    private MicrobatchBuffer buffer0;
+    private MicrobatchBuffer buffer1;
+    // Cached column references to avoid repeated hashmap lookups
+    private QwpTableBuffer.ColumnBuffer cachedTimestampColumn;
+    private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
+    // WebSocket client (zero-GC native implementation)
+    private WebSocketClient client;
+    private boolean closed;
+    private boolean connected;
+    // Track max global symbol ID used in current batch (for delta calculation)
+    private int currentBatchMaxSymbolId = -1;
+    private QwpTableBuffer currentTableBuffer;
+    private String currentTableName;
+    private long firstPendingRowTimeNanos;
+    // Configuration
+    private boolean gorillaEnabled = true;
+    // Flow control
+    private InFlightWindow inFlightWindow;
+    // Track highest symbol ID sent to server (for delta encoding)
+    // Once sent over TCP, server is guaranteed to receive it (or connection dies)
+    private volatile int maxSentSymbolId = -1;
+    // Batch sequence counter (must match server's messageSequence)
+    private long nextBatchSequence = 0;
+    // Async mode: pending row tracking
+    private int pendingRowCount;
+    private WebSocketSendQueue sendQueue;
 
-    private QwpWebSocketSender(String host, int port, boolean tlsEnabled, int bufferSize,
-                                 int autoFlushRows, int autoFlushBytes, long autoFlushIntervalNanos,
-                                 int inFlightWindowSize, int sendQueueCapacity) {
+    private QwpWebSocketSender(
+            String host,
+            int port,
+            boolean tlsEnabled,
+            int bufferSize,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            int sendQueueCapacity
+    ) {
         this.host = host;
         this.port = port;
         this.tlsEnabled = tlsEnabled;
@@ -223,17 +214,17 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Creates a new sender with async mode and custom configuration.
      *
-     * @param host                    server host
-     * @param port                    server HTTP port
-     * @param tlsEnabled              whether to use TLS
-     * @param autoFlushRows           rows per batch (0 = no limit)
-     * @param autoFlushBytes          bytes per batch (0 = no limit)
-     * @param autoFlushIntervalNanos  age before flush in nanos (0 = no limit)
+     * @param host                   server host
+     * @param port                   server HTTP port
+     * @param tlsEnabled             whether to use TLS
+     * @param autoFlushRows          rows per batch (0 = no limit)
+     * @param autoFlushBytes         bytes per batch (0 = no limit)
+     * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
      * @return connected sender
      */
     public static QwpWebSocketSender connectAsync(String host, int port, boolean tlsEnabled,
-                                                    int autoFlushRows, int autoFlushBytes,
-                                                    long autoFlushIntervalNanos) {
+                                                  int autoFlushRows, int autoFlushBytes,
+                                                  long autoFlushIntervalNanos) {
         return connectAsync(host, port, tlsEnabled, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 DEFAULT_IN_FLIGHT_WINDOW_SIZE, DEFAULT_SEND_QUEUE_CAPACITY);
     }
@@ -241,20 +232,26 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Creates a new sender with async mode and full configuration including flow control.
      *
-     * @param host                    server host
-     * @param port                    server HTTP port
-     * @param tlsEnabled              whether to use TLS
-     * @param autoFlushRows           rows per batch (0 = no limit)
-     * @param autoFlushBytes          bytes per batch (0 = no limit)
-     * @param autoFlushIntervalNanos  age before flush in nanos (0 = no limit)
-     * @param inFlightWindowSize      max batches awaiting server ACK (default: 8)
-     * @param sendQueueCapacity       max batches waiting to send (default: 16)
+     * @param host                   server host
+     * @param port                   server HTTP port
+     * @param tlsEnabled             whether to use TLS
+     * @param autoFlushRows          rows per batch (0 = no limit)
+     * @param autoFlushBytes         bytes per batch (0 = no limit)
+     * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
+     * @param inFlightWindowSize     max batches awaiting server ACK (default: 8)
+     * @param sendQueueCapacity      max batches waiting to send (default: 16)
      * @return connected sender
      */
-    public static QwpWebSocketSender connectAsync(String host, int port, boolean tlsEnabled,
-                                                    int autoFlushRows, int autoFlushBytes,
-                                                    long autoFlushIntervalNanos,
-                                                    int inFlightWindowSize, int sendQueueCapacity) {
+    public static QwpWebSocketSender connectAsync(
+            String host,
+            int port,
+            boolean tlsEnabled,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            int sendQueueCapacity
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -304,8 +301,8 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * This allows unit tests to test sender logic without requiring a real server.
      *
-     * @param host              server host (not connected)
-     * @param port              server port (not connected)
+     * @param host               server host (not connected)
+     * @param port               server port (not connected)
      * @param inFlightWindowSize window size: 1 for sync behavior, >1 for async
      * @return unconnected sender
      */
@@ -340,6 +337,711 @@ public class QwpWebSocketSender implements Sender {
                 inFlightWindowSize, sendQueueCapacity
         );
         // Note: does NOT call ensureConnected()
+    }
+
+    @Override
+    public void at(long timestamp, ChronoUnit unit) {
+        checkNotClosed();
+        checkTableSelected();
+        if (unit == ChronoUnit.NANOS) {
+            atNanos(timestamp);
+        } else {
+            long micros = toMicros(timestamp, unit);
+            atMicros(micros);
+        }
+    }
+
+    @Override
+    public void at(Instant timestamp) {
+        checkNotClosed();
+        checkTableSelected();
+        long micros = timestamp.getEpochSecond() * 1_000_000L + timestamp.getNano() / 1000L;
+        atMicros(micros);
+    }
+
+    @Override
+    public void atNow() {
+        checkNotClosed();
+        checkTableSelected();
+        // Server-assigned timestamp - just send the row without designated timestamp
+        sendRow();
+    }
+
+    @Override
+    public QwpWebSocketSender boolColumn(CharSequence columnName, boolean value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_BOOLEAN, false);
+        col.addBoolean(value);
+        return this;
+    }
+
+    @Override
+    public DirectByteSlice bufferView() {
+        throw new LineSenderException("bufferView() is not supported for WebSocket sender");
+    }
+
+    /**
+     * Adds a BYTE column value to the current row.
+     *
+     * @param columnName the column name
+     * @param value      the byte value
+     * @return this sender for method chaining
+     */
+    public QwpWebSocketSender byteColumn(CharSequence columnName, byte value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_BYTE, false);
+        col.addByte(value);
+        return this;
+    }
+
+    @Override
+    public void cancelRow() {
+        checkNotClosed();
+        if (currentTableBuffer != null) {
+            currentTableBuffer.cancelCurrentRow();
+        }
+    }
+
+    /**
+     * Adds a CHAR column value to the current row.
+     * <p>
+     * CHAR is stored as a 2-byte UTF-16 code unit in QuestDB.
+     *
+     * @param columnName the column name
+     * @param value      the character value
+     * @return this sender for method chaining
+     */
+    public QwpWebSocketSender charColumn(CharSequence columnName, char value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_CHAR, false);
+        col.addShort((short) value);
+        return this;
+    }
+
+    @Override
+    public void close() {
+        if (!closed) {
+            closed = true;
+
+            // Flush any remaining data
+            try {
+                if (inFlightWindowSize > 1) {
+                    // Async mode (window > 1): flush accumulated rows in table buffers first
+                    flushPendingRows();
+
+                    if (activeBuffer != null && activeBuffer.hasData()) {
+                        sealAndSwapBuffer();
+                    }
+                    if (sendQueue != null) {
+                        sendQueue.close();
+                    }
+                } else {
+                    // Sync mode (window=1): flush pending rows synchronously
+                    if (pendingRowCount > 0 && client != null && client.isConnected()) {
+                        flushSync();
+                    }
+                }
+            } catch (Exception e) {
+                LOG.error("Error during close: {}", String.valueOf(e));
+            }
+
+            // Close buffers (async mode only, window > 1)
+            if (buffer0 != null) {
+                buffer0.close();
+            }
+            if (buffer1 != null) {
+                buffer1.close();
+            }
+
+            if (client != null) {
+                client.close();
+                client = null;
+            }
+            encoder.close();
+            // Close all table buffers to free off-heap column memory
+            ObjList<CharSequence> keys = tableBuffers.keys();
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                CharSequence key = keys.getQuick(i);
+                if (key != null) {
+                    QwpTableBuffer tb = tableBuffers.get(key);
+                    if (tb != null) {
+                        tb.close();
+                    }
+                }
+            }
+            tableBuffers.clear();
+
+            LOG.info("QwpWebSocketSender closed");
+        }
+    }
+
+    @Override
+    public Sender decimalColumn(CharSequence name, Decimal64 value) {
+        if (value == null || value.isNull()) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL64, true);
+        col.addDecimal64(value);
+        return this;
+    }
+
+    @Override
+    public Sender decimalColumn(CharSequence name, Decimal128 value) {
+        if (value == null || value.isNull()) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL128, true);
+        col.addDecimal128(value);
+        return this;
+    }
+
+    // ==================== Fast-path API for high-throughput generators ====================
+    //
+    // These methods bypass the normal fluent API to avoid per-row overhead:
+    // - No hashmap lookups for column names
+    // - No checkNotClosed()/checkTableSelected() per column
+    // - Direct access to column buffers
+    //
+    // Usage:
+    //   // Setup (once)
+    //   QwpTableBuffer tableBuffer = sender.getTableBuffer("q");
+    //   QwpTableBuffer.ColumnBuffer colSymbol = tableBuffer.getOrCreateColumn("s", TYPE_SYMBOL, true);
+    //   QwpTableBuffer.ColumnBuffer colBid = tableBuffer.getOrCreateColumn("b", TYPE_DOUBLE, false);
+    //
+    //   // Hot path (per row)
+    //   colSymbol.addSymbolWithGlobalId(symbol, sender.getOrAddGlobalSymbol(symbol));
+    //   colBid.addDouble(bid);
+    //   tableBuffer.nextRow();
+    //   sender.incrementPendingRowCount();
+
+    @Override
+    public Sender decimalColumn(CharSequence name, Decimal256 value) {
+        if (value == null || value.isNull()) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
+        col.addDecimal256(value);
+        return this;
+    }
+
+    @Override
+    public Sender decimalColumn(CharSequence name, CharSequence value) {
+        if (value == null || value.length() == 0) return this;
+        checkNotClosed();
+        checkTableSelected();
+        try {
+            java.math.BigDecimal bd = new java.math.BigDecimal(value.toString());
+            Decimal256 decimal = Decimal256.fromBigDecimal(bd);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
+            col.addDecimal256(decimal);
+        } catch (Exception e) {
+            throw new LineSenderException("Failed to parse decimal value: " + value, e);
+        }
+        return this;
+    }
+
+    @Override
+    public Sender doubleArray(@NotNull CharSequence name, double[] values) {
+        if (values == null) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
+        col.addDoubleArray(values);
+        return this;
+    }
+
+    // ==================== Sender interface implementation ====================
+
+    @Override
+    public Sender doubleArray(@NotNull CharSequence name, double[][] values) {
+        if (values == null) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
+        col.addDoubleArray(values);
+        return this;
+    }
+
+    @Override
+    public Sender doubleArray(@NotNull CharSequence name, double[][][] values) {
+        if (values == null) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
+        col.addDoubleArray(values);
+        return this;
+    }
+
+    @Override
+    public Sender doubleArray(CharSequence name, DoubleArray array) {
+        if (array == null) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
+        col.addDoubleArray(array);
+        return this;
+    }
+
+    @Override
+    public QwpWebSocketSender doubleColumn(CharSequence columnName, double value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_DOUBLE, false);
+        col.addDouble(value);
+        return this;
+    }
+
+    /**
+     * Adds an INT column value to the current row.
+     *
+     * @param columnName the column name
+     * @param value      the int value
+     * @return this sender for method chaining
+     */
+
+    /**
+     * Adds a FLOAT column value to the current row.
+     *
+     * @param columnName the column name
+     * @param value      the float value
+     * @return this sender for method chaining
+     */
+    public QwpWebSocketSender floatColumn(CharSequence columnName, float value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_FLOAT, false);
+        col.addFloat(value);
+        return this;
+    }
+
+    @Override
+    public void flush() {
+        checkNotClosed();
+        ensureConnected();
+
+        if (inFlightWindowSize > 1) {
+            // Async mode (window > 1): flush pending rows and wait for ACKs
+            flushPendingRows();
+
+            // Flush any remaining data in the active microbatch buffer
+            if (activeBuffer.hasData()) {
+                sealAndSwapBuffer();
+            }
+
+            // Wait for all pending batches to be sent to the server
+            sendQueue.flush();
+
+            // Wait for all in-flight batches to be acknowledged by the server
+            inFlightWindow.awaitEmpty();
+
+            LOG.debug("Flush complete [totalBatches={}, totalBytes={}, totalAcked={}]", sendQueue.getTotalBatchesSent(), sendQueue.getTotalBytesSent(), inFlightWindow.getTotalAcked());
+        } else {
+            // Sync mode (window=1): flush pending rows and wait for ACKs synchronously
+            flushSync();
+        }
+    }
+
+    /**
+     * Returns the auto-flush byte threshold.
+     */
+    public int getAutoFlushBytes() {
+        return autoFlushBytes;
+    }
+
+    /**
+     * Returns the auto-flush interval in nanoseconds.
+     */
+    public long getAutoFlushIntervalNanos() {
+        return autoFlushIntervalNanos;
+    }
+
+    /**
+     * Returns the auto-flush row threshold.
+     */
+    public int getAutoFlushRows() {
+        return autoFlushRows;
+    }
+
+    /**
+     * Returns the global symbol dictionary.
+     * For testing and encoder integration.
+     */
+    public GlobalSymbolDictionary getGlobalSymbolDictionary() {
+        return globalSymbolDictionary;
+    }
+
+    /**
+     * Returns the in-flight window size.
+     * Window=1 means sync mode, window>1 means async mode.
+     */
+    public int getInFlightWindowSize() {
+        return inFlightWindowSize;
+    }
+
+    /**
+     * Returns the max symbol ID sent to the server.
+     * Once sent over TCP, server is guaranteed to receive it (or connection dies).
+     */
+    public int getMaxSentSymbolId() {
+        return maxSentSymbolId;
+    }
+
+    /**
+     * Registers a symbol in the global dictionary and returns its ID.
+     * For use with fast-path column buffer access.
+     */
+    public int getOrAddGlobalSymbol(String value) {
+        int globalId = globalSymbolDictionary.getOrAddSymbol(value);
+        if (globalId > currentBatchMaxSymbolId) {
+            currentBatchMaxSymbolId = globalId;
+        }
+        return globalId;
+    }
+
+    /**
+     * Returns the send queue capacity.
+     */
+    public int getSendQueueCapacity() {
+        return sendQueueCapacity;
+    }
+
+    /**
+     * Gets or creates a table buffer for direct access.
+     * For high-throughput generators that want to bypass fluent API overhead.
+     */
+    public QwpTableBuffer getTableBuffer(String tableName) {
+        QwpTableBuffer buffer = tableBuffers.get(tableName);
+        if (buffer == null) {
+            buffer = new QwpTableBuffer(tableName);
+            tableBuffers.put(tableName, buffer);
+        }
+        currentTableBuffer = buffer;
+        currentTableName = tableName;
+        return buffer;
+    }
+
+    /**
+     * Increments the pending row count for auto-flush tracking.
+     * Call this after adding a complete row via fast-path API.
+     * Triggers auto-flush if any threshold is exceeded.
+     */
+    public void incrementPendingRowCount() {
+        if (pendingRowCount == 0) {
+            firstPendingRowTimeNanos = System.nanoTime();
+        }
+        pendingRowCount++;
+
+        // Check if any flush threshold is exceeded (same as sendRow())
+        if (shouldAutoFlush()) {
+            if (inFlightWindowSize > 1) {
+                flushPendingRows();
+            } else {
+                // Sync mode (window=1): flush directly with ACK wait
+                flushSync();
+            }
+        }
+    }
+
+    public QwpWebSocketSender intColumn(CharSequence columnName, int value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_INT, false);
+        col.addInt(value);
+        return this;
+    }
+
+    /**
+     * Returns whether async mode is enabled (window size > 1).
+     */
+    public boolean isAsyncMode() {
+        return inFlightWindowSize > 1;
+    }
+
+    /**
+     * Returns whether Gorilla encoding is enabled.
+     */
+    public boolean isGorillaEnabled() {
+        return gorillaEnabled;
+    }
+
+    /**
+     * Adds a LONG256 column value to the current row.
+     *
+     * @param columnName the column name
+     * @param l0         the least significant 64 bits
+     * @param l1         the second 64 bits
+     * @param l2         the third 64 bits
+     * @param l3         the most significant 64 bits
+     * @return this sender for method chaining
+     */
+    public QwpWebSocketSender long256Column(CharSequence columnName, long l0, long l1, long l2, long l3) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_LONG256, true);
+        col.addLong256(l0, l1, l2, l3);
+        return this;
+    }
+
+    @Override
+    public Sender longArray(@NotNull CharSequence name, long[] values) {
+        if (values == null) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
+        col.addLongArray(values);
+        return this;
+    }
+
+    @Override
+    public Sender longArray(@NotNull CharSequence name, long[][] values) {
+        if (values == null) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
+        col.addLongArray(values);
+        return this;
+    }
+
+    @Override
+    public Sender longArray(@NotNull CharSequence name, long[][][] values) {
+        if (values == null) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
+        col.addLongArray(values);
+        return this;
+    }
+
+    @Override
+    public Sender longArray(@NotNull CharSequence name, LongArray array) {
+        if (array == null) return this;
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
+        col.addLongArray(array);
+        return this;
+    }
+
+    @Override
+    public QwpWebSocketSender longColumn(CharSequence columnName, long value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_LONG, false);
+        col.addLong(value);
+        return this;
+    }
+
+    @Override
+    public void reset() {
+        checkNotClosed();
+        if (currentTableBuffer != null) {
+            currentTableBuffer.reset();
+        }
+    }
+
+    /**
+     * Sets whether to use Gorilla timestamp encoding.
+     */
+    public QwpWebSocketSender setGorillaEnabled(boolean enabled) {
+        this.gorillaEnabled = enabled;
+        this.encoder.setGorillaEnabled(enabled);
+        return this;
+    }
+
+    /**
+     * Adds a SHORT column value to the current row.
+     *
+     * @param columnName the column name
+     * @param value      the short value
+     * @return this sender for method chaining
+     */
+    public QwpWebSocketSender shortColumn(CharSequence columnName, short value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_SHORT, false);
+        col.addShort(value);
+        return this;
+    }
+
+    @Override
+    public QwpWebSocketSender stringColumn(CharSequence columnName, CharSequence value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_STRING, true);
+        col.addString(value != null ? value.toString() : null);
+        return this;
+    }
+
+    @Override
+    public QwpWebSocketSender symbol(CharSequence columnName, CharSequence value) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_SYMBOL, true);
+
+        if (value != null) {
+            // Register symbol in global dictionary and track max ID for delta calculation
+            String symbolValue = value.toString();
+            int globalId = globalSymbolDictionary.getOrAddSymbol(symbolValue);
+            if (globalId > currentBatchMaxSymbolId) {
+                currentBatchMaxSymbolId = globalId;
+            }
+            // Store global ID in the column buffer
+            col.addSymbolWithGlobalId(symbolValue, globalId);
+        } else {
+            col.addSymbol(null);
+        }
+        return this;
+    }
+
+    @Override
+    public QwpWebSocketSender table(CharSequence tableName) {
+        checkNotClosed();
+        // Fast path: if table name matches current, skip hashmap lookup
+        if (currentTableName != null && currentTableBuffer != null && Chars.equals(tableName, currentTableName)) {
+            return this;
+        }
+        // Table changed - invalidate cached column references
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
+        currentTableName = tableName.toString();
+        currentTableBuffer = tableBuffers.get(currentTableName);
+        if (currentTableBuffer == null) {
+            currentTableBuffer = new QwpTableBuffer(currentTableName);
+            tableBuffers.put(currentTableName, currentTableBuffer);
+        }
+        // Both modes accumulate rows until flush
+        return this;
+    }
+
+    @Override
+    public QwpWebSocketSender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
+        checkNotClosed();
+        checkTableSelected();
+        if (unit == ChronoUnit.NANOS) {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP_NANOS, true);
+            col.addLong(value);
+        } else {
+            long micros = toMicros(value, unit);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP, true);
+            col.addLong(micros);
+        }
+        return this;
+    }
+
+    @Override
+    public QwpWebSocketSender timestampColumn(CharSequence columnName, Instant value) {
+        checkNotClosed();
+        checkTableSelected();
+        long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP, true);
+        col.addLong(micros);
+        return this;
+    }
+
+    // ==================== Array methods ====================
+
+    /**
+     * Adds a UUID column value to the current row.
+     *
+     * @param columnName the column name
+     * @param lo         the low 64 bits of the UUID
+     * @param hi         the high 64 bits of the UUID
+     * @return this sender for method chaining
+     */
+    public QwpWebSocketSender uuidColumn(CharSequence columnName, long lo, long hi) {
+        checkNotClosed();
+        checkTableSelected();
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_UUID, true);
+        col.addUuid(hi, lo);
+        return this;
+    }
+
+    /**
+     * Adds encoded data to the active microbatch buffer.
+     * Triggers seal and swap if buffer is full.
+     */
+    private void addToMicrobatch(long dataPtr, int length) {
+        // Ensure activeBuffer is ready for writing
+        ensureActiveBufferReady();
+
+        // If current buffer can't hold the data, seal and swap
+        if (activeBuffer.hasData() &&
+                activeBuffer.getBufferPos() + length > activeBuffer.getBufferCapacity()) {
+            sealAndSwapBuffer();
+        }
+
+        // Ensure buffer can hold the data
+        activeBuffer.ensureCapacity(activeBuffer.getBufferPos() + length);
+
+        // Copy data to buffer
+        activeBuffer.write(dataPtr, length);
+        activeBuffer.incrementRowCount();
+    }
+
+    private void atMicros(long timestampMicros) {
+        // Add designated timestamp column (empty name for designated timestamp)
+        // Use cached reference to avoid hashmap lookup per row
+        if (cachedTimestampColumn == null) {
+            cachedTimestampColumn = currentTableBuffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+        }
+        cachedTimestampColumn.addLong(timestampMicros);
+        sendRow();
+    }
+
+    private void atNanos(long timestampNanos) {
+        // Add designated timestamp column (empty name for designated timestamp)
+        // Use cached reference to avoid hashmap lookup per row
+        if (cachedTimestampNanosColumn == null) {
+            cachedTimestampNanosColumn = currentTableBuffer.getOrCreateColumn("", TYPE_TIMESTAMP_NANOS, true);
+        }
+        cachedTimestampNanosColumn.addLong(timestampNanos);
+        sendRow();
+    }
+
+    private void checkNotClosed() {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+    }
+
+    private void checkTableSelected() {
+        if (currentTableBuffer == null) {
+            throw new LineSenderException("table() must be called before adding columns");
+        }
+    }
+
+    /**
+     * Ensures the active buffer is ready for writing (in FILLING state).
+     * If the buffer is in RECYCLED state, resets it. If it's in use, waits for it.
+     */
+    private void ensureActiveBufferReady() {
+        if (activeBuffer.isFilling()) {
+            return; // Already ready
+        }
+
+        if (activeBuffer.isRecycled()) {
+            // Buffer was recycled but not reset - reset it now
+            activeBuffer.reset();
+            return;
+        }
+
+        // Buffer is in use (SEALED or SENDING) - wait for it
+        // Use a while loop to handle spurious wakeups and race conditions with the latch
+        while (activeBuffer.isInUse()) {
+            LOG.debug("Waiting for active buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+            boolean recycled = activeBuffer.awaitRecycled(30, TimeUnit.SECONDS);
+            if (!recycled) {
+                throw new LineSenderException("Timeout waiting for active buffer to be recycled");
+            }
+        }
+
+        // Buffer should now be RECYCLED - reset it
+        if (activeBuffer.isRecycled()) {
+            activeBuffer.reset();
+        }
     }
 
     private void ensureConnected() {
@@ -385,458 +1087,12 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    /**
-     * Returns whether Gorilla encoding is enabled.
-     */
-    public boolean isGorillaEnabled() {
-        return gorillaEnabled;
-    }
+    // ==================== Decimal methods ====================
 
-    /**
-     * Sets whether to use Gorilla timestamp encoding.
-     */
-    public QwpWebSocketSender setGorillaEnabled(boolean enabled) {
-        this.gorillaEnabled = enabled;
-        this.encoder.setGorillaEnabled(enabled);
-        return this;
-    }
-
-    /**
-     * Returns whether async mode is enabled (window size > 1).
-     */
-    public boolean isAsyncMode() {
-        return inFlightWindowSize > 1;
-    }
-
-    /**
-     * Returns the in-flight window size.
-     * Window=1 means sync mode, window>1 means async mode.
-     */
-    public int getInFlightWindowSize() {
-        return inFlightWindowSize;
-    }
-
-    /**
-     * Returns the send queue capacity.
-     */
-    public int getSendQueueCapacity() {
-        return sendQueueCapacity;
-    }
-
-    /**
-     * Returns the auto-flush row threshold.
-     */
-    public int getAutoFlushRows() {
-        return autoFlushRows;
-    }
-
-    /**
-     * Returns the auto-flush byte threshold.
-     */
-    public int getAutoFlushBytes() {
-        return autoFlushBytes;
-    }
-
-    /**
-     * Returns the auto-flush interval in nanoseconds.
-     */
-    public long getAutoFlushIntervalNanos() {
-        return autoFlushIntervalNanos;
-    }
-
-    /**
-     * Returns the global symbol dictionary.
-     * For testing and encoder integration.
-     */
-    public GlobalSymbolDictionary getGlobalSymbolDictionary() {
-        return globalSymbolDictionary;
-    }
-
-    /**
-     * Returns the max symbol ID sent to the server.
-     * Once sent over TCP, server is guaranteed to receive it (or connection dies).
-     */
-    public int getMaxSentSymbolId() {
-        return maxSentSymbolId;
-    }
-
-    // ==================== Fast-path API for high-throughput generators ====================
-    //
-    // These methods bypass the normal fluent API to avoid per-row overhead:
-    // - No hashmap lookups for column names
-    // - No checkNotClosed()/checkTableSelected() per column
-    // - Direct access to column buffers
-    //
-    // Usage:
-    //   // Setup (once)
-    //   QwpTableBuffer tableBuffer = sender.getTableBuffer("q");
-    //   QwpTableBuffer.ColumnBuffer colSymbol = tableBuffer.getOrCreateColumn("s", TYPE_SYMBOL, true);
-    //   QwpTableBuffer.ColumnBuffer colBid = tableBuffer.getOrCreateColumn("b", TYPE_DOUBLE, false);
-    //
-    //   // Hot path (per row)
-    //   colSymbol.addSymbolWithGlobalId(symbol, sender.getOrAddGlobalSymbol(symbol));
-    //   colBid.addDouble(bid);
-    //   tableBuffer.nextRow();
-    //   sender.incrementPendingRowCount();
-
-    /**
-     * Gets or creates a table buffer for direct access.
-     * For high-throughput generators that want to bypass fluent API overhead.
-     */
-    public QwpTableBuffer getTableBuffer(String tableName) {
-        QwpTableBuffer buffer = tableBuffers.get(tableName);
-        if (buffer == null) {
-            buffer = new QwpTableBuffer(tableName);
-            tableBuffers.put(tableName, buffer);
+    private void failExpectedIfNeeded(long expectedSequence, LineSenderException error) {
+        if (inFlightWindow != null && inFlightWindow.getLastError() == null) {
+            inFlightWindow.fail(expectedSequence, error);
         }
-        currentTableBuffer = buffer;
-        currentTableName = tableName;
-        return buffer;
-    }
-
-    /**
-     * Registers a symbol in the global dictionary and returns its ID.
-     * For use with fast-path column buffer access.
-     */
-    public int getOrAddGlobalSymbol(String value) {
-        int globalId = globalSymbolDictionary.getOrAddSymbol(value);
-        if (globalId > currentBatchMaxSymbolId) {
-            currentBatchMaxSymbolId = globalId;
-        }
-        return globalId;
-    }
-
-    /**
-     * Increments the pending row count for auto-flush tracking.
-     * Call this after adding a complete row via fast-path API.
-     * Triggers auto-flush if any threshold is exceeded.
-     */
-    public void incrementPendingRowCount() {
-        if (pendingRowCount == 0) {
-            firstPendingRowTimeNanos = System.nanoTime();
-        }
-        pendingRowCount++;
-
-        // Check if any flush threshold is exceeded (same as sendRow())
-        if (shouldAutoFlush()) {
-            if (inFlightWindowSize > 1) {
-                flushPendingRows();
-            } else {
-                // Sync mode (window=1): flush directly with ACK wait
-                flushSync();
-            }
-        }
-    }
-
-    // ==================== Sender interface implementation ====================
-
-    @Override
-    public QwpWebSocketSender table(CharSequence tableName) {
-        checkNotClosed();
-        // Fast path: if table name matches current, skip hashmap lookup
-        if (currentTableName != null && currentTableBuffer != null && Chars.equals(tableName, currentTableName)) {
-            return this;
-        }
-        // Table changed - invalidate cached column references
-        cachedTimestampColumn = null;
-        cachedTimestampNanosColumn = null;
-        currentTableName = tableName.toString();
-        currentTableBuffer = tableBuffers.get(currentTableName);
-        if (currentTableBuffer == null) {
-            currentTableBuffer = new QwpTableBuffer(currentTableName);
-            tableBuffers.put(currentTableName, currentTableBuffer);
-        }
-        // Both modes accumulate rows until flush
-        return this;
-    }
-
-    @Override
-    public QwpWebSocketSender symbol(CharSequence columnName, CharSequence value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_SYMBOL, true);
-
-        if (value != null) {
-            // Register symbol in global dictionary and track max ID for delta calculation
-            String symbolValue = value.toString();
-            int globalId = globalSymbolDictionary.getOrAddSymbol(symbolValue);
-            if (globalId > currentBatchMaxSymbolId) {
-                currentBatchMaxSymbolId = globalId;
-            }
-            // Store global ID in the column buffer
-            col.addSymbolWithGlobalId(symbolValue, globalId);
-        } else {
-            col.addSymbol(null);
-        }
-        return this;
-    }
-
-    @Override
-    public QwpWebSocketSender boolColumn(CharSequence columnName, boolean value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_BOOLEAN, false);
-        col.addBoolean(value);
-        return this;
-    }
-
-    @Override
-    public QwpWebSocketSender longColumn(CharSequence columnName, long value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_LONG, false);
-        col.addLong(value);
-        return this;
-    }
-
-    /**
-     * Adds an INT column value to the current row.
-     *
-     * @param columnName the column name
-     * @param value      the int value
-     * @return this sender for method chaining
-     */
-    /**
-     * Adds a BYTE column value to the current row.
-     *
-     * @param columnName the column name
-     * @param value      the byte value
-     * @return this sender for method chaining
-     */
-    public QwpWebSocketSender byteColumn(CharSequence columnName, byte value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_BYTE, false);
-        col.addByte(value);
-        return this;
-    }
-
-    public QwpWebSocketSender intColumn(CharSequence columnName, int value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_INT, false);
-        col.addInt(value);
-        return this;
-    }
-
-    @Override
-    public QwpWebSocketSender doubleColumn(CharSequence columnName, double value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_DOUBLE, false);
-        col.addDouble(value);
-        return this;
-    }
-
-    /**
-     * Adds a FLOAT column value to the current row.
-     *
-     * @param columnName the column name
-     * @param value      the float value
-     * @return this sender for method chaining
-     */
-    public QwpWebSocketSender floatColumn(CharSequence columnName, float value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_FLOAT, false);
-        col.addFloat(value);
-        return this;
-    }
-
-    @Override
-    public QwpWebSocketSender stringColumn(CharSequence columnName, CharSequence value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_STRING, true);
-        col.addString(value != null ? value.toString() : null);
-        return this;
-    }
-
-    /**
-     * Adds a SHORT column value to the current row.
-     *
-     * @param columnName the column name
-     * @param value      the short value
-     * @return this sender for method chaining
-     */
-    public QwpWebSocketSender shortColumn(CharSequence columnName, short value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_SHORT, false);
-        col.addShort(value);
-        return this;
-    }
-
-    /**
-     * Adds a CHAR column value to the current row.
-     * <p>
-     * CHAR is stored as a 2-byte UTF-16 code unit in QuestDB.
-     *
-     * @param columnName the column name
-     * @param value      the character value
-     * @return this sender for method chaining
-     */
-    public QwpWebSocketSender charColumn(CharSequence columnName, char value) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_CHAR, false);
-        col.addShort((short) value);
-        return this;
-    }
-
-    /**
-     * Adds a UUID column value to the current row.
-     *
-     * @param columnName the column name
-     * @param lo         the low 64 bits of the UUID
-     * @param hi         the high 64 bits of the UUID
-     * @return this sender for method chaining
-     */
-    public QwpWebSocketSender uuidColumn(CharSequence columnName, long lo, long hi) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_UUID, true);
-        col.addUuid(hi, lo);
-        return this;
-    }
-
-    /**
-     * Adds a LONG256 column value to the current row.
-     *
-     * @param columnName the column name
-     * @param l0         the least significant 64 bits
-     * @param l1         the second 64 bits
-     * @param l2         the third 64 bits
-     * @param l3         the most significant 64 bits
-     * @return this sender for method chaining
-     */
-    public QwpWebSocketSender long256Column(CharSequence columnName, long l0, long l1, long l2, long l3) {
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_LONG256, true);
-        col.addLong256(l0, l1, l2, l3);
-        return this;
-    }
-
-    @Override
-    public QwpWebSocketSender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
-        checkNotClosed();
-        checkTableSelected();
-        if (unit == ChronoUnit.NANOS) {
-            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP_NANOS, true);
-            col.addLong(value);
-        } else {
-            long micros = toMicros(value, unit);
-            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP, true);
-            col.addLong(micros);
-        }
-        return this;
-    }
-
-    @Override
-    public QwpWebSocketSender timestampColumn(CharSequence columnName, Instant value) {
-        checkNotClosed();
-        checkTableSelected();
-        long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_TIMESTAMP, true);
-        col.addLong(micros);
-        return this;
-    }
-
-    @Override
-    public void at(long timestamp, ChronoUnit unit) {
-        checkNotClosed();
-        checkTableSelected();
-        if (unit == ChronoUnit.NANOS) {
-            atNanos(timestamp);
-        } else {
-            long micros = toMicros(timestamp, unit);
-            atMicros(micros);
-        }
-    }
-
-    @Override
-    public void at(Instant timestamp) {
-        checkNotClosed();
-        checkTableSelected();
-        long micros = timestamp.getEpochSecond() * 1_000_000L + timestamp.getNano() / 1000L;
-        atMicros(micros);
-    }
-
-    private void atMicros(long timestampMicros) {
-        // Add designated timestamp column (empty name for designated timestamp)
-        // Use cached reference to avoid hashmap lookup per row
-        if (cachedTimestampColumn == null) {
-            cachedTimestampColumn = currentTableBuffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
-        }
-        cachedTimestampColumn.addLong(timestampMicros);
-        sendRow();
-    }
-
-    private void atNanos(long timestampNanos) {
-        // Add designated timestamp column (empty name for designated timestamp)
-        // Use cached reference to avoid hashmap lookup per row
-        if (cachedTimestampNanosColumn == null) {
-            cachedTimestampNanosColumn = currentTableBuffer.getOrCreateColumn("", TYPE_TIMESTAMP_NANOS, true);
-        }
-        cachedTimestampNanosColumn.addLong(timestampNanos);
-        sendRow();
-    }
-
-    @Override
-    public void atNow() {
-        checkNotClosed();
-        checkTableSelected();
-        // Server-assigned timestamp - just send the row without designated timestamp
-        sendRow();
-    }
-
-    /**
-     * Accumulates the current row.
-     * Both sync and async modes buffer rows until flush (explicit or auto-flush).
-     * The difference is that sync mode flush() blocks until server ACKs.
-     */
-    private void sendRow() {
-        ensureConnected();
-        currentTableBuffer.nextRow();
-
-        // Both modes: accumulate rows, don't encode yet
-        if (pendingRowCount == 0) {
-            firstPendingRowTimeNanos = System.nanoTime();
-        }
-        pendingRowCount++;
-
-        // Check if any flush threshold is exceeded
-        if (shouldAutoFlush()) {
-            if (inFlightWindowSize > 1) {
-                flushPendingRows();
-            } else {
-                // Sync mode (window=1): flush directly with ACK wait
-                flushSync();
-            }
-        }
-    }
-
-    /**
-     * Checks if any auto-flush threshold is exceeded.
-     */
-    private boolean shouldAutoFlush() {
-        if (pendingRowCount <= 0) {
-            return false;
-        }
-        // Row limit
-        if (autoFlushRows > 0 && pendingRowCount >= autoFlushRows) {
-            return true;
-        }
-        // Time limit
-        if (autoFlushIntervalNanos > 0) {
-            long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
-            if (ageNanos >= autoFlushIntervalNanos) {
-                return true;
-            }
-        }
-        // Byte limit is harder to estimate without encoding, skip for now
-        return false;
     }
 
     /**
@@ -916,134 +1172,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Ensures the active buffer is ready for writing (in FILLING state).
-     * If the buffer is in RECYCLED state, resets it. If it's in use, waits for it.
-     */
-    private void ensureActiveBufferReady() {
-        if (activeBuffer.isFilling()) {
-            return; // Already ready
-        }
-
-        if (activeBuffer.isRecycled()) {
-            // Buffer was recycled but not reset - reset it now
-            activeBuffer.reset();
-            return;
-        }
-
-        // Buffer is in use (SEALED or SENDING) - wait for it
-        // Use a while loop to handle spurious wakeups and race conditions with the latch
-        while (activeBuffer.isInUse()) {
-            LOG.debug("Waiting for active buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
-            boolean recycled = activeBuffer.awaitRecycled(30, TimeUnit.SECONDS);
-            if (!recycled) {
-                throw new LineSenderException("Timeout waiting for active buffer to be recycled");
-            }
-        }
-
-        // Buffer should now be RECYCLED - reset it
-        if (activeBuffer.isRecycled()) {
-            activeBuffer.reset();
-        }
-    }
-
-    /**
-     * Adds encoded data to the active microbatch buffer.
-     * Triggers seal and swap if buffer is full.
-     */
-    private void addToMicrobatch(long dataPtr, int length) {
-        // Ensure activeBuffer is ready for writing
-        ensureActiveBufferReady();
-
-        // If current buffer can't hold the data, seal and swap
-        if (activeBuffer.hasData() &&
-            activeBuffer.getBufferPos() + length > activeBuffer.getBufferCapacity()) {
-            sealAndSwapBuffer();
-        }
-
-        // Ensure buffer can hold the data
-        activeBuffer.ensureCapacity(activeBuffer.getBufferPos() + length);
-
-        // Copy data to buffer
-        activeBuffer.write(dataPtr, length);
-        activeBuffer.incrementRowCount();
-    }
-
-    /**
-     * Seals the current buffer and swaps to the other buffer.
-     * Enqueues the sealed buffer for async sending.
-     */
-    private void sealAndSwapBuffer() {
-        if (!activeBuffer.hasData()) {
-            return; // Nothing to send
-        }
-
-        MicrobatchBuffer toSend = activeBuffer;
-        toSend.seal();
-
-        LOG.debug("Sealing buffer [id={}, rows={}, bytes={}]", toSend.getBatchId(), toSend.getRowCount(), toSend.getBufferPos());
-
-        // Swap to the other buffer
-        activeBuffer = (activeBuffer == buffer0) ? buffer1 : buffer0;
-
-        // If the other buffer is still being sent, wait for it
-        // Use a while loop to handle spurious wakeups and race conditions with the latch
-        while (activeBuffer.isInUse()) {
-            LOG.debug("Waiting for buffer recycle [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
-            boolean recycled = activeBuffer.awaitRecycled(30, TimeUnit.SECONDS);
-            if (!recycled) {
-                throw new LineSenderException("Timeout waiting for buffer to be recycled");
-            }
-            LOG.debug("Buffer recycled [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
-        }
-
-        // Reset the new active buffer
-        int stateBeforeReset = activeBuffer.getState();
-        LOG.debug("Resetting buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(stateBeforeReset));
-        activeBuffer.reset();
-
-        // Enqueue the sealed buffer for sending.
-        // If enqueue fails, roll back local state so the same batch can be retried.
-        try {
-            if (!sendQueue.enqueue(toSend)) {
-                throw new LineSenderException("Failed to enqueue buffer for sending");
-            }
-        } catch (LineSenderException e) {
-            activeBuffer = toSend;
-            if (toSend.isSealed()) {
-                toSend.rollbackSealForRetry();
-            }
-            throw e;
-        }
-    }
-
-    @Override
-    public void flush() {
-        checkNotClosed();
-        ensureConnected();
-
-        if (inFlightWindowSize > 1) {
-            // Async mode (window > 1): flush pending rows and wait for ACKs
-            flushPendingRows();
-
-            // Flush any remaining data in the active microbatch buffer
-            if (activeBuffer.hasData()) {
-                sealAndSwapBuffer();
-            }
-
-            // Wait for all pending batches to be sent to the server
-            sendQueue.flush();
-
-            // Wait for all in-flight batches to be acknowledged by the server
-            inFlightWindow.awaitEmpty();
-
-            LOG.debug("Flush complete [totalBatches={}, totalBytes={}, totalAcked={}]", sendQueue.getTotalBatchesSent(), sendQueue.getTotalBytesSent(), inFlightWindow.getTotalAcked());
-        } else {
-            // Sync mode (window=1): flush pending rows and wait for ACKs synchronously
-            flushSync();
-        }
-    }
-
-    /**
      * Flushes pending rows synchronously, blocking until server ACKs.
      * Used in sync mode for simpler, blocking operation.
      */
@@ -1120,6 +1248,125 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Seals the current buffer and swaps to the other buffer.
+     * Enqueues the sealed buffer for async sending.
+     */
+    private void sealAndSwapBuffer() {
+        if (!activeBuffer.hasData()) {
+            return; // Nothing to send
+        }
+
+        MicrobatchBuffer toSend = activeBuffer;
+        toSend.seal();
+
+        LOG.debug("Sealing buffer [id={}, rows={}, bytes={}]", toSend.getBatchId(), toSend.getRowCount(), toSend.getBufferPos());
+
+        // Swap to the other buffer
+        activeBuffer = (activeBuffer == buffer0) ? buffer1 : buffer0;
+
+        // If the other buffer is still being sent, wait for it
+        // Use a while loop to handle spurious wakeups and race conditions with the latch
+        while (activeBuffer.isInUse()) {
+            LOG.debug("Waiting for buffer recycle [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+            boolean recycled = activeBuffer.awaitRecycled(30, TimeUnit.SECONDS);
+            if (!recycled) {
+                throw new LineSenderException("Timeout waiting for buffer to be recycled");
+            }
+            LOG.debug("Buffer recycled [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+        }
+
+        // Reset the new active buffer
+        int stateBeforeReset = activeBuffer.getState();
+        LOG.debug("Resetting buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(stateBeforeReset));
+        activeBuffer.reset();
+
+        // Enqueue the sealed buffer for sending.
+        // If enqueue fails, roll back local state so the same batch can be retried.
+        try {
+            if (!sendQueue.enqueue(toSend)) {
+                throw new LineSenderException("Failed to enqueue buffer for sending");
+            }
+        } catch (LineSenderException e) {
+            activeBuffer = toSend;
+            if (toSend.isSealed()) {
+                toSend.rollbackSealForRetry();
+            }
+            throw e;
+        }
+    }
+
+    // ==================== Helper methods ====================
+
+    /**
+     * Accumulates the current row.
+     * Both sync and async modes buffer rows until flush (explicit or auto-flush).
+     * The difference is that sync mode flush() blocks until server ACKs.
+     */
+    private void sendRow() {
+        ensureConnected();
+        currentTableBuffer.nextRow();
+
+        // Both modes: accumulate rows, don't encode yet
+        if (pendingRowCount == 0) {
+            firstPendingRowTimeNanos = System.nanoTime();
+        }
+        pendingRowCount++;
+
+        // Check if any flush threshold is exceeded
+        if (shouldAutoFlush()) {
+            if (inFlightWindowSize > 1) {
+                flushPendingRows();
+            } else {
+                // Sync mode (window=1): flush directly with ACK wait
+                flushSync();
+            }
+        }
+    }
+
+    /**
+     * Checks if any auto-flush threshold is exceeded.
+     */
+    private boolean shouldAutoFlush() {
+        if (pendingRowCount <= 0) {
+            return false;
+        }
+        // Row limit
+        if (autoFlushRows > 0 && pendingRowCount >= autoFlushRows) {
+            return true;
+        }
+        // Time limit
+        if (autoFlushIntervalNanos > 0) {
+            long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
+            if (ageNanos >= autoFlushIntervalNanos) {
+                return true;
+            }
+        }
+        // Byte limit is harder to estimate without encoding, skip for now
+        return false;
+    }
+
+    private long toMicros(long value, ChronoUnit unit) {
+        switch (unit) {
+            case NANOS:
+                return value / 1000L;
+            case MICROS:
+                return value;
+            case MILLIS:
+                return value * 1000L;
+            case SECONDS:
+                return value * 1_000_000L;
+            case MINUTES:
+                return value * 60_000_000L;
+            case HOURS:
+                return value * 3_600_000_000L;
+            case DAYS:
+                return value * 86_400_000_000L;
+            default:
+                throw new LineSenderException("Unsupported time unit: " + unit);
+        }
+    }
+
+    /**
      * Waits synchronously for an ACK from the server for the specified batch.
      */
     private void waitForAck(long expectedSequence) {
@@ -1186,254 +1433,5 @@ public class QwpWebSocketSender implements Sender {
         LineSenderException timeout = new LineSenderException("Timeout waiting for ACK for batch " + expectedSequence);
         failExpectedIfNeeded(expectedSequence, timeout);
         throw timeout;
-    }
-
-    private void failExpectedIfNeeded(long expectedSequence, LineSenderException error) {
-        if (inFlightWindow != null && inFlightWindow.getLastError() == null) {
-            inFlightWindow.fail(expectedSequence, error);
-        }
-    }
-
-    @Override
-    public DirectByteSlice bufferView() {
-        throw new LineSenderException("bufferView() is not supported for WebSocket sender");
-    }
-
-    @Override
-    public void cancelRow() {
-        checkNotClosed();
-        if (currentTableBuffer != null) {
-            currentTableBuffer.cancelCurrentRow();
-        }
-    }
-
-    @Override
-    public void reset() {
-        checkNotClosed();
-        if (currentTableBuffer != null) {
-            currentTableBuffer.reset();
-        }
-    }
-
-    // ==================== Array methods ====================
-
-    @Override
-    public Sender doubleArray(@NotNull CharSequence name, double[] values) {
-        if (values == null) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
-        col.addDoubleArray(values);
-        return this;
-    }
-
-    @Override
-    public Sender doubleArray(@NotNull CharSequence name, double[][] values) {
-        if (values == null) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
-        col.addDoubleArray(values);
-        return this;
-    }
-
-    @Override
-    public Sender doubleArray(@NotNull CharSequence name, double[][][] values) {
-        if (values == null) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
-        col.addDoubleArray(values);
-        return this;
-    }
-
-    @Override
-    public Sender doubleArray(CharSequence name, DoubleArray array) {
-        if (array == null) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DOUBLE_ARRAY, true);
-        col.addDoubleArray(array);
-        return this;
-    }
-
-    @Override
-    public Sender longArray(@NotNull CharSequence name, long[] values) {
-        if (values == null) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
-        col.addLongArray(values);
-        return this;
-    }
-
-    @Override
-    public Sender longArray(@NotNull CharSequence name, long[][] values) {
-        if (values == null) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
-        col.addLongArray(values);
-        return this;
-    }
-
-    @Override
-    public Sender longArray(@NotNull CharSequence name, long[][][] values) {
-        if (values == null) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
-        col.addLongArray(values);
-        return this;
-    }
-
-    @Override
-    public Sender longArray(@NotNull CharSequence name, LongArray array) {
-        if (array == null) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_LONG_ARRAY, true);
-        col.addLongArray(array);
-        return this;
-    }
-
-    // ==================== Decimal methods ====================
-
-    @Override
-    public Sender decimalColumn(CharSequence name, Decimal64 value) {
-        if (value == null || value.isNull()) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL64, true);
-        col.addDecimal64(value);
-        return this;
-    }
-
-    @Override
-    public Sender decimalColumn(CharSequence name, Decimal128 value) {
-        if (value == null || value.isNull()) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL128, true);
-        col.addDecimal128(value);
-        return this;
-    }
-
-    @Override
-    public Sender decimalColumn(CharSequence name, Decimal256 value) {
-        if (value == null || value.isNull()) return this;
-        checkNotClosed();
-        checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
-        col.addDecimal256(value);
-        return this;
-    }
-
-    @Override
-    public Sender decimalColumn(CharSequence name, CharSequence value) {
-        if (value == null || value.length() == 0) return this;
-        checkNotClosed();
-        checkTableSelected();
-        try {
-            java.math.BigDecimal bd = new java.math.BigDecimal(value.toString());
-            Decimal256 decimal = Decimal256.fromBigDecimal(bd);
-            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
-            col.addDecimal256(decimal);
-        } catch (Exception e) {
-            throw new LineSenderException("Failed to parse decimal value: " + value, e);
-        }
-        return this;
-    }
-
-    // ==================== Helper methods ====================
-
-    private long toMicros(long value, ChronoUnit unit) {
-        switch (unit) {
-            case NANOS:
-                return value / 1000L;
-            case MICROS:
-                return value;
-            case MILLIS:
-                return value * 1000L;
-            case SECONDS:
-                return value * 1_000_000L;
-            case MINUTES:
-                return value * 60_000_000L;
-            case HOURS:
-                return value * 3_600_000_000L;
-            case DAYS:
-                return value * 86_400_000_000L;
-            default:
-                throw new LineSenderException("Unsupported time unit: " + unit);
-        }
-    }
-
-    private void checkNotClosed() {
-        if (closed) {
-            throw new LineSenderException("Sender is closed");
-        }
-    }
-
-    private void checkTableSelected() {
-        if (currentTableBuffer == null) {
-            throw new LineSenderException("table() must be called before adding columns");
-        }
-    }
-
-    @Override
-    public void close() {
-        if (!closed) {
-            closed = true;
-
-            // Flush any remaining data
-            try {
-                if (inFlightWindowSize > 1) {
-                    // Async mode (window > 1): flush accumulated rows in table buffers first
-                    flushPendingRows();
-
-                    if (activeBuffer != null && activeBuffer.hasData()) {
-                        sealAndSwapBuffer();
-                    }
-                    if (sendQueue != null) {
-                        sendQueue.close();
-                    }
-                } else {
-                    // Sync mode (window=1): flush pending rows synchronously
-                    if (pendingRowCount > 0 && client != null && client.isConnected()) {
-                        flushSync();
-                    }
-                }
-            } catch (Exception e) {
-                LOG.error("Error during close: {}", String.valueOf(e));
-            }
-
-            // Close buffers (async mode only, window > 1)
-            if (buffer0 != null) {
-                buffer0.close();
-            }
-            if (buffer1 != null) {
-                buffer1.close();
-            }
-
-            if (client != null) {
-                client.close();
-                client = null;
-            }
-            encoder.close();
-            // Close all table buffers to free off-heap column memory
-            ObjList<CharSequence> keys = tableBuffers.keys();
-            for (int i = 0, n = keys.size(); i < n; i++) {
-                CharSequence key = keys.getQuick(i);
-                if (key != null) {
-                    QwpTableBuffer tb = tableBuffers.get(key);
-                    if (tb != null) {
-                        tb.close();
-                    }
-                }
-            }
-            tableBuffers.clear();
-
-            LOG.info("QwpWebSocketSender closed");
-        }
     }
 }

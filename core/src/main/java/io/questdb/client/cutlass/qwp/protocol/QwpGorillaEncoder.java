@@ -143,7 +143,7 @@ public class QwpGorillaEncoder {
     }
 
     /**
-     * Encodes an array of timestamps to native memory using Gorilla compression.
+     * Encodes timestamps from off-heap memory using Gorilla compression.
      * <p>
      * Format:
      * <pre>
@@ -157,11 +157,11 @@ public class QwpGorillaEncoder {
      *
      * @param destAddress destination address in native memory
      * @param capacity    maximum number of bytes to write
-     * @param timestamps  array of timestamp values
+     * @param srcAddress  source address of contiguous int64 timestamps in native memory
      * @param count       number of timestamps to encode
      * @return number of bytes written
      */
-    public int encodeTimestamps(long destAddress, long capacity, long[] timestamps, int count) {
+    public int encodeTimestamps(long destAddress, long capacity, long srcAddress, int count) {
         if (count == 0) {
             return 0;
         }
@@ -172,7 +172,8 @@ public class QwpGorillaEncoder {
         if (capacity < 8) {
             return 0; // Not enough space
         }
-        Unsafe.getUnsafe().putLong(destAddress, timestamps[0]);
+        long ts0 = Unsafe.getUnsafe().getLong(srcAddress);
+        Unsafe.getUnsafe().putLong(destAddress, ts0);
         pos = 8;
 
         if (count == 1) {
@@ -183,7 +184,8 @@ public class QwpGorillaEncoder {
         if (capacity < pos + 8) {
             return pos; // Not enough space
         }
-        Unsafe.getUnsafe().putLong(destAddress + pos, timestamps[1]);
+        long ts1 = Unsafe.getUnsafe().getLong(srcAddress + 8);
+        Unsafe.getUnsafe().putLong(destAddress + pos, ts1);
         pos += 8;
 
         if (count == 2) {
@@ -192,39 +194,41 @@ public class QwpGorillaEncoder {
 
         // Encode remaining with delta-of-delta
         bitWriter.reset(destAddress + pos, capacity - pos);
-        long prevTs = timestamps[1];
-        long prevDelta = timestamps[1] - timestamps[0];
+        long prevTs = ts1;
+        long prevDelta = ts1 - ts0;
 
         for (int i = 2; i < count; i++) {
-            long delta = timestamps[i] - prevTs;
+            long ts = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8);
+            long delta = ts - prevTs;
             long dod = delta - prevDelta;
             encodeDoD(dod);
             prevDelta = delta;
-            prevTs = timestamps[i];
+            prevTs = ts;
         }
 
         return pos + bitWriter.finish();
     }
 
     /**
-     * Checks if Gorilla encoding can be used for the given timestamps.
+     * Checks if Gorilla encoding can be used for timestamps stored off-heap.
      * <p>
      * Gorilla encoding uses 32-bit signed integers for delta-of-delta values,
      * so it cannot encode timestamps where the delta-of-delta exceeds the
      * 32-bit signed integer range.
      *
-     * @param timestamps array of timestamp values
+     * @param srcAddress source address of contiguous int64 timestamps in native memory
      * @param count      number of timestamps
      * @return true if Gorilla encoding can be used, false otherwise
      */
-    public static boolean canUseGorilla(long[] timestamps, int count) {
+    public static boolean canUseGorilla(long srcAddress, int count) {
         if (count < 3) {
             return true; // No DoD encoding needed for 0, 1, or 2 timestamps
         }
 
-        long prevDelta = timestamps[1] - timestamps[0];
+        long prevDelta = Unsafe.getUnsafe().getLong(srcAddress + 8) - Unsafe.getUnsafe().getLong(srcAddress);
         for (int i = 2; i < count; i++) {
-            long delta = timestamps[i] - timestamps[i - 1];
+            long delta = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8)
+                    - Unsafe.getUnsafe().getLong(srcAddress + (long) (i - 1) * 8);
             long dod = delta - prevDelta;
             if (dod < Integer.MIN_VALUE || dod > Integer.MAX_VALUE) {
                 return false;
@@ -235,16 +239,16 @@ public class QwpGorillaEncoder {
     }
 
     /**
-     * Calculates the encoded size in bytes for Gorilla-encoded timestamps.
+     * Calculates the encoded size in bytes for Gorilla-encoded timestamps stored off-heap.
      * <p>
      * Note: This does NOT include the encoding flag byte. Add 1 byte if
      * the encoding flag is needed.
      *
-     * @param timestamps array of timestamp values
+     * @param srcAddress source address of contiguous int64 timestamps in native memory
      * @param count      number of timestamps
      * @return encoded size in bytes (excluding encoding flag)
      */
-    public static int calculateEncodedSize(long[] timestamps, int count) {
+    public static int calculateEncodedSize(long srcAddress, int count) {
         if (count == 0) {
             return 0;
         }
@@ -262,18 +266,19 @@ public class QwpGorillaEncoder {
         }
 
         // Calculate bits for delta-of-delta encoding
-        long prevTimestamp = timestamps[1];
-        long prevDelta = timestamps[1] - timestamps[0];
+        long prevTimestamp = Unsafe.getUnsafe().getLong(srcAddress + 8);
+        long prevDelta = prevTimestamp - Unsafe.getUnsafe().getLong(srcAddress);
         int totalBits = 0;
 
         for (int i = 2; i < count; i++) {
-            long delta = timestamps[i] - prevTimestamp;
+            long ts = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8);
+            long delta = ts - prevTimestamp;
             long deltaOfDelta = delta - prevDelta;
 
             totalBits += getBitsRequired(deltaOfDelta);
 
             prevDelta = delta;
-            prevTimestamp = timestamps[i];
+            prevTimestamp = ts;
         }
 
         // Round up to bytes

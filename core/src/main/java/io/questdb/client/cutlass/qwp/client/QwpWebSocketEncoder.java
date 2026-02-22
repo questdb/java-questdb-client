@@ -567,38 +567,29 @@ public class QwpWebSocketEncoder implements QuietCloseable {
 
     /**
      * Writes a timestamp column with optional Gorilla compression.
-     * Reads longs from off-heap. For Gorilla encoding, creates a temporary
-     * on-heap array since the Gorilla encoder requires long[].
+     * Reads longs directly from off-heap — zero heap allocation.
      */
     private void writeTimestampColumn(long addr, int count, boolean useGorilla) {
         if (useGorilla && count > 2) {
-            // Extract to temp array for Gorilla encoder (which requires long[])
-            long[] values = new long[count];
-            for (int i = 0; i < count; i++) {
-                values[i] = Unsafe.getUnsafe().getLong(addr + (long) i * 8);
-            }
-
-            if (QwpGorillaEncoder.canUseGorilla(values, count)) {
+            if (QwpGorillaEncoder.canUseGorilla(addr, count)) {
                 buffer.putByte(ENCODING_GORILLA);
-                int encodedSize = QwpGorillaEncoder.calculateEncodedSize(values, count);
+                int encodedSize = QwpGorillaEncoder.calculateEncodedSize(addr, count);
                 buffer.ensureCapacity(encodedSize);
                 int bytesWritten = gorillaEncoder.encodeTimestamps(
                         buffer.getBufferPtr() + buffer.getPosition(),
                         buffer.getCapacity() - buffer.getPosition(),
-                        values,
+                        addr,
                         count
                 );
                 buffer.skip(bytesWritten);
             } else {
                 buffer.putByte(ENCODING_UNCOMPRESSED);
-                // Bulk copy for uncompressed path
                 buffer.putBlockOfBytes(addr, (long) count * 8);
             }
         } else {
             if (useGorilla) {
                 buffer.putByte(ENCODING_UNCOMPRESSED);
             }
-            // Bulk copy for uncompressed timestamps
             buffer.putBlockOfBytes(addr, (long) count * 8);
         }
     }
