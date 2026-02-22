@@ -868,7 +868,7 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected precision loss error but got: " + msg,
-                    msg.contains("loses precision") && msg.contains("123.456") && msg.contains("scale=2")
+                    msg.contains("cannot be converted to") && msg.contains("123.456") && msg.contains("scale=2")
             );
         }
     }
@@ -1204,7 +1204,7 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected precision loss error but got: " + msg,
-                    msg.contains("loses precision") && msg.contains("scale=1")
+                    msg.contains("cannot be converted to") && msg.contains("scale=1")
             );
         }
     }
