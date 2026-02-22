@@ -28,37 +28,26 @@ import io.questdb.client.cutlass.qwp.protocol.QwpColumnDef;
 import io.questdb.client.cutlass.qwp.protocol.QwpGorillaEncoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.QuietCloseable;
+import io.questdb.client.std.Unsafe;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 /**
  * Encodes ILP v4 messages for WebSocket transport.
  * <p>
- * This encoder can write to either an internal {@link NativeBufferWriter} (default)
- * or an external {@link QwpBufferWriter} such as {@link io.questdb.client.cutlass.http.client.WebSocketSendBuffer}.
+ * This encoder reads column data from off-heap {@link io.questdb.client.cutlass.qwp.protocol.OffHeapAppendMemory}
+ * buffers in {@link QwpTableBuffer.ColumnBuffer} and uses bulk {@code putBlockOfBytes} for fixed-width
+ * types where wire format matches native byte order.
  * <p>
- * When using an external buffer, the encoder writes directly to it without intermediate copies,
- * enabling zero-copy WebSocket frame construction.
+ * Types that use bulk copy (native byte-order on wire):
+ * BYTE, SHORT, INT, LONG, FLOAT, DOUBLE, DATE, UUID, LONG256
  * <p>
- * Usage with external buffer (zero-copy):
- * <pre>
- * WebSocketSendBuffer buf = client.getSendBuffer();
- * buf.beginBinaryFrame();
- * encoder.setBuffer(buf);
- * encoder.encode(tableData, false);
- * FrameInfo frame = buf.endBinaryFrame();
- * client.sendFrame(frame);
- * </pre>
+ * Types that require element-by-element encoding:
+ * BOOLEAN (bit-packed on wire), TIMESTAMP (Gorilla), DECIMAL64/128/256 (big-endian on wire)
  */
 public class QwpWebSocketEncoder implements QuietCloseable {
 
-    /**
-     * Encoding flag for Gorilla-encoded timestamps.
-     */
     public static final byte ENCODING_GORILLA = 0x01;
-    /**
-     * Encoding flag for uncompressed timestamps.
-     */
     public static final byte ENCODING_UNCOMPRESSED = 0x00;
     private final QwpGorillaEncoder gorillaEncoder = new QwpGorillaEncoder();
     private QwpBufferWriter buffer;
@@ -85,43 +74,16 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    /**
-     * Encodes a complete ILP v4 message from a table buffer.
-     *
-     * @param tableBuffer  the table buffer containing row data
-     * @param useSchemaRef whether to use schema reference mode
-     * @return the number of bytes written
-     */
     public int encode(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
         buffer.reset();
-
-        // Write message header with placeholder for payload length
         writeHeader(1, 0);
         int payloadStart = buffer.getPosition();
-
-        // Encode table data
         encodeTable(tableBuffer, useSchemaRef);
-
-        // Patch payload length
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
-
         return buffer.getPosition();
     }
 
-    /**
-     * Encodes a complete ILP v4 message with delta symbol dictionary encoding.
-     * <p>
-     * This method sends only new symbols (delta) since the last confirmed watermark,
-     * and uses global symbol IDs instead of per-column local indices.
-     *
-     * @param tableBuffer    the table buffer containing row data
-     * @param globalDict     the global symbol dictionary
-     * @param confirmedMaxId the highest symbol ID the server has confirmed (from ConnectionSymbolState)
-     * @param batchMaxId     the highest symbol ID used in this batch
-     * @param useSchemaRef   whether to use schema reference mode
-     * @return the number of bytes written
-     */
     public int encodeWithDeltaDict(
             QwpTableBuffer tableBuffer,
             GlobalSymbolDictionary globalDict,
@@ -130,101 +92,51 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             boolean useSchemaRef
     ) {
         buffer.reset();
-
-        // Calculate delta range
         int deltaStart = confirmedMaxId + 1;
         int deltaCount = Math.max(0, batchMaxId - confirmedMaxId);
-
-        // Set delta dictionary flag
         byte savedFlags = flags;
         flags |= FLAG_DELTA_SYMBOL_DICT;
-
-        // Write message header with placeholder for payload length
         writeHeader(1, 0);
         int payloadStart = buffer.getPosition();
-
-        // Write symbol delta section (before tables)
         buffer.putVarint(deltaStart);
         buffer.putVarint(deltaCount);
         for (int id = deltaStart; id < deltaStart + deltaCount; id++) {
             String symbol = globalDict.getSymbol(id);
             buffer.putString(symbol);
         }
-
-        // Encode table data (symbol columns will use global IDs)
         encodeTableWithGlobalSymbols(tableBuffer, useSchemaRef);
-
-        // Patch payload length
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
-
-        // Restore flags
         flags = savedFlags;
-
         return buffer.getPosition();
     }
 
-    /**
-     * Returns the underlying buffer.
-     * <p>
-     * If an external buffer was set via {@link #setBuffer(QwpBufferWriter)},
-     * that buffer is returned. Otherwise, returns the internal buffer.
-     */
     public QwpBufferWriter getBuffer() {
         return buffer;
     }
 
-    /**
-     * Returns true if delta symbol dictionary encoding is enabled.
-     */
     public boolean isDeltaSymbolDictEnabled() {
         return (flags & FLAG_DELTA_SYMBOL_DICT) != 0;
     }
 
-    /**
-     * Returns true if Gorilla encoding is enabled.
-     */
     public boolean isGorillaEnabled() {
         return (flags & FLAG_GORILLA) != 0;
     }
 
-    /**
-     * Returns true if currently using an external buffer.
-     */
     public boolean isUsingExternalBuffer() {
         return buffer != ownedBuffer;
     }
 
-    /**
-     * Resets the encoder for a new message.
-     * <p>
-     * If using an external buffer, this only resets the internal state (flags).
-     * The external buffer's reset is the caller's responsibility.
-     * If using the internal buffer, resets both the buffer and internal state.
-     */
     public void reset() {
         if (!isUsingExternalBuffer()) {
             buffer.reset();
         }
     }
 
-    /**
-     * Sets an external buffer for encoding.
-     * <p>
-     * When set, the encoder writes directly to this buffer instead of its internal buffer.
-     * The caller is responsible for managing the external buffer's lifecycle.
-     * <p>
-     * Pass {@code null} to revert to using the internal buffer.
-     *
-     * @param externalBuffer the external buffer to use, or null to use internal buffer
-     */
     public void setBuffer(QwpBufferWriter externalBuffer) {
         this.buffer = externalBuffer != null ? externalBuffer : ownedBuffer;
     }
 
-    /**
-     * Sets the delta symbol dictionary flag.
-     */
     public void setDeltaSymbolDictEnabled(boolean enabled) {
         if (enabled) {
             flags |= FLAG_DELTA_SYMBOL_DICT;
@@ -233,9 +145,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    /**
-     * Sets whether Gorilla timestamp encoding is enabled.
-     */
     public void setGorillaEnabled(boolean enabled) {
         if (enabled) {
             flags |= FLAG_GORILLA;
@@ -244,73 +153,54 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    /**
-     * Writes the ILP v4 message header.
-     *
-     * @param tableCount    number of tables in the message
-     * @param payloadLength payload length (can be 0 if patched later)
-     */
     public void writeHeader(int tableCount, int payloadLength) {
-        // Magic "ILP4"
         buffer.putByte((byte) 'I');
         buffer.putByte((byte) 'L');
         buffer.putByte((byte) 'P');
         buffer.putByte((byte) '4');
-
-        // Version
         buffer.putByte(VERSION_1);
-
-        // Flags
         buffer.putByte(flags);
-
-        // Table count (uint16, little-endian)
         buffer.putShort((short) tableCount);
-
-        // Payload length (uint32, little-endian)
         buffer.putInt(payloadLength);
     }
 
-    /**
-     * Encodes a single column.
-     */
     private void encodeColumn(QwpTableBuffer.ColumnBuffer col, QwpColumnDef colDef, int rowCount, boolean useGorilla) {
         int valueCount = col.getValueCount();
+        long dataAddr = col.getDataAddress();
 
-        // Write null bitmap if column is nullable
         if (colDef.isNullable()) {
-            writeNullBitmapPacked(col.getNullBitmapPacked(), rowCount);
+            writeNullBitmap(col, rowCount);
         }
 
-        // Write column data based on type
         switch (col.getType()) {
             case TYPE_BOOLEAN:
-                writeBooleanColumn(col.getBooleanValues(), valueCount);
+                writeBooleanColumn(dataAddr, valueCount);
                 break;
             case TYPE_BYTE:
-                writeByteColumn(col.getByteValues(), valueCount);
+                buffer.putBlockOfBytes(dataAddr, valueCount);
                 break;
             case TYPE_SHORT:
             case TYPE_CHAR:
-                writeShortColumn(col.getShortValues(), valueCount);
+                buffer.putBlockOfBytes(dataAddr, (long) valueCount * 2);
                 break;
             case TYPE_INT:
-                writeIntColumn(col.getIntValues(), valueCount);
+                buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
                 break;
             case TYPE_LONG:
-                writeLongColumn(col.getLongValues(), valueCount);
+                buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
                 break;
             case TYPE_FLOAT:
-                writeFloatColumn(col.getFloatValues(), valueCount);
+                buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
                 break;
             case TYPE_DOUBLE:
-                writeDoubleColumn(col.getDoubleValues(), valueCount);
+                buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
                 break;
             case TYPE_TIMESTAMP:
             case TYPE_TIMESTAMP_NANOS:
-                writeTimestampColumn(col.getLongValues(), valueCount, useGorilla);
+                writeTimestampColumn(dataAddr, valueCount, useGorilla);
                 break;
             case TYPE_DATE:
-                writeLongColumn(col.getLongValues(), valueCount);
+                buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
                 break;
             case TYPE_STRING:
             case TYPE_VARCHAR:
@@ -320,10 +210,12 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                 writeSymbolColumn(col, valueCount);
                 break;
             case TYPE_UUID:
-                writeUuidColumn(col.getUuidHigh(), col.getUuidLow(), valueCount);
+                // Stored as lo+hi contiguously, matching wire order
+                buffer.putBlockOfBytes(dataAddr, (long) valueCount * 16);
                 break;
             case TYPE_LONG256:
-                writeLong256Column(col.getLong256Values(), valueCount);
+                // Stored as 4 contiguous longs per value
+                buffer.putBlockOfBytes(dataAddr, (long) valueCount * 32);
                 break;
             case TYPE_DOUBLE_ARRAY:
                 writeDoubleArrayColumn(col, valueCount);
@@ -332,77 +224,70 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                 writeLongArrayColumn(col, valueCount);
                 break;
             case TYPE_DECIMAL64:
-                writeDecimal64Column(col.getDecimalScale(), col.getDecimal64Values(), valueCount);
+                writeDecimal64Column(col.getDecimalScale(), dataAddr, valueCount);
                 break;
             case TYPE_DECIMAL128:
-                writeDecimal128Column(col.getDecimalScale(), col.getDecimal128High(), col.getDecimal128Low(), valueCount);
+                writeDecimal128Column(col.getDecimalScale(), dataAddr, valueCount);
                 break;
             case TYPE_DECIMAL256:
-                writeDecimal256Column(col.getDecimalScale(),
-                        col.getDecimal256Hh(), col.getDecimal256Hl(),
-                        col.getDecimal256Lh(), col.getDecimal256Ll(), valueCount);
+                writeDecimal256Column(col.getDecimalScale(), dataAddr, valueCount);
                 break;
             default:
                 throw new IllegalStateException("Unknown column type: " + col.getType());
         }
     }
 
-    /**
-     * Encodes a single column using global symbol IDs for SYMBOL type.
-     * All other column types are encoded the same as encodeColumn.
-     */
     private void encodeColumnWithGlobalSymbols(QwpTableBuffer.ColumnBuffer col, QwpColumnDef colDef, int rowCount, boolean useGorilla) {
         int valueCount = col.getValueCount();
 
-        // Write null bitmap if column is nullable
         if (colDef.isNullable()) {
-            writeNullBitmapPacked(col.getNullBitmapPacked(), rowCount);
+            writeNullBitmap(col, rowCount);
         }
 
-        // For symbol columns, use global IDs; for all others, use standard encoding
         if (col.getType() == TYPE_SYMBOL) {
             writeSymbolColumnWithGlobalIds(col, valueCount);
         } else {
-            // Write column data based on type (same as encodeColumn)
+            // Delegate to standard encoding for all other types
+            long dataAddr = col.getDataAddress();
             switch (col.getType()) {
                 case TYPE_BOOLEAN:
-                    writeBooleanColumn(col.getBooleanValues(), valueCount);
+                    writeBooleanColumn(dataAddr, valueCount);
                     break;
                 case TYPE_BYTE:
-                    writeByteColumn(col.getByteValues(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, valueCount);
                     break;
                 case TYPE_SHORT:
                 case TYPE_CHAR:
-                    writeShortColumn(col.getShortValues(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 2);
                     break;
                 case TYPE_INT:
-                    writeIntColumn(col.getIntValues(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
                     break;
                 case TYPE_LONG:
-                    writeLongColumn(col.getLongValues(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
                     break;
                 case TYPE_FLOAT:
-                    writeFloatColumn(col.getFloatValues(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
                     break;
                 case TYPE_DOUBLE:
-                    writeDoubleColumn(col.getDoubleValues(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
                     break;
                 case TYPE_TIMESTAMP:
                 case TYPE_TIMESTAMP_NANOS:
-                    writeTimestampColumn(col.getLongValues(), valueCount, useGorilla);
+                    writeTimestampColumn(dataAddr, valueCount, useGorilla);
                     break;
                 case TYPE_DATE:
-                    writeLongColumn(col.getLongValues(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
                     break;
                 case TYPE_STRING:
                 case TYPE_VARCHAR:
                     writeStringColumn(col.getStringValues(), valueCount);
                     break;
                 case TYPE_UUID:
-                    writeUuidColumn(col.getUuidHigh(), col.getUuidLow(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 16);
                     break;
                 case TYPE_LONG256:
-                    writeLong256Column(col.getLong256Values(), valueCount);
+                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 32);
                     break;
                 case TYPE_DOUBLE_ARRAY:
                     writeDoubleArrayColumn(col, valueCount);
@@ -411,15 +296,13 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                     writeLongArrayColumn(col, valueCount);
                     break;
                 case TYPE_DECIMAL64:
-                    writeDecimal64Column(col.getDecimalScale(), col.getDecimal64Values(), valueCount);
+                    writeDecimal64Column(col.getDecimalScale(), dataAddr, valueCount);
                     break;
                 case TYPE_DECIMAL128:
-                    writeDecimal128Column(col.getDecimalScale(), col.getDecimal128High(), col.getDecimal128Low(), valueCount);
+                    writeDecimal128Column(col.getDecimalScale(), dataAddr, valueCount);
                     break;
                 case TYPE_DECIMAL256:
-                    writeDecimal256Column(col.getDecimalScale(),
-                            col.getDecimal256Hh(), col.getDecimal256Hl(),
-                            col.getDecimal256Lh(), col.getDecimal256Ll(), valueCount);
+                    writeDecimal256Column(col.getDecimalScale(), dataAddr, valueCount);
                     break;
                 default:
                     throw new IllegalStateException("Unknown column type: " + col.getType());
@@ -427,9 +310,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    /**
-     * Encodes a single table from the buffer.
-     */
     private void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
         QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
         int rowCount = tableBuffer.getRowCount();
@@ -445,7 +325,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, columnDefs);
         }
 
-        // Write each column's data
         boolean useGorilla = isGorillaEnabled();
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
             QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
@@ -454,10 +333,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    /**
-     * Encodes a single table from the buffer using global symbol IDs.
-     * This is used with delta dictionary encoding.
-     */
     private void encodeTableWithGlobalSymbols(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
         QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
         int rowCount = tableBuffer.getRowCount();
@@ -473,7 +348,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, columnDefs);
         }
 
-        // Write each column's data
         boolean useGorilla = isGorillaEnabled();
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
             QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
@@ -483,16 +357,16 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     }
 
     /**
-     * Writes boolean column data (bit-packed).
+     * Writes boolean column data (bit-packed on wire).
+     * Reads individual bytes from off-heap and packs into bits.
      */
-    private void writeBooleanColumn(boolean[] values, int count) {
+    private void writeBooleanColumn(long addr, int count) {
         int packedSize = (count + 7) / 8;
-
         for (int i = 0; i < packedSize; i++) {
             byte b = 0;
             for (int bit = 0; bit < 8; bit++) {
                 int idx = i * 8 + bit;
-                if (idx < count && values[idx]) {
+                if (idx < count && Unsafe.getUnsafe().getByte(addr + idx) != 0) {
                     b |= (1 << bit);
                 }
             }
@@ -500,34 +374,44 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    private void writeByteColumn(byte[] values, int count) {
+    /**
+     * Writes Decimal128 values in big-endian wire format.
+     * Reads hi/lo pairs from off-heap (stored as hi, lo per value).
+     */
+    private void writeDecimal128Column(byte scale, long addr, int count) {
+        buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
-            buffer.putByte(values[i]);
+            long offset = (long) i * 16;
+            long hi = Unsafe.getUnsafe().getLong(addr + offset);
+            long lo = Unsafe.getUnsafe().getLong(addr + offset + 8);
+            buffer.putLongBE(hi);
+            buffer.putLongBE(lo);
         }
     }
 
-    private void writeDecimal128Column(byte scale, long[] high, long[] low, int count) {
+    /**
+     * Writes Decimal256 values in big-endian wire format.
+     * Reads hh/hl/lh/ll quads from off-heap (stored contiguously per value).
+     */
+    private void writeDecimal256Column(byte scale, long addr, int count) {
         buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
-            buffer.putLongBE(high[i]);
-            buffer.putLongBE(low[i]);
+            long offset = (long) i * 32;
+            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + offset));
+            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + offset + 8));
+            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + offset + 16));
+            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + offset + 24));
         }
     }
 
-    private void writeDecimal256Column(byte scale, long[] hh, long[] hl, long[] lh, long[] ll, int count) {
+    /**
+     * Writes Decimal64 values in big-endian wire format.
+     * Reads longs from off-heap.
+     */
+    private void writeDecimal64Column(byte scale, long addr, int count) {
         buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
-            buffer.putLongBE(hh[i]);
-            buffer.putLongBE(hl[i]);
-            buffer.putLongBE(lh[i]);
-            buffer.putLongBE(ll[i]);
-        }
-    }
-
-    private void writeDecimal64Column(byte scale, long[] values, int count) {
-        buffer.putByte(scale);
-        for (int i = 0; i < count; i++) {
-            buffer.putLongBE(values[i]);
+            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + (long) i * 8));
         }
     }
 
@@ -555,32 +439,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    private void writeDoubleColumn(double[] values, int count) {
-        for (int i = 0; i < count; i++) {
-            buffer.putDouble(values[i]);
-        }
-    }
-
-    private void writeFloatColumn(float[] values, int count) {
-        for (int i = 0; i < count; i++) {
-            buffer.putFloat(values[i]);
-        }
-    }
-
-    private void writeIntColumn(int[] values, int count) {
-        for (int i = 0; i < count; i++) {
-            buffer.putInt(values[i]);
-        }
-    }
-
-    private void writeLong256Column(long[] values, int count) {
-        // Flat array: 4 longs per value, little-endian (least significant first)
-        // values layout: [long0, long1, long2, long3] per row
-        for (int i = 0; i < count * 4; i++) {
-            buffer.putLong(values[i]);
-        }
-    }
-
     private void writeLongArrayColumn(QwpTableBuffer.ColumnBuffer col, int count) {
         byte[] dims = col.getArrayDims();
         int[] shapes = col.getArrayShapes();
@@ -605,37 +463,26 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    private void writeLongColumn(long[] values, int count) {
-        for (int i = 0; i < count; i++) {
-            buffer.putLong(values[i]);
-        }
-    }
-
     /**
-     * Writes a null bitmap from bit-packed long array.
+     * Writes a null bitmap from off-heap memory.
+     * On little-endian platforms, the byte layout of the long-packed bitmap
+     * in memory matches the wire format, enabling bulk copy.
      */
-    private void writeNullBitmapPacked(long[] nullsPacked, int count) {
-        int bitmapSize = (count + 7) / 8;
-
-        for (int byteIdx = 0; byteIdx < bitmapSize; byteIdx++) {
-            int longIndex = byteIdx >>> 3;
-            int byteInLong = byteIdx & 7;
-            byte b = (byte) ((nullsPacked[longIndex] >>> (byteInLong * 8)) & 0xFF);
-            buffer.putByte(b);
+    private void writeNullBitmap(QwpTableBuffer.ColumnBuffer col, int rowCount) {
+        long nullAddr = col.getNullBitmapAddress();
+        if (nullAddr != 0) {
+            int bitmapSize = (rowCount + 7) / 8;
+            buffer.putBlockOfBytes(nullAddr, bitmapSize);
+        } else {
+            // Non-nullable column shouldn't reach here, but write zeros as fallback
+            int bitmapSize = (rowCount + 7) / 8;
+            for (int i = 0; i < bitmapSize; i++) {
+                buffer.putByte((byte) 0);
+            }
         }
     }
 
-    private void writeShortColumn(short[] values, int count) {
-        for (int i = 0; i < count; i++) {
-            buffer.putShort(values[i]);
-        }
-    }
-
-    /**
-     * Writes a string column with offset array.
-     */
     private void writeStringColumn(String[] strings, int count) {
-        // Calculate total data length
         int totalDataLen = 0;
         for (int i = 0; i < count; i++) {
             if (strings[i] != null) {
@@ -643,7 +490,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             }
         }
 
-        // Write offset array
         int runningOffset = 0;
         buffer.putInt(0);
         for (int i = 0; i < count; i++) {
@@ -653,7 +499,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             buffer.putInt(runningOffset);
         }
 
-        // Write string data
         for (int i = 0; i < count; i++) {
             if (strings[i] != null) {
                 buffer.putUtf8(strings[i]);
@@ -663,133 +508,98 @@ public class QwpWebSocketEncoder implements QuietCloseable {
 
     /**
      * Writes a symbol column with dictionary.
-     * Format:
-     * - Dictionary length (varint)
-     * - Dictionary entries (length-prefixed UTF-8 strings)
-     * - Symbol indices (varints, one per value)
+     * Reads local symbol indices from off-heap data buffer.
      */
     private void writeSymbolColumn(QwpTableBuffer.ColumnBuffer col, int count) {
-        // Get symbol data from column buffer
-        int[] symbolIndices = col.getSymbolIndices();
+        long dataAddr = col.getDataAddress();
         String[] dictionary = col.getSymbolDictionary();
 
-        // Write dictionary
         buffer.putVarint(dictionary.length);
         for (String symbol : dictionary) {
             buffer.putString(symbol);
         }
 
-        // Write symbol indices (one per non-null value)
         for (int i = 0; i < count; i++) {
-            buffer.putVarint(symbolIndices[i]);
+            int idx = Unsafe.getUnsafe().getInt(dataAddr + (long) i * 4);
+            buffer.putVarint(idx);
         }
     }
 
     /**
      * Writes a symbol column using global IDs (for delta dictionary mode).
-     * Format:
-     * - Global symbol IDs (varints, one per value)
-     * <p>
-     * The dictionary is not included here because it's written at the message level
-     * in delta format.
+     * Reads from auxiliary data buffer if available, otherwise falls back to local indices.
      */
     private void writeSymbolColumnWithGlobalIds(QwpTableBuffer.ColumnBuffer col, int count) {
-        int[] globalIds = col.getGlobalSymbolIds();
-        if (globalIds == null) {
-            // Fall back to local indices if no global IDs stored
-            int[] symbolIndices = col.getSymbolIndices();
+        long auxAddr = col.getAuxDataAddress();
+        if (auxAddr == 0) {
+            // Fall back to local indices
+            long dataAddr = col.getDataAddress();
             for (int i = 0; i < count; i++) {
-                buffer.putVarint(symbolIndices[i]);
+                int idx = Unsafe.getUnsafe().getInt(dataAddr + (long) i * 4);
+                buffer.putVarint(idx);
             }
         } else {
-            // Write global symbol IDs
             for (int i = 0; i < count; i++) {
-                buffer.putVarint(globalIds[i]);
+                int globalId = Unsafe.getUnsafe().getInt(auxAddr + (long) i * 4);
+                buffer.putVarint(globalId);
             }
         }
     }
 
-    /**
-     * Writes a table header with full schema.
-     */
     private void writeTableHeaderWithSchema(String tableName, int rowCount, QwpColumnDef[] columns) {
-        // Table name
         buffer.putString(tableName);
-
-        // Row count (varint)
         buffer.putVarint(rowCount);
-
-        // Column count (varint)
         buffer.putVarint(columns.length);
-
-        // Schema mode: full schema (0x00)
         buffer.putByte(SCHEMA_MODE_FULL);
-
-        // Column definitions (name + type for each)
         for (QwpColumnDef col : columns) {
             buffer.putString(col.getName());
             buffer.putByte(col.getWireTypeCode());
         }
     }
 
-    /**
-     * Writes a table header with schema reference.
-     */
     private void writeTableHeaderWithSchemaRef(String tableName, int rowCount, long schemaHash, int columnCount) {
-        // Table name
         buffer.putString(tableName);
-
-        // Row count (varint)
         buffer.putVarint(rowCount);
-
-        // Column count (varint)
         buffer.putVarint(columnCount);
-
-        // Schema mode: reference (0x01)
         buffer.putByte(SCHEMA_MODE_REFERENCE);
-
-        // Schema hash (8 bytes)
         buffer.putLong(schemaHash);
     }
 
     /**
      * Writes a timestamp column with optional Gorilla compression.
-     * <p>
-     * When Gorilla encoding is enabled and applicable (3+ timestamps with
-     * delta-of-deltas fitting in 32-bit range), uses delta-of-delta compression.
-     * Otherwise, falls back to uncompressed encoding.
+     * Reads longs from off-heap. For Gorilla encoding, creates a temporary
+     * on-heap array since the Gorilla encoder requires long[].
      */
-    private void writeTimestampColumn(long[] values, int count, boolean useGorilla) {
-        if (useGorilla && count > 2 && QwpGorillaEncoder.canUseGorilla(values, count)) {
-            // Write Gorilla encoding flag
-            buffer.putByte(ENCODING_GORILLA);
+    private void writeTimestampColumn(long addr, int count, boolean useGorilla) {
+        if (useGorilla && count > 2) {
+            // Extract to temp array for Gorilla encoder (which requires long[])
+            long[] values = new long[count];
+            for (int i = 0; i < count; i++) {
+                values[i] = Unsafe.getUnsafe().getLong(addr + (long) i * 8);
+            }
 
-            // Calculate size needed and ensure buffer has capacity
-            int encodedSize = QwpGorillaEncoder.calculateEncodedSize(values, count);
-            buffer.ensureCapacity(encodedSize);
-
-            // Encode timestamps to buffer
-            int bytesWritten = gorillaEncoder.encodeTimestamps(
-                    buffer.getBufferPtr() + buffer.getPosition(),
-                    buffer.getCapacity() - buffer.getPosition(),
-                    values,
-                    count
-            );
-            buffer.skip(bytesWritten);
+            if (QwpGorillaEncoder.canUseGorilla(values, count)) {
+                buffer.putByte(ENCODING_GORILLA);
+                int encodedSize = QwpGorillaEncoder.calculateEncodedSize(values, count);
+                buffer.ensureCapacity(encodedSize);
+                int bytesWritten = gorillaEncoder.encodeTimestamps(
+                        buffer.getBufferPtr() + buffer.getPosition(),
+                        buffer.getCapacity() - buffer.getPosition(),
+                        values,
+                        count
+                );
+                buffer.skip(bytesWritten);
+            } else {
+                buffer.putByte(ENCODING_UNCOMPRESSED);
+                // Bulk copy for uncompressed path
+                buffer.putBlockOfBytes(addr, (long) count * 8);
+            }
         } else {
-            // Write uncompressed
             if (useGorilla) {
                 buffer.putByte(ENCODING_UNCOMPRESSED);
             }
-            writeLongColumn(values, count);
-        }
-    }
-
-    private void writeUuidColumn(long[] highBits, long[] lowBits, int count) {
-        // Little-endian: lo first, then hi
-        for (int i = 0; i < count; i++) {
-            buffer.putLong(lowBits[i]);
-            buffer.putLong(highBits[i]);
+            // Bulk copy for uncompressed timestamps
+            buffer.putBlockOfBytes(addr, (long) count * 8);
         }
     }
 }

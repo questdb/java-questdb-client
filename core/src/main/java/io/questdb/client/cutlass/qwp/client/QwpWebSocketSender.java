@@ -1420,6 +1420,17 @@ public class QwpWebSocketSender implements Sender {
                 client = null;
             }
             encoder.close();
+            // Close all table buffers to free off-heap column memory
+            ObjList<CharSequence> keys = tableBuffers.keys();
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                CharSequence key = keys.getQuick(i);
+                if (key != null) {
+                    QwpTableBuffer tb = tableBuffers.get(key);
+                    if (tb != null) {
+                        tb.close();
+                    }
+                }
+            }
             tableBuffers.clear();
 
             LOG.info("QwpWebSocketSender closed");

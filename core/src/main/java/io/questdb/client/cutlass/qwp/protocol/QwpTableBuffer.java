@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,8 +33,11 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Decimals;
+import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.Vect;
 
 import java.util.Arrays;
 
@@ -43,10 +46,11 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 /**
  * Buffers rows for a single table in columnar format.
  * <p>
- * This buffer accumulates row data column by column, allowing efficient
- * encoding to the ILP v4 wire format.
+ * Fixed-width column data is stored off-heap via {@link OffHeapAppendMemory} for zero-GC
+ * buffering and bulk copy to network buffers. Variable-width data (strings, symbol
+ * dictionaries, arrays) remains on-heap.
  */
-public class QwpTableBuffer {
+public class QwpTableBuffer implements QuietCloseable {
 
     private final String tableName;
     private final ObjList<ColumnBuffer> columns;
@@ -70,24 +74,43 @@ public class QwpTableBuffer {
     }
 
     /**
-     * Returns the table name.
+     * Cancels the current in-progress row.
+     * <p>
+     * This removes any column values added since the last {@link #nextRow()} call.
+     * If no values have been added for the current row, this is a no-op.
      */
-    public String getTableName() {
-        return tableName;
+    public void cancelCurrentRow() {
+        // Reset sequential access cursor
+        columnAccessCursor = 0;
+        // Truncate each column back to the committed row count
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            ColumnBuffer col = fastColumns[i];
+            col.truncateTo(rowCount);
+        }
     }
 
     /**
-     * Returns the number of rows buffered.
+     * Clears the buffer completely, including column definitions.
+     * Frees all off-heap memory.
      */
-    public int getRowCount() {
-        return rowCount;
+    public void clear() {
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            columns.get(i).close();
+        }
+        columns.clear();
+        columnNameToIndex.clear();
+        fastColumns = null;
+        columnAccessCursor = 0;
+        rowCount = 0;
+        schemaHash = 0;
+        schemaHashComputed = false;
+        columnDefsCacheValid = false;
+        cachedColumnDefs = null;
     }
 
-    /**
-     * Returns the number of columns.
-     */
-    public int getColumnCount() {
-        return columns.size();
+    @Override
+    public void close() {
+        clear();
     }
 
     /**
@@ -95,6 +118,13 @@ public class QwpTableBuffer {
      */
     public ColumnBuffer getColumn(int index) {
         return columns.get(index);
+    }
+
+    /**
+     * Returns the number of columns.
+     */
+    public int getColumnCount() {
+        return columns.size();
     }
 
     /**
@@ -167,38 +197,10 @@ public class QwpTableBuffer {
     }
 
     /**
-     * Advances to the next row.
-     * <p>
-     * This should be called after all column values for the current row have been set.
+     * Returns the number of rows buffered.
      */
-    public void nextRow() {
-        // Reset sequential access cursor for the next row
-        columnAccessCursor = 0;
-        // Ensure all columns have the same row count
-        for (int i = 0, n = columns.size(); i < n; i++) {
-            ColumnBuffer col = fastColumns[i];
-            // If column wasn't set for this row, add a null
-            while (col.size < rowCount + 1) {
-                col.addNull();
-            }
-        }
-        rowCount++;
-    }
-
-    /**
-     * Cancels the current in-progress row.
-     * <p>
-     * This removes any column values added since the last {@link #nextRow()} call.
-     * If no values have been added for the current row, this is a no-op.
-     */
-    public void cancelCurrentRow() {
-        // Reset sequential access cursor
-        columnAccessCursor = 0;
-        // Truncate each column back to the committed row count
-        for (int i = 0, n = columns.size(); i < n; i++) {
-            ColumnBuffer col = fastColumns[i];
-            col.truncateTo(rowCount);
-        }
+    public int getRowCount() {
+        return rowCount;
     }
 
     /**
@@ -218,7 +220,33 @@ public class QwpTableBuffer {
     }
 
     /**
-     * Resets the buffer for reuse.
+     * Returns the table name.
+     */
+    public String getTableName() {
+        return tableName;
+    }
+
+    /**
+     * Advances to the next row.
+     * <p>
+     * This should be called after all column values for the current row have been set.
+     */
+    public void nextRow() {
+        // Reset sequential access cursor for the next row
+        columnAccessCursor = 0;
+        // Ensure all columns have the same row count
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            ColumnBuffer col = fastColumns[i];
+            // If column wasn't set for this row, add a null
+            while (col.size < rowCount + 1) {
+                col.addNull();
+            }
+        }
+        rowCount++;
+    }
+
+    /**
+     * Resets the buffer for reuse. Keeps column definitions and allocated memory.
      */
     public void reset() {
         for (int i = 0, n = columns.size(); i < n; i++) {
@@ -229,569 +257,146 @@ public class QwpTableBuffer {
     }
 
     /**
-     * Clears the buffer completely, including column definitions.
+     * Returns the element size in bytes for a fixed-width column type.
+     * Returns 0 for variable-width types (string, arrays).
      */
-    public void clear() {
-        columns.clear();
-        columnNameToIndex.clear();
-        fastColumns = null;
-        columnAccessCursor = 0;
-        rowCount = 0;
-        schemaHash = 0;
-        schemaHashComputed = false;
-        columnDefsCacheValid = false;
-        cachedColumnDefs = null;
+    static int elementSize(byte type) {
+        switch (type) {
+            case TYPE_BOOLEAN:
+            case TYPE_BYTE:
+                return 1;
+            case TYPE_SHORT:
+            case TYPE_CHAR:
+                return 2;
+            case TYPE_INT:
+            case TYPE_SYMBOL:
+            case TYPE_FLOAT:
+                return 4;
+            case TYPE_LONG:
+            case TYPE_TIMESTAMP:
+            case TYPE_TIMESTAMP_NANOS:
+            case TYPE_DATE:
+            case TYPE_DECIMAL64:
+            case TYPE_DOUBLE:
+                return 8;
+            case TYPE_UUID:
+            case TYPE_DECIMAL128:
+                return 16;
+            case TYPE_LONG256:
+            case TYPE_DECIMAL256:
+                return 32;
+            default:
+                return 0;
+        }
     }
 
     /**
      * Column buffer for a single column.
+     * <p>
+     * Fixed-width data is stored off-heap in {@link OffHeapAppendMemory} for zero-GC
+     * operation and efficient bulk copy to network buffers.
      */
-    public static class ColumnBuffer {
+    public static class ColumnBuffer implements QuietCloseable {
         final String name;
         final byte type;
         final boolean nullable;
+        final int elemSize;
 
         private int size;         // Total row count (including nulls)
         private int valueCount;   // Actual stored values (excludes nulls)
-        private int capacity;
 
-        // Storage for different types
-        private boolean[] booleanValues;
-        private byte[] byteValues;
-        private short[] shortValues;
-        private int[] intValues;
-        private long[] longValues;
-        private float[] floatValues;
-        private double[] doubleValues;
-        private String[] stringValues;
-        private long[] uuidHigh;
-        private long[] uuidLow;
-        // Long256 stored as flat array: 4 longs per value (avoids inner array allocation)
-        private long[] long256Values;
+        // Off-heap data buffer for fixed-width types
+        private OffHeapAppendMemory dataBuffer;
 
-        // Array storage (double/long arrays - variable length per row)
-        // Each row stores: [nDims (1B)][dim1..dimN (4B each)][flattened data]
-        // We track per-row metadata separately from the actual data
-        private byte[] arrayDims;           // nDims per row
-        private int[] arrayShapes;          // Flattened shape data (all dimensions concatenated)
-        private int arrayShapeOffset;       // Current write offset in arrayShapes
-        private double[] doubleArrayData;   // Flattened double values
-        private long[] longArrayData;       // Flattened long values
-        private int arrayDataOffset;        // Current write offset in data arrays
-        private int arrayRowCapacity;       // Capacity for array row count
+        // Off-heap auxiliary buffer for global symbol IDs (SYMBOL type only)
+        private OffHeapAppendMemory auxBuffer;
 
-        // Null tracking - bit-packed for memory efficiency (1 bit per row vs 8 bits with boolean[])
-        private long[] nullBitmapPacked;
+        // Off-heap null bitmap (bit-packed, 1 bit per row)
+        private long nullBufPtr;
+        private int nullBufCapRows;
         private boolean hasNulls;
 
-        // Symbol specific
+        // On-heap capacity for variable-width arrays (string values, array dims)
+        private int onHeapCapacity;
+
+        // On-heap storage for variable-width types
+        private String[] stringValues;
+
+        // Array storage (double/long arrays - variable length per row)
+        private byte[] arrayDims;
+        private int[] arrayShapes;
+        private int arrayShapeOffset;
+        private double[] doubleArrayData;
+        private long[] longArrayData;
+        private int arrayDataOffset;
+
+        // Symbol specific (dictionary stays on-heap)
         private CharSequenceIntHashMap symbolDict;
         private ObjList<String> symbolList;
-        private int[] symbolIndices;
-
-        // Global symbol IDs for delta encoding (parallel to symbolIndices)
-        private int[] globalSymbolIds;
         private int maxGlobalSymbolId = -1;
 
         // Decimal storage
-        // All values in a decimal column must share the same scale
-        // For Decimal64: single long per value (64-bit unscaled)
-        // For Decimal128: two longs per value (128-bit unscaled: high, low)
-        // For Decimal256: four longs per value (256-bit unscaled: hh, hl, lh, ll)
-        private byte decimalScale = -1;   // Shared scale for column (-1 = not set)
-        private final Decimal256 rescaleTemp = new Decimal256(); // Reusable temp for rescaling
-        private long[] decimal64Values;   // Decimal64: one long per value
-        private long[] decimal128High;    // Decimal128: high 64 bits
-        private long[] decimal128Low;     // Decimal128: low 64 bits
-        private long[] decimal256Hh;      // Decimal256: bits 255-192
-        private long[] decimal256Hl;      // Decimal256: bits 191-128
-        private long[] decimal256Lh;      // Decimal256: bits 127-64
-        private long[] decimal256Ll;      // Decimal256: bits 63-0
+        private byte decimalScale = -1;
+        private final Decimal256 rescaleTemp = new Decimal256();
 
         public ColumnBuffer(String name, byte type, boolean nullable) {
             this.name = name;
             this.type = type;
             this.nullable = nullable;
+            this.elemSize = elementSize(type);
             this.size = 0;
             this.valueCount = 0;
-            this.capacity = 16;
             this.hasNulls = false;
+            this.onHeapCapacity = 16;
 
-            allocateStorage(type, capacity);
+            allocateStorage(type);
             if (nullable) {
-                // Bit-packed: 64 bits per long, so we need (capacity + 63) / 64 longs
-                nullBitmapPacked = new long[(capacity + 63) >>> 6];
+                nullBufCapRows = 64; // multiple of 64
+                long sizeBytes = (long) nullBufCapRows >>> 3;
+                nullBufPtr = Unsafe.calloc(sizeBytes, MemoryTag.NATIVE_ILP_RSS);
             }
-        }
-
-        public String getName() {
-            return name;
-        }
-
-        public byte getType() {
-            return type;
-        }
-
-        public int getSize() {
-            return size;
-        }
-
-        /**
-         * Returns the number of actual stored values (excludes nulls).
-         */
-        public int getValueCount() {
-            return valueCount;
-        }
-
-        public boolean hasNulls() {
-            return hasNulls;
-        }
-
-        /**
-         * Returns the bit-packed null bitmap.
-         * Each long contains 64 bits, bit 0 of long 0 = row 0, bit 1 of long 0 = row 1, etc.
-         */
-        public long[] getNullBitmapPacked() {
-            return nullBitmapPacked;
-        }
-
-        /**
-         * Returns the null bitmap as boolean array (for backward compatibility).
-         * This creates a new array, so prefer getNullBitmapPacked() for efficiency.
-         */
-        public boolean[] getNullBitmap() {
-            if (nullBitmapPacked == null) {
-                return null;
-            }
-            boolean[] result = new boolean[size];
-            for (int i = 0; i < size; i++) {
-                result[i] = isNull(i);
-            }
-            return result;
-        }
-
-        /**
-         * Checks if the row at the given index is null.
-         */
-        public boolean isNull(int index) {
-            if (nullBitmapPacked == null) {
-                return false;
-            }
-            int longIndex = index >>> 6;
-            int bitIndex = index & 63;
-            return (nullBitmapPacked[longIndex] & (1L << bitIndex)) != 0;
-        }
-
-        public boolean[] getBooleanValues() {
-            return booleanValues;
-        }
-
-        public byte[] getByteValues() {
-            return byteValues;
-        }
-
-        public short[] getShortValues() {
-            return shortValues;
-        }
-
-        public int[] getIntValues() {
-            return intValues;
-        }
-
-        public long[] getLongValues() {
-            return longValues;
-        }
-
-        public float[] getFloatValues() {
-            return floatValues;
-        }
-
-        public double[] getDoubleValues() {
-            return doubleValues;
-        }
-
-        public String[] getStringValues() {
-            return stringValues;
-        }
-
-        public long[] getUuidHigh() {
-            return uuidHigh;
-        }
-
-        public long[] getUuidLow() {
-            return uuidLow;
-        }
-
-        /**
-         * Returns Long256 values as flat array (4 longs per value).
-         * Use getLong256Value(index, component) for indexed access.
-         */
-        public long[] getLong256Values() {
-            return long256Values;
-        }
-
-        /**
-         * Returns a component of a Long256 value.
-         * @param index value index
-         * @param component component 0-3
-         */
-        public long getLong256Value(int index, int component) {
-            return long256Values[index * 4 + component];
-        }
-
-        // ==================== Decimal getters ====================
-
-        /**
-         * Returns the shared scale for this decimal column.
-         * Returns -1 if no values have been added yet.
-         */
-        public byte getDecimalScale() {
-            return decimalScale;
-        }
-
-        /**
-         * Returns the Decimal64 values (one long per value).
-         */
-        public long[] getDecimal64Values() {
-            return decimal64Values;
-        }
-
-        /**
-         * Returns the high 64 bits of Decimal128 values.
-         */
-        public long[] getDecimal128High() {
-            return decimal128High;
-        }
-
-        /**
-         * Returns the low 64 bits of Decimal128 values.
-         */
-        public long[] getDecimal128Low() {
-            return decimal128Low;
-        }
-
-        /**
-         * Returns bits 255-192 of Decimal256 values.
-         */
-        public long[] getDecimal256Hh() {
-            return decimal256Hh;
-        }
-
-        /**
-         * Returns bits 191-128 of Decimal256 values.
-         */
-        public long[] getDecimal256Hl() {
-            return decimal256Hl;
-        }
-
-        /**
-         * Returns bits 127-64 of Decimal256 values.
-         */
-        public long[] getDecimal256Lh() {
-            return decimal256Lh;
-        }
-
-        /**
-         * Returns bits 63-0 of Decimal256 values.
-         */
-        public long[] getDecimal256Ll() {
-            return decimal256Ll;
-        }
-
-        /**
-         * Returns the array dimensions per row (nDims for each row).
-         */
-        public byte[] getArrayDims() {
-            return arrayDims;
-        }
-
-        /**
-         * Returns the flattened array shapes (all dimension lengths concatenated).
-         */
-        public int[] getArrayShapes() {
-            return arrayShapes;
-        }
-
-        /**
-         * Returns the current write offset in arrayShapes.
-         */
-        public int getArrayShapeOffset() {
-            return arrayShapeOffset;
-        }
-
-        /**
-         * Returns the flattened double array data.
-         */
-        public double[] getDoubleArrayData() {
-            return doubleArrayData;
-        }
-
-        /**
-         * Returns the flattened long array data.
-         */
-        public long[] getLongArrayData() {
-            return longArrayData;
-        }
-
-        /**
-         * Returns the current write offset in the data arrays.
-         */
-        public int getArrayDataOffset() {
-            return arrayDataOffset;
-        }
-
-        /**
-         * Returns the symbol indices array (one index per value).
-         * Each index refers to a position in the symbol dictionary.
-         */
-        public int[] getSymbolIndices() {
-            return symbolIndices;
-        }
-
-        /**
-         * Returns the symbol dictionary as a String array.
-         * Index i in symbolIndices maps to symbolDictionary[i].
-         */
-        public String[] getSymbolDictionary() {
-            if (symbolList == null) {
-                return new String[0];
-            }
-            String[] dict = new String[symbolList.size()];
-            for (int i = 0; i < symbolList.size(); i++) {
-                dict[i] = symbolList.get(i);
-            }
-            return dict;
-        }
-
-        /**
-         * Returns the size of the symbol dictionary.
-         */
-        public int getSymbolDictionarySize() {
-            return symbolList == null ? 0 : symbolList.size();
-        }
-
-        /**
-         * Returns the global symbol IDs array for delta encoding.
-         * Returns null if no global IDs have been stored.
-         */
-        public int[] getGlobalSymbolIds() {
-            return globalSymbolIds;
-        }
-
-        /**
-         * Returns the maximum global symbol ID used in this column.
-         * Returns -1 if no symbols have been added with global IDs.
-         */
-        public int getMaxGlobalSymbolId() {
-            return maxGlobalSymbolId;
         }
 
         public void addBoolean(boolean value) {
-            ensureCapacity();
-            booleanValues[valueCount++] = value;
+            dataBuffer.putByte(value ? (byte) 1 : (byte) 0);
+            valueCount++;
             size++;
         }
 
         public void addByte(byte value) {
-            ensureCapacity();
-            byteValues[valueCount++] = value;
-            size++;
-        }
-
-        public void addShort(short value) {
-            ensureCapacity();
-            shortValues[valueCount++] = value;
-            size++;
-        }
-
-        public void addInt(int value) {
-            ensureCapacity();
-            intValues[valueCount++] = value;
-            size++;
-        }
-
-        public void addLong(long value) {
-            ensureCapacity();
-            longValues[valueCount++] = value;
-            size++;
-        }
-
-        public void addFloat(float value) {
-            ensureCapacity();
-            floatValues[valueCount++] = value;
-            size++;
-        }
-
-        public void addDouble(double value) {
-            ensureCapacity();
-            doubleValues[valueCount++] = value;
-            size++;
-        }
-
-        public void addString(String value) {
-            ensureCapacity();
-            if (value == null && nullable) {
-                markNull(size);
-                // Null strings don't take space in the value buffer
-                size++;
-            } else {
-                stringValues[valueCount++] = value;
-                size++;
-            }
-        }
-
-        public void addSymbol(String value) {
-            ensureCapacity();
-            if (value == null) {
-                if (nullable) {
-                    markNull(size);
-                }
-                // Null symbols don't take space in the value buffer
-                size++;
-            } else {
-                int idx = symbolDict.get(value);
-                if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-                    idx = symbolList.size();
-                    symbolDict.put(value, idx);
-                    symbolList.add(value);
-                }
-                symbolIndices[valueCount++] = idx;
-                size++;
-            }
-        }
-
-        /**
-         * Adds a symbol with both local dictionary and global ID tracking.
-         * Used for delta dictionary encoding where global IDs are shared across all columns.
-         *
-         * @param value    the symbol string
-         * @param globalId the global ID from GlobalSymbolDictionary
-         */
-        public void addSymbolWithGlobalId(String value, int globalId) {
-            ensureCapacity();
-            if (value == null) {
-                if (nullable) {
-                    markNull(size);
-                }
-                size++;
-            } else {
-                // Add to local dictionary (for backward compatibility with existing encoder)
-                int localIdx = symbolDict.get(value);
-                if (localIdx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-                    localIdx = symbolList.size();
-                    symbolDict.put(value, localIdx);
-                    symbolList.add(value);
-                }
-                symbolIndices[valueCount] = localIdx;
-
-                // Also store global ID for delta encoding
-                if (globalSymbolIds == null) {
-                    globalSymbolIds = new int[capacity];
-                }
-                globalSymbolIds[valueCount] = globalId;
-
-                // Track max global ID for this column
-                if (globalId > maxGlobalSymbolId) {
-                    maxGlobalSymbolId = globalId;
-                }
-
-                valueCount++;
-                size++;
-            }
-        }
-
-        public void addUuid(long high, long low) {
-            ensureCapacity();
-            uuidHigh[valueCount] = high;
-            uuidLow[valueCount] = low;
+            dataBuffer.putByte(value);
             valueCount++;
             size++;
         }
 
-        public void addLong256(long l0, long l1, long l2, long l3) {
-            ensureCapacity();
-            int offset = valueCount * 4;
-            long256Values[offset] = l0;
-            long256Values[offset + 1] = l1;
-            long256Values[offset + 2] = l2;
-            long256Values[offset + 3] = l3;
-            valueCount++;
-            size++;
-        }
-
-        // ==================== Decimal methods ====================
-
-        /**
-         * Adds a Decimal64 value.
-         * If the value's scale differs from the column's established scale,
-         * the value is automatically rescaled to match.
-         *
-         * @param value the Decimal64 value to add
-         */
-        public void addDecimal64(Decimal64 value) {
-            if (value == null || value.isNull()) {
-                addNull();
-                return;
-            }
-            ensureCapacity();
-            if (decimalScale == -1) {
-                decimalScale = (byte) value.getScale();
-                decimal64Values[valueCount++] = value.getValue();
-            } else if (decimalScale != value.getScale()) {
-                rescaleTemp.ofRaw(value.getValue());
-                rescaleTemp.setScale(value.getScale());
-                rescaleTemp.rescale(decimalScale);
-                decimal64Values[valueCount++] = rescaleTemp.getLl();
-            } else {
-                decimal64Values[valueCount++] = value.getValue();
-            }
-            size++;
-        }
-
-        /**
-         * Adds a Decimal128 value.
-         * If the value's scale differs from the column's established scale,
-         * the value is automatically rescaled to match.
-         *
-         * @param value the Decimal128 value to add
-         */
         public void addDecimal128(Decimal128 value) {
             if (value == null || value.isNull()) {
                 addNull();
                 return;
             }
-            ensureCapacity();
             if (decimalScale == -1) {
                 decimalScale = (byte) value.getScale();
             } else if (decimalScale != value.getScale()) {
                 rescaleTemp.ofRaw(value.getHigh(), value.getLow());
                 rescaleTemp.setScale(value.getScale());
                 rescaleTemp.rescale(decimalScale);
-                decimal128High[valueCount] = rescaleTemp.getLh();
-                decimal128Low[valueCount] = rescaleTemp.getLl();
+                dataBuffer.putLong(rescaleTemp.getLh());
+                dataBuffer.putLong(rescaleTemp.getLl());
                 valueCount++;
                 size++;
                 return;
             }
-            decimal128High[valueCount] = value.getHigh();
-            decimal128Low[valueCount] = value.getLow();
+            dataBuffer.putLong(value.getHigh());
+            dataBuffer.putLong(value.getLow());
             valueCount++;
             size++;
         }
 
-        /**
-         * Adds a Decimal256 value.
-         * If the value's scale differs from the column's established scale,
-         * the value is automatically rescaled to match.
-         *
-         * @param value the Decimal256 value to add
-         */
         public void addDecimal256(Decimal256 value) {
             if (value == null || value.isNull()) {
                 addNull();
                 return;
             }
-            ensureCapacity();
             Decimal256 src = value;
             if (decimalScale == -1) {
                 decimalScale = (byte) value.getScale();
@@ -800,19 +405,40 @@ public class QwpTableBuffer {
                 rescaleTemp.rescale(decimalScale);
                 src = rescaleTemp;
             }
-            decimal256Hh[valueCount] = src.getHh();
-            decimal256Hl[valueCount] = src.getHl();
-            decimal256Lh[valueCount] = src.getLh();
-            decimal256Ll[valueCount] = src.getLl();
+            dataBuffer.putLong(src.getHh());
+            dataBuffer.putLong(src.getHl());
+            dataBuffer.putLong(src.getLh());
+            dataBuffer.putLong(src.getLl());
             valueCount++;
             size++;
         }
 
-        // ==================== Array methods ====================
+        public void addDecimal64(Decimal64 value) {
+            if (value == null || value.isNull()) {
+                addNull();
+                return;
+            }
+            if (decimalScale == -1) {
+                decimalScale = (byte) value.getScale();
+                dataBuffer.putLong(value.getValue());
+            } else if (decimalScale != value.getScale()) {
+                rescaleTemp.ofRaw(value.getValue());
+                rescaleTemp.setScale(value.getScale());
+                rescaleTemp.rescale(decimalScale);
+                dataBuffer.putLong(rescaleTemp.getLl());
+            } else {
+                dataBuffer.putLong(value.getValue());
+            }
+            valueCount++;
+            size++;
+        }
 
-        /**
-         * Adds a 1D double array.
-         */
+        public void addDouble(double value) {
+            dataBuffer.putDouble(value);
+            valueCount++;
+            size++;
+        }
+
         public void addDoubleArray(double[] values) {
             if (values == null) {
                 addNull();
@@ -828,10 +454,6 @@ public class QwpTableBuffer {
             size++;
         }
 
-        /**
-         * Adds a 2D double array.
-         * @throws LineSenderException if the array is jagged (irregular shape)
-         */
         public void addDoubleArray(double[][] values) {
             if (values == null) {
                 addNull();
@@ -839,7 +461,6 @@ public class QwpTableBuffer {
             }
             int dim0 = values.length;
             int dim1 = dim0 > 0 ? values[0].length : 0;
-            // Validate rectangular shape
             for (int i = 1; i < dim0; i++) {
                 if (values[i].length != dim1) {
                     throw new LineSenderException("irregular array shape");
@@ -858,10 +479,6 @@ public class QwpTableBuffer {
             size++;
         }
 
-        /**
-         * Adds a 3D double array.
-         * @throws LineSenderException if the array is jagged (irregular shape)
-         */
         public void addDoubleArray(double[][][] values) {
             if (values == null) {
                 addNull();
@@ -870,7 +487,6 @@ public class QwpTableBuffer {
             int dim0 = values.length;
             int dim1 = dim0 > 0 ? values[0].length : 0;
             int dim2 = dim0 > 0 && dim1 > 0 ? values[0][0].length : 0;
-            // Validate rectangular shape
             for (int i = 0; i < dim0; i++) {
                 if (values[i].length != dim1) {
                     throw new LineSenderException("irregular array shape");
@@ -897,16 +513,11 @@ public class QwpTableBuffer {
             size++;
         }
 
-        /**
-         * Adds a DoubleArray (N-dimensional wrapper).
-         * Uses a capturing approach to extract shape and data.
-         */
         public void addDoubleArray(DoubleArray array) {
             if (array == null) {
                 addNull();
                 return;
             }
-            // Use a capturing ArrayBufferAppender to extract the data
             ArrayCapture capture = new ArrayCapture();
             array.appendToBufPtr(capture);
 
@@ -922,9 +533,33 @@ public class QwpTableBuffer {
             size++;
         }
 
-        /**
-         * Adds a 1D long array.
-         */
+        public void addFloat(float value) {
+            dataBuffer.putFloat(value);
+            valueCount++;
+            size++;
+        }
+
+        public void addInt(int value) {
+            dataBuffer.putInt(value);
+            valueCount++;
+            size++;
+        }
+
+        public void addLong(long value) {
+            dataBuffer.putLong(value);
+            valueCount++;
+            size++;
+        }
+
+        public void addLong256(long l0, long l1, long l2, long l3) {
+            dataBuffer.putLong(l0);
+            dataBuffer.putLong(l1);
+            dataBuffer.putLong(l2);
+            dataBuffer.putLong(l3);
+            valueCount++;
+            size++;
+        }
+
         public void addLongArray(long[] values) {
             if (values == null) {
                 addNull();
@@ -940,10 +575,6 @@ public class QwpTableBuffer {
             size++;
         }
 
-        /**
-         * Adds a 2D long array.
-         * @throws LineSenderException if the array is jagged (irregular shape)
-         */
         public void addLongArray(long[][] values) {
             if (values == null) {
                 addNull();
@@ -951,7 +582,6 @@ public class QwpTableBuffer {
             }
             int dim0 = values.length;
             int dim1 = dim0 > 0 ? values[0].length : 0;
-            // Validate rectangular shape
             for (int i = 1; i < dim0; i++) {
                 if (values[i].length != dim1) {
                     throw new LineSenderException("irregular array shape");
@@ -970,10 +600,6 @@ public class QwpTableBuffer {
             size++;
         }
 
-        /**
-         * Adds a 3D long array.
-         * @throws LineSenderException if the array is jagged (irregular shape)
-         */
         public void addLongArray(long[][][] values) {
             if (values == null) {
                 addNull();
@@ -982,7 +608,6 @@ public class QwpTableBuffer {
             int dim0 = values.length;
             int dim1 = dim0 > 0 ? values[0].length : 0;
             int dim2 = dim0 > 0 && dim1 > 0 ? values[0][0].length : 0;
-            // Validate rectangular shape
             for (int i = 0; i < dim0; i++) {
                 if (values[i].length != dim1) {
                     throw new LineSenderException("irregular array shape");
@@ -1009,16 +634,11 @@ public class QwpTableBuffer {
             size++;
         }
 
-        /**
-         * Adds a LongArray (N-dimensional wrapper).
-         * Uses a capturing approach to extract shape and data.
-         */
         public void addLongArray(LongArray array) {
             if (array == null) {
                 addNull();
                 return;
             }
-            // Use a capturing ArrayBufferAppender to extract the data
             ArrayCapture capture = new ArrayCapture();
             array.appendToBufPtr(capture);
 
@@ -1034,13 +654,427 @@ public class QwpTableBuffer {
             size++;
         }
 
+        public void addNull() {
+            if (nullable) {
+                ensureNullCapacity(size + 1);
+                markNull(size);
+                size++;
+            } else {
+                // For non-nullable columns, store a sentinel/default value
+                switch (type) {
+                    case TYPE_BOOLEAN:
+                        dataBuffer.putByte((byte) 0);
+                        break;
+                    case TYPE_BYTE:
+                        dataBuffer.putByte((byte) 0);
+                        break;
+                    case TYPE_SHORT:
+                    case TYPE_CHAR:
+                        dataBuffer.putShort((short) 0);
+                        break;
+                    case TYPE_INT:
+                        dataBuffer.putInt(0);
+                        break;
+                    case TYPE_LONG:
+                    case TYPE_TIMESTAMP:
+                    case TYPE_TIMESTAMP_NANOS:
+                    case TYPE_DATE:
+                        dataBuffer.putLong(Long.MIN_VALUE);
+                        break;
+                    case TYPE_FLOAT:
+                        dataBuffer.putFloat(Float.NaN);
+                        break;
+                    case TYPE_DOUBLE:
+                        dataBuffer.putDouble(Double.NaN);
+                        break;
+                    case TYPE_STRING:
+                    case TYPE_VARCHAR:
+                        ensureOnHeapCapacity();
+                        stringValues[valueCount] = null;
+                        break;
+                    case TYPE_SYMBOL:
+                        dataBuffer.putInt(-1);
+                        break;
+                    case TYPE_UUID:
+                        dataBuffer.putLong(Long.MIN_VALUE);
+                        dataBuffer.putLong(Long.MIN_VALUE);
+                        break;
+                    case TYPE_LONG256:
+                        dataBuffer.putLong(Long.MIN_VALUE);
+                        dataBuffer.putLong(Long.MIN_VALUE);
+                        dataBuffer.putLong(Long.MIN_VALUE);
+                        dataBuffer.putLong(Long.MIN_VALUE);
+                        break;
+                    case TYPE_DECIMAL64:
+                        dataBuffer.putLong(Decimals.DECIMAL64_NULL);
+                        break;
+                    case TYPE_DECIMAL128:
+                        dataBuffer.putLong(Decimals.DECIMAL128_HI_NULL);
+                        dataBuffer.putLong(Decimals.DECIMAL128_LO_NULL);
+                        break;
+                    case TYPE_DECIMAL256:
+                        dataBuffer.putLong(Decimals.DECIMAL256_HH_NULL);
+                        dataBuffer.putLong(Decimals.DECIMAL256_HL_NULL);
+                        dataBuffer.putLong(Decimals.DECIMAL256_LH_NULL);
+                        dataBuffer.putLong(Decimals.DECIMAL256_LL_NULL);
+                        break;
+                }
+                valueCount++;
+                size++;
+            }
+        }
+
+        public void addShort(short value) {
+            dataBuffer.putShort(value);
+            valueCount++;
+            size++;
+        }
+
+        public void addString(String value) {
+            if (value == null && nullable) {
+                ensureNullCapacity(size + 1);
+                markNull(size);
+                size++;
+            } else {
+                ensureOnHeapCapacity();
+                stringValues[valueCount++] = value;
+                size++;
+            }
+        }
+
+        public void addSymbol(String value) {
+            if (value == null) {
+                if (nullable) {
+                    ensureNullCapacity(size + 1);
+                    markNull(size);
+                }
+                size++;
+            } else {
+                int idx = symbolDict.get(value);
+                if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+                    idx = symbolList.size();
+                    symbolDict.put(value, idx);
+                    symbolList.add(value);
+                }
+                dataBuffer.putInt(idx);
+                valueCount++;
+                size++;
+            }
+        }
+
+        public void addSymbolWithGlobalId(String value, int globalId) {
+            if (value == null) {
+                if (nullable) {
+                    ensureNullCapacity(size + 1);
+                    markNull(size);
+                }
+                size++;
+            } else {
+                int localIdx = symbolDict.get(value);
+                if (localIdx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+                    localIdx = symbolList.size();
+                    symbolDict.put(value, localIdx);
+                    symbolList.add(value);
+                }
+                dataBuffer.putInt(localIdx);
+
+                if (auxBuffer == null) {
+                    auxBuffer = new OffHeapAppendMemory(64);
+                }
+                auxBuffer.putInt(globalId);
+
+                if (globalId > maxGlobalSymbolId) {
+                    maxGlobalSymbolId = globalId;
+                }
+
+                valueCount++;
+                size++;
+            }
+        }
+
+        public void addUuid(long high, long low) {
+            // Store in wire order: lo first, hi second
+            dataBuffer.putLong(low);
+            dataBuffer.putLong(high);
+            valueCount++;
+            size++;
+        }
+
+        @Override
+        public void close() {
+            if (dataBuffer != null) {
+                dataBuffer.close();
+                dataBuffer = null;
+            }
+            if (auxBuffer != null) {
+                auxBuffer.close();
+                auxBuffer = null;
+            }
+            if (nullBufPtr != 0) {
+                Unsafe.free(nullBufPtr, (long) nullBufCapRows >>> 3, MemoryTag.NATIVE_ILP_RSS);
+                nullBufPtr = 0;
+                nullBufCapRows = 0;
+            }
+        }
+
+        public int getArrayDataOffset() {
+            return arrayDataOffset;
+        }
+
+        public byte[] getArrayDims() {
+            return arrayDims;
+        }
+
+        public int[] getArrayShapes() {
+            return arrayShapes;
+        }
+
+        public int getArrayShapeOffset() {
+            return arrayShapeOffset;
+        }
+
         /**
-         * Ensures capacity for array storage.
-         * @param nDims number of dimensions for this array
-         * @param dataElements number of data elements
+         * Returns the off-heap address of the auxiliary data buffer (global symbol IDs).
+         * Returns 0 if no auxiliary data exists.
          */
+        public long getAuxDataAddress() {
+            return auxBuffer != null ? auxBuffer.pageAddress() : 0;
+        }
+
+        /**
+         * Returns the off-heap address of the column data buffer.
+         */
+        public long getDataAddress() {
+            return dataBuffer != null ? dataBuffer.pageAddress() : 0;
+        }
+
+        /**
+         * Returns the number of bytes of data in the off-heap buffer.
+         */
+        public long getDataSize() {
+            return dataBuffer != null ? dataBuffer.getAppendOffset() : 0;
+        }
+
+        public byte getDecimalScale() {
+            return decimalScale;
+        }
+
+        public double[] getDoubleArrayData() {
+            return doubleArrayData;
+        }
+
+        public long[] getLongArrayData() {
+            return longArrayData;
+        }
+
+        public int getMaxGlobalSymbolId() {
+            return maxGlobalSymbolId;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        /**
+         * Returns the off-heap address of the null bitmap.
+         * Returns 0 for non-nullable columns.
+         */
+        public long getNullBitmapAddress() {
+            return nullBufPtr;
+        }
+
+        /**
+         * Returns the bit-packed null bitmap as a long array.
+         * This creates a new array from off-heap data.
+         */
+        public long[] getNullBitmapPacked() {
+            if (nullBufPtr == 0) {
+                return null;
+            }
+            int longCount = (size + 63) >>> 6;
+            long[] result = new long[longCount];
+            for (int i = 0; i < longCount; i++) {
+                result[i] = Unsafe.getUnsafe().getLong(nullBufPtr + (long) i * 8);
+            }
+            return result;
+        }
+
+        public int getSize() {
+            return size;
+        }
+
+        public String[] getStringValues() {
+            return stringValues;
+        }
+
+        public String[] getSymbolDictionary() {
+            if (symbolList == null) {
+                return new String[0];
+            }
+            String[] dict = new String[symbolList.size()];
+            for (int i = 0; i < symbolList.size(); i++) {
+                dict[i] = symbolList.get(i);
+            }
+            return dict;
+        }
+
+        public int getSymbolDictionarySize() {
+            return symbolList == null ? 0 : symbolList.size();
+        }
+
+        public byte getType() {
+            return type;
+        }
+
+        public int getValueCount() {
+            return valueCount;
+        }
+
+        public boolean hasNulls() {
+            return hasNulls;
+        }
+
+        public boolean isNull(int index) {
+            if (nullBufPtr == 0) {
+                return false;
+            }
+            long longAddr = nullBufPtr + ((long) (index >>> 6)) * 8;
+            int bitIndex = index & 63;
+            return (Unsafe.getUnsafe().getLong(longAddr) & (1L << bitIndex)) != 0;
+        }
+
+        public void reset() {
+            size = 0;
+            valueCount = 0;
+            hasNulls = false;
+            if (dataBuffer != null) {
+                dataBuffer.truncate();
+            }
+            if (auxBuffer != null) {
+                auxBuffer.truncate();
+            }
+            if (nullBufPtr != 0) {
+                Vect.memset(nullBufPtr, (long) nullBufCapRows >>> 3, 0);
+            }
+            if (symbolDict != null) {
+                symbolDict.clear();
+                symbolList.clear();
+            }
+            maxGlobalSymbolId = -1;
+            arrayShapeOffset = 0;
+            arrayDataOffset = 0;
+            decimalScale = -1;
+        }
+
+        public void truncateTo(int newSize) {
+            if (newSize >= size) {
+                return;
+            }
+
+            int newValueCount = 0;
+            if (nullable && nullBufPtr != 0) {
+                for (int i = 0; i < newSize; i++) {
+                    if (!isNull(i)) {
+                        newValueCount++;
+                    }
+                }
+                // Clear null bits for truncated rows
+                for (int i = newSize; i < size; i++) {
+                    long longAddr = nullBufPtr + ((long) (i >>> 6)) * 8;
+                    int bitIndex = i & 63;
+                    long current = Unsafe.getUnsafe().getLong(longAddr);
+                    Unsafe.getUnsafe().putLong(longAddr, current & ~(1L << bitIndex));
+                }
+                hasNulls = false;
+                for (int i = 0; i < newSize && !hasNulls; i++) {
+                    if (isNull(i)) {
+                        hasNulls = true;
+                    }
+                }
+            } else {
+                newValueCount = newSize;
+            }
+
+            size = newSize;
+            valueCount = newValueCount;
+
+            // Rewind off-heap data buffer
+            if (dataBuffer != null && elemSize > 0) {
+                dataBuffer.jumpTo((long) newValueCount * elemSize);
+            }
+
+            // Rewind aux buffer (symbol global IDs)
+            if (auxBuffer != null) {
+                auxBuffer.jumpTo((long) newValueCount * 4);
+            }
+        }
+
+        private void allocateStorage(byte type) {
+            switch (type) {
+                case TYPE_BOOLEAN:
+                case TYPE_BYTE:
+                    dataBuffer = new OffHeapAppendMemory(16);
+                    break;
+                case TYPE_SHORT:
+                case TYPE_CHAR:
+                    dataBuffer = new OffHeapAppendMemory(32);
+                    break;
+                case TYPE_INT:
+                    dataBuffer = new OffHeapAppendMemory(64);
+                    break;
+                case TYPE_LONG:
+                case TYPE_TIMESTAMP:
+                case TYPE_TIMESTAMP_NANOS:
+                case TYPE_DATE:
+                    dataBuffer = new OffHeapAppendMemory(128);
+                    break;
+                case TYPE_FLOAT:
+                    dataBuffer = new OffHeapAppendMemory(64);
+                    break;
+                case TYPE_DOUBLE:
+                    dataBuffer = new OffHeapAppendMemory(128);
+                    break;
+                case TYPE_STRING:
+                case TYPE_VARCHAR:
+                    stringValues = new String[onHeapCapacity];
+                    break;
+                case TYPE_SYMBOL:
+                    dataBuffer = new OffHeapAppendMemory(64);
+                    symbolDict = new CharSequenceIntHashMap();
+                    symbolList = new ObjList<>();
+                    break;
+                case TYPE_UUID:
+                    dataBuffer = new OffHeapAppendMemory(256);
+                    break;
+                case TYPE_LONG256:
+                    dataBuffer = new OffHeapAppendMemory(512);
+                    break;
+                case TYPE_DOUBLE_ARRAY:
+                case TYPE_LONG_ARRAY:
+                    arrayDims = new byte[onHeapCapacity];
+                    break;
+                case TYPE_DECIMAL64:
+                    dataBuffer = new OffHeapAppendMemory(128);
+                    break;
+                case TYPE_DECIMAL128:
+                    dataBuffer = new OffHeapAppendMemory(256);
+                    break;
+                case TYPE_DECIMAL256:
+                    dataBuffer = new OffHeapAppendMemory(512);
+                    break;
+            }
+        }
+
         private void ensureArrayCapacity(int nDims, int dataElements) {
-            ensureCapacity(); // For row-level capacity (arrayDims uses valueCount)
+            // Ensure per-row array dims capacity
+            if (valueCount >= arrayDims.length) {
+                arrayDims = Arrays.copyOf(arrayDims, arrayDims.length * 2);
+            }
+
+            // Ensure null bitmap capacity
+            if (nullable) {
+                ensureNullCapacity(size + 1);
+            }
 
             // Ensure shape array capacity
             int requiredShapeCapacity = arrayShapeOffset + nDims;
@@ -1067,308 +1101,42 @@ public class QwpTableBuffer {
             }
         }
 
-        public void addNull() {
-            ensureCapacity();
-            if (nullable) {
-                // For nullable columns, mark null in bitmap but don't store a value
-                markNull(size);
-                size++;
-            } else {
-                // For non-nullable columns, we must store a sentinel/default value
-                // because no null bitmap will be written
-                switch (type) {
-                    case TYPE_BOOLEAN:
-                        booleanValues[valueCount++] = false;
-                        break;
-                    case TYPE_BYTE:
-                        byteValues[valueCount++] = 0;
-                        break;
-                    case TYPE_SHORT:
-                    case TYPE_CHAR:
-                        shortValues[valueCount++] = 0;
-                        break;
-                    case TYPE_INT:
-                        intValues[valueCount++] = 0;
-                        break;
-                    case TYPE_LONG:
-                    case TYPE_TIMESTAMP:
-                    case TYPE_TIMESTAMP_NANOS:
-                    case TYPE_DATE:
-                        longValues[valueCount++] = Long.MIN_VALUE;
-                        break;
-                    case TYPE_FLOAT:
-                        floatValues[valueCount++] = Float.NaN;
-                        break;
-                    case TYPE_DOUBLE:
-                        doubleValues[valueCount++] = Double.NaN;
-                        break;
-                    case TYPE_STRING:
-                    case TYPE_VARCHAR:
-                        stringValues[valueCount++] = null;
-                        break;
-                    case TYPE_SYMBOL:
-                        symbolIndices[valueCount++] = -1;
-                        break;
-                    case TYPE_UUID:
-                        uuidHigh[valueCount] = Long.MIN_VALUE;
-                        uuidLow[valueCount] = Long.MIN_VALUE;
-                        valueCount++;
-                        break;
-                    case TYPE_LONG256:
-                        int offset = valueCount * 4;
-                        long256Values[offset] = Long.MIN_VALUE;
-                        long256Values[offset + 1] = Long.MIN_VALUE;
-                        long256Values[offset + 2] = Long.MIN_VALUE;
-                        long256Values[offset + 3] = Long.MIN_VALUE;
-                        valueCount++;
-                        break;
-                    case TYPE_DECIMAL64:
-                        decimal64Values[valueCount++] = Decimals.DECIMAL64_NULL;
-                        break;
-                    case TYPE_DECIMAL128:
-                        decimal128High[valueCount] = Decimals.DECIMAL128_HI_NULL;
-                        decimal128Low[valueCount] = Decimals.DECIMAL128_LO_NULL;
-                        valueCount++;
-                        break;
-                    case TYPE_DECIMAL256:
-                        decimal256Hh[valueCount] = Decimals.DECIMAL256_HH_NULL;
-                        decimal256Hl[valueCount] = Decimals.DECIMAL256_HL_NULL;
-                        decimal256Lh[valueCount] = Decimals.DECIMAL256_LH_NULL;
-                        decimal256Ll[valueCount] = Decimals.DECIMAL256_LL_NULL;
-                        valueCount++;
-                        break;
+        private void ensureNullCapacity(int rows) {
+            if (rows > nullBufCapRows) {
+                int newCapRows = Math.max(nullBufCapRows * 2, ((rows + 63) >>> 6) << 6);
+                long newSizeBytes = (long) newCapRows >>> 3;
+                long oldSizeBytes = (long) nullBufCapRows >>> 3;
+                nullBufPtr = Unsafe.realloc(nullBufPtr, oldSizeBytes, newSizeBytes, MemoryTag.NATIVE_ILP_RSS);
+                Vect.memset(nullBufPtr + oldSizeBytes, newSizeBytes - oldSizeBytes, 0);
+                nullBufCapRows = newCapRows;
+            }
+        }
+
+        private void ensureOnHeapCapacity() {
+            if (valueCount >= onHeapCapacity) {
+                int newCapacity = onHeapCapacity * 2;
+                if (stringValues != null) {
+                    stringValues = Arrays.copyOf(stringValues, newCapacity);
                 }
-                size++;
+                onHeapCapacity = newCapacity;
             }
         }
 
         private void markNull(int index) {
-            int longIndex = index >>> 6;
+            long longAddr = nullBufPtr + ((long) (index >>> 6)) * 8;
             int bitIndex = index & 63;
-            nullBitmapPacked[longIndex] |= (1L << bitIndex);
+            long current = Unsafe.getUnsafe().getLong(longAddr);
+            Unsafe.getUnsafe().putLong(longAddr, current | (1L << bitIndex));
             hasNulls = true;
-        }
-
-        public void reset() {
-            size = 0;
-            valueCount = 0;
-            hasNulls = false;
-            if (nullBitmapPacked != null) {
-                Arrays.fill(nullBitmapPacked, 0L);
-            }
-            if (symbolDict != null) {
-                symbolDict.clear();
-                symbolList.clear();
-            }
-            // Reset global symbol tracking
-            maxGlobalSymbolId = -1;
-            // Reset array tracking
-            arrayShapeOffset = 0;
-            arrayDataOffset = 0;
-            // Reset decimal scale (will be set by first non-null value)
-            decimalScale = -1;
-        }
-
-        /**
-         * Truncates the column to the specified size.
-         * This is used to cancel uncommitted row values.
-         *
-         * @param newSize the target size (number of rows)
-         */
-        public void truncateTo(int newSize) {
-            if (newSize >= size) {
-                return; // Nothing to truncate
-            }
-
-            // Count non-null values up to newSize
-            int newValueCount = 0;
-            if (nullable && nullBitmapPacked != null) {
-                for (int i = 0; i < newSize; i++) {
-                    int longIndex = i >>> 6;
-                    int bitIndex = i & 63;
-                    if ((nullBitmapPacked[longIndex] & (1L << bitIndex)) == 0) {
-                        newValueCount++;
-                    }
-                }
-                // Clear null bits for truncated rows
-                for (int i = newSize; i < size; i++) {
-                    int longIndex = i >>> 6;
-                    int bitIndex = i & 63;
-                    nullBitmapPacked[longIndex] &= ~(1L << bitIndex);
-                }
-                // Recompute hasNulls
-                hasNulls = false;
-                for (int i = 0; i < newSize && !hasNulls; i++) {
-                    int longIndex = i >>> 6;
-                    int bitIndex = i & 63;
-                    if ((nullBitmapPacked[longIndex] & (1L << bitIndex)) != 0) {
-                        hasNulls = true;
-                    }
-                }
-            } else {
-                newValueCount = newSize;
-            }
-
-            size = newSize;
-            valueCount = newValueCount;
-        }
-
-        private void ensureCapacity() {
-            if (size >= capacity) {
-                int newCapacity = capacity * 2;
-                growStorage(type, newCapacity);
-                if (nullable && nullBitmapPacked != null) {
-                    int newLongCount = (newCapacity + 63) >>> 6;
-                    nullBitmapPacked = Arrays.copyOf(nullBitmapPacked, newLongCount);
-                }
-                capacity = newCapacity;
-            }
-        }
-
-        private void allocateStorage(byte type, int cap) {
-            switch (type) {
-                case TYPE_BOOLEAN:
-                    booleanValues = new boolean[cap];
-                    break;
-                case TYPE_BYTE:
-                    byteValues = new byte[cap];
-                    break;
-                case TYPE_SHORT:
-                case TYPE_CHAR:
-                    shortValues = new short[cap];
-                    break;
-                case TYPE_INT:
-                    intValues = new int[cap];
-                    break;
-                case TYPE_LONG:
-                case TYPE_TIMESTAMP:
-                case TYPE_TIMESTAMP_NANOS:
-                case TYPE_DATE:
-                    longValues = new long[cap];
-                    break;
-                case TYPE_FLOAT:
-                    floatValues = new float[cap];
-                    break;
-                case TYPE_DOUBLE:
-                    doubleValues = new double[cap];
-                    break;
-                case TYPE_STRING:
-                case TYPE_VARCHAR:
-                    stringValues = new String[cap];
-                    break;
-                case TYPE_SYMBOL:
-                    symbolIndices = new int[cap];
-                    symbolDict = new CharSequenceIntHashMap();
-                    symbolList = new ObjList<>();
-                    break;
-                case TYPE_UUID:
-                    uuidHigh = new long[cap];
-                    uuidLow = new long[cap];
-                    break;
-                case TYPE_LONG256:
-                    // Flat array: 4 longs per value
-                    long256Values = new long[cap * 4];
-                    break;
-                case TYPE_DOUBLE_ARRAY:
-                case TYPE_LONG_ARRAY:
-                    // Array types: allocate per-row tracking
-                    // Shape and data arrays are grown dynamically in ensureArrayCapacity()
-                    arrayDims = new byte[cap];
-                    arrayRowCapacity = cap;
-                    break;
-                case TYPE_DECIMAL64:
-                    decimal64Values = new long[cap];
-                    break;
-                case TYPE_DECIMAL128:
-                    decimal128High = new long[cap];
-                    decimal128Low = new long[cap];
-                    break;
-                case TYPE_DECIMAL256:
-                    decimal256Hh = new long[cap];
-                    decimal256Hl = new long[cap];
-                    decimal256Lh = new long[cap];
-                    decimal256Ll = new long[cap];
-                    break;
-            }
-        }
-
-        private void growStorage(byte type, int newCap) {
-            switch (type) {
-                case TYPE_BOOLEAN:
-                    booleanValues = Arrays.copyOf(booleanValues, newCap);
-                    break;
-                case TYPE_BYTE:
-                    byteValues = Arrays.copyOf(byteValues, newCap);
-                    break;
-                case TYPE_SHORT:
-                case TYPE_CHAR:
-                    shortValues = Arrays.copyOf(shortValues, newCap);
-                    break;
-                case TYPE_INT:
-                    intValues = Arrays.copyOf(intValues, newCap);
-                    break;
-                case TYPE_LONG:
-                case TYPE_TIMESTAMP:
-                case TYPE_TIMESTAMP_NANOS:
-                case TYPE_DATE:
-                    longValues = Arrays.copyOf(longValues, newCap);
-                    break;
-                case TYPE_FLOAT:
-                    floatValues = Arrays.copyOf(floatValues, newCap);
-                    break;
-                case TYPE_DOUBLE:
-                    doubleValues = Arrays.copyOf(doubleValues, newCap);
-                    break;
-                case TYPE_STRING:
-                case TYPE_VARCHAR:
-                    stringValues = Arrays.copyOf(stringValues, newCap);
-                    break;
-                case TYPE_SYMBOL:
-                    symbolIndices = Arrays.copyOf(symbolIndices, newCap);
-                    if (globalSymbolIds != null) {
-                        globalSymbolIds = Arrays.copyOf(globalSymbolIds, newCap);
-                    }
-                    break;
-                case TYPE_UUID:
-                    uuidHigh = Arrays.copyOf(uuidHigh, newCap);
-                    uuidLow = Arrays.copyOf(uuidLow, newCap);
-                    break;
-                case TYPE_LONG256:
-                    // Flat array: 4 longs per value
-                    long256Values = Arrays.copyOf(long256Values, newCap * 4);
-                    break;
-                case TYPE_DOUBLE_ARRAY:
-                case TYPE_LONG_ARRAY:
-                    // Array types: grow per-row tracking
-                    arrayDims = Arrays.copyOf(arrayDims, newCap);
-                    arrayRowCapacity = newCap;
-                    // Note: shapes and data arrays are grown in ensureArrayCapacity()
-                    break;
-                case TYPE_DECIMAL64:
-                    decimal64Values = Arrays.copyOf(decimal64Values, newCap);
-                    break;
-                case TYPE_DECIMAL128:
-                    decimal128High = Arrays.copyOf(decimal128High, newCap);
-                    decimal128Low = Arrays.copyOf(decimal128Low, newCap);
-                    break;
-                case TYPE_DECIMAL256:
-                    decimal256Hh = Arrays.copyOf(decimal256Hh, newCap);
-                    decimal256Hl = Arrays.copyOf(decimal256Hl, newCap);
-                    decimal256Lh = Arrays.copyOf(decimal256Lh, newCap);
-                    decimal256Ll = Arrays.copyOf(decimal256Ll, newCap);
-                    break;
-            }
         }
     }
 
     /**
      * Helper class to capture array data from DoubleArray/LongArray.appendToBufPtr().
-     * This implements ArrayBufferAppender to intercept the serialization and extract
-     * shape and data into Java arrays for storage in ColumnBuffer.
      */
     private static class ArrayCapture implements ArrayBufferAppender {
         byte nDims;
-        int[] shape = new int[32]; // Max 32 dimensions
+        int[] shape = new int[32];
         int shapeIndex;
         double[] doubleData;
         int doubleDataOffset;
@@ -1376,28 +1144,20 @@ public class QwpTableBuffer {
         int longDataOffset;
 
         @Override
-        public void putByte(byte b) {
-            if (shapeIndex == 0) {
-                // First byte is nDims
-                nDims = b;
+        public void putBlockOfBytes(long from, long len) {
+            int count = (int) (len / 8);
+            if (doubleData == null) {
+                doubleData = new double[count];
+            }
+            for (int i = 0; i < count; i++) {
+                doubleData[doubleDataOffset++] = Unsafe.getUnsafe().getDouble(from + i * 8L);
             }
         }
 
         @Override
-        public void putInt(int value) {
-            // Shape dimensions
-            if (shapeIndex < nDims) {
-                shape[shapeIndex++] = value;
-                // Once we have all dimensions, compute total elements and allocate data array
-                if (shapeIndex == nDims) {
-                    int totalElements = 1;
-                    for (int i = 0; i < nDims; i++) {
-                        totalElements *= shape[i];
-                    }
-                    // Allocate both - only one will be used
-                    doubleData = new double[totalElements];
-                    longData = new long[totalElements];
-                }
+        public void putByte(byte b) {
+            if (shapeIndex == 0) {
+                nDims = b;
             }
         }
 
@@ -1409,24 +1169,24 @@ public class QwpTableBuffer {
         }
 
         @Override
-        public void putLong(long value) {
-            if (longData != null && longDataOffset < longData.length) {
-                longData[longDataOffset++] = value;
+        public void putInt(int value) {
+            if (shapeIndex < nDims) {
+                shape[shapeIndex++] = value;
+                if (shapeIndex == nDims) {
+                    int totalElements = 1;
+                    for (int i = 0; i < nDims; i++) {
+                        totalElements *= shape[i];
+                    }
+                    doubleData = new double[totalElements];
+                    longData = new long[totalElements];
+                }
             }
         }
 
         @Override
-        public void putBlockOfBytes(long from, long len) {
-            // This is the bulk data from the array
-            // The AbstractArray uses this to copy raw bytes
-            // We need to figure out if it's doubles or longs based on context
-            // For now, assume doubles (8 bytes each) since DoubleArray uses this
-            int count = (int) (len / 8);
-            if (doubleData == null) {
-                doubleData = new double[count];
-            }
-            for (int i = 0; i < count; i++) {
-                doubleData[doubleDataOffset++] = Unsafe.getUnsafe().getDouble(from + i * 8L);
+        public void putLong(long value) {
+            if (longData != null && longDataOffset < longData.length) {
+                longData[longDataOffset++] = value;
             }
         }
     }
