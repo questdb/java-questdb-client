@@ -263,4 +263,81 @@ public class OffHeapAppendMemoryTest {
         long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
         assertEquals(before, after);
     }
+
+    @Test
+    public void testPutUtf8Ascii() {
+        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            mem.putUtf8("hello");
+            assertEquals(5, mem.getAppendOffset());
+            assertEquals('h', Unsafe.getUnsafe().getByte(mem.addressOf(0)));
+            assertEquals('e', Unsafe.getUnsafe().getByte(mem.addressOf(1)));
+            assertEquals('l', Unsafe.getUnsafe().getByte(mem.addressOf(2)));
+            assertEquals('l', Unsafe.getUnsafe().getByte(mem.addressOf(3)));
+            assertEquals('o', Unsafe.getUnsafe().getByte(mem.addressOf(4)));
+        }
+        long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        assertEquals(before, after);
+    }
+
+    @Test
+    public void testPutUtf8Empty() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            mem.putUtf8("");
+            assertEquals(0, mem.getAppendOffset());
+        }
+    }
+
+    @Test
+    public void testPutUtf8MultiByte() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            // 2-byte: U+00E9 (e-acute) = C3 A9
+            mem.putUtf8("\u00E9");
+            assertEquals(2, mem.getAppendOffset());
+            assertEquals((byte) 0xC3, Unsafe.getUnsafe().getByte(mem.addressOf(0)));
+            assertEquals((byte) 0xA9, Unsafe.getUnsafe().getByte(mem.addressOf(1)));
+        }
+    }
+
+    @Test
+    public void testPutUtf8Null() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            mem.putUtf8(null);
+            assertEquals(0, mem.getAppendOffset());
+        }
+    }
+
+    @Test
+    public void testPutUtf8SurrogatePairs() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            // U+1F600 (grinning face) = F0 9F 98 80
+            mem.putUtf8("\uD83D\uDE00");
+            assertEquals(4, mem.getAppendOffset());
+            assertEquals((byte) 0xF0, Unsafe.getUnsafe().getByte(mem.addressOf(0)));
+            assertEquals((byte) 0x9F, Unsafe.getUnsafe().getByte(mem.addressOf(1)));
+            assertEquals((byte) 0x98, Unsafe.getUnsafe().getByte(mem.addressOf(2)));
+            assertEquals((byte) 0x80, Unsafe.getUnsafe().getByte(mem.addressOf(3)));
+        }
+    }
+
+    @Test
+    public void testPutUtf8ThreeByte() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            // 3-byte: U+4E16 (CJK character) = E4 B8 96
+            mem.putUtf8("\u4E16");
+            assertEquals(3, mem.getAppendOffset());
+            assertEquals((byte) 0xE4, Unsafe.getUnsafe().getByte(mem.addressOf(0)));
+            assertEquals((byte) 0xB8, Unsafe.getUnsafe().getByte(mem.addressOf(1)));
+            assertEquals((byte) 0x96, Unsafe.getUnsafe().getByte(mem.addressOf(2)));
+        }
+    }
+
+    @Test
+    public void testPutUtf8Mixed() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            // Mix: ASCII "A" (1 byte) + e-acute (2 bytes) + CJK (3 bytes) + emoji (4 bytes) = 10 bytes
+            mem.putUtf8("A\u00E9\u4E16\uD83D\uDE00");
+            assertEquals(10, mem.getAppendOffset());
+        }
+    }
 }

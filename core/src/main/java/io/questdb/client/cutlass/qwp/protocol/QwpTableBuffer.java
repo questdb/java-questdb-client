@@ -52,16 +52,16 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  */
 public class QwpTableBuffer implements QuietCloseable {
 
-    private final String tableName;
-    private final ObjList<ColumnBuffer> columns;
     private final CharSequenceIntHashMap columnNameToIndex;
-    private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
+    private final ObjList<ColumnBuffer> columns;
+    private final String tableName;
+    private QwpColumnDef[] cachedColumnDefs;
     private int columnAccessCursor; // tracks expected next column index
+    private boolean columnDefsCacheValid;
+    private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int rowCount;
     private long schemaHash;
     private boolean schemaHashComputed;
-    private QwpColumnDef[] cachedColumnDefs;
-    private boolean columnDefsCacheValid;
 
     public QwpTableBuffer(String tableName) {
         this.tableName = tableName;
@@ -156,7 +156,7 @@ public class QwpTableBuffer implements QuietCloseable {
             if (candidate.name.equals(name)) {
                 columnAccessCursor++;
                 if (candidate.type != type) {
-                    throw new IllegalArgumentException(
+                    throw new LineSenderException(
                             "Column type mismatch for " + name + ": existing=" + candidate.type + " new=" + type
                     );
                 }
@@ -169,7 +169,7 @@ public class QwpTableBuffer implements QuietCloseable {
         if (idx != CharSequenceIntHashMap.NO_ENTRY_VALUE) {
             ColumnBuffer existing = columns.get(idx);
             if (existing.type != type) {
-                throw new IllegalArgumentException(
+                throw new LineSenderException(
                         "Column type mismatch for " + name + ": existing=" + existing.type + " new=" + type
                 );
             }
@@ -291,53 +291,103 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Helper class to capture array data from DoubleArray/LongArray.appendToBufPtr().
+     */
+    private static class ArrayCapture implements ArrayBufferAppender {
+        double[] doubleData;
+        int doubleDataOffset;
+        long[] longData;
+        int longDataOffset;
+        byte nDims;
+        int[] shape = new int[32];
+        int shapeIndex;
+
+        @Override
+        public void putBlockOfBytes(long from, long len) {
+            int count = (int) (len / 8);
+            if (doubleData == null) {
+                doubleData = new double[count];
+            }
+            for (int i = 0; i < count; i++) {
+                doubleData[doubleDataOffset++] = Unsafe.getUnsafe().getDouble(from + i * 8L);
+            }
+        }
+
+        @Override
+        public void putByte(byte b) {
+            if (shapeIndex == 0) {
+                nDims = b;
+            }
+        }
+
+        @Override
+        public void putDouble(double value) {
+            if (doubleData != null && doubleDataOffset < doubleData.length) {
+                doubleData[doubleDataOffset++] = value;
+            }
+        }
+
+        @Override
+        public void putInt(int value) {
+            if (shapeIndex < nDims) {
+                shape[shapeIndex++] = value;
+                if (shapeIndex == nDims) {
+                    int totalElements = 1;
+                    for (int i = 0; i < nDims; i++) {
+                        totalElements *= shape[i];
+                    }
+                    doubleData = new double[totalElements];
+                    longData = new long[totalElements];
+                }
+            }
+        }
+
+        @Override
+        public void putLong(long value) {
+            if (longData != null && longDataOffset < longData.length) {
+                longData[longDataOffset++] = value;
+            }
+        }
+    }
+
+    /**
      * Column buffer for a single column.
      * <p>
      * Fixed-width data is stored off-heap in {@link OffHeapAppendMemory} for zero-GC
      * operation and efficient bulk copy to network buffers.
      */
     public static class ColumnBuffer implements QuietCloseable {
-        final String name;
-        final byte type;
-        final boolean nullable;
         final int elemSize;
-
-        private int size;         // Total row count (including nulls)
-        private int valueCount;   // Actual stored values (excludes nulls)
-
-        // Off-heap data buffer for fixed-width types
-        private OffHeapAppendMemory dataBuffer;
-
-        // Off-heap auxiliary buffer for global symbol IDs (SYMBOL type only)
-        private OffHeapAppendMemory auxBuffer;
-
-        // Off-heap null bitmap (bit-packed, 1 bit per row)
-        private long nullBufPtr;
-        private int nullBufCapRows;
-        private boolean hasNulls;
-
-        // On-heap capacity for variable-width arrays (string values, array dims)
-        private int onHeapCapacity;
-
-        // On-heap storage for variable-width types
-        private String[] stringValues;
-
+        final String name;
+        final boolean nullable;
+        final byte type;
+        private final Decimal256 rescaleTemp = new Decimal256();
+        private int arrayDataOffset;
         // Array storage (double/long arrays - variable length per row)
         private byte[] arrayDims;
-        private int[] arrayShapes;
         private int arrayShapeOffset;
+        private int[] arrayShapes;
+        // Off-heap auxiliary buffer for global symbol IDs (SYMBOL type only)
+        private OffHeapAppendMemory auxBuffer;
+        // Off-heap data buffer for fixed-width types
+        private OffHeapAppendMemory dataBuffer;
+        // Decimal storage
+        private byte decimalScale = -1;
         private double[] doubleArrayData;
+        private boolean hasNulls;
         private long[] longArrayData;
-        private int arrayDataOffset;
-
+        private int maxGlobalSymbolId = -1;
+        private int nullBufCapRows;
+        // Off-heap null bitmap (bit-packed, 1 bit per row)
+        private long nullBufPtr;
+        private int size;         // Total row count (including nulls)
+        private OffHeapAppendMemory stringData;
+        // Off-heap storage for string/varchar column data
+        private OffHeapAppendMemory stringOffsets;
         // Symbol specific (dictionary stays on-heap)
         private CharSequenceIntHashMap symbolDict;
         private ObjList<String> symbolList;
-        private int maxGlobalSymbolId = -1;
-
-        // Decimal storage
-        private byte decimalScale = -1;
-        private final Decimal256 rescaleTemp = new Decimal256();
+        private int valueCount;   // Actual stored values (excludes nulls)
 
         public ColumnBuffer(String name, byte type, boolean nullable) {
             this.name = name;
@@ -347,7 +397,6 @@ public class QwpTableBuffer implements QuietCloseable {
             this.size = 0;
             this.valueCount = 0;
             this.hasNulls = false;
-            this.onHeapCapacity = 16;
 
             allocateStorage(type);
             if (nullable) {
@@ -358,12 +407,14 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addBoolean(boolean value) {
+            ensureNullBitmapForNonNull();
             dataBuffer.putByte(value ? (byte) 1 : (byte) 0);
             valueCount++;
             size++;
         }
 
         public void addByte(byte value) {
+            ensureNullBitmapForNonNull();
             dataBuffer.putByte(value);
             valueCount++;
             size++;
@@ -374,6 +425,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
+            ensureNullBitmapForNonNull();
             if (decimalScale == -1) {
                 decimalScale = (byte) value.getScale();
             } else if (decimalScale != value.getScale()) {
@@ -397,6 +449,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
+            ensureNullBitmapForNonNull();
             Decimal256 src = value;
             if (decimalScale == -1) {
                 decimalScale = (byte) value.getScale();
@@ -418,6 +471,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
+            ensureNullBitmapForNonNull();
             if (decimalScale == -1) {
                 decimalScale = (byte) value.getScale();
                 dataBuffer.putLong(value.getValue());
@@ -434,6 +488,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addDouble(double value) {
+            ensureNullBitmapForNonNull();
             dataBuffer.putDouble(value);
             valueCount++;
             size++;
@@ -534,24 +589,28 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addFloat(float value) {
+            ensureNullBitmapForNonNull();
             dataBuffer.putFloat(value);
             valueCount++;
             size++;
         }
 
         public void addInt(int value) {
+            ensureNullBitmapForNonNull();
             dataBuffer.putInt(value);
             valueCount++;
             size++;
         }
 
         public void addLong(long value) {
+            ensureNullBitmapForNonNull();
             dataBuffer.putLong(value);
             valueCount++;
             size++;
         }
 
         public void addLong256(long l0, long l1, long l2, long l3) {
+            ensureNullBitmapForNonNull();
             dataBuffer.putLong(l0);
             dataBuffer.putLong(l1);
             dataBuffer.putLong(l2);
@@ -689,8 +748,7 @@ public class QwpTableBuffer implements QuietCloseable {
                         break;
                     case TYPE_STRING:
                     case TYPE_VARCHAR:
-                        ensureOnHeapCapacity();
-                        stringValues[valueCount] = null;
+                        stringOffsets.putInt((int) stringData.getAppendOffset());
                         break;
                     case TYPE_SYMBOL:
                         dataBuffer.putInt(-1);
@@ -725,6 +783,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addShort(short value) {
+            ensureNullBitmapForNonNull();
             dataBuffer.putShort(value);
             valueCount++;
             size++;
@@ -734,12 +793,15 @@ public class QwpTableBuffer implements QuietCloseable {
             if (value == null && nullable) {
                 ensureNullCapacity(size + 1);
                 markNull(size);
-                size++;
             } else {
-                ensureOnHeapCapacity();
-                stringValues[valueCount++] = value;
-                size++;
+                ensureNullBitmapForNonNull();
+                if (value != null) {
+                    stringData.putUtf8(value);
+                }
+                stringOffsets.putInt((int) stringData.getAppendOffset());
+                valueCount++;
             }
+            size++;
         }
 
         public void addSymbol(String value) {
@@ -748,8 +810,8 @@ public class QwpTableBuffer implements QuietCloseable {
                     ensureNullCapacity(size + 1);
                     markNull(size);
                 }
-                size++;
             } else {
+                ensureNullBitmapForNonNull();
                 int idx = symbolDict.get(value);
                 if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
                     idx = symbolList.size();
@@ -758,8 +820,8 @@ public class QwpTableBuffer implements QuietCloseable {
                 }
                 dataBuffer.putInt(idx);
                 valueCount++;
-                size++;
             }
+            size++;
         }
 
         public void addSymbolWithGlobalId(String value, int globalId) {
@@ -770,6 +832,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 }
                 size++;
             } else {
+                ensureNullBitmapForNonNull();
                 int localIdx = symbolDict.get(value);
                 if (localIdx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
                     localIdx = symbolList.size();
@@ -793,6 +856,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addUuid(long high, long low) {
+            ensureNullBitmapForNonNull();
             // Store in wire order: lo first, hi second
             dataBuffer.putLong(low);
             dataBuffer.putLong(high);
@@ -810,6 +874,14 @@ public class QwpTableBuffer implements QuietCloseable {
                 auxBuffer.close();
                 auxBuffer = null;
             }
+            if (stringOffsets != null) {
+                stringOffsets.close();
+                stringOffsets = null;
+            }
+            if (stringData != null) {
+                stringData.close();
+                stringData = null;
+            }
             if (nullBufPtr != 0) {
                 Unsafe.free(nullBufPtr, (long) nullBufCapRows >>> 3, MemoryTag.NATIVE_ILP_RSS);
                 nullBufPtr = 0;
@@ -825,12 +897,12 @@ public class QwpTableBuffer implements QuietCloseable {
             return arrayDims;
         }
 
-        public int[] getArrayShapes() {
-            return arrayShapes;
-        }
-
         public int getArrayShapeOffset() {
             return arrayShapeOffset;
+        }
+
+        public int[] getArrayShapes() {
+            return arrayShapes;
         }
 
         /**
@@ -883,28 +955,20 @@ public class QwpTableBuffer implements QuietCloseable {
             return nullBufPtr;
         }
 
-        /**
-         * Returns the bit-packed null bitmap as a long array.
-         * This creates a new array from off-heap data.
-         */
-        public long[] getNullBitmapPacked() {
-            if (nullBufPtr == 0) {
-                return null;
-            }
-            int longCount = (size + 63) >>> 6;
-            long[] result = new long[longCount];
-            for (int i = 0; i < longCount; i++) {
-                result[i] = Unsafe.getUnsafe().getLong(nullBufPtr + (long) i * 8);
-            }
-            return result;
-        }
-
         public int getSize() {
             return size;
         }
 
-        public String[] getStringValues() {
-            return stringValues;
+        public long getStringDataAddress() {
+            return stringData != null ? stringData.pageAddress() : 0;
+        }
+
+        public long getStringDataSize() {
+            return stringData != null ? stringData.getAppendOffset() : 0;
+        }
+
+        public long getStringOffsetsAddress() {
+            return stringOffsets != null ? stringOffsets.pageAddress() : 0;
         }
 
         public String[] getSymbolDictionary() {
@@ -952,6 +1016,13 @@ public class QwpTableBuffer implements QuietCloseable {
             }
             if (auxBuffer != null) {
                 auxBuffer.truncate();
+            }
+            if (stringOffsets != null) {
+                stringOffsets.truncate();
+                stringOffsets.putInt(0); // re-seed initial 0 offset
+            }
+            if (stringData != null) {
+                stringData.truncate();
             }
             if (nullBufPtr != 0) {
                 Vect.memset(nullBufPtr, (long) nullBufCapRows >>> 3, 0);
@@ -1003,6 +1074,13 @@ public class QwpTableBuffer implements QuietCloseable {
                 dataBuffer.jumpTo((long) newValueCount * elemSize);
             }
 
+            // Rewind string buffers
+            if (stringOffsets != null) {
+                int dataOffset = Unsafe.getUnsafe().getInt(stringOffsets.pageAddress() + (long) newValueCount * 4);
+                stringData.jumpTo(dataOffset);
+                stringOffsets.jumpTo((long) (newValueCount + 1) * 4);
+            }
+
             // Rewind aux buffer (symbol global IDs)
             if (auxBuffer != null) {
                 auxBuffer.jumpTo((long) newValueCount * 4);
@@ -1036,7 +1114,9 @@ public class QwpTableBuffer implements QuietCloseable {
                     break;
                 case TYPE_STRING:
                 case TYPE_VARCHAR:
-                    stringValues = new String[onHeapCapacity];
+                    stringOffsets = new OffHeapAppendMemory(64);
+                    stringOffsets.putInt(0); // seed initial 0 offset
+                    stringData = new OffHeapAppendMemory(256);
                     break;
                 case TYPE_SYMBOL:
                     dataBuffer = new OffHeapAppendMemory(64);
@@ -1051,7 +1131,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     break;
                 case TYPE_DOUBLE_ARRAY:
                 case TYPE_LONG_ARRAY:
-                    arrayDims = new byte[onHeapCapacity];
+                    arrayDims = new byte[16];
                     break;
                 case TYPE_DECIMAL64:
                     dataBuffer = new OffHeapAppendMemory(128);
@@ -1101,6 +1181,12 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
+        private void ensureNullBitmapForNonNull() {
+            if (nullBufPtr != 0) {
+                ensureNullCapacity(size + 1);
+            }
+        }
+
         private void ensureNullCapacity(int rows) {
             if (rows > nullBufCapRows) {
                 int newCapRows = Math.max(nullBufCapRows * 2, ((rows + 63) >>> 6) << 6);
@@ -1112,82 +1198,12 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
-        private void ensureOnHeapCapacity() {
-            if (valueCount >= onHeapCapacity) {
-                int newCapacity = onHeapCapacity * 2;
-                if (stringValues != null) {
-                    stringValues = Arrays.copyOf(stringValues, newCapacity);
-                }
-                onHeapCapacity = newCapacity;
-            }
-        }
-
         private void markNull(int index) {
             long longAddr = nullBufPtr + ((long) (index >>> 6)) * 8;
             int bitIndex = index & 63;
             long current = Unsafe.getUnsafe().getLong(longAddr);
             Unsafe.getUnsafe().putLong(longAddr, current | (1L << bitIndex));
             hasNulls = true;
-        }
-    }
-
-    /**
-     * Helper class to capture array data from DoubleArray/LongArray.appendToBufPtr().
-     */
-    private static class ArrayCapture implements ArrayBufferAppender {
-        byte nDims;
-        int[] shape = new int[32];
-        int shapeIndex;
-        double[] doubleData;
-        int doubleDataOffset;
-        long[] longData;
-        int longDataOffset;
-
-        @Override
-        public void putBlockOfBytes(long from, long len) {
-            int count = (int) (len / 8);
-            if (doubleData == null) {
-                doubleData = new double[count];
-            }
-            for (int i = 0; i < count; i++) {
-                doubleData[doubleDataOffset++] = Unsafe.getUnsafe().getDouble(from + i * 8L);
-            }
-        }
-
-        @Override
-        public void putByte(byte b) {
-            if (shapeIndex == 0) {
-                nDims = b;
-            }
-        }
-
-        @Override
-        public void putDouble(double value) {
-            if (doubleData != null && doubleDataOffset < doubleData.length) {
-                doubleData[doubleDataOffset++] = value;
-            }
-        }
-
-        @Override
-        public void putInt(int value) {
-            if (shapeIndex < nDims) {
-                shape[shapeIndex++] = value;
-                if (shapeIndex == nDims) {
-                    int totalElements = 1;
-                    for (int i = 0; i < nDims; i++) {
-                        totalElements *= shape[i];
-                    }
-                    doubleData = new double[totalElements];
-                    longData = new long[totalElements];
-                }
-            }
-        }
-
-        @Override
-        public void putLong(long value) {
-            if (longData != null && longDataOffset < longData.length) {
-                longData[longDataOffset++] = value;
-            }
         }
     }
 }

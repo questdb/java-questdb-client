@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.protocol.QwpColumnDef;
 import io.questdb.client.cutlass.qwp.protocol.QwpGorillaEncoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
@@ -204,7 +205,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                 break;
             case TYPE_STRING:
             case TYPE_VARCHAR:
-                writeStringColumn(col.getStringValues(), valueCount);
+                writeStringColumn(col, valueCount);
                 break;
             case TYPE_SYMBOL:
                 writeSymbolColumn(col, valueCount);
@@ -233,7 +234,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                 writeDecimal256Column(col.getDecimalScale(), dataAddr, valueCount);
                 break;
             default:
-                throw new IllegalStateException("Unknown column type: " + col.getType());
+                throw new LineSenderException("Unknown column type: " + col.getType());
         }
     }
 
@@ -281,7 +282,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                     break;
                 case TYPE_STRING:
                 case TYPE_VARCHAR:
-                    writeStringColumn(col.getStringValues(), valueCount);
+                    writeStringColumn(col, valueCount);
                     break;
                 case TYPE_UUID:
                     buffer.putBlockOfBytes(dataAddr, (long) valueCount * 16);
@@ -305,7 +306,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                     writeDecimal256Column(col.getDecimalScale(), dataAddr, valueCount);
                     break;
                 default:
-                    throw new IllegalStateException("Unknown column type: " + col.getType());
+                    throw new LineSenderException("Unknown column type: " + col.getType());
             }
         }
     }
@@ -482,28 +483,11 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    private void writeStringColumn(String[] strings, int count) {
-        int totalDataLen = 0;
-        for (int i = 0; i < count; i++) {
-            if (strings[i] != null) {
-                totalDataLen += QwpBufferWriter.utf8Length(strings[i]);
-            }
-        }
-
-        int runningOffset = 0;
-        buffer.putInt(0);
-        for (int i = 0; i < count; i++) {
-            if (strings[i] != null) {
-                runningOffset += QwpBufferWriter.utf8Length(strings[i]);
-            }
-            buffer.putInt(runningOffset);
-        }
-
-        for (int i = 0; i < count; i++) {
-            if (strings[i] != null) {
-                buffer.putUtf8(strings[i]);
-            }
-        }
+    private void writeStringColumn(QwpTableBuffer.ColumnBuffer col, int valueCount) {
+        // Offset array: (valueCount + 1) int32 values, pre-built in wire format
+        buffer.putBlockOfBytes(col.getStringOffsetsAddress(), (long) (valueCount + 1) * 4);
+        // UTF-8 data: raw bytes, contiguous
+        buffer.putBlockOfBytes(col.getStringDataAddress(), col.getStringDataSize());
     }
 
     /**

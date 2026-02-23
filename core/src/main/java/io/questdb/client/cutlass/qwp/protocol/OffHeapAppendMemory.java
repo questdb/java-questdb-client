@@ -132,6 +132,38 @@ public class OffHeapAppendMemory implements QuietCloseable {
     }
 
     /**
+     * Encodes a Java String to UTF-8 directly into the off-heap buffer.
+     * Pre-ensures worst-case capacity to avoid per-byte checks.
+     */
+    public void putUtf8(String value) {
+        if (value == null || value.isEmpty()) {
+            return;
+        }
+        int len = value.length();
+        ensureCapacity((long) len * 4); // worst case: all supplementary chars
+        for (int i = 0; i < len; i++) {
+            char c = value.charAt(i);
+            if (c < 0x80) {
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) c);
+            } else if (c < 0x800) {
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xC0 | (c >> 6)));
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (c & 0x3F)));
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
+                char c2 = value.charAt(++i);
+                int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xF0 | (codePoint >> 18)));
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((codePoint >> 12) & 0x3F)));
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((codePoint >> 6) & 0x3F)));
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (codePoint & 0x3F)));
+            } else {
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xE0 | (c >> 12)));
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((c >> 6) & 0x3F)));
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | (c & 0x3F)));
+            }
+        }
+    }
+
+    /**
      * Advances the append position by the given number of bytes without writing.
      */
     public void skip(long bytes) {
