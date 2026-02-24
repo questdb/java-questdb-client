@@ -93,6 +93,12 @@ public abstract class WebSocketClient implements QuietCloseable {
     private boolean upgraded;
     private boolean closed;
 
+    // Fragmentation state (RFC 6455 Section 5.4)
+    private int fragmentOpcode = -1;   // opcode of first fragment, -1 = not in a fragmented message
+    private long fragmentBufPtr;       // native buffer for accumulating fragment payloads
+    private int fragmentBufSize;
+    private int fragmentBufPos;
+
     // Handshake key for verification
     private String handshakeKey;
 
@@ -138,6 +144,11 @@ public abstract class WebSocketClient implements QuietCloseable {
             sendBuffer.close();
             controlFrameBuffer.close();
 
+            if (fragmentBufPtr != 0) {
+                Unsafe.free(fragmentBufPtr, fragmentBufSize, MemoryTag.NATIVE_DEFAULT);
+                fragmentBufPtr = 0;
+            }
+
             if (recvBufPtr != 0) {
                 Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
                 recvBufPtr = 0;
@@ -156,6 +167,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         port = 0;
         recvPos = 0;
         recvReadPos = 0;
+        resetFragmentState();
     }
 
     /**
@@ -625,13 +637,40 @@ public abstract class WebSocketClient implements QuietCloseable {
                     }
                     break;
                 case WebSocketOpcode.BINARY:
-                    if (handler != null) {
-                        handler.onBinaryMessage(payloadPtr, payloadLen);
+                case WebSocketOpcode.TEXT:
+                    if (frameParser.isFin()) {
+                        if (fragmentOpcode != -1) {
+                            throw new HttpClientException("WebSocket protocol error: new data frame during fragmented message");
+                        }
+                        if (handler != null) {
+                            if (opcode == WebSocketOpcode.BINARY) {
+                                handler.onBinaryMessage(payloadPtr, payloadLen);
+                            } else {
+                                handler.onTextMessage(payloadPtr, payloadLen);
+                            }
+                        }
+                    } else {
+                        if (fragmentOpcode != -1) {
+                            throw new HttpClientException("WebSocket protocol error: new data frame during fragmented message");
+                        }
+                        fragmentOpcode = opcode;
+                        appendToFragmentBuffer(payloadPtr, payloadLen);
                     }
                     break;
-                case WebSocketOpcode.TEXT:
-                    if (handler != null) {
-                        handler.onTextMessage(payloadPtr, payloadLen);
+                case WebSocketOpcode.CONTINUATION:
+                    if (fragmentOpcode == -1) {
+                        throw new HttpClientException("WebSocket protocol error: continuation frame without initial fragment");
+                    }
+                    appendToFragmentBuffer(payloadPtr, payloadLen);
+                    if (frameParser.isFin()) {
+                        if (handler != null) {
+                            if (fragmentOpcode == WebSocketOpcode.BINARY) {
+                                handler.onBinaryMessage(fragmentBufPtr, fragmentBufPos);
+                            } else {
+                                handler.onTextMessage(fragmentBufPtr, fragmentBufPos);
+                            }
+                        }
+                        resetFragmentState();
                     }
                     break;
             }
@@ -668,6 +707,28 @@ public abstract class WebSocketClient implements QuietCloseable {
         } catch (Exception e) {
             LOG.error("Failed to send pong: {}", e.getMessage());
         }
+    }
+
+    private void appendToFragmentBuffer(long payloadPtr, int payloadLen) {
+        if (payloadLen == 0) {
+            return;
+        }
+        int required = fragmentBufPos + payloadLen;
+        if (fragmentBufPtr == 0) {
+            fragmentBufSize = Math.max(required, DEFAULT_RECV_BUFFER_SIZE);
+            fragmentBufPtr = Unsafe.malloc(fragmentBufSize, MemoryTag.NATIVE_DEFAULT);
+        } else if (required > fragmentBufSize) {
+            int newSize = Math.max(fragmentBufSize * 2, required);
+            fragmentBufPtr = Unsafe.realloc(fragmentBufPtr, fragmentBufSize, newSize, MemoryTag.NATIVE_DEFAULT);
+            fragmentBufSize = newSize;
+        }
+        Vect.memmove(fragmentBufPtr + fragmentBufPos, payloadPtr, payloadLen);
+        fragmentBufPos += payloadLen;
+    }
+
+    private void resetFragmentState() {
+        fragmentOpcode = -1;
+        fragmentBufPos = 0;
     }
 
     private void compactRecvBuffer() {
