@@ -27,9 +27,7 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.line.LineSenderException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
-import io.questdb.client.std.Unsafe;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -61,10 +59,6 @@ public class ResponseReader implements QuietCloseable {
     private final CountDownLatch shutdownLatch;
     private final WebSocketResponse response;
 
-    // Buffer for parsing responses
-    private final long parseBufferPtr;
-    private final int parseBufferSize;
-
     // State
     private volatile boolean running;
     private volatile Throwable lastError;
@@ -90,10 +84,6 @@ public class ResponseReader implements QuietCloseable {
         this.channel = channel;
         this.inFlightWindow = inFlightWindow;
         this.response = new WebSocketResponse();
-
-        // Allocate parse buffer (enough for max response)
-        this.parseBufferSize = 2048;
-        this.parseBufferPtr = Unsafe.malloc(parseBufferSize, MemoryTag.NATIVE_DEFAULT);
 
         this.running = true;
         this.shutdownLatch = new CountDownLatch(1);
@@ -149,11 +139,6 @@ public class ResponseReader implements QuietCloseable {
             shutdownLatch.await(DEFAULT_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-        }
-
-        // Free parse buffer
-        if (parseBufferPtr != 0) {
-            Unsafe.free(parseBufferPtr, parseBufferSize, MemoryTag.NATIVE_DEFAULT);
         }
 
         LOG.info("Response reader closed [totalAcks={}, totalErrors={}]", totalAcks.get(), totalErrors.get());
