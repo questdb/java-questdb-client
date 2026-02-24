@@ -595,9 +595,7 @@ public class WebSocketChannel implements QuietCloseable {
         // Copy to temp array for socket write (unavoidable with OutputStream)
         // Use separate write buffer to avoid race with read thread
         byte[] temp = getWriteTempBuffer(len);
-        for (int i = 0; i < len; i++) {
-            temp[i] = Unsafe.getUnsafe().getByte(ptr + i);
-        }
+        Unsafe.getUnsafe().copyMemory(null, ptr, temp, Unsafe.BYTE_OFFSET, len);
         out.write(temp, 0, len);
         out.flush();
     }
@@ -618,9 +616,7 @@ public class WebSocketChannel implements QuietCloseable {
         byte[] temp = getReadTempBuffer(available);
         int bytesRead = in.read(temp, 0, available);
         if (bytesRead > 0) {
-            for (int i = 0; i < bytesRead; i++) {
-                Unsafe.getUnsafe().putByte(recvBufferPtr + recvBufferPos + i, temp[i]);
-            }
+            Unsafe.getUnsafe().copyMemory(temp, Unsafe.BYTE_OFFSET, null, recvBufferPtr + recvBufferPos, bytesRead);
             recvBufferPos += bytesRead;
         }
         return bytesRead;
