@@ -296,20 +296,38 @@ public class QwpTableBuffer implements QuietCloseable {
     private static class ArrayCapture implements ArrayBufferAppender {
         double[] doubleData;
         int doubleDataOffset;
+        private boolean forLong;
         long[] longData;
         int longDataOffset;
         byte nDims;
-        int[] shape = new int[32];
-        int shapeIndex;
+        final int[] shape = new int[32];
+        private int shapeIndex;
+
+        void reset(boolean forLong) {
+            this.forLong = forLong;
+            shapeIndex = 0;
+            nDims = 0;
+            doubleDataOffset = 0;
+            longDataOffset = 0;
+        }
 
         @Override
         public void putBlockOfBytes(long from, long len) {
             int count = (int) (len / 8);
-            if (doubleData == null) {
-                doubleData = new double[count];
-            }
-            for (int i = 0; i < count; i++) {
-                doubleData[doubleDataOffset++] = Unsafe.getUnsafe().getDouble(from + i * 8L);
+            if (forLong) {
+                if (longData == null || longData.length < count) {
+                    longData = new long[count];
+                }
+                for (int i = 0; i < count; i++) {
+                    longData[longDataOffset++] = Unsafe.getUnsafe().getLong(from + i * 8L);
+                }
+            } else {
+                if (doubleData == null || doubleData.length < count) {
+                    doubleData = new double[count];
+                }
+                for (int i = 0; i < count; i++) {
+                    doubleData[doubleDataOffset++] = Unsafe.getUnsafe().getDouble(from + i * 8L);
+                }
             }
         }
 
@@ -336,8 +354,15 @@ public class QwpTableBuffer implements QuietCloseable {
                     for (int i = 0; i < nDims; i++) {
                         totalElements *= shape[i];
                     }
-                    doubleData = new double[totalElements];
-                    longData = new long[totalElements];
+                    if (forLong) {
+                        if (longData == null || longData.length < totalElements) {
+                            longData = new long[totalElements];
+                        }
+                    } else {
+                        if (doubleData == null || doubleData.length < totalElements) {
+                            doubleData = new double[totalElements];
+                        }
+                    }
                 }
             }
         }
@@ -362,6 +387,7 @@ public class QwpTableBuffer implements QuietCloseable {
         final boolean nullable;
         final byte type;
         private final Decimal256 rescaleTemp = new Decimal256();
+        private ArrayCapture arrayCapture;
         private int arrayDataOffset;
         // Array storage (double/long arrays - variable length per row)
         private byte[] arrayDims;
@@ -573,16 +599,16 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ArrayCapture capture = new ArrayCapture();
-            array.appendToBufPtr(capture);
+            arrayCapture.reset(false);
+            array.appendToBufPtr(arrayCapture);
 
-            ensureArrayCapacity(capture.nDims, capture.doubleDataOffset);
-            arrayDims[valueCount] = capture.nDims;
-            for (int i = 0; i < capture.nDims; i++) {
-                arrayShapes[arrayShapeOffset++] = capture.shape[i];
+            ensureArrayCapacity(arrayCapture.nDims, arrayCapture.doubleDataOffset);
+            arrayDims[valueCount] = arrayCapture.nDims;
+            for (int i = 0; i < arrayCapture.nDims; i++) {
+                arrayShapes[arrayShapeOffset++] = arrayCapture.shape[i];
             }
-            for (int i = 0; i < capture.doubleDataOffset; i++) {
-                doubleArrayData[arrayDataOffset++] = capture.doubleData[i];
+            for (int i = 0; i < arrayCapture.doubleDataOffset; i++) {
+                doubleArrayData[arrayDataOffset++] = arrayCapture.doubleData[i];
             }
             valueCount++;
             size++;
@@ -698,16 +724,16 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ArrayCapture capture = new ArrayCapture();
-            array.appendToBufPtr(capture);
+            arrayCapture.reset(true);
+            array.appendToBufPtr(arrayCapture);
 
-            ensureArrayCapacity(capture.nDims, capture.longDataOffset);
-            arrayDims[valueCount] = capture.nDims;
-            for (int i = 0; i < capture.nDims; i++) {
-                arrayShapes[arrayShapeOffset++] = capture.shape[i];
+            ensureArrayCapacity(arrayCapture.nDims, arrayCapture.longDataOffset);
+            arrayDims[valueCount] = arrayCapture.nDims;
+            for (int i = 0; i < arrayCapture.nDims; i++) {
+                arrayShapes[arrayShapeOffset++] = arrayCapture.shape[i];
             }
-            for (int i = 0; i < capture.longDataOffset; i++) {
-                longArrayData[arrayDataOffset++] = capture.longData[i];
+            for (int i = 0; i < arrayCapture.longDataOffset; i++) {
+                longArrayData[arrayDataOffset++] = arrayCapture.longData[i];
             }
             valueCount++;
             size++;
@@ -1148,6 +1174,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 case TYPE_DOUBLE_ARRAY:
                 case TYPE_LONG_ARRAY:
                     arrayDims = new byte[16];
+                    arrayCapture = new ArrayCapture();
                     break;
                 case TYPE_DECIMAL64:
                     dataBuffer = new OffHeapAppendMemory(128);

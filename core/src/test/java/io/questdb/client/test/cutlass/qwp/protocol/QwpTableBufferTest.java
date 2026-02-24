@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.protocol;
 
+import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import org.junit.Test;
@@ -211,6 +212,169 @@ public class QwpTableBufferTest {
                     encoded,
                     0.0
             );
+        }
+    }
+
+    @Test
+    public void testDoubleArrayWrapperMultipleRows() {
+        try (QwpTableBuffer table = new QwpTableBuffer("test");
+             DoubleArray arr = new DoubleArray(3)) {
+            QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("arr", QwpConstants.TYPE_DOUBLE_ARRAY, false);
+
+            arr.append(1.0).append(2.0).append(3.0);
+            col.addDoubleArray(arr);
+            table.nextRow();
+
+            // DoubleArray auto-wraps, so just append next row's data
+            arr.append(4.0).append(5.0).append(6.0);
+            col.addDoubleArray(arr);
+            table.nextRow();
+
+            arr.append(7.0).append(8.0).append(9.0);
+            col.addDoubleArray(arr);
+            table.nextRow();
+
+            assertEquals(3, col.getValueCount());
+            double[] encoded = readDoubleArraysLikeEncoder(col);
+            assertArrayEquals(
+                    new double[]{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0},
+                    encoded,
+                    0.0
+            );
+
+            byte[] dims = col.getArrayDims();
+            int[] shapes = col.getArrayShapes();
+            for (int i = 0; i < 3; i++) {
+                assertEquals(1, dims[i]);
+                assertEquals(3, shapes[i]);
+            }
+        }
+    }
+
+    @Test
+    public void testDoubleArrayWrapperShrinkingSize() {
+        try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+            QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("arr", QwpConstants.TYPE_DOUBLE_ARRAY, false);
+
+            // Row 0: large array (5 elements)
+            try (DoubleArray big = new DoubleArray(5)) {
+                big.append(1.0).append(2.0).append(3.0).append(4.0).append(5.0);
+                col.addDoubleArray(big);
+                table.nextRow();
+            }
+
+            // Row 1: smaller array (2 elements) — must not see leftover data from row 0
+            try (DoubleArray small = new DoubleArray(2)) {
+                small.append(10.0).append(20.0);
+                col.addDoubleArray(small);
+                table.nextRow();
+            }
+
+            assertEquals(2, col.getValueCount());
+            double[] encoded = readDoubleArraysLikeEncoder(col);
+            assertArrayEquals(
+                    new double[]{1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0},
+                    encoded,
+                    0.0
+            );
+
+            int[] shapes = col.getArrayShapes();
+            assertEquals(5, shapes[0]);
+            assertEquals(2, shapes[1]);
+        }
+    }
+
+    @Test
+    public void testDoubleArrayWrapperVaryingDimensionality() {
+        try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+            QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("arr", QwpConstants.TYPE_DOUBLE_ARRAY, false);
+
+            // Row 0: 2D array (2x2)
+            try (DoubleArray matrix = new DoubleArray(2, 2)) {
+                matrix.append(1.0).append(2.0).append(3.0).append(4.0);
+                col.addDoubleArray(matrix);
+                table.nextRow();
+            }
+
+            // Row 1: 1D array (3 elements) — different dimensionality
+            try (DoubleArray vec = new DoubleArray(3)) {
+                vec.append(10.0).append(20.0).append(30.0);
+                col.addDoubleArray(vec);
+                table.nextRow();
+            }
+
+            assertEquals(2, col.getValueCount());
+
+            byte[] dims = col.getArrayDims();
+            assertEquals(2, dims[0]);
+            assertEquals(1, dims[1]);
+
+            int[] shapes = col.getArrayShapes();
+            // Row 0: shape [2, 2]
+            assertEquals(2, shapes[0]);
+            assertEquals(2, shapes[1]);
+            // Row 1: shape [3]
+            assertEquals(3, shapes[2]);
+
+            double[] encoded = readDoubleArraysLikeEncoder(col);
+            assertArrayEquals(
+                    new double[]{1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0},
+                    encoded,
+                    0.0
+            );
+        }
+    }
+
+    @Test
+    public void testLongArrayMultipleRows() {
+        try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+            QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("arr", QwpConstants.TYPE_LONG_ARRAY, false);
+
+            col.addLongArray(new long[]{10, 20, 30});
+            table.nextRow();
+
+            col.addLongArray(new long[]{40, 50, 60});
+            table.nextRow();
+
+            col.addLongArray(new long[]{70, 80, 90});
+            table.nextRow();
+
+            assertEquals(3, col.getValueCount());
+            long[] encoded = readLongArraysLikeEncoder(col);
+            assertArrayEquals(
+                    new long[]{10, 20, 30, 40, 50, 60, 70, 80, 90},
+                    encoded
+            );
+
+            byte[] dims = col.getArrayDims();
+            int[] shapes = col.getArrayShapes();
+            for (int i = 0; i < 3; i++) {
+                assertEquals(1, dims[i]);
+                assertEquals(3, shapes[i]);
+            }
+        }
+    }
+
+    @Test
+    public void testLongArrayShrinkingSize() {
+        try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+            QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("arr", QwpConstants.TYPE_LONG_ARRAY, false);
+
+            // Row 0: large array (4 elements)
+            col.addLongArray(new long[]{100, 200, 300, 400});
+            table.nextRow();
+
+            // Row 1: smaller array (2 elements) — must not see leftover data from row 0
+            col.addLongArray(new long[]{10, 20});
+            table.nextRow();
+
+            assertEquals(2, col.getValueCount());
+            long[] encoded = readLongArraysLikeEncoder(col);
+            assertArrayEquals(new long[]{100, 200, 300, 400, 10, 20}, encoded);
+
+            int[] shapes = col.getArrayShapes();
+            assertEquals(4, shapes[0]);
+            assertEquals(2, shapes[1]);
         }
     }
 }
