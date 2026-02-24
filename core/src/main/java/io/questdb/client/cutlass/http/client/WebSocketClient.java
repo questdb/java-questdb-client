@@ -378,11 +378,28 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);
         }
 
-        // Verify Sec-WebSocket-Accept
+        // Verify Sec-WebSocket-Accept (case-insensitive per RFC 7230)
         String expectedAccept = WebSocketHandshake.computeAcceptKey(handshakeKey);
-        if (!response.contains("Sec-WebSocket-Accept: " + expectedAccept)) {
+        if (!containsHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept)) {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
+    }
+
+    private static boolean containsHeaderValue(String response, String headerName, String expectedValue) {
+        int headerLen = headerName.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, headerName, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String actualValue = response.substring(valueStart, lineEnd).trim();
+                return actualValue.equals(expectedValue);
+            }
+        }
+        return false;
     }
 
     // === Sending ===
