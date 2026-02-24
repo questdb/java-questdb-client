@@ -123,9 +123,9 @@ public final class QwpColumnDef {
      * @throws IllegalArgumentException if type code is invalid
      */
     public void validate() {
-        // Valid type codes: TYPE_BOOLEAN (0x01) through TYPE_DECIMAL256 (0x15)
-        // This includes all basic types, arrays, and decimals
-        boolean valid = (typeCode >= TYPE_BOOLEAN && typeCode <= TYPE_DECIMAL256);
+        // Valid type codes: TYPE_BOOLEAN (0x01) through TYPE_CHAR (0x16)
+        // This includes all basic types, arrays, decimals, and char
+        boolean valid = (typeCode >= TYPE_BOOLEAN && typeCode <= TYPE_CHAR);
         if (!valid) {
             throw new IllegalArgumentException(
                     "invalid column type code: 0x" + Integer.toHexString(typeCode)
