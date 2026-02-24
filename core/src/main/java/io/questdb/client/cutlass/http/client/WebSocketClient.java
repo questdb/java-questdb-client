@@ -80,6 +80,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private final WebSocketFrameParser frameParser;
     private final Rnd rnd;
     private final int defaultTimeout;
+    private final int maxRecvBufSize;
 
     // Receive buffer (native memory)
     private long recvBufPtr;
@@ -116,6 +117,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         this.controlFrameBuffer = new WebSocketSendBuffer(256, 256);
 
         this.recvBufSize = Math.max(configuration.getResponseBufferSize(), DEFAULT_RECV_BUFFER_SIZE);
+        this.maxRecvBufSize = Math.max(configuration.getMaximumResponseBufferSize(), recvBufSize);
         this.recvBufPtr = Unsafe.malloc(recvBufSize, MemoryTag.NATIVE_DEFAULT);
         this.recvPos = 0;
         this.recvReadPos = 0;
@@ -714,11 +716,18 @@ public abstract class WebSocketClient implements QuietCloseable {
             return;
         }
         int required = fragmentBufPos + payloadLen;
+        if (required > maxRecvBufSize) {
+            throw new HttpClientException("WebSocket fragment buffer size exceeded maximum [required=")
+                    .put(required)
+                    .put(", max=")
+                    .put(maxRecvBufSize)
+                    .put(']');
+        }
         if (fragmentBufPtr == 0) {
             fragmentBufSize = Math.max(required, DEFAULT_RECV_BUFFER_SIZE);
             fragmentBufPtr = Unsafe.malloc(fragmentBufSize, MemoryTag.NATIVE_DEFAULT);
         } else if (required > fragmentBufSize) {
-            int newSize = Math.max(fragmentBufSize * 2, required);
+            int newSize = Math.min(Math.max(fragmentBufSize * 2, required), maxRecvBufSize);
             fragmentBufPtr = Unsafe.realloc(fragmentBufPtr, fragmentBufSize, newSize, MemoryTag.NATIVE_DEFAULT);
             fragmentBufSize = newSize;
         }
@@ -744,6 +753,16 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     private void growRecvBuffer() {
         int newSize = recvBufSize * 2;
+        if (newSize > maxRecvBufSize) {
+            if (recvBufSize >= maxRecvBufSize) {
+                throw new HttpClientException("WebSocket receive buffer size exceeded maximum [current=")
+                        .put(recvBufSize)
+                        .put(", max=")
+                        .put(maxRecvBufSize)
+                        .put(']');
+            }
+            newSize = maxRecvBufSize;
+        }
         recvBufPtr = Unsafe.realloc(recvBufPtr, recvBufSize, newSize, MemoryTag.NATIVE_DEFAULT);
         recvBufSize = newSize;
     }

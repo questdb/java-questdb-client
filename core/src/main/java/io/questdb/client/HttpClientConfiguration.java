@@ -54,6 +54,10 @@ public interface HttpClientConfiguration {
         return Integer.MAX_VALUE;
     }
 
+    default int getMaximumResponseBufferSize() {
+        return Integer.MAX_VALUE;
+    }
+
     default NetworkFacade getNetworkFacade() {
         return NetworkFacadeImpl.INSTANCE;
     }
