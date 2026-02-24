@@ -45,14 +45,12 @@ import io.questdb.client.std.Unsafe;
  */
 public class QwpBitReader {
 
-    private long startAddress;
-    private long currentAddress;
-    private long endAddress;
-
     // Buffer for reading bits
     private long bitBuffer;
     // Number of bits currently available in the buffer (0-64)
     private int bitsInBuffer;
+    private long currentAddress;
+    private long endAddress;
     // Total bits available for reading (from reset)
     private long totalBitsAvailable;
     // Total bits already consumed
@@ -65,32 +63,21 @@ public class QwpBitReader {
     }
 
     /**
-     * Resets the reader to read from the specified memory region.
+     * Aligns the reader to the next byte boundary by skipping any partial bits.
      *
-     * @param address the starting address
-     * @param length  the number of bytes available to read
+     * @throws IllegalStateException if alignment fails
      */
-    public void reset(long address, long length) {
-        this.startAddress = address;
-        this.currentAddress = address;
-        this.endAddress = address + length;
-        this.bitBuffer = 0;
-        this.bitsInBuffer = 0;
-        this.totalBitsAvailable = length * 8L;
-        this.totalBitsRead = 0;
-    }
-
-    /**
-     * Resets the reader to read from the specified byte array.
-     *
-     * @param buf    the byte array
-     * @param offset the starting offset
-     * @param length the number of bytes available
-     */
-    public void reset(byte[] buf, int offset, int length) {
-        // For byte array, we'll store position info differently
-        // This is mainly for testing - in production we use direct memory
-        throw new UnsupportedOperationException("Use direct memory version");
+    public void alignToByte() {
+        int bitsToSkip = bitsInBuffer % 8;
+        if (bitsToSkip != 0) {
+            // We need to skip the remaining bits in the current partial byte
+            // But since we read in byte chunks, bitsInBuffer should be a multiple of 8
+            // minus what we've consumed. The remainder in the conceptual stream is:
+            int remainder = (int) (totalBitsRead % 8);
+            if (remainder != 0) {
+                skipBits(8 - remainder);
+            }
+        }
     }
 
     /**
@@ -103,15 +90,6 @@ public class QwpBitReader {
     }
 
     /**
-     * Returns true if there are more bits to read.
-     *
-     * @return true if bits available
-     */
-    public boolean hasMoreBits() {
-        return totalBitsRead < totalBitsAvailable;
-    }
-
-    /**
      * Returns the current position in bits from the start.
      *
      * @return bits read since reset
@@ -121,19 +99,37 @@ public class QwpBitReader {
     }
 
     /**
-     * Ensures the buffer has at least the requested number of bits.
-     * Loads more bytes from memory if needed.
+     * Returns the current byte address being read.
+     * Note: This is approximate due to bit buffering.
      *
-     * @param bitsNeeded minimum bits required in buffer
-     * @return true if sufficient bits available, false otherwise
+     * @return current address
      */
-    private boolean ensureBits(int bitsNeeded) {
-        while (bitsInBuffer < bitsNeeded && currentAddress < endAddress) {
-            byte b = Unsafe.getUnsafe().getByte(currentAddress++);
-            bitBuffer |= (long) (b & 0xFF) << bitsInBuffer;
-            bitsInBuffer += 8;
+    public long getCurrentAddress() {
+        return currentAddress;
+    }
+
+    /**
+     * Returns true if there are more bits to read.
+     *
+     * @return true if bits available
+     */
+    public boolean hasMoreBits() {
+        return totalBitsRead < totalBitsAvailable;
+    }
+
+    /**
+     * Peeks at the next bit without consuming it.
+     *
+     * @return 0 or 1, or -1 if no more bits
+     */
+    public int peekBit() {
+        if (totalBitsRead >= totalBitsAvailable) {
+            return -1;
         }
-        return bitsInBuffer >= bitsNeeded;
+        if (!ensureBits(1)) {
+            return -1;
+        }
+        return (int) (bitBuffer & 1);
     }
 
     /**
@@ -204,6 +200,36 @@ public class QwpBitReader {
     }
 
     /**
+     * Reads a complete byte, ensuring byte alignment first.
+     *
+     * @return the byte value (0-255)
+     * @throws IllegalStateException if not enough data
+     */
+    public int readByte() {
+        return (int) readBits(8) & 0xFF;
+    }
+
+    /**
+     * Reads a complete 32-bit integer in little-endian order.
+     *
+     * @return the integer value
+     * @throws IllegalStateException if not enough data
+     */
+    public int readInt() {
+        return (int) readBits(32);
+    }
+
+    /**
+     * Reads a complete 64-bit long in little-endian order.
+     *
+     * @return the long value
+     * @throws IllegalStateException if not enough data
+     */
+    public long readLong() {
+        return readBits(64);
+    }
+
+    /**
      * Reads multiple bits and interprets them as a signed value using two's complement.
      *
      * @param numBits number of bits to read (1-64)
@@ -221,18 +247,31 @@ public class QwpBitReader {
     }
 
     /**
-     * Peeks at the next bit without consuming it.
+     * Resets the reader to read from the specified memory region.
      *
-     * @return 0 or 1, or -1 if no more bits
+     * @param address the starting address
+     * @param length  the number of bytes available to read
      */
-    public int peekBit() {
-        if (totalBitsRead >= totalBitsAvailable) {
-            return -1;
-        }
-        if (!ensureBits(1)) {
-            return -1;
-        }
-        return (int) (bitBuffer & 1);
+    public void reset(long address, long length) {
+        this.currentAddress = address;
+        this.endAddress = address + length;
+        this.bitBuffer = 0;
+        this.bitsInBuffer = 0;
+        this.totalBitsAvailable = length * 8L;
+        this.totalBitsRead = 0;
+    }
+
+    /**
+     * Resets the reader to read from the specified byte array.
+     *
+     * @param buf    the byte array
+     * @param offset the starting offset
+     * @param length the number of bytes available
+     */
+    public void reset(byte[] buf, int offset, int length) {
+        // For byte array, we'll store position info differently
+        // This is mainly for testing - in production we use direct memory
+        throw new UnsupportedOperationException("Use direct memory version");
     }
 
     /**
@@ -276,60 +315,18 @@ public class QwpBitReader {
     }
 
     /**
-     * Aligns the reader to the next byte boundary by skipping any partial bits.
+     * Ensures the buffer has at least the requested number of bits.
+     * Loads more bytes from memory if needed.
      *
-     * @throws IllegalStateException if alignment fails
+     * @param bitsNeeded minimum bits required in buffer
+     * @return true if sufficient bits available, false otherwise
      */
-    public void alignToByte() {
-        int bitsToSkip = bitsInBuffer % 8;
-        if (bitsToSkip != 0) {
-            // We need to skip the remaining bits in the current partial byte
-            // But since we read in byte chunks, bitsInBuffer should be a multiple of 8
-            // minus what we've consumed. The remainder in the conceptual stream is:
-            int remainder = (int) (totalBitsRead % 8);
-            if (remainder != 0) {
-                skipBits(8 - remainder);
-            }
+    private boolean ensureBits(int bitsNeeded) {
+        while (bitsInBuffer < bitsNeeded && currentAddress < endAddress) {
+            byte b = Unsafe.getUnsafe().getByte(currentAddress++);
+            bitBuffer |= (long) (b & 0xFF) << bitsInBuffer;
+            bitsInBuffer += 8;
         }
-    }
-
-    /**
-     * Reads a complete byte, ensuring byte alignment first.
-     *
-     * @return the byte value (0-255)
-     * @throws IllegalStateException if not enough data
-     */
-    public int readByte() {
-        return (int) readBits(8) & 0xFF;
-    }
-
-    /**
-     * Reads a complete 32-bit integer in little-endian order.
-     *
-     * @return the integer value
-     * @throws IllegalStateException if not enough data
-     */
-    public int readInt() {
-        return (int) readBits(32);
-    }
-
-    /**
-     * Reads a complete 64-bit long in little-endian order.
-     *
-     * @return the long value
-     * @throws IllegalStateException if not enough data
-     */
-    public long readLong() {
-        return readBits(64);
-    }
-
-    /**
-     * Returns the current byte address being read.
-     * Note: This is approximate due to bit buffering.
-     *
-     * @return current address
-     */
-    public long getCurrentAddress() {
-        return currentAddress;
+        return bitsInBuffer >= bitsNeeded;
     }
 }
