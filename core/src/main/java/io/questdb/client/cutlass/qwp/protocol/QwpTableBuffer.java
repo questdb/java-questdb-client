@@ -1085,6 +1085,22 @@ public class QwpTableBuffer implements QuietCloseable {
             if (auxBuffer != null) {
                 auxBuffer.jumpTo((long) newValueCount * 4);
             }
+
+            // Rewind array offsets by walking the retained values
+            if (arrayDims != null) {
+                int newShapeOffset = 0;
+                int newDataOffset = 0;
+                for (int i = 0; i < newValueCount; i++) {
+                    int nDims = arrayDims[i];
+                    int elemCount = 1;
+                    for (int d = 0; d < nDims; d++) {
+                        elemCount *= arrayShapes[newShapeOffset++];
+                    }
+                    newDataOffset += elemCount;
+                }
+                arrayShapeOffset = newShapeOffset;
+                arrayDataOffset = newDataOffset;
+            }
         }
 
         private void allocateStorage(byte type) {
