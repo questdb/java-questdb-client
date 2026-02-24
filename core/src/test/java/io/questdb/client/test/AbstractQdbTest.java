@@ -425,7 +425,7 @@ public class AbstractQdbTest extends AbstractTest {
      * Get whether a QuestDB instance is running locally.
      */
     protected static boolean getQuestDBRunning() {
-        return getConfigBool("QUESTDB_RUNNING", "questdb.running", true);
+        return getConfigBool("QUESTDB_RUNNING", "questdb.running", false);
     }
 
     /**
