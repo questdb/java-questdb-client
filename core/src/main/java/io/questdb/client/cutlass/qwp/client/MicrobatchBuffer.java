@@ -30,6 +30,7 @@ import io.questdb.client.std.Unsafe;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * A buffer for accumulating ILP data into microbatches before sending.
@@ -79,7 +80,7 @@ public class MicrobatchBuffer implements QuietCloseable {
 
     // Batch identification
     private long batchId;
-    private static long nextBatchId = 0;
+    private static final AtomicLong nextBatchId = new AtomicLong();
 
     // State machine
     private volatile int state = STATE_FILLING;
@@ -108,7 +109,7 @@ public class MicrobatchBuffer implements QuietCloseable {
         this.maxRows = maxRows;
         this.maxBytes = maxBytes;
         this.maxAgeNanos = maxAgeNanos;
-        this.batchId = nextBatchId++;
+        this.batchId = nextBatchId.getAndIncrement();
     }
 
     /**
@@ -452,7 +453,7 @@ public class MicrobatchBuffer implements QuietCloseable {
         rowCount = 0;
         firstRowTimeNanos = 0;
         maxSymbolId = -1;
-        batchId = nextBatchId++;
+        batchId = nextBatchId.getAndIncrement();
         state = STATE_FILLING;
         recycleLatch = new CountDownLatch(1);
     }
