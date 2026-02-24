@@ -1583,7 +1583,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     } else if (protocol == PROTOCOL_HTTP) {
                         httpToken(sink.toString());
                     } else {
-                        throw new AssertionError();
+                        throw new LineSenderException("token is not supported for WebSocket protocol");
                     }
                 } else if (Chars.equals("retry_timeout", sink)) {
                     pos = getValue(configurationString, pos, sink, "retry_timeout");
