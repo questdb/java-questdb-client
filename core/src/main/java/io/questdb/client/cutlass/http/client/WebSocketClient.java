@@ -603,21 +603,24 @@ public abstract class WebSocketClient implements QuietCloseable {
                     }
                     break;
                 case WebSocketOpcode.CLOSE:
+                    int closeCode = 0;
+                    String reason = null;
+                    if (payloadLen >= 2) {
+                        closeCode = ((Unsafe.getUnsafe().getByte(payloadPtr) & 0xFF) << 8)
+                                | (Unsafe.getUnsafe().getByte(payloadPtr + 1) & 0xFF);
+                        if (payloadLen > 2) {
+                            byte[] reasonBytes = new byte[payloadLen - 2];
+                            for (int i = 0; i < reasonBytes.length; i++) {
+                                reasonBytes[i] = Unsafe.getUnsafe().getByte(payloadPtr + 2 + i);
+                            }
+                            reason = new String(reasonBytes, StandardCharsets.UTF_8);
+                        }
+                    }
+                    // RFC 6455 Section 5.5.1: echo a close frame back before
+                    // marking the connection as no longer upgraded
+                    sendCloseFrameEcho(closeCode);
                     upgraded = false;
                     if (handler != null) {
-                        int closeCode = 0;
-                        String reason = null;
-                        if (payloadLen >= 2) {
-                            closeCode = ((Unsafe.getUnsafe().getByte(payloadPtr) & 0xFF) << 8)
-                                    | (Unsafe.getUnsafe().getByte(payloadPtr + 1) & 0xFF);
-                            if (payloadLen > 2) {
-                                byte[] reasonBytes = new byte[payloadLen - 2];
-                                for (int i = 0; i < reasonBytes.length; i++) {
-                                    reasonBytes[i] = Unsafe.getUnsafe().getByte(payloadPtr + 2 + i);
-                                }
-                                reason = new String(reasonBytes, StandardCharsets.UTF_8);
-                            }
-                        }
                         handler.onClose(closeCode, reason);
                     }
                     break;
@@ -643,6 +646,17 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         return false;
+    }
+
+    private void sendCloseFrameEcho(int code) {
+        try {
+            controlFrameBuffer.reset();
+            WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writeCloseFrame(code, null);
+            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, 1000);
+            controlFrameBuffer.reset();
+        } catch (Exception e) {
+            LOG.error("Failed to echo close frame: {}", e.getMessage());
+        }
     }
 
     private void sendPongFrame(long payloadPtr, int payloadLen) {
