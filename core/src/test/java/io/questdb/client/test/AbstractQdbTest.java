@@ -31,7 +31,6 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
-import org.junit.Assume;
 import org.junit.Before;
 import org.junit.BeforeClass;
 
@@ -210,10 +209,10 @@ public class AbstractQdbTest extends AbstractTest {
             System.err.printf("CLEANING UP TEST TABLES%n");
             // Cleanup all test tables before starting tests
             try (Connection conn = getPgConnection();
-                    Statement readStmt = conn.createStatement();
-                    Statement stmt = conn.createStatement();
-                    ResultSet rs = readStmt
-                            .executeQuery("SELECT table_name FROM tables() WHERE table_name LIKE 'test_%'")) {
+                 Statement readStmt = conn.createStatement();
+                 Statement stmt = conn.createStatement();
+                 ResultSet rs = readStmt
+                         .executeQuery("SELECT table_name FROM tables() WHERE table_name LIKE 'test_%'")) {
                 while (rs.next()) {
                     String tableName = rs.getString(1);
                     try {
@@ -458,7 +457,7 @@ public class AbstractQdbTest extends AbstractTest {
     protected void assertSqlEventually(CharSequence expected, String sql) throws Exception {
         assertEventually(() -> {
             try (Statement statement = getPgConnection().createStatement();
-                    ResultSet rs = statement.executeQuery(sql)) {
+                 ResultSet rs = statement.executeQuery(sql)) {
                 sink.clear();
                 printToSink(sink, rs);
                 TestUtils.assertEquals(expected, sink);
@@ -474,8 +473,8 @@ public class AbstractQdbTest extends AbstractTest {
     protected void assertTableExistsEventually(CharSequence tableName) throws Exception {
         assertEventually(() -> {
             try (Statement stmt = getPgConnection().createStatement();
-                    ResultSet rs = stmt.executeQuery(
-                            String.format("SELECT COUNT(*) AS cnt FROM tables() WHERE table_name = '%s'", tableName))) {
+                 ResultSet rs = stmt.executeQuery(
+                         String.format("SELECT COUNT(*) AS cnt FROM tables() WHERE table_name = '%s'", tableName))) {
                 Assert.assertTrue(rs.next());
                 final long actualSize = rs.getLong(1);
                 Assert.assertEquals(1, actualSize);
@@ -546,7 +545,7 @@ public class AbstractQdbTest extends AbstractTest {
         List<Map<String, Object>> results = new ArrayList<>();
 
         try (Statement stmt = getPgConnection().createStatement();
-                ResultSet rs = stmt.executeQuery(sql)) {
+             ResultSet rs = stmt.executeQuery(sql)) {
 
             ResultSetMetaData metaData = rs.getMetaData();
             int columnCount = metaData.getColumnCount();
@@ -595,7 +594,7 @@ public class AbstractQdbTest extends AbstractTest {
         }
 
         try (Statement stmt = getPgConnection().createStatement();
-                ResultSet rs = stmt.executeQuery(sql)) {
+             ResultSet rs = stmt.executeQuery(sql)) {
 
             ResultSetMetaData metaData = rs.getMetaData();
             int columnCount = metaData.getColumnCount();
