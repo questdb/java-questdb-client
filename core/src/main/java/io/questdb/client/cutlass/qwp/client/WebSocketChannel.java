@@ -429,7 +429,9 @@ public class WebSocketChannel implements QuietCloseable {
         int maskKey = rnd.nextInt();
 
         // Close payload: 2-byte code + optional reason
-        int reasonLen = (reason != null) ? reason.length() : 0;
+        // Compute UTF-8 bytes upfront so payload length is correct
+        byte[] reasonBytes = (reason != null) ? reason.getBytes(StandardCharsets.UTF_8) : null;
+        int reasonLen = (reasonBytes != null) ? reasonBytes.length : 0;
         int payloadLen = 2 + reasonLen;
 
         int headerSize = WebSocketFrameWriter.headerSize(payloadLen, true);
@@ -447,8 +449,7 @@ public class WebSocketChannel implements QuietCloseable {
         Unsafe.getUnsafe().putByte(payloadStart + 1, (byte) (code & 0xFF));
 
         // Write reason if present
-        if (reason != null) {
-            byte[] reasonBytes = reason.getBytes(StandardCharsets.UTF_8);
+        if (reasonBytes != null) {
             for (int i = 0; i < reasonBytes.length; i++) {
                 Unsafe.getUnsafe().putByte(payloadStart + 2 + i, reasonBytes[i]);
             }
