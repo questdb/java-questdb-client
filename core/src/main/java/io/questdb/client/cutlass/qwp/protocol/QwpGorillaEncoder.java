@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.protocol;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.Unsafe;
 
 /**
@@ -170,7 +171,7 @@ public class QwpGorillaEncoder {
 
         // Write first timestamp uncompressed
         if (capacity < 8) {
-            return 0; // Not enough space
+            throw new LineSenderException("Gorilla encoder buffer overflow");
         }
         long ts0 = Unsafe.getUnsafe().getLong(srcAddress);
         Unsafe.getUnsafe().putLong(destAddress, ts0);
@@ -182,7 +183,7 @@ public class QwpGorillaEncoder {
 
         // Write second timestamp uncompressed
         if (capacity < pos + 8) {
-            return pos; // Not enough space
+            throw new LineSenderException("Gorilla encoder buffer overflow");
         }
         long ts1 = Unsafe.getUnsafe().getLong(srcAddress + 8);
         Unsafe.getUnsafe().putLong(destAddress + pos, ts1);

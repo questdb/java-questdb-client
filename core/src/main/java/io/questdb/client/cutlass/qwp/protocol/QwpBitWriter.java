@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.protocol;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.Unsafe;
 
 /**
@@ -139,9 +140,10 @@ public class QwpBitWriter {
 
             // Flush complete bytes from the buffer
             while (bitsInBuffer >= 8) {
-                if (currentAddress < endAddress) {
-                    Unsafe.getUnsafe().putByte(currentAddress++, (byte) bitBuffer);
+                if (currentAddress >= endAddress) {
+                    throw new LineSenderException("QwpBitWriter buffer overflow");
                 }
+                Unsafe.getUnsafe().putByte(currentAddress++, (byte) bitBuffer);
                 bitBuffer >>>= 8;
                 bitsInBuffer -= 8;
             }
@@ -168,7 +170,10 @@ public class QwpBitWriter {
      * Must be called before reading the output or getting the final position.
      */
     public void flush() {
-        if (bitsInBuffer > 0 && currentAddress < endAddress) {
+        if (bitsInBuffer > 0) {
+            if (currentAddress >= endAddress) {
+                throw new LineSenderException("QwpBitWriter buffer overflow");
+            }
             Unsafe.getUnsafe().putByte(currentAddress++, (byte) bitBuffer);
             bitBuffer = 0;
             bitsInBuffer = 0;
@@ -214,9 +219,10 @@ public class QwpBitWriter {
      */
     public void writeByte(int value) {
         alignToByte();
-        if (currentAddress < endAddress) {
-            Unsafe.getUnsafe().putByte(currentAddress++, (byte) value);
+        if (currentAddress >= endAddress) {
+            throw new LineSenderException("QwpBitWriter buffer overflow");
         }
+        Unsafe.getUnsafe().putByte(currentAddress++, (byte) value);
     }
 
     /**
@@ -226,10 +232,11 @@ public class QwpBitWriter {
      */
     public void writeInt(int value) {
         alignToByte();
-        if (currentAddress + 4 <= endAddress) {
-            Unsafe.getUnsafe().putInt(currentAddress, value);
-            currentAddress += 4;
+        if (currentAddress + 4 > endAddress) {
+            throw new LineSenderException("QwpBitWriter buffer overflow");
         }
+        Unsafe.getUnsafe().putInt(currentAddress, value);
+        currentAddress += 4;
     }
 
     /**
@@ -239,9 +246,10 @@ public class QwpBitWriter {
      */
     public void writeLong(long value) {
         alignToByte();
-        if (currentAddress + 8 <= endAddress) {
-            Unsafe.getUnsafe().putLong(currentAddress, value);
-            currentAddress += 8;
+        if (currentAddress + 8 > endAddress) {
+            throw new LineSenderException("QwpBitWriter buffer overflow");
         }
+        Unsafe.getUnsafe().putLong(currentAddress, value);
+        currentAddress += 8;
     }
 }
