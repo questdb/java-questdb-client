@@ -252,19 +252,24 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testBuilderWithWebSocketTransportCreatesCorrectSenderType() {
+    public void testBuilderWithWebSocketTransportCreatesCorrectSenderType() throws Exception {
+        int port;
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+            port = s.getLocalPort();
+        }
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST + ":9000"),
+                        .address(LOCALHOST + ":" + port),
                 "connect", "Failed"
         );
     }
 
     @Test
-    public void testConnectionRefused() {
+    public void testConnectionRefused() throws Exception {
+        int port = findUnusedPort();
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST + ":19999"),
+                        .address(LOCALHOST + ":" + port),
                 "connect", "Failed"
         );
     }
@@ -691,22 +696,25 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWsConfigString() {
-        assertBadConfig("ws::addr=localhost:9000;", "connect", "Failed");
+    public void testWsConfigString() throws Exception {
+        int port = findUnusedPort();
+        assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
     }
 
     // ==================== Edge Cases ====================
 
     @Test
-    public void testWsConfigString_missingAddr_fails() {
-        assertBadConfig("ws::addr=localhost;", "connect", "Failed");
+    public void testWsConfigString_missingAddr_fails() throws Exception {
+        int port = findUnusedPort();
+        assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
         assertBadConfig("ws::foo=bar;", "addr is missing");
     }
 
     @Test
-    public void testWsConfigString_protocolAlreadyConfigured_fails() {
+    public void testWsConfigString_protocolAlreadyConfigured_fails() throws Exception {
+        int port = findUnusedPort();
         assertThrowsAny(
-                Sender.builder("ws::addr=localhost:9000;")
+                Sender.builder("ws::addr=localhost:" + port + ";")
                         .enableTls(),
                 "TLS", "connect", "Failed"
         );
@@ -759,6 +767,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     private static void assertThrowsAny(Sender.LineSenderBuilder builder, String... anyOf) {
         assertThrowsAny(builder::build, anyOf);
+    }
+
+    private static int findUnusedPort() throws Exception {
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+            return s.getLocalPort();
+        }
     }
 
     private static void assertThrowsAny(Runnable action, String... anyOf) {
