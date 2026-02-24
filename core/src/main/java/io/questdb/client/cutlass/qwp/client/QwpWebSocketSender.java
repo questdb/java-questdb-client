@@ -1141,10 +1141,6 @@ public class QwpWebSocketSender implements Sender {
                         useSchemaRef
                 );
 
-                // Track schema key if this was the first time sending this schema
-                if (!useSchemaRef) {
-                    sentSchemaHashes.add(schemaKey);
-                }
                 QwpBufferWriter buffer = encoder.getBuffer();
 
                 // Copy to microbatch buffer and seal immediately
@@ -1154,11 +1150,17 @@ public class QwpWebSocketSender implements Sender {
                 activeBuffer.incrementRowCount();
                 activeBuffer.setMaxSymbolId(currentBatchMaxSymbolId);
 
-                // Update maxSentSymbolId - once sent over TCP, server will receive it
-                maxSentSymbolId = currentBatchMaxSymbolId;
-
                 // Seal and enqueue for sending
                 sealAndSwapBuffer();
+
+                // Update sent state only after successful enqueue.
+                // If sealAndSwapBuffer() threw, these remain unchanged so the
+                // next batch's delta dictionary will correctly re-include the
+                // symbols and schema that the server never received.
+                maxSentSymbolId = currentBatchMaxSymbolId;
+                if (!useSchemaRef) {
+                    sentSchemaHashes.add(schemaKey);
+                }
 
                 // Reset table buffer and batch-level symbol tracking
                 tableBuffer.reset();
@@ -1209,11 +1211,6 @@ public class QwpWebSocketSender implements Sender {
                     useSchemaRef
             );
 
-            // Track schema key if this was the first time sending this schema
-            if (!useSchemaRef) {
-                sentSchemaHashes.add(schemaKey);
-            }
-
             if (messageSize > 0) {
                 QwpBufferWriter buffer = encoder.getBuffer();
 
@@ -1221,16 +1218,22 @@ public class QwpWebSocketSender implements Sender {
                 long batchSequence = nextBatchSequence++;
                 inFlightWindow.addInFlight(batchSequence);
 
-                // Update maxSentSymbolId - once sent over TCP, server will receive it
-                maxSentSymbolId = currentBatchMaxSymbolId;
-
-                LOG.debug("Sending sync batch [seq={}, bytes={}, rows={}, maxSentSymbolId={}, useSchemaRef={}]", batchSequence, messageSize, tableBuffer.getRowCount(), maxSentSymbolId, useSchemaRef);
+                LOG.debug("Sending sync batch [seq={}, bytes={}, rows={}, maxSentSymbolId={}, useSchemaRef={}]", batchSequence, messageSize, tableBuffer.getRowCount(), currentBatchMaxSymbolId, useSchemaRef);
 
                 // Send over WebSocket
                 client.sendBinary(buffer.getBufferPtr(), messageSize);
 
                 // Wait for ACK synchronously
                 waitForAck(batchSequence);
+
+                // Update sent state only after successful send + ACK.
+                // If sendBinary() or waitForAck() threw, these remain unchanged
+                // so the next batch's delta dictionary will correctly re-include
+                // the symbols and schema that the server never received.
+                maxSentSymbolId = currentBatchMaxSymbolId;
+                if (!useSchemaRef) {
+                    sentSchemaHashes.add(schemaKey);
+                }
             }
 
             // Reset table buffer after sending
