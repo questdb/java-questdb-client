@@ -76,6 +76,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     protected final Socket socket;
 
     private final WebSocketSendBuffer sendBuffer;
+    private final WebSocketSendBuffer controlFrameBuffer;
     private final WebSocketFrameParser frameParser;
     private final Rnd rnd;
     private final int defaultTimeout;
@@ -103,6 +104,10 @@ public abstract class WebSocketClient implements QuietCloseable {
         int sendBufSize = Math.max(configuration.getInitialRequestBufferSize(), DEFAULT_SEND_BUFFER_SIZE);
         int maxSendBufSize = Math.max(configuration.getMaximumRequestBufferSize(), sendBufSize);
         this.sendBuffer = new WebSocketSendBuffer(sendBufSize, maxSendBufSize);
+        // Control frames (ping/pong/close) have max 125-byte payload + 14-byte header.
+        // This dedicated buffer prevents sendPongFrame from clobbering an in-progress
+        // frame being built in the main sendBuffer.
+        this.controlFrameBuffer = new WebSocketSendBuffer(256, 256);
 
         this.recvBufSize = Math.max(configuration.getResponseBufferSize(), DEFAULT_RECV_BUFFER_SIZE);
         this.recvBufPtr = Unsafe.malloc(recvBufSize, MemoryTag.NATIVE_DEFAULT);
@@ -131,6 +136,7 @@ public abstract class WebSocketClient implements QuietCloseable {
 
             disconnect();
             sendBuffer.close();
+            controlFrameBuffer.close();
 
             if (recvBufPtr != 0) {
                 Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
@@ -641,10 +647,10 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     private void sendPongFrame(long payloadPtr, int payloadLen) {
         try {
-            sendBuffer.reset();
-            WebSocketSendBuffer.FrameInfo frame = sendBuffer.writePongFrame(payloadPtr, payloadLen);
-            doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, 1000); // Short timeout for pong
-            sendBuffer.reset();
+            controlFrameBuffer.reset();
+            WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writePongFrame(payloadPtr, payloadLen);
+            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, 1000);
+            controlFrameBuffer.reset();
         } catch (Exception e) {
             LOG.error("Failed to send pong: {}", e.getMessage());
         }
