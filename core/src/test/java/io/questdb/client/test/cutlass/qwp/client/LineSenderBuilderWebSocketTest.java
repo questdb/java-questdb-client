@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.AbstractTest;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -620,6 +621,32 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     // ==================== Unsupported Features (HTTP-specific options) ====================
+
+    @Test
+    public void testSyncModeAutoFlushDefaults() throws Exception {
+        // Regression test: sync-mode connect() must not hardcode autoFlush to 0.
+        // createForTesting(host, port, windowSize) mirrors what connect(h,p,tls)
+        // creates internally. Verify it uses sensible defaults.
+        TestUtils.assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            try {
+                Assert.assertEquals(
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                        sender.getAutoFlushRows()
+                );
+                Assert.assertEquals(
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                        sender.getAutoFlushBytes()
+                );
+                Assert.assertEquals(
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                        sender.getAutoFlushIntervalNanos()
+                );
+            } finally {
+                sender.close();
+            }
+        });
+    }
 
     @Test
     public void testSyncModeIsDefault() {

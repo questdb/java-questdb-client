@@ -194,7 +194,7 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Creates a new sender with TLS and connects to the specified host and port.
-     * Uses synchronous mode for backward compatibility.
+     * Uses synchronous mode with default auto-flush settings.
      *
      * @param host       server host
      * @param port       server HTTP port
@@ -202,9 +202,28 @@ public class QwpWebSocketSender implements Sender {
      * @return connected sender
      */
     public static QwpWebSocketSender connect(String host, int port, boolean tlsEnabled) {
+        return connect(host, port, tlsEnabled,
+                DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS);
+    }
+
+    /**
+     * Creates a new sender with TLS and connects to the specified host and port.
+     * Uses synchronous mode with custom auto-flush settings.
+     *
+     * @param host                   server host
+     * @param port                   server HTTP port
+     * @param tlsEnabled             whether to use TLS
+     * @param autoFlushRows          rows per batch (0 = no limit)
+     * @param autoFlushBytes         bytes per batch (0 = no limit)
+     * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
+     * @return connected sender
+     */
+    public static QwpWebSocketSender connect(String host, int port, boolean tlsEnabled,
+                                              int autoFlushRows, int autoFlushBytes,
+                                              long autoFlushIntervalNanos) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
-                0, 0, 0, // No auto-flush in sync mode
+                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 1, 1    // window=1 for sync behavior, queue=1 (not used)
         );
         sender.ensureConnected();
@@ -300,6 +319,7 @@ public class QwpWebSocketSender implements Sender {
      * Creates a sender without connecting. For testing only.
      * <p>
      * This allows unit tests to test sender logic without requiring a real server.
+     * Uses default auto-flush settings.
      *
      * @param host               server host (not connected)
      * @param port               server port (not connected)
@@ -309,7 +329,7 @@ public class QwpWebSocketSender implements Sender {
     public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
         return new QwpWebSocketSender(
                 host, port, false, DEFAULT_BUFFER_SIZE,
-                0, 0, 0,
+                DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
                 inFlightWindowSize, DEFAULT_SEND_QUEUE_CAPACITY
         );
         // Note: does NOT call ensureConnected()

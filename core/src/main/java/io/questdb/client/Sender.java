@@ -895,7 +895,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     return QwpWebSocketSender.connect(
                             hosts.getQuick(0),
                             ports.getQuick(0),
-                            tlsEnabled
+                            tlsEnabled,
+                            actualAutoFlushRows,
+                            actualAutoFlushBytes,
+                            actualAutoFlushIntervalNanos
                     );
                 }
             }
