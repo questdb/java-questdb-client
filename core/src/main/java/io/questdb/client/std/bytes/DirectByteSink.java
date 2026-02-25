@@ -71,6 +71,7 @@ public class DirectByteSink implements DirectByteSequence, BorrowableAsNativeByt
             return impl;
         }
     };
+
     public DirectByteSink(long initialCapacity, int memoryTag) {
         this(initialCapacity, memoryTag, false);
     }

@@ -55,11 +55,63 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
+     * Returns the UTF-8 encoded length of a string.
+     */
+    public static int utf8Length(String s) {
+        if (s == null) return 0;
+        int len = 0;
+        for (int i = 0, n = s.length(); i < n; i++) {
+            char c = s.charAt(i);
+            if (c < 0x80) {
+                len++;
+            } else if (c < 0x800) {
+                len += 2;
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
+                i++;
+                len += 4;
+            } else {
+                len += 3;
+            }
+        }
+        return len;
+    }
+
+    @Override
+    public void close() {
+        if (bufferPtr != 0) {
+            Unsafe.free(bufferPtr, capacity, MemoryTag.NATIVE_DEFAULT);
+            bufferPtr = 0;
+        }
+    }
+
+    /**
+     * Ensures the buffer has at least the specified additional capacity.
+     *
+     * @param needed additional bytes needed beyond current position
+     */
+    @Override
+    public void ensureCapacity(int needed) {
+        if (position + needed > capacity) {
+            int newCapacity = Math.max(capacity * 2, position + needed);
+            bufferPtr = Unsafe.realloc(bufferPtr, capacity, newCapacity, MemoryTag.NATIVE_DEFAULT);
+            capacity = newCapacity;
+        }
+    }
+
+    /**
      * Returns the buffer pointer.
      */
     @Override
     public long getBufferPtr() {
         return bufferPtr;
+    }
+
+    /**
+     * Returns the current buffer capacity.
+     */
+    @Override
+    public int getCapacity() {
+        return capacity;
     }
 
     /**
@@ -71,11 +123,22 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Resets the buffer for reuse.
+     * Patches an int value at the specified offset.
+     * Used for updating length fields after writing content.
      */
     @Override
-    public void reset() {
-        position = 0;
+    public void patchInt(int offset, int value) {
+        Unsafe.getUnsafe().putInt(bufferPtr + offset, value);
+    }
+
+    /**
+     * Writes a block of bytes from native memory.
+     */
+    @Override
+    public void putBlockOfBytes(long from, long len) {
+        ensureCapacity((int) len);
+        Unsafe.getUnsafe().copyMemory(from, bufferPtr + position, len);
+        position += (int) len;
     }
 
     /**
@@ -89,13 +152,23 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Writes a short (2 bytes, little-endian).
+     * Writes a double (8 bytes, little-endian).
      */
     @Override
-    public void putShort(short value) {
-        ensureCapacity(2);
-        Unsafe.getUnsafe().putShort(bufferPtr + position, value);
-        position += 2;
+    public void putDouble(double value) {
+        ensureCapacity(8);
+        Unsafe.getUnsafe().putDouble(bufferPtr + position, value);
+        position += 8;
+    }
+
+    /**
+     * Writes a float (4 bytes, little-endian).
+     */
+    @Override
+    public void putFloat(float value) {
+        ensureCapacity(4);
+        Unsafe.getUnsafe().putFloat(bufferPtr + position, value);
+        position += 4;
     }
 
     /**
@@ -129,45 +202,13 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Writes a float (4 bytes, little-endian).
+     * Writes a short (2 bytes, little-endian).
      */
     @Override
-    public void putFloat(float value) {
-        ensureCapacity(4);
-        Unsafe.getUnsafe().putFloat(bufferPtr + position, value);
-        position += 4;
-    }
-
-    /**
-     * Writes a double (8 bytes, little-endian).
-     */
-    @Override
-    public void putDouble(double value) {
-        ensureCapacity(8);
-        Unsafe.getUnsafe().putDouble(bufferPtr + position, value);
-        position += 8;
-    }
-
-    /**
-     * Writes a block of bytes from native memory.
-     */
-    @Override
-    public void putBlockOfBytes(long from, long len) {
-        ensureCapacity((int) len);
-        Unsafe.getUnsafe().copyMemory(from, bufferPtr + position, len);
-        position += (int) len;
-    }
-
-    /**
-     * Writes a varint (unsigned LEB128).
-     */
-    @Override
-    public void putVarint(long value) {
-        while (value > 0x7F) {
-            putByte((byte) ((value & 0x7F) | 0x80));
-            value >>>= 7;
-        }
-        putByte((byte) value);
+    public void putShort(short value) {
+        ensureCapacity(2);
+        Unsafe.getUnsafe().putShort(bufferPtr + position, value);
+        position += 2;
     }
 
     /**
@@ -216,42 +257,23 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Returns the UTF-8 encoded length of a string.
+     * Writes a varint (unsigned LEB128).
      */
-    public static int utf8Length(String s) {
-        if (s == null) return 0;
-        int len = 0;
-        for (int i = 0, n = s.length(); i < n; i++) {
-            char c = s.charAt(i);
-            if (c < 0x80) {
-                len++;
-            } else if (c < 0x800) {
-                len += 2;
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
-                i++;
-                len += 4;
-            } else {
-                len += 3;
-            }
+    @Override
+    public void putVarint(long value) {
+        while (value > 0x7F) {
+            putByte((byte) ((value & 0x7F) | 0x80));
+            value >>>= 7;
         }
-        return len;
+        putByte((byte) value);
     }
 
     /**
-     * Patches an int value at the specified offset.
-     * Used for updating length fields after writing content.
+     * Resets the buffer for reuse.
      */
     @Override
-    public void patchInt(int offset, int value) {
-        Unsafe.getUnsafe().putInt(bufferPtr + offset, value);
-    }
-
-    /**
-     * Returns the current buffer capacity.
-     */
-    @Override
-    public int getCapacity() {
-        return capacity;
+    public void reset() {
+        position = 0;
     }
 
     /**
@@ -263,27 +285,5 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     @Override
     public void skip(int bytes) {
         position += bytes;
-    }
-
-    /**
-     * Ensures the buffer has at least the specified additional capacity.
-     *
-     * @param needed additional bytes needed beyond current position
-     */
-    @Override
-    public void ensureCapacity(int needed) {
-        if (position + needed > capacity) {
-            int newCapacity = Math.max(capacity * 2, position + needed);
-            bufferPtr = Unsafe.realloc(bufferPtr, capacity, newCapacity, MemoryTag.NATIVE_DEFAULT);
-            capacity = newCapacity;
-        }
-    }
-
-    @Override
-    public void close() {
-        if (bufferPtr != 0) {
-            Unsafe.free(bufferPtr, capacity, MemoryTag.NATIVE_DEFAULT);
-            bufferPtr = 0;
-        }
     }
 }

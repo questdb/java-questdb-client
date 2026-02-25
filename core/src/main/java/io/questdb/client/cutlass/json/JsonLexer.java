@@ -65,6 +65,7 @@ public class JsonLexer implements Mutable, Closeable {
     private boolean quoted = false;
     private int state = S_START;
     private boolean useCache = false;
+
     public JsonLexer(int cacheSize, int cacheSizeLimit) {
         this.cacheSizeLimit = cacheSizeLimit;
         // if cacheSizeLimit is 0 or negative, the cache is disabled

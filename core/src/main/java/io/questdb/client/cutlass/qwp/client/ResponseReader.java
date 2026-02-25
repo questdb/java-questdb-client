@@ -25,9 +25,9 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.std.QuietCloseable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import io.questdb.client.std.QuietCloseable;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -48,24 +48,20 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class ResponseReader implements QuietCloseable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(ResponseReader.class);
-
     private static final int DEFAULT_READ_TIMEOUT_MS = 100;
     private static final long DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
-
+    private static final Logger LOG = LoggerFactory.getLogger(ResponseReader.class);
     private final WebSocketChannel channel;
     private final InFlightWindow inFlightWindow;
     private final Thread readerThread;
-    private final CountDownLatch shutdownLatch;
     private final WebSocketResponse response;
-
-    // State
-    private volatile boolean running;
-    private volatile Throwable lastError;
-
+    private final CountDownLatch shutdownLatch;
     // Statistics
     private final AtomicLong totalAcks = new AtomicLong(0);
     private final AtomicLong totalErrors = new AtomicLong(0);
+    private volatile Throwable lastError;
+    // State
+    private volatile boolean running;
 
     /**
      * Creates a new response reader.
@@ -96,34 +92,6 @@ public class ResponseReader implements QuietCloseable {
         LOG.info("Response reader started");
     }
 
-    /**
-     * Returns the last error that occurred, or null if no error.
-     */
-    public Throwable getLastError() {
-        return lastError;
-    }
-
-    /**
-     * Returns true if the reader is still running.
-     */
-    public boolean isRunning() {
-        return running;
-    }
-
-    /**
-     * Returns total successful acknowledgments received.
-     */
-    public long getTotalAcks() {
-        return totalAcks.get();
-    }
-
-    /**
-     * Returns total error responses received.
-     */
-    public long getTotalErrors() {
-        return totalErrors.get();
-    }
-
     @Override
     public void close() {
         if (!running) {
@@ -144,7 +112,33 @@ public class ResponseReader implements QuietCloseable {
         LOG.info("Response reader closed [totalAcks={}, totalErrors={}]", totalAcks.get(), totalErrors.get());
     }
 
-    // ==================== Reader Thread ====================
+    /**
+     * Returns the last error that occurred, or null if no error.
+     */
+    public Throwable getLastError() {
+        return lastError;
+    }
+
+    /**
+     * Returns total successful acknowledgments received.
+     */
+    public long getTotalAcks() {
+        return totalAcks.get();
+    }
+
+    /**
+     * Returns total error responses received.
+     */
+    public long getTotalErrors() {
+        return totalErrors.get();
+    }
+
+    /**
+     * Returns true if the reader is still running.
+     */
+    public boolean isRunning() {
+        return running;
+    }
 
     /**
      * Main read loop that processes incoming WebSocket frames.

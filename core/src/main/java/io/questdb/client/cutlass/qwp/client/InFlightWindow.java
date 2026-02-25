@@ -57,38 +57,29 @@ import java.util.concurrent.locks.LockSupport;
  */
 public class InFlightWindow {
 
-    private static final Logger LOG = LoggerFactory.getLogger(InFlightWindow.class);
-
-    public static final int DEFAULT_WINDOW_SIZE = 8;
     public static final long DEFAULT_TIMEOUT_MS = 30_000;
-
+    public static final int DEFAULT_WINDOW_SIZE = 8;
+    private static final Logger LOG = LoggerFactory.getLogger(InFlightWindow.class);
+    private static final long PARK_NANOS = 100_000; // 100 microseconds
     // Spin parameters
     private static final int SPIN_TRIES = 100;
-    private static final long PARK_NANOS = 100_000; // 100 microseconds
-
+    // Error state
+    private final AtomicReference<Throwable> lastError = new AtomicReference<>();
     private final int maxWindowSize;
     private final long timeoutMs;
-
+    private volatile long failedBatchId = -1;
+    // highestAcked: the sequence number of the last acknowledged batch (cumulative)
+    private volatile long highestAcked = -1;
     // Core state
     // highestSent: the sequence number of the last batch added to the window
     private volatile long highestSent = -1;
-
-    // highestAcked: the sequence number of the last acknowledged batch (cumulative)
-    private volatile long highestAcked = -1;
-
-    // Error state
-    private final AtomicReference<Throwable> lastError = new AtomicReference<>();
-    private volatile long failedBatchId = -1;
-
-    // Thread waiting for space (sender thread)
-    private volatile Thread waitingForSpace;
-
-    // Thread waiting for empty (flush thread)
-    private volatile Thread waitingForEmpty;
-
     // Statistics (not strictly accurate under contention, but good enough for monitoring)
     private volatile long totalAcked = 0;
     private volatile long totalFailed = 0;
+    // Thread waiting for empty (flush thread)
+    private volatile Thread waitingForEmpty;
+    // Thread waiting for space (sender thread)
+    private volatile Thread waitingForSpace;
 
     /**
      * Creates a new InFlightWindow with default configuration.
@@ -112,37 +103,64 @@ public class InFlightWindow {
     }
 
     /**
-     * Checks if there's space in the window for another batch.
-     * Wait-free operation.
+     * Acknowledges a batch, removing it from the in-flight window.
+     * <p>
+     * For sequential batch IDs, this is a cumulative acknowledgment -
+     * acknowledging batch N means all batches up to N are acknowledged.
+     * <p>
+     * Called by: acker (WebSocket I/O thread) after receiving an ACK.
      *
-     * @return true if there's space, false if window is full
+     * @param batchId the batch ID that was acknowledged
+     * @return true if the batch was in flight, false if already acknowledged
      */
-    public boolean hasWindowSpace() {
-        return getInFlightCount() < maxWindowSize;
+    public boolean acknowledge(long batchId) {
+        return acknowledgeUpTo(batchId) > 0 || highestAcked >= batchId;
     }
 
     /**
-     * Tries to add a batch to the in-flight window without blocking.
-     * Lock-free, assuming single producer for highestSent.
+     * Acknowledges all batches up to and including the given sequence (cumulative ACK).
+     * Lock-free with single consumer.
+     * <p>
+     * Called by: acker (WebSocket I/O thread) after receiving an ACK.
      *
-     * Called by: async producer (WebSocket I/O thread) before sending a batch.
-     * @param batchId the batch ID to track (must be sequential)
-     * @return true if added, false if window is full
+     * @param sequence the highest acknowledged sequence
+     * @return the number of batches acknowledged
      */
-    public boolean tryAddInFlight(long batchId) {
-        // Check window space first
+    public int acknowledgeUpTo(long sequence) {
         long sent = highestSent;
-        long acked = highestAcked;
 
-        if (sent - acked >= maxWindowSize) {
-            return false;
+        // Nothing to acknowledge if window is empty or sequence is beyond what's sent
+        if (sent < 0) {
+            return 0; // No batches have been sent
         }
 
-        // Sequential caller: just publish the new highestSent
-        highestSent = batchId;
+        // Cap sequence at highestSent - can't acknowledge what hasn't been sent
+        long effectiveSequence = Math.min(sequence, sent);
 
-        LOG.debug("Added to window [batchId={}, windowSize={}]", batchId, getInFlightCount());
-        return true;
+        long prevAcked = highestAcked;
+        if (effectiveSequence <= prevAcked) {
+            // Already acknowledged up to this point
+            return 0;
+        }
+        highestAcked = effectiveSequence;
+
+        int acknowledged = (int) (effectiveSequence - prevAcked);
+        totalAcked += acknowledged;
+
+        LOG.debug("Cumulative ACK [upTo={}, acknowledged={}, remaining={}]", sequence, acknowledged, getInFlightCount());
+
+        // Wake up waiting threads
+        Thread waiter = waitingForSpace;
+        if (waiter != null) {
+            LockSupport.unpark(waiter);
+        }
+
+        waiter = waitingForEmpty;
+        if (waiter != null && getInFlightCount() == 0) {
+            LockSupport.unpark(waiter);
+        }
+
+        return acknowledged;
     }
 
     /**
@@ -156,8 +174,9 @@ public class InFlightWindow {
      * it must ensure ACKs are processed on another thread; a single-threaded caller
      * with window>1 would deadlock by parking while also being the only thread that
      * can advance {@link #acknowledgeUpTo(long)}.
-     *
+     * <p>
      * Called by: sync sender thread before sending a batch (window=1).
+     *
      * @param batchId the batch ID to track
      * @throws LineSenderException if timeout occurs or an error was reported
      */
@@ -210,126 +229,13 @@ public class InFlightWindow {
         }
     }
 
-    private boolean tryAddInFlightInternal(long batchId) {
-        long sent = highestSent;
-        long acked = highestAcked;
-
-        if (sent - acked >= maxWindowSize) {
-            return false;
-        }
-
-        // For sequential IDs, we just update highestSent
-        // The caller guarantees batchId is the next in sequence
-        highestSent = batchId;
-
-        LOG.debug("Added to window [batchId={}, windowSize={}]", batchId, getInFlightCount());
-        return true;
-    }
-
-    /**
-     * Acknowledges a batch, removing it from the in-flight window.
-     * <p>
-     * For sequential batch IDs, this is a cumulative acknowledgment -
-     * acknowledging batch N means all batches up to N are acknowledged.
-     *
-     * Called by: acker (WebSocket I/O thread) after receiving an ACK.
-     * @param batchId the batch ID that was acknowledged
-     * @return true if the batch was in flight, false if already acknowledged
-     */
-    public boolean acknowledge(long batchId) {
-        return acknowledgeUpTo(batchId) > 0 || highestAcked >= batchId;
-    }
-
-    /**
-     * Acknowledges all batches up to and including the given sequence (cumulative ACK).
-     * Lock-free with single consumer.
-     *
-     * Called by: acker (WebSocket I/O thread) after receiving an ACK.
-     * @param sequence the highest acknowledged sequence
-     * @return the number of batches acknowledged
-     */
-    public int acknowledgeUpTo(long sequence) {
-        long sent = highestSent;
-
-        // Nothing to acknowledge if window is empty or sequence is beyond what's sent
-        if (sent < 0) {
-            return 0; // No batches have been sent
-        }
-
-        // Cap sequence at highestSent - can't acknowledge what hasn't been sent
-        long effectiveSequence = Math.min(sequence, sent);
-
-        long prevAcked = highestAcked;
-        if (effectiveSequence <= prevAcked) {
-            // Already acknowledged up to this point
-            return 0;
-        }
-        highestAcked = effectiveSequence;
-
-        int acknowledged = (int) (effectiveSequence - prevAcked);
-        totalAcked += acknowledged;
-
-        LOG.debug("Cumulative ACK [upTo={}, acknowledged={}, remaining={}]", sequence, acknowledged, getInFlightCount());
-
-        // Wake up waiting threads
-        Thread waiter = waitingForSpace;
-        if (waiter != null) {
-            LockSupport.unpark(waiter);
-        }
-
-        waiter = waitingForEmpty;
-        if (waiter != null && getInFlightCount() == 0) {
-            LockSupport.unpark(waiter);
-        }
-
-        return acknowledged;
-    }
-
-    /**
-     * Marks a batch as failed, setting an error that will be propagated to waiters.
-     *
-     * Called by: acker (WebSocket I/O thread) on error response or send failure.
-     * @param batchId the batch ID that failed
-     * @param error   the error that occurred
-     */
-    public void fail(long batchId, Throwable error) {
-        this.failedBatchId = batchId;
-        this.lastError.set(error);
-        totalFailed++;
-
-        LOG.error("Batch failed [batchId={}, error={}]", batchId, String.valueOf(error));
-
-        wakeWaiters();
-    }
-
-    /**
-     * Marks all currently in-flight batches as failed.
-     * <p>
-     * Used for transport-level failures (disconnect/protocol violation) where
-     * no further ACKs are expected and all waiters must be released.
-     *
-     * @param error terminal error to propagate
-     */
-    public void failAll(Throwable error) {
-        long sent = highestSent;
-        long acked = highestAcked;
-        long inFlight = Math.max(0, sent - acked);
-
-        this.failedBatchId = sent;
-        this.lastError.set(error);
-        totalFailed += Math.max(1, inFlight);
-
-        LOG.error("All in-flight batches failed [inFlight={}, error={}]", inFlight, String.valueOf(error));
-
-        wakeWaiters();
-    }
-
     /**
      * Waits until all in-flight batches are acknowledged.
      * <p>
      * Called by flush() to ensure all data is confirmed.
-     *
+     * <p>
      * Called by: waiter (flush thread), while producer/acker thread progresses.
+     *
      * @throws LineSenderException if timeout occurs or an error was reported
      */
     public void awaitEmpty() {
@@ -374,6 +280,54 @@ public class InFlightWindow {
     }
 
     /**
+     * Clears the error state.
+     */
+    public void clearError() {
+        lastError.set(null);
+        failedBatchId = -1;
+    }
+
+    /**
+     * Marks a batch as failed, setting an error that will be propagated to waiters.
+     * <p>
+     * Called by: acker (WebSocket I/O thread) on error response or send failure.
+     *
+     * @param batchId the batch ID that failed
+     * @param error   the error that occurred
+     */
+    public void fail(long batchId, Throwable error) {
+        this.failedBatchId = batchId;
+        this.lastError.set(error);
+        totalFailed++;
+
+        LOG.error("Batch failed [batchId={}, error={}]", batchId, String.valueOf(error));
+
+        wakeWaiters();
+    }
+
+    /**
+     * Marks all currently in-flight batches as failed.
+     * <p>
+     * Used for transport-level failures (disconnect/protocol violation) where
+     * no further ACKs are expected and all waiters must be released.
+     *
+     * @param error terminal error to propagate
+     */
+    public void failAll(Throwable error) {
+        long sent = highestSent;
+        long acked = highestAcked;
+        long inFlight = Math.max(0, sent - acked);
+
+        this.failedBatchId = sent;
+        this.lastError.set(error);
+        totalFailed += Math.max(1, inFlight);
+
+        LOG.error("All in-flight batches failed [inFlight={}, error={}]", inFlight, String.valueOf(error));
+
+        wakeWaiters();
+    }
+
+    /**
      * Returns the current number of batches in flight.
      * Wait-free operation.
      */
@@ -385,19 +339,10 @@ public class InFlightWindow {
     }
 
     /**
-     * Returns true if the window is empty.
-     * Wait-free operation.
+     * Returns the last error, or null if no error.
      */
-    public boolean isEmpty() {
-        return getInFlightCount() == 0;
-    }
-
-    /**
-     * Returns true if the window is full.
-     * Wait-free operation.
-     */
-    public boolean isFull() {
-        return getInFlightCount() >= maxWindowSize;
+    public Throwable getLastError() {
+        return lastError.get();
     }
 
     /**
@@ -422,18 +367,29 @@ public class InFlightWindow {
     }
 
     /**
-     * Returns the last error, or null if no error.
+     * Checks if there's space in the window for another batch.
+     * Wait-free operation.
+     *
+     * @return true if there's space, false if window is full
      */
-    public Throwable getLastError() {
-        return lastError.get();
+    public boolean hasWindowSpace() {
+        return getInFlightCount() < maxWindowSize;
     }
 
     /**
-     * Clears the error state.
+     * Returns true if the window is empty.
+     * Wait-free operation.
      */
-    public void clearError() {
-        lastError.set(null);
-        failedBatchId = -1;
+    public boolean isEmpty() {
+        return getInFlightCount() == 0;
+    }
+
+    /**
+     * Returns true if the window is full.
+     * Wait-free operation.
+     */
+    public boolean isFull() {
+        return getInFlightCount() >= maxWindowSize;
     }
 
     /**
@@ -448,11 +404,52 @@ public class InFlightWindow {
         wakeWaiters();
     }
 
+    /**
+     * Tries to add a batch to the in-flight window without blocking.
+     * Lock-free, assuming single producer for highestSent.
+     * <p>
+     * Called by: async producer (WebSocket I/O thread) before sending a batch.
+     *
+     * @param batchId the batch ID to track (must be sequential)
+     * @return true if added, false if window is full
+     */
+    public boolean tryAddInFlight(long batchId) {
+        // Check window space first
+        long sent = highestSent;
+        long acked = highestAcked;
+
+        if (sent - acked >= maxWindowSize) {
+            return false;
+        }
+
+        // Sequential caller: just publish the new highestSent
+        highestSent = batchId;
+
+        LOG.debug("Added to window [batchId={}, windowSize={}]", batchId, getInFlightCount());
+        return true;
+    }
+
     private void checkError() {
         Throwable error = lastError.get();
         if (error != null) {
             throw new LineSenderException("Batch " + failedBatchId + " failed: " + error.getMessage(), error);
         }
+    }
+
+    private boolean tryAddInFlightInternal(long batchId) {
+        long sent = highestSent;
+        long acked = highestAcked;
+
+        if (sent - acked >= maxWindowSize) {
+            return false;
+        }
+
+        // For sequential IDs, we just update highestSent
+        // The caller guarantees batchId is the next in sequence
+        highestSent = batchId;
+
+        LOG.debug("Added to window [batchId={}, windowSize={}]", batchId, getInFlightCount());
+        return true;
     }
 
     private void wakeWaiters() {

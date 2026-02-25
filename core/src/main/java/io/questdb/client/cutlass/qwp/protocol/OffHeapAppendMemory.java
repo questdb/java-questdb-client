@@ -40,10 +40,9 @@ import io.questdb.client.std.Unsafe;
 public class OffHeapAppendMemory implements QuietCloseable {
 
     private static final int DEFAULT_INITIAL_CAPACITY = 128;
-
-    private long pageAddress;
     private long appendAddress;
     private long capacity;
+    private long pageAddress;
 
     public OffHeapAppendMemory() {
         this(DEFAULT_INITIAL_CAPACITY);
@@ -56,31 +55,27 @@ public class OffHeapAppendMemory implements QuietCloseable {
     }
 
     /**
-     * Returns the append offset (number of bytes written).
-     */
-    public long getAppendOffset() {
-        return appendAddress - pageAddress;
-    }
-
-    /**
-     * Returns the base address of the buffer.
-     */
-    public long pageAddress() {
-        return pageAddress;
-    }
-
-    /**
      * Returns the address at the given byte offset from the start.
      */
     public long addressOf(long offset) {
         return pageAddress + offset;
     }
 
+    @Override
+    public void close() {
+        if (pageAddress != 0) {
+            Unsafe.free(pageAddress, capacity, MemoryTag.NATIVE_ILP_RSS);
+            pageAddress = 0;
+            appendAddress = 0;
+            capacity = 0;
+        }
+    }
+
     /**
-     * Resets the append position to 0 without freeing memory.
+     * Returns the append offset (number of bytes written).
      */
-    public void truncate() {
-        appendAddress = pageAddress;
+    public long getAppendOffset() {
+        return appendAddress - pageAddress;
     }
 
     /**
@@ -91,20 +86,33 @@ public class OffHeapAppendMemory implements QuietCloseable {
         appendAddress = pageAddress + offset;
     }
 
-    public void putByte(byte value) {
-        ensureCapacity(1);
-        Unsafe.getUnsafe().putByte(appendAddress, value);
-        appendAddress++;
+    /**
+     * Returns the base address of the buffer.
+     */
+    public long pageAddress() {
+        return pageAddress;
     }
 
     public void putBoolean(boolean value) {
         putByte(value ? (byte) 1 : (byte) 0);
     }
 
-    public void putShort(short value) {
-        ensureCapacity(2);
-        Unsafe.getUnsafe().putShort(appendAddress, value);
-        appendAddress += 2;
+    public void putByte(byte value) {
+        ensureCapacity(1);
+        Unsafe.getUnsafe().putByte(appendAddress, value);
+        appendAddress++;
+    }
+
+    public void putDouble(double value) {
+        ensureCapacity(8);
+        Unsafe.getUnsafe().putDouble(appendAddress, value);
+        appendAddress += 8;
+    }
+
+    public void putFloat(float value) {
+        ensureCapacity(4);
+        Unsafe.getUnsafe().putFloat(appendAddress, value);
+        appendAddress += 4;
     }
 
     public void putInt(int value) {
@@ -119,16 +127,10 @@ public class OffHeapAppendMemory implements QuietCloseable {
         appendAddress += 8;
     }
 
-    public void putFloat(float value) {
-        ensureCapacity(4);
-        Unsafe.getUnsafe().putFloat(appendAddress, value);
-        appendAddress += 4;
-    }
-
-    public void putDouble(double value) {
-        ensureCapacity(8);
-        Unsafe.getUnsafe().putDouble(appendAddress, value);
-        appendAddress += 8;
+    public void putShort(short value) {
+        ensureCapacity(2);
+        Unsafe.getUnsafe().putShort(appendAddress, value);
+        appendAddress += 2;
     }
 
     /**
@@ -171,14 +173,11 @@ public class OffHeapAppendMemory implements QuietCloseable {
         appendAddress += bytes;
     }
 
-    @Override
-    public void close() {
-        if (pageAddress != 0) {
-            Unsafe.free(pageAddress, capacity, MemoryTag.NATIVE_ILP_RSS);
-            pageAddress = 0;
-            appendAddress = 0;
-            capacity = 0;
-        }
+    /**
+     * Resets the append position to 0 without freeing memory.
+     */
+    public void truncate() {
+        appendAddress = pageAddress;
     }
 
     private void ensureCapacity(long needed) {

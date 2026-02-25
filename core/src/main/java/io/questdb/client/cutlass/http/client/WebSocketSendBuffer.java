@@ -24,10 +24,10 @@
 
 package io.questdb.client.cutlass.http.client;
 
+import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
+import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
-import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
-import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.QuietCloseable;
@@ -57,21 +57,18 @@ import io.questdb.client.std.Vect;
  */
 public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
 
-    // Maximum header size: 2 (base) + 8 (64-bit length) + 4 (mask key)
-    private static final int MAX_HEADER_SIZE = 14;
-
     private static final int DEFAULT_INITIAL_CAPACITY = 65536;
     private static final int MAX_BUFFER_SIZE = Integer.MAX_VALUE - 8; // Leave room for alignment
-
-    private long bufPtr;
+    // Maximum header size: 2 (base) + 8 (64-bit length) + 4 (mask key)
+    private static final int MAX_HEADER_SIZE = 14;
+    private final FrameInfo frameInfo = new FrameInfo();
+    private final int maxBufferSize;
+    private final Rnd rnd;
     private int bufCapacity;
-    private int writePos;           // Current write position (offset from bufPtr)
+    private long bufPtr;
     private int frameStartOffset;   // Where current frame's reserved header starts
     private int payloadStartOffset; // Where payload begins (frameStart + MAX_HEADER_SIZE)
-
-    private final Rnd rnd;
-    private final int maxBufferSize;
-    private final FrameInfo frameInfo = new FrameInfo();
+    private int writePos;           // Current write position (offset from bufPtr)
 
     /**
      * Creates a new WebSocket send buffer with default initial capacity.
@@ -105,6 +102,34 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         this.rnd = new Rnd(System.nanoTime(), System.currentTimeMillis());
     }
 
+    /**
+     * Begins a new binary WebSocket frame. Reserves space for the maximum header size.
+     * After calling this method, use ArrayBufferAppender methods to write the payload.
+     */
+    public void beginBinaryFrame() {
+        beginFrame(WebSocketOpcode.BINARY);
+    }
+
+    /**
+     * Begins a new WebSocket frame with the specified opcode.
+     *
+     * @param opcode the frame opcode
+     */
+    public void beginFrame(int opcode) {
+        frameStartOffset = writePos;
+        // Reserve maximum header space
+        ensureCapacity(MAX_HEADER_SIZE);
+        writePos += MAX_HEADER_SIZE;
+        payloadStartOffset = writePos;
+    }
+
+    /**
+     * Begins a new text WebSocket frame. Reserves space for the maximum header size.
+     */
+    public void beginTextFrame() {
+        beginFrame(WebSocketOpcode.TEXT);
+    }
+
     @Override
     public void close() {
         if (bufPtr != 0) {
@@ -114,7 +139,53 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         }
     }
 
-    // === Buffer Management ===
+    /**
+     * Finishes the current binary frame, writing the header and applying masking.
+     * Returns information about where to find the complete frame in the buffer.
+     * <p>
+     * IMPORTANT: Only call this after all payload writes are complete. The buffer
+     * pointer is stable after this call (no more reallocations for this frame).
+     *
+     * @return frame info containing offset and length for sending
+     */
+    public FrameInfo endBinaryFrame() {
+        return endFrame(WebSocketOpcode.BINARY);
+    }
+
+    /**
+     * Finishes the current frame with the specified opcode.
+     *
+     * @param opcode the frame opcode
+     * @return frame info containing offset and length for sending
+     */
+    public FrameInfo endFrame(int opcode) {
+        int payloadLen = writePos - payloadStartOffset;
+
+        // Calculate actual header size (with mask key for client frames)
+        int actualHeaderSize = WebSocketFrameWriter.headerSize(payloadLen, true);
+        int unusedSpace = MAX_HEADER_SIZE - actualHeaderSize;
+        int actualFrameStart = frameStartOffset + unusedSpace;
+
+        // Generate mask key
+        int maskKey = rnd.nextInt();
+
+        // Write header at actual position (after unused space)
+        WebSocketFrameWriter.writeHeader(bufPtr + actualFrameStart, true, opcode, payloadLen, maskKey);
+
+        // Apply mask to payload
+        if (payloadLen > 0) {
+            WebSocketFrameWriter.maskPayload(bufPtr + payloadStartOffset, payloadLen, maskKey);
+        }
+
+        return frameInfo.set(actualFrameStart, actualHeaderSize + payloadLen);
+    }
+
+    /**
+     * Finishes the current text frame, writing the header and applying masking.
+     */
+    public FrameInfo endTextFrame() {
+        return endFrame(WebSocketOpcode.TEXT);
+    }
 
     /**
      * Ensures the buffer has capacity for the specified number of additional bytes.
@@ -130,103 +201,48 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         }
     }
 
-    private void grow(long requiredCapacity) {
-        if (requiredCapacity > maxBufferSize) {
-            throw new HttpClientException("WebSocket buffer size exceeded maximum [required=")
-                    .put(requiredCapacity)
-                    .put(", max=")
-                    .put(maxBufferSize)
-                    .put(']');
-        }
-        int newCapacity = Math.min(
-                Numbers.ceilPow2((int) requiredCapacity),
-                maxBufferSize
-        );
-        bufPtr = Unsafe.realloc(bufPtr, bufCapacity, newCapacity, MemoryTag.NATIVE_DEFAULT);
-        bufCapacity = newCapacity;
-    }
-
-    // === ArrayBufferAppender Implementation ===
-
-    @Override
-    public void putByte(byte b) {
-        ensureCapacity(1);
-        Unsafe.getUnsafe().putByte(bufPtr + writePos, b);
-        writePos++;
-    }
-
-    @Override
-    public void putInt(int value) {
-        ensureCapacity(4);
-        Unsafe.getUnsafe().putInt(bufPtr + writePos, value);
-        writePos += 4;
-    }
-
-    @Override
-    public void putLong(long value) {
-        ensureCapacity(8);
-        Unsafe.getUnsafe().putLong(bufPtr + writePos, value);
-        writePos += 8;
-    }
-
-    @Override
-    public void putDouble(double value) {
-        ensureCapacity(8);
-        Unsafe.getUnsafe().putDouble(bufPtr + writePos, value);
-        writePos += 8;
-    }
-
-    @Override
-    public void putBlockOfBytes(long from, long len) {
-        if (len <= 0) {
-            return;
-        }
-        ensureCapacity((int) len);
-        Vect.memcpy(bufPtr + writePos, from, len);
-        writePos += (int) len;
-    }
-
-    // === Additional write methods (not in ArrayBufferAppender but useful) ===
-
     /**
-     * Writes a short value in little-endian format.
+     * Gets the buffer pointer. Only use this for reading after frame is complete.
      */
-    public void putShort(short value) {
-        ensureCapacity(2);
-        Unsafe.getUnsafe().putShort(bufPtr + writePos, value);
-        writePos += 2;
+    public long getBufferPtr() {
+        return bufPtr;
     }
 
     /**
-     * Writes a float value.
+     * Gets the current buffer capacity.
      */
-    public void putFloat(float value) {
-        ensureCapacity(4);
-        Unsafe.getUnsafe().putFloat(bufPtr + writePos, value);
-        writePos += 4;
+    public int getCapacity() {
+        return bufCapacity;
     }
 
     /**
-     * Writes a long value in big-endian format.
+     * Gets the payload length of the current frame being built.
      */
-    public void putLongBE(long value) {
-        ensureCapacity(8);
-        Unsafe.getUnsafe().putLong(bufPtr + writePos, Long.reverseBytes(value));
-        writePos += 8;
+    public int getCurrentPayloadLength() {
+        return writePos - payloadStartOffset;
     }
 
     /**
-     * Writes raw bytes from a byte array.
+     * Gets the current write position (number of bytes written).
      */
-    public void putBytes(byte[] bytes, int offset, int length) {
-        if (length <= 0) {
-            return;
-        }
-        ensureCapacity(length);
-        for (int i = 0; i < length; i++) {
-            Unsafe.getUnsafe().putByte(bufPtr + writePos + i, bytes[offset + i]);
-        }
-        writePos += length;
+    @Override
+    public int getPosition() {
+        return writePos;
+    }
+
+    /**
+     * Gets the current write position (total bytes written since last reset).
+     */
+    public int getWritePos() {
+        return writePos;
+    }
+
+    /**
+     * Patches an int value at the specified offset.
+     */
+    @Override
+    public void patchInt(int offset, int value) {
+        Unsafe.getUnsafe().putInt(bufPtr + offset, value);
     }
 
     /**
@@ -244,18 +260,83 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         writePos += len;
     }
 
-    // === QwpBufferWriter Implementation ===
+    @Override
+    public void putBlockOfBytes(long from, long len) {
+        if (len <= 0) {
+            return;
+        }
+        ensureCapacity((int) len);
+        Vect.memcpy(bufPtr + writePos, from, len);
+        writePos += (int) len;
+    }
+
+    @Override
+    public void putByte(byte b) {
+        ensureCapacity(1);
+        Unsafe.getUnsafe().putByte(bufPtr + writePos, b);
+        writePos++;
+    }
 
     /**
-     * Writes an unsigned variable-length integer (LEB128 encoding).
+     * Writes raw bytes from a byte array.
      */
-    @Override
-    public void putVarint(long value) {
-        while (value > 0x7F) {
-            putByte((byte) ((value & 0x7F) | 0x80));
-            value >>>= 7;
+    public void putBytes(byte[] bytes, int offset, int length) {
+        if (length <= 0) {
+            return;
         }
-        putByte((byte) value);
+        ensureCapacity(length);
+        for (int i = 0; i < length; i++) {
+            Unsafe.getUnsafe().putByte(bufPtr + writePos + i, bytes[offset + i]);
+        }
+        writePos += length;
+    }
+
+    @Override
+    public void putDouble(double value) {
+        ensureCapacity(8);
+        Unsafe.getUnsafe().putDouble(bufPtr + writePos, value);
+        writePos += 8;
+    }
+
+    /**
+     * Writes a float value.
+     */
+    public void putFloat(float value) {
+        ensureCapacity(4);
+        Unsafe.getUnsafe().putFloat(bufPtr + writePos, value);
+        writePos += 4;
+    }
+
+    @Override
+    public void putInt(int value) {
+        ensureCapacity(4);
+        Unsafe.getUnsafe().putInt(bufPtr + writePos, value);
+        writePos += 4;
+    }
+
+    @Override
+    public void putLong(long value) {
+        ensureCapacity(8);
+        Unsafe.getUnsafe().putLong(bufPtr + writePos, value);
+        writePos += 8;
+    }
+
+    /**
+     * Writes a long value in big-endian format.
+     */
+    public void putLongBE(long value) {
+        ensureCapacity(8);
+        Unsafe.getUnsafe().putLong(bufPtr + writePos, Long.reverseBytes(value));
+        writePos += 8;
+    }
+
+    /**
+     * Writes a short value in little-endian format.
+     */
+    public void putShort(short value) {
+        ensureCapacity(2);
+        Unsafe.getUnsafe().putShort(bufPtr + writePos, value);
+        writePos += 2;
     }
 
     /**
@@ -303,11 +384,24 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Patches an int value at the specified offset.
+     * Writes an unsigned variable-length integer (LEB128 encoding).
      */
     @Override
-    public void patchInt(int offset, int value) {
-        Unsafe.getUnsafe().putInt(bufPtr + offset, value);
+    public void putVarint(long value) {
+        while (value > 0x7F) {
+            putByte((byte) ((value & 0x7F) | 0x80));
+            value >>>= 7;
+        }
+        putByte((byte) value);
+    }
+
+    /**
+     * Resets the buffer for reuse. Does not deallocate memory.
+     */
+    public void reset() {
+        writePos = 0;
+        frameStartOffset = 0;
+        payloadStartOffset = 0;
     }
 
     /**
@@ -320,89 +414,49 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Gets the current write position (number of bytes written).
-     */
-    @Override
-    public int getPosition() {
-        return writePos;
-    }
-
-    // === Frame Building ===
-
-    /**
-     * Begins a new binary WebSocket frame. Reserves space for the maximum header size.
-     * After calling this method, use ArrayBufferAppender methods to write the payload.
-     */
-    public void beginBinaryFrame() {
-        beginFrame(WebSocketOpcode.BINARY);
-    }
-
-    /**
-     * Begins a new text WebSocket frame. Reserves space for the maximum header size.
-     */
-    public void beginTextFrame() {
-        beginFrame(WebSocketOpcode.TEXT);
-    }
-
-    /**
-     * Begins a new WebSocket frame with the specified opcode.
+     * Writes a complete close frame.
      *
-     * @param opcode the frame opcode
+     * @param code   close status code (e.g., 1000 for normal closure)
+     * @param reason optional reason string (may be null)
+     * @return frame info for sending
      */
-    public void beginFrame(int opcode) {
-        frameStartOffset = writePos;
-        // Reserve maximum header space
-        ensureCapacity(MAX_HEADER_SIZE);
-        writePos += MAX_HEADER_SIZE;
-        payloadStartOffset = writePos;
-    }
-
-    /**
-     * Finishes the current binary frame, writing the header and applying masking.
-     * Returns information about where to find the complete frame in the buffer.
-     * <p>
-     * IMPORTANT: Only call this after all payload writes are complete. The buffer
-     * pointer is stable after this call (no more reallocations for this frame).
-     *
-     * @return frame info containing offset and length for sending
-     */
-    public FrameInfo endBinaryFrame() {
-        return endFrame(WebSocketOpcode.BINARY);
-    }
-
-    /**
-     * Finishes the current text frame, writing the header and applying masking.
-     */
-    public FrameInfo endTextFrame() {
-        return endFrame(WebSocketOpcode.TEXT);
-    }
-
-    /**
-     * Finishes the current frame with the specified opcode.
-     *
-     * @param opcode the frame opcode
-     * @return frame info containing offset and length for sending
-     */
-    public FrameInfo endFrame(int opcode) {
-        int payloadLen = writePos - payloadStartOffset;
-
-        // Calculate actual header size (with mask key for client frames)
-        int actualHeaderSize = WebSocketFrameWriter.headerSize(payloadLen, true);
-        int unusedSpace = MAX_HEADER_SIZE - actualHeaderSize;
-        int actualFrameStart = frameStartOffset + unusedSpace;
-
-        // Generate mask key
-        int maskKey = rnd.nextInt();
-
-        // Write header at actual position (after unused space)
-        WebSocketFrameWriter.writeHeader(bufPtr + actualFrameStart, true, opcode, payloadLen, maskKey);
-
-        // Apply mask to payload
-        if (payloadLen > 0) {
-            WebSocketFrameWriter.maskPayload(bufPtr + payloadStartOffset, payloadLen, maskKey);
+    public FrameInfo writeCloseFrame(int code, String reason) {
+        int payloadLen = 2; // status code
+        byte[] reasonBytes = null;
+        if (reason != null && !reason.isEmpty()) {
+            reasonBytes = reason.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            payloadLen += reasonBytes.length;
         }
 
-        return frameInfo.set(actualFrameStart, actualHeaderSize + payloadLen);
+        if (payloadLen > 125) {
+            throw new HttpClientException("Close payload too large [len=").put(payloadLen).put(']');
+        }
+
+        int frameStart = writePos;
+        int headerSize = WebSocketFrameWriter.headerSize(payloadLen, true);
+        ensureCapacity(headerSize + payloadLen);
+
+        int maskKey = rnd.nextInt();
+        int written = WebSocketFrameWriter.writeHeader(bufPtr + writePos, true, WebSocketOpcode.CLOSE, payloadLen, maskKey);
+        writePos += written;
+
+        // Write status code (big-endian)
+        long payloadStart = bufPtr + writePos;
+        Unsafe.getUnsafe().putByte(payloadStart, (byte) ((code >> 8) & 0xFF));
+        Unsafe.getUnsafe().putByte(payloadStart + 1, (byte) (code & 0xFF));
+        writePos += 2;
+
+        // Write reason if present
+        if (reasonBytes != null) {
+            for (byte reasonByte : reasonBytes) {
+                Unsafe.getUnsafe().putByte(bufPtr + writePos++, reasonByte);
+            }
+        }
+
+        // Mask the payload (including status code and reason)
+        WebSocketFrameWriter.maskPayload(payloadStart, payloadLen, maskKey);
+
+        return frameInfo.set(frameStart, headerSize + payloadLen);
     }
 
     /**
@@ -473,89 +527,20 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         return frameInfo.set(frameStart, headerSize + payloadLen);
     }
 
-    /**
-     * Writes a complete close frame.
-     *
-     * @param code   close status code (e.g., 1000 for normal closure)
-     * @param reason optional reason string (may be null)
-     * @return frame info for sending
-     */
-    public FrameInfo writeCloseFrame(int code, String reason) {
-        int payloadLen = 2; // status code
-        byte[] reasonBytes = null;
-        if (reason != null && !reason.isEmpty()) {
-            reasonBytes = reason.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            payloadLen += reasonBytes.length;
+    private void grow(long requiredCapacity) {
+        if (requiredCapacity > maxBufferSize) {
+            throw new HttpClientException("WebSocket buffer size exceeded maximum [required=")
+                    .put(requiredCapacity)
+                    .put(", max=")
+                    .put(maxBufferSize)
+                    .put(']');
         }
-
-        if (payloadLen > 125) {
-            throw new HttpClientException("Close payload too large [len=").put(payloadLen).put(']');
-        }
-
-        int frameStart = writePos;
-        int headerSize = WebSocketFrameWriter.headerSize(payloadLen, true);
-        ensureCapacity(headerSize + payloadLen);
-
-        int maskKey = rnd.nextInt();
-        int written = WebSocketFrameWriter.writeHeader(bufPtr + writePos, true, WebSocketOpcode.CLOSE, payloadLen, maskKey);
-        writePos += written;
-
-        // Write status code (big-endian)
-        long payloadStart = bufPtr + writePos;
-        Unsafe.getUnsafe().putByte(payloadStart, (byte) ((code >> 8) & 0xFF));
-        Unsafe.getUnsafe().putByte(payloadStart + 1, (byte) (code & 0xFF));
-        writePos += 2;
-
-        // Write reason if present
-        if (reasonBytes != null) {
-            for (byte reasonByte : reasonBytes) {
-                Unsafe.getUnsafe().putByte(bufPtr + writePos++, reasonByte);
-            }
-        }
-
-        // Mask the payload (including status code and reason)
-        WebSocketFrameWriter.maskPayload(payloadStart, payloadLen, maskKey);
-
-        return frameInfo.set(frameStart, headerSize + payloadLen);
-    }
-
-    // === Buffer State ===
-
-    /**
-     * Gets the buffer pointer. Only use this for reading after frame is complete.
-     */
-    public long getBufferPtr() {
-        return bufPtr;
-    }
-
-    /**
-     * Gets the current buffer capacity.
-     */
-    public int getCapacity() {
-        return bufCapacity;
-    }
-
-    /**
-     * Gets the current write position (total bytes written since last reset).
-     */
-    public int getWritePos() {
-        return writePos;
-    }
-
-    /**
-     * Gets the payload length of the current frame being built.
-     */
-    public int getCurrentPayloadLength() {
-        return writePos - payloadStartOffset;
-    }
-
-    /**
-     * Resets the buffer for reuse. Does not deallocate memory.
-     */
-    public void reset() {
-        writePos = 0;
-        frameStartOffset = 0;
-        payloadStartOffset = 0;
+        int newCapacity = Math.min(
+                Numbers.ceilPow2((int) requiredCapacity),
+                maxBufferSize
+        );
+        bufPtr = Unsafe.realloc(bufPtr, bufCapacity, newCapacity, MemoryTag.NATIVE_DEFAULT);
+        bufCapacity = newCapacity;
     }
 
     /**
@@ -565,14 +550,13 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
      */
     public static final class FrameInfo {
         /**
-         * Offset from buffer start where the frame begins.
-         */
-        public int offset;
-
-        /**
          * Total length of the frame (header + payload).
          */
         public int length;
+        /**
+         * Offset from buffer start where the frame begins.
+         */
+        public int offset;
 
         FrameInfo set(int offset, int length) {
             this.offset = offset;

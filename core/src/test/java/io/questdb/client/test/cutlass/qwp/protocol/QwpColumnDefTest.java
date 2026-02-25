@@ -28,7 +28,8 @@ import io.questdb.client.cutlass.qwp.protocol.QwpColumnDef;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import org.junit.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class QwpColumnDefTest {
 

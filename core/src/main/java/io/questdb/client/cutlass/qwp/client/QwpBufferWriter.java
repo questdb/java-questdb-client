@@ -44,112 +44,6 @@ import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
  */
 public interface QwpBufferWriter extends ArrayBufferAppender {
 
-    // === Primitive writes (little-endian) ===
-
-    /**
-     * Writes a short (2 bytes, little-endian).
-     */
-    void putShort(short value);
-
-    /**
-     * Writes a float (4 bytes, little-endian).
-     */
-    void putFloat(float value);
-
-    // === Big-endian writes ===
-
-    /**
-     * Writes a long in big-endian byte order.
-     */
-    void putLongBE(long value);
-
-    // === Variable-length encoding ===
-
-    /**
-     * Writes an unsigned variable-length integer (LEB128 encoding).
-     * <p>
-     * Each byte contains 7 bits of data with the high bit indicating
-     * whether more bytes follow.
-     */
-    void putVarint(long value);
-
-    // === String encoding ===
-
-    /**
-     * Writes a length-prefixed UTF-8 string.
-     * <p>
-     * Format: varint length + UTF-8 bytes
-     *
-     * @param value the string to write (may be null or empty)
-     */
-    void putString(String value);
-
-    /**
-     * Writes UTF-8 encoded bytes directly without length prefix.
-     *
-     * @param value the string to encode (may be null or empty)
-     */
-    void putUtf8(String value);
-
-    // === Buffer manipulation ===
-
-    /**
-     * Patches an int value at the specified offset in the buffer.
-     * <p>
-     * Used for updating length fields after writing content.
-     *
-     * @param offset the byte offset from buffer start
-     * @param value  the int value to write
-     */
-    void patchInt(int offset, int value);
-
-    /**
-     * Skips the specified number of bytes, advancing the position.
-     * <p>
-     * Used when data has been written directly to the buffer via
-     * {@link #getBufferPtr()}.
-     *
-     * @param bytes number of bytes to skip
-     */
-    void skip(int bytes);
-
-    /**
-     * Ensures the buffer has capacity for at least the specified
-     * additional bytes beyond the current position.
-     *
-     * @param additionalBytes number of additional bytes needed
-     */
-    void ensureCapacity(int additionalBytes);
-
-    /**
-     * Resets the buffer for reuse, setting the position to 0.
-     * <p>
-     * Does not deallocate memory.
-     */
-    void reset();
-
-    // === Buffer state ===
-
-    /**
-     * Returns the current write position (number of bytes written).
-     */
-    int getPosition();
-
-    /**
-     * Returns the current buffer capacity in bytes.
-     */
-    int getCapacity();
-
-    /**
-     * Returns the native memory pointer to the buffer start.
-     * <p>
-     * The returned pointer is valid until the next buffer growth operation.
-     * Use with care and only for reading completed data.
-     */
-    long getBufferPtr();
-
-    // === Utility ===
-
     /**
      * Returns the UTF-8 encoded length of a string.
      *
@@ -174,4 +68,96 @@ public interface QwpBufferWriter extends ArrayBufferAppender {
         }
         return len;
     }
+
+    /**
+     * Ensures the buffer has capacity for at least the specified
+     * additional bytes beyond the current position.
+     *
+     * @param additionalBytes number of additional bytes needed
+     */
+    void ensureCapacity(int additionalBytes);
+
+    /**
+     * Returns the native memory pointer to the buffer start.
+     * <p>
+     * The returned pointer is valid until the next buffer growth operation.
+     * Use with care and only for reading completed data.
+     */
+    long getBufferPtr();
+
+    /**
+     * Returns the current buffer capacity in bytes.
+     */
+    int getCapacity();
+
+    /**
+     * Returns the current write position (number of bytes written).
+     */
+    int getPosition();
+
+    /**
+     * Patches an int value at the specified offset in the buffer.
+     * <p>
+     * Used for updating length fields after writing content.
+     *
+     * @param offset the byte offset from buffer start
+     * @param value  the int value to write
+     */
+    void patchInt(int offset, int value);
+
+    /**
+     * Writes a float (4 bytes, little-endian).
+     */
+    void putFloat(float value);
+
+    /**
+     * Writes a long in big-endian byte order.
+     */
+    void putLongBE(long value);
+
+    /**
+     * Writes a short (2 bytes, little-endian).
+     */
+    void putShort(short value);
+
+    /**
+     * Writes a length-prefixed UTF-8 string.
+     * <p>
+     * Format: varint length + UTF-8 bytes
+     *
+     * @param value the string to write (may be null or empty)
+     */
+    void putString(String value);
+
+    /**
+     * Writes UTF-8 encoded bytes directly without length prefix.
+     *
+     * @param value the string to encode (may be null or empty)
+     */
+    void putUtf8(String value);
+
+    /**
+     * Writes an unsigned variable-length integer (LEB128 encoding).
+     * <p>
+     * Each byte contains 7 bits of data with the high bit indicating
+     * whether more bytes follow.
+     */
+    void putVarint(long value);
+
+    /**
+     * Resets the buffer for reuse, setting the position to 0.
+     * <p>
+     * Does not deallocate memory.
+     */
+    void reset();
+
+    /**
+     * Skips the specified number of bytes, advancing the position.
+     * <p>
+     * Used when data has been written directly to the buffer via
+     * {@link #getBufferPtr()}.
+     *
+     * @param bytes number of bytes to skip
+     */
+    void skip(int bytes);
 }

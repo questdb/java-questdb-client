@@ -36,6 +36,69 @@ import static org.junit.Assert.*;
 public class QwpBitWriterTest {
 
     @Test
+    public void testFlushThrowsOnOverflow() {
+        long ptr = Unsafe.malloc(1, MemoryTag.NATIVE_ILP_RSS);
+        try {
+            QwpBitWriter writer = new QwpBitWriter();
+            writer.reset(ptr, 1);
+            // Write 8 bits to fill the single byte
+            writer.writeBits(0xFF, 8);
+            // Write a few more bits that sit in the bit buffer
+            writer.writeBits(0x3, 4);
+            // Flush should throw because there's no room for the partial byte
+            try {
+                writer.flush();
+                fail("expected LineSenderException on buffer overflow during flush");
+            } catch (LineSenderException e) {
+                assertTrue(e.getMessage().contains("buffer overflow"));
+            }
+        } finally {
+            Unsafe.free(ptr, 1, MemoryTag.NATIVE_ILP_RSS);
+        }
+    }
+
+    @Test
+    public void testGorillaEncoderThrowsOnInsufficientCapacityForFirstTimestamp() {
+        // Source: 1 timestamp (8 bytes), dest: only 4 bytes
+        long src = Unsafe.malloc(8, MemoryTag.NATIVE_ILP_RSS);
+        long dst = Unsafe.malloc(4, MemoryTag.NATIVE_ILP_RSS);
+        try {
+            Unsafe.getUnsafe().putLong(src, 1_000_000L);
+            QwpGorillaEncoder encoder = new QwpGorillaEncoder();
+            try {
+                encoder.encodeTimestamps(dst, 4, src, 1);
+                fail("expected LineSenderException on buffer overflow");
+            } catch (LineSenderException e) {
+                assertTrue(e.getMessage().contains("buffer overflow"));
+            }
+        } finally {
+            Unsafe.free(src, 8, MemoryTag.NATIVE_ILP_RSS);
+            Unsafe.free(dst, 4, MemoryTag.NATIVE_ILP_RSS);
+        }
+    }
+
+    @Test
+    public void testGorillaEncoderThrowsOnInsufficientCapacityForSecondTimestamp() {
+        // Source: 2 timestamps (16 bytes), dest: only 12 bytes (enough for first, not second)
+        long src = Unsafe.malloc(16, MemoryTag.NATIVE_ILP_RSS);
+        long dst = Unsafe.malloc(12, MemoryTag.NATIVE_ILP_RSS);
+        try {
+            Unsafe.getUnsafe().putLong(src, 1_000_000L);
+            Unsafe.getUnsafe().putLong(src + 8, 2_000_000L);
+            QwpGorillaEncoder encoder = new QwpGorillaEncoder();
+            try {
+                encoder.encodeTimestamps(dst, 12, src, 2);
+                fail("expected LineSenderException on buffer overflow");
+            } catch (LineSenderException e) {
+                assertTrue(e.getMessage().contains("buffer overflow"));
+            }
+        } finally {
+            Unsafe.free(src, 16, MemoryTag.NATIVE_ILP_RSS);
+            Unsafe.free(dst, 12, MemoryTag.NATIVE_ILP_RSS);
+        }
+    }
+
+    @Test
     public void testWriteBitsThrowsOnOverflow() {
         long ptr = Unsafe.malloc(4, MemoryTag.NATIVE_ILP_RSS);
         try {
@@ -52,6 +115,21 @@ public class QwpBitWriterTest {
             }
         } finally {
             Unsafe.free(ptr, 4, MemoryTag.NATIVE_ILP_RSS);
+        }
+    }
+
+    @Test
+    public void testWriteBitsWithinCapacitySucceeds() {
+        long ptr = Unsafe.malloc(8, MemoryTag.NATIVE_ILP_RSS);
+        try {
+            QwpBitWriter writer = new QwpBitWriter();
+            writer.reset(ptr, 8);
+            writer.writeBits(0xDEAD_BEEF_CAFE_BABEL, 64);
+            writer.flush();
+            assertEquals(8, writer.getPosition() - ptr);
+            assertEquals(0xDEAD_BEEF_CAFE_BABEL, Unsafe.getUnsafe().getLong(ptr));
+        } finally {
+            Unsafe.free(ptr, 8, MemoryTag.NATIVE_ILP_RSS);
         }
     }
 
@@ -104,86 +182,6 @@ public class QwpBitWriterTest {
             } catch (LineSenderException e) {
                 assertTrue(e.getMessage().contains("buffer overflow"));
             }
-        } finally {
-            Unsafe.free(ptr, 8, MemoryTag.NATIVE_ILP_RSS);
-        }
-    }
-
-    @Test
-    public void testFlushThrowsOnOverflow() {
-        long ptr = Unsafe.malloc(1, MemoryTag.NATIVE_ILP_RSS);
-        try {
-            QwpBitWriter writer = new QwpBitWriter();
-            writer.reset(ptr, 1);
-            // Write 8 bits to fill the single byte
-            writer.writeBits(0xFF, 8);
-            // Write a few more bits that sit in the bit buffer
-            writer.writeBits(0x3, 4);
-            // Flush should throw because there's no room for the partial byte
-            try {
-                writer.flush();
-                fail("expected LineSenderException on buffer overflow during flush");
-            } catch (LineSenderException e) {
-                assertTrue(e.getMessage().contains("buffer overflow"));
-            }
-        } finally {
-            Unsafe.free(ptr, 1, MemoryTag.NATIVE_ILP_RSS);
-        }
-    }
-
-    // --- QwpGorillaEncoder overflow tests ---
-
-    @Test
-    public void testGorillaEncoderThrowsOnInsufficientCapacityForFirstTimestamp() {
-        // Source: 1 timestamp (8 bytes), dest: only 4 bytes
-        long src = Unsafe.malloc(8, MemoryTag.NATIVE_ILP_RSS);
-        long dst = Unsafe.malloc(4, MemoryTag.NATIVE_ILP_RSS);
-        try {
-            Unsafe.getUnsafe().putLong(src, 1_000_000L);
-            QwpGorillaEncoder encoder = new QwpGorillaEncoder();
-            try {
-                encoder.encodeTimestamps(dst, 4, src, 1);
-                fail("expected LineSenderException on buffer overflow");
-            } catch (LineSenderException e) {
-                assertTrue(e.getMessage().contains("buffer overflow"));
-            }
-        } finally {
-            Unsafe.free(src, 8, MemoryTag.NATIVE_ILP_RSS);
-            Unsafe.free(dst, 4, MemoryTag.NATIVE_ILP_RSS);
-        }
-    }
-
-    @Test
-    public void testGorillaEncoderThrowsOnInsufficientCapacityForSecondTimestamp() {
-        // Source: 2 timestamps (16 bytes), dest: only 12 bytes (enough for first, not second)
-        long src = Unsafe.malloc(16, MemoryTag.NATIVE_ILP_RSS);
-        long dst = Unsafe.malloc(12, MemoryTag.NATIVE_ILP_RSS);
-        try {
-            Unsafe.getUnsafe().putLong(src, 1_000_000L);
-            Unsafe.getUnsafe().putLong(src + 8, 2_000_000L);
-            QwpGorillaEncoder encoder = new QwpGorillaEncoder();
-            try {
-                encoder.encodeTimestamps(dst, 12, src, 2);
-                fail("expected LineSenderException on buffer overflow");
-            } catch (LineSenderException e) {
-                assertTrue(e.getMessage().contains("buffer overflow"));
-            }
-        } finally {
-            Unsafe.free(src, 16, MemoryTag.NATIVE_ILP_RSS);
-            Unsafe.free(dst, 12, MemoryTag.NATIVE_ILP_RSS);
-        }
-    }
-
-    @Test
-    public void testWriteBitsWithinCapacitySucceeds() {
-        long ptr = Unsafe.malloc(8, MemoryTag.NATIVE_ILP_RSS);
-        try {
-            QwpBitWriter writer = new QwpBitWriter();
-            writer.reset(ptr, 8);
-            writer.writeBits(0xDEAD_BEEF_CAFE_BABEL, 64);
-            writer.flush();
-            assertEquals(8, writer.getPosition() - ptr);
-            assertEquals(0xDEAD_BEEF_CAFE_BABEL, Unsafe.getUnsafe().getLong(ptr));
         } finally {
             Unsafe.free(ptr, 8, MemoryTag.NATIVE_ILP_RSS);
         }

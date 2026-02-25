@@ -67,41 +67,34 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
  */
 public abstract class WebSocketClient implements QuietCloseable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(WebSocketClient.class);
-
     private static final int DEFAULT_RECV_BUFFER_SIZE = 65536;
     private static final int DEFAULT_SEND_BUFFER_SIZE = 65536;
-
+    private static final Logger LOG = LoggerFactory.getLogger(WebSocketClient.class);
     protected final NetworkFacade nf;
     protected final Socket socket;
-
-    private final WebSocketSendBuffer sendBuffer;
     private final WebSocketSendBuffer controlFrameBuffer;
-    private final WebSocketFrameParser frameParser;
-    private final Rnd rnd;
     private final int defaultTimeout;
+    private final WebSocketFrameParser frameParser;
     private final int maxRecvBufSize;
-
+    private final Rnd rnd;
+    private final WebSocketSendBuffer sendBuffer;
+    private boolean closed;
+    private int fragmentBufPos;
+    private long fragmentBufPtr;       // native buffer for accumulating fragment payloads
+    private int fragmentBufSize;
+    // Fragmentation state (RFC 6455 Section 5.4)
+    private int fragmentOpcode = -1;   // opcode of first fragment, -1 = not in a fragmented message
+    // Handshake key for verification
+    private String handshakeKey;
+    // Connection state
+    private CharSequence host;
+    private int port;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
     private int recvPos;      // Write position
     private int recvReadPos;  // Read position
-
-    // Connection state
-    private CharSequence host;
-    private int port;
     private boolean upgraded;
-    private boolean closed;
-
-    // Fragmentation state (RFC 6455 Section 5.4)
-    private int fragmentOpcode = -1;   // opcode of first fragment, -1 = not in a fragmented message
-    private long fragmentBufPtr;       // native buffer for accumulating fragment payloads
-    private int fragmentBufSize;
-    private int fragmentBufPos;
-
-    // Handshake key for verification
-    private String handshakeKey;
 
     public WebSocketClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         this.nf = configuration.getNetworkFacade();
@@ -159,20 +152,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Disconnects the socket without closing the client.
-     * The client can be reconnected by calling connect() again.
-     */
-    public void disconnect() {
-        Misc.free(socket);
-        upgraded = false;
-        host = null;
-        port = 0;
-        recvPos = 0;
-        recvReadPos = 0;
-        resetFragmentState();
-    }
-
-    /**
      * Connects to a WebSocket server.
      *
      * @param host    the server hostname
@@ -204,56 +183,206 @@ public abstract class WebSocketClient implements QuietCloseable {
         connect(host, port, defaultTimeout);
     }
 
-    private void doConnect(CharSequence host, int port, int timeout) {
-        int fd = nf.socketTcp(true);
-        if (fd < 0) {
-            throw new HttpClientException("could not allocate a file descriptor [errno=").errno(nf.errno()).put(']');
+    /**
+     * Disconnects the socket without closing the client.
+     * The client can be reconnected by calling connect() again.
+     */
+    public void disconnect() {
+        Misc.free(socket);
+        upgraded = false;
+        host = null;
+        port = 0;
+        recvPos = 0;
+        recvReadPos = 0;
+        resetFragmentState();
+    }
+
+    /**
+     * Returns the connected host.
+     */
+    public CharSequence getHost() {
+        return host;
+    }
+
+    /**
+     * Returns the connected port.
+     */
+    public int getPort() {
+        return port;
+    }
+
+    /**
+     * Gets the send buffer for building WebSocket frames.
+     * <p>
+     * Usage:
+     * <pre>
+     * WebSocketSendBuffer buf = client.getSendBuffer();
+     * buf.beginBinaryFrame();
+     * buf.putLong(data);
+     * WebSocketSendBuffer.FrameInfo frame = buf.endBinaryFrame();
+     * client.sendFrame(frame, timeout);
+     * buf.reset();
+     * </pre>
+     */
+    public WebSocketSendBuffer getSendBuffer() {
+        return sendBuffer;
+    }
+
+    /**
+     * Returns whether the WebSocket is connected and upgraded.
+     */
+    public boolean isConnected() {
+        return upgraded && !closed && !socket.isClosed();
+    }
+
+    /**
+     * Receives and processes WebSocket frames.
+     *
+     * @param handler frame handler callback
+     * @param timeout timeout in milliseconds
+     * @return true if a frame was received, false on timeout
+     */
+    public boolean receiveFrame(WebSocketFrameHandler handler, int timeout) {
+        checkConnected();
+
+        // First, try to parse any data already in buffer
+        Boolean result = tryParseFrame(handler);
+        if (result != null) {
+            return result;
         }
 
-        if (nf.setTcpNoDelay(fd, true) < 0) {
-            LOG.info("could not disable Nagle's algorithm [fd={}, errno={}]", fd, nf.errno());
-        }
+        // Need more data
+        long startTime = System.nanoTime();
+        while (true) {
+            int remainingTimeout = remainingTime(timeout, startTime);
+            if (remainingTimeout <= 0) {
+                return false; // Timeout
+            }
 
-        socket.of(fd);
-        nf.configureKeepAlive(fd);
+            // Ensure buffer has space
+            if (recvPos >= recvBufSize - 1024) {
+                growRecvBuffer();
+            }
 
-        long addrInfo = nf.getAddrInfo(host, port);
-        if (addrInfo == -1) {
-            disconnect();
-            throw new HttpClientException("could not resolve host [host=").put(host).put(']');
-        }
+            int bytesRead = recvOrTimeout(recvBufPtr + recvPos, recvBufSize - recvPos, remainingTimeout);
+            if (bytesRead <= 0) {
+                return false; // Timeout
+            }
+            recvPos += bytesRead;
 
-        if (nf.connectAddrInfo(fd, addrInfo) != 0) {
-            int errno = nf.errno();
-            nf.freeAddrInfo(addrInfo);
-            disconnect();
-            throw new HttpClientException("could not connect [host=").put(host)
-                    .put(", port=").put(port)
-                    .put(", errno=").put(errno).put(']');
-        }
-        nf.freeAddrInfo(addrInfo);
-
-        if (nf.configureNonBlocking(fd) < 0) {
-            int errno = nf.errno();
-            disconnect();
-            throw new HttpClientException("could not configure non-blocking [fd=").put(fd)
-                    .put(", errno=").put(errno).put(']');
-        }
-
-        if (socket.supportsTls()) {
-            try {
-                socket.startTlsSession(host);
-            } catch (TlsSessionInitFailedException e) {
-                int errno = nf.errno();
-                disconnect();
-                throw new HttpClientException("could not start TLS session [fd=").put(fd)
-                        .put(", error=").put(e.getFlyweightMessage())
-                        .put(", errno=").put(errno).put(']');
+            result = tryParseFrame(handler);
+            if (result != null) {
+                return result;
             }
         }
+    }
 
-        setupIoWait();
-        LOG.debug("Connected to [host={}, port={}]", host, port);
+    /**
+     * Receives frame with default timeout.
+     */
+    public boolean receiveFrame(WebSocketFrameHandler handler) {
+        return receiveFrame(handler, defaultTimeout);
+    }
+
+    /**
+     * Sends binary data as a WebSocket binary frame.
+     *
+     * @param dataPtr pointer to data
+     * @param length  data length
+     * @param timeout timeout in milliseconds
+     */
+    public void sendBinary(long dataPtr, int length, int timeout) {
+        checkConnected();
+        sendBuffer.reset();
+        sendBuffer.beginBinaryFrame();
+        sendBuffer.putBlockOfBytes(dataPtr, length);
+        WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
+        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+        sendBuffer.reset();
+    }
+
+    /**
+     * Sends binary data with default timeout.
+     */
+    public void sendBinary(long dataPtr, int length) {
+        sendBinary(dataPtr, length, defaultTimeout);
+    }
+
+    /**
+     * Sends a close frame.
+     */
+    public void sendCloseFrame(int code, String reason, int timeout) {
+        sendBuffer.reset();
+        WebSocketSendBuffer.FrameInfo frame = sendBuffer.writeCloseFrame(code, reason);
+        try {
+            doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+        } finally {
+            sendBuffer.reset();
+        }
+    }
+
+    /**
+     * Sends a complete WebSocket frame.
+     *
+     * @param frame   frame info from endBinaryFrame()
+     * @param timeout timeout in milliseconds
+     */
+    public void sendFrame(WebSocketSendBuffer.FrameInfo frame, int timeout) {
+        checkConnected();
+        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+    }
+
+    /**
+     * Sends a complete WebSocket frame with default timeout.
+     */
+    public void sendFrame(WebSocketSendBuffer.FrameInfo frame) {
+        sendFrame(frame, defaultTimeout);
+    }
+
+    /**
+     * Sends a ping frame.
+     */
+    public void sendPing(int timeout) {
+        checkConnected();
+        sendBuffer.reset();
+        WebSocketSendBuffer.FrameInfo frame = sendBuffer.writePingFrame();
+        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+        sendBuffer.reset();
+    }
+
+    /**
+     * Non-blocking attempt to receive a WebSocket frame.
+     * Returns immediately if no complete frame is available.
+     *
+     * @param handler frame handler callback
+     * @return true if a frame was received, false if no data available
+     */
+    public boolean tryReceiveFrame(WebSocketFrameHandler handler) {
+        checkConnected();
+
+        // First, try to parse any data already in buffer
+        Boolean result = tryParseFrame(handler);
+        if (result != null) {
+            return result;
+        }
+
+        // Try one non-blocking recv
+        if (recvPos >= recvBufSize - 1024) {
+            growRecvBuffer();
+        }
+
+        int n = socket.recv(recvBufPtr + recvPos, recvBufSize - recvPos);
+        if (n < 0) {
+            throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
+        }
+        if (n == 0) {
+            return false; // No data available
+        }
+        recvPos += n;
+
+        // Try to parse again
+        result = tryParseFrame(handler);
+        return result != null && result;
     }
 
     /**
@@ -320,6 +449,173 @@ public abstract class WebSocketClient implements QuietCloseable {
         upgrade(path, defaultTimeout);
     }
 
+    private static boolean containsHeaderValue(String response, String headerName, String expectedValue) {
+        int headerLen = headerName.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, headerName, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String actualValue = response.substring(valueStart, lineEnd).trim();
+                return actualValue.equals(expectedValue);
+            }
+        }
+        return false;
+    }
+
+    private void appendToFragmentBuffer(long payloadPtr, int payloadLen) {
+        if (payloadLen == 0) {
+            return;
+        }
+        int required = fragmentBufPos + payloadLen;
+        if (required > maxRecvBufSize) {
+            throw new HttpClientException("WebSocket fragment buffer size exceeded maximum [required=")
+                    .put(required)
+                    .put(", max=")
+                    .put(maxRecvBufSize)
+                    .put(']');
+        }
+        if (fragmentBufPtr == 0) {
+            fragmentBufSize = Math.max(required, DEFAULT_RECV_BUFFER_SIZE);
+            fragmentBufPtr = Unsafe.malloc(fragmentBufSize, MemoryTag.NATIVE_DEFAULT);
+        } else if (required > fragmentBufSize) {
+            int newSize = Math.min(Math.max(fragmentBufSize * 2, required), maxRecvBufSize);
+            fragmentBufPtr = Unsafe.realloc(fragmentBufPtr, fragmentBufSize, newSize, MemoryTag.NATIVE_DEFAULT);
+            fragmentBufSize = newSize;
+        }
+        Vect.memmove(fragmentBufPtr + fragmentBufPos, payloadPtr, payloadLen);
+        fragmentBufPos += payloadLen;
+    }
+
+    private void checkConnected() {
+        if (closed) {
+            throw new HttpClientException("WebSocket client is closed");
+        }
+        if (!upgraded) {
+            throw new HttpClientException("WebSocket not connected or upgraded");
+        }
+    }
+
+    private void compactRecvBuffer() {
+        if (recvReadPos > 0) {
+            int remaining = recvPos - recvReadPos;
+            if (remaining > 0) {
+                Vect.memmove(recvBufPtr, recvBufPtr + recvReadPos, remaining);
+            }
+            recvPos = remaining;
+            recvReadPos = 0;
+        }
+    }
+
+    private int dieIfNegative(int byteCount) {
+        if (byteCount < 0) {
+            throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
+        }
+        return byteCount;
+    }
+
+    private void doConnect(CharSequence host, int port, int timeout) {
+        int fd = nf.socketTcp(true);
+        if (fd < 0) {
+            throw new HttpClientException("could not allocate a file descriptor [errno=").errno(nf.errno()).put(']');
+        }
+
+        if (nf.setTcpNoDelay(fd, true) < 0) {
+            LOG.info("could not disable Nagle's algorithm [fd={}, errno={}]", fd, nf.errno());
+        }
+
+        socket.of(fd);
+        nf.configureKeepAlive(fd);
+
+        long addrInfo = nf.getAddrInfo(host, port);
+        if (addrInfo == -1) {
+            disconnect();
+            throw new HttpClientException("could not resolve host [host=").put(host).put(']');
+        }
+
+        if (nf.connectAddrInfo(fd, addrInfo) != 0) {
+            int errno = nf.errno();
+            nf.freeAddrInfo(addrInfo);
+            disconnect();
+            throw new HttpClientException("could not connect [host=").put(host)
+                    .put(", port=").put(port)
+                    .put(", errno=").put(errno).put(']');
+        }
+        nf.freeAddrInfo(addrInfo);
+
+        if (nf.configureNonBlocking(fd) < 0) {
+            int errno = nf.errno();
+            disconnect();
+            throw new HttpClientException("could not configure non-blocking [fd=").put(fd)
+                    .put(", errno=").put(errno).put(']');
+        }
+
+        if (socket.supportsTls()) {
+            try {
+                socket.startTlsSession(host);
+            } catch (TlsSessionInitFailedException e) {
+                int errno = nf.errno();
+                disconnect();
+                throw new HttpClientException("could not start TLS session [fd=").put(fd)
+                        .put(", error=").put(e.getFlyweightMessage())
+                        .put(", errno=").put(errno).put(']');
+            }
+        }
+
+        setupIoWait();
+        LOG.debug("Connected to [host={}, port={}]", host, port);
+    }
+
+    private void doSend(long ptr, int len, int timeout) {
+        long startTime = System.nanoTime();
+        while (len > 0) {
+            int remainingTimeout = remainingTime(timeout, startTime);
+            ioWait(remainingTimeout, IOOperation.WRITE);
+            int sent = dieIfNegative(socket.send(ptr, len));
+            while (socket.wantsTlsWrite()) {
+                remainingTimeout = remainingTime(timeout, startTime);
+                ioWait(remainingTimeout, IOOperation.WRITE);
+                dieIfNegative(socket.tlsIO(Socket.WRITE_FLAG));
+            }
+            if (sent > 0) {
+                ptr += sent;
+                len -= sent;
+            }
+        }
+    }
+
+    private int findHeaderEnd() {
+        // Look for \r\n\r\n
+        for (int i = 0; i < recvPos - 3; i++) {
+            if (Unsafe.getUnsafe().getByte(recvBufPtr + i) == '\r' &&
+                    Unsafe.getUnsafe().getByte(recvBufPtr + i + 1) == '\n' &&
+                    Unsafe.getUnsafe().getByte(recvBufPtr + i + 2) == '\r' &&
+                    Unsafe.getUnsafe().getByte(recvBufPtr + i + 3) == '\n') {
+                return i + 4;
+            }
+        }
+        return -1;
+    }
+
+    private void growRecvBuffer() {
+        int newSize = recvBufSize * 2;
+        if (newSize > maxRecvBufSize) {
+            if (recvBufSize >= maxRecvBufSize) {
+                throw new HttpClientException("WebSocket receive buffer size exceeded maximum [current=")
+                        .put(recvBufSize)
+                        .put(", max=")
+                        .put(maxRecvBufSize)
+                        .put(']');
+            }
+            newSize = maxRecvBufSize;
+        }
+        recvBufPtr = Unsafe.realloc(recvBufPtr, recvBufSize, newSize, MemoryTag.NATIVE_DEFAULT);
+        recvBufSize = newSize;
+    }
+
     private void readUpgradeResponse(int timeout) {
         // Read HTTP response into receive buffer
         long startTime = System.nanoTime();
@@ -351,244 +647,70 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
     }
 
-    private int findHeaderEnd() {
-        // Look for \r\n\r\n
-        for (int i = 0; i < recvPos - 3; i++) {
-            if (Unsafe.getUnsafe().getByte(recvBufPtr + i) == '\r' &&
-                Unsafe.getUnsafe().getByte(recvBufPtr + i + 1) == '\n' &&
-                Unsafe.getUnsafe().getByte(recvBufPtr + i + 2) == '\r' &&
-                Unsafe.getUnsafe().getByte(recvBufPtr + i + 3) == '\n') {
-                return i + 4;
-            }
-        }
-        return -1;
-    }
-
-    private void validateUpgradeResponse(int headerEnd) {
-        // Extract response as string for parsing
-        byte[] responseBytes = new byte[headerEnd];
-        for (int i = 0; i < headerEnd; i++) {
-            responseBytes[i] = Unsafe.getUnsafe().getByte(recvBufPtr + i);
-        }
-        String response = new String(responseBytes, StandardCharsets.US_ASCII);
-
-        // Check status line
-        if (!response.startsWith("HTTP/1.1 101")) {
-            String statusLine = response.split("\r\n")[0];
-            throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);
-        }
-
-        // Verify Sec-WebSocket-Accept (case-insensitive per RFC 7230)
-        String expectedAccept = WebSocketHandshake.computeAcceptKey(handshakeKey);
-        if (!containsHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept)) {
-            throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
-        }
-    }
-
-    private static boolean containsHeaderValue(String response, String headerName, String expectedValue) {
-        int headerLen = headerName.length();
-        int responseLen = response.length();
-        for (int i = 0; i <= responseLen - headerLen; i++) {
-            if (response.regionMatches(true, i, headerName, 0, headerLen)) {
-                int valueStart = i + headerLen;
-                int lineEnd = response.indexOf('\r', valueStart);
-                if (lineEnd < 0) {
-                    lineEnd = responseLen;
-                }
-                String actualValue = response.substring(valueStart, lineEnd).trim();
-                return actualValue.equals(expectedValue);
-            }
-        }
-        return false;
-    }
-
-    // === Sending ===
-
-    /**
-     * Gets the send buffer for building WebSocket frames.
-     * <p>
-     * Usage:
-     * <pre>
-     * WebSocketSendBuffer buf = client.getSendBuffer();
-     * buf.beginBinaryFrame();
-     * buf.putLong(data);
-     * WebSocketSendBuffer.FrameInfo frame = buf.endBinaryFrame();
-     * client.sendFrame(frame, timeout);
-     * buf.reset();
-     * </pre>
-     */
-    public WebSocketSendBuffer getSendBuffer() {
-        return sendBuffer;
-    }
-
-    /**
-     * Sends a complete WebSocket frame.
-     *
-     * @param frame   frame info from endBinaryFrame()
-     * @param timeout timeout in milliseconds
-     */
-    public void sendFrame(WebSocketSendBuffer.FrameInfo frame, int timeout) {
-        checkConnected();
-        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
-    }
-
-    /**
-     * Sends a complete WebSocket frame with default timeout.
-     */
-    public void sendFrame(WebSocketSendBuffer.FrameInfo frame) {
-        sendFrame(frame, defaultTimeout);
-    }
-
-    /**
-     * Sends binary data as a WebSocket binary frame.
-     *
-     * @param dataPtr pointer to data
-     * @param length  data length
-     * @param timeout timeout in milliseconds
-     */
-    public void sendBinary(long dataPtr, int length, int timeout) {
-        checkConnected();
-        sendBuffer.reset();
-        sendBuffer.beginBinaryFrame();
-        sendBuffer.putBlockOfBytes(dataPtr, length);
-        WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
-        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
-        sendBuffer.reset();
-    }
-
-    /**
-     * Sends binary data with default timeout.
-     */
-    public void sendBinary(long dataPtr, int length) {
-        sendBinary(dataPtr, length, defaultTimeout);
-    }
-
-    /**
-     * Sends a ping frame.
-     */
-    public void sendPing(int timeout) {
-        checkConnected();
-        sendBuffer.reset();
-        WebSocketSendBuffer.FrameInfo frame = sendBuffer.writePingFrame();
-        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
-        sendBuffer.reset();
-    }
-
-    /**
-     * Sends a close frame.
-     */
-    public void sendCloseFrame(int code, String reason, int timeout) {
-        sendBuffer.reset();
-        WebSocketSendBuffer.FrameInfo frame = sendBuffer.writeCloseFrame(code, reason);
-        try {
-            doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
-        } finally {
-            sendBuffer.reset();
-        }
-    }
-
-    private void doSend(long ptr, int len, int timeout) {
+    private int recvOrDie(long ptr, int len, int timeout) {
         long startTime = System.nanoTime();
-        while (len > 0) {
-            int remainingTimeout = remainingTime(timeout, startTime);
-            ioWait(remainingTimeout, IOOperation.WRITE);
-            int sent = dieIfNegative(socket.send(ptr, len));
-            while (socket.wantsTlsWrite()) {
-                remainingTimeout = remainingTime(timeout, startTime);
-                ioWait(remainingTimeout, IOOperation.WRITE);
-                dieIfNegative(socket.tlsIO(Socket.WRITE_FLAG));
-            }
-            if (sent > 0) {
-                ptr += sent;
-                len -= sent;
-            }
+        int n = dieIfNegative(socket.recv(ptr, len));
+        if (n == 0) {
+            ioWait(remainingTime(timeout, startTime), IOOperation.READ);
+            n = dieIfNegative(socket.recv(ptr, len));
         }
+        return n;
     }
 
-    // === Receiving ===
-
-    /**
-     * Receives and processes WebSocket frames.
-     *
-     * @param handler frame handler callback
-     * @param timeout timeout in milliseconds
-     * @return true if a frame was received, false on timeout
-     */
-    public boolean receiveFrame(WebSocketFrameHandler handler, int timeout) {
-        checkConnected();
-
-        // First, try to parse any data already in buffer
-        Boolean result = tryParseFrame(handler);
-        if (result != null) {
-            return result;
-        }
-
-        // Need more data
+    private int recvOrTimeout(long ptr, int len, int timeout) {
         long startTime = System.nanoTime();
-        while (true) {
-            int remainingTimeout = remainingTime(timeout, startTime);
-            if (remainingTimeout <= 0) {
-                return false; // Timeout
-            }
-
-            // Ensure buffer has space
-            if (recvPos >= recvBufSize - 1024) {
-                growRecvBuffer();
-            }
-
-            int bytesRead = recvOrTimeout(recvBufPtr + recvPos, recvBufSize - recvPos, remainingTimeout);
-            if (bytesRead <= 0) {
-                return false; // Timeout
-            }
-            recvPos += bytesRead;
-
-            result = tryParseFrame(handler);
-            if (result != null) {
-                return result;
-            }
-        }
-    }
-
-    /**
-     * Receives frame with default timeout.
-     */
-    public boolean receiveFrame(WebSocketFrameHandler handler) {
-        return receiveFrame(handler, defaultTimeout);
-    }
-
-    /**
-     * Non-blocking attempt to receive a WebSocket frame.
-     * Returns immediately if no complete frame is available.
-     *
-     * @param handler frame handler callback
-     * @return true if a frame was received, false if no data available
-     */
-    public boolean tryReceiveFrame(WebSocketFrameHandler handler) {
-        checkConnected();
-
-        // First, try to parse any data already in buffer
-        Boolean result = tryParseFrame(handler);
-        if (result != null) {
-            return result;
-        }
-
-        // Try one non-blocking recv
-        if (recvPos >= recvBufSize - 1024) {
-            growRecvBuffer();
-        }
-
-        int n = socket.recv(recvBufPtr + recvPos, recvBufSize - recvPos);
+        int n = socket.recv(ptr, len);
         if (n < 0) {
             throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
         }
         if (n == 0) {
-            return false; // No data available
+            try {
+                ioWait(timeout, IOOperation.READ);
+            } catch (HttpClientException e) {
+                // Timeout
+                return 0;
+            }
+            n = socket.recv(ptr, len);
+            if (n < 0) {
+                throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
+            }
         }
-        recvPos += n;
+        return n;
+    }
 
-        // Try to parse again
-        result = tryParseFrame(handler);
-        return result != null && result;
+    private int remainingTime(int timeoutMillis, long startTimeNanos) {
+        timeoutMillis -= (int) NANOSECONDS.toMillis(System.nanoTime() - startTimeNanos);
+        if (timeoutMillis <= 0) {
+            throw new HttpClientException("timed out [errno=").errno(nf.errno()).put(']');
+        }
+        return timeoutMillis;
+    }
+
+    private void resetFragmentState() {
+        fragmentOpcode = -1;
+        fragmentBufPos = 0;
+    }
+
+    private void sendCloseFrameEcho(int code) {
+        try {
+            controlFrameBuffer.reset();
+            WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writeCloseFrame(code, null);
+            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, 1000);
+            controlFrameBuffer.reset();
+        } catch (Exception e) {
+            LOG.error("Failed to echo close frame: {}", e.getMessage());
+        }
+    }
+
+    private void sendPongFrame(long payloadPtr, int payloadLen) {
+        try {
+            controlFrameBuffer.reset();
+            WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writePongFrame(payloadPtr, payloadLen);
+            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, 1000);
+            controlFrameBuffer.reset();
+        } catch (Exception e) {
+            LOG.error("Failed to send pong: {}", e.getMessage());
+        }
     }
 
     private Boolean tryParseFrame(WebSocketFrameHandler handler) {
@@ -600,7 +722,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         int consumed = frameParser.parse(recvBufPtr + recvReadPos, recvBufPtr + recvPos);
 
         if (frameParser.getState() == WebSocketFrameParser.STATE_NEED_MORE ||
-            frameParser.getState() == WebSocketFrameParser.STATE_NEED_PAYLOAD) {
+                frameParser.getState() == WebSocketFrameParser.STATE_NEED_PAYLOAD) {
             return null; // Need more data
         }
 
@@ -706,130 +828,25 @@ public abstract class WebSocketClient implements QuietCloseable {
         return false;
     }
 
-    private void sendCloseFrameEcho(int code) {
-        try {
-            controlFrameBuffer.reset();
-            WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writeCloseFrame(code, null);
-            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, 1000);
-            controlFrameBuffer.reset();
-        } catch (Exception e) {
-            LOG.error("Failed to echo close frame: {}", e.getMessage());
+    private void validateUpgradeResponse(int headerEnd) {
+        // Extract response as string for parsing
+        byte[] responseBytes = new byte[headerEnd];
+        for (int i = 0; i < headerEnd; i++) {
+            responseBytes[i] = Unsafe.getUnsafe().getByte(recvBufPtr + i);
         }
-    }
+        String response = new String(responseBytes, StandardCharsets.US_ASCII);
 
-    private void sendPongFrame(long payloadPtr, int payloadLen) {
-        try {
-            controlFrameBuffer.reset();
-            WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writePongFrame(payloadPtr, payloadLen);
-            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, 1000);
-            controlFrameBuffer.reset();
-        } catch (Exception e) {
-            LOG.error("Failed to send pong: {}", e.getMessage());
+        // Check status line
+        if (!response.startsWith("HTTP/1.1 101")) {
+            String statusLine = response.split("\r\n")[0];
+            throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);
         }
-    }
 
-    private void appendToFragmentBuffer(long payloadPtr, int payloadLen) {
-        if (payloadLen == 0) {
-            return;
+        // Verify Sec-WebSocket-Accept (case-insensitive per RFC 7230)
+        String expectedAccept = WebSocketHandshake.computeAcceptKey(handshakeKey);
+        if (!containsHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept)) {
+            throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
-        int required = fragmentBufPos + payloadLen;
-        if (required > maxRecvBufSize) {
-            throw new HttpClientException("WebSocket fragment buffer size exceeded maximum [required=")
-                    .put(required)
-                    .put(", max=")
-                    .put(maxRecvBufSize)
-                    .put(']');
-        }
-        if (fragmentBufPtr == 0) {
-            fragmentBufSize = Math.max(required, DEFAULT_RECV_BUFFER_SIZE);
-            fragmentBufPtr = Unsafe.malloc(fragmentBufSize, MemoryTag.NATIVE_DEFAULT);
-        } else if (required > fragmentBufSize) {
-            int newSize = Math.min(Math.max(fragmentBufSize * 2, required), maxRecvBufSize);
-            fragmentBufPtr = Unsafe.realloc(fragmentBufPtr, fragmentBufSize, newSize, MemoryTag.NATIVE_DEFAULT);
-            fragmentBufSize = newSize;
-        }
-        Vect.memmove(fragmentBufPtr + fragmentBufPos, payloadPtr, payloadLen);
-        fragmentBufPos += payloadLen;
-    }
-
-    private void resetFragmentState() {
-        fragmentOpcode = -1;
-        fragmentBufPos = 0;
-    }
-
-    private void compactRecvBuffer() {
-        if (recvReadPos > 0) {
-            int remaining = recvPos - recvReadPos;
-            if (remaining > 0) {
-                Vect.memmove(recvBufPtr, recvBufPtr + recvReadPos, remaining);
-            }
-            recvPos = remaining;
-            recvReadPos = 0;
-        }
-    }
-
-    private void growRecvBuffer() {
-        int newSize = recvBufSize * 2;
-        if (newSize > maxRecvBufSize) {
-            if (recvBufSize >= maxRecvBufSize) {
-                throw new HttpClientException("WebSocket receive buffer size exceeded maximum [current=")
-                        .put(recvBufSize)
-                        .put(", max=")
-                        .put(maxRecvBufSize)
-                        .put(']');
-            }
-            newSize = maxRecvBufSize;
-        }
-        recvBufPtr = Unsafe.realloc(recvBufPtr, recvBufSize, newSize, MemoryTag.NATIVE_DEFAULT);
-        recvBufSize = newSize;
-    }
-
-    // === Socket I/O helpers ===
-
-    private int recvOrDie(long ptr, int len, int timeout) {
-        long startTime = System.nanoTime();
-        int n = dieIfNegative(socket.recv(ptr, len));
-        if (n == 0) {
-            ioWait(remainingTime(timeout, startTime), IOOperation.READ);
-            n = dieIfNegative(socket.recv(ptr, len));
-        }
-        return n;
-    }
-
-    private int recvOrTimeout(long ptr, int len, int timeout) {
-        long startTime = System.nanoTime();
-        int n = socket.recv(ptr, len);
-        if (n < 0) {
-            throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
-        }
-        if (n == 0) {
-            try {
-                ioWait(timeout, IOOperation.READ);
-            } catch (HttpClientException e) {
-                // Timeout
-                return 0;
-            }
-            n = socket.recv(ptr, len);
-            if (n < 0) {
-                throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
-            }
-        }
-        return n;
-    }
-
-    private int dieIfNegative(int byteCount) {
-        if (byteCount < 0) {
-            throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
-        }
-        return byteCount;
-    }
-
-    private int remainingTime(int timeoutMillis, long startTimeNanos) {
-        timeoutMillis -= (int) NANOSECONDS.toMillis(System.nanoTime() - startTimeNanos);
-        if (timeoutMillis <= 0) {
-            throw new HttpClientException("timed out [errno=").errno(nf.errno()).put(']');
-        }
-        return timeoutMillis;
     }
 
     protected void dieWaiting(int n) {
@@ -841,40 +858,6 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
         throw new HttpClientException("queue error [errno=").put(nf.errno()).put(']');
     }
-
-    private void checkConnected() {
-        if (closed) {
-            throw new HttpClientException("WebSocket client is closed");
-        }
-        if (!upgraded) {
-            throw new HttpClientException("WebSocket not connected or upgraded");
-        }
-    }
-
-    // === State ===
-
-    /**
-     * Returns whether the WebSocket is connected and upgraded.
-     */
-    public boolean isConnected() {
-        return upgraded && !closed && !socket.isClosed();
-    }
-
-    /**
-     * Returns the connected host.
-     */
-    public CharSequence getHost() {
-        return host;
-    }
-
-    /**
-     * Returns the connected port.
-     */
-    public int getPort() {
-        return port;
-    }
-
-    // === Platform-specific I/O ===
 
     /**
      * Waits for I/O readiness using platform-specific mechanism.

@@ -26,9 +26,9 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
-import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
+import io.questdb.client.std.Decimal64;
 import io.questdb.client.test.cutlass.line.AbstractLineSenderTest;
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -54,7 +54,425 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         AbstractLineSenderTest.setUpStatic();
     }
 
-    // === BYTE coercion tests ===
+    @Test
+    public void testBoolToString() throws Exception {
+        String table = "test_qwp_bool_to_string";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s STRING, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("s", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .boolColumn("s", false)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "true\t1970-01-01T00:00:01.000000000Z\n" +
+                        "false\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testBoolToVarchar() throws Exception {
+        String table = "test_qwp_bool_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v VARCHAR, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .boolColumn("v", false)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "true\t1970-01-01T00:00:01.000000000Z\n" +
+                        "false\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testBoolean() throws Exception {
+        String table = "test_qwp_boolean";
+        useTable(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("b", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .boolColumn("b", false)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "b\ttimestamp\n" +
+                        "true\t1970-01-01T00:00:01.000000000Z\n" +
+                        "false\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT b, timestamp FROM " + table + " ORDER BY timestamp");
+    }
+
+    @Test
+    public void testBooleanToByteCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_byte_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("BYTE")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToCharCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_char_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("CHAR")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToDateCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_date_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("DATE")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToDecimalCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_decimal_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DECIMAL(18,2), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("DECIMAL")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToDoubleCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_double_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("DOUBLE")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToFloatCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_float_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("FLOAT")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToGeoHashCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_geohash_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("GEOHASH")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToIntCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_int_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("INT")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToLong256CoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_long256_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("LONG256")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToLongCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_long_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("LONG")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToShortCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_short_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("SHORT")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToSymbolCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_symbol_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("SYMBOL")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToTimestampCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_timestamp_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("TIMESTAMP")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToTimestampNsCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_timestamp_ns_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v TIMESTAMP_NS, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("TIMESTAMP")
+            );
+        }
+    }
+
+    @Test
+    public void testBooleanToUuidCoercionError() throws Exception {
+        String table = "test_qwp_boolean_to_uuid_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .boolColumn("v", true)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write BOOLEAN") && msg.contains("UUID")
+            );
+        }
+    }
+
+    @Test
+    public void testByte() throws Exception {
+        String table = "test_qwp_byte";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "b BYTE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("b", (short) -1)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("b", (short) 0)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("b", (short) 127)
+                    .at(3_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 3);
+    }
 
     @Test
     public void testByteToBooleanCoercionError() throws Exception {
@@ -653,57 +1071,6 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
-    // === Exact Type Match Tests ===
-
-    @Test
-    public void testBoolean() throws Exception {
-        String table = "test_qwp_boolean";
-        useTable(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("b", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .boolColumn("b", false)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "b\ttimestamp\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT b, timestamp FROM " + table + " ORDER BY timestamp");
-    }
-
-    @Test
-    public void testByte() throws Exception {
-        String table = "test_qwp_byte";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "b BYTE, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .shortColumn("b", (short) -1)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .shortColumn("b", (short) 0)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .shortColumn("b", (short) 127)
-                    .at(3_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 3);
-    }
-
     @Test
     public void testChar() throws Exception {
         String table = "test_qwp_char";
@@ -732,6 +1099,314 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testCharToBooleanCoercionError() throws Exception {
+        String table = "test_qwp_char_to_boolean_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write") && msg.contains("BOOLEAN")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToByteCoercionError() throws Exception {
+        String table = "test_qwp_char_to_byte_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("BYTE")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToDateCoercionError() throws Exception {
+        String table = "test_qwp_char_to_date_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("DATE")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToDoubleCoercionError() throws Exception {
+        String table = "test_qwp_char_to_double_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("DOUBLE")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToFloatCoercionError() throws Exception {
+        String table = "test_qwp_char_to_float_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("FLOAT")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToGeoHashCoercionError() throws Exception {
+        String table = "test_qwp_char_to_geohash_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("GEOHASH")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToIntCoercionError() throws Exception {
+        String table = "test_qwp_char_to_int_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("INT")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToLong256CoercionError() throws Exception {
+        String table = "test_qwp_char_to_long256_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("LONG256")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToLongCoercionError() throws Exception {
+        String table = "test_qwp_char_to_long_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("LONG")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToShortCoercionError() throws Exception {
+        String table = "test_qwp_char_to_short_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("SHORT")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToString() throws Exception {
+        String table = "test_qwp_char_to_string";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s STRING, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("s", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .charColumn("s", 'Z')
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "A\t1970-01-01T00:00:01.000000000Z\n" +
+                        "Z\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testCharToSymbolCoercionError() throws Exception {
+        String table = "test_qwp_char_to_symbol_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write") && msg.contains("SYMBOL")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToUuidCoercionError() throws Exception {
+        String table = "test_qwp_char_to_uuid_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("not supported") && msg.contains("UUID")
+            );
+        }
+    }
+
+    @Test
+    public void testCharToVarchar() throws Exception {
+        String table = "test_qwp_char_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v VARCHAR, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .charColumn("v", 'A')
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .charColumn("v", 'Z')
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "A\t1970-01-01T00:00:01.000000000Z\n" +
+                        "Z\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testDecimal() throws Exception {
         String table = "test_qwp_decimal";
         useTable(table);
@@ -753,6 +1428,630 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
 
         assertTableSizeEventually(table, 4);
+    }
+
+    @Test
+    public void testDecimal128ToDecimal256() throws Exception {
+        String table = "test_qwp_dec128_to_dec256";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(76, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("d", Decimal128.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("d", Decimal128.fromLong(-9999, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDecimal128ToDecimal64() throws Exception {
+        String table = "test_qwp_dec128_to_dec64";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(18, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("d", Decimal128.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("d", Decimal128.fromLong(-9999, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDecimal256ToDecimal128() throws Exception {
+        String table = "test_qwp_dec256_to_dec128";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(38, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("d", Decimal256.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("d", Decimal256.fromLong(-9999, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDecimal256ToDecimal64() throws Exception {
+        String table = "test_qwp_dec256_to_dec64";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(18, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            // Send DECIMAL256 wire type to DECIMAL64 column
+            sender.table(table)
+                    .decimalColumn("d", Decimal256.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("d", Decimal256.fromLong(-9999, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDecimal256ToDecimal64OverflowError() throws Exception {
+        String table = "test_qwp_dec256_to_dec64_overflow";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(18, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            // Create a value that fits in Decimal256 but overflows Decimal64
+            // Decimal256 with hi bits set will overflow 64-bit storage
+            Decimal256 bigValue = Decimal256.fromBigDecimal(new java.math.BigDecimal("99999999999999999999.99"));
+            sender.table(table)
+                    .decimalColumn("d", bigValue)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected overflow error but got: " + msg,
+                    msg.contains("decimal value overflows")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimal256ToDecimal8OverflowError() throws Exception {
+        String table = "test_qwp_dec256_to_dec8_overflow";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(2, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            // 999.9 with scale=1 → unscaled 9999, which doesn't fit in a byte (-128..127)
+            sender.table(table)
+                    .decimalColumn("d", Decimal256.fromLong(9999, 1))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected overflow error but got: " + msg,
+                    msg.contains("decimal value overflows")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimal64ToDecimal128() throws Exception {
+        String table = "test_qwp_dec64_to_dec128";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(38, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            // Send DECIMAL64 wire type to DECIMAL128 column (widening)
+            sender.table(table)
+                    .decimalColumn("d", Decimal64.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("d", Decimal64.fromLong(-9999, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDecimal64ToDecimal256() throws Exception {
+        String table = "test_qwp_dec64_to_dec256";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(76, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("d", Decimal64.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("d", Decimal64.fromLong(-9999, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDecimalRescale() throws Exception {
+        String table = "test_qwp_decimal_rescale";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(18, 4), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            // Send scale=2 wire data to scale=4 column: server should rescale
+            sender.table(table)
+                    .decimalColumn("d", Decimal64.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("d", Decimal64.fromLong(-100, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.4500\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-1.0000\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDecimalToBooleanCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_boolean_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("BOOLEAN")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToByteCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_byte_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("BYTE")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToCharCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_char_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("CHAR")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToDateCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_date_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("DATE")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToDoubleCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_double_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("DOUBLE")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToFloatCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_float_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("FLOAT")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToGeoHashCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_geohash_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("GEOHASH")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToIntCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_int_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("INT")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToLong256CoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_long256_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("LONG256")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToLongCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_long_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("LONG")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToShortCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_short_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("SHORT")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToString() throws Exception {
+        String table = "test_qwp_decimal_to_string";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s STRING, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("s", Decimal64.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("s", Decimal64.fromLong(-9999, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDecimalToSymbolCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_symbol_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("SYMBOL")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToTimestampCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_timestamp_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("TIMESTAMP")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToTimestampNsCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_timestamp_ns_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v TIMESTAMP_NS, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("TIMESTAMP")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToUuidCoercionError() throws Exception {
+        String table = "test_qwp_decimal_to_uuid_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DECIMAL64") && msg.contains("UUID")
+            );
+        }
+    }
+
+    @Test
+    public void testDecimalToVarchar() throws Exception {
+        String table = "test_qwp_decimal_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v VARCHAR, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(12345, 2))
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .decimalColumn("v", Decimal64.fromLong(-9999, 2))
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
     @Test
@@ -821,6 +2120,231 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testDoubleArrayToIntCoercionError() throws Exception {
+        String table = "test_qwp_doublearray_to_int_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleArray("v", new double[]{1.0, 2.0})
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DOUBLE_ARRAY") && msg.contains("INT")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleArrayToStringCoercionError() throws Exception {
+        String table = "test_qwp_doublearray_to_string_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v STRING, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleArray("v", new double[]{1.0, 2.0})
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DOUBLE_ARRAY") && msg.contains("STRING")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleArrayToSymbolCoercionError() throws Exception {
+        String table = "test_qwp_doublearray_to_symbol_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleArray("v", new double[]{1.0, 2.0})
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DOUBLE_ARRAY") && msg.contains("SYMBOL")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleArrayToTimestampCoercionError() throws Exception {
+        String table = "test_qwp_doublearray_to_timestamp_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleArray("v", new double[]{1.0, 2.0})
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DOUBLE_ARRAY") && msg.contains("TIMESTAMP")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleToBooleanCoercionError() throws Exception {
+        String table = "test_qwp_double_to_boolean_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("v", 3.14)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DOUBLE") && msg.contains("BOOLEAN")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleToByte() throws Exception {
+        String table = "test_qwp_double_to_byte";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "b BYTE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("b", 42.0)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .doubleColumn("b", -100.0)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "b\tts\n" +
+                        "42\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT b, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testDoubleToByteOverflowError() throws Exception {
+        String table = "test_qwp_double_to_byte_ovf";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "b BYTE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("b", 200.0)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected overflow error but got: " + msg,
+                    msg.contains("integer value 200 out of range for BYTE")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleToBytePrecisionLossError() throws Exception {
+        String table = "test_qwp_double_to_byte_prec";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "b BYTE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("b", 42.5)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected precision loss error but got: " + msg,
+                    msg.contains("loses precision") && msg.contains("42.5")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleToCharCoercionError() throws Exception {
+        String table = "test_qwp_double_to_char_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("v", 3.14)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write DOUBLE") && msg.contains("CHAR")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleToDateCoercionError() throws Exception {
+        String table = "test_qwp_double_to_date_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("v", 3.14)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from DOUBLE to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
     public void testDoubleToDecimal() throws Exception {
         String table = "test_qwp_double_to_decimal";
         useTable(table);
@@ -874,84 +2398,6 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testDoubleToByte() throws Exception {
-        String table = "test_qwp_double_to_byte";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "b BYTE, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("b", 42.0)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .doubleColumn("b", -100.0)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT b, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDoubleToBytePrecisionLossError() throws Exception {
-        String table = "test_qwp_double_to_byte_prec";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "b BYTE, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("b", 42.5)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected precision loss error but got: " + msg,
-                    msg.contains("loses precision") && msg.contains("42.5")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleToByteOverflowError() throws Exception {
-        String table = "test_qwp_double_to_byte_ovf";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "b BYTE, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("b", 200.0)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected overflow error but got: " + msg,
-                    msg.contains("integer value 200 out of range for BYTE")
-            );
-        }
-    }
-
-    @Test
     public void testDoubleToFloat() throws Exception {
         String table = "test_qwp_double_to_float";
         useTable(table);
@@ -972,6 +2418,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
 
         assertTableSizeEventually(table, 2);
+    }
+
+    @Test
+    public void testDoubleToGeoHashCoercionError() throws Exception {
+        String table = "test_qwp_double_to_geohash_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("v", 3.14)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from DOUBLE to") && msg.contains("is not supported")
+            );
+        }
     }
 
     @Test
@@ -1056,6 +2523,55 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testDoubleToLong256CoercionError() throws Exception {
+        String table = "test_qwp_double_to_long256_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("v", 3.14)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from DOUBLE to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testDoubleToShort() throws Exception {
+        String table = "test_qwp_double_to_short";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v SHORT, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("v", 100.0)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .doubleColumn("v", -200.0)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "100\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-200\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testDoubleToString() throws Exception {
         String table = "test_qwp_double_to_string";
         useTable(table);
@@ -1108,6 +2624,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testDoubleToUuidCoercionError() throws Exception {
+        String table = "test_qwp_double_to_uuid_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .doubleColumn("v", 3.14)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from DOUBLE to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
     public void testDoubleToVarchar() throws Exception {
         String table = "test_qwp_double_to_varchar";
         useTable(table);
@@ -1154,6 +2691,97 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
 
         assertTableSizeEventually(table, 3);
+    }
+
+    @Test
+    public void testFloatToBooleanCoercionError() throws Exception {
+        String table = "test_qwp_float_to_boolean_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .floatColumn("v", 1.5f)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write FLOAT") && msg.contains("BOOLEAN")
+            );
+        }
+    }
+
+    @Test
+    public void testFloatToByte() throws Exception {
+        String table = "test_qwp_float_to_byte";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v BYTE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .floatColumn("v", 7.0f)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .floatColumn("v", -100.0f)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "7\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-100\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testFloatToCharCoercionError() throws Exception {
+        String table = "test_qwp_float_to_char_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .floatColumn("v", 1.5f)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write FLOAT") && msg.contains("CHAR")
+            );
+        }
+    }
+
+    @Test
+    public void testFloatToDateCoercionError() throws Exception {
+        String table = "test_qwp_float_to_date_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .floatColumn("v", 1.5f)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from FLOAT to") && msg.contains("is not supported")
+            );
+        }
     }
 
     @Test
@@ -1238,6 +2866,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testFloatToGeoHashCoercionError() throws Exception {
+        String table = "test_qwp_float_to_geohash_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .floatColumn("v", 1.5f)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from FLOAT to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
     public void testFloatToInt() throws Exception {
         String table = "test_qwp_float_to_int";
         useTable(table);
@@ -1315,6 +2964,55 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testFloatToLong256CoercionError() throws Exception {
+        String table = "test_qwp_float_to_long256_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .floatColumn("v", 1.5f)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from FLOAT to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testFloatToShort() throws Exception {
+        String table = "test_qwp_float_to_short";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v SHORT, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .floatColumn("v", 42.0f)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .floatColumn("v", -1000.0f)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "42\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-1000\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testFloatToString() throws Exception {
         String table = "test_qwp_float_to_string";
         useTable(table);
@@ -1360,6 +3058,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                 "sym\tts\n" +
                         "1.5\t1970-01-01T00:00:01.000000000Z\n",
                 "SELECT sym, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testFloatToUuidCoercionError() throws Exception {
+        String table = "test_qwp_float_to_uuid_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .floatColumn("v", 1.5f)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from FLOAT to") && msg.contains("is not supported")
+            );
+        }
     }
 
     @Test
@@ -2140,6 +3859,306 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testLong256ToBooleanCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_boolean_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write LONG256") && msg.contains("BOOLEAN")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToByteCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_byte_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToCharCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_char_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write LONG256") && msg.contains("CHAR")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToDateCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_date_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToDoubleCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_double_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToFloatCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_float_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToGeoHashCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_geohash_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToIntCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_int_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToLongCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_long_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToShortCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_short_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToString() throws Exception {
+        String table = "test_qwp_long256_to_string";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s STRING, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("s", 1, 2, 3, 4)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 1);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "0x04000000000000000300000000000000020000000000000001\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT s, ts FROM " + table);
+    }
+
+    @Test
+    public void testLong256ToSymbolCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_symbol_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write LONG256") && msg.contains("SYMBOL")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToUuidCoercionError() throws Exception {
+        String table = "test_qwp_long256_to_uuid_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1L, 0L, 0L, 0L)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testLong256ToVarchar() throws Exception {
+        String table = "test_qwp_long256_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v VARCHAR, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .long256Column("v", 1, 2, 3, 4)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 1);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "0x04000000000000000300000000000000020000000000000001\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT v, ts FROM " + table);
+    }
+
+    @Test
     public void testLongToBooleanCoercionError() throws Exception {
         String table = "test_qwp_long_to_boolean_error";
         useTable(table);
@@ -2809,6 +4828,429 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testNullStringToBoolean() throws Exception {
+        String table = "test_qwp_null_string_to_boolean";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (b BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("b", "true")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("b", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "b\tts\n" +
+                        "true\t1970-01-01T00:00:01.000000000Z\n" +
+                        "false\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT b, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToByte() throws Exception {
+        String table = "test_qwp_null_string_to_byte";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (b BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("b", "42")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("b", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "b\tts\n" +
+                        "42\t1970-01-01T00:00:01.000000000Z\n" +
+                        "0\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT b, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToChar() throws Exception {
+        String table = "test_qwp_null_string_to_char";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (c CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("c", "A")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("c", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "c\tts\n" +
+                        "A\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT c, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToDate() throws Exception {
+        String table = "test_qwp_null_string_to_date";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (d DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("d", "2022-02-25T00:00:00.000Z")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("d", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToDecimal() throws Exception {
+        String table = "test_qwp_null_string_to_decimal";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (d DECIMAL(18,2), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("d", "123.45")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("d", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToFloat() throws Exception {
+        String table = "test_qwp_null_string_to_float";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (f FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("f", "3.14")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("f", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "f\tts\n" +
+                        "3.14\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT f, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToGeoHash() throws Exception {
+        String table = "test_qwp_null_string_to_geohash";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (g GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("g", "s09wh")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("g", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "g\tts\n" +
+                        "s09wh\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT g, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToLong256() throws Exception {
+        String table = "test_qwp_null_string_to_long256";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (l LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("l", "0x01")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("l", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "l\tts\n" +
+                        "0x01\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT l, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToNumeric() throws Exception {
+        String table = "test_qwp_null_string_to_numeric";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "i INT, " +
+                "l LONG, " +
+                "d DOUBLE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("i", "42")
+                    .stringColumn("l", "100")
+                    .stringColumn("d", "3.14")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("i", null)
+                    .stringColumn("l", null)
+                    .stringColumn("d", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "i\tl\td\tts\n" +
+                        "42\t100\t3.14\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\tnull\tnull\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT i, l, d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToShort() throws Exception {
+        String table = "test_qwp_null_string_to_short";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (s SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("s", "42")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("s", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "42\t1970-01-01T00:00:01.000000000Z\n" +
+                        "0\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToSymbol() throws Exception {
+        String table = "test_qwp_null_string_to_symbol";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (s SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("s", "alpha")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("s", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToTimestamp() throws Exception {
+        String table = "test_qwp_null_string_to_timestamp";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (t TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("t", "2022-02-25T00:00:00.000000Z")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("t", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "t\tts\n" +
+                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT t, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToTimestampNs() throws Exception {
+        String table = "test_qwp_null_string_to_timestamp_ns";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (t TIMESTAMP_NS, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("t", "2022-02-25T00:00:00.000000Z")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("t", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "t\tts\n" +
+                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT t, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToUuid() throws Exception {
+        String table = "test_qwp_null_string_to_uuid";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (u UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("u", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("u", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "u\tts\n" +
+                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT u, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullStringToVarchar() throws Exception {
+        String table = "test_qwp_null_string_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v VARCHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "hello")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("v", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullSymbolToString() throws Exception {
+        String table = "test_qwp_null_symbol_to_string";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (s STRING, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .symbol("s", "hello")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .symbol("s", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullSymbolToSymbol() throws Exception {
+        String table = "test_qwp_null_symbol_to_symbol";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (s SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .symbol("s", "alpha")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .symbol("s", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testNullSymbolToVarchar() throws Exception {
+        String table = "test_qwp_null_symbol_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v VARCHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .symbol("v", "hello")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .symbol("v", null)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
+                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testShort() throws Exception {
         String table = "test_qwp_short";
         useTable(table);
@@ -2828,6 +5270,142 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
 
         assertTableSizeEventually(table, 3);
+    }
+
+    @Test
+    public void testShortToBooleanCoercionError() throws Exception {
+        String table = "test_qwp_short_to_boolean_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "b BOOLEAN, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("b", (short) 1)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected error mentioning SHORT and BOOLEAN but got: " + msg,
+                    msg.contains("SHORT") && msg.contains("BOOLEAN")
+            );
+        }
+    }
+
+    @Test
+    public void testShortToByte() throws Exception {
+        String table = "test_qwp_short_to_byte";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "b BYTE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("b", (short) 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("b", (short) -128)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("b", (short) 127)
+                    .at(3_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 3);
+        assertSqlEventually(
+                "b\tts\n" +
+                        "42\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-128\t1970-01-01T00:00:02.000000000Z\n" +
+                        "127\t1970-01-01T00:00:03.000000000Z\n",
+                "SELECT b, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testShortToByteOverflowError() throws Exception {
+        String table = "test_qwp_short_to_byte_overflow";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "b BYTE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("b", (short) 128)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected overflow error but got: " + msg,
+                    msg.contains("integer value 128 out of range for BYTE")
+            );
+        }
+    }
+
+    @Test
+    public void testShortToCharCoercionError() throws Exception {
+        String table = "test_qwp_short_to_char_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "c CHAR, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("c", (short) 65)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected error mentioning SHORT and CHAR but got: " + msg,
+                    msg.contains("SHORT") && msg.contains("CHAR")
+            );
+        }
+    }
+
+    @Test
+    public void testShortToDate() throws Exception {
+        String table = "test_qwp_short_to_date";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DATE, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            // 1000 millis = 1 second
+            sender.table(table)
+                    .shortColumn("d", (short) 1000)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("d", (short) 0)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "1970-01-01T00:00:01.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
+                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
     @Test
@@ -2999,198 +5577,6 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testShortToInt() throws Exception {
-        String table = "test_qwp_short_to_int";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "i INT, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .shortColumn("i", (short) 42)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .shortColumn("i", Short.MAX_VALUE)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "i\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "32767\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT i, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testShortToLong() throws Exception {
-        String table = "test_qwp_short_to_long";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "l LONG, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .shortColumn("l", (short) 42)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .shortColumn("l", Short.MAX_VALUE)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "l\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "32767\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT l, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testShortToBooleanCoercionError() throws Exception {
-        String table = "test_qwp_short_to_boolean_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "b BOOLEAN, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .shortColumn("b", (short) 1)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected error mentioning SHORT and BOOLEAN but got: " + msg,
-                    msg.contains("SHORT") && msg.contains("BOOLEAN")
-            );
-        }
-    }
-
-    @Test
-    public void testShortToByte() throws Exception {
-        String table = "test_qwp_short_to_byte";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "b BYTE, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .shortColumn("b", (short) 42)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .shortColumn("b", (short) -128)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .shortColumn("b", (short) 127)
-                    .at(3_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 3);
-        assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-128\t1970-01-01T00:00:02.000000000Z\n" +
-                        "127\t1970-01-01T00:00:03.000000000Z\n",
-                "SELECT b, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testShortToByteOverflowError() throws Exception {
-        String table = "test_qwp_short_to_byte_overflow";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "b BYTE, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .shortColumn("b", (short) 128)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected overflow error but got: " + msg,
-                    msg.contains("integer value 128 out of range for BYTE")
-            );
-        }
-    }
-
-    @Test
-    public void testShortToCharCoercionError() throws Exception {
-        String table = "test_qwp_short_to_char_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "c CHAR, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .shortColumn("c", (short) 65)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected error mentioning SHORT and CHAR but got: " + msg,
-                    msg.contains("SHORT") && msg.contains("CHAR")
-            );
-        }
-    }
-
-    @Test
-    public void testShortToDate() throws Exception {
-        String table = "test_qwp_short_to_date";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DATE, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            // 1000 millis = 1 second
-            sender.table(table)
-                    .shortColumn("d", (short) 1000)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .shortColumn("d", (short) 0)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "1970-01-01T00:00:01.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
     public void testShortToDouble() throws Exception {
         String table = "test_qwp_short_to_double";
         useTable(table);
@@ -3269,6 +5655,62 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                     msg.contains("type coercion from SHORT to") && msg.contains("is not supported")
             );
         }
+    }
+
+    @Test
+    public void testShortToInt() throws Exception {
+        String table = "test_qwp_short_to_int";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "i INT, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("i", (short) 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("i", Short.MAX_VALUE)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "i\tts\n" +
+                        "42\t1970-01-01T00:00:01.000000000Z\n" +
+                        "32767\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT i, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testShortToLong() throws Exception {
+        String table = "test_qwp_short_to_long";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "l LONG, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .shortColumn("l", (short) 42)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .shortColumn("l", Short.MAX_VALUE)
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "l\tts\n" +
+                        "42\t1970-01-01T00:00:01.000000000Z\n" +
+                        "32767\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
     @Test
@@ -3477,541 +5919,6 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testStringToChar() throws Exception {
-        String table = "test_qwp_string_to_char";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "c CHAR, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("c", "A")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("c", "Hello")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "c\tts\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "H\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT c, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testStringToSymbol() throws Exception {
-        String table = "test_qwp_string_to_symbol";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s SYMBOL, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("s", "hello")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("s", "world")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "world\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testStringToUuid() throws Exception {
-        String table = "test_qwp_string_to_uuid";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "u UUID, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("u", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-        assertSqlEventually(
-                "u\tts\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT u, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testSymbol() throws Exception {
-        String table = "test_qwp_symbol";
-        useTable(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .symbol("s", "alpha")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .symbol("s", "beta")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            // repeated value reuses dictionary entry
-            sender.table(table)
-                    .symbol("s", "alpha")
-                    .at(3_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 3);
-        assertSqlEventually(
-                "s\ttimestamp\n" +
-                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
-                        "beta\t1970-01-01T00:00:02.000000000Z\n" +
-                        "alpha\t1970-01-01T00:00:03.000000000Z\n",
-                "SELECT s, timestamp FROM " + table + " ORDER BY timestamp");
-    }
-
-    @Test
-    public void testTimestampMicros() throws Exception {
-        String table = "test_qwp_timestamp_micros";
-        useTable(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            long tsMicros = 1_645_747_200_000_000L; // 2022-02-25T00:00:00Z in micros
-            sender.table(table)
-                    .timestampColumn("ts_col", tsMicros, ChronoUnit.MICROS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-        assertSqlEventually(
-                "ts_col\ttimestamp\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT ts_col, timestamp FROM " + table);
-    }
-
-    @Test
-    public void testTimestampMicrosToNanos() throws Exception {
-        String table = "test_qwp_timestamp_micros_to_nanos";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "ts_col TIMESTAMP_NS, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            long tsMicros = 1_645_747_200_111_111L; // 2022-02-25T00:00:00Z
-            sender.table(table)
-                    .timestampColumn("ts_col", tsMicros, ChronoUnit.MICROS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-        // Microseconds scaled to nanoseconds
-        assertSqlEventually(
-                "ts_col\tts\n" +
-                        "2022-02-25T00:00:00.111111000Z\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT ts_col, ts FROM " + table);
-    }
-
-    @Test
-    public void testTimestampNanos() throws Exception {
-        String table = "test_qwp_timestamp_nanos";
-        useTable(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            long tsNanos = 1_645_747_200_000_000_000L; // 2022-02-25T00:00:00Z in nanos
-            sender.table(table)
-                    .timestampColumn("ts_col", tsNanos, ChronoUnit.NANOS)
-                    .at(tsNanos, ChronoUnit.NANOS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-    }
-
-    @Test
-    public void testTimestampNanosToMicros() throws Exception {
-        String table = "test_qwp_timestamp_nanos_to_micros";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "ts_col TIMESTAMP, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            long tsNanos = 1_645_747_200_123_456_789L;
-            sender.table(table)
-                    .timestampColumn("ts_col", tsNanos, ChronoUnit.NANOS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-        // Nanoseconds truncated to microseconds
-        assertSqlEventually(
-                "ts_col\tts\n" +
-                        "2022-02-25T00:00:00.123456000Z\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT ts_col, ts FROM " + table);
-    }
-
-    @Test
-    public void testUuid() throws Exception {
-        String table = "test_qwp_uuid";
-        useTable(table);
-
-        UUID uuid1 = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-        UUID uuid2 = UUID.fromString("11111111-2222-3333-4444-555555555555");
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .uuidColumn("u", uuid1.getLeastSignificantBits(), uuid1.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .uuidColumn("u", uuid2.getLeastSignificantBits(), uuid2.getMostSignificantBits())
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "u\ttimestamp\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n" +
-                        "11111111-2222-3333-4444-555555555555\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT u, timestamp FROM " + table + " ORDER BY timestamp");
-    }
-
-    @Test
-    public void testUuidToShortCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_short_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s SHORT, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("s", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to SHORT is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testWriteAllTypesInOneRow() throws Exception {
-        String table = "test_qwp_all_types";
-        useTable(table);
-
-        UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-        double[] arr1d = {1.0, 2.0, 3.0};
-        long tsMicros = 1_645_747_200_000_000L; // 2022-02-25T00:00:00Z
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .symbol("sym", "test_symbol")
-                    .boolColumn("bool_col", true)
-                    .shortColumn("short_col", (short) 42)
-                    .intColumn("int_col", 100_000)
-                    .longColumn("long_col", 1_000_000_000L)
-                    .floatColumn("float_col", 2.5f)
-                    .doubleColumn("double_col", 3.14)
-                    .stringColumn("string_col", "hello")
-                    .charColumn("char_col", 'Z')
-                    .timestampColumn("ts_col", tsMicros, ChronoUnit.MICROS)
-                    .uuidColumn("uuid_col", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .long256Column("long256_col", 1, 0, 0, 0)
-                    .doubleArray("arr_col", arr1d)
-                    .decimalColumn("decimal_col", "99.99")
-                    .at(tsMicros, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-    }
-
-    // === Decimal cross-width coercion tests ===
-
-    @Test
-    public void testDecimal256ToDecimal64() throws Exception {
-        String table = "test_qwp_dec256_to_dec64";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(18, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            // Send DECIMAL256 wire type to DECIMAL64 column
-            sender.table(table)
-                    .decimalColumn("d", Decimal256.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("d", Decimal256.fromLong(-9999, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimal256ToDecimal128() throws Exception {
-        String table = "test_qwp_dec256_to_dec128";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(38, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("d", Decimal256.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("d", Decimal256.fromLong(-9999, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimal64ToDecimal128() throws Exception {
-        String table = "test_qwp_dec64_to_dec128";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(38, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            // Send DECIMAL64 wire type to DECIMAL128 column (widening)
-            sender.table(table)
-                    .decimalColumn("d", Decimal64.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("d", Decimal64.fromLong(-9999, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimal64ToDecimal256() throws Exception {
-        String table = "test_qwp_dec64_to_dec256";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(76, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("d", Decimal64.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("d", Decimal64.fromLong(-9999, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimal128ToDecimal64() throws Exception {
-        String table = "test_qwp_dec128_to_dec64";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(18, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("d", Decimal128.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("d", Decimal128.fromLong(-9999, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimal128ToDecimal256() throws Exception {
-        String table = "test_qwp_dec128_to_dec256";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(76, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("d", Decimal128.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("d", Decimal128.fromLong(-9999, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimalRescale() throws Exception {
-        String table = "test_qwp_decimal_rescale";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(18, 4), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            // Send scale=2 wire data to scale=4 column: server should rescale
-            sender.table(table)
-                    .decimalColumn("d", Decimal64.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("d", Decimal64.fromLong(-100, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.4500\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1.0000\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimal256ToDecimal64OverflowError() throws Exception {
-        String table = "test_qwp_dec256_to_dec64_overflow";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(18, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            // Create a value that fits in Decimal256 but overflows Decimal64
-            // Decimal256 with hi bits set will overflow 64-bit storage
-            Decimal256 bigValue = Decimal256.fromBigDecimal(new java.math.BigDecimal("99999999999999999999.99"));
-            sender.table(table)
-                    .decimalColumn("d", bigValue)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected overflow error but got: " + msg,
-                    msg.contains("decimal value overflows")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimal256ToDecimal8OverflowError() throws Exception {
-        String table = "test_qwp_dec256_to_dec8_overflow";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(2, 1), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            // 999.9 with scale=1 → unscaled 9999, which doesn't fit in a byte (-128..127)
-            sender.table(table)
-                    .decimalColumn("d", Decimal256.fromLong(9999, 1))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected overflow error but got: " + msg,
-                    msg.contains("decimal value overflows")
-            );
-        }
-    }
-
-    @Test
     public void testStringToBoolean() throws Exception {
         String table = "test_qwp_string_to_boolean";
         useTable(table);
@@ -4134,6 +6041,34 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testStringToChar() throws Exception {
+        String table = "test_qwp_string_to_char";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "c CHAR, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("c", "A")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("c", "Hello")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "c\tts\n" +
+                        "A\t1970-01-01T00:00:01.000000000Z\n" +
+                        "H\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT c, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testStringToDate() throws Exception {
         String table = "test_qwp_string_to_date";
         useTable(table);
@@ -4158,31 +6093,24 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testStringToDecimal64() throws Exception {
-        String table = "test_qwp_string_to_dec64";
+    public void testStringToDateParseError() throws Exception {
+        String table = "test_qwp_string_to_date_parse_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(18, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
-
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
-                    .stringColumn("d", "123.45")
+                    .stringColumn("v", "not_a_date")
                     .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("d", "-99.99")
-                    .at(2_000_000, ChronoUnit.MICROS);
             sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse DATE from string") && msg.contains("not_a_date")
+            );
         }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
     @Test
@@ -4210,6 +6138,34 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                 "d\tts\n" +
                         "123.45\t1970-01-01T00:00:01.000000000Z\n" +
                         "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testStringToDecimal16() throws Exception {
+        String table = "test_qwp_string_to_dec16";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(4, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("d", "12.5")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("d", "-99.9")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "12.5\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.9\t1970-01-01T00:00:02.000000000Z\n",
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4242,6 +6198,90 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testStringToDecimal32() throws Exception {
+        String table = "test_qwp_string_to_dec32";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(6, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("d", "1234.56")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("d", "-999.99")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "1234.56\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-999.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testStringToDecimal64() throws Exception {
+        String table = "test_qwp_string_to_dec64";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(18, 2), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("d", "123.45")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("d", "-99.99")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testStringToDecimal8() throws Exception {
+        String table = "test_qwp_string_to_dec8";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "d DECIMAL(2, 1), " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("d", "1.5")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("d", "-9.9")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "d\tts\n" +
+                        "1.5\t1970-01-01T00:00:01.000000000Z\n" +
+                        "-9.9\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testStringToDouble() throws Exception {
         String table = "test_qwp_string_to_double";
         useTable(table);
@@ -4267,6 +6307,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                         "3.14\t1970-01-01T00:00:01.000000000Z\n" +
                         "-2.718\t1970-01-01T00:00:02.000000000Z\n",
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testStringToDoubleParseError() throws Exception {
+        String table = "test_qwp_string_to_double_parse_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "not_a_number")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse DOUBLE from string") && msg.contains("not_a_number")
+            );
+        }
     }
 
     @Test
@@ -4298,6 +6359,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testStringToFloatParseError() throws Exception {
+        String table = "test_qwp_string_to_float_parse_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "not_a_number")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse FLOAT from string") && msg.contains("not_a_number")
+            );
+        }
+    }
+
+    @Test
     public void testStringToGeoHash() throws Exception {
         String table = "test_qwp_string_to_geohash";
         useTable(table);
@@ -4323,6 +6405,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                         "s24se\t1970-01-01T00:00:01.000000000Z\n" +
                         "u33dc\t1970-01-01T00:00:02.000000000Z\n",
                 "SELECT g, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testStringToGeoHashParseError() throws Exception {
+        String table = "test_qwp_string_to_geohash_parse_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "!!!")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse geohash from string") && msg.contains("!!!")
+            );
+        }
     }
 
     @Test
@@ -4355,6 +6458,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                         "-100\t1970-01-01T00:00:02.000000000Z\n" +
                         "0\t1970-01-01T00:00:03.000000000Z\n",
                 "SELECT i, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testStringToIntParseError() throws Exception {
+        String table = "test_qwp_string_to_int_parse_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "not_a_number")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse INT from string") && msg.contains("not_a_number")
+            );
+        }
     }
 
     @Test
@@ -4410,6 +6534,48 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testStringToLong256ParseError() throws Exception {
+        String table = "test_qwp_string_to_long256_parse_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "not_a_long256")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse long256 from string") && msg.contains("not_a_long256")
+            );
+        }
+    }
+
+    @Test
+    public void testStringToLongParseError() throws Exception {
+        String table = "test_qwp_string_to_long_parse_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "not_a_number")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse LONG from string") && msg.contains("not_a_number")
+            );
+        }
+    }
+
+    @Test
     public void testStringToShort() throws Exception {
         String table = "test_qwp_string_to_short";
         useTable(table);
@@ -4442,6 +6608,55 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
+    public void testStringToShortParseError() throws Exception {
+        String table = "test_qwp_string_to_short_parse_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "not_a_number")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse SHORT from string") && msg.contains("not_a_number")
+            );
+        }
+    }
+
+    @Test
+    public void testStringToSymbol() throws Exception {
+        String table = "test_qwp_string_to_symbol";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s SYMBOL, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("s", "hello")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("s", "world")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
+                        "world\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
     public void testStringToTimestamp() throws Exception {
         String table = "test_qwp_string_to_timestamp";
         useTable(table);
@@ -4463,496 +6678,6 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                 "t\tts\n" +
                         "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n",
                 "SELECT t, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testBoolToString() throws Exception {
-        String table = "test_qwp_bool_to_string";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s STRING, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("s", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .boolColumn("s", false)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testBoolToVarchar() throws Exception {
-        String table = "test_qwp_bool_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v VARCHAR, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .boolColumn("v", false)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimalToString() throws Exception {
-        String table = "test_qwp_decimal_to_string";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s STRING, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("s", Decimal64.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("s", Decimal64.fromLong(-9999, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDecimalToVarchar() throws Exception {
-        String table = "test_qwp_decimal_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v VARCHAR, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(-9999, 2))
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testSymbolToString() throws Exception {
-        String table = "test_qwp_symbol_to_string";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s STRING, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .symbol("s", "hello")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .symbol("s", "world")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "world\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testSymbolToVarchar() throws Exception {
-        String table = "test_qwp_symbol_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v VARCHAR, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .symbol("v", "hello")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .symbol("v", "world")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "world\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testTimestampToString() throws Exception {
-        String table = "test_qwp_timestamp_to_string";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s STRING, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            long tsMicros = 1_645_747_200_000_000L; // 2022-02-25T00:00:00Z in micros
-            sender.table(table)
-                    .timestampColumn("s", tsMicros, ChronoUnit.MICROS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "2022-02-25T00:00:00.000Z\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testTimestampToVarchar() throws Exception {
-        String table = "test_qwp_timestamp_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v VARCHAR, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            long tsMicros = 1_645_747_200_000_000L; // 2022-02-25T00:00:00Z in micros
-            sender.table(table)
-                    .timestampColumn("v", tsMicros, ChronoUnit.MICROS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "2022-02-25T00:00:00.000Z\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testCharToString() throws Exception {
-        String table = "test_qwp_char_to_string";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s STRING, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("s", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .charColumn("s", 'Z')
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "Z\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testCharToVarchar() throws Exception {
-        String table = "test_qwp_char_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v VARCHAR, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .charColumn("v", 'Z')
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "Z\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testDoubleToShort() throws Exception {
-        String table = "test_qwp_double_to_short";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v SHORT, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("v", 100.0)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .doubleColumn("v", -200.0)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "100\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-200\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testFloatToByte() throws Exception {
-        String table = "test_qwp_float_to_byte";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v BYTE, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .floatColumn("v", 7.0f)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .floatColumn("v", -100.0f)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "7\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testFloatToShort() throws Exception {
-        String table = "test_qwp_float_to_short";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v SHORT, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .floatColumn("v", 42.0f)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .floatColumn("v", -1000.0f)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1000\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testLong256ToString() throws Exception {
-        String table = "test_qwp_long256_to_string";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s STRING, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("s", 1, 2, 3, 4)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "0x04000000000000000300000000000000020000000000000001\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT s, ts FROM " + table);
-    }
-
-    @Test
-    public void testLong256ToVarchar() throws Exception {
-        String table = "test_qwp_long256_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "v VARCHAR, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1, 2, 3, 4)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 1);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "0x04000000000000000300000000000000020000000000000001\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT v, ts FROM " + table);
-    }
-
-    @Test
-    public void testStringToDecimal8() throws Exception {
-        String table = "test_qwp_string_to_dec8";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(2, 1), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("d", "1.5")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("d", "-9.9")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "1.5\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-9.9\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testStringToDecimal16() throws Exception {
-        String table = "test_qwp_string_to_dec16";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(4, 1), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("d", "12.5")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("d", "-99.9")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "12.5\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.9\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testStringToDecimal32() throws Exception {
-        String table = "test_qwp_string_to_dec32";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "d DECIMAL(6, 2), " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("d", "1234.56")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("d", "-999.99")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "1234.56\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-999.99\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
     @Test
@@ -4980,56 +6705,121 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testUuidToString() throws Exception {
-        String table = "test_qwp_uuid_to_string";
+    public void testStringToTimestampParseError() throws Exception {
+        String table = "test_qwp_string_to_timestamp_parse_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (" +
-                "s STRING, " +
-                "ts TIMESTAMP" +
-                ") TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
-
-        UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
-                    .uuidColumn("s", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .stringColumn("v", "not_a_timestamp")
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse timestamp from string") && msg.contains("not_a_timestamp")
+            );
         }
-
-        assertTableSizeEventually(table, 1);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT s, ts FROM " + table);
     }
 
     @Test
-    public void testUuidToVarchar() throws Exception {
-        String table = "test_qwp_uuid_to_varchar";
+    public void testStringToUuid() throws Exception {
+        String table = "test_qwp_string_to_uuid";
         useTable(table);
         execute("CREATE TABLE " + table + " (" +
-                "v VARCHAR, " +
+                "u UUID, " +
                 "ts TIMESTAMP" +
                 ") TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
 
-        UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .stringColumn("u", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
         }
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "v\tts\n" +
+                "u\tts\n" +
                         "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n",
-                "SELECT v, ts FROM " + table);
+                "SELECT u, ts FROM " + table + " ORDER BY ts");
     }
 
-    // === SYMBOL negative coercion tests ===
+    @Test
+    public void testStringToUuidParseError() throws Exception {
+        String table = "test_qwp_string_to_uuid_parse_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "not-a-uuid")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected parse error but got: " + msg,
+                    msg.contains("cannot parse UUID from string") && msg.contains("not-a-uuid")
+            );
+        }
+    }
+
+    @Test
+    public void testStringToVarchar() throws Exception {
+        String table = "test_qwp_string_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v VARCHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .stringColumn("v", "hello")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .stringColumn("v", "world")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
+                        "world\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testSymbol() throws Exception {
+        String table = "test_qwp_symbol";
+        useTable(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .symbol("s", "alpha")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .symbol("s", "beta")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            // repeated value reuses dictionary entry
+            sender.table(table)
+                    .symbol("s", "alpha")
+                    .at(3_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 3);
+        assertSqlEventually(
+                "s\ttimestamp\n" +
+                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
+                        "beta\t1970-01-01T00:00:02.000000000Z\n" +
+                        "alpha\t1970-01-01T00:00:03.000000000Z\n",
+                "SELECT s, timestamp FROM " + table + " ORDER BY timestamp");
+    }
 
     @Test
     public void testSymbolToBooleanCoercionError() throws Exception {
@@ -5221,27 +7011,6 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testSymbolToLongCoercionError() throws Exception {
-        String table = "test_qwp_symbol_to_long_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .symbol("v", "hello")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write SYMBOL") && msg.contains("LONG")
-            );
-        }
-    }
-
-    @Test
     public void testSymbolToLong256CoercionError() throws Exception {
         String table = "test_qwp_symbol_to_long256_error";
         useTable(table);
@@ -5258,6 +7027,27 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
                     msg.contains("cannot write SYMBOL") && msg.contains("LONG256")
+            );
+        }
+    }
+
+    @Test
+    public void testSymbolToLongCoercionError() throws Exception {
+        String table = "test_qwp_symbol_to_long_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .symbol("v", "hello")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write SYMBOL") && msg.contains("LONG")
             );
         }
     }
@@ -5281,6 +7071,34 @@ public class QwpSenderTest extends AbstractLineSenderTest {
                     msg.contains("cannot write SYMBOL") && msg.contains("SHORT")
             );
         }
+    }
+
+    @Test
+    public void testSymbolToString() throws Exception {
+        String table = "test_qwp_symbol_to_string";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s STRING, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .symbol("s", "hello")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .symbol("s", "world")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
+                        "world\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
     @Test
@@ -5346,1642 +7164,121 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
     }
 
-    // === Null coercion tests ===
-
     @Test
-    public void testNullStringToBoolean() throws Exception {
-        String table = "test_qwp_null_string_to_boolean";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (b BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("b", "true")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("b", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "b\tts\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT b, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToChar() throws Exception {
-        String table = "test_qwp_null_string_to_char";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (c CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("c", "A")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("c", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "c\tts\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT c, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToDate() throws Exception {
-        String table = "test_qwp_null_string_to_date";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (d DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("d", "2022-02-25T00:00:00.000Z")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("d", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToDecimal() throws Exception {
-        String table = "test_qwp_null_string_to_decimal";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (d DECIMAL(18,2), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("d", "123.45")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("d", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT d, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToGeoHash() throws Exception {
-        String table = "test_qwp_null_string_to_geohash";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (g GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("g", "s09wh")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("g", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "g\tts\n" +
-                        "s09wh\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT g, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToLong256() throws Exception {
-        String table = "test_qwp_null_string_to_long256";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (l LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("l", "0x01")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("l", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "l\tts\n" +
-                        "0x01\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT l, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToNumeric() throws Exception {
-        String table = "test_qwp_null_string_to_numeric";
+    public void testSymbolToVarchar() throws Exception {
+        String table = "test_qwp_symbol_to_varchar";
         useTable(table);
         execute("CREATE TABLE " + table + " (" +
-                "i INT, " +
-                "l LONG, " +
-                "d DOUBLE, " +
+                "v VARCHAR, " +
                 "ts TIMESTAMP" +
                 ") TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("i", "42")
-                    .stringColumn("l", "100")
-                    .stringColumn("d", "3.14")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("i", null)
-                    .stringColumn("l", null)
-                    .stringColumn("d", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "i\tl\td\tts\n" +
-                        "42\t100\t3.14\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\tnull\tnull\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT i, l, d, ts FROM " + table + " ORDER BY ts");
-    }
 
-    @Test
-    public void testNullStringToSymbol() throws Exception {
-        String table = "test_qwp_null_string_to_symbol";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (s SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("s", "alpha")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("s", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToTimestamp() throws Exception {
-        String table = "test_qwp_null_string_to_timestamp";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (t TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("t", "2022-02-25T00:00:00.000000Z")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("t", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "t\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT t, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToTimestampNs() throws Exception {
-        String table = "test_qwp_null_string_to_timestamp_ns";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (t TIMESTAMP_NS, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("t", "2022-02-25T00:00:00.000000Z")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("t", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "t\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT t, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToUuid() throws Exception {
-        String table = "test_qwp_null_string_to_uuid";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (u UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("u", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("u", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "u\tts\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT u, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullSymbolToString() throws Exception {
-        String table = "test_qwp_null_symbol_to_string";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (s STRING, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .symbol("s", "hello")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .symbol("s", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullSymbolToVarchar() throws Exception {
-        String table = "test_qwp_null_symbol_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v VARCHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
                     .symbol("v", "hello")
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.table(table)
-                    .symbol("v", null)
+                    .symbol("v", "world")
                     .at(2_000_000, ChronoUnit.MICROS);
             sender.flush();
         }
+
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
                 "v\tts\n" +
                         "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                        "world\t1970-01-01T00:00:02.000000000Z\n",
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
-    // === BOOLEAN negative tests ===
-
     @Test
-    public void testBooleanToByteCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_byte_error";
+    public void testTimestampMicros() throws Exception {
+        String table = "test_qwp_timestamp_micros";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
+
         try (QwpWebSocketSender sender = createQwpSender()) {
+            long tsMicros = 1_645_747_200_000_000L; // 2022-02-25T00:00:00Z in micros
             sender.table(table)
-                    .boolColumn("v", true)
+                    .timestampColumn("ts_col", tsMicros, ChronoUnit.MICROS)
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("BYTE")
-            );
         }
+
+        assertTableSizeEventually(table, 1);
+        assertSqlEventually(
+                "ts_col\ttimestamp\n" +
+                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT ts_col, timestamp FROM " + table);
     }
 
     @Test
-    public void testBooleanToShortCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_short_error";
+    public void testTimestampMicrosToNanos() throws Exception {
+        String table = "test_qwp_timestamp_micros_to_nanos";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (" +
+                "ts_col TIMESTAMP_NS, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
+
         try (QwpWebSocketSender sender = createQwpSender()) {
+            long tsMicros = 1_645_747_200_111_111L; // 2022-02-25T00:00:00Z
             sender.table(table)
-                    .boolColumn("v", true)
+                    .timestampColumn("ts_col", tsMicros, ChronoUnit.MICROS)
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("SHORT")
-            );
         }
+
+        assertTableSizeEventually(table, 1);
+        // Microseconds scaled to nanoseconds
+        assertSqlEventually(
+                "ts_col\tts\n" +
+                        "2022-02-25T00:00:00.111111000Z\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT ts_col, ts FROM " + table);
     }
 
     @Test
-    public void testBooleanToIntCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_int_error";
+    public void testTimestampNanos() throws Exception {
+        String table = "test_qwp_timestamp_nanos";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
+
         try (QwpWebSocketSender sender = createQwpSender()) {
+            long tsNanos = 1_645_747_200_000_000_000L; // 2022-02-25T00:00:00Z in nanos
             sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
+                    .timestampColumn("ts_col", tsNanos, ChronoUnit.NANOS)
+                    .at(tsNanos, ChronoUnit.NANOS);
             sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("INT")
-            );
         }
+
+        assertTableSizeEventually(table, 1);
     }
 
     @Test
-    public void testBooleanToLongCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_long_error";
+    public void testTimestampNanosToMicros() throws Exception {
+        String table = "test_qwp_timestamp_nanos_to_micros";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (" +
+                "ts_col TIMESTAMP, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
+
         try (QwpWebSocketSender sender = createQwpSender()) {
+            long tsNanos = 1_645_747_200_123_456_789L;
             sender.table(table)
-                    .boolColumn("v", true)
+                    .timestampColumn("ts_col", tsNanos, ChronoUnit.NANOS)
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("LONG")
-            );
         }
+
+        assertTableSizeEventually(table, 1);
+        // Nanoseconds truncated to microseconds
+        assertSqlEventually(
+                "ts_col\tts\n" +
+                        "2022-02-25T00:00:00.123456000Z\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT ts_col, ts FROM " + table);
     }
-
-    @Test
-    public void testBooleanToFloatCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_float_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("FLOAT")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToDoubleCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_double_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("DOUBLE")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToDateCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_date_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("DATE")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToUuidCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_uuid_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("UUID")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToLong256CoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_long256_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("LONG256")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToGeoHashCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_geohash_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("GEOHASH")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToTimestampCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_timestamp_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("TIMESTAMP")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToTimestampNsCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_timestamp_ns_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v TIMESTAMP_NS, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("TIMESTAMP")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToCharCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_char_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("CHAR")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToSymbolCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_symbol_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("SYMBOL")
-            );
-        }
-    }
-
-    @Test
-    public void testBooleanToDecimalCoercionError() throws Exception {
-        String table = "test_qwp_boolean_to_decimal_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DECIMAL(18,2), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .boolColumn("v", true)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write BOOLEAN") && msg.contains("DECIMAL")
-            );
-        }
-    }
-
-    // === FLOAT negative tests ===
-
-    @Test
-    public void testFloatToBooleanCoercionError() throws Exception {
-        String table = "test_qwp_float_to_boolean_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .floatColumn("v", 1.5f)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write FLOAT") && msg.contains("BOOLEAN")
-            );
-        }
-    }
-
-    @Test
-    public void testFloatToCharCoercionError() throws Exception {
-        String table = "test_qwp_float_to_char_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .floatColumn("v", 1.5f)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write FLOAT") && msg.contains("CHAR")
-            );
-        }
-    }
-
-    @Test
-    public void testFloatToDateCoercionError() throws Exception {
-        String table = "test_qwp_float_to_date_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .floatColumn("v", 1.5f)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from FLOAT to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testFloatToGeoHashCoercionError() throws Exception {
-        String table = "test_qwp_float_to_geohash_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .floatColumn("v", 1.5f)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from FLOAT to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testFloatToUuidCoercionError() throws Exception {
-        String table = "test_qwp_float_to_uuid_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .floatColumn("v", 1.5f)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from FLOAT to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testFloatToLong256CoercionError() throws Exception {
-        String table = "test_qwp_float_to_long256_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .floatColumn("v", 1.5f)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from FLOAT to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    // === DOUBLE negative tests ===
-
-    @Test
-    public void testDoubleToBooleanCoercionError() throws Exception {
-        String table = "test_qwp_double_to_boolean_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("v", 3.14)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DOUBLE") && msg.contains("BOOLEAN")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleToCharCoercionError() throws Exception {
-        String table = "test_qwp_double_to_char_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("v", 3.14)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DOUBLE") && msg.contains("CHAR")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleToDateCoercionError() throws Exception {
-        String table = "test_qwp_double_to_date_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("v", 3.14)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from DOUBLE to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleToGeoHashCoercionError() throws Exception {
-        String table = "test_qwp_double_to_geohash_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("v", 3.14)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from DOUBLE to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleToUuidCoercionError() throws Exception {
-        String table = "test_qwp_double_to_uuid_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("v", 3.14)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from DOUBLE to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleToLong256CoercionError() throws Exception {
-        String table = "test_qwp_double_to_long256_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleColumn("v", 3.14)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from DOUBLE to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    // ==================== CHAR negative tests ====================
-
-    @Test
-    public void testCharToBooleanCoercionError() throws Exception {
-        String table = "test_qwp_char_to_boolean_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write") && msg.contains("BOOLEAN")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToSymbolCoercionError() throws Exception {
-        String table = "test_qwp_char_to_symbol_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write") && msg.contains("SYMBOL")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToByteCoercionError() throws Exception {
-        String table = "test_qwp_char_to_byte_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("BYTE")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToShortCoercionError() throws Exception {
-        String table = "test_qwp_char_to_short_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("SHORT")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToIntCoercionError() throws Exception {
-        String table = "test_qwp_char_to_int_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("INT")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToLongCoercionError() throws Exception {
-        String table = "test_qwp_char_to_long_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("LONG")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToFloatCoercionError() throws Exception {
-        String table = "test_qwp_char_to_float_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("FLOAT")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToDoubleCoercionError() throws Exception {
-        String table = "test_qwp_char_to_double_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("DOUBLE")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToDateCoercionError() throws Exception {
-        String table = "test_qwp_char_to_date_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("DATE")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToUuidCoercionError() throws Exception {
-        String table = "test_qwp_char_to_uuid_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("UUID")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToLong256CoercionError() throws Exception {
-        String table = "test_qwp_char_to_long256_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("not supported") && msg.contains("LONG256")
-            );
-        }
-    }
-
-    @Test
-    public void testCharToGeoHashCoercionError() throws Exception {
-        String table = "test_qwp_char_to_geohash_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .charColumn("v", 'A')
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("GEOHASH")
-            );
-        }
-    }
-
-    // ==================== LONG256 negative tests ====================
-
-    @Test
-    public void testLong256ToBooleanCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_boolean_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write LONG256") && msg.contains("BOOLEAN")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToCharCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_char_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write LONG256") && msg.contains("CHAR")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToSymbolCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_symbol_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write LONG256") && msg.contains("SYMBOL")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToByteCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_byte_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToShortCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_short_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToIntCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_int_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToLongCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_long_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToFloatCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_float_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToDoubleCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_double_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToDateCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_date_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToUuidCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_uuid_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testLong256ToGeoHashCoercionError() throws Exception {
-        String table = "test_qwp_long256_to_geohash_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .long256Column("v", 1L, 0L, 0L, 0L)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from LONG256 to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    // ==================== UUID negative tests ====================
-
-    @Test
-    public void testUuidToBooleanCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_boolean_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write UUID") && msg.contains("BOOLEAN")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToCharCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_char_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write UUID") && msg.contains("CHAR")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToSymbolCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_symbol_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write UUID") && msg.contains("SYMBOL")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToByteCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_byte_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToIntCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_int_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToLongCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_long_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToFloatCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_float_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToDoubleCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_double_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToDateCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_date_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToLong256CoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_long256_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    @Test
-    public void testUuidToGeoHashCoercionError() throws Exception {
-        String table = "test_qwp_uuid_to_geohash_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-            sender.table(table)
-                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
-            );
-        }
-    }
-
-    // === TIMESTAMP negative coercion tests ===
 
     @Test
     public void testTimestampToBooleanCoercionError() throws Exception {
@@ -7026,10 +7323,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testTimestampToShortCoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_short_error";
+    public void testTimestampToCharCoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_char_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
@@ -7041,91 +7338,7 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("SHORT")
-            );
-        }
-    }
-
-    @Test
-    public void testTimestampToIntCoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_int_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .timestampColumn("v", 1_645_747_200_000_000L, ChronoUnit.MICROS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("INT")
-            );
-        }
-    }
-
-    @Test
-    public void testTimestampToLongCoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_long_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .timestampColumn("v", 1_645_747_200_000_000L, ChronoUnit.MICROS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("LONG")
-            );
-        }
-    }
-
-    @Test
-    public void testTimestampToFloatCoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_float_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .timestampColumn("v", 1_645_747_200_000_000L, ChronoUnit.MICROS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("FLOAT")
-            );
-        }
-    }
-
-    @Test
-    public void testTimestampToDoubleCoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_double_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .timestampColumn("v", 1_645_747_200_000_000L, ChronoUnit.MICROS)
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("DOUBLE")
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("CHAR")
             );
         }
     }
@@ -7152,10 +7365,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testTimestampToUuidCoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_uuid_error";
+    public void testTimestampToDecimalCoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_decimal_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v DECIMAL(18,2), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
@@ -7167,16 +7380,16 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("UUID")
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("DECIMAL")
             );
         }
     }
 
     @Test
-    public void testTimestampToLong256CoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_long256_error";
+    public void testTimestampToDoubleCoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_double_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
@@ -7188,7 +7401,28 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("LONG256")
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("DOUBLE")
+            );
+        }
+    }
+
+    @Test
+    public void testTimestampToFloatCoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_float_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .timestampColumn("v", 1_645_747_200_000_000L, ChronoUnit.MICROS)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("FLOAT")
             );
         }
     }
@@ -7215,10 +7449,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testTimestampToCharCoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_char_error";
+    public void testTimestampToIntCoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_int_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
@@ -7230,9 +7464,97 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("CHAR")
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("INT")
             );
         }
+    }
+
+    @Test
+    public void testTimestampToLong256CoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_long256_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .timestampColumn("v", 1_645_747_200_000_000L, ChronoUnit.MICROS)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("LONG256")
+            );
+        }
+    }
+
+    @Test
+    public void testTimestampToLongCoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_long_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .timestampColumn("v", 1_645_747_200_000_000L, ChronoUnit.MICROS)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("LONG")
+            );
+        }
+    }
+
+    @Test
+    public void testTimestampToShortCoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_short_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .timestampColumn("v", 1_645_747_200_000_000L, ChronoUnit.MICROS)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("SHORT")
+            );
+        }
+    }
+
+    @Test
+    public void testTimestampToString() throws Exception {
+        String table = "test_qwp_timestamp_to_string";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s STRING, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            long tsMicros = 1_645_747_200_000_000L; // 2022-02-25T00:00:00Z in micros
+            sender.table(table)
+                    .timestampColumn("s", tsMicros, ChronoUnit.MICROS)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 1);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "2022-02-25T00:00:00.000Z\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
     @Test
@@ -7257,10 +7579,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
     }
 
     @Test
-    public void testTimestampToDecimalCoercionError() throws Exception {
-        String table = "test_qwp_timestamp_to_decimal_error";
+    public void testTimestampToUuidCoercionError() throws Exception {
+        String table = "test_qwp_timestamp_to_uuid_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v DECIMAL(18,2), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
             sender.table(table)
@@ -7272,22 +7594,72 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write TIMESTAMP") && msg.contains("DECIMAL")
+                    msg.contains("cannot write TIMESTAMP") && msg.contains("UUID")
             );
         }
     }
 
-    // === DECIMAL negative coercion tests ===
+    @Test
+    public void testTimestampToVarchar() throws Exception {
+        String table = "test_qwp_timestamp_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v VARCHAR, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            long tsMicros = 1_645_747_200_000_000L; // 2022-02-25T00:00:00Z in micros
+            sender.table(table)
+                    .timestampColumn("v", tsMicros, ChronoUnit.MICROS)
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 1);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "2022-02-25T00:00:00.000Z\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
 
     @Test
-    public void testDecimalToBooleanCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_boolean_error";
+    public void testUuid() throws Exception {
+        String table = "test_qwp_uuid";
+        useTable(table);
+
+        UUID uuid1 = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        UUID uuid2 = UUID.fromString("11111111-2222-3333-4444-555555555555");
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .uuidColumn("u", uuid1.getLeastSignificantBits(), uuid1.getMostSignificantBits())
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .uuidColumn("u", uuid2.getLeastSignificantBits(), uuid2.getMostSignificantBits())
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                "u\ttimestamp\n" +
+                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n" +
+                        "11111111-2222-3333-4444-555555555555\t1970-01-01T00:00:02.000000000Z\n",
+                "SELECT u, timestamp FROM " + table + " ORDER BY timestamp");
+    }
+
+    @Test
+    public void testUuidToBooleanCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_boolean_error";
         useTable(table);
         execute("CREATE TABLE " + table + " (v BOOLEAN, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
             sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
             Assert.fail("Expected LineSenderException");
@@ -7295,20 +7667,21 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("BOOLEAN")
+                    msg.contains("cannot write UUID") && msg.contains("BOOLEAN")
             );
         }
     }
 
     @Test
-    public void testDecimalToByteCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_byte_error";
+    public void testUuidToByteCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_byte_error";
         useTable(table);
         execute("CREATE TABLE " + table + " (v BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
             sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
             Assert.fail("Expected LineSenderException");
@@ -7316,251 +7689,21 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("BYTE")
+                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
             );
         }
     }
 
     @Test
-    public void testDecimalToShortCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_short_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("SHORT")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToIntCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_int_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("INT")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToLongCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_long_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("LONG")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToFloatCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_float_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("FLOAT")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToDoubleCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_double_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("DOUBLE")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToDateCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_date_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("DATE")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToUuidCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_uuid_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("UUID")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToLong256CoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_long256_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("LONG256")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToGeoHashCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_geohash_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("GEOHASH")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToTimestampCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_timestamp_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("TIMESTAMP")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToTimestampNsCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_timestamp_ns_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v TIMESTAMP_NS, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("TIMESTAMP")
-            );
-        }
-    }
-
-    @Test
-    public void testDecimalToCharCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_char_error";
+    public void testUuidToCharCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_char_error";
         useTable(table);
         execute("CREATE TABLE " + table + " (v CHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
             sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
             Assert.fail("Expected LineSenderException");
@@ -7568,473 +7711,294 @@ public class QwpSenderTest extends AbstractLineSenderTest {
             String msg = e.getMessage();
             Assert.assertTrue(
                     "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("CHAR")
+                    msg.contains("cannot write UUID") && msg.contains("CHAR")
             );
         }
     }
 
     @Test
-    public void testDecimalToSymbolCoercionError() throws Exception {
-        String table = "test_qwp_decimal_to_symbol_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .decimalColumn("v", Decimal64.fromLong(12345L, 2))
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DECIMAL64") && msg.contains("SYMBOL")
-            );
-        }
-    }
-
-    // === DOUBLE_ARRAY negative coercion tests ===
-
-    @Test
-    public void testDoubleArrayToIntCoercionError() throws Exception {
-        String table = "test_qwp_doublearray_to_int_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleArray("v", new double[]{1.0, 2.0})
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DOUBLE_ARRAY") && msg.contains("INT")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleArrayToStringCoercionError() throws Exception {
-        String table = "test_qwp_doublearray_to_string_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v STRING, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleArray("v", new double[]{1.0, 2.0})
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DOUBLE_ARRAY") && msg.contains("STRING")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleArrayToSymbolCoercionError() throws Exception {
-        String table = "test_qwp_doublearray_to_symbol_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleArray("v", new double[]{1.0, 2.0})
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DOUBLE_ARRAY") && msg.contains("SYMBOL")
-            );
-        }
-    }
-
-    @Test
-    public void testDoubleArrayToTimestampCoercionError() throws Exception {
-        String table = "test_qwp_doublearray_to_timestamp_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .doubleArray("v", new double[]{1.0, 2.0})
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected coercion error but got: " + msg,
-                    msg.contains("cannot write DOUBLE_ARRAY") && msg.contains("TIMESTAMP")
-            );
-        }
-    }
-
-    // ==================== Additional null coercion tests ====================
-
-    @Test
-    public void testNullStringToVarchar() throws Exception {
-        String table = "test_qwp_null_string_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v VARCHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("v", "hello")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("v", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullSymbolToSymbol() throws Exception {
-        String table = "test_qwp_null_symbol_to_symbol";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (s SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .symbol("s", "alpha")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .symbol("s", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToByte() throws Exception {
-        String table = "test_qwp_null_string_to_byte";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (b BYTE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("b", "42")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("b", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "0\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT b, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToShort() throws Exception {
-        String table = "test_qwp_null_string_to_short";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (s SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("s", "42")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("s", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "0\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT s, ts FROM " + table + " ORDER BY ts");
-    }
-
-    @Test
-    public void testNullStringToFloat() throws Exception {
-        String table = "test_qwp_null_string_to_float";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (f FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("f", "3.14")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("f", null)
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "f\tts\n" +
-                        "3.14\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT f, ts FROM " + table + " ORDER BY ts");
-    }
-
-    // ==================== Additional positive coercion test ====================
-
-    @Test
-    public void testStringToVarchar() throws Exception {
-        String table = "test_qwp_string_to_varchar";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v VARCHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("v", "hello")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.table(table)
-                    .stringColumn("v", "world")
-                    .at(2_000_000, ChronoUnit.MICROS);
-            sender.flush();
-        }
-        assertTableSizeEventually(table, 2);
-        assertSqlEventually(
-                "v\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "world\t1970-01-01T00:00:02.000000000Z\n",
-                "SELECT v, ts FROM " + table + " ORDER BY ts");
-    }
-
-    // ==================== Additional parse error tests ====================
-
-    @Test
-    public void testStringToIntParseError() throws Exception {
-        String table = "test_qwp_string_to_int_parse_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("v", "not_a_number")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse INT from string") && msg.contains("not_a_number")
-            );
-        }
-    }
-
-    @Test
-    public void testStringToLongParseError() throws Exception {
-        String table = "test_qwp_string_to_long_parse_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("v", "not_a_number")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse LONG from string") && msg.contains("not_a_number")
-            );
-        }
-    }
-
-    @Test
-    public void testStringToShortParseError() throws Exception {
-        String table = "test_qwp_string_to_short_parse_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v SHORT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("v", "not_a_number")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse SHORT from string") && msg.contains("not_a_number")
-            );
-        }
-    }
-
-    @Test
-    public void testStringToFloatParseError() throws Exception {
-        String table = "test_qwp_string_to_float_parse_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("v", "not_a_number")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse FLOAT from string") && msg.contains("not_a_number")
-            );
-        }
-    }
-
-    @Test
-    public void testStringToDoubleParseError() throws Exception {
-        String table = "test_qwp_string_to_double_parse_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("v", "not_a_number")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse DOUBLE from string") && msg.contains("not_a_number")
-            );
-        }
-    }
-
-    @Test
-    public void testStringToDateParseError() throws Exception {
-        String table = "test_qwp_string_to_date_parse_error";
+    public void testUuidToDateCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_date_error";
         useTable(table);
         execute("CREATE TABLE " + table + " (v DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
             sender.table(table)
-                    .stringColumn("v", "not_a_date")
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
             Assert.fail("Expected LineSenderException");
         } catch (LineSenderException e) {
             String msg = e.getMessage();
             Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse DATE from string") && msg.contains("not_a_date")
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
             );
         }
     }
 
     @Test
-    public void testStringToTimestampParseError() throws Exception {
-        String table = "test_qwp_string_to_timestamp_parse_error";
+    public void testUuidToDoubleCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_double_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
             sender.table(table)
-                    .stringColumn("v", "not_a_timestamp")
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
             Assert.fail("Expected LineSenderException");
         } catch (LineSenderException e) {
             String msg = e.getMessage();
             Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse timestamp from string") && msg.contains("not_a_timestamp")
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
             );
         }
     }
 
     @Test
-    public void testStringToUuidParseError() throws Exception {
-        String table = "test_qwp_string_to_uuid_parse_error";
+    public void testUuidToFloatCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_float_error";
         useTable(table);
-        execute("CREATE TABLE " + table + " (v UUID, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("CREATE TABLE " + table + " (v FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
             sender.table(table)
-                    .stringColumn("v", "not-a-uuid")
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
             Assert.fail("Expected LineSenderException");
         } catch (LineSenderException e) {
             String msg = e.getMessage();
             Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse UUID from string") && msg.contains("not-a-uuid")
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
             );
         }
     }
 
     @Test
-    public void testStringToLong256ParseError() throws Exception {
-        String table = "test_qwp_string_to_long256_parse_error";
-        useTable(table);
-        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-        assertTableExistsEventually(table);
-        try (QwpWebSocketSender sender = createQwpSender()) {
-            sender.table(table)
-                    .stringColumn("v", "not_a_long256")
-                    .at(1_000_000, ChronoUnit.MICROS);
-            sender.flush();
-            Assert.fail("Expected LineSenderException");
-        } catch (LineSenderException e) {
-            String msg = e.getMessage();
-            Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse long256 from string") && msg.contains("not_a_long256")
-            );
-        }
-    }
-
-    @Test
-    public void testStringToGeoHashParseError() throws Exception {
-        String table = "test_qwp_string_to_geohash_parse_error";
+    public void testUuidToGeoHashCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_geohash_error";
         useTable(table);
         execute("CREATE TABLE " + table + " (v GEOHASH(5c), ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
         assertTableExistsEventually(table);
         try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
             sender.table(table)
-                    .stringColumn("v", "!!!")
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
                     .at(1_000_000, ChronoUnit.MICROS);
             sender.flush();
             Assert.fail("Expected LineSenderException");
         } catch (LineSenderException e) {
             String msg = e.getMessage();
             Assert.assertTrue(
-                    "Expected parse error but got: " + msg,
-                    msg.contains("cannot parse geohash from string") && msg.contains("!!!")
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
             );
         }
     }
 
-    // === Helper Methods ===
+    @Test
+    public void testUuidToIntCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_int_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+            sender.table(table)
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testUuidToLong256CoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_long256_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG256, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+            sender.table(table)
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testUuidToLongCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_long_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+            sender.table(table)
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from UUID to") && msg.contains("is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testUuidToShortCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_short_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s SHORT, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+            sender.table(table)
+                    .uuidColumn("s", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("type coercion from UUID to SHORT is not supported")
+            );
+        }
+    }
+
+    @Test
+    public void testUuidToString() throws Exception {
+        String table = "test_qwp_uuid_to_string";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "s STRING, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .uuidColumn("s", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 1);
+        assertSqlEventually(
+                "s\tts\n" +
+                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT s, ts FROM " + table);
+    }
+
+    @Test
+    public void testUuidToSymbolCoercionError() throws Exception {
+        String table = "test_qwp_uuid_to_symbol_error";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (v SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+            sender.table(table)
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+            Assert.fail("Expected LineSenderException");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertTrue(
+                    "Expected coercion error but got: " + msg,
+                    msg.contains("cannot write UUID") && msg.contains("SYMBOL")
+            );
+        }
+    }
+
+    @Test
+    public void testUuidToVarchar() throws Exception {
+        String table = "test_qwp_uuid_to_varchar";
+        useTable(table);
+        execute("CREATE TABLE " + table + " (" +
+                "v VARCHAR, " +
+                "ts TIMESTAMP" +
+                ") TIMESTAMP(ts) PARTITION BY DAY");
+        assertTableExistsEventually(table);
+
+        UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .uuidColumn("v", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 1);
+        assertSqlEventually(
+                "v\tts\n" +
+                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n",
+                "SELECT v, ts FROM " + table);
+    }
+
+    @Test
+    public void testWriteAllTypesInOneRow() throws Exception {
+        String table = "test_qwp_all_types";
+        useTable(table);
+
+        UUID uuid = UUID.fromString("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        double[] arr1d = {1.0, 2.0, 3.0};
+        long tsMicros = 1_645_747_200_000_000L; // 2022-02-25T00:00:00Z
+
+        try (QwpWebSocketSender sender = createQwpSender()) {
+            sender.table(table)
+                    .symbol("sym", "test_symbol")
+                    .boolColumn("bool_col", true)
+                    .shortColumn("short_col", (short) 42)
+                    .intColumn("int_col", 100_000)
+                    .longColumn("long_col", 1_000_000_000L)
+                    .floatColumn("float_col", 2.5f)
+                    .doubleColumn("double_col", 3.14)
+                    .stringColumn("string_col", "hello")
+                    .charColumn("char_col", 'Z')
+                    .timestampColumn("ts_col", tsMicros, ChronoUnit.MICROS)
+                    .uuidColumn("uuid_col", uuid.getLeastSignificantBits(), uuid.getMostSignificantBits())
+                    .long256Column("long256_col", 1, 0, 0, 0)
+                    .doubleArray("arr_col", arr1d)
+                    .decimalColumn("decimal_col", "99.99")
+                    .at(tsMicros, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 1);
+    }
 
     private QwpWebSocketSender createQwpSender() {
         return QwpWebSocketSender.connect(getQuestDbHost(), getHttpPort());

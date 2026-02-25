@@ -61,36 +61,36 @@ import java.util.concurrent.TimeUnit;
  */
 public class StacBenchmarkClient {
 
-    private static final String PROTOCOL_ILP_TCP = "ilp-tcp";
-    private static final String PROTOCOL_ILP_HTTP = "ilp-http";
-    private static final String PROTOCOL_QWP_WEBSOCKET = "qwp-websocket";
-
-    private static final String DEFAULT_HOST = "localhost";
-    private static final int DEFAULT_ROWS = 80_000_000;
     private static final int DEFAULT_BATCH_SIZE = 10_000;
     private static final int DEFAULT_FLUSH_BYTES = 0;
     private static final long DEFAULT_FLUSH_INTERVAL_MS = 0;
+    private static final String DEFAULT_HOST = "localhost";
     private static final int DEFAULT_IN_FLIGHT_WINDOW = 0;
-    private static final int DEFAULT_SEND_QUEUE = 0;
-    private static final int DEFAULT_WARMUP_ROWS = 100_000;
     private static final int DEFAULT_REPORT_INTERVAL = 1_000_000;
+    private static final int DEFAULT_ROWS = 80_000_000;
+    private static final int DEFAULT_SEND_QUEUE = 0;
     private static final String DEFAULT_TABLE = "q";
-
-    // 8512 unique 4-letter symbols, as per STAC NYSE benchmark
-    private static final int SYMBOL_COUNT = 8512;
-    private static final String[] SYMBOLS = generateSymbols(SYMBOL_COUNT);
-
+    private static final int DEFAULT_WARMUP_ROWS = 100_000;
+    // Estimated row size for throughput calculation:
+    // - 1 symbol: ~6 bytes (4-char + overhead)
+    // - 1 char: 2 bytes
+    // - 2 floats: 4 bytes each = 8 bytes
+    // - 2 shorts: 2 bytes each = 4 bytes
+    // - 1 boolean: 1 byte
+    // - 1 timestamp: 8 bytes
+    // - overhead: ~10 bytes
+    // Total: ~39 bytes
+    private static final int ESTIMATED_ROW_SIZE = 39;
     // Exchange codes (single characters)
     private static final char[] EXCHANGES = {'N', 'Q', 'A', 'B', 'C', 'D', 'P', 'Z'};
     // Pre-computed single-char strings to avoid allocation
     private static final String[] EXCHANGE_STRINGS = new String[EXCHANGES.length];
-
-    static {
-        for (int i = 0; i < EXCHANGES.length; i++) {
-            EXCHANGE_STRINGS[i] = String.valueOf(EXCHANGES[i]);
-        }
-    }
-
+    private static final String PROTOCOL_ILP_HTTP = "ilp-http";
+    private static final String PROTOCOL_ILP_TCP = "ilp-tcp";
+    private static final String PROTOCOL_QWP_WEBSOCKET = "qwp-websocket";
+    // 8512 unique 4-letter symbols, as per STAC NYSE benchmark
+    private static final int SYMBOL_COUNT = 8512;
+    private static final String[] SYMBOLS = generateSymbols(SYMBOL_COUNT);
     // Pre-computed bid base prices per symbol (to generate realistic spreads)
     private static final float[] BASE_PRICES = generateBasePrices(SYMBOL_COUNT);
 
@@ -176,6 +176,80 @@ public class StacBenchmarkClient {
         }
     }
 
+    private static Sender createSender(String protocol, String host, int port,
+                                       int batchSize, int flushBytes, long flushIntervalMs,
+                                       int inFlightWindow, int sendQueue) {
+        switch (protocol) {
+            case PROTOCOL_ILP_TCP:
+                return Sender.builder(Sender.Transport.TCP)
+                        .address(host)
+                        .port(port)
+                        .build();
+            case PROTOCOL_ILP_HTTP:
+                return Sender.builder(Sender.Transport.HTTP)
+                        .address(host)
+                        .port(port)
+                        .autoFlushRows(batchSize)
+                        .build();
+            case PROTOCOL_QWP_WEBSOCKET:
+                Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(host)
+                        .port(port)
+                        .asyncMode(true);
+                if (batchSize > 0) b.autoFlushRows(batchSize);
+                if (flushBytes > 0) b.autoFlushBytes(flushBytes);
+                if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
+                if (inFlightWindow > 0) b.inFlightWindowSize(inFlightWindow);
+                if (sendQueue > 0) b.sendQueueCapacity(sendQueue);
+                return b.build();
+            default:
+                throw new IllegalArgumentException("Unknown protocol: " + protocol +
+                        ". Use one of: ilp-tcp, ilp-http, qwp-websocket");
+        }
+    }
+
+    /**
+     * Generates pseudo-random base prices for each symbol.
+     * Prices range from $1 to $500 to simulate realistic stock prices.
+     */
+    private static float[] generateBasePrices(int count) {
+        float[] prices = new float[count];
+        Random rng = new Random(42); // fixed seed for reproducibility
+        for (int i = 0; i < count; i++) {
+            prices[i] = 1.0f + rng.nextFloat() * 499.0f;
+        }
+        return prices;
+    }
+
+    /**
+     * Generates N unique 4-letter symbols.
+     * Uses combinations of uppercase letters to produce predictable, reproducible symbols.
+     */
+    private static String[] generateSymbols(int count) {
+        String[] symbols = new String[count];
+        int idx = 0;
+        // 26^4 = 456,976 possible 4-letter combinations, far more than 8512
+        outer:
+        for (char a = 'A'; a <= 'Z' && idx < count; a++) {
+            for (char b = 'A'; b <= 'Z' && idx < count; b++) {
+                for (char c = 'A'; c <= 'Z' && idx < count; c++) {
+                    for (char d = 'A'; d <= 'Z' && idx < count; d++) {
+                        symbols[idx++] = new String(new char[]{a, b, c, d});
+                        if (idx >= count) break outer;
+                    }
+                }
+            }
+        }
+        return symbols;
+    }
+
+    private static int getDefaultPort(String protocol) {
+        if (PROTOCOL_ILP_HTTP.equals(protocol) || PROTOCOL_QWP_WEBSOCKET.equals(protocol)) {
+            return 9000;
+        }
+        return 9009;
+    }
+
     private static void printUsage() {
         System.out.println("STAC Benchmark Ingestion Client");
         System.out.println();
@@ -210,13 +284,6 @@ public class StacBenchmarkClient {
         System.out.println("      s SYMBOL, x CHAR, b FLOAT, a FLOAT,");
         System.out.println("      v SHORT, w SHORT, m BOOLEAN, T TIMESTAMP");
         System.out.println("  ) timestamp(T) PARTITION BY DAY WAL;");
-    }
-
-    private static int getDefaultPort(String protocol) {
-        if (PROTOCOL_ILP_HTTP.equals(protocol) || PROTOCOL_QWP_WEBSOCKET.equals(protocol)) {
-            return 9000;
-        }
-        return 9009;
     }
 
     private static void runTest(String protocol, String host, int port, String table,
@@ -305,38 +372,6 @@ public class StacBenchmarkClient {
         }
     }
 
-    private static Sender createSender(String protocol, String host, int port,
-                                       int batchSize, int flushBytes, long flushIntervalMs,
-                                       int inFlightWindow, int sendQueue) {
-        switch (protocol) {
-            case PROTOCOL_ILP_TCP:
-                return Sender.builder(Sender.Transport.TCP)
-                        .address(host)
-                        .port(port)
-                        .build();
-            case PROTOCOL_ILP_HTTP:
-                return Sender.builder(Sender.Transport.HTTP)
-                        .address(host)
-                        .port(port)
-                        .autoFlushRows(batchSize)
-                        .build();
-            case PROTOCOL_QWP_WEBSOCKET:
-                Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(host)
-                        .port(port)
-                        .asyncMode(true);
-                if (batchSize > 0) b.autoFlushRows(batchSize);
-                if (flushBytes > 0) b.autoFlushBytes(flushBytes);
-                if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
-                if (inFlightWindow > 0) b.inFlightWindowSize(inFlightWindow);
-                if (sendQueue > 0) b.sendQueueCapacity(sendQueue);
-                return b.build();
-            default:
-                throw new IllegalArgumentException("Unknown protocol: " + protocol +
-                        ". Use one of: ilp-tcp, ilp-http, qwp-websocket");
-        }
-    }
-
     /**
      * Sends a single quote row matching the STAC schema.
      * <p>
@@ -376,49 +411,9 @@ public class StacBenchmarkClient {
                 .at(timestamp, ChronoUnit.MICROS);
     }
 
-    /**
-     * Generates N unique 4-letter symbols.
-     * Uses combinations of uppercase letters to produce predictable, reproducible symbols.
-     */
-    private static String[] generateSymbols(int count) {
-        String[] symbols = new String[count];
-        int idx = 0;
-        // 26^4 = 456,976 possible 4-letter combinations, far more than 8512
-        outer:
-        for (char a = 'A'; a <= 'Z' && idx < count; a++) {
-            for (char b = 'A'; b <= 'Z' && idx < count; b++) {
-                for (char c = 'A'; c <= 'Z' && idx < count; c++) {
-                    for (char d = 'A'; d <= 'Z' && idx < count; d++) {
-                        symbols[idx++] = new String(new char[]{a, b, c, d});
-                        if (idx >= count) break outer;
-                    }
-                }
-            }
+    static {
+        for (int i = 0; i < EXCHANGES.length; i++) {
+            EXCHANGE_STRINGS[i] = String.valueOf(EXCHANGES[i]);
         }
-        return symbols;
     }
-
-    /**
-     * Generates pseudo-random base prices for each symbol.
-     * Prices range from $1 to $500 to simulate realistic stock prices.
-     */
-    private static float[] generateBasePrices(int count) {
-        float[] prices = new float[count];
-        Random rng = new Random(42); // fixed seed for reproducibility
-        for (int i = 0; i < count; i++) {
-            prices[i] = 1.0f + rng.nextFloat() * 499.0f;
-        }
-        return prices;
-    }
-
-    // Estimated row size for throughput calculation:
-    // - 1 symbol: ~6 bytes (4-char + overhead)
-    // - 1 char: 2 bytes
-    // - 2 floats: 4 bytes each = 8 bytes
-    // - 2 shorts: 2 bytes each = 4 bytes
-    // - 1 boolean: 1 byte
-    // - 1 timestamp: 8 bytes
-    // - overhead: ~10 bytes
-    // Total: ~39 bytes
-    private static final int ESTIMATED_ROW_SIZE = 39;
 }

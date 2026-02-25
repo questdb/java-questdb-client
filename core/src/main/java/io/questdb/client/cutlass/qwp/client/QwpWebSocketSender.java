@@ -50,6 +50,7 @@ import java.util.concurrent.TimeUnit;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
+
 /**
  * ILP v4 WebSocket client sender for streaming data to QuestDB.
  * <p>
@@ -81,6 +82,25 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  *     // flush() waits for all pending batches to be sent
  *     sender.flush();
  * }
+ * </pre>
+ * <p>
+ * <b>Fast-path API for high-throughput generators</b>
+ * <p>
+ * For maximum throughput, bypass the fluent API to avoid per-row overhead
+ * (no column-name hashmap lookups, no {@code checkNotClosed()}/{@code checkTableSelected()}
+ * per column, direct access to column buffers). Use {@link #getTableBuffer(String)},
+ * {@link #getOrAddGlobalSymbol(String)}, and {@link #incrementPendingRowCount()}:
+ * <pre>
+ * // Setup (once)
+ * QwpTableBuffer tableBuffer = sender.getTableBuffer("q");
+ * QwpTableBuffer.ColumnBuffer colSymbol = tableBuffer.getOrCreateColumn("s", TYPE_SYMBOL, true);
+ * QwpTableBuffer.ColumnBuffer colBid = tableBuffer.getOrCreateColumn("b", TYPE_DOUBLE, false);
+ *
+ * // Hot path (per row)
+ * colSymbol.addSymbolWithGlobalId(symbol, sender.getOrAddGlobalSymbol(symbol));
+ * colBid.addDouble(bid);
+ * tableBuffer.nextRow();
+ * sender.incrementPendingRowCount();
  * </pre>
  */
 public class QwpWebSocketSender implements Sender {
@@ -219,8 +239,8 @@ public class QwpWebSocketSender implements Sender {
      * @return connected sender
      */
     public static QwpWebSocketSender connect(String host, int port, boolean tlsEnabled,
-                                              int autoFlushRows, int autoFlushBytes,
-                                              long autoFlushIntervalNanos) {
+                                             int autoFlushRows, int autoFlushBytes,
+                                             long autoFlushIntervalNanos) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -518,25 +538,6 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
-    // ==================== Fast-path API for high-throughput generators ====================
-    //
-    // These methods bypass the normal fluent API to avoid per-row overhead:
-    // - No hashmap lookups for column names
-    // - No checkNotClosed()/checkTableSelected() per column
-    // - Direct access to column buffers
-    //
-    // Usage:
-    //   // Setup (once)
-    //   QwpTableBuffer tableBuffer = sender.getTableBuffer("q");
-    //   QwpTableBuffer.ColumnBuffer colSymbol = tableBuffer.getOrCreateColumn("s", TYPE_SYMBOL, true);
-    //   QwpTableBuffer.ColumnBuffer colBid = tableBuffer.getOrCreateColumn("b", TYPE_DOUBLE, false);
-    //
-    //   // Hot path (per row)
-    //   colSymbol.addSymbolWithGlobalId(symbol, sender.getOrAddGlobalSymbol(symbol));
-    //   colBid.addDouble(bid);
-    //   tableBuffer.nextRow();
-    //   sender.incrementPendingRowCount();
-
     @Override
     public Sender decimalColumn(CharSequence name, Decimal256 value) {
         if (value == null || value.isNull()) return this;
@@ -572,8 +573,6 @@ public class QwpWebSocketSender implements Sender {
         col.addDoubleArray(values);
         return this;
     }
-
-    // ==================== Sender interface implementation ====================
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][] values) {
@@ -613,14 +612,6 @@ public class QwpWebSocketSender implements Sender {
         col.addDouble(value);
         return this;
     }
-
-    /**
-     * Adds an INT column value to the current row.
-     *
-     * @param columnName the column name
-     * @param value      the int value
-     * @return this sender for method chaining
-     */
 
     /**
      * Adds a FLOAT column value to the current row.
@@ -765,6 +756,14 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+
+    /**
+     * Adds an INT column value to the current row.
+     *
+     * @param columnName the column name
+     * @param value      the int value
+     * @return this sender for method chaining
+     */
     public QwpWebSocketSender intColumn(CharSequence columnName, int value) {
         checkNotClosed();
         checkTableSelected();
@@ -961,8 +960,6 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
-    // ==================== Array methods ====================
-
     /**
      * Adds a UUID column value to the current row.
      *
@@ -1106,8 +1103,6 @@ public class QwpWebSocketSender implements Sender {
             LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}]", host, port, inFlightWindowSize);
         }
     }
-
-    // ==================== Decimal methods ====================
 
     private void failExpectedIfNeeded(long expectedSequence, LineSenderException error) {
         if (inFlightWindow != null && inFlightWindow.getLastError() == null) {
@@ -1317,8 +1312,6 @@ public class QwpWebSocketSender implements Sender {
             throw e;
         }
     }
-
-    // ==================== Helper methods ====================
 
     /**
      * Accumulates the current row.

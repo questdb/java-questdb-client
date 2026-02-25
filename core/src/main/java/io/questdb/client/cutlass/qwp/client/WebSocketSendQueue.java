@@ -27,10 +27,10 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -62,90 +62,50 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class WebSocketSendQueue implements QuietCloseable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(WebSocketSendQueue.class);
-
+    public static final long DEFAULT_ENQUEUE_TIMEOUT_MS = 30_000;
     // Default configuration
     public static final int DEFAULT_QUEUE_CAPACITY = 16;
-    public static final long DEFAULT_ENQUEUE_TIMEOUT_MS = 30_000;
     public static final long DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
-
-    // Single pending buffer slot (double-buffering means at most 1 item in queue)
-    // Zero allocation - just a volatile reference handoff
-    private volatile MicrobatchBuffer pendingBuffer;
-
+    private static final Logger LOG = LoggerFactory.getLogger(WebSocketSendQueue.class);
     // The WebSocket client for I/O (single-threaded access only)
     private final WebSocketClient client;
-
+    // Configuration
+    private final long enqueueTimeoutMs;
     // Optional InFlightWindow for tracking sent batches awaiting ACK
     @Nullable
     private final InFlightWindow inFlightWindow;
 
     // The I/O thread for async send/receive
     private final Thread ioThread;
-
-    // Running state
-    private volatile boolean running;
-    private volatile boolean shuttingDown;
-
-    // Synchronization for flush/close
-    private final CountDownLatch shutdownLatch;
-
-    // Error handling
-    private volatile Throwable lastError;
-
-    // Statistics - sending
-    private final AtomicLong totalBatchesSent = new AtomicLong(0);
-    private final AtomicLong totalBytesSent = new AtomicLong(0);
-
-    // Statistics - receiving
-    private final AtomicLong totalAcks = new AtomicLong(0);
-    private final AtomicLong totalErrors = new AtomicLong(0);
-
     // Counter for batches currently being processed by the I/O thread
     // This tracks batches that have been dequeued but not yet fully sent
     private final AtomicInteger processingCount = new AtomicInteger(0);
-
     // Lock for all coordination between user thread and I/O thread.
     // Used for: queue poll + processingCount increment atomicity,
     // flush() waiting, I/O thread waiting when idle.
     private final Object processingLock = new Object();
-
-    // Batch sequence counter (must match server's messageSequence)
-    private long nextBatchSequence = 0;
-
     // Response parsing
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
-
-    // Configuration
-    private final long enqueueTimeoutMs;
+    // Synchronization for flush/close
+    private final CountDownLatch shutdownLatch;
     private final long shutdownTimeoutMs;
-
-    // ==================== Pending Buffer Operations (zero allocation) ====================
-
-    private boolean offerPending(MicrobatchBuffer buffer) {
-        if (pendingBuffer != null) {
-            return false; // slot occupied
-        }
-        pendingBuffer = buffer;
-        return true;
-    }
-
-    private MicrobatchBuffer pollPending() {
-        MicrobatchBuffer buffer = pendingBuffer;
-        if (buffer != null) {
-            pendingBuffer = null;
-        }
-        return buffer;
-    }
-
-    private boolean isPendingEmpty() {
-        return pendingBuffer == null;
-    }
-
-    private int getPendingSize() {
-        return pendingBuffer == null ? 0 : 1;
-    }
+    // Statistics - receiving
+    private final AtomicLong totalAcks = new AtomicLong(0);
+    // Statistics - sending
+    private final AtomicLong totalBatchesSent = new AtomicLong(0);
+    private final AtomicLong totalBytesSent = new AtomicLong(0);
+    private final AtomicLong totalErrors = new AtomicLong(0);
+    // Error handling
+    private volatile Throwable lastError;
+    // Batch sequence counter (must match server's messageSequence)
+    private long nextBatchSequence = 0;
+    // Single pending buffer slot (double-buffering means at most 1 item in queue)
+    // Zero allocation - just a volatile reference handoff
+    private volatile MicrobatchBuffer pendingBuffer;
+    // Running state
+    private volatile boolean running;
+    private volatile boolean shuttingDown;
 
     /**
      * Creates a new send queue with default configuration.
@@ -198,6 +158,61 @@ public class WebSocketSendQueue implements QuietCloseable {
         this.ioThread.start();
 
         LOG.info("WebSocket I/O thread started [capacity={}]", queueCapacity);
+    }
+
+    /**
+     * Closes the send queue gracefully.
+     * <p>
+     * This method:
+     * 1. Stops accepting new batches
+     * 2. Waits for pending batches to be sent
+     * 3. Stops the I/O thread
+     * <p>
+     * Note: This does NOT close the WebSocket channel - that's the caller's responsibility.
+     */
+    @Override
+    public void close() {
+        if (!running) {
+            return;
+        }
+
+        LOG.info("Closing WebSocket send queue [pending={}]", getPendingSize());
+
+        // Signal shutdown
+        shuttingDown = true;
+
+        // Wait for pending batches to be sent
+        long startTime = System.currentTimeMillis();
+        while (!isPendingEmpty()) {
+            if (System.currentTimeMillis() - startTime > shutdownTimeoutMs) {
+                LOG.error("Shutdown timeout, {} batches not sent", getPendingSize());
+                break;
+            }
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        // Stop the I/O thread
+        running = false;
+
+        // Wake up I/O thread if it's blocked on processingLock.wait()
+        synchronized (processingLock) {
+            processingLock.notifyAll();
+        }
+        ioThread.interrupt();
+
+        // Wait for I/O thread to finish
+        try {
+            shutdownLatch.await(shutdownTimeoutMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        LOG.info("WebSocket send queue closed [totalBatches={}, totalBytes={}]", totalBatchesSent.get(), totalBytesSent.get());
     }
 
     /**
@@ -301,6 +316,13 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
+     * Returns the last error that occurred in the I/O thread, or null if no error.
+     */
+    public Throwable getLastError() {
+        return lastError;
+    }
+
+    /**
      * Returns the number of batches waiting to be sent.
      */
     public int getPendingCount() {
@@ -308,17 +330,10 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
-     * Returns true if the queue is empty.
+     * Returns total successful acknowledgments received.
      */
-    public boolean isEmpty() {
-        return isPendingEmpty();
-    }
-
-    /**
-     * Returns true if the queue is still running.
-     */
-    public boolean isRunning() {
-        return running && !shuttingDown;
+    public long getTotalAcks() {
+        return totalAcks.get();
     }
 
     /**
@@ -336,79 +351,76 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
-     * Returns the last error that occurred in the I/O thread, or null if no error.
+     * Returns total error responses received.
      */
-    public Throwable getLastError() {
-        return lastError;
+    public long getTotalErrors() {
+        return totalErrors.get();
     }
 
     /**
-     * Closes the send queue gracefully.
-     * <p>
-     * This method:
-     * 1. Stops accepting new batches
-     * 2. Waits for pending batches to be sent
-     * 3. Stops the I/O thread
-     * <p>
-     * Note: This does NOT close the WebSocket channel - that's the caller's responsibility.
+     * Returns true if the queue is empty.
      */
-    @Override
-    public void close() {
-        if (!running) {
-            return;
+    public boolean isEmpty() {
+        return isPendingEmpty();
+    }
+
+    /**
+     * Returns true if the queue is still running.
+     */
+    public boolean isRunning() {
+        return running && !shuttingDown;
+    }
+
+    /**
+     * Checks if an error occurred in the I/O thread and throws if so.
+     */
+    private void checkError() {
+        Throwable error = lastError;
+        if (error != null) {
+            throw new LineSenderException("Error in send queue I/O thread: " + error.getMessage(), error);
         }
+    }
 
-        LOG.info("Closing WebSocket send queue [pending={}]", getPendingSize());
-
-        // Signal shutdown
-        shuttingDown = true;
-
-        // Wait for pending batches to be sent
-        long startTime = System.currentTimeMillis();
-        while (!isPendingEmpty()) {
-            if (System.currentTimeMillis() - startTime > shutdownTimeoutMs) {
-                LOG.error("Shutdown timeout, {} batches not sent", getPendingSize());
-                break;
-            }
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
+    /**
+     * Computes the current I/O state based on queue and in-flight status.
+     */
+    private IoState computeState(boolean hasInFlight) {
+        if (!isPendingEmpty()) {
+            return IoState.ACTIVE;
+        } else if (hasInFlight) {
+            return IoState.DRAINING;
+        } else {
+            return IoState.IDLE;
         }
+    }
 
-        // Stop the I/O thread
+    private void failTransport(LineSenderException error) {
+        Throwable rootError = lastError;
+        if (rootError == null) {
+            lastError = error;
+            rootError = error;
+        }
         running = false;
-
-        // Wake up I/O thread if it's blocked on processingLock.wait()
+        shuttingDown = true;
+        if (inFlightWindow != null) {
+            inFlightWindow.failAll(rootError);
+        }
         synchronized (processingLock) {
+            MicrobatchBuffer dropped = pollPending();
+            if (dropped != null) {
+                if (dropped.isSealed()) {
+                    dropped.markSending();
+                }
+                if (dropped.isSending()) {
+                    dropped.markRecycled();
+                }
+            }
             processingLock.notifyAll();
         }
-        ioThread.interrupt();
-
-        // Wait for I/O thread to finish
-        try {
-            shutdownLatch.await(shutdownTimeoutMs, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-
-        LOG.info("WebSocket send queue closed [totalBatches={}, totalBytes={}]", totalBatchesSent.get(), totalBytesSent.get());
     }
 
-    // ==================== I/O Thread ====================
-
-    /**
-     * I/O loop states for the state machine.
-     * <ul>
-     *   <li>IDLE: queue empty, no in-flight batches - can block waiting for work</li>
-     *   <li>ACTIVE: have batches to send - non-blocking loop</li>
-     *   <li>DRAINING: queue empty but ACKs pending - poll for ACKs, short wait</li>
-     * </ul>
-     */
-    private enum IoState {
-        IDLE, ACTIVE, DRAINING
+    private int getPendingSize() {
+        return pendingBuffer == null ? 0 : 1;
     }
 
     /**
@@ -495,31 +507,24 @@ public class WebSocketSendQueue implements QuietCloseable {
         }
     }
 
-    /**
-     * Computes the current I/O state based on queue and in-flight status.
-     */
-    private IoState computeState(boolean hasInFlight) {
-        if (!isPendingEmpty()) {
-            return IoState.ACTIVE;
-        } else if (hasInFlight) {
-            return IoState.DRAINING;
-        } else {
-            return IoState.IDLE;
-        }
+    private boolean isPendingEmpty() {
+        return pendingBuffer == null;
     }
 
-    /**
-     * Tries to receive ACKs from the server (non-blocking).
-     */
-    private void tryReceiveAcks() {
-        try {
-            client.tryReceiveFrame(responseHandler);
-        } catch (Exception e) {
-            if (running) {
-                LOG.error("Error receiving response: {}", e.getMessage());
-                failTransport(new LineSenderException("Error receiving response: " + e.getMessage(), e));
-            }
+    private boolean offerPending(MicrobatchBuffer buffer) {
+        if (pendingBuffer != null) {
+            return false; // slot occupied
         }
+        pendingBuffer = buffer;
+        return true;
+    }
+
+    private MicrobatchBuffer pollPending() {
+        MicrobatchBuffer buffer = pendingBuffer;
+        if (buffer != null) {
+            pendingBuffer = null;
+        }
+        return buffer;
     }
 
     /**
@@ -582,55 +587,30 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
-     * Checks if an error occurred in the I/O thread and throws if so.
+     * Tries to receive ACKs from the server (non-blocking).
      */
-    private void checkError() {
-        Throwable error = lastError;
-        if (error != null) {
-            throw new LineSenderException("Error in send queue I/O thread: " + error.getMessage(), error);
-        }
-    }
-
-    private void failTransport(LineSenderException error) {
-        Throwable rootError = lastError;
-        if (rootError == null) {
-            lastError = error;
-            rootError = error;
-        }
-        running = false;
-        shuttingDown = true;
-        if (inFlightWindow != null) {
-            inFlightWindow.failAll(rootError);
-        }
-        synchronized (processingLock) {
-            MicrobatchBuffer dropped = pollPending();
-            if (dropped != null) {
-                if (dropped.isSealed()) {
-                    dropped.markSending();
-                }
-                if (dropped.isSending()) {
-                    dropped.markRecycled();
-                }
+    private void tryReceiveAcks() {
+        try {
+            client.tryReceiveFrame(responseHandler);
+        } catch (Exception e) {
+            if (running) {
+                LOG.error("Error receiving response: {}", e.getMessage());
+                failTransport(new LineSenderException("Error receiving response: " + e.getMessage(), e));
             }
-            processingLock.notifyAll();
         }
     }
 
     /**
-     * Returns total successful acknowledgments received.
+     * I/O loop states for the state machine.
+     * <ul>
+     *   <li>IDLE: queue empty, no in-flight batches - can block waiting for work</li>
+     *   <li>ACTIVE: have batches to send - non-blocking loop</li>
+     *   <li>DRAINING: queue empty but ACKs pending - poll for ACKs, short wait</li>
+     * </ul>
      */
-    public long getTotalAcks() {
-        return totalAcks.get();
+    private enum IoState {
+        IDLE, ACTIVE, DRAINING
     }
-
-    /**
-     * Returns total error responses received.
-     */
-    public long getTotalErrors() {
-        return totalErrors.get();
-    }
-
-    // ==================== Response Handler ====================
 
     /**
      * Handler for received WebSocket frames (ACKs from server).

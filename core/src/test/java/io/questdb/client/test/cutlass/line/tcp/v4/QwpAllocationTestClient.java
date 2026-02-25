@@ -65,33 +65,29 @@ import java.util.concurrent.TimeUnit;
  */
 public class QwpAllocationTestClient {
 
-    // Protocol modes
-    private static final String PROTOCOL_ILP_TCP = "ilp-tcp";
-    private static final String PROTOCOL_ILP_HTTP = "ilp-http";
-    private static final String PROTOCOL_QWP_WEBSOCKET = "qwp-websocket";
-
-
-    // Default configuration
-    private static final String DEFAULT_HOST = "localhost";
-    private static final int DEFAULT_ROWS = 80_000_000;
     private static final int DEFAULT_BATCH_SIZE = 10_000;
     private static final int DEFAULT_FLUSH_BYTES = 0; // 0 = use protocol default
     private static final long DEFAULT_FLUSH_INTERVAL_MS = 0; // 0 = use protocol default
+    // Default configuration
+    private static final String DEFAULT_HOST = "localhost";
     private static final int DEFAULT_IN_FLIGHT_WINDOW = 0; // 0 = use protocol default (8)
+    private static final int DEFAULT_REPORT_INTERVAL = 1_000_000;
+    private static final int DEFAULT_ROWS = 80_000_000;
     private static final int DEFAULT_SEND_QUEUE = 0; // 0 = use protocol default (16)
     private static final int DEFAULT_WARMUP_ROWS = 100_000;
-    private static final int DEFAULT_REPORT_INTERVAL = 1_000_000;
-
-    // Pre-computed test data to avoid allocation during the test
-    private static final String[] SYMBOLS = {
-            "AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", "TSLA", "BRK.A", "JPM", "JNJ",
-            "V", "PG", "UNH", "HD", "MA", "DIS", "PYPL", "BAC", "ADBE", "CMCSA"
-    };
-
+    private static final String PROTOCOL_ILP_HTTP = "ilp-http";
+    // Protocol modes
+    private static final String PROTOCOL_ILP_TCP = "ilp-tcp";
+    private static final String PROTOCOL_QWP_WEBSOCKET = "qwp-websocket";
     private static final String[] STRINGS = {
             "New York", "London", "Tokyo", "Paris", "Berlin", "Sydney", "Toronto", "Singapore",
             "Hong Kong", "Dubai", "Mumbai", "Shanghai", "Moscow", "Seoul", "Bangkok",
             "Amsterdam", "Zurich", "Frankfurt", "Milan", "Madrid"
+    };
+    // Pre-computed test data to avoid allocation during the test
+    private static final String[] SYMBOLS = {
+            "AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", "TSLA", "BRK.A", "JPM", "JNJ",
+            "V", "PG", "UNH", "HD", "MA", "DIS", "PYPL", "BAC", "ADBE", "CMCSA"
     };
 
     public static void main(String[] args) {
@@ -176,6 +172,61 @@ public class QwpAllocationTestClient {
         }
     }
 
+    private static Sender createSender(String protocol, String host, int port,
+                                       int batchSize, int flushBytes, long flushIntervalMs,
+                                       int inFlightWindow, int sendQueue) {
+        switch (protocol) {
+            case PROTOCOL_ILP_TCP:
+                return Sender.builder(Sender.Transport.TCP)
+                        .address(host)
+                        .port(port)
+                        .build();
+            case PROTOCOL_ILP_HTTP:
+                return Sender.builder(Sender.Transport.HTTP)
+                        .address(host)
+                        .port(port)
+                        .autoFlushRows(batchSize)
+                        .build();
+            case PROTOCOL_QWP_WEBSOCKET:
+                Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(host)
+                        .port(port)
+                        .asyncMode(true);
+                if (batchSize > 0) b.autoFlushRows(batchSize);
+                if (flushBytes > 0) b.autoFlushBytes(flushBytes);
+                if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
+                if (inFlightWindow > 0) b.inFlightWindowSize(inFlightWindow);
+                if (sendQueue > 0) b.sendQueueCapacity(sendQueue);
+                return b.build();
+            default:
+                throw new IllegalArgumentException("Unknown protocol: " + protocol +
+                        ". Use one of: ilp-tcp, ilp-http, qwp-websocket");
+        }
+    }
+
+    /**
+     * Estimates the size of a single row in bytes for throughput calculation.
+     */
+    private static int estimatedRowSize() {
+        // Rough estimate (binary protocol):
+        // - 2 symbols: ~10 bytes each = 20 bytes
+        // - 3 longs: 8 bytes each = 24 bytes
+        // - 4 doubles: 8 bytes each = 32 bytes
+        // - 1 string: ~10 bytes average
+        // - 1 boolean: 1 byte
+        // - 2 timestamps: 8 bytes each = 16 bytes
+        // - Overhead: ~20 bytes
+        // Total: ~123 bytes
+        return 123;
+    }
+
+    private static int getDefaultPort(String protocol) {
+        if (PROTOCOL_ILP_HTTP.equals(protocol) || PROTOCOL_QWP_WEBSOCKET.equals(protocol)) {
+            return 9000;
+        }
+        return 9009;
+    }
+
     private static void printUsage() {
         System.out.println("ILP Allocation Test Client");
         System.out.println();
@@ -207,17 +258,10 @@ public class QwpAllocationTestClient {
         System.out.println("  QwpAllocationTestClient --protocol=ilp-tcp --rows=100000 --no-warmup");
     }
 
-    private static int getDefaultPort(String protocol) {
-        if (PROTOCOL_ILP_HTTP.equals(protocol) || PROTOCOL_QWP_WEBSOCKET.equals(protocol)) {
-            return 9000;
-        }
-        return 9009;
-    }
-
     private static void runTest(String protocol, String host, int port, int totalRows,
-                                  int batchSize, int flushBytes, long flushIntervalMs,
-                                  int inFlightWindow, int sendQueue,
-                                  int warmupRows, int reportInterval) throws IOException {
+                                int batchSize, int flushBytes, long flushIntervalMs,
+                                int inFlightWindow, int sendQueue,
+                                int warmupRows, int reportInterval) throws IOException {
         System.out.println("Connecting to " + host + ":" + port + "...");
 
         try (Sender sender = createSender(protocol, host, port, batchSize, flushBytes, flushIntervalMs,
@@ -289,43 +333,11 @@ public class QwpAllocationTestClient {
             System.out.println("Batch size: " + String.format("%,d", batchSize));
             System.out.println("Total time: " + String.format("%.2f", totalSeconds) + " seconds");
             System.out.println("Throughput: " + String.format("%,.0f", rowsPerSecond) + " rows/second");
-            System.out.println("Data rate (before compression): " + String.format("%.2f", ((long)totalRows * estimatedRowSize()) / (1024.0 * 1024.0 * totalSeconds)) + " MB/s (estimated)");
+            System.out.println("Data rate (before compression): " + String.format("%.2f", ((long) totalRows * estimatedRowSize()) / (1024.0 * 1024.0 * totalSeconds)) + " MB/s (estimated)");
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted", e);
-        }
-    }
-
-    private static Sender createSender(String protocol, String host, int port,
-                                         int batchSize, int flushBytes, long flushIntervalMs,
-                                         int inFlightWindow, int sendQueue) {
-        switch (protocol) {
-            case PROTOCOL_ILP_TCP:
-                return Sender.builder(Sender.Transport.TCP)
-                        .address(host)
-                        .port(port)
-                        .build();
-            case PROTOCOL_ILP_HTTP:
-                return Sender.builder(Sender.Transport.HTTP)
-                        .address(host)
-                        .port(port)
-                        .autoFlushRows(batchSize)
-                        .build();
-            case PROTOCOL_QWP_WEBSOCKET:
-                Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(host)
-                        .port(port)
-                        .asyncMode(true);
-                if (batchSize > 0) b.autoFlushRows(batchSize);
-                if (flushBytes > 0) b.autoFlushBytes(flushBytes);
-                if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
-                if (inFlightWindow > 0) b.inFlightWindowSize(inFlightWindow);
-                if (sendQueue > 0) b.sendQueueCapacity(sendQueue);
-                return b.build();
-            default:
-                throw new IllegalArgumentException("Unknown protocol: " + protocol +
-                        ". Use one of: ilp-tcp, ilp-http, qwp-websocket");
         }
     }
 
@@ -359,21 +371,5 @@ public class QwpAllocationTestClient {
 
                 // Designated timestamp
                 .at(timestamp, ChronoUnit.MICROS);
-    }
-
-    /**
-     * Estimates the size of a single row in bytes for throughput calculation.
-     */
-    private static int estimatedRowSize() {
-        // Rough estimate (binary protocol):
-        // - 2 symbols: ~10 bytes each = 20 bytes
-        // - 3 longs: 8 bytes each = 24 bytes
-        // - 4 doubles: 8 bytes each = 32 bytes
-        // - 1 string: ~10 bytes average
-        // - 1 boolean: 1 byte
-        // - 2 timestamps: 8 bytes each = 16 bytes
-        // - Overhead: ~20 bytes
-        // Total: ~123 bytes
-        return 123;
     }
 }

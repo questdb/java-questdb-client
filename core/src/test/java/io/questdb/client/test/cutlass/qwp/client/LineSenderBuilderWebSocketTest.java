@@ -67,8 +67,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 () -> Sender.builder(Sender.Transport.WEBSOCKET).address(null));
     }
 
-    // ==================== Transport Selection Tests ====================
-
     @Test
     public void testAddressWithoutPort_usesDefaultPort9000() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
@@ -84,8 +82,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .asyncMode(false);
         Assert.assertNotNull(builder);
     }
-
-    // ==================== Address Configuration Tests ====================
 
     @Test
     public void testAsyncModeDisabled() {
@@ -166,8 +162,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .autoFlushIntervalMillis(200));
     }
 
-    // ==================== TLS Configuration Tests ====================
-
     @Test
     public void testAutoFlushIntervalMillisNegative_fails() {
         assertThrows("cannot be negative",
@@ -209,8 +203,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .autoFlushRows(-1));
     }
 
-    // ==================== Async Mode Tests ====================
-
     @Test
     public void testAutoFlushRowsZero_disablesRowBasedAutoFlush() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
@@ -235,8 +227,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .bufferCapacity(1024)
                         .bufferCapacity(2048));
     }
-
-    // ==================== Auto Flush Rows Tests ====================
 
     @Test
     public void testBufferCapacityNegative_fails() {
@@ -275,8 +265,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         );
     }
 
-    // ==================== Auto Flush Bytes Tests ====================
-
     @Test
     public void testCustomTrustStore_butTlsNotEnabled_fails() {
         assertThrowsAny(
@@ -311,8 +299,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .address(LOCALHOST + ":9000")
                         .address(LOCALHOST + ":9000"));
     }
-
-    // ==================== Auto Flush Interval Tests ====================
 
     @Test
     @Ignore("TCP authentication is not supported for WebSocket protocol")
@@ -361,8 +347,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         Assert.assertNotNull(builder);
     }
 
-    // ==================== In-Flight Window Size Tests ====================
-
     @Test
     @Ignore("HTTP timeout is HTTP-specific and may not apply to WebSocket")
     public void testHttpTimeout_mayNotApply() {
@@ -410,8 +394,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .inFlightWindowSize(-1));
     }
 
-    // ==================== Send Queue Capacity Tests ====================
-
     @Test
     public void testInFlightWindowSizeZero_fails() {
         assertThrows("must be positive",
@@ -450,8 +432,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertBadConfig("invalid::addr=localhost:9000;", "invalid schema [schema=invalid, supported-schemas=[http, https, tcp, tcps, ws, wss]]");
     }
 
-    // ==================== Combined Async Configuration Tests ====================
-
     @Test
     public void testMalformedPortInAddress_fails() {
         assertThrows("cannot parse a port from the address",
@@ -466,8 +446,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .maxBackoffMillis(1000);
         Assert.assertNotNull(builder);
     }
-
-    // ==================== Config String Tests (ws:// and wss://) ====================
 
     @Test
     public void testMaxNameLength() {
@@ -528,8 +506,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 "mismatch");
     }
 
-    // ==================== Buffer Configuration Tests ====================
-
     @Test
     @Ignore("Protocol version is for ILP text protocol, WebSocket uses ILP v4 binary protocol")
     public void testProtocolVersion_notApplicable() {
@@ -558,8 +534,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .sendQueueCapacity(32));
     }
 
-    // ==================== Unsupported Features (TCP Authentication) ====================
-
     @Test
     public void testSendQueueCapacityNegative_fails() {
         assertThrows("must be positive",
@@ -578,8 +552,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .sendQueueCapacity(0));
     }
 
-    // ==================== Unsupported Features (HTTP Token Authentication) ====================
-
     @Test
     public void testSendQueueCapacity_withAsyncMode() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
@@ -597,30 +569,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .sendQueueCapacity(32),
                 "requires async mode");
     }
-
-    // ==================== Unsupported Features (Username/Password Authentication) ====================
-
-    @Test
-    public void testSyncModeDoesNotAllowInFlightWindowSize() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .asyncMode(false)
-                        .inFlightWindowSize(16),
-                "requires async mode");
-    }
-
-    @Test
-    public void testSyncModeDoesNotAllowSendQueueCapacity() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .asyncMode(false)
-                        .sendQueueCapacity(32),
-                "requires async mode");
-    }
-
-    // ==================== Unsupported Features (HTTP-specific options) ====================
 
     @Test
     public void testSyncModeAutoFlushDefaults() throws Exception {
@@ -646,6 +594,26 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 sender.close();
             }
         });
+    }
+
+    @Test
+    public void testSyncModeDoesNotAllowInFlightWindowSize() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .asyncMode(false)
+                        .inFlightWindowSize(16),
+                "requires async mode");
+    }
+
+    @Test
+    public void testSyncModeDoesNotAllowSendQueueCapacity() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .asyncMode(false)
+                        .sendQueueCapacity(32),
+                "requires async mode");
     }
 
     @Test
@@ -699,8 +667,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 "TLS was not enabled");
     }
 
-    // ==================== Unsupported Features (Protocol Version) ====================
-
     @Test
     public void testUsernamePassword_fails() {
         assertThrowsAny(
@@ -709,8 +675,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .httpUsernamePassword("user", "pass"),
                 "not yet supported");
     }
-
-    // ==================== Config String Unsupported Options ====================
 
     @Test
     @Ignore("Username/password authentication is not yet supported for WebSocket protocol")
@@ -727,8 +691,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         int port = findUnusedPort();
         assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
     }
-
-    // ==================== Edge Cases ====================
 
     @Test
     public void testWsConfigString_missingAddr_fails() throws Exception {
@@ -764,8 +726,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertBadConfig("ws::addr=localhost:9000;username=user;password=pass;", "not yet supported");
     }
 
-    // ==================== Connection Tests ====================
-
     @Test
     public void testWssConfigString() {
         assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;", "connect", "Failed", "SSL");
@@ -775,8 +735,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     public void testWssConfigString_uppercaseNotSupported() {
         assertBadConfig("WSS::addr=localhost:9000;", "invalid schema");
     }
-
-    // ==================== Sync vs Async Mode Tests ====================
 
     @SuppressWarnings("resource")
     private static void assertBadConfig(String config, String... anyOf) {
@@ -796,12 +754,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertThrowsAny(builder::build, anyOf);
     }
 
-    private static int findUnusedPort() throws Exception {
-        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
-            return s.getLocalPort();
-        }
-    }
-
     private static void assertThrowsAny(Runnable action, String... anyOf) {
         try {
             action.run();
@@ -814,6 +766,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 }
             }
             Assert.fail("Expected message containing one of [" + String.join(", ", anyOf) + "] but got: " + msg);
+        }
+    }
+
+    private static int findUnusedPort() throws Exception {
+        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+            return s.getLocalPort();
         }
     }
 }

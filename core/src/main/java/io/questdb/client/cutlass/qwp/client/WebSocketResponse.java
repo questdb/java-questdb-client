@@ -54,37 +54,25 @@ import java.nio.charset.StandardCharsets;
  */
 public class WebSocketResponse {
 
+    public static final int MAX_ERROR_MESSAGE_LENGTH = 1024;
+    public static final int MIN_ERROR_RESPONSE_SIZE = 11; // status + sequence + error length
+    // Minimum response size: status (1) + sequence (8)
+    public static final int MIN_RESPONSE_SIZE = 9;
+    public static final byte STATUS_INTERNAL_ERROR = (byte) 255;
     // Status codes
     public static final byte STATUS_OK = 0;
     public static final byte STATUS_PARSE_ERROR = 1;
     public static final byte STATUS_SCHEMA_ERROR = 2;
-    public static final byte STATUS_WRITE_ERROR = 3;
     public static final byte STATUS_SECURITY_ERROR = 4;
-    public static final byte STATUS_INTERNAL_ERROR = (byte) 255;
-
-    // Minimum response size: status (1) + sequence (8)
-    public static final int MIN_RESPONSE_SIZE = 9;
-    public static final int MIN_ERROR_RESPONSE_SIZE = 11; // status + sequence + error length
-    public static final int MAX_ERROR_MESSAGE_LENGTH = 1024;
-
-    private byte status;
-    private long sequence;
+    public static final byte STATUS_WRITE_ERROR = 3;
     private String errorMessage;
+    private long sequence;
+    private byte status;
 
     public WebSocketResponse() {
         this.status = STATUS_OK;
         this.sequence = 0;
         this.errorMessage = null;
-    }
-
-    /**
-     * Creates a success response.
-     */
-    public static WebSocketResponse success(long sequence) {
-        WebSocketResponse response = new WebSocketResponse();
-        response.status = STATUS_OK;
-        response.sequence = sequence;
-        return response;
     }
 
     /**
@@ -130,17 +118,20 @@ public class WebSocketResponse {
     }
 
     /**
-     * Returns true if this is a success response.
+     * Creates a success response.
      */
-    public boolean isSuccess() {
-        return status == STATUS_OK;
+    public static WebSocketResponse success(long sequence) {
+        WebSocketResponse response = new WebSocketResponse();
+        response.status = STATUS_OK;
+        response.sequence = sequence;
+        return response;
     }
 
     /**
-     * Returns the status code.
+     * Returns the error message, or null for success responses.
      */
-    public byte getStatus() {
-        return status;
+    public String getErrorMessage() {
+        return errorMessage;
     }
 
     /**
@@ -151,10 +142,10 @@ public class WebSocketResponse {
     }
 
     /**
-     * Returns the error message, or null for success responses.
+     * Returns the status code.
      */
-    public String getErrorMessage() {
-        return errorMessage;
+    public byte getStatus() {
+        return status;
     }
 
     /**
@@ -180,52 +171,10 @@ public class WebSocketResponse {
     }
 
     /**
-     * Calculates the serialized size of this response.
+     * Returns true if this is a success response.
      */
-    public int serializedSize() {
-        int size = MIN_RESPONSE_SIZE;
-        if (errorMessage != null && !errorMessage.isEmpty()) {
-            byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
-            int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
-            size += 2 + msgLen; // 2 bytes for length prefix
-        }
-        return size;
-    }
-
-    /**
-     * Writes this response to native memory.
-     *
-     * @param ptr destination address
-     * @return number of bytes written
-     */
-    public int writeTo(long ptr) {
-        int offset = 0;
-
-        // Status (1 byte)
-        Unsafe.getUnsafe().putByte(ptr + offset, status);
-        offset += 1;
-
-        // Sequence (8 bytes, little-endian)
-        Unsafe.getUnsafe().putLong(ptr + offset, sequence);
-        offset += 8;
-
-        // Error message (if any)
-        if (status != STATUS_OK && errorMessage != null && !errorMessage.isEmpty()) {
-            byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
-            int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
-
-            // Length prefix (2 bytes, little-endian)
-            Unsafe.getUnsafe().putShort(ptr + offset, (short) msgLen);
-            offset += 2;
-
-            // Message bytes
-            for (int i = 0; i < msgLen; i++) {
-                Unsafe.getUnsafe().putByte(ptr + offset + i, msgBytes[i]);
-            }
-            offset += msgLen;
-        }
-
-        return offset;
+    public boolean isSuccess() {
+        return status == STATUS_OK;
     }
 
     /**
@@ -270,6 +219,19 @@ public class WebSocketResponse {
         return true;
     }
 
+    /**
+     * Calculates the serialized size of this response.
+     */
+    public int serializedSize() {
+        int size = MIN_RESPONSE_SIZE;
+        if (errorMessage != null && !errorMessage.isEmpty()) {
+            byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
+            int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
+            size += 2 + msgLen; // 2 bytes for length prefix
+        }
+        return size;
+    }
+
     @Override
     public String toString() {
         if (isSuccess()) {
@@ -278,5 +240,41 @@ public class WebSocketResponse {
             return "WebSocketResponse{status=" + getStatusName() + ", seq=" + sequence +
                     ", error=" + errorMessage + "}";
         }
+    }
+
+    /**
+     * Writes this response to native memory.
+     *
+     * @param ptr destination address
+     * @return number of bytes written
+     */
+    public int writeTo(long ptr) {
+        int offset = 0;
+
+        // Status (1 byte)
+        Unsafe.getUnsafe().putByte(ptr + offset, status);
+        offset += 1;
+
+        // Sequence (8 bytes, little-endian)
+        Unsafe.getUnsafe().putLong(ptr + offset, sequence);
+        offset += 8;
+
+        // Error message (if any)
+        if (status != STATUS_OK && errorMessage != null && !errorMessage.isEmpty()) {
+            byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
+            int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
+
+            // Length prefix (2 bytes, little-endian)
+            Unsafe.getUnsafe().putShort(ptr + offset, (short) msgLen);
+            offset += 2;
+
+            // Message bytes
+            for (int i = 0; i < msgLen; i++) {
+                Unsafe.getUnsafe().putByte(ptr + offset + i, msgBytes[i]);
+            }
+            offset += msgLen;
+        }
+
+        return offset;
     }
 }

@@ -63,6 +63,84 @@ public class QwpGorillaEncoder {
     }
 
     /**
+     * Calculates the encoded size in bytes for Gorilla-encoded timestamps stored off-heap.
+     * <p>
+     * Note: This does NOT include the encoding flag byte. Add 1 byte if
+     * the encoding flag is needed.
+     *
+     * @param srcAddress source address of contiguous int64 timestamps in native memory
+     * @param count      number of timestamps
+     * @return encoded size in bytes (excluding encoding flag)
+     */
+    public static int calculateEncodedSize(long srcAddress, int count) {
+        if (count == 0) {
+            return 0;
+        }
+
+        int size = 8; // first timestamp
+
+        if (count == 1) {
+            return size;
+        }
+
+        size += 8; // second timestamp
+
+        if (count == 2) {
+            return size;
+        }
+
+        // Calculate bits for delta-of-delta encoding
+        long prevTimestamp = Unsafe.getUnsafe().getLong(srcAddress + 8);
+        long prevDelta = prevTimestamp - Unsafe.getUnsafe().getLong(srcAddress);
+        int totalBits = 0;
+
+        for (int i = 2; i < count; i++) {
+            long ts = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8);
+            long delta = ts - prevTimestamp;
+            long deltaOfDelta = delta - prevDelta;
+
+            totalBits += getBitsRequired(deltaOfDelta);
+
+            prevDelta = delta;
+            prevTimestamp = ts;
+        }
+
+        // Round up to bytes
+        size += (totalBits + 7) / 8;
+
+        return size;
+    }
+
+    /**
+     * Checks if Gorilla encoding can be used for timestamps stored off-heap.
+     * <p>
+     * Gorilla encoding uses 32-bit signed integers for delta-of-delta values,
+     * so it cannot encode timestamps where the delta-of-delta exceeds the
+     * 32-bit signed integer range.
+     *
+     * @param srcAddress source address of contiguous int64 timestamps in native memory
+     * @param count      number of timestamps
+     * @return true if Gorilla encoding can be used, false otherwise
+     */
+    public static boolean canUseGorilla(long srcAddress, int count) {
+        if (count < 3) {
+            return true; // No DoD encoding needed for 0, 1, or 2 timestamps
+        }
+
+        long prevDelta = Unsafe.getUnsafe().getLong(srcAddress + 8) - Unsafe.getUnsafe().getLong(srcAddress);
+        for (int i = 2; i < count; i++) {
+            long delta = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8)
+                    - Unsafe.getUnsafe().getLong(srcAddress + (long) (i - 1) * 8);
+            long dod = delta - prevDelta;
+            if (dod < Integer.MIN_VALUE || dod > Integer.MAX_VALUE) {
+                return false;
+            }
+            prevDelta = delta;
+        }
+        return true;
+    }
+
+    /**
      * Returns the number of bits required to encode a delta-of-delta value.
      *
      * @param deltaOfDelta the delta-of-delta value
@@ -208,83 +286,5 @@ public class QwpGorillaEncoder {
         }
 
         return pos + bitWriter.finish();
-    }
-
-    /**
-     * Checks if Gorilla encoding can be used for timestamps stored off-heap.
-     * <p>
-     * Gorilla encoding uses 32-bit signed integers for delta-of-delta values,
-     * so it cannot encode timestamps where the delta-of-delta exceeds the
-     * 32-bit signed integer range.
-     *
-     * @param srcAddress source address of contiguous int64 timestamps in native memory
-     * @param count      number of timestamps
-     * @return true if Gorilla encoding can be used, false otherwise
-     */
-    public static boolean canUseGorilla(long srcAddress, int count) {
-        if (count < 3) {
-            return true; // No DoD encoding needed for 0, 1, or 2 timestamps
-        }
-
-        long prevDelta = Unsafe.getUnsafe().getLong(srcAddress + 8) - Unsafe.getUnsafe().getLong(srcAddress);
-        for (int i = 2; i < count; i++) {
-            long delta = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8)
-                    - Unsafe.getUnsafe().getLong(srcAddress + (long) (i - 1) * 8);
-            long dod = delta - prevDelta;
-            if (dod < Integer.MIN_VALUE || dod > Integer.MAX_VALUE) {
-                return false;
-            }
-            prevDelta = delta;
-        }
-        return true;
-    }
-
-    /**
-     * Calculates the encoded size in bytes for Gorilla-encoded timestamps stored off-heap.
-     * <p>
-     * Note: This does NOT include the encoding flag byte. Add 1 byte if
-     * the encoding flag is needed.
-     *
-     * @param srcAddress source address of contiguous int64 timestamps in native memory
-     * @param count      number of timestamps
-     * @return encoded size in bytes (excluding encoding flag)
-     */
-    public static int calculateEncodedSize(long srcAddress, int count) {
-        if (count == 0) {
-            return 0;
-        }
-
-        int size = 8; // first timestamp
-
-        if (count == 1) {
-            return size;
-        }
-
-        size += 8; // second timestamp
-
-        if (count == 2) {
-            return size;
-        }
-
-        // Calculate bits for delta-of-delta encoding
-        long prevTimestamp = Unsafe.getUnsafe().getLong(srcAddress + 8);
-        long prevDelta = prevTimestamp - Unsafe.getUnsafe().getLong(srcAddress);
-        int totalBits = 0;
-
-        for (int i = 2; i < count; i++) {
-            long ts = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8);
-            long delta = ts - prevTimestamp;
-            long deltaOfDelta = delta - prevDelta;
-
-            totalBits += getBitsRequired(deltaOfDelta);
-
-            prevDelta = delta;
-            prevTimestamp = ts;
-        }
-
-        // Round up to bytes
-        size += (totalBits + 7) / 8;
-
-        return size;
     }
 }

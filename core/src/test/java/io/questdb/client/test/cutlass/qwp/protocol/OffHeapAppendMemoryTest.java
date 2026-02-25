@@ -29,9 +29,117 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import org.junit.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class OffHeapAppendMemoryTest {
+
+    @Test
+    public void testCloseFreesMemory() {
+        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        OffHeapAppendMemory mem = new OffHeapAppendMemory(1024);
+        long during = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        assertTrue(during > before);
+
+        mem.close();
+        long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        assertEquals(before, after);
+    }
+
+    @Test
+    public void testDoubleCloseIsSafe() {
+        OffHeapAppendMemory mem = new OffHeapAppendMemory();
+        mem.putInt(42);
+        mem.close();
+        mem.close(); // should not throw
+    }
+
+    @Test
+    public void testGrowth() {
+        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory(8)) {
+            // Write more data than initial capacity to force growth
+            for (int i = 0; i < 100; i++) {
+                mem.putLong(i);
+            }
+
+            assertEquals(800, mem.getAppendOffset());
+            for (int i = 0; i < 100; i++) {
+                assertEquals(i, Unsafe.getUnsafe().getLong(mem.addressOf((long) i * 8)));
+            }
+        }
+        long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        assertEquals(before, after);
+    }
+
+    @Test
+    public void testJumpTo() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            mem.putLong(100);
+            mem.putLong(200);
+            mem.putLong(300);
+            assertEquals(24, mem.getAppendOffset());
+
+            // Jump back to offset 8 (after first long)
+            mem.jumpTo(8);
+            assertEquals(8, mem.getAppendOffset());
+
+            // Write new value at offset 8
+            mem.putLong(999);
+            assertEquals(16, mem.getAppendOffset());
+            assertEquals(100, Unsafe.getUnsafe().getLong(mem.addressOf(0)));
+            assertEquals(999, Unsafe.getUnsafe().getLong(mem.addressOf(8)));
+        }
+    }
+
+    @Test
+    public void testLargeGrowth() {
+        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory(8)) {
+            // Write 10000 doubles to stress growth
+            for (int i = 0; i < 10_000; i++) {
+                mem.putDouble(i * 1.1);
+            }
+            assertEquals(80_000, mem.getAppendOffset());
+
+            // Verify first and last values
+            assertEquals(0.0, Unsafe.getUnsafe().getDouble(mem.addressOf(0)), 0.0);
+            assertEquals(9999 * 1.1, Unsafe.getUnsafe().getDouble(mem.addressOf(79_992)), 0.001);
+        }
+        long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
+        assertEquals(before, after);
+    }
+
+    @Test
+    public void testMixedTypes() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            mem.putByte((byte) 1);
+            mem.putShort((short) 2);
+            mem.putInt(3);
+            mem.putLong(4L);
+            mem.putFloat(5.0f);
+            mem.putDouble(6.0);
+
+            long addr = mem.pageAddress();
+            assertEquals(1, Unsafe.getUnsafe().getByte(addr));
+            assertEquals(2, Unsafe.getUnsafe().getShort(addr + 1));
+            assertEquals(3, Unsafe.getUnsafe().getInt(addr + 3));
+            assertEquals(4L, Unsafe.getUnsafe().getLong(addr + 7));
+            assertEquals(5.0f, Unsafe.getUnsafe().getFloat(addr + 15), 0.0f);
+            assertEquals(6.0, Unsafe.getUnsafe().getDouble(addr + 19), 0.0);
+            assertEquals(27, mem.getAppendOffset());
+        }
+    }
+
+    @Test
+    public void testPageAddress() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            assertTrue(mem.pageAddress() != 0);
+            assertEquals(mem.pageAddress(), mem.addressOf(0));
+            mem.putLong(42);
+            assertEquals(mem.pageAddress() + 8, mem.addressOf(8));
+        }
+    }
 
     @Test
     public void testPutAndReadByte() {
@@ -51,16 +159,26 @@ public class OffHeapAppendMemoryTest {
     }
 
     @Test
-    public void testPutAndReadShort() {
+    public void testPutAndReadDouble() {
         try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            mem.putShort((short) 12_345);
-            mem.putShort(Short.MIN_VALUE);
-            mem.putShort(Short.MAX_VALUE);
+            mem.putDouble(2.718281828);
+            mem.putDouble(Double.NaN);
 
-            assertEquals(6, mem.getAppendOffset());
-            assertEquals(12_345, Unsafe.getUnsafe().getShort(mem.addressOf(0)));
-            assertEquals(Short.MIN_VALUE, Unsafe.getUnsafe().getShort(mem.addressOf(2)));
-            assertEquals(Short.MAX_VALUE, Unsafe.getUnsafe().getShort(mem.addressOf(4)));
+            assertEquals(16, mem.getAppendOffset());
+            assertEquals(2.718281828, Unsafe.getUnsafe().getDouble(mem.addressOf(0)), 0.0);
+            assertTrue(Double.isNaN(Unsafe.getUnsafe().getDouble(mem.addressOf(8))));
+        }
+    }
+
+    @Test
+    public void testPutAndReadFloat() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            mem.putFloat(3.14f);
+            mem.putFloat(Float.NaN);
+
+            assertEquals(8, mem.getAppendOffset());
+            assertEquals(3.14f, Unsafe.getUnsafe().getFloat(mem.addressOf(0)), 0.0f);
+            assertTrue(Float.isNaN(Unsafe.getUnsafe().getFloat(mem.addressOf(4))));
         }
     }
 
@@ -89,26 +207,16 @@ public class OffHeapAppendMemoryTest {
     }
 
     @Test
-    public void testPutAndReadFloat() {
+    public void testPutAndReadShort() {
         try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            mem.putFloat(3.14f);
-            mem.putFloat(Float.NaN);
+            mem.putShort((short) 12_345);
+            mem.putShort(Short.MIN_VALUE);
+            mem.putShort(Short.MAX_VALUE);
 
-            assertEquals(8, mem.getAppendOffset());
-            assertEquals(3.14f, Unsafe.getUnsafe().getFloat(mem.addressOf(0)), 0.0f);
-            assertTrue(Float.isNaN(Unsafe.getUnsafe().getFloat(mem.addressOf(4))));
-        }
-    }
-
-    @Test
-    public void testPutAndReadDouble() {
-        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            mem.putDouble(2.718281828);
-            mem.putDouble(Double.NaN);
-
-            assertEquals(16, mem.getAppendOffset());
-            assertEquals(2.718281828, Unsafe.getUnsafe().getDouble(mem.addressOf(0)), 0.0);
-            assertTrue(Double.isNaN(Unsafe.getUnsafe().getDouble(mem.addressOf(8))));
+            assertEquals(6, mem.getAppendOffset());
+            assertEquals(12_345, Unsafe.getUnsafe().getShort(mem.addressOf(0)));
+            assertEquals(Short.MIN_VALUE, Unsafe.getUnsafe().getShort(mem.addressOf(2)));
+            assertEquals(Short.MAX_VALUE, Unsafe.getUnsafe().getShort(mem.addressOf(4)));
         }
     }
 
@@ -124,144 +232,6 @@ public class OffHeapAppendMemoryTest {
             assertEquals(0, Unsafe.getUnsafe().getByte(mem.addressOf(1)));
             assertEquals(1, Unsafe.getUnsafe().getByte(mem.addressOf(2)));
         }
-    }
-
-    @Test
-    public void testGrowth() {
-        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
-        try (OffHeapAppendMemory mem = new OffHeapAppendMemory(8)) {
-            // Write more data than initial capacity to force growth
-            for (int i = 0; i < 100; i++) {
-                mem.putLong(i);
-            }
-
-            assertEquals(800, mem.getAppendOffset());
-            for (int i = 0; i < 100; i++) {
-                assertEquals(i, Unsafe.getUnsafe().getLong(mem.addressOf((long) i * 8)));
-            }
-        }
-        long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
-        assertEquals(before, after);
-    }
-
-    @Test
-    public void testTruncate() {
-        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            mem.putInt(1);
-            mem.putInt(2);
-            mem.putInt(3);
-            assertEquals(12, mem.getAppendOffset());
-
-            mem.truncate();
-            assertEquals(0, mem.getAppendOffset());
-
-            // Can write again after truncate
-            mem.putInt(42);
-            assertEquals(4, mem.getAppendOffset());
-            assertEquals(42, Unsafe.getUnsafe().getInt(mem.addressOf(0)));
-        }
-    }
-
-    @Test
-    public void testJumpTo() {
-        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            mem.putLong(100);
-            mem.putLong(200);
-            mem.putLong(300);
-            assertEquals(24, mem.getAppendOffset());
-
-            // Jump back to offset 8 (after first long)
-            mem.jumpTo(8);
-            assertEquals(8, mem.getAppendOffset());
-
-            // Write new value at offset 8
-            mem.putLong(999);
-            assertEquals(16, mem.getAppendOffset());
-            assertEquals(100, Unsafe.getUnsafe().getLong(mem.addressOf(0)));
-            assertEquals(999, Unsafe.getUnsafe().getLong(mem.addressOf(8)));
-        }
-    }
-
-    @Test
-    public void testSkip() {
-        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            mem.putInt(1);
-            mem.skip(8);
-            mem.putInt(2);
-
-            assertEquals(16, mem.getAppendOffset());
-            assertEquals(1, Unsafe.getUnsafe().getInt(mem.addressOf(0)));
-            assertEquals(2, Unsafe.getUnsafe().getInt(mem.addressOf(12)));
-        }
-    }
-
-    @Test
-    public void testPageAddress() {
-        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            assertTrue(mem.pageAddress() != 0);
-            assertEquals(mem.pageAddress(), mem.addressOf(0));
-            mem.putLong(42);
-            assertEquals(mem.pageAddress() + 8, mem.addressOf(8));
-        }
-    }
-
-    @Test
-    public void testCloseFreesMemory() {
-        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
-        OffHeapAppendMemory mem = new OffHeapAppendMemory(1024);
-        long during = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
-        assertTrue(during > before);
-
-        mem.close();
-        long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
-        assertEquals(before, after);
-    }
-
-    @Test
-    public void testDoubleCloseIsSafe() {
-        OffHeapAppendMemory mem = new OffHeapAppendMemory();
-        mem.putInt(42);
-        mem.close();
-        mem.close(); // should not throw
-    }
-
-    @Test
-    public void testMixedTypes() {
-        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            mem.putByte((byte) 1);
-            mem.putShort((short) 2);
-            mem.putInt(3);
-            mem.putLong(4L);
-            mem.putFloat(5.0f);
-            mem.putDouble(6.0);
-
-            long addr = mem.pageAddress();
-            assertEquals(1, Unsafe.getUnsafe().getByte(addr));
-            assertEquals(2, Unsafe.getUnsafe().getShort(addr + 1));
-            assertEquals(3, Unsafe.getUnsafe().getInt(addr + 3));
-            assertEquals(4L, Unsafe.getUnsafe().getLong(addr + 7));
-            assertEquals(5.0f, Unsafe.getUnsafe().getFloat(addr + 15), 0.0f);
-            assertEquals(6.0, Unsafe.getUnsafe().getDouble(addr + 19), 0.0);
-            assertEquals(27, mem.getAppendOffset());
-        }
-    }
-
-    @Test
-    public void testLargeGrowth() {
-        long before = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
-        try (OffHeapAppendMemory mem = new OffHeapAppendMemory(8)) {
-            // Write 10000 doubles to stress growth
-            for (int i = 0; i < 10_000; i++) {
-                mem.putDouble(i * 1.1);
-            }
-            assertEquals(80_000, mem.getAppendOffset());
-
-            // Verify first and last values
-            assertEquals(0.0, Unsafe.getUnsafe().getDouble(mem.addressOf(0)), 0.0);
-            assertEquals(9999 * 1.1, Unsafe.getUnsafe().getDouble(mem.addressOf(79_992)), 0.001);
-        }
-        long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_ILP_RSS);
-        assertEquals(before, after);
     }
 
     @Test
@@ -285,6 +255,15 @@ public class OffHeapAppendMemoryTest {
         try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
             mem.putUtf8("");
             assertEquals(0, mem.getAppendOffset());
+        }
+    }
+
+    @Test
+    public void testPutUtf8Mixed() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            // Mix: ASCII "A" (1 byte) + e-acute (2 bytes) + CJK (3 bytes) + emoji (4 bytes) = 10 bytes
+            mem.putUtf8("A\u00E9\u4E16\uD83D\uDE00");
+            assertEquals(10, mem.getAppendOffset());
         }
     }
 
@@ -333,11 +312,33 @@ public class OffHeapAppendMemoryTest {
     }
 
     @Test
-    public void testPutUtf8Mixed() {
+    public void testSkip() {
         try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-            // Mix: ASCII "A" (1 byte) + e-acute (2 bytes) + CJK (3 bytes) + emoji (4 bytes) = 10 bytes
-            mem.putUtf8("A\u00E9\u4E16\uD83D\uDE00");
-            assertEquals(10, mem.getAppendOffset());
+            mem.putInt(1);
+            mem.skip(8);
+            mem.putInt(2);
+
+            assertEquals(16, mem.getAppendOffset());
+            assertEquals(1, Unsafe.getUnsafe().getInt(mem.addressOf(0)));
+            assertEquals(2, Unsafe.getUnsafe().getInt(mem.addressOf(12)));
+        }
+    }
+
+    @Test
+    public void testTruncate() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            mem.putInt(1);
+            mem.putInt(2);
+            mem.putInt(3);
+            assertEquals(12, mem.getAppendOffset());
+
+            mem.truncate();
+            assertEquals(0, mem.getAppendOffset());
+
+            // Can write again after truncate
+            mem.putInt(42);
+            assertEquals(4, mem.getAppendOffset());
+            assertEquals(42, Unsafe.getUnsafe().getInt(mem.addressOf(0)));
         }
     }
 }

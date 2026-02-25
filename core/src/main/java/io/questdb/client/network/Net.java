@@ -106,18 +106,6 @@ public final class Net {
         }
     }
 
-    private static long getAddrInfo(DirectUtf8Sequence host, int port) {
-        return getAddrInfo(host.ptr(), port);
-    }
-
-    private static long getAddrInfo(long lpszHost, int port) {
-        long addrInfo = getAddrInfo0(lpszHost, port);
-        if (addrInfo != -1) {
-            ADDR_INFO_COUNTER.incrementAndGet();
-        }
-        return addrInfo;
-    }
-
     public native static int getSndBuf(int fd);
 
     public static void init() {
@@ -162,6 +150,18 @@ public final class Net {
     private static native void freeAddrInfo0(long pAddrInfo);
 
     private static native void freeSockAddr0(long sockaddr);
+
+    private static long getAddrInfo(DirectUtf8Sequence host, int port) {
+        return getAddrInfo(host.ptr(), port);
+    }
+
+    private static long getAddrInfo(long lpszHost, int port) {
+        long addrInfo = getAddrInfo0(lpszHost, port);
+        if (addrInfo != -1) {
+            ADDR_INFO_COUNTER.incrementAndGet();
+        }
+        return addrInfo;
+    }
 
     private static native long getAddrInfo0(long lpszHost, int port);
 

@@ -531,12 +531,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
+        private static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 8;
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
         private static final int DEFAULT_MAX_BACKOFF_MILLIS = 1_000;
         private static final int DEFAULT_MAX_NAME_LEN = 127;
         private static final long DEFAULT_MAX_RETRY_NANOS = TimeUnit.SECONDS.toNanos(10); // keep sync with the contract of the configuration method
         private static final long DEFAULT_MIN_REQUEST_THROUGHPUT = 100 * 1024; // 100KB/s, keep in sync with the contract of the configuration method
+        private static final int DEFAULT_SEND_QUEUE_CAPACITY = 16;
         private static final int DEFAULT_TCP_PORT = 9009;
+        private static final int DEFAULT_WEBSOCKET_PORT = 9000;
+        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 1024 * 1024; // 1MB
+        private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
+        private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 500;
         private static final int MIN_BUFFER_SIZE = AuthUtils.CHALLENGE_LEN + 1; // challenge size + 1;
         // The PARAMETER_NOT_SET_EXPLICITLY constant is used to detect if a parameter was set explicitly in configuration parameters
         // where it matters. This is needed to detect invalid combinations of parameters. Why?
@@ -546,14 +552,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_HTTP = 1;
         private static final int PROTOCOL_TCP = 0;
         private static final int PROTOCOL_WEBSOCKET = 2;
-        private static final int DEFAULT_WEBSOCKET_PORT = 9000;
-        private static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 8;
-        private static final int DEFAULT_SEND_QUEUE_CAPACITY = 16;
-        private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 500;
-        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 1024 * 1024; // 1MB
-        private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
+        private boolean asyncMode = false;
+        private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
         private int bufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
@@ -561,6 +563,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpToken;
+        // WebSocket-specific fields
+        private int inFlightWindowSize = PARAMETER_NOT_SET_EXPLICITLY;
         private String keyId;
         private int maxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxNameLength = PARAMETER_NOT_SET_EXPLICITLY;
@@ -592,17 +596,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int protocol = PARAMETER_NOT_SET_EXPLICITLY;
         private int protocolVersion = PARAMETER_NOT_SET_EXPLICITLY;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private int sendQueueCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
         private String trustStorePath;
         private String username;
-        // WebSocket-specific fields
-        private int inFlightWindowSize = PARAMETER_NOT_SET_EXPLICITLY;
-        private int sendQueueCapacity = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean asyncMode = false;
-        private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
 
         private LineSenderBuilder() {
 
@@ -694,6 +694,47 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Enable asynchronous mode for WebSocket transport.
+         * <br>
+         * In async mode, rows are batched and sent asynchronously with flow control.
+         * This provides higher throughput at the cost of more complex error handling.
+         * <br>
+         * This is only used when communicating over WebSocket transport.
+         * <br>
+         * Default is synchronous mode (false).
+         *
+         * @param enabled whether to enable async mode
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder asyncMode(boolean enabled) {
+            this.asyncMode = enabled;
+            return this;
+        }
+
+        /**
+         * Set the maximum number of bytes per batch before auto-flushing.
+         * <br>
+         * This is only used when communicating over WebSocket transport.
+         * <br>
+         * Default value is 1MB.
+         *
+         * @param bytes maximum bytes per batch
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder autoFlushBytes(int bytes) {
+            if (this.autoFlushBytes != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("auto flush bytes was already configured")
+                        .put("[bytes=").put(this.autoFlushBytes).put("]");
+            }
+            if (bytes < 0) {
+                throw new LineSenderException("auto flush bytes cannot be negative")
+                        .put("[bytes=").put(bytes).put("]");
+            }
+            this.autoFlushBytes = bytes;
+            return this;
+        }
+
+        /**
          * Set the interval in milliseconds at which the Sender automatically flushes its buffer.
          * <br>
          * It flushes the buffer even when the number of buffered rows is less than the value set by {@link #autoFlushRows(int)}.
@@ -765,47 +806,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put("[autoFlushRows=").put(autoFlushRows).put("]");
             }
             this.autoFlushRows = autoFlushRows;
-            return this;
-        }
-
-        /**
-         * Set the maximum number of bytes per batch before auto-flushing.
-         * <br>
-         * This is only used when communicating over WebSocket transport.
-         * <br>
-         * Default value is 1MB.
-         *
-         * @param bytes maximum bytes per batch
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder autoFlushBytes(int bytes) {
-            if (this.autoFlushBytes != PARAMETER_NOT_SET_EXPLICITLY) {
-                throw new LineSenderException("auto flush bytes was already configured")
-                        .put("[bytes=").put(this.autoFlushBytes).put("]");
-            }
-            if (bytes < 0) {
-                throw new LineSenderException("auto flush bytes cannot be negative")
-                        .put("[bytes=").put(bytes).put("]");
-            }
-            this.autoFlushBytes = bytes;
-            return this;
-        }
-
-        /**
-         * Enable asynchronous mode for WebSocket transport.
-         * <br>
-         * In async mode, rows are batched and sent asynchronously with flow control.
-         * This provides higher throughput at the cost of more complex error handling.
-         * <br>
-         * This is only used when communicating over WebSocket transport.
-         * <br>
-         * Default is synchronous mode (false).
-         *
-         * @param enabled whether to enable async mode
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder asyncMode(boolean enabled) {
-            this.asyncMode = enabled;
             return this;
         }
 
@@ -1729,14 +1729,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             protocol = PROTOCOL_TCP;
         }
 
-        private void websocket() {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
-                throw new LineSenderException("protocol was already configured ")
-                        .put("[protocol=").put(protocol).put("]");
-            }
-            protocol = PROTOCOL_WEBSOCKET;
-        }
-
         private void validateParameters() {
             if (hosts.size() == 0) {
                 throw new LineSenderException("questdb server address not set");
@@ -1815,6 +1807,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("unsupported protocol ")
                         .put("[protocol=").put(protocol).put("]");
             }
+        }
+
+        private void websocket() {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("protocol was already configured ")
+                        .put("[protocol=").put(protocol).put("]");
+            }
+            protocol = PROTOCOL_WEBSOCKET;
         }
 
         public class AdvancedTlsSettings {

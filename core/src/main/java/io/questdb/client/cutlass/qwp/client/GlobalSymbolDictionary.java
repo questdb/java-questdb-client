@@ -38,8 +38,8 @@ import io.questdb.client.std.ObjList;
  */
 public class GlobalSymbolDictionary {
 
-    private final CharSequenceIntHashMap symbolToId;
     private final ObjList<String> idToSymbol;
+    private final CharSequenceIntHashMap symbolToId;
 
     public GlobalSymbolDictionary() {
         this(64); // Default initial capacity
@@ -48,6 +48,40 @@ public class GlobalSymbolDictionary {
     public GlobalSymbolDictionary(int initialCapacity) {
         this.symbolToId = new CharSequenceIntHashMap(initialCapacity);
         this.idToSymbol = new ObjList<>(initialCapacity);
+    }
+
+    /**
+     * Clears all symbols from the dictionary.
+     * <p>
+     * After clearing, the next symbol added will get ID 0.
+     */
+    public void clear() {
+        symbolToId.clear();
+        idToSymbol.clear();
+    }
+
+    /**
+     * Checks if the dictionary contains the given symbol.
+     *
+     * @param symbol the symbol to check
+     * @return true if the symbol exists in the dictionary
+     */
+    public boolean contains(String symbol) {
+        return symbol != null && symbolToId.get(symbol) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
+    }
+
+    /**
+     * Gets the ID for an existing symbol, or -1 if not found.
+     *
+     * @param symbol the symbol string
+     * @return the symbol ID, or -1 if not in dictionary
+     */
+    public int getId(String symbol) {
+        if (symbol == null) {
+            return -1;
+        }
+        int id = symbolToId.get(symbol);
+        return id == CharSequenceIntHashMap.NO_ENTRY_VALUE ? -1 : id;
     }
 
     /**
@@ -92,48 +126,6 @@ public class GlobalSymbolDictionary {
     }
 
     /**
-     * Gets the ID for an existing symbol, or -1 if not found.
-     *
-     * @param symbol the symbol string
-     * @return the symbol ID, or -1 if not in dictionary
-     */
-    public int getId(String symbol) {
-        if (symbol == null) {
-            return -1;
-        }
-        int id = symbolToId.get(symbol);
-        return id == CharSequenceIntHashMap.NO_ENTRY_VALUE ? -1 : id;
-    }
-
-    /**
-     * Returns the number of symbols in the dictionary.
-     *
-     * @return dictionary size
-     */
-    public int size() {
-        return idToSymbol.size();
-    }
-
-    /**
-     * Checks if the dictionary is empty.
-     *
-     * @return true if no symbols have been added
-     */
-    public boolean isEmpty() {
-        return idToSymbol.size() == 0;
-    }
-
-    /**
-     * Checks if the dictionary contains the given symbol.
-     *
-     * @param symbol the symbol to check
-     * @return true if the symbol exists in the dictionary
-     */
-    public boolean contains(String symbol) {
-        return symbol != null && symbolToId.get(symbol) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
-    }
-
-    /**
      * Gets the symbols in the given ID range [fromId, toId).
      * <p>
      * This is used to extract the delta for sending to the server.
@@ -162,12 +154,20 @@ public class GlobalSymbolDictionary {
     }
 
     /**
-     * Clears all symbols from the dictionary.
-     * <p>
-     * After clearing, the next symbol added will get ID 0.
+     * Checks if the dictionary is empty.
+     *
+     * @return true if no symbols have been added
      */
-    public void clear() {
-        symbolToId.clear();
-        idToSymbol.clear();
+    public boolean isEmpty() {
+        return idToSymbol.size() == 0;
+    }
+
+    /**
+     * Returns the number of symbols in the dictionary.
+     *
+     * @return dictionary size
+     */
+    public int size() {
+        return idToSymbol.size();
     }
 }

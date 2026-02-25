@@ -34,6 +34,15 @@ import static org.junit.Assert.assertTrue;
 public class NativeBufferWriterTest {
 
     @Test
+    public void testEnsureCapacityGrowsBuffer() {
+        try (NativeBufferWriter writer = new NativeBufferWriter(16)) {
+            assertEquals(16, writer.getCapacity());
+            writer.ensureCapacity(32);
+            assertTrue(writer.getCapacity() >= 32);
+        }
+    }
+
+    @Test
     public void testPatchIntAtLastValidOffset() {
         try (NativeBufferWriter writer = new NativeBufferWriter(16)) {
             writer.putLong(0L); // 8 bytes, position = 8
@@ -75,15 +84,6 @@ public class NativeBufferWriterTest {
             writer.patchInt(patchOffset, 4);
             assertEquals(0x4, Unsafe.getUnsafe().getInt(writer.getBufferPtr() + patchOffset));
             assertEquals(0xDEAD, Unsafe.getUnsafe().getInt(writer.getBufferPtr() + 4));
-        }
-    }
-
-    @Test
-    public void testEnsureCapacityGrowsBuffer() {
-        try (NativeBufferWriter writer = new NativeBufferWriter(16)) {
-            assertEquals(16, writer.getCapacity());
-            writer.ensureCapacity(32);
-            assertTrue(writer.getCapacity() >= 32);
         }
     }
 }

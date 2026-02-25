@@ -53,13 +53,19 @@ import java.util.regex.Pattern;
 public class WebSocketChannelTest extends AbstractTest {
 
     @Test
-    public void testBinaryRoundTripSmallPayload() throws Exception {
-        TestUtils.assertMemoryLeak(() -> assertBinaryRoundTrip(13));
-    }
-
-    @Test
-    public void testBinaryRoundTripMediumPayload() throws Exception {
-        TestUtils.assertMemoryLeak(() -> assertBinaryRoundTrip(4096));
+    public void testBinaryRoundTripAllByteValues() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            int len = 256;
+            long sendPtr = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < len; i++) {
+                    Unsafe.getUnsafe().putByte(sendPtr + i, (byte) i);
+                }
+                assertBinaryRoundTrip(sendPtr, len);
+            } finally {
+                Unsafe.free(sendPtr, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
     }
 
     @Test
@@ -74,19 +80,8 @@ public class WebSocketChannelTest extends AbstractTest {
     }
 
     @Test
-    public void testBinaryRoundTripAllByteValues() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            int len = 256;
-            long sendPtr = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
-            try {
-                for (int i = 0; i < len; i++) {
-                    Unsafe.getUnsafe().putByte(sendPtr + i, (byte) i);
-                }
-                assertBinaryRoundTrip(sendPtr, len);
-            } finally {
-                Unsafe.free(sendPtr, len, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
+    public void testBinaryRoundTripMediumPayload() throws Exception {
+        TestUtils.assertMemoryLeak(() -> assertBinaryRoundTrip(4096));
     }
 
     @Test
@@ -133,6 +128,30 @@ public class WebSocketChannelTest extends AbstractTest {
                 Unsafe.free(sendPtr, payloadLen, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    @Test
+    public void testBinaryRoundTripSmallPayload() throws Exception {
+        TestUtils.assertMemoryLeak(() -> assertBinaryRoundTrip(13));
+    }
+
+    /**
+     * Calls receiveFrame in a loop to handle the case where doReceiveFrame
+     * needs multiple reads to assemble a complete frame (e.g. header and
+     * payload arrive in separate TCP segments).
+     */
+    private static boolean receiveWithRetry(WebSocketChannel channel, ReceivedPayload handler, int timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            int remaining = (int) (deadline - System.currentTimeMillis());
+            if (remaining <= 0) {
+                break;
+            }
+            if (channel.receiveFrame(handler, remaining)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void assertBinaryRoundTrip(int payloadLen) throws Exception {
@@ -183,40 +202,6 @@ public class WebSocketChannelTest extends AbstractTest {
     }
 
     /**
-     * Calls receiveFrame in a loop to handle the case where doReceiveFrame
-     * needs multiple reads to assemble a complete frame (e.g. header and
-     * payload arrive in separate TCP segments).
-     */
-    private static boolean receiveWithRetry(WebSocketChannel channel, ReceivedPayload handler, int timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < deadline) {
-            int remaining = (int) (deadline - System.currentTimeMillis());
-            if (remaining <= 0) {
-                break;
-            }
-            if (channel.receiveFrame(handler, remaining)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static class ReceivedPayload implements WebSocketChannel.ResponseHandler {
-        long ptr;
-        int length;
-
-        @Override
-        public void onBinaryMessage(long payload, int length) {
-            this.ptr = payload;
-            this.length = length;
-        }
-
-        @Override
-        public void onClose(int code, String reason) {
-        }
-    }
-
-    /**
      * Minimal WebSocket echo server. Accepts one connection, completes the
      * HTTP upgrade handshake, then echoes every binary frame back unmasked.
      * All echo writes use a single byte array to avoid TCP fragmentation.
@@ -224,30 +209,12 @@ public class WebSocketChannelTest extends AbstractTest {
     private static class EchoServer implements AutoCloseable {
         private static final Pattern KEY_PATTERN =
                 Pattern.compile("Sec-WebSocket-Key:\\s*(.+?)\\r\\n");
-
-        private final ServerSocket serverSocket;
         private final AtomicReference<Throwable> error = new AtomicReference<>();
+        private final ServerSocket serverSocket;
         private Thread thread;
 
         EchoServer() throws IOException {
             serverSocket = new ServerSocket(0);
-        }
-
-        int getPort() {
-            return serverSocket.getLocalPort();
-        }
-
-        void start() {
-            thread = new Thread(this::run, "ws-echo-server");
-            thread.setDaemon(true);
-            thread.start();
-        }
-
-        void assertNoError() {
-            Throwable t = error.get();
-            if (t != null) {
-                throw new AssertionError("echo server error", t);
-            }
         }
 
         @Override
@@ -255,24 +222,6 @@ public class WebSocketChannelTest extends AbstractTest {
             serverSocket.close();
             if (thread != null) {
                 thread.join(5000);
-            }
-        }
-
-        private void run() {
-            try (Socket client = serverSocket.accept()) {
-                client.setSoTimeout(10_000);
-                client.setTcpNoDelay(true);
-                InputStream in = client.getInputStream();
-                OutputStream out = new BufferedOutputStream(client.getOutputStream());
-
-                completeHandshake(in, out);
-                echoFrames(in, out);
-            } catch (IOException e) {
-                if (!serverSocket.isClosed()) {
-                    error.set(e);
-                }
-            } catch (Throwable t) {
-                error.set(t);
             }
         }
 
@@ -389,10 +338,18 @@ public class WebSocketChannelTest extends AbstractTest {
                     byte m3 = readBuf[maskKeyOffset + 3];
                     for (int i = 0; i < (int) payloadLength; i++) {
                         switch (i & 3) {
-                            case 0: readBuf[headerSize + i] ^= m0; break;
-                            case 1: readBuf[headerSize + i] ^= m1; break;
-                            case 2: readBuf[headerSize + i] ^= m2; break;
-                            case 3: readBuf[headerSize + i] ^= m3; break;
+                            case 0:
+                                readBuf[headerSize + i] ^= m0;
+                                break;
+                            case 1:
+                                readBuf[headerSize + i] ^= m1;
+                                break;
+                            case 2:
+                                readBuf[headerSize + i] ^= m2;
+                                break;
+                            case 3:
+                                readBuf[headerSize + i] ^= m3;
+                                break;
                         }
                     }
                 }
@@ -425,6 +382,56 @@ public class WebSocketChannelTest extends AbstractTest {
                 out.write(readBuf, headerSize, (int) payloadLength);
                 out.flush();
             }
+        }
+
+        private void run() {
+            try (Socket client = serverSocket.accept()) {
+                client.setSoTimeout(10_000);
+                client.setTcpNoDelay(true);
+                InputStream in = client.getInputStream();
+                OutputStream out = new BufferedOutputStream(client.getOutputStream());
+
+                completeHandshake(in, out);
+                echoFrames(in, out);
+            } catch (IOException e) {
+                if (!serverSocket.isClosed()) {
+                    error.set(e);
+                }
+            } catch (Throwable t) {
+                error.set(t);
+            }
+        }
+
+        void assertNoError() {
+            Throwable t = error.get();
+            if (t != null) {
+                throw new AssertionError("echo server error", t);
+            }
+        }
+
+        int getPort() {
+            return serverSocket.getLocalPort();
+        }
+
+        void start() {
+            thread = new Thread(this::run, "ws-echo-server");
+            thread.setDaemon(true);
+            thread.start();
+        }
+    }
+
+    private static class ReceivedPayload implements WebSocketChannel.ResponseHandler {
+        int length;
+        long ptr;
+
+        @Override
+        public void onBinaryMessage(long payload, int length) {
+            this.ptr = payload;
+            this.length = length;
+        }
+
+        @Override
+        public void onClose(int code, String reason) {
         }
     }
 }

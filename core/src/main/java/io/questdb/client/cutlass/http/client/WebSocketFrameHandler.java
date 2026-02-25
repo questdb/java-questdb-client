@@ -44,18 +44,6 @@ public interface WebSocketFrameHandler {
     void onBinaryMessage(long payloadPtr, int payloadLen);
 
     /**
-     * Called when a text frame is received.
-     * <p>
-     * Default implementation does nothing. Override if text frames need handling.
-     *
-     * @param payloadPtr pointer to the UTF-8 encoded payload in native memory
-     * @param payloadLen length of the payload in bytes
-     */
-    default void onTextMessage(long payloadPtr, int payloadLen) {
-        // Default: ignore text frames
-    }
-
-    /**
      * Called when a close frame is received from the server.
      * <p>
      * After this callback, the connection will be closed. The handler should
@@ -89,5 +77,17 @@ public interface WebSocketFrameHandler {
      */
     default void onPong(long payloadPtr, int payloadLen) {
         // Default: ignore pong frames
+    }
+
+    /**
+     * Called when a text frame is received.
+     * <p>
+     * Default implementation does nothing. Override if text frames need handling.
+     *
+     * @param payloadPtr pointer to the UTF-8 encoded payload in native memory
+     * @param payloadLen length of the payload in bytes
+     */
+    default void onTextMessage(long payloadPtr, int payloadLen) {
+        // Default: ignore text frames
     }
 }

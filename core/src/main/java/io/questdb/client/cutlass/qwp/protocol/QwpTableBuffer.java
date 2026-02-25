@@ -294,22 +294,14 @@ public class QwpTableBuffer implements QuietCloseable {
      * Helper class to capture array data from DoubleArray/LongArray.appendToBufPtr().
      */
     private static class ArrayCapture implements ArrayBufferAppender {
+        final int[] shape = new int[32];
         double[] doubleData;
         int doubleDataOffset;
-        private boolean forLong;
         long[] longData;
         int longDataOffset;
         byte nDims;
-        final int[] shape = new int[32];
+        private boolean forLong;
         private int shapeIndex;
-
-        void reset(boolean forLong) {
-            this.forLong = forLong;
-            shapeIndex = 0;
-            nDims = 0;
-            doubleDataOffset = 0;
-            longDataOffset = 0;
-        }
 
         @Override
         public void putBlockOfBytes(long from, long len) {
@@ -372,6 +364,14 @@ public class QwpTableBuffer implements QuietCloseable {
             if (longData != null && longDataOffset < longData.length) {
                 longData[longDataOffset++] = value;
             }
+        }
+
+        void reset(boolean forLong) {
+            this.forLong = forLong;
+            shapeIndex = 0;
+            nDims = 0;
+            doubleDataOffset = 0;
+            longDataOffset = 0;
         }
     }
 

@@ -157,6 +157,29 @@ public class CharSequenceIntHashMap extends AbstractCharSequenceHashSet {
         return get(list.getQuick(index));
     }
 
+    private void erase(int index) {
+        keys[index] = noEntryKey;
+        values[index] = noEntryValue;
+    }
+
+    private void move(int from, int to) {
+        keys[to] = keys[from];
+        values[to] = values[from];
+        erase(from);
+    }
+
+    private int probe0(CharSequence key, int index) {
+        do {
+            index = (index + 1) & mask;
+            if (keys[index] == noEntryKey) {
+                return index;
+            }
+            if (Chars.equals(key, keys[index])) {
+                return -index - 1;
+            }
+        } while (true);
+    }
+
     private void putAt0(int index, CharSequence key, int value) {
         keys[index] = key;
         values[index] = value;
@@ -182,28 +205,5 @@ public class CharSequenceIntHashMap extends AbstractCharSequenceHashSet {
                 values[index] = oldValues[i];
             }
         }
-    }
-
-    private void erase(int index) {
-        keys[index] = noEntryKey;
-        values[index] = noEntryValue;
-    }
-
-    private void move(int from, int to) {
-        keys[to] = keys[from];
-        values[to] = values[from];
-        erase(from);
-    }
-
-    private int probe0(CharSequence key, int index) {
-        do {
-            index = (index + 1) & mask;
-            if (keys[index] == noEntryKey) {
-                return index;
-            }
-            if (Chars.equals(key, keys[index])) {
-                return -index - 1;
-            }
-        } while (true);
     }
 }

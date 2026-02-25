@@ -29,87 +29,10 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import org.junit.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
 
 public class QwpTableBufferTest {
-
-    /**
-     * Simulates the encoder's walk over array data — the same logic as
-     * QwpWebSocketEncoder.writeDoubleArrayColumn(). Returns the flat
-     * double values the encoder would serialize for the given column.
-     */
-    private static double[] readDoubleArraysLikeEncoder(QwpTableBuffer.ColumnBuffer col) {
-        byte[] dims = col.getArrayDims();
-        int[] shapes = col.getArrayShapes();
-        double[] data = col.getDoubleArrayData();
-        int count = col.getValueCount();
-
-        // First pass: count total elements
-        int totalElements = 0;
-        int shapeIdx = 0;
-        for (int row = 0; row < count; row++) {
-            int nDims = dims[row];
-            int elemCount = 1;
-            for (int d = 0; d < nDims; d++) {
-                elemCount *= shapes[shapeIdx++];
-            }
-            totalElements += elemCount;
-        }
-
-        // Second pass: collect values
-        double[] result = new double[totalElements];
-        shapeIdx = 0;
-        int dataIdx = 0;
-        int resultIdx = 0;
-        for (int row = 0; row < count; row++) {
-            int nDims = dims[row];
-            int elemCount = 1;
-            for (int d = 0; d < nDims; d++) {
-                elemCount *= shapes[shapeIdx++];
-            }
-            for (int e = 0; e < elemCount; e++) {
-                result[resultIdx++] = data[dataIdx++];
-            }
-        }
-        return result;
-    }
-
-    /**
-     * Same as above but for long arrays (mirrors QwpWebSocketEncoder.writeLongArrayColumn()).
-     */
-    private static long[] readLongArraysLikeEncoder(QwpTableBuffer.ColumnBuffer col) {
-        byte[] dims = col.getArrayDims();
-        int[] shapes = col.getArrayShapes();
-        long[] data = col.getLongArrayData();
-        int count = col.getValueCount();
-
-        int totalElements = 0;
-        int shapeIdx = 0;
-        for (int row = 0; row < count; row++) {
-            int nDims = dims[row];
-            int elemCount = 1;
-            for (int d = 0; d < nDims; d++) {
-                elemCount *= shapes[shapeIdx++];
-            }
-            totalElements += elemCount;
-        }
-
-        long[] result = new long[totalElements];
-        shapeIdx = 0;
-        int dataIdx = 0;
-        int resultIdx = 0;
-        for (int row = 0; row < count; row++) {
-            int nDims = dims[row];
-            int elemCount = 1;
-            for (int d = 0; d < nDims; d++) {
-                elemCount *= shapes[shapeIdx++];
-            }
-            for (int e = 0; e < elemCount; e++) {
-                result[resultIdx++] = data[dataIdx++];
-            }
-        }
-        return result;
-    }
 
     @Test
     public void testCancelRowRewindsDoubleArrayOffsets() {
@@ -376,5 +299,83 @@ public class QwpTableBufferTest {
             assertEquals(4, shapes[0]);
             assertEquals(2, shapes[1]);
         }
+    }
+
+    /**
+     * Simulates the encoder's walk over array data — the same logic as
+     * QwpWebSocketEncoder.writeDoubleArrayColumn(). Returns the flat
+     * double values the encoder would serialize for the given column.
+     */
+    private static double[] readDoubleArraysLikeEncoder(QwpTableBuffer.ColumnBuffer col) {
+        byte[] dims = col.getArrayDims();
+        int[] shapes = col.getArrayShapes();
+        double[] data = col.getDoubleArrayData();
+        int count = col.getValueCount();
+
+        // First pass: count total elements
+        int totalElements = 0;
+        int shapeIdx = 0;
+        for (int row = 0; row < count; row++) {
+            int nDims = dims[row];
+            int elemCount = 1;
+            for (int d = 0; d < nDims; d++) {
+                elemCount *= shapes[shapeIdx++];
+            }
+            totalElements += elemCount;
+        }
+
+        // Second pass: collect values
+        double[] result = new double[totalElements];
+        shapeIdx = 0;
+        int dataIdx = 0;
+        int resultIdx = 0;
+        for (int row = 0; row < count; row++) {
+            int nDims = dims[row];
+            int elemCount = 1;
+            for (int d = 0; d < nDims; d++) {
+                elemCount *= shapes[shapeIdx++];
+            }
+            for (int e = 0; e < elemCount; e++) {
+                result[resultIdx++] = data[dataIdx++];
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Same as above but for long arrays (mirrors QwpWebSocketEncoder.writeLongArrayColumn()).
+     */
+    private static long[] readLongArraysLikeEncoder(QwpTableBuffer.ColumnBuffer col) {
+        byte[] dims = col.getArrayDims();
+        int[] shapes = col.getArrayShapes();
+        long[] data = col.getLongArrayData();
+        int count = col.getValueCount();
+
+        int totalElements = 0;
+        int shapeIdx = 0;
+        for (int row = 0; row < count; row++) {
+            int nDims = dims[row];
+            int elemCount = 1;
+            for (int d = 0; d < nDims; d++) {
+                elemCount *= shapes[shapeIdx++];
+            }
+            totalElements += elemCount;
+        }
+
+        long[] result = new long[totalElements];
+        shapeIdx = 0;
+        int dataIdx = 0;
+        int resultIdx = 0;
+        for (int row = 0; row < count; row++) {
+            int nDims = dims[row];
+            int elemCount = 1;
+            for (int d = 0; d < nDims; d++) {
+                elemCount *= shapes[shapeIdx++];
+            }
+            for (int e = 0; e < elemCount; e++) {
+                result[resultIdx++] = data[dataIdx++];
+            }
+        }
+        return result;
     }
 }

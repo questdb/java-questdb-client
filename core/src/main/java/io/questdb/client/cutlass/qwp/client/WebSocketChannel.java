@@ -24,12 +24,12 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketHandshake;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
-import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Rnd;
@@ -68,45 +68,40 @@ public class WebSocketChannel implements QuietCloseable {
 
     private static final int DEFAULT_BUFFER_SIZE = 65536;
     private static final int MAX_FRAME_HEADER_SIZE = 14; // 2 + 8 + 4 (header + extended len + mask)
-
+    // Frame parser (reused)
+    private final WebSocketFrameParser frameParser;
+    // Temporary byte array for handshake (allocated once)
+    private final byte[] handshakeBuffer = new byte[4096];
     // Connection state
     private final String host;
-    private final int port;
     private final String path;
+    private final int port;
+    // Random for mask key generation
+    private final Rnd rnd;
     private final boolean tlsEnabled;
     private final boolean tlsValidationEnabled;
-
-    // Socket I/O
-    private Socket socket;
+    private boolean closed;
+    // Timeouts
+    private int connectTimeoutMs = 10_000;
+    // State
+    private boolean connected;
     private InputStream in;
     private OutputStream out;
-
+    private byte[] readTempBuffer;
+    private int readTimeoutMs = 30_000;
+    private int recvBufferPos;      // Write position
+    // Pre-allocated receive buffer (native memory)
+    private long recvBufferPtr;
+    private int recvBufferReadPos;  // Read position
+    private int recvBufferSize;
     // Pre-allocated send buffer (native memory)
     private long sendBufferPtr;
     private int sendBufferSize;
-
-    // Pre-allocated receive buffer (native memory)
-    private long recvBufferPtr;
-    private int recvBufferSize;
-    private int recvBufferPos;      // Write position
-    private int recvBufferReadPos;  // Read position
-
-    // Frame parser (reused)
-    private final WebSocketFrameParser frameParser;
-
-    // Random for mask key generation
-    private final Rnd rnd;
-
-    // Timeouts
-    private int connectTimeoutMs = 10_000;
-    private int readTimeoutMs = 30_000;
-
-    // State
-    private boolean connected;
-    private boolean closed;
-
-    // Temporary byte array for handshake (allocated once)
-    private final byte[] handshakeBuffer = new byte[4096];
+    // Socket I/O
+    private Socket socket;
+    // Separate temp buffers for read and write to avoid race conditions
+    // between send queue thread and response reader thread
+    private byte[] writeTempBuffer;
 
     public WebSocketChannel(String url, boolean tlsEnabled) {
         this(url, tlsEnabled, true);
@@ -162,19 +157,35 @@ public class WebSocketChannel implements QuietCloseable {
     }
 
     /**
-     * Sets the connection timeout.
+     * Sends a close frame and closes the connection.
      */
-    public WebSocketChannel setConnectTimeout(int timeoutMs) {
-        this.connectTimeoutMs = timeoutMs;
-        return this;
-    }
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
 
-    /**
-     * Sets the read timeout.
-     */
-    public WebSocketChannel setReadTimeout(int timeoutMs) {
-        this.readTimeoutMs = timeoutMs;
-        return this;
+        try {
+            if (connected) {
+                // Send close frame
+                sendCloseFrame(WebSocketCloseCode.NORMAL_CLOSURE, null);
+            }
+        } catch (Exception e) {
+            // Ignore errors during close
+        }
+
+        closeQuietly();
+
+        // Free native memory
+        if (sendBufferPtr != 0) {
+            Unsafe.free(sendBufferPtr, sendBufferSize, MemoryTag.NATIVE_DEFAULT);
+            sendBufferPtr = 0;
+        }
+        if (recvBufferPtr != 0) {
+            Unsafe.free(recvBufferPtr, recvBufferSize, MemoryTag.NATIVE_DEFAULT);
+            recvBufferPtr = 0;
+        }
     }
 
     /**
@@ -210,31 +221,15 @@ public class WebSocketChannel implements QuietCloseable {
         }
     }
 
-    /**
-     * Sends binary data as a WebSocket binary frame.
-     * The data is read from native memory at the given pointer.
-     *
-     * @param dataPtr pointer to the data
-     * @param length  length of data in bytes
-     */
-    public void sendBinary(long dataPtr, int length) {
-        ensureConnected();
-        sendFrame(WebSocketOpcode.BINARY, dataPtr, length);
-    }
-
-    /**
-     * Sends a ping frame.
-     */
-    public void sendPing() {
-        ensureConnected();
-        sendFrame(WebSocketOpcode.PING, 0, 0);
+    public boolean isConnected() {
+        return connected && !closed;
     }
 
     /**
      * Receives and processes incoming frames.
      * Handles ping/pong automatically.
      *
-     * @param handler callback for received binary messages (may be null)
+     * @param handler   callback for received binary messages (may be null)
      * @param timeoutMs read timeout in milliseconds
      * @return true if a frame was received, false on timeout
      */
@@ -256,42 +251,99 @@ public class WebSocketChannel implements QuietCloseable {
     }
 
     /**
-     * Sends a close frame and closes the connection.
+     * Sends binary data as a WebSocket binary frame.
+     * The data is read from native memory at the given pointer.
+     *
+     * @param dataPtr pointer to the data
+     * @param length  length of data in bytes
      */
-    @Override
-    public void close() {
-        if (closed) {
-            return;
-        }
-        closed = true;
+    public void sendBinary(long dataPtr, int length) {
+        ensureConnected();
+        sendFrame(WebSocketOpcode.BINARY, dataPtr, length);
+    }
 
-        try {
-            if (connected) {
-                // Send close frame
-                sendCloseFrame(WebSocketCloseCode.NORMAL_CLOSURE, null);
+    /**
+     * Sends a ping frame.
+     */
+    public void sendPing() {
+        ensureConnected();
+        sendFrame(WebSocketOpcode.PING, 0, 0);
+    }
+
+    /**
+     * Sets the connection timeout.
+     */
+    public WebSocketChannel setConnectTimeout(int timeoutMs) {
+        this.connectTimeoutMs = timeoutMs;
+        return this;
+    }
+
+    /**
+     * Sets the read timeout.
+     */
+    public WebSocketChannel setReadTimeout(int timeoutMs) {
+        this.readTimeoutMs = timeoutMs;
+        return this;
+    }
+
+    private void closeQuietly() {
+        connected = false;
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (IOException e) {
+                // Ignore
             }
+            socket = null;
+        }
+        in = null;
+        out = null;
+    }
+
+    private SocketFactory createSslSocketFactory() {
+        try {
+            if (!tlsValidationEnabled) {
+                SSLContext sslContext = SSLContext.getInstance("TLS");
+                sslContext.init(null, new TrustManager[]{new X509TrustManager() {
+                    public void checkClientTrusted(X509Certificate[] certs, String t) {
+                    }
+
+                    public void checkServerTrusted(X509Certificate[] certs, String t) {
+                    }
+
+                    public X509Certificate[] getAcceptedIssuers() {
+                        return null;
+                    }
+                }}, new SecureRandom());
+                return sslContext.getSocketFactory();
+            }
+            return SSLSocketFactory.getDefault();
         } catch (Exception e) {
-            // Ignore errors during close
-        }
-
-        closeQuietly();
-
-        // Free native memory
-        if (sendBufferPtr != 0) {
-            Unsafe.free(sendBufferPtr, sendBufferSize, MemoryTag.NATIVE_DEFAULT);
-            sendBufferPtr = 0;
-        }
-        if (recvBufferPtr != 0) {
-            Unsafe.free(recvBufferPtr, recvBufferSize, MemoryTag.NATIVE_DEFAULT);
-            recvBufferPtr = 0;
+            throw new LineSenderException("Failed to create SSL socket factory: " + e.getMessage(), e);
         }
     }
 
-    public boolean isConnected() {
-        return connected && !closed;
-    }
+    private boolean doReceiveFrame(ResponseHandler handler) throws IOException {
+        // First, try to parse any data already in the buffer
+        // This handles the case where multiple frames arrived in a single TCP read
+        if (recvBufferPos > recvBufferReadPos) {
+            Boolean result = tryParseFrame(handler);
+            if (result != null) {
+                return result;
+            }
+            // result == null means we need more data, continue to read
+        }
 
-    // ==================== Private methods ====================
+        // Read more data into receive buffer
+        int bytesRead = readFromSocket();
+        if (bytesRead <= 0) {
+            return false;
+        }
+
+        // Try parsing again with the new data
+        Boolean result = tryParseFrame(handler);
+        return result != null && result;
+    }
 
     private void ensureConnected() {
         if (closed) {
@@ -302,21 +354,26 @@ public class WebSocketChannel implements QuietCloseable {
         }
     }
 
-    private SocketFactory createSslSocketFactory() {
-        try {
-            if (!tlsValidationEnabled) {
-                SSLContext sslContext = SSLContext.getInstance("TLS");
-                sslContext.init(null, new TrustManager[]{new X509TrustManager() {
-                    public void checkClientTrusted(X509Certificate[] certs, String t) {}
-                    public void checkServerTrusted(X509Certificate[] certs, String t) {}
-                    public X509Certificate[] getAcceptedIssuers() { return null; }
-                }}, new SecureRandom());
-                return sslContext.getSocketFactory();
-            }
-            return SSLSocketFactory.getDefault();
-        } catch (Exception e) {
-            throw new LineSenderException("Failed to create SSL socket factory: " + e.getMessage(), e);
+    private void ensureSendBufferSize(int required) {
+        if (required > sendBufferSize) {
+            int newSize = Math.max(required, sendBufferSize * 2);
+            sendBufferPtr = Unsafe.realloc(sendBufferPtr, sendBufferSize, newSize, MemoryTag.NATIVE_DEFAULT);
+            sendBufferSize = newSize;
         }
+    }
+
+    private byte[] getReadTempBuffer(int minSize) {
+        if (readTempBuffer == null || readTempBuffer.length < minSize) {
+            readTempBuffer = new byte[Math.max(minSize, 8192)];
+        }
+        return readTempBuffer;
+    }
+
+    private byte[] getWriteTempBuffer(int minSize) {
+        if (writeTempBuffer == null || writeTempBuffer.length < minSize) {
+            writeTempBuffer = new byte[Math.max(minSize, 8192)];
+        }
+        return writeTempBuffer;
     }
 
     private void performHandshake() throws IOException {
@@ -364,6 +421,28 @@ public class WebSocketChannel implements QuietCloseable {
         }
     }
 
+    private int readFromSocket() throws IOException {
+        // Ensure space in receive buffer
+        int available = recvBufferSize - recvBufferPos;
+        if (available < 1024) {
+            // Grow buffer
+            int newSize = recvBufferSize * 2;
+            recvBufferPtr = Unsafe.realloc(recvBufferPtr, recvBufferSize, newSize, MemoryTag.NATIVE_DEFAULT);
+            recvBufferSize = newSize;
+            available = recvBufferSize - recvBufferPos;
+        }
+
+        // Read into temp array then copy to native buffer
+        // Use separate read buffer to avoid race with write thread
+        byte[] temp = getReadTempBuffer(available);
+        int bytesRead = in.read(temp, 0, available);
+        if (bytesRead > 0) {
+            Unsafe.getUnsafe().copyMemory(temp, Unsafe.BYTE_OFFSET, null, recvBufferPtr + recvBufferPos, bytesRead);
+            recvBufferPos += bytesRead;
+        }
+        return bytesRead;
+    }
+
     private int readHttpResponse() throws IOException {
         int pos = 0;
         int consecutiveCrLf = 0;
@@ -378,9 +457,9 @@ public class WebSocketChannel implements QuietCloseable {
             // Look for \r\n\r\n
             if (b == '\r' || b == '\n') {
                 if ((consecutiveCrLf == 0 && b == '\r') ||
-                    (consecutiveCrLf == 1 && b == '\n') ||
-                    (consecutiveCrLf == 2 && b == '\r') ||
-                    (consecutiveCrLf == 3 && b == '\n')) {
+                        (consecutiveCrLf == 1 && b == '\n') ||
+                        (consecutiveCrLf == 2 && b == '\r') ||
+                        (consecutiveCrLf == 3 && b == '\n')) {
                     consecutiveCrLf++;
                     if (consecutiveCrLf == 4) {
                         return pos;
@@ -393,36 +472,6 @@ public class WebSocketChannel implements QuietCloseable {
             }
         }
         throw new IOException("HTTP response too large");
-    }
-
-    private void sendFrame(int opcode, long payloadPtr, int payloadLen) {
-        // Generate mask key
-        int maskKey = rnd.nextInt();
-
-        // Calculate required buffer size
-        int headerSize = WebSocketFrameWriter.headerSize(payloadLen, true);
-        int frameSize = headerSize + payloadLen;
-
-        // Ensure buffer is large enough
-        ensureSendBufferSize(frameSize);
-
-        // Write frame header with mask
-        int headerWritten = WebSocketFrameWriter.writeHeader(
-                sendBufferPtr, true, opcode, payloadLen, maskKey);
-
-        // Copy payload to buffer after header
-        if (payloadLen > 0) {
-            Unsafe.getUnsafe().copyMemory(payloadPtr, sendBufferPtr + headerWritten, payloadLen);
-            // Mask the payload in place
-            WebSocketFrameWriter.maskPayload(sendBufferPtr + headerWritten, payloadLen, maskKey);
-        }
-
-        // Send frame
-        try {
-            writeToSocket(sendBufferPtr, frameSize);
-        } catch (IOException e) {
-            throw new LineSenderException("Failed to send WebSocket frame: " + e.getMessage(), e);
-        }
     }
 
     private void sendCloseFrame(int code, String reason) {
@@ -465,30 +514,61 @@ public class WebSocketChannel implements QuietCloseable {
         }
     }
 
-    private boolean doReceiveFrame(ResponseHandler handler) throws IOException {
-        // First, try to parse any data already in the buffer
-        // This handles the case where multiple frames arrived in a single TCP read
-        if (recvBufferPos > recvBufferReadPos) {
-            Boolean result = tryParseFrame(handler);
-            if (result != null) {
-                return result;
-            }
-            // result == null means we need more data, continue to read
+    private void sendFrame(int opcode, long payloadPtr, int payloadLen) {
+        // Generate mask key
+        int maskKey = rnd.nextInt();
+
+        // Calculate required buffer size
+        int headerSize = WebSocketFrameWriter.headerSize(payloadLen, true);
+        int frameSize = headerSize + payloadLen;
+
+        // Ensure buffer is large enough
+        ensureSendBufferSize(frameSize);
+
+        // Write frame header with mask
+        int headerWritten = WebSocketFrameWriter.writeHeader(
+                sendBufferPtr, true, opcode, payloadLen, maskKey);
+
+        // Copy payload to buffer after header
+        if (payloadLen > 0) {
+            Unsafe.getUnsafe().copyMemory(payloadPtr, sendBufferPtr + headerWritten, payloadLen);
+            // Mask the payload in place
+            WebSocketFrameWriter.maskPayload(sendBufferPtr + headerWritten, payloadLen, maskKey);
         }
 
-        // Read more data into receive buffer
-        int bytesRead = readFromSocket();
-        if (bytesRead <= 0) {
-            return false;
+        // Send frame
+        try {
+            writeToSocket(sendBufferPtr, frameSize);
+        } catch (IOException e) {
+            throw new LineSenderException("Failed to send WebSocket frame: " + e.getMessage(), e);
+        }
+    }
+
+    private void sendPongFrame(long pingPayloadPtr, int pingPayloadLen) {
+        int maskKey = rnd.nextInt();
+        int headerSize = WebSocketFrameWriter.headerSize(pingPayloadLen, true);
+        int frameSize = headerSize + pingPayloadLen;
+
+        ensureSendBufferSize(frameSize);
+
+        int headerWritten = WebSocketFrameWriter.writeHeader(
+                sendBufferPtr, true, WebSocketOpcode.PONG, pingPayloadLen, maskKey);
+
+        if (pingPayloadLen > 0) {
+            Unsafe.getUnsafe().copyMemory(pingPayloadPtr, sendBufferPtr + headerWritten, pingPayloadLen);
+            WebSocketFrameWriter.maskPayload(sendBufferPtr + headerWritten, pingPayloadLen, maskKey);
         }
 
-        // Try parsing again with the new data
-        Boolean result = tryParseFrame(handler);
-        return result != null && result;
+        try {
+            writeToSocket(sendBufferPtr, frameSize);
+        } catch (IOException e) {
+            // Ignore pong send errors
+        }
     }
 
     /**
      * Tries to parse a frame from the receive buffer.
+     *
      * @return true if frame processed, false if error, null if need more data
      */
     private Boolean tryParseFrame(ResponseHandler handler) throws IOException {
@@ -561,36 +641,6 @@ public class WebSocketChannel implements QuietCloseable {
         return false;
     }
 
-    private void sendPongFrame(long pingPayloadPtr, int pingPayloadLen) {
-        int maskKey = rnd.nextInt();
-        int headerSize = WebSocketFrameWriter.headerSize(pingPayloadLen, true);
-        int frameSize = headerSize + pingPayloadLen;
-
-        ensureSendBufferSize(frameSize);
-
-        int headerWritten = WebSocketFrameWriter.writeHeader(
-                sendBufferPtr, true, WebSocketOpcode.PONG, pingPayloadLen, maskKey);
-
-        if (pingPayloadLen > 0) {
-            Unsafe.getUnsafe().copyMemory(pingPayloadPtr, sendBufferPtr + headerWritten, pingPayloadLen);
-            WebSocketFrameWriter.maskPayload(sendBufferPtr + headerWritten, pingPayloadLen, maskKey);
-        }
-
-        try {
-            writeToSocket(sendBufferPtr, frameSize);
-        } catch (IOException e) {
-            // Ignore pong send errors
-        }
-    }
-
-    private void ensureSendBufferSize(int required) {
-        if (required > sendBufferSize) {
-            int newSize = Math.max(required, sendBufferSize * 2);
-            sendBufferPtr = Unsafe.realloc(sendBufferPtr, sendBufferSize, newSize, MemoryTag.NATIVE_DEFAULT);
-            sendBufferSize = newSize;
-        }
-    }
-
     private void writeToSocket(long ptr, int len) throws IOException {
         // Copy to temp array for socket write (unavoidable with OutputStream)
         // Use separate write buffer to avoid race with read thread
@@ -600,66 +650,12 @@ public class WebSocketChannel implements QuietCloseable {
         out.flush();
     }
 
-    private int readFromSocket() throws IOException {
-        // Ensure space in receive buffer
-        int available = recvBufferSize - recvBufferPos;
-        if (available < 1024) {
-            // Grow buffer
-            int newSize = recvBufferSize * 2;
-            recvBufferPtr = Unsafe.realloc(recvBufferPtr, recvBufferSize, newSize, MemoryTag.NATIVE_DEFAULT);
-            recvBufferSize = newSize;
-            available = recvBufferSize - recvBufferPos;
-        }
-
-        // Read into temp array then copy to native buffer
-        // Use separate read buffer to avoid race with write thread
-        byte[] temp = getReadTempBuffer(available);
-        int bytesRead = in.read(temp, 0, available);
-        if (bytesRead > 0) {
-            Unsafe.getUnsafe().copyMemory(temp, Unsafe.BYTE_OFFSET, null, recvBufferPtr + recvBufferPos, bytesRead);
-            recvBufferPos += bytesRead;
-        }
-        return bytesRead;
-    }
-
-    // Separate temp buffers for read and write to avoid race conditions
-    // between send queue thread and response reader thread
-    private byte[] writeTempBuffer;
-    private byte[] readTempBuffer;
-
-    private byte[] getWriteTempBuffer(int minSize) {
-        if (writeTempBuffer == null || writeTempBuffer.length < minSize) {
-            writeTempBuffer = new byte[Math.max(minSize, 8192)];
-        }
-        return writeTempBuffer;
-    }
-
-    private byte[] getReadTempBuffer(int minSize) {
-        if (readTempBuffer == null || readTempBuffer.length < minSize) {
-            readTempBuffer = new byte[Math.max(minSize, 8192)];
-        }
-        return readTempBuffer;
-    }
-
-    private void closeQuietly() {
-        connected = false;
-        if (socket != null) {
-            try {
-                socket.close();
-            } catch (IOException e) {
-                // Ignore
-            }
-            socket = null;
-        }
-        in = null;
-        out = null;
-    }
-
     /**
      * Callback interface for received WebSocket messages.
      */
     public interface ResponseHandler {
         void onBinaryMessage(long payload, int length);
+
         void onClose(int code, String reason);
     }
 }

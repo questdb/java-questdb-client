@@ -43,197 +43,19 @@ import io.questdb.client.std.str.Utf8Sequence;
  */
 public final class QwpSchemaHash {
 
+    // Default seed (0 for ILP v4)
+    private static final long DEFAULT_SEED = 0L;
     // XXHash64 constants
     private static final long PRIME64_1 = 0x9E3779B185EBCA87L;
     private static final long PRIME64_2 = 0xC2B2AE3D27D4EB4FL;
+    // Thread-local Hasher to avoid allocation on every computeSchemaHash call
+    private static final ThreadLocal<Hasher> HASHER_POOL = ThreadLocal.withInitial(Hasher::new);
     private static final long PRIME64_3 = 0x165667B19E3779F9L;
     private static final long PRIME64_4 = 0x85EBCA77C2B2AE63L;
     private static final long PRIME64_5 = 0x27D4EB2F165667C5L;
 
-    // Default seed (0 for ILP v4)
-    private static final long DEFAULT_SEED = 0L;
-
-    // Thread-local Hasher to avoid allocation on every computeSchemaHash call
-    private static final ThreadLocal<Hasher> HASHER_POOL = ThreadLocal.withInitial(Hasher::new);
-
     private QwpSchemaHash() {
         // utility class
-    }
-
-    /**
-     * Computes XXHash64 of a byte array.
-     *
-     * @param data the data to hash
-     * @return the 64-bit hash value
-     */
-    public static long hash(byte[] data) {
-        return hash(data, 0, data.length, DEFAULT_SEED);
-    }
-
-    /**
-     * Computes XXHash64 of a byte array region.
-     *
-     * @param data   the data to hash
-     * @param offset starting offset
-     * @param length number of bytes to hash
-     * @return the 64-bit hash value
-     */
-    public static long hash(byte[] data, int offset, int length) {
-        return hash(data, offset, length, DEFAULT_SEED);
-    }
-
-    /**
-     * Computes XXHash64 of a byte array region with custom seed.
-     *
-     * @param data   the data to hash
-     * @param offset starting offset
-     * @param length number of bytes to hash
-     * @param seed   the hash seed
-     * @return the 64-bit hash value
-     */
-    public static long hash(byte[] data, int offset, int length, long seed) {
-        long h64;
-        int end = offset + length;
-        int pos = offset;
-
-        if (length >= 32) {
-            int limit = end - 32;
-            long v1 = seed + PRIME64_1 + PRIME64_2;
-            long v2 = seed + PRIME64_2;
-            long v3 = seed;
-            long v4 = seed - PRIME64_1;
-
-            do {
-                v1 = round(v1, getLong(data, pos));
-                pos += 8;
-                v2 = round(v2, getLong(data, pos));
-                pos += 8;
-                v3 = round(v3, getLong(data, pos));
-                pos += 8;
-                v4 = round(v4, getLong(data, pos));
-                pos += 8;
-            } while (pos <= limit);
-
-            h64 = Long.rotateLeft(v1, 1) + Long.rotateLeft(v2, 7) +
-                    Long.rotateLeft(v3, 12) + Long.rotateLeft(v4, 18);
-            h64 = mergeRound(h64, v1);
-            h64 = mergeRound(h64, v2);
-            h64 = mergeRound(h64, v3);
-            h64 = mergeRound(h64, v4);
-        } else {
-            h64 = seed + PRIME64_5;
-        }
-
-        h64 += length;
-
-        // Process remaining 8-byte blocks
-        while (pos + 8 <= end) {
-            long k1 = getLong(data, pos);
-            k1 *= PRIME64_2;
-            k1 = Long.rotateLeft(k1, 31);
-            k1 *= PRIME64_1;
-            h64 ^= k1;
-            h64 = Long.rotateLeft(h64, 27) * PRIME64_1 + PRIME64_4;
-            pos += 8;
-        }
-
-        // Process remaining 4-byte block
-        if (pos + 4 <= end) {
-            h64 ^= (getInt(data, pos) & 0xFFFFFFFFL) * PRIME64_1;
-            h64 = Long.rotateLeft(h64, 23) * PRIME64_2 + PRIME64_3;
-            pos += 4;
-        }
-
-        // Process remaining bytes
-        while (pos < end) {
-            h64 ^= (data[pos] & 0xFFL) * PRIME64_5;
-            h64 = Long.rotateLeft(h64, 11) * PRIME64_1;
-            pos++;
-        }
-
-        return avalanche(h64);
-    }
-
-    /**
-     * Computes XXHash64 of direct memory.
-     *
-     * @param address start address
-     * @param length  number of bytes
-     * @return the 64-bit hash value
-     */
-    public static long hash(long address, long length) {
-        return hash(address, length, DEFAULT_SEED);
-    }
-
-    /**
-     * Computes XXHash64 of direct memory with custom seed.
-     *
-     * @param address start address
-     * @param length  number of bytes
-     * @param seed    the hash seed
-     * @return the 64-bit hash value
-     */
-    public static long hash(long address, long length, long seed) {
-        long h64;
-        long end = address + length;
-        long pos = address;
-
-        if (length >= 32) {
-            long limit = end - 32;
-            long v1 = seed + PRIME64_1 + PRIME64_2;
-            long v2 = seed + PRIME64_2;
-            long v3 = seed;
-            long v4 = seed - PRIME64_1;
-
-            do {
-                v1 = round(v1, Unsafe.getUnsafe().getLong(pos));
-                pos += 8;
-                v2 = round(v2, Unsafe.getUnsafe().getLong(pos));
-                pos += 8;
-                v3 = round(v3, Unsafe.getUnsafe().getLong(pos));
-                pos += 8;
-                v4 = round(v4, Unsafe.getUnsafe().getLong(pos));
-                pos += 8;
-            } while (pos <= limit);
-
-            h64 = Long.rotateLeft(v1, 1) + Long.rotateLeft(v2, 7) +
-                    Long.rotateLeft(v3, 12) + Long.rotateLeft(v4, 18);
-            h64 = mergeRound(h64, v1);
-            h64 = mergeRound(h64, v2);
-            h64 = mergeRound(h64, v3);
-            h64 = mergeRound(h64, v4);
-        } else {
-            h64 = seed + PRIME64_5;
-        }
-
-        h64 += length;
-
-        // Process remaining 8-byte blocks
-        while (pos + 8 <= end) {
-            long k1 = Unsafe.getUnsafe().getLong(pos);
-            k1 *= PRIME64_2;
-            k1 = Long.rotateLeft(k1, 31);
-            k1 *= PRIME64_1;
-            h64 ^= k1;
-            h64 = Long.rotateLeft(h64, 27) * PRIME64_1 + PRIME64_4;
-            pos += 8;
-        }
-
-        // Process remaining 4-byte block
-        if (pos + 4 <= end) {
-            h64 ^= (Unsafe.getUnsafe().getInt(pos) & 0xFFFFFFFFL) * PRIME64_1;
-            h64 = Long.rotateLeft(h64, 23) * PRIME64_2 + PRIME64_3;
-            pos += 4;
-        }
-
-        // Process remaining bytes
-        while (pos < end) {
-            h64 ^= (Unsafe.getUnsafe().getByte(pos) & 0xFFL) * PRIME64_5;
-            h64 = Long.rotateLeft(h64, 11) * PRIME64_1;
-            pos++;
-        }
-
-        return avalanche(h64);
     }
 
     /**
@@ -377,18 +199,180 @@ public final class QwpSchemaHash {
         return hasher.getValue();
     }
 
-    private static long round(long acc, long input) {
-        acc += input * PRIME64_2;
-        acc = Long.rotateLeft(acc, 31);
-        acc *= PRIME64_1;
-        return acc;
+    /**
+     * Computes XXHash64 of direct memory with custom seed.
+     *
+     * @param address start address
+     * @param length  number of bytes
+     * @param seed    the hash seed
+     * @return the 64-bit hash value
+     */
+    public static long hash(long address, long length, long seed) {
+        long h64;
+        long end = address + length;
+        long pos = address;
+
+        if (length >= 32) {
+            long limit = end - 32;
+            long v1 = seed + PRIME64_1 + PRIME64_2;
+            long v2 = seed + PRIME64_2;
+            long v3 = seed;
+            long v4 = seed - PRIME64_1;
+
+            do {
+                v1 = round(v1, Unsafe.getUnsafe().getLong(pos));
+                pos += 8;
+                v2 = round(v2, Unsafe.getUnsafe().getLong(pos));
+                pos += 8;
+                v3 = round(v3, Unsafe.getUnsafe().getLong(pos));
+                pos += 8;
+                v4 = round(v4, Unsafe.getUnsafe().getLong(pos));
+                pos += 8;
+            } while (pos <= limit);
+
+            h64 = Long.rotateLeft(v1, 1) + Long.rotateLeft(v2, 7) +
+                    Long.rotateLeft(v3, 12) + Long.rotateLeft(v4, 18);
+            h64 = mergeRound(h64, v1);
+            h64 = mergeRound(h64, v2);
+            h64 = mergeRound(h64, v3);
+            h64 = mergeRound(h64, v4);
+        } else {
+            h64 = seed + PRIME64_5;
+        }
+
+        h64 += length;
+
+        // Process remaining 8-byte blocks
+        while (pos + 8 <= end) {
+            long k1 = Unsafe.getUnsafe().getLong(pos);
+            k1 *= PRIME64_2;
+            k1 = Long.rotateLeft(k1, 31);
+            k1 *= PRIME64_1;
+            h64 ^= k1;
+            h64 = Long.rotateLeft(h64, 27) * PRIME64_1 + PRIME64_4;
+            pos += 8;
+        }
+
+        // Process remaining 4-byte block
+        if (pos + 4 <= end) {
+            h64 ^= (Unsafe.getUnsafe().getInt(pos) & 0xFFFFFFFFL) * PRIME64_1;
+            h64 = Long.rotateLeft(h64, 23) * PRIME64_2 + PRIME64_3;
+            pos += 4;
+        }
+
+        // Process remaining bytes
+        while (pos < end) {
+            h64 ^= (Unsafe.getUnsafe().getByte(pos) & 0xFFL) * PRIME64_5;
+            h64 = Long.rotateLeft(h64, 11) * PRIME64_1;
+            pos++;
+        }
+
+        return avalanche(h64);
     }
 
-    private static long mergeRound(long acc, long val) {
-        val = round(0, val);
-        acc ^= val;
-        acc = acc * PRIME64_1 + PRIME64_4;
-        return acc;
+    /**
+     * Computes XXHash64 of a byte array.
+     *
+     * @param data the data to hash
+     * @return the 64-bit hash value
+     */
+    public static long hash(byte[] data) {
+        return hash(data, 0, data.length, DEFAULT_SEED);
+    }
+
+    /**
+     * Computes XXHash64 of a byte array region.
+     *
+     * @param data   the data to hash
+     * @param offset starting offset
+     * @param length number of bytes to hash
+     * @return the 64-bit hash value
+     */
+    public static long hash(byte[] data, int offset, int length) {
+        return hash(data, offset, length, DEFAULT_SEED);
+    }
+
+    /**
+     * Computes XXHash64 of a byte array region with custom seed.
+     *
+     * @param data   the data to hash
+     * @param offset starting offset
+     * @param length number of bytes to hash
+     * @param seed   the hash seed
+     * @return the 64-bit hash value
+     */
+    public static long hash(byte[] data, int offset, int length, long seed) {
+        long h64;
+        int end = offset + length;
+        int pos = offset;
+
+        if (length >= 32) {
+            int limit = end - 32;
+            long v1 = seed + PRIME64_1 + PRIME64_2;
+            long v2 = seed + PRIME64_2;
+            long v3 = seed;
+            long v4 = seed - PRIME64_1;
+
+            do {
+                v1 = round(v1, getLong(data, pos));
+                pos += 8;
+                v2 = round(v2, getLong(data, pos));
+                pos += 8;
+                v3 = round(v3, getLong(data, pos));
+                pos += 8;
+                v4 = round(v4, getLong(data, pos));
+                pos += 8;
+            } while (pos <= limit);
+
+            h64 = Long.rotateLeft(v1, 1) + Long.rotateLeft(v2, 7) +
+                    Long.rotateLeft(v3, 12) + Long.rotateLeft(v4, 18);
+            h64 = mergeRound(h64, v1);
+            h64 = mergeRound(h64, v2);
+            h64 = mergeRound(h64, v3);
+            h64 = mergeRound(h64, v4);
+        } else {
+            h64 = seed + PRIME64_5;
+        }
+
+        h64 += length;
+
+        // Process remaining 8-byte blocks
+        while (pos + 8 <= end) {
+            long k1 = getLong(data, pos);
+            k1 *= PRIME64_2;
+            k1 = Long.rotateLeft(k1, 31);
+            k1 *= PRIME64_1;
+            h64 ^= k1;
+            h64 = Long.rotateLeft(h64, 27) * PRIME64_1 + PRIME64_4;
+            pos += 8;
+        }
+
+        // Process remaining 4-byte block
+        if (pos + 4 <= end) {
+            h64 ^= (getInt(data, pos) & 0xFFFFFFFFL) * PRIME64_1;
+            h64 = Long.rotateLeft(h64, 23) * PRIME64_2 + PRIME64_3;
+            pos += 4;
+        }
+
+        // Process remaining bytes
+        while (pos < end) {
+            h64 ^= (data[pos] & 0xFFL) * PRIME64_5;
+            h64 = Long.rotateLeft(h64, 11) * PRIME64_1;
+            pos++;
+        }
+
+        return avalanche(h64);
+    }
+
+    /**
+     * Computes XXHash64 of direct memory.
+     *
+     * @param address start address
+     * @param length  number of bytes
+     * @return the 64-bit hash value
+     */
+    public static long hash(long address, long length) {
+        return hash(address, length, DEFAULT_SEED);
     }
 
     private static long avalanche(long h64) {
@@ -398,6 +382,13 @@ public final class QwpSchemaHash {
         h64 *= PRIME64_3;
         h64 ^= h64 >>> 32;
         return h64;
+    }
+
+    private static int getInt(byte[] data, int pos) {
+        return (data[pos] & 0xFF) |
+                ((data[pos + 1] & 0xFF) << 8) |
+                ((data[pos + 2] & 0xFF) << 16) |
+                ((data[pos + 3] & 0xFF) << 24);
     }
 
     private static long getLong(byte[] data, int pos) {
@@ -411,11 +402,18 @@ public final class QwpSchemaHash {
                 (((long) data[pos + 7] & 0xFF) << 56);
     }
 
-    private static int getInt(byte[] data, int pos) {
-        return (data[pos] & 0xFF) |
-                ((data[pos + 1] & 0xFF) << 8) |
-                ((data[pos + 2] & 0xFF) << 16) |
-                ((data[pos + 3] & 0xFF) << 24);
+    private static long mergeRound(long acc, long val) {
+        val = round(0, val);
+        acc ^= val;
+        acc = acc * PRIME64_1 + PRIME64_4;
+        return acc;
+    }
+
+    private static long round(long acc, long input) {
+        acc += input * PRIME64_2;
+        acc = Long.rotateLeft(acc, 31);
+        acc *= PRIME64_1;
+        return acc;
     }
 
     /**
@@ -425,14 +423,62 @@ public final class QwpSchemaHash {
      * as columns are processed.
      */
     public static class Hasher {
-        private long v1, v2, v3, v4;
-        private long totalLen;
         private final byte[] buffer = new byte[32];
         private int bufferPos;
         private long seed;
+        private long totalLen;
+        private long v1, v2, v3, v4;
 
         public Hasher() {
             reset(DEFAULT_SEED);
+        }
+
+        /**
+         * Finalizes and returns the hash value.
+         *
+         * @return the 64-bit hash
+         */
+        public long getValue() {
+            long h64;
+
+            if (totalLen >= 32) {
+                h64 = Long.rotateLeft(v1, 1) + Long.rotateLeft(v2, 7) +
+                        Long.rotateLeft(v3, 12) + Long.rotateLeft(v4, 18);
+                h64 = mergeRound(h64, v1);
+                h64 = mergeRound(h64, v2);
+                h64 = mergeRound(h64, v3);
+                h64 = mergeRound(h64, v4);
+            } else {
+                h64 = seed + PRIME64_5;
+            }
+
+            h64 += totalLen;
+
+            // Process buffered data
+            int pos = 0;
+            while (pos + 8 <= bufferPos) {
+                long k1 = getLong(buffer, pos);
+                k1 *= PRIME64_2;
+                k1 = Long.rotateLeft(k1, 31);
+                k1 *= PRIME64_1;
+                h64 ^= k1;
+                h64 = Long.rotateLeft(h64, 27) * PRIME64_1 + PRIME64_4;
+                pos += 8;
+            }
+
+            if (pos + 4 <= bufferPos) {
+                h64 ^= (getInt(buffer, pos) & 0xFFFFFFFFL) * PRIME64_1;
+                h64 = Long.rotateLeft(h64, 23) * PRIME64_2 + PRIME64_3;
+                pos += 4;
+            }
+
+            while (pos < bufferPos) {
+                h64 ^= (buffer[pos] & 0xFFL) * PRIME64_5;
+                h64 = Long.rotateLeft(h64, 11) * PRIME64_1;
+                pos++;
+            }
+
+            return avalanche(h64);
         }
 
         /**
@@ -448,20 +494,6 @@ public final class QwpSchemaHash {
             v4 = seed - PRIME64_1;
             totalLen = 0;
             bufferPos = 0;
-        }
-
-        /**
-         * Updates the hash with a single byte.
-         *
-         * @param b the byte to add
-         */
-        public void update(byte b) {
-            buffer[bufferPos++] = b;
-            totalLen++;
-
-            if (bufferPos == 32) {
-                processBuffer();
-            }
         }
 
         /**
@@ -514,51 +546,17 @@ public final class QwpSchemaHash {
         }
 
         /**
-         * Finalizes and returns the hash value.
+         * Updates the hash with a single byte.
          *
-         * @return the 64-bit hash
+         * @param b the byte to add
          */
-        public long getValue() {
-            long h64;
+        public void update(byte b) {
+            buffer[bufferPos++] = b;
+            totalLen++;
 
-            if (totalLen >= 32) {
-                h64 = Long.rotateLeft(v1, 1) + Long.rotateLeft(v2, 7) +
-                        Long.rotateLeft(v3, 12) + Long.rotateLeft(v4, 18);
-                h64 = mergeRound(h64, v1);
-                h64 = mergeRound(h64, v2);
-                h64 = mergeRound(h64, v3);
-                h64 = mergeRound(h64, v4);
-            } else {
-                h64 = seed + PRIME64_5;
+            if (bufferPos == 32) {
+                processBuffer();
             }
-
-            h64 += totalLen;
-
-            // Process buffered data
-            int pos = 0;
-            while (pos + 8 <= bufferPos) {
-                long k1 = getLong(buffer, pos);
-                k1 *= PRIME64_2;
-                k1 = Long.rotateLeft(k1, 31);
-                k1 *= PRIME64_1;
-                h64 ^= k1;
-                h64 = Long.rotateLeft(h64, 27) * PRIME64_1 + PRIME64_4;
-                pos += 8;
-            }
-
-            if (pos + 4 <= bufferPos) {
-                h64 ^= (getInt(buffer, pos) & 0xFFFFFFFFL) * PRIME64_1;
-                h64 = Long.rotateLeft(h64, 23) * PRIME64_2 + PRIME64_3;
-                pos += 4;
-            }
-
-            while (pos < bufferPos) {
-                h64 ^= (buffer[pos] & 0xFFL) * PRIME64_5;
-                h64 = Long.rotateLeft(h64, 11) * PRIME64_1;
-                pos++;
-            }
-
-            return avalanche(h64);
         }
 
         private void processBuffer() {
