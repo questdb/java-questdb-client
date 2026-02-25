@@ -527,7 +527,7 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
                     .put(']');
         }
         int newCapacity = Math.min(
-                Numbers.ceilPow2((int) requiredCapacity),
+                Math.max(Numbers.ceilPow2((int) requiredCapacity), (int) requiredCapacity),
                 maxBufferSize
         );
         bufPtr = Unsafe.realloc(bufPtr, bufCapacity, newCapacity, MemoryTag.NATIVE_DEFAULT);
