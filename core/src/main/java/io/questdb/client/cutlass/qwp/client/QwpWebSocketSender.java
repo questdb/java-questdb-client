@@ -1148,6 +1148,10 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
+        // Invalidate cached column references — table buffers will be reset below
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
+
         LOG.debug("Flushing pending rows [count={}, tables={}]", pendingRowCount, tableBuffers.size());
 
         // Ensure activeBuffer is ready for writing
@@ -1225,6 +1229,10 @@ public class QwpWebSocketSender implements Sender {
         if (pendingRowCount <= 0) {
             return;
         }
+
+        // Invalidate cached column references — table buffers will be reset below
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
 
         LOG.debug("Sync flush [pendingRows={}, tables={}]", pendingRowCount, tableBuffers.size());
 
