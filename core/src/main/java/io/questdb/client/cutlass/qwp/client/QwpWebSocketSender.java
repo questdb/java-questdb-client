@@ -711,6 +711,14 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Returns the number of pending rows not yet flushed.
+     * For testing.
+     */
+    public int getPendingRowCount() {
+        return pendingRowCount;
+    }
+
+    /**
      * Registers a symbol in the global dictionary and returns its ID.
      * For use with fast-path column buffer access.
      */
@@ -866,9 +874,20 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public void reset() {
         checkNotClosed();
-        if (currentTableBuffer != null) {
-            currentTableBuffer.reset();
+        // Reset ALL table buffers, not just the current one
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            QwpTableBuffer buf = tableBuffers.get(keys.getQuick(i));
+            if (buf != null) {
+                buf.reset();
+            }
         }
+        pendingRowCount = 0;
+        firstPendingRowTimeNanos = 0;
+        currentTableBuffer = null;
+        currentTableName = null;
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
     }
 
     /**
