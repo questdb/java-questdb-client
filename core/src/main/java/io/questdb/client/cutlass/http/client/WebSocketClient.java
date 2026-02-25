@@ -312,12 +312,12 @@ public abstract class WebSocketClient implements QuietCloseable {
      * Sends a close frame.
      */
     public void sendCloseFrame(int code, String reason, int timeout) {
-        sendBuffer.reset();
-        WebSocketSendBuffer.FrameInfo frame = sendBuffer.writeCloseFrame(code, reason);
+        controlFrameBuffer.reset();
+        WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writeCloseFrame(code, reason);
         try {
-            doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
         } finally {
-            sendBuffer.reset();
+            controlFrameBuffer.reset();
         }
     }
 
@@ -344,10 +344,10 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public void sendPing(int timeout) {
         checkConnected();
-        sendBuffer.reset();
-        WebSocketSendBuffer.FrameInfo frame = sendBuffer.writePingFrame();
-        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
-        sendBuffer.reset();
+        controlFrameBuffer.reset();
+        WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writePingFrame();
+        doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+        controlFrameBuffer.reset();
     }
 
     /**
