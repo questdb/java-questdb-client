@@ -103,31 +103,15 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Begins a new binary WebSocket frame. Reserves space for the maximum header size.
-     * After calling this method, use ArrayBufferAppender methods to write the payload.
+     * Begins a new WebSocket frame. Reserves space for the maximum header size.
+     * The opcode is specified later when ending the frame via {@link #endFrame(int)}.
      */
-    public void beginBinaryFrame() {
-        beginFrame(WebSocketOpcode.BINARY);
-    }
-
-    /**
-     * Begins a new WebSocket frame with the specified opcode.
-     *
-     * @param opcode the frame opcode
-     */
-    public void beginFrame(int opcode) {
+    public void beginFrame() {
         frameStartOffset = writePos;
         // Reserve maximum header space
         ensureCapacity(MAX_HEADER_SIZE);
         writePos += MAX_HEADER_SIZE;
         payloadStartOffset = writePos;
-    }
-
-    /**
-     * Begins a new text WebSocket frame. Reserves space for the maximum header size.
-     */
-    public void beginTextFrame() {
-        beginFrame(WebSocketOpcode.TEXT);
     }
 
     @Override
