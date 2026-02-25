@@ -68,15 +68,9 @@ public class QwpBitReader {
      * @throws IllegalStateException if alignment fails
      */
     public void alignToByte() {
-        int bitsToSkip = bitsInBuffer % 8;
-        if (bitsToSkip != 0) {
-            // We need to skip the remaining bits in the current partial byte
-            // But since we read in byte chunks, bitsInBuffer should be a multiple of 8
-            // minus what we've consumed. The remainder in the conceptual stream is:
-            int remainder = (int) (totalBitsRead % 8);
-            if (remainder != 0) {
-                skipBits(8 - remainder);
-            }
+        int remainder = (int) (totalBitsRead % 8);
+        if (remainder != 0) {
+            skipBits(8 - remainder);
         }
     }
 
