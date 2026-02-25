@@ -35,6 +35,27 @@ import static org.junit.Assert.assertEquals;
 public class QwpTableBufferTest {
 
     @Test
+    public void testAddSymbolNullOnNonNullableColumn() {
+        try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+            QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, false);
+            col.addSymbol("server1");
+            table.nextRow();
+
+            // Null on a non-nullable column must write a sentinel value,
+            // keeping size and valueCount in sync
+            col.addSymbol(null);
+            table.nextRow();
+
+            col.addSymbol("server2");
+            table.nextRow();
+
+            assertEquals(3, table.getRowCount());
+            // For non-nullable columns, every row must have a physical value
+            assertEquals(col.getSize(), col.getValueCount());
+        }
+    }
+
+    @Test
     public void testCancelRowRewindsDoubleArrayOffsets() {
         try (QwpTableBuffer table = new QwpTableBuffer("test")) {
             // Row 0: committed with [1.0, 2.0]

@@ -836,53 +836,46 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public void addSymbol(String value) {
             if (value == null) {
-                if (nullable) {
-                    ensureNullCapacity(size + 1);
-                    markNull(size);
-                }
-            } else {
-                ensureNullBitmapForNonNull();
-                int idx = symbolDict.get(value);
-                if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-                    idx = symbolList.size();
-                    symbolDict.put(value, idx);
-                    symbolList.add(value);
-                }
-                dataBuffer.putInt(idx);
-                valueCount++;
+                addNull();
+                return;
             }
+            ensureNullBitmapForNonNull();
+            int idx = symbolDict.get(value);
+            if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+                idx = symbolList.size();
+                symbolDict.put(value, idx);
+                symbolList.add(value);
+            }
+            dataBuffer.putInt(idx);
+            valueCount++;
             size++;
         }
 
         public void addSymbolWithGlobalId(String value, int globalId) {
             if (value == null) {
-                if (nullable) {
-                    ensureNullCapacity(size + 1);
-                    markNull(size);
-                }
-                size++;
-            } else {
-                ensureNullBitmapForNonNull();
-                int localIdx = symbolDict.get(value);
-                if (localIdx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-                    localIdx = symbolList.size();
-                    symbolDict.put(value, localIdx);
-                    symbolList.add(value);
-                }
-                dataBuffer.putInt(localIdx);
-
-                if (auxBuffer == null) {
-                    auxBuffer = new OffHeapAppendMemory(64);
-                }
-                auxBuffer.putInt(globalId);
-
-                if (globalId > maxGlobalSymbolId) {
-                    maxGlobalSymbolId = globalId;
-                }
-
-                valueCount++;
-                size++;
+                addNull();
+                return;
             }
+            ensureNullBitmapForNonNull();
+            int localIdx = symbolDict.get(value);
+            if (localIdx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+                localIdx = symbolList.size();
+                symbolDict.put(value, localIdx);
+                symbolList.add(value);
+            }
+            dataBuffer.putInt(localIdx);
+
+            if (auxBuffer == null) {
+                auxBuffer = new OffHeapAppendMemory(64);
+            }
+            auxBuffer.putInt(globalId);
+
+            if (globalId > maxGlobalSymbolId) {
+                maxGlobalSymbolId = globalId;
+            }
+
+            valueCount++;
+            size++;
         }
 
         public void addUuid(long high, long low) {
