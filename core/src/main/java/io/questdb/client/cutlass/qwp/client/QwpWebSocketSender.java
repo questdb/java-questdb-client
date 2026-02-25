@@ -133,6 +133,8 @@ public class QwpWebSocketSender implements Sender {
     private final LongHashSet sentSchemaHashes = new LongHashSet();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     private final boolean tlsEnabled;
+    private final AckFrameHandler ackHandler = new AckFrameHandler(this);
+    private final WebSocketResponse ackResponse = new WebSocketResponse();
     private MicrobatchBuffer activeBuffer;
     // Double-buffering for async I/O
     private MicrobatchBuffer buffer0;
@@ -160,6 +162,7 @@ public class QwpWebSocketSender implements Sender {
     private long nextBatchSequence = 0;
     // Async mode: pending row tracking
     private int pendingRowCount;
+    private boolean sawBinaryAck;
     private WebSocketSendQueue sendQueue;
 
     private QwpWebSocketSender(
@@ -1386,39 +1389,20 @@ public class QwpWebSocketSender implements Sender {
      * Waits synchronously for an ACK from the server for the specified batch.
      */
     private void waitForAck(long expectedSequence) {
-        WebSocketResponse response = new WebSocketResponse();
         long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
 
         while (System.currentTimeMillis() < deadline) {
             try {
-                final boolean[] sawBinary = {false};
-                boolean received = client.receiveFrame(new WebSocketFrameHandler() {
-                    @Override
-                    public void onBinaryMessage(long payloadPtr, int payloadLen) {
-                        sawBinary[0] = true;
-                        if (!WebSocketResponse.isStructurallyValid(payloadPtr, payloadLen)) {
-                            throw new LineSenderException(
-                                    "Invalid ACK response payload [length=" + payloadLen + ']'
-                            );
-                        }
-                        if (!response.readFrom(payloadPtr, payloadLen)) {
-                            throw new LineSenderException("Failed to parse ACK response");
-                        }
-                    }
-
-                    @Override
-                    public void onClose(int code, String reason) {
-                        throw new LineSenderException("WebSocket closed while waiting for ACK: " + reason);
-                    }
-                }, 1000); // 1 second timeout per read attempt
+                sawBinaryAck = false;
+                boolean received = client.receiveFrame(ackHandler, 1000); // 1 second timeout per read attempt
 
                 if (received) {
                     // Non-binary frames (e.g. ping/pong/text) are not ACKs.
-                    if (!sawBinary[0]) {
+                    if (!sawBinaryAck) {
                         continue;
                     }
-                    long sequence = response.getSequence();
-                    if (response.isSuccess()) {
+                    long sequence = ackResponse.getSequence();
+                    if (ackResponse.isSuccess()) {
                         // Cumulative ACK - acknowledge all batches up to this sequence
                         inFlightWindow.acknowledgeUpTo(sequence);
                         if (sequence >= expectedSequence) {
@@ -1426,10 +1410,10 @@ public class QwpWebSocketSender implements Sender {
                         }
                         // Got ACK for lower sequence - continue waiting
                     } else {
-                        String errorMessage = response.getErrorMessage();
+                        String errorMessage = ackResponse.getErrorMessage();
                         LineSenderException error = new LineSenderException(
                                 "Server error for batch " + sequence + ": " +
-                                        response.getStatusName() + " - " + errorMessage);
+                                        ackResponse.getStatusName() + " - " + errorMessage);
                         inFlightWindow.fail(sequence, error);
                         if (sequence == expectedSequence) {
                             throw error;
@@ -1449,5 +1433,31 @@ public class QwpWebSocketSender implements Sender {
         LineSenderException timeout = new LineSenderException("Timeout waiting for ACK for batch " + expectedSequence);
         failExpectedIfNeeded(expectedSequence, timeout);
         throw timeout;
+    }
+
+    private static class AckFrameHandler implements WebSocketFrameHandler {
+        private final QwpWebSocketSender sender;
+
+        AckFrameHandler(QwpWebSocketSender sender) {
+            this.sender = sender;
+        }
+
+        @Override
+        public void onBinaryMessage(long payloadPtr, int payloadLen) {
+            sender.sawBinaryAck = true;
+            if (!WebSocketResponse.isStructurallyValid(payloadPtr, payloadLen)) {
+                throw new LineSenderException(
+                        "Invalid ACK response payload [length=" + payloadLen + ']'
+                );
+            }
+            if (!sender.ackResponse.readFrom(payloadPtr, payloadLen)) {
+                throw new LineSenderException("Failed to parse ACK response");
+            }
+        }
+
+        @Override
+        public void onClose(int code, String reason) {
+            throw new LineSenderException("WebSocket closed while waiting for ACK: " + reason);
+        }
     }
 }
