@@ -293,6 +293,7 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
      */
     @Override
     public void skip(int bytes) {
+        ensureCapacity(bytes);
         position += bytes;
     }
 }

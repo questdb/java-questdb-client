@@ -76,6 +76,20 @@ public class NativeBufferWriterTest {
     }
 
     @Test
+    public void testSkipBeyondCapacityGrowsBuffer() {
+        try (NativeBufferWriter writer = new NativeBufferWriter(16)) {
+            // skip past the 16-byte buffer — must grow, not corrupt memory
+            writer.skip(32);
+            assertEquals(32, writer.getPosition());
+            assertTrue(writer.getCapacity() >= 32);
+            // writing after the skip must also succeed
+            writer.putInt(0xCAFE);
+            assertEquals(36, writer.getPosition());
+            assertEquals(0xCAFE, Unsafe.getUnsafe().getInt(writer.getBufferPtr() + 32));
+        }
+    }
+
+    @Test
     public void testPutUtf8InvalidSurrogatePair() {
         try (NativeBufferWriter writer = new NativeBufferWriter(64)) {
             // High surrogate \uD800 followed by non-low-surrogate 'X'.
