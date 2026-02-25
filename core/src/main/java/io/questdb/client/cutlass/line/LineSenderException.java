@@ -39,15 +39,9 @@ import io.questdb.client.std.str.StringSink;
  *   <li>For permanent errors: Either close and recreate the Sender, or call {@code reset()} to clear
  *       the buffer and continue with new data</li>
  * </ul>
+ * <p>
+ *  @see io.questdb.client.Sender
  *
- * <h2>Retryability</h2>
- * The {@link #isRetryable()} method provides a best-effort indication of whether the error
- * might be resolved by retrying at the application level. This is particularly important
- * because this exception is only thrown after the sender has exhausted its own internal
- * retry attempts. The retryability flag helps applications decide whether to implement
- * additional retry logic with longer delays or different strategies.
- *
- * @see io.questdb.client.Sender
  * @see io.questdb.client.Sender#flush()
  * @see io.questdb.client.Sender#reset()
  */

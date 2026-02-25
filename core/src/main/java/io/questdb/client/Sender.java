@@ -96,7 +96,7 @@ import java.util.concurrent.TimeUnit;
  *   2. Call {@link #reset()} to clear the internal buffers and start building a new row
  * <br>
  * Note: If the underlying error is permanent, retrying {@link #flush()} will fail again.
- * Use {@link #reset()} to discard the problematic data and continue with new data. See {@link LineSenderException#isRetryable()}
+ * Use {@link #reset()} to discard the problematic data and continue with new data.
  *
  */
 public interface Sender extends Closeable, ArraySender<Sender> {
@@ -109,7 +109,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Create a Sender builder instance from a configuration string.
      * <br>
-     * This allows to use the configuration string as a template for creating a Sender builder instance and then
+     * This allows using the configuration string as a template for creating a Sender builder instance and then
      * tune options which are not available in the configuration string. Configurations options specified in the
      * configuration string cannot be overridden via the builder methods.
      * <p>
@@ -1529,7 +1529,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     address(sink);
                     if (ports.size() == hosts.size() - 1) {
                         // not set
-                        port(protocol == PROTOCOL_TCP ? DEFAULT_TCP_PORT : DEFAULT_HTTP_PORT);
+                        port(protocol == PROTOCOL_TCP ? DEFAULT_TCP_PORT
+                                : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
+                                : DEFAULT_HTTP_PORT);
                     }
                 } else if (Chars.equals("user", sink)) {
                     // deprecated key: user, new key: username
