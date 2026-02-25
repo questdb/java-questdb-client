@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.test.AbstractTest;
@@ -35,25 +36,14 @@ import java.lang.reflect.Field;
 import java.time.temporal.ChronoUnit;
 
 /**
- * Verifies that {@link QwpWebSocketSender} invalidates its cached timestamp
- * column references ({@code cachedTimestampColumn} and
- * {@code cachedTimestampNanosColumn}) during flush operations.
- * <p>
- * These cached references point into a {@code QwpTableBuffer} whose columns
- * are reset by {@code flushSync()} / {@code flushPendingRows()}. If the cache
- * is not cleared, subsequent rows may write through a stale reference.
- * <p>
- * The test uses {@code autoFlushRows=1} so that every row triggers a flush
- * inside {@code sendRow()}. The flush itself fails (no real connection), but
- * the cache must be invalidated <em>before</em> the send is attempted.
- * After the failed flush the test clears the table buffer, making any
- * surviving stale reference point to a freed {@code ColumnBuffer}. A second
- * row is then sent: if the cache was properly invalidated, a fresh column is
- * created and the row is buffered normally; if stale, {@code addLong()} hits
- * an NPE before {@code sendRow()} / {@code nextRow()}, so the row is never
- * counted.
+ * Verifies {@link QwpWebSocketSender} internal state management:
+ * <ul>
+ *   <li>{@code reset()} discards all pending state, not just the current table buffer.</li>
+ *   <li>Cached timestamp column references are invalidated during flush operations,
+ *       preventing stale writes through freed {@code ColumnBuffer} instances.</li>
+ * </ul>
  */
-public class QwpWebSocketSenderFlushCacheTest extends AbstractTest {
+public class QwpWebSocketSenderStateTest extends AbstractTest {
 
     @Test
     public void testCachedTimestampColumnInvalidatedDuringFlush() throws Exception {
@@ -62,7 +52,7 @@ public class QwpWebSocketSenderFlushCacheTest extends AbstractTest {
                     "localhost", 0, 1, 10_000_000, 0, 1, 16
             );
             try {
-                setConnected(sender, true);
+                setField(sender, "connected", true);
 
                 // Row 1: caches cachedTimestampColumn, then auto-flush
                 // triggers and fails (no real connection).
@@ -91,7 +81,7 @@ public class QwpWebSocketSenderFlushCacheTest extends AbstractTest {
                 Assert.assertEquals("row must be buffered when cache is properly invalidated",
                         1, tb.getRowCount());
             } finally {
-                setConnected(sender, false);
+                setField(sender, "connected", false);
                 sender.close();
             }
         });
@@ -104,7 +94,7 @@ public class QwpWebSocketSenderFlushCacheTest extends AbstractTest {
                     "localhost", 0, 1, 10_000_000, 0, 1, 16
             );
             try {
-                setConnected(sender, true);
+                setField(sender, "connected", true);
 
                 try {
                     sender.table("t")
@@ -126,15 +116,62 @@ public class QwpWebSocketSenderFlushCacheTest extends AbstractTest {
                 Assert.assertEquals("row must be buffered when cache is properly invalidated",
                         1, tb.getRowCount());
             } finally {
-                setConnected(sender, false);
+                setField(sender, "connected", false);
                 sender.close();
             }
         });
     }
 
-    private static void setConnected(QwpWebSocketSender sender, boolean value) throws Exception {
-        Field f = QwpWebSocketSender.class.getDeclaredField("connected");
+    @Test
+    public void testResetClearsAllTableBuffersAndPendingRowCount() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Use high autoFlushRows to prevent auto-flush during the test
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 0, 10_000, 10_000_000, 0, 1, 16
+            );
+            try {
+                // Bypass ensureConnected() — mark as connected, leave client null
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                // Buffer rows into two different tables via the fluent API
+                sender.table("t1")
+                        .longColumn("x", 1)
+                        .at(1, ChronoUnit.MICROS);
+                sender.table("t2")
+                        .longColumn("y", 2)
+                        .at(2, ChronoUnit.MICROS);
+
+                // Verify data is buffered
+                QwpTableBuffer t1 = sender.getTableBuffer("t1");
+                QwpTableBuffer t2 = sender.getTableBuffer("t2");
+                Assert.assertEquals("t1 should have 1 row before reset", 1, t1.getRowCount());
+                Assert.assertEquals("t2 should have 1 row before reset", 1, t2.getRowCount());
+                Assert.assertEquals("pendingRowCount should be 2 before reset", 2, sender.getPendingRowCount());
+
+                // Select t1 as the current table
+                sender.table("t1");
+
+                // Call reset — per the Sender contract this should discard
+                // ALL pending state, not just the current table
+                sender.reset();
+
+                // Both table buffers should be cleared
+                Assert.assertEquals("t1 row count should be 0 after reset", 0, t1.getRowCount());
+                Assert.assertEquals("t2 row count should be 0 after reset", 0, t2.getRowCount());
+
+                // Pending row count should be zeroed
+                Assert.assertEquals("pendingRowCount should be 0 after reset", 0, sender.getPendingRowCount());
+            } finally {
+                setField(sender, "connected", false);
+                sender.close();
+            }
+        });
+    }
+
+    private static void setField(Object target, String fieldName, Object value) throws Exception {
+        Field f = target.getClass().getDeclaredField(fieldName);
         f.setAccessible(true);
-        f.set(sender, value);
+        f.set(target, value);
     }
 }
