@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
+import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.std.Unsafe;
 import org.junit.Test;
 
@@ -72,6 +73,42 @@ public class NativeBufferWriterTest {
             writer.skip(8);
             assertEquals(12, writer.getPosition());
         }
+    }
+
+    @Test
+    public void testPutUtf8InvalidSurrogatePair() {
+        try (NativeBufferWriter writer = new NativeBufferWriter(64)) {
+            // High surrogate \uD800 followed by non-low-surrogate 'X'.
+            // Should produce '?' for the lone high surrogate, then 'X'.
+            writer.putUtf8("\uD800X");
+            assertEquals(2, writer.getPosition());
+            assertEquals((byte) '?', Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
+            assertEquals((byte) 'X', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 1));
+        }
+    }
+
+    @Test
+    public void testNativeBufferWriterUtf8LengthInvalidSurrogatePair() {
+        // High surrogate followed by non-low-surrogate: '?' (1) + 'X' (1) = 2
+        assertEquals(2, NativeBufferWriter.utf8Length("\uD800X"));
+        // Lone high surrogate at end: '?' (1)
+        assertEquals(1, NativeBufferWriter.utf8Length("\uD800"));
+        // Lone low surrogate: '?' (1)
+        assertEquals(1, NativeBufferWriter.utf8Length("\uDC00"));
+        // Valid pair still works: 4 bytes
+        assertEquals(4, NativeBufferWriter.utf8Length("\uD83D\uDE00"));
+    }
+
+    @Test
+    public void testQwpBufferWriterUtf8LengthInvalidSurrogatePair() {
+        // High surrogate followed by non-low-surrogate: '?' (1) + 'X' (1) = 2
+        assertEquals(2, QwpBufferWriter.utf8Length("\uD800X"));
+        // Lone high surrogate at end: '?' (1)
+        assertEquals(1, QwpBufferWriter.utf8Length("\uD800"));
+        // Lone low surrogate: '?' (1)
+        assertEquals(1, QwpBufferWriter.utf8Length("\uDC00"));
+        // Valid pair still works: 4 bytes
+        assertEquals(4, QwpBufferWriter.utf8Length("\uD83D\uDE00"));
     }
 
     @Test

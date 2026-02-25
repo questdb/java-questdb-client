@@ -287,6 +287,18 @@ public class OffHeapAppendMemoryTest {
     }
 
     @Test
+    public void testPutUtf8InvalidSurrogatePair() {
+        try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+            // High surrogate \uD800 followed by non-low-surrogate 'X'.
+            // Should produce '?' for the lone high surrogate, then 'X'.
+            mem.putUtf8("\uD800X");
+            assertEquals(2, mem.getAppendOffset());
+            assertEquals((byte) '?', Unsafe.getUnsafe().getByte(mem.addressOf(0)));
+            assertEquals((byte) 'X', Unsafe.getUnsafe().getByte(mem.addressOf(1)));
+        }
+    }
+
+    @Test
     public void testPutUtf8SurrogatePairs() {
         try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
             // U+1F600 (grinning face) = F0 9F 98 80

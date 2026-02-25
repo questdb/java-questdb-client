@@ -59,9 +59,11 @@ public interface QwpBufferWriter extends ArrayBufferAppender {
                 len++;
             } else if (c < 0x800) {
                 len += 2;
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
                 i++;
                 len += 4;
+            } else if (Character.isSurrogate(c)) {
+                len++;
             } else {
                 len += 3;
             }

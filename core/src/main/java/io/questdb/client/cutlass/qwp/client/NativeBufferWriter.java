@@ -66,9 +66,11 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
                 len++;
             } else if (c < 0x800) {
                 len += 2;
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
                 i++;
                 len += 4;
+            } else if (Character.isSurrogate(c)) {
+                len++;
             } else {
                 len += 3;
             }
@@ -243,11 +245,16 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
                 putByte((byte) (0x80 | (c & 0x3F)));
             } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
                 char c2 = value.charAt(++i);
-                int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
-                putByte((byte) (0xF0 | (codePoint >> 18)));
-                putByte((byte) (0x80 | ((codePoint >> 12) & 0x3F)));
-                putByte((byte) (0x80 | ((codePoint >> 6) & 0x3F)));
-                putByte((byte) (0x80 | (codePoint & 0x3F)));
+                if (Character.isLowSurrogate(c2)) {
+                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+                    putByte((byte) (0xF0 | (codePoint >> 18)));
+                    putByte((byte) (0x80 | ((codePoint >> 12) & 0x3F)));
+                    putByte((byte) (0x80 | ((codePoint >> 6) & 0x3F)));
+                    putByte((byte) (0x80 | (codePoint & 0x3F)));
+                } else {
+                    putByte((byte) '?');
+                    i--;
+                }
             } else {
                 putByte((byte) (0xE0 | (c >> 12)));
                 putByte((byte) (0x80 | ((c >> 6) & 0x3F)));
