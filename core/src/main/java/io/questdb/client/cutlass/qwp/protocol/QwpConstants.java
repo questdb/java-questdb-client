@@ -326,6 +326,8 @@ public final class QwpConstants {
             case TYPE_LONG256:
             case TYPE_DECIMAL256:
                 return 32;
+            case TYPE_GEOHASH:
+                return -1; // Variable width: varint precision + packed values
             default:
                 return -1; // Variable width
         }

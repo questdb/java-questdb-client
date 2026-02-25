@@ -272,6 +272,7 @@ public class QwpTableBuffer implements QuietCloseable {
             case TYPE_SYMBOL:
             case TYPE_FLOAT:
                 return 4;
+            case TYPE_GEOHASH:
             case TYPE_LONG:
             case TYPE_TIMESTAMP:
             case TYPE_TIMESTAMP_NANOS:
@@ -760,6 +761,9 @@ public class QwpTableBuffer implements QuietCloseable {
                     case TYPE_INT:
                         dataBuffer.putInt(0);
                         break;
+                    case TYPE_GEOHASH:
+                        dataBuffer.putLong(-1L);
+                        break;
                     case TYPE_LONG:
                     case TYPE_TIMESTAMP:
                     case TYPE_TIMESTAMP_NANOS:
@@ -1142,6 +1146,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 case TYPE_INT:
                     dataBuffer = new OffHeapAppendMemory(64);
                     break;
+                case TYPE_GEOHASH:
                 case TYPE_LONG:
                 case TYPE_TIMESTAMP:
                 case TYPE_TIMESTAMP_NANOS:
