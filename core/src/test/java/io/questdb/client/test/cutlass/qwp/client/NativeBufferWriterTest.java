@@ -88,6 +88,40 @@ public class NativeBufferWriterTest {
     }
 
     @Test
+    public void testPutUtf8LoneHighSurrogateAtEnd() {
+        try (NativeBufferWriter writer = new NativeBufferWriter(64)) {
+            writer.putUtf8("\uD800");
+            assertEquals(1, writer.getPosition());
+            assertEquals((byte) '?', Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
+        }
+    }
+
+    @Test
+    public void testPutUtf8LoneLowSurrogate() {
+        try (NativeBufferWriter writer = new NativeBufferWriter(64)) {
+            writer.putUtf8("\uDC00");
+            assertEquals(1, writer.getPosition());
+            assertEquals((byte) '?', Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
+        }
+    }
+
+    @Test
+    public void testPutUtf8LoneSurrogateMatchesUtf8Length() {
+        try (NativeBufferWriter writer = new NativeBufferWriter(64)) {
+            // Verify putUtf8 and utf8Length agree for all lone surrogate cases
+            String[] cases = {"\uD800", "\uDBFF", "\uDC00", "\uDFFF", "\uD800X", "A\uDC00B"};
+            for (String s : cases) {
+                writer.reset();
+                writer.putUtf8(s);
+                assertEquals("length mismatch for: " + s.codePoints()
+                                .mapToObj(cp -> String.format("U+%04X", cp))
+                                .reduce((a, b) -> a + " " + b).orElse(""),
+                        NativeBufferWriter.utf8Length(s), writer.getPosition());
+            }
+        }
+    }
+
+    @Test
     public void testNativeBufferWriterUtf8LengthInvalidSurrogatePair() {
         // High surrogate followed by non-low-surrogate: '?' (1) + 'X' (1) = 2
         assertEquals(2, NativeBufferWriter.utf8Length("\uD800X"));

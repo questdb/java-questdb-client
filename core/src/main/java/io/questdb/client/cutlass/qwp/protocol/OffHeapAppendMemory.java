@@ -162,6 +162,8 @@ public class OffHeapAppendMemory implements QuietCloseable {
                     Unsafe.getUnsafe().putByte(appendAddress++, (byte) '?');
                     i--;
                 }
+            } else if (Character.isSurrogate(c)) {
+                Unsafe.getUnsafe().putByte(appendAddress++, (byte) '?');
             } else {
                 Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0xE0 | (c >> 12)));
                 Unsafe.getUnsafe().putByte(appendAddress++, (byte) (0x80 | ((c >> 6) & 0x3F)));

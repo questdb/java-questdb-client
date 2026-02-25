@@ -364,6 +364,8 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
                     putByte((byte) '?');
                     i--;
                 }
+            } else if (Character.isSurrogate(c)) {
+                putByte((byte) '?');
             } else {
                 putByte((byte) (0xE0 | (c >> 12)));
                 putByte((byte) (0x80 | ((c >> 6) & 0x3F)));
