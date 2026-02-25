@@ -806,6 +806,12 @@ public class QwpTableBuffer implements QuietCloseable {
                         dataBuffer.putLong(Decimals.DECIMAL256_LH_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL256_LL_NULL);
                         break;
+                    case TYPE_DOUBLE_ARRAY:
+                    case TYPE_LONG_ARRAY:
+                        ensureArrayCapacity(1, 0);
+                        arrayDims[valueCount] = 1;
+                        arrayShapes[arrayShapeOffset++] = 0;
+                        break;
                 }
                 valueCount++;
                 size++;
