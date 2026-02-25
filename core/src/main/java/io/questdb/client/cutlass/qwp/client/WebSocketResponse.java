@@ -211,6 +211,8 @@ public class WebSocketResponse {
                 }
                 errorMessage = new String(msgBytes, StandardCharsets.UTF_8);
                 offset += msgLen;
+            } else {
+                errorMessage = null;
             }
         } else {
             errorMessage = null;

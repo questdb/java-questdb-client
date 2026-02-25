@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.WebSocketChannel;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketHandshake;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import io.questdb.client.std.MemoryTag;
@@ -133,6 +134,44 @@ public class WebSocketChannelTest extends AbstractTest {
     @Test
     public void testBinaryRoundTripSmallPayload() throws Exception {
         TestUtils.assertMemoryLeak(() -> assertBinaryRoundTrip(13));
+    }
+
+    @Test
+    public void testResponseReadFromEmptyErrorClearsStaleMessage() {
+        // First, parse an error response WITH an error message
+        WebSocketResponse response = new WebSocketResponse();
+        WebSocketResponse errorWithMsg = WebSocketResponse.error(42, WebSocketResponse.STATUS_PARSE_ERROR, "bad input");
+        int size1 = errorWithMsg.serializedSize();
+        long ptr = Unsafe.malloc(size1, MemoryTag.NATIVE_DEFAULT);
+        try {
+            errorWithMsg.writeTo(ptr);
+            Assert.assertTrue(response.readFrom(ptr, size1));
+            Assert.assertEquals("bad input", response.getErrorMessage());
+        } finally {
+            Unsafe.free(ptr, size1, MemoryTag.NATIVE_DEFAULT);
+        }
+
+        // Now, parse an error response with an EMPTY error message (msgLen=0)
+        // but with a buffer larger than MIN_ERROR_RESPONSE_SIZE. This triggers
+        // the path where the outer if (length > offset + 2) is true, but the
+        // inner if (msgLen > 0) is false, leaving errorMessage stale.
+        int size2 = WebSocketResponse.MIN_ERROR_RESPONSE_SIZE + 1;
+        ptr = Unsafe.malloc(size2, MemoryTag.NATIVE_DEFAULT);
+        try {
+            int offset = 0;
+            Unsafe.getUnsafe().putByte(ptr + offset, WebSocketResponse.STATUS_WRITE_ERROR);
+            offset += 1;
+            Unsafe.getUnsafe().putLong(ptr + offset, 99L);
+            offset += 8;
+            Unsafe.getUnsafe().putShort(ptr + offset, (short) 0); // msgLen = 0
+
+            Assert.assertTrue(response.readFrom(ptr, size2));
+            Assert.assertEquals(WebSocketResponse.STATUS_WRITE_ERROR, response.getStatus());
+            Assert.assertEquals(99L, response.getSequence());
+            Assert.assertNull("errorMessage should be null for empty error message", response.getErrorMessage());
+        } finally {
+            Unsafe.free(ptr, size2, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     /**
