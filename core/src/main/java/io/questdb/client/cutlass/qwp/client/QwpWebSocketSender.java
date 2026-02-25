@@ -478,6 +478,13 @@ public class QwpWebSocketSender implements Sender {
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
+                    // Wait for all batches to be sent and acknowledged before closing
+                    if (sendQueue != null) {
+                        sendQueue.flush();
+                    }
+                    if (inFlightWindow != null) {
+                        inFlightWindow.awaitEmpty();
+                    }
                     if (sendQueue != null) {
                         sendQueue.close();
                     }
