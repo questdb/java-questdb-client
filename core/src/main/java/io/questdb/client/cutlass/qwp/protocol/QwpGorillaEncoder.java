@@ -36,9 +36,9 @@ import io.questdb.client.std.Unsafe;
  * DoD = (t[n] - t[n-1]) - (t[n-1] - t[n-2])
  *
  * if DoD == 0:              write '0'              (1 bit)
- * elif DoD in [-63, 64]:    write '10' + 7-bit     (9 bits)
- * elif DoD in [-255, 256]:  write '110' + 9-bit    (12 bits)
- * elif DoD in [-2047, 2048]: write '1110' + 12-bit (16 bits)
+ * elif DoD in [-64, 63]:    write '10' + 7-bit     (9 bits)
+ * elif DoD in [-256, 255]:  write '110' + 9-bit    (12 bits)
+ * elif DoD in [-2048, 2047]: write '1110' + 12-bit (16 bits)
  * else:                     write '1111' + 32-bit  (36 bits)
  * </pre>
  * <p>
@@ -47,13 +47,13 @@ import io.questdb.client.std.Unsafe;
  */
 public class QwpGorillaEncoder {
 
-    private static final int BUCKET_12BIT_MAX = 2048;
-    private static final int BUCKET_12BIT_MIN = -2047;
-    private static final int BUCKET_7BIT_MAX = 64;
+    private static final int BUCKET_12BIT_MAX = 2047;
+    private static final int BUCKET_12BIT_MIN = -2048;
+    private static final int BUCKET_7BIT_MAX = 63;
     // Bucket boundaries (two's complement signed ranges)
-    private static final int BUCKET_7BIT_MIN = -63;
-    private static final int BUCKET_9BIT_MAX = 256;
-    private static final int BUCKET_9BIT_MIN = -255;
+    private static final int BUCKET_7BIT_MIN = -64;
+    private static final int BUCKET_9BIT_MAX = 255;
+    private static final int BUCKET_9BIT_MIN = -256;
     private final QwpBitWriter bitWriter = new QwpBitWriter();
 
     /**
@@ -202,15 +202,15 @@ public class QwpGorillaEncoder {
             case 0: // DoD == 0
                 bitWriter.writeBit(0);
                 break;
-            case 1: // [-63, 64] -> '10' + 7-bit
+            case 1: // [-64, 63] -> '10' + 7-bit
                 bitWriter.writeBits(0b01, 2);
                 bitWriter.writeSigned(deltaOfDelta, 7);
                 break;
-            case 2: // [-255, 256] -> '110' + 9-bit
+            case 2: // [-256, 255] -> '110' + 9-bit
                 bitWriter.writeBits(0b011, 3);
                 bitWriter.writeSigned(deltaOfDelta, 9);
                 break;
-            case 3: // [-2047, 2048] -> '1110' + 12-bit
+            case 3: // [-2048, 2047] -> '1110' + 12-bit
                 bitWriter.writeBits(0b0111, 4);
                 bitWriter.writeSigned(deltaOfDelta, 12);
                 break;
