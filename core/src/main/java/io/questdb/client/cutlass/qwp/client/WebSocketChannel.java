@@ -32,7 +32,7 @@ import io.questdb.client.cutlass.qwp.websocket.WebSocketHandshake;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
-import io.questdb.client.std.Rnd;
+import io.questdb.client.std.SecureRnd;
 import io.questdb.client.std.Unsafe;
 
 import javax.net.SocketFactory;
@@ -76,8 +76,8 @@ public class WebSocketChannel implements QuietCloseable {
     private final String host;
     private final String path;
     private final int port;
-    // Random for mask key generation
-    private final Rnd rnd;
+    // Random for mask key generation (ChaCha20-based CSPRNG, RFC 6455 Section 5.3)
+    private final SecureRnd rnd;
     private final boolean tlsEnabled;
     private final boolean tlsValidationEnabled;
     private boolean closed;
@@ -141,7 +141,7 @@ public class WebSocketChannel implements QuietCloseable {
 
         this.tlsValidationEnabled = tlsValidationEnabled;
         this.frameParser = new WebSocketFrameParser();
-        this.rnd = new Rnd(System.nanoTime(), System.currentTimeMillis());
+        this.rnd = new SecureRnd();
 
         // Allocate native buffers
         this.sendBufferSize = DEFAULT_BUFFER_SIZE;
@@ -380,7 +380,7 @@ public class WebSocketChannel implements QuietCloseable {
         // Generate random key (16 bytes, base64 encoded = 24 chars)
         byte[] keyBytes = new byte[16];
         for (int i = 0; i < 16; i++) {
-            keyBytes[i] = (byte) rnd.nextInt(256);
+            keyBytes[i] = (byte) rnd.nextInt();
         }
         String key = Base64.getEncoder().encodeToString(keyBytes);
 

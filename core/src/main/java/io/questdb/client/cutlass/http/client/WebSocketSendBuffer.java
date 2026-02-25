@@ -31,7 +31,7 @@ import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.QuietCloseable;
-import io.questdb.client.std.Rnd;
+import io.questdb.client.std.SecureRnd;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
 
@@ -63,7 +63,7 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     private static final int MAX_HEADER_SIZE = 14;
     private final FrameInfo frameInfo = new FrameInfo();
     private final int maxBufferSize;
-    private final Rnd rnd;
+    private final SecureRnd rnd;
     private int bufCapacity;
     private long bufPtr;
     private int frameStartOffset;   // Where current frame's reserved header starts
@@ -99,7 +99,7 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         this.writePos = 0;
         this.frameStartOffset = 0;
         this.payloadStartOffset = 0;
-        this.rnd = new Rnd(System.nanoTime(), System.currentTimeMillis());
+        this.rnd = new SecureRnd();
     }
 
     /**
