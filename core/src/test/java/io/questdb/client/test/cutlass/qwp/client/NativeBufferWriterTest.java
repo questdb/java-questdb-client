@@ -27,10 +27,12 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.std.Unsafe;
+import org.junit.Assert;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class NativeBufferWriterTest {
 
@@ -86,6 +88,18 @@ public class NativeBufferWriterTest {
             writer.putInt(0xCAFE);
             assertEquals(36, writer.getPosition());
             assertEquals(0xCAFE, Unsafe.getUnsafe().getInt(writer.getBufferPtr() + 32));
+        }
+    }
+
+    @Test
+    public void testPutBlockOfBytesRejectsLenExceedingIntMax() {
+        try (NativeBufferWriter writer = new NativeBufferWriter(16)) {
+            try {
+                writer.putBlockOfBytes(0, (long) Integer.MAX_VALUE + 1);
+                fail("expected IllegalArgumentException");
+            } catch (IllegalArgumentException e) {
+                Assert.assertTrue(e.getMessage().contains("len"));
+            }
         }
     }
 

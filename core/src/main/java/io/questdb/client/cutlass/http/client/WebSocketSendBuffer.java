@@ -249,9 +249,13 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         if (len <= 0) {
             return;
         }
-        ensureCapacity((int) len);
-        Vect.memcpy(bufPtr + writePos, from, len);
-        writePos += (int) len;
+        if (len > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("len exceeds int range: " + len);
+        }
+        int intLen = (int) len;
+        ensureCapacity(intLen);
+        Vect.memcpy(bufPtr + writePos, from, intLen);
+        writePos += intLen;
     }
 
     @Override

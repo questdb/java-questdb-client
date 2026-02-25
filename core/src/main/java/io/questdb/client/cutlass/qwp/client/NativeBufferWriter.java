@@ -138,9 +138,13 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
      */
     @Override
     public void putBlockOfBytes(long from, long len) {
-        ensureCapacity((int) len);
-        Unsafe.getUnsafe().copyMemory(from, bufferPtr + position, len);
-        position += (int) len;
+        if (len < 0 || len > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("len exceeds int range: " + len);
+        }
+        int intLen = (int) len;
+        ensureCapacity(intLen);
+        Unsafe.getUnsafe().copyMemory(from, bufferPtr + position, intLen);
+        position += intLen;
     }
 
     /**
