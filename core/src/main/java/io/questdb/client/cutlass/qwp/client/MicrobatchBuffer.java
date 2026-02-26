@@ -181,8 +181,7 @@ public class MicrobatchBuffer implements QuietCloseable {
         }
         if (requiredCapacity > bufferCapacity) {
             int newCapacity = Math.max(bufferCapacity * 2, requiredCapacity);
-            long newPtr = Unsafe.realloc(bufferPtr, bufferCapacity, newCapacity, MemoryTag.NATIVE_ILP_RSS);
-            bufferPtr = newPtr;
+            bufferPtr = Unsafe.realloc(bufferPtr, bufferCapacity, newCapacity, MemoryTag.NATIVE_ILP_RSS);
             bufferCapacity = newCapacity;
         }
     }
