@@ -146,6 +146,7 @@ public class QwpWebSocketSender implements Sender {
     private boolean connected;
     // Track max global symbol ID used in current batch (for delta calculation)
     private int currentBatchMaxSymbolId = -1;
+    private final Decimal256 currentDecimal256 = new Decimal256();
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
     private long firstPendingRowTimeNanos;
@@ -557,10 +558,9 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         try {
-            java.math.BigDecimal bd = new java.math.BigDecimal(value.toString());
-            Decimal256 decimal = Decimal256.fromBigDecimal(bd);
+            currentDecimal256.ofString(value);
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name.toString(), TYPE_DECIMAL256, true);
-            col.addDecimal256(decimal);
+            col.addDecimal256(currentDecimal256);
         } catch (Exception e) {
             throw new LineSenderException("Failed to parse decimal value: " + value, e);
         }
