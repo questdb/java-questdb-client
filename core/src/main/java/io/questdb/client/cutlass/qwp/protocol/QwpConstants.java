@@ -30,14 +30,6 @@ package io.questdb.client.cutlass.qwp.protocol;
 public final class QwpConstants {
 
     /**
-     * Size of capability request in bytes.
-     */
-    public static final int CAPABILITY_REQUEST_SIZE = 8;
-    /**
-     * Size of capability response in bytes.
-     */
-    public static final int CAPABILITY_RESPONSE_SIZE = 8;
-    /**
      * Default initial receive buffer size (64 KB).
      */
     public static final int DEFAULT_INITIAL_RECV_BUFFER_SIZE = 64 * 1024;
@@ -54,10 +46,6 @@ public final class QwpConstants {
      * Default maximum rows per table in a batch.
      */
     public static final int DEFAULT_MAX_ROWS_PER_TABLE = 1_000_000;
-    /**
-     * Default maximum string length in bytes (1 MB).
-     */
-    public static final int DEFAULT_MAX_STRING_LENGTH = 1024 * 1024;
     /**
      * Default maximum tables per batch.
      */
@@ -90,23 +78,6 @@ public final class QwpConstants {
      */
     public static final int HEADER_OFFSET_FLAGS = 5;
     /**
-     * Offset of magic bytes in header (4 bytes).
-     */
-    public static final int HEADER_OFFSET_MAGIC = 0;
-    /**
-     * Offset of payload length (uint32, little-endian) in header.
-     */
-    public static final int HEADER_OFFSET_PAYLOAD_LENGTH = 8;
-
-    /**
-     * Offset of table count (uint16, little-endian) in header.
-     */
-    public static final int HEADER_OFFSET_TABLE_COUNT = 6;
-    /**
-     * Offset of version byte in header.
-     */
-    public static final int HEADER_OFFSET_VERSION = 4;
-    /**
      * Size of the message header in bytes.
      */
     public static final int HEADER_SIZE = 12;
@@ -130,14 +101,6 @@ public final class QwpConstants {
      * Maximum columns per table (QuestDB limit).
      */
     public static final int MAX_COLUMNS_PER_TABLE = 2048;
-    /**
-     * Maximum column name length in bytes.
-     */
-    public static final int MAX_COLUMN_NAME_LENGTH = 127;
-    /**
-     * Maximum table name length in bytes.
-     */
-    public static final int MAX_TABLE_NAME_LENGTH = 127;
     /**
      * Schema mode: Full schema included.
      */
@@ -307,35 +270,17 @@ public final class QwpConstants {
      */
     public static int getFixedTypeSize(byte typeCode) {
         int code = typeCode & TYPE_MASK;
-        switch (code) {
-            case TYPE_BOOLEAN:
-                return 0; // Special: bit-packed
-            case TYPE_BYTE:
-                return 1;
-            case TYPE_SHORT:
-            case TYPE_CHAR:
-                return 2;
-            case TYPE_INT:
-            case TYPE_FLOAT:
-                return 4;
-            case TYPE_LONG:
-            case TYPE_DOUBLE:
-            case TYPE_TIMESTAMP:
-            case TYPE_TIMESTAMP_NANOS:
-            case TYPE_DATE:
-            case TYPE_DECIMAL64:
-                return 8;
-            case TYPE_UUID:
-            case TYPE_DECIMAL128:
-                return 16;
-            case TYPE_LONG256:
-            case TYPE_DECIMAL256:
-                return 32;
-            case TYPE_GEOHASH:
-                return -1; // Variable width: varint precision + packed values
-            default:
-                return -1; // Variable width
-        }
+        return switch (code) {
+            case TYPE_BOOLEAN -> 0; // Special: bit-packed
+            case TYPE_BYTE -> 1;
+            case TYPE_SHORT, TYPE_CHAR -> 2;
+            case TYPE_INT, TYPE_FLOAT -> 4;
+            case TYPE_LONG, TYPE_DOUBLE, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS, TYPE_DATE, TYPE_DECIMAL64 -> 8;
+            case TYPE_UUID, TYPE_DECIMAL128 -> 16;
+            case TYPE_LONG256, TYPE_DECIMAL256 -> 32;
+            case TYPE_GEOHASH -> -1; // Variable width: varint precision + packed values
+            default -> -1; // Variable width
+        };
     }
 
     /**
@@ -347,77 +292,31 @@ public final class QwpConstants {
     public static String getTypeName(byte typeCode) {
         int code = typeCode & TYPE_MASK;
         boolean nullable = (typeCode & TYPE_NULLABLE_FLAG) != 0;
-        String name;
-        switch (code) {
-            case TYPE_BOOLEAN:
-                name = "BOOLEAN";
-                break;
-            case TYPE_BYTE:
-                name = "BYTE";
-                break;
-            case TYPE_SHORT:
-                name = "SHORT";
-                break;
-            case TYPE_CHAR:
-                name = "CHAR";
-                break;
-            case TYPE_INT:
-                name = "INT";
-                break;
-            case TYPE_LONG:
-                name = "LONG";
-                break;
-            case TYPE_FLOAT:
-                name = "FLOAT";
-                break;
-            case TYPE_DOUBLE:
-                name = "DOUBLE";
-                break;
-            case TYPE_STRING:
-                name = "STRING";
-                break;
-            case TYPE_SYMBOL:
-                name = "SYMBOL";
-                break;
-            case TYPE_TIMESTAMP:
-                name = "TIMESTAMP";
-                break;
-            case TYPE_TIMESTAMP_NANOS:
-                name = "TIMESTAMP_NANOS";
-                break;
-            case TYPE_DATE:
-                name = "DATE";
-                break;
-            case TYPE_UUID:
-                name = "UUID";
-                break;
-            case TYPE_LONG256:
-                name = "LONG256";
-                break;
-            case TYPE_GEOHASH:
-                name = "GEOHASH";
-                break;
-            case TYPE_VARCHAR:
-                name = "VARCHAR";
-                break;
-            case TYPE_DOUBLE_ARRAY:
-                name = "DOUBLE_ARRAY";
-                break;
-            case TYPE_LONG_ARRAY:
-                name = "LONG_ARRAY";
-                break;
-            case TYPE_DECIMAL64:
-                name = "DECIMAL64";
-                break;
-            case TYPE_DECIMAL128:
-                name = "DECIMAL128";
-                break;
-            case TYPE_DECIMAL256:
-                name = "DECIMAL256";
-                break;
-            default:
-                name = "UNKNOWN(" + code + ")";
-        }
+        String name = switch (code) {
+            case TYPE_BOOLEAN -> "BOOLEAN";
+            case TYPE_BYTE -> "BYTE";
+            case TYPE_SHORT -> "SHORT";
+            case TYPE_CHAR -> "CHAR";
+            case TYPE_INT -> "INT";
+            case TYPE_LONG -> "LONG";
+            case TYPE_FLOAT -> "FLOAT";
+            case TYPE_DOUBLE -> "DOUBLE";
+            case TYPE_STRING -> "STRING";
+            case TYPE_SYMBOL -> "SYMBOL";
+            case TYPE_TIMESTAMP -> "TIMESTAMP";
+            case TYPE_TIMESTAMP_NANOS -> "TIMESTAMP_NANOS";
+            case TYPE_DATE -> "DATE";
+            case TYPE_UUID -> "UUID";
+            case TYPE_LONG256 -> "LONG256";
+            case TYPE_GEOHASH -> "GEOHASH";
+            case TYPE_VARCHAR -> "VARCHAR";
+            case TYPE_DOUBLE_ARRAY -> "DOUBLE_ARRAY";
+            case TYPE_LONG_ARRAY -> "LONG_ARRAY";
+            case TYPE_DECIMAL64 -> "DECIMAL64";
+            case TYPE_DECIMAL128 -> "DECIMAL128";
+            case TYPE_DECIMAL256 -> "DECIMAL256";
+            default -> "UNKNOWN(" + code + ")";
+        };
         return nullable ? name + "?" : name;
     }
 
