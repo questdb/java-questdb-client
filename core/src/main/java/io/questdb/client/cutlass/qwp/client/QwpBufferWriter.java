@@ -45,33 +45,6 @@ import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 public interface QwpBufferWriter extends ArrayBufferAppender {
 
     /**
-     * Returns the UTF-8 encoded length of a string.
-     *
-     * @param s the string (may be null)
-     * @return the number of bytes needed to encode the string as UTF-8
-     */
-    static int utf8Length(String s) {
-        if (s == null) return 0;
-        int len = 0;
-        for (int i = 0, n = s.length(); i < n; i++) {
-            char c = s.charAt(i);
-            if (c < 0x80) {
-                len++;
-            } else if (c < 0x800) {
-                len += 2;
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
-                i++;
-                len += 4;
-            } else if (Character.isSurrogate(c)) {
-                len++;
-            } else {
-                len += 3;
-            }
-        }
-        return len;
-    }
-
-    /**
      * Ensures the buffer has capacity for at least the specified
      * additional bytes beyond the current position.
      *

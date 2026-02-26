@@ -25,7 +25,6 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
-import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
@@ -206,13 +205,13 @@ public class NativeBufferWriterTest {
     @Test
     public void testQwpBufferWriterUtf8LengthInvalidSurrogatePair() {
         // High surrogate followed by non-low-surrogate: '?' (1) + 'X' (1) = 2
-        assertEquals(2, QwpBufferWriter.utf8Length("\uD800X"));
+        assertEquals(2, NativeBufferWriter.utf8Length("\uD800X"));
         // Lone high surrogate at end: '?' (1)
-        assertEquals(1, QwpBufferWriter.utf8Length("\uD800"));
+        assertEquals(1, NativeBufferWriter.utf8Length("\uD800"));
         // Lone low surrogate: '?' (1)
-        assertEquals(1, QwpBufferWriter.utf8Length("\uDC00"));
+        assertEquals(1, NativeBufferWriter.utf8Length("\uDC00"));
         // Valid pair still works: 4 bytes
-        assertEquals(4, QwpBufferWriter.utf8Length("\uD83D\uDE00"));
+        assertEquals(4, NativeBufferWriter.utf8Length("\uD83D\uDE00"));
     }
 
     @Test

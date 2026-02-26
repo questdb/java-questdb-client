@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.http.client;
 
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
+import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameWriter;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
@@ -336,7 +337,7 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
             putVarint(0);
             return;
         }
-        int utf8Len = QwpBufferWriter.utf8Length(value);
+        int utf8Len = NativeBufferWriter.utf8Length(value);
         putVarint(utf8Len);
         putUtf8(value);
     }

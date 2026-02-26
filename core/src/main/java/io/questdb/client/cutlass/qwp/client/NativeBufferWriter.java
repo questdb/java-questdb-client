@@ -56,6 +56,9 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
 
     /**
      * Returns the UTF-8 encoded length of a string.
+     *
+     * @param s the string (may be null)
+     * @return the number of bytes needed to encode the string as UTF-8
      */
     public static int utf8Length(String s) {
         if (s == null) return 0;
