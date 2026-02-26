@@ -231,6 +231,11 @@ public class QwpGorillaEncoder {
      * - Remaining timestamps: bit-packed delta-of-delta
      * </pre>
      * <p>
+     * Precondition: the caller must verify that {@link #canUseGorilla(long, int)}
+     * returns {@code true} before calling this method. The largest delta-of-delta
+     * bucket uses 32-bit signed encoding, so values outside the {@code int} range
+     * are silently truncated, producing corrupt output on decode.
+     * <p>
      * Note: This method does NOT write the encoding flag byte. The caller is
      * responsible for writing the ENCODING_GORILLA flag before calling this method.
      *
