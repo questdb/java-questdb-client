@@ -73,8 +73,6 @@ public class WebSocketFrameParser {
     private boolean masked;
     private int opcode;
     private long payloadLength;
-    // Configuration
-    private boolean serverMode = false;  // If true, expect masked frames from clients
     // Parser state
     private int state = STATE_HEADER;
     private boolean strictMode = false;  // If true, reject non-minimal length encodings
@@ -86,12 +84,6 @@ public class WebSocketFrameParser {
     public int getHeaderSize() {
         return headerSize;
     }
-
-    public int getMaskKey() {
-        return maskKey;
-    }
-
-    // Getters
 
     public int getOpcode() {
         return opcode;
@@ -160,13 +152,9 @@ public class WebSocketFrameParser {
         int lengthField = byte1 & LENGTH_MASK;
 
         // Validate masking based on mode
-        if (serverMode && !masked) {
-            // Client frames MUST be masked
-            state = STATE_ERROR;
-            errorCode = WebSocketCloseCode.PROTOCOL_ERROR;
-            return 0;
-        }
-        if (!serverMode && masked) {
+        // Configuration
+        // If true, expect masked frames from clients
+        if (masked) {
             // Server frames MUST NOT be masked
             state = STATE_ERROR;
             errorCode = WebSocketCloseCode.PROTOCOL_ERROR;
@@ -272,24 +260,6 @@ public class WebSocketFrameParser {
         payloadLength = 0;
         headerSize = 0;
         errorCode = 0;
-    }
-
-    /**
-     * Sets the mask key for unmasking. Used in testing.
-     */
-    public void setMaskKey(int maskKey) {
-        this.maskKey = maskKey;
-        this.masked = true;
-    }
-
-    // Setters for configuration
-
-    public void setServerMode(boolean serverMode) {
-        this.serverMode = serverMode;
-    }
-
-    public void setStrictMode(boolean strictMode) {
-        this.strictMode = strictMode;
     }
 
     /**
