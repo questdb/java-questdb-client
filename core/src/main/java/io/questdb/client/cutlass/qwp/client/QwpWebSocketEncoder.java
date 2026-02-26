@@ -203,6 +203,9 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             case TYPE_DATE:
                 buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
                 break;
+            case TYPE_GEOHASH:
+                writeGeoHashColumn(dataAddr, valueCount, col.getGeoHashPrecision());
+                break;
             case TYPE_STRING:
             case TYPE_VARCHAR:
                 writeStringColumn(col, valueCount);
@@ -279,6 +282,9 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                     break;
                 case TYPE_DATE:
                     buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
+                    break;
+                case TYPE_GEOHASH:
+                    writeGeoHashColumn(dataAddr, valueCount, col.getGeoHashPrecision());
                     break;
                 case TYPE_STRING:
                 case TYPE_VARCHAR:
@@ -413,6 +419,30 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
             buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + (long) i * 8));
+        }
+    }
+
+    /**
+     * Writes a GeoHash column in variable-width wire format.
+     * <p>
+     * Wire format: [precision varint] [packed values: ceil(precision/8) bytes each]
+     * Values are stored as 8-byte longs in the off-heap buffer but only the
+     * lower ceil(precision/8) bytes are written to the wire.
+     */
+    private void writeGeoHashColumn(long addr, int count, int precision) {
+        if (precision < 1) {
+            // All values are null: use minimum valid precision.
+            // The decoder will skip all values via the null bitmap,
+            // so the precision only needs to be structurally valid.
+            precision = 1;
+        }
+        buffer.putVarint(precision);
+        int valueSize = (precision + 7) / 8;
+        for (int i = 0; i < count; i++) {
+            long value = Unsafe.getUnsafe().getLong(addr + (long) i * 8);
+            for (int b = 0; b < valueSize; b++) {
+                buffer.putByte((byte) (value >>> (b * 8)));
+            }
         }
     }
 

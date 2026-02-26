@@ -411,6 +411,8 @@ public class QwpTableBuffer implements QuietCloseable {
         // Decimal storage
         private byte decimalScale = -1;
         private double[] doubleArrayData;
+        // GeoHash precision (number of bits, 1-60)
+        private int geohashPrecision = -1;
         private boolean hasNulls;
         private long[] longArrayData;
         private int maxGlobalSymbolId = -1;
@@ -632,6 +634,29 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
+        /**
+         * Adds a geohash value with the given precision.
+         *
+         * @param value     the geohash value (bit-packed)
+         * @param precision number of bits (1-60)
+         */
+        public void addGeoHash(long value, int precision) {
+            if (precision < 1 || precision > 60) {
+                throw new LineSenderException("invalid GeoHash precision: " + precision + " (must be 1-60)");
+            }
+            if (geohashPrecision == -1) {
+                geohashPrecision = precision;
+            } else if (geohashPrecision != precision) {
+                throw new LineSenderException(
+                        "GeoHash precision mismatch: column has " + geohashPrecision + " bits, got " + precision
+                );
+            }
+            ensureNullBitmapForNonNull();
+            dataBuffer.putLong(value);
+            valueCount++;
+            size++;
+        }
+
         public void addInt(int value) {
             ensureNullBitmapForNonNull();
             dataBuffer.putInt(value);
@@ -754,6 +779,13 @@ public class QwpTableBuffer implements QuietCloseable {
             if (nullable) {
                 ensureNullCapacity(size + 1);
                 markNull(size);
+                // GEOHASH uses dense wire format: all rows (including nulls)
+                // occupy space in the values array. Write a placeholder value
+                // so the data buffer stays aligned with the row index.
+                if (type == TYPE_GEOHASH) {
+                    dataBuffer.putLong(0L);
+                    valueCount++;
+                }
                 size++;
             } else {
                 // For non-nullable columns, store a sentinel/default value
@@ -928,16 +960,8 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
-        public int getArrayDataOffset() {
-            return arrayDataOffset;
-        }
-
         public byte[] getArrayDims() {
             return arrayDims;
-        }
-
-        public int getArrayShapeOffset() {
-            return arrayShapeOffset;
         }
 
         public int[] getArrayShapes() {
@@ -972,6 +996,10 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public double[] getDoubleArrayData() {
             return doubleArrayData;
+        }
+
+        public int getGeoHashPrecision() {
+            return geohashPrecision;
         }
 
         public long[] getLongArrayData() {
@@ -1021,20 +1049,12 @@ public class QwpTableBuffer implements QuietCloseable {
             return dict;
         }
 
-        public int getSymbolDictionarySize() {
-            return symbolList == null ? 0 : symbolList.size();
-        }
-
         public byte getType() {
             return type;
         }
 
         public int getValueCount() {
             return valueCount;
-        }
-
-        public boolean hasNulls() {
-            return hasNulls;
         }
 
         public boolean isNull(int index) {
@@ -1074,6 +1094,7 @@ public class QwpTableBuffer implements QuietCloseable {
             arrayShapeOffset = 0;
             arrayDataOffset = 0;
             decimalScale = -1;
+            geohashPrecision = -1;
         }
 
         public void truncateTo(int newSize) {
@@ -1153,6 +1174,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     dataBuffer = new OffHeapAppendMemory(32);
                     break;
                 case TYPE_INT:
+                case TYPE_FLOAT:
                     dataBuffer = new OffHeapAppendMemory(64);
                     break;
                 case TYPE_GEOHASH:
@@ -1160,13 +1182,16 @@ public class QwpTableBuffer implements QuietCloseable {
                 case TYPE_TIMESTAMP:
                 case TYPE_TIMESTAMP_NANOS:
                 case TYPE_DATE:
-                    dataBuffer = new OffHeapAppendMemory(128);
-                    break;
-                case TYPE_FLOAT:
-                    dataBuffer = new OffHeapAppendMemory(64);
-                    break;
+                case TYPE_DECIMAL64:
                 case TYPE_DOUBLE:
                     dataBuffer = new OffHeapAppendMemory(128);
+                    break;
+                case TYPE_DECIMAL128:
+                    dataBuffer = new OffHeapAppendMemory(256);
+                    break;
+                case TYPE_LONG256:
+                case TYPE_DECIMAL256:
+                    dataBuffer = new OffHeapAppendMemory(512);
                     break;
                 case TYPE_STRING:
                 case TYPE_VARCHAR:
@@ -1180,24 +1205,10 @@ public class QwpTableBuffer implements QuietCloseable {
                     symbolList = new ObjList<>();
                     break;
                 case TYPE_UUID:
-                    dataBuffer = new OffHeapAppendMemory(256);
-                    break;
-                case TYPE_LONG256:
-                    dataBuffer = new OffHeapAppendMemory(512);
-                    break;
                 case TYPE_DOUBLE_ARRAY:
                 case TYPE_LONG_ARRAY:
                     arrayDims = new byte[16];
                     arrayCapture = new ArrayCapture();
-                    break;
-                case TYPE_DECIMAL64:
-                    dataBuffer = new OffHeapAppendMemory(128);
-                    break;
-                case TYPE_DECIMAL128:
-                    dataBuffer = new OffHeapAppendMemory(256);
-                    break;
-                case TYPE_DECIMAL256:
-                    dataBuffer = new OffHeapAppendMemory(512);
                     break;
             }
         }
