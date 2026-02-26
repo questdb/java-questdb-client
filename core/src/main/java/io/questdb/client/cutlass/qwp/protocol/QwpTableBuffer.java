@@ -1194,6 +1194,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 case TYPE_DOUBLE:
                     dataBuffer = new OffHeapAppendMemory(128);
                     break;
+                case TYPE_UUID:
                 case TYPE_DECIMAL128:
                     dataBuffer = new OffHeapAppendMemory(256);
                     break;
@@ -1212,7 +1213,6 @@ public class QwpTableBuffer implements QuietCloseable {
                     symbolDict = new CharSequenceIntHashMap();
                     symbolList = new ObjList<>();
                     break;
-                case TYPE_UUID:
                 case TYPE_DOUBLE_ARRAY:
                 case TYPE_LONG_ARRAY:
                     arrayDims = new byte[16];
