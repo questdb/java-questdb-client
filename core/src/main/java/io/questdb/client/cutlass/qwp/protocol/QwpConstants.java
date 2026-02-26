@@ -295,10 +295,15 @@ public final class QwpConstants {
     }
 
     /**
-     * Returns the size in bytes for fixed-width types.
+     * Returns the per-value size in bytes as encoded on the wire. BOOLEAN returns 0
+     * because it is bit-packed (1 bit per value). GEOHASH returns -1 because it uses
+     * variable-width encoding (varint precision + ceil(precision/8) bytes per value).
+     * <p>
+     * This is distinct from the in-memory buffer stride used by the client's
+     * {@code QwpTableBuffer.elementSizeInBuffer()}.
      *
      * @param typeCode the column type code (without nullable flag)
-     * @return size in bytes, or -1 for variable-width types
+     * @return size in bytes, 0 for bit-packed (BOOLEAN), or -1 for variable-width types
      */
     public static int getFixedTypeSize(byte typeCode) {
         int code = typeCode & TYPE_MASK;

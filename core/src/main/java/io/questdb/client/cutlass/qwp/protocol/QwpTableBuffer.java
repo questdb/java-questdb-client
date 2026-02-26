@@ -257,10 +257,20 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
-     * Returns the element size in bytes for a fixed-width column type.
-     * Returns 0 for variable-width types (string, arrays).
+     * Returns the in-memory buffer element stride in bytes. This is the size used
+     * to store each value in the client's off-heap {@link OffHeapAppendMemory} buffer.
+     * This is different from element size on the wire.
+     * <p>
+     * For example, BOOLEAN is stored as 1 byte per value here (for easy indexed access)
+     * but bit-packed on the wire; GEOHASH is stored as 8-byte longs here but uses
+     * variable-width encoding on the wire.
+     * <p>
+     * Returns 0 for variable-width types (string, arrays) that do not use a fixed-stride
+     * data buffer.
+     *
+     * @see QwpConstants#getFixedTypeSize(byte) for wire-format sizes
      */
-    static int elementSize(byte type) {
+    static int elementSizeInBuffer(byte type) {
         switch (type) {
             case TYPE_BOOLEAN:
             case TYPE_BYTE:
@@ -420,7 +430,7 @@ public class QwpTableBuffer implements QuietCloseable {
             this.name = name;
             this.type = type;
             this.nullable = nullable;
-            this.elemSize = elementSize(type);
+            this.elemSize = elementSizeInBuffer(type);
             this.size = 0;
             this.valueCount = 0;
             this.hasNulls = false;
