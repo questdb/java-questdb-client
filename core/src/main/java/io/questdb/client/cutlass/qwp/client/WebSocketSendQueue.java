@@ -179,16 +179,19 @@ public class WebSocketSendQueue implements QuietCloseable {
 
         // Wait for pending batches to be sent
         long startTime = System.currentTimeMillis();
-        while (!isPendingEmpty()) {
-            if (System.currentTimeMillis() - startTime > shutdownTimeoutMs) {
-                LOG.error("Shutdown timeout, {} batches not sent", getPendingSize());
-                break;
-            }
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+        synchronized (processingLock) {
+            while (!isPendingEmpty()) {
+                long elapsed = System.currentTimeMillis() - startTime;
+                if (elapsed >= shutdownTimeoutMs) {
+                    LOG.error("Shutdown timeout, {} batches not sent", getPendingSize());
+                    break;
+                }
+                try {
+                    processingLock.wait(shutdownTimeoutMs - elapsed);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
 
