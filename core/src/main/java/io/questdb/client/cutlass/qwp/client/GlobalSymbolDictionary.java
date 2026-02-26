@@ -126,34 +126,6 @@ public class GlobalSymbolDictionary {
     }
 
     /**
-     * Gets the symbols in the given ID range [fromId, toId).
-     * <p>
-     * This is used to extract the delta for sending to the server.
-     * The range is inclusive of fromId and exclusive of toId.
-     *
-     * @param fromId start ID (inclusive)
-     * @param toId   end ID (exclusive)
-     * @return array of symbols in the range, or empty array if range is invalid/empty
-     */
-    public String[] getSymbolsInRange(int fromId, int toId) {
-        if (fromId < 0 || toId < fromId || fromId >= idToSymbol.size()) {
-            return new String[0];
-        }
-
-        int actualToId = Math.min(toId, idToSymbol.size());
-        int count = actualToId - fromId;
-        if (count <= 0) {
-            return new String[0];
-        }
-
-        String[] result = new String[count];
-        for (int i = 0; i < count; i++) {
-            result[i] = idToSymbol.getQuick(fromId + i);
-        }
-        return result;
-    }
-
-    /**
      * Checks if the dictionary is empty.
      *
      * @return true if no symbols have been added
