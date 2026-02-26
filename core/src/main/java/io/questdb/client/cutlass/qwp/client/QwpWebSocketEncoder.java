@@ -79,7 +79,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         buffer.reset();
         writeHeader(1, 0);
         int payloadStart = buffer.getPosition();
-        encodeTable(tableBuffer, useSchemaRef);
+        encodeTable(tableBuffer, useSchemaRef, false);
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
         return buffer.getPosition();
@@ -105,7 +105,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             String symbol = globalDict.getSymbol(id);
             buffer.putString(symbol);
         }
-        encodeTableWithGlobalSymbols(tableBuffer, useSchemaRef);
+        encodeTable(tableBuffer, useSchemaRef, true);
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
         flags = savedFlags;
@@ -165,7 +165,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         buffer.putInt(payloadLength);
     }
 
-    private void encodeColumn(QwpTableBuffer.ColumnBuffer col, QwpColumnDef colDef, int rowCount, boolean useGorilla) {
+    private void encodeColumn(QwpTableBuffer.ColumnBuffer col, QwpColumnDef colDef, int rowCount, boolean useGorilla, boolean useGlobalSymbols) {
         int valueCount = col.getValueCount();
         long dataAddr = col.getDataAddress();
 
@@ -211,7 +211,11 @@ public class QwpWebSocketEncoder implements QuietCloseable {
                 writeStringColumn(col, valueCount);
                 break;
             case TYPE_SYMBOL:
-                writeSymbolColumn(col, valueCount);
+                if (useGlobalSymbols) {
+                    writeSymbolColumnWithGlobalIds(col, valueCount);
+                } else {
+                    writeSymbolColumn(col, valueCount);
+                }
                 break;
             case TYPE_UUID:
                 // Stored as lo+hi contiguously, matching wire order
@@ -241,83 +245,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    private void encodeColumnWithGlobalSymbols(QwpTableBuffer.ColumnBuffer col, QwpColumnDef colDef, int rowCount, boolean useGorilla) {
-        int valueCount = col.getValueCount();
-
-        if (colDef.isNullable()) {
-            writeNullBitmap(col, rowCount);
-        }
-
-        if (col.getType() == TYPE_SYMBOL) {
-            writeSymbolColumnWithGlobalIds(col, valueCount);
-        } else {
-            // Delegate to standard encoding for all other types
-            long dataAddr = col.getDataAddress();
-            switch (col.getType()) {
-                case TYPE_BOOLEAN:
-                    writeBooleanColumn(dataAddr, valueCount);
-                    break;
-                case TYPE_BYTE:
-                    buffer.putBlockOfBytes(dataAddr, valueCount);
-                    break;
-                case TYPE_SHORT:
-                case TYPE_CHAR:
-                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 2);
-                    break;
-                case TYPE_INT:
-                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
-                    break;
-                case TYPE_LONG:
-                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
-                    break;
-                case TYPE_FLOAT:
-                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
-                    break;
-                case TYPE_DOUBLE:
-                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
-                    break;
-                case TYPE_TIMESTAMP:
-                case TYPE_TIMESTAMP_NANOS:
-                    writeTimestampColumn(dataAddr, valueCount, useGorilla);
-                    break;
-                case TYPE_DATE:
-                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
-                    break;
-                case TYPE_GEOHASH:
-                    writeGeoHashColumn(dataAddr, valueCount, col.getGeoHashPrecision());
-                    break;
-                case TYPE_STRING:
-                case TYPE_VARCHAR:
-                    writeStringColumn(col, valueCount);
-                    break;
-                case TYPE_UUID:
-                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 16);
-                    break;
-                case TYPE_LONG256:
-                    buffer.putBlockOfBytes(dataAddr, (long) valueCount * 32);
-                    break;
-                case TYPE_DOUBLE_ARRAY:
-                    writeDoubleArrayColumn(col, valueCount);
-                    break;
-                case TYPE_LONG_ARRAY:
-                    writeLongArrayColumn(col, valueCount);
-                    break;
-                case TYPE_DECIMAL64:
-                    writeDecimal64Column(col.getDecimalScale(), dataAddr, valueCount);
-                    break;
-                case TYPE_DECIMAL128:
-                    writeDecimal128Column(col.getDecimalScale(), dataAddr, valueCount);
-                    break;
-                case TYPE_DECIMAL256:
-                    writeDecimal256Column(col.getDecimalScale(), dataAddr, valueCount);
-                    break;
-                default:
-                    throw new LineSenderException("Unknown column type: " + col.getType());
-            }
-        }
-    }
-
-    private void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
+    private void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef, boolean useGlobalSymbols) {
         QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
         int rowCount = tableBuffer.getRowCount();
 
@@ -336,30 +264,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
             QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
             QwpColumnDef colDef = columnDefs[i];
-            encodeColumn(col, colDef, rowCount, useGorilla);
-        }
-    }
-
-    private void encodeTableWithGlobalSymbols(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
-        QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
-        int rowCount = tableBuffer.getRowCount();
-
-        if (useSchemaRef) {
-            writeTableHeaderWithSchemaRef(
-                    tableBuffer.getTableName(),
-                    rowCount,
-                    tableBuffer.getSchemaHash(),
-                    columnDefs.length
-            );
-        } else {
-            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, columnDefs);
-        }
-
-        boolean useGorilla = isGorillaEnabled();
-        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
-            QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
-            QwpColumnDef colDef = columnDefs[i];
-            encodeColumnWithGlobalSymbols(col, colDef, rowCount, useGorilla);
+            encodeColumn(col, colDef, rowCount, useGorilla, useGlobalSymbols);
         }
     }
 
