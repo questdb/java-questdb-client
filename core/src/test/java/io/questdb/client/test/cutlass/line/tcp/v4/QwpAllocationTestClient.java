@@ -73,7 +73,6 @@ public class QwpAllocationTestClient {
     private static final int DEFAULT_IN_FLIGHT_WINDOW = 0; // 0 = use protocol default (8)
     private static final int DEFAULT_REPORT_INTERVAL = 1_000_000;
     private static final int DEFAULT_ROWS = 80_000_000;
-    private static final int DEFAULT_SEND_QUEUE = 0; // 0 = use protocol default (16)
     private static final int DEFAULT_WARMUP_ROWS = 100_000;
     private static final String PROTOCOL_ILP_HTTP = "ilp-http";
     // Protocol modes
@@ -100,7 +99,6 @@ public class QwpAllocationTestClient {
         int flushBytes = DEFAULT_FLUSH_BYTES;
         long flushIntervalMs = DEFAULT_FLUSH_INTERVAL_MS;
         int inFlightWindow = DEFAULT_IN_FLIGHT_WINDOW;
-        int sendQueue = DEFAULT_SEND_QUEUE;
         int warmupRows = DEFAULT_WARMUP_ROWS;
         int reportInterval = DEFAULT_REPORT_INTERVAL;
 
@@ -124,8 +122,6 @@ public class QwpAllocationTestClient {
                 flushIntervalMs = Long.parseLong(arg.substring("--flush-interval-ms=".length()));
             } else if (arg.startsWith("--in-flight-window=")) {
                 inFlightWindow = Integer.parseInt(arg.substring("--in-flight-window=".length()));
-            } else if (arg.startsWith("--send-queue=")) {
-                sendQueue = Integer.parseInt(arg.substring("--send-queue=".length()));
             } else if (arg.startsWith("--warmup=")) {
                 warmupRows = Integer.parseInt(arg.substring("--warmup=".length()));
             } else if (arg.startsWith("--report=")) {
@@ -157,14 +153,13 @@ public class QwpAllocationTestClient {
         System.out.println("Flush bytes: " + (flushBytes == 0 ? "(default)" : String.format("%,d", flushBytes)));
         System.out.println("Flush interval: " + (flushIntervalMs == 0 ? "(default)" : flushIntervalMs + " ms"));
         System.out.println("In-flight window: " + (inFlightWindow == 0 ? "(default: 8)" : inFlightWindow));
-        System.out.println("Send queue: " + (sendQueue == 0 ? "(default: 16)" : sendQueue));
         System.out.println("Warmup rows: " + String.format("%,d", warmupRows));
         System.out.println("Report interval: " + String.format("%,d", reportInterval));
         System.out.println();
 
         try {
             runTest(protocol, host, port, totalRows, batchSize, flushBytes, flushIntervalMs,
-                    inFlightWindow, sendQueue, warmupRows, reportInterval);
+                    inFlightWindow, warmupRows, reportInterval);
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace(System.err);
@@ -174,7 +169,7 @@ public class QwpAllocationTestClient {
 
     private static Sender createSender(String protocol, String host, int port,
                                        int batchSize, int flushBytes, long flushIntervalMs,
-                                       int inFlightWindow, int sendQueue) {
+                                       int inFlightWindow) {
         switch (protocol) {
             case PROTOCOL_ILP_TCP:
                 return Sender.builder(Sender.Transport.TCP)
@@ -196,7 +191,6 @@ public class QwpAllocationTestClient {
                 if (flushBytes > 0) b.autoFlushBytes(flushBytes);
                 if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
                 if (inFlightWindow > 0) b.inFlightWindowSize(inFlightWindow);
-                if (sendQueue > 0) b.sendQueueCapacity(sendQueue);
                 return b.build();
             default:
                 throw new IllegalArgumentException("Unknown protocol: " + protocol +
@@ -260,12 +254,12 @@ public class QwpAllocationTestClient {
 
     private static void runTest(String protocol, String host, int port, int totalRows,
                                 int batchSize, int flushBytes, long flushIntervalMs,
-                                int inFlightWindow, int sendQueue,
+                                int inFlightWindow,
                                 int warmupRows, int reportInterval) throws IOException {
         System.out.println("Connecting to " + host + ":" + port + "...");
 
         try (Sender sender = createSender(protocol, host, port, batchSize, flushBytes, flushIntervalMs,
-                inFlightWindow, sendQueue)) {
+                inFlightWindow)) {
             System.out.println("Connected! Protocol: " + protocol);
             System.out.println();
 

@@ -107,8 +107,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .autoFlushRows(500)
                 .autoFlushBytes(512 * 1024)
                 .autoFlushIntervalMillis(50)
-                .inFlightWindowSize(8)
-                .sendQueueCapacity(16);
+                .inFlightWindowSize(8);
         Assert.assertNotNull(builder);
     }
 
@@ -319,8 +318,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .autoFlushRows(1000)
                 .autoFlushBytes(1024 * 1024)
                 .autoFlushIntervalMillis(100)
-                .inFlightWindowSize(16)
-                .sendQueueCapacity(32);
+                .inFlightWindowSize(16);
         Assert.assertNotNull(builder);
     }
 
@@ -333,8 +331,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .asyncMode(true)
                 .autoFlushRows(1000)
                 .autoFlushBytes(1024 * 1024)
-                .inFlightWindowSize(16)
-                .sendQueueCapacity(32);
+                .inFlightWindowSize(16);
         Assert.assertNotNull(builder);
     }
 
@@ -525,52 +522,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testSendQueueCapacityDoubleSet_fails() {
-        assertThrows("already configured",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .asyncMode(true)
-                        .sendQueueCapacity(16)
-                        .sendQueueCapacity(32));
-    }
-
-    @Test
-    public void testSendQueueCapacityNegative_fails() {
-        assertThrows("must be positive",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .asyncMode(true)
-                        .sendQueueCapacity(-1));
-    }
-
-    @Test
-    public void testSendQueueCapacityZero_fails() {
-        assertThrows("must be positive",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .asyncMode(true)
-                        .sendQueueCapacity(0));
-    }
-
-    @Test
-    public void testSendQueueCapacity_withAsyncMode() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .asyncMode(true)
-                .sendQueueCapacity(32);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testSendQueueCapacity_withoutAsyncMode_fails() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .sendQueueCapacity(32),
-                "requires async mode");
-    }
-
-    @Test
     public void testSyncModeAutoFlushDefaults() throws Exception {
         // Regression test: sync-mode connect() must not hardcode autoFlush to 0.
         // createForTesting(host, port, windowSize) mirrors what connect(h,p,tls)
@@ -603,16 +554,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         .address(LOCALHOST)
                         .asyncMode(false)
                         .inFlightWindowSize(16),
-                "requires async mode");
-    }
-
-    @Test
-    public void testSyncModeDoesNotAllowSendQueueCapacity() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .asyncMode(false)
-                        .sendQueueCapacity(32),
                 "requires async mode");
     }
 

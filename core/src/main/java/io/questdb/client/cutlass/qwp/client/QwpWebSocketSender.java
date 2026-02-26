@@ -109,7 +109,6 @@ public class QwpWebSocketSender implements Sender {
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 500;
     public static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = InFlightWindow.DEFAULT_WINDOW_SIZE; // 8
-    public static final int DEFAULT_SEND_QUEUE_CAPACITY = WebSocketSendQueue.DEFAULT_QUEUE_CAPACITY; // 16
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
@@ -126,7 +125,6 @@ public class QwpWebSocketSender implements Sender {
     // Flow control configuration
     private final int inFlightWindowSize;
     private final int port;
-    private final int sendQueueCapacity;
     // Track schema hashes that have been sent to the server (for schema reference mode)
     // First time we send a schema: full schema. Subsequent times: 8-byte hash reference.
     // Combined key = schemaHash XOR (tableNameHash << 32) to include table name in lookup.
@@ -173,8 +171,7 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
-            int sendQueueCapacity
+            int inFlightWindowSize
     ) {
         this.host = host;
         this.port = port;
@@ -189,7 +186,6 @@ public class QwpWebSocketSender implements Sender {
         this.autoFlushBytes = autoFlushBytes;
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
         this.inFlightWindowSize = inFlightWindowSize;
-        this.sendQueueCapacity = sendQueueCapacity;
 
         // Initialize global symbol dictionary for delta encoding
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
@@ -247,7 +243,7 @@ public class QwpWebSocketSender implements Sender {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                1, 1    // window=1 for sync behavior, queue=1 (not used)
+                1   // window=1 for sync behavior
         );
         sender.ensureConnected();
         return sender;
@@ -268,7 +264,7 @@ public class QwpWebSocketSender implements Sender {
                                                   int autoFlushRows, int autoFlushBytes,
                                                   long autoFlushIntervalNanos) {
         return connectAsync(host, port, tlsEnabled, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                DEFAULT_IN_FLIGHT_WINDOW_SIZE, DEFAULT_SEND_QUEUE_CAPACITY);
+                DEFAULT_IN_FLIGHT_WINDOW_SIZE);
     }
 
     /**
@@ -281,7 +277,6 @@ public class QwpWebSocketSender implements Sender {
      * @param autoFlushBytes         bytes per batch (0 = no limit)
      * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
      * @param inFlightWindowSize     max batches awaiting server ACK (default: 8)
-     * @param sendQueueCapacity      max batches waiting to send (default: 16)
      * @return connected sender
      */
     public static QwpWebSocketSender connectAsync(
@@ -291,13 +286,12 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
-            int sendQueueCapacity
+            int inFlightWindowSize
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, sendQueueCapacity
+                inFlightWindowSize
         );
         sender.ensureConnected();
         return sender;
@@ -331,7 +325,7 @@ public class QwpWebSocketSender implements Sender {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, bufferSize,
                 0, 0, 0,
-                1, 1    // window=1 for sync behavior
+                1   // window=1 for sync behavior
         );
         // TODO: Store auth credentials for connection
         sender.ensureConnected();
@@ -353,7 +347,7 @@ public class QwpWebSocketSender implements Sender {
         return new QwpWebSocketSender(
                 host, port, false, DEFAULT_BUFFER_SIZE,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                inFlightWindowSize, DEFAULT_SEND_QUEUE_CAPACITY
+                inFlightWindowSize
         );
         // Note: does NOT call ensureConnected()
     }
@@ -367,17 +361,16 @@ public class QwpWebSocketSender implements Sender {
      * @param autoFlushBytes         bytes per batch (0 = no limit)
      * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
      * @param inFlightWindowSize     window size: 1 for sync behavior, >1 for async
-     * @param sendQueueCapacity      max batches waiting to send
      * @return unconnected sender
      */
     public static QwpWebSocketSender createForTesting(
             String host, int port,
             int autoFlushRows, int autoFlushBytes, long autoFlushIntervalNanos,
-            int inFlightWindowSize, int sendQueueCapacity) {
+            int inFlightWindowSize) {
         return new QwpWebSocketSender(
                 host, port, false, DEFAULT_BUFFER_SIZE,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, sendQueueCapacity
+                inFlightWindowSize
         );
         // Note: does NOT call ensureConnected()
     }
@@ -728,13 +721,6 @@ public class QwpWebSocketSender implements Sender {
             currentBatchMaxSymbolId = globalId;
         }
         return globalId;
-    }
-
-    /**
-     * Returns the send queue capacity.
-     */
-    public int getSendQueueCapacity() {
-        return sendQueueCapacity;
     }
 
     /**
@@ -1119,7 +1105,6 @@ public class QwpWebSocketSender implements Sender {
             // The send queue handles both sending AND receiving (single I/O thread)
             if (inFlightWindowSize > 1) {
                 sendQueue = new WebSocketSendQueue(client, inFlightWindow,
-                        sendQueueCapacity,
                         WebSocketSendQueue.DEFAULT_ENQUEUE_TIMEOUT_MS,
                         WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS);
             }

@@ -42,29 +42,29 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>
  * This class manages a dedicated I/O thread that handles both:
  * <ul>
- *   <li>Sending batches from a bounded queue</li>
+ *   <li>Sending batches via a single-slot handoff (volatile reference)</li>
  *   <li>Receiving and processing server ACK responses</li>
  * </ul>
+ * The single-slot design matches the double-buffering scheme: at most one
+ * sealed buffer is pending while the other is being filled.
  * Using a single thread eliminates concurrency issues with the WebSocket channel.
  * <p>
  * Thread safety:
  * <ul>
- *   <li>The send queue is thread-safe for concurrent access</li>
+ *   <li>The pending slot is thread-safe for concurrent access</li>
  *   <li>Only the I/O thread interacts with the WebSocket channel</li>
  *   <li>Buffer state transitions ensure safe hand-over</li>
  * </ul>
  * <p>
  * Backpressure:
  * <ul>
- *   <li>When the queue is full, {@link #enqueue} blocks</li>
+ *   <li>When the slot is occupied, {@link #enqueue} blocks</li>
  *   <li>This propagates backpressure to the user thread</li>
  * </ul>
  */
 public class WebSocketSendQueue implements QuietCloseable {
 
     public static final long DEFAULT_ENQUEUE_TIMEOUT_MS = 30_000;
-    // Default configuration
-    public static final int DEFAULT_QUEUE_CAPACITY = 16;
     public static final long DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
     private static final Logger LOG = LoggerFactory.getLogger(WebSocketSendQueue.class);
     // The WebSocket client for I/O (single-threaded access only)
@@ -113,7 +113,7 @@ public class WebSocketSendQueue implements QuietCloseable {
      * @param client the WebSocket client for I/O
      */
     public WebSocketSendQueue(WebSocketClient client) {
-        this(client, null, DEFAULT_QUEUE_CAPACITY, DEFAULT_ENQUEUE_TIMEOUT_MS, DEFAULT_SHUTDOWN_TIMEOUT_MS);
+        this(client, null, DEFAULT_ENQUEUE_TIMEOUT_MS, DEFAULT_SHUTDOWN_TIMEOUT_MS);
     }
 
     /**
@@ -123,7 +123,7 @@ public class WebSocketSendQueue implements QuietCloseable {
      * @param inFlightWindow the window to track sent batches awaiting ACK (may be null)
      */
     public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow) {
-        this(client, inFlightWindow, DEFAULT_QUEUE_CAPACITY, DEFAULT_ENQUEUE_TIMEOUT_MS, DEFAULT_SHUTDOWN_TIMEOUT_MS);
+        this(client, inFlightWindow, DEFAULT_ENQUEUE_TIMEOUT_MS, DEFAULT_SHUTDOWN_TIMEOUT_MS);
     }
 
     /**
@@ -131,17 +131,13 @@ public class WebSocketSendQueue implements QuietCloseable {
      *
      * @param client            the WebSocket client for I/O
      * @param inFlightWindow    the window to track sent batches awaiting ACK (may be null)
-     * @param queueCapacity     maximum number of pending batches
      * @param enqueueTimeoutMs  timeout for enqueue operations (ms)
      * @param shutdownTimeoutMs timeout for graceful shutdown (ms)
      */
     public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
-                              int queueCapacity, long enqueueTimeoutMs, long shutdownTimeoutMs) {
+                              long enqueueTimeoutMs, long shutdownTimeoutMs) {
         if (client == null) {
             throw new IllegalArgumentException("client cannot be null");
-        }
-        if (queueCapacity <= 0) {
-            throw new IllegalArgumentException("queueCapacity must be positive");
         }
 
         this.client = client;
@@ -157,7 +153,7 @@ public class WebSocketSendQueue implements QuietCloseable {
         this.ioThread.setDaemon(true);
         this.ioThread.start();
 
-        LOG.info("WebSocket I/O thread started [capacity={}]", queueCapacity);
+        LOG.info("WebSocket I/O thread started");
     }
 
     /**

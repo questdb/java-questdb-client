@@ -537,7 +537,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_MAX_NAME_LEN = 127;
         private static final long DEFAULT_MAX_RETRY_NANOS = TimeUnit.SECONDS.toNanos(10); // keep sync with the contract of the configuration method
         private static final long DEFAULT_MIN_REQUEST_THROUGHPUT = 100 * 1024; // 100KB/s, keep in sync with the contract of the configuration method
-        private static final int DEFAULT_SEND_QUEUE_CAPACITY = 16;
         private static final int DEFAULT_TCP_PORT = 9009;
         private static final int DEFAULT_WEBSOCKET_PORT = 9000;
         private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 1024 * 1024; // 1MB
@@ -596,7 +595,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int protocol = PARAMETER_NOT_SET_EXPLICITLY;
         private int protocolVersion = PARAMETER_NOT_SET_EXPLICITLY;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        private int sendQueueCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
@@ -878,7 +876,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
                         : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
                 int actualInFlightWindowSize = inFlightWindowSize == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_IN_FLIGHT_WINDOW_SIZE : inFlightWindowSize;
-                int actualSendQueueCapacity = sendQueueCapacity == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_SEND_QUEUE_CAPACITY : sendQueueCapacity;
 
                 if (asyncMode) {
                     return QwpWebSocketSender.connectAsync(
@@ -888,8 +885,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualAutoFlushRows,
                             actualAutoFlushBytes,
                             actualAutoFlushIntervalNanos,
-                            actualInFlightWindowSize,
-                            actualSendQueueCapacity
+                            actualInFlightWindowSize
                     );
                 } else {
                     return QwpWebSocketSender.connect(
@@ -1374,29 +1370,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
-        /**
-         * Set the capacity of the send queue for batches waiting to be sent.
-         * <br>
-         * This is only used when communicating over WebSocket transport with async mode enabled.
-         * <br>
-         * Default value is 16.
-         *
-         * @param capacity send queue capacity
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder sendQueueCapacity(int capacity) {
-            if (this.sendQueueCapacity != PARAMETER_NOT_SET_EXPLICITLY) {
-                throw new LineSenderException("send queue capacity was already configured")
-                        .put("[capacity=").put(this.sendQueueCapacity).put("]");
-            }
-            if (capacity < 1) {
-                throw new LineSenderException("send queue capacity must be positive")
-                        .put("[capacity=").put(capacity).put("]");
-            }
-            this.sendQueueCapacity = capacity;
-            return this;
-        }
-
         private static int getValue(CharSequence configurationString, int pos, StringSink sink, String name) {
             if ((pos = ConfStringParser.value(configurationString, pos, sink)) < 0) {
                 throw new LineSenderException("invalid ").put(name).put(" [error=").put(sink).put("]");
@@ -1801,9 +1774,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY && !asyncMode) {
                     throw new LineSenderException("in-flight window size requires async mode");
-                }
-                if (sendQueueCapacity != PARAMETER_NOT_SET_EXPLICITLY && !asyncMode) {
-                    throw new LineSenderException("send queue capacity requires async mode");
                 }
             } else {
                 throw new LineSenderException("unsupported protocol ")

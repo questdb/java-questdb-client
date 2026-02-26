@@ -49,7 +49,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
     public void testCachedTimestampColumnInvalidatedDuringFlush() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 0, 1, 10_000_000, 0, 1, 16
+                    "localhost", 0, 1, 10_000_000, 0, 1
             );
             try {
                 setField(sender, "connected", true);
@@ -91,7 +91,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
     public void testCachedTimestampNanosColumnInvalidatedDuringFlush() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 0, 1, 10_000_000, 0, 1, 16
+                    "localhost", 0, 1, 10_000_000, 0, 1
             );
             try {
                 setField(sender, "connected", true);
@@ -127,7 +127,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
         TestUtils.assertMemoryLeak(() -> {
             // Use high autoFlushRows to prevent auto-flush during the test
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 0, 10_000, 10_000_000, 0, 1, 16
+                    "localhost", 0, 10_000, 10_000_000, 0, 1
             );
             try {
                 // Bypass ensureConnected() — mark as connected, leave client null

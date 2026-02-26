@@ -68,7 +68,6 @@ public class StacBenchmarkClient {
     private static final int DEFAULT_IN_FLIGHT_WINDOW = 0;
     private static final int DEFAULT_REPORT_INTERVAL = 1_000_000;
     private static final int DEFAULT_ROWS = 80_000_000;
-    private static final int DEFAULT_SEND_QUEUE = 0;
     private static final String DEFAULT_TABLE = "q";
     private static final int DEFAULT_WARMUP_ROWS = 100_000;
     // Estimated row size for throughput calculation:
@@ -103,7 +102,6 @@ public class StacBenchmarkClient {
         int flushBytes = DEFAULT_FLUSH_BYTES;
         long flushIntervalMs = DEFAULT_FLUSH_INTERVAL_MS;
         int inFlightWindow = DEFAULT_IN_FLIGHT_WINDOW;
-        int sendQueue = DEFAULT_SEND_QUEUE;
         int warmupRows = DEFAULT_WARMUP_ROWS;
         int reportInterval = DEFAULT_REPORT_INTERVAL;
         String table = DEFAULT_TABLE;
@@ -128,8 +126,6 @@ public class StacBenchmarkClient {
                 flushIntervalMs = Long.parseLong(arg.substring("--flush-interval-ms=".length()));
             } else if (arg.startsWith("--in-flight-window=")) {
                 inFlightWindow = Integer.parseInt(arg.substring("--in-flight-window=".length()));
-            } else if (arg.startsWith("--send-queue=")) {
-                sendQueue = Integer.parseInt(arg.substring("--send-queue=".length()));
             } else if (arg.startsWith("--warmup=")) {
                 warmupRows = Integer.parseInt(arg.substring("--warmup=".length()));
             } else if (arg.startsWith("--report=")) {
@@ -160,7 +156,6 @@ public class StacBenchmarkClient {
         System.out.println("Flush bytes: " + (flushBytes == 0 ? "(default)" : String.format("%,d", flushBytes)));
         System.out.println("Flush interval: " + (flushIntervalMs == 0 ? "(default)" : flushIntervalMs + " ms"));
         System.out.println("In-flight window: " + (inFlightWindow == 0 ? "(default: 8)" : inFlightWindow));
-        System.out.println("Send queue: " + (sendQueue == 0 ? "(default: 16)" : sendQueue));
         System.out.println("Warmup rows: " + String.format("%,d", warmupRows));
         System.out.println("Report interval: " + String.format("%,d", reportInterval));
         System.out.println("Symbols: " + String.format("%,d", SYMBOL_COUNT) + " unique 4-letter tickers");
@@ -168,7 +163,7 @@ public class StacBenchmarkClient {
 
         try {
             runTest(protocol, host, port, table, totalRows, batchSize, flushBytes, flushIntervalMs,
-                    inFlightWindow, sendQueue, warmupRows, reportInterval);
+                    inFlightWindow, warmupRows, reportInterval);
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
@@ -178,7 +173,7 @@ public class StacBenchmarkClient {
 
     private static Sender createSender(String protocol, String host, int port,
                                        int batchSize, int flushBytes, long flushIntervalMs,
-                                       int inFlightWindow, int sendQueue) {
+                                       int inFlightWindow) {
         switch (protocol) {
             case PROTOCOL_ILP_TCP:
                 return Sender.builder(Sender.Transport.TCP)
@@ -200,7 +195,6 @@ public class StacBenchmarkClient {
                 if (flushBytes > 0) b.autoFlushBytes(flushBytes);
                 if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
                 if (inFlightWindow > 0) b.inFlightWindowSize(inFlightWindow);
-                if (sendQueue > 0) b.sendQueueCapacity(sendQueue);
                 return b.build();
             default:
                 throw new IllegalArgumentException("Unknown protocol: " + protocol +
@@ -288,12 +282,12 @@ public class StacBenchmarkClient {
 
     private static void runTest(String protocol, String host, int port, String table,
                                 int totalRows, int batchSize, int flushBytes, long flushIntervalMs,
-                                int inFlightWindow, int sendQueue,
+                                int inFlightWindow,
                                 int warmupRows, int reportInterval) throws IOException {
         System.out.println("Connecting to " + host + ":" + port + "...");
 
         try (Sender sender = createSender(protocol, host, port, batchSize, flushBytes, flushIntervalMs,
-                inFlightWindow, sendQueue)) {
+                inFlightWindow)) {
             System.out.println("Connected! Protocol: " + protocol);
             System.out.println();
 
