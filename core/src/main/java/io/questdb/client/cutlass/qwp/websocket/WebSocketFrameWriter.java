@@ -26,8 +26,6 @@ package io.questdb.client.cutlass.qwp.websocket;
 
 import io.questdb.client.std.Unsafe;
 
-import java.nio.charset.StandardCharsets;
-
 /**
  * Zero-allocation WebSocket frame writer.
  * Writes WebSocket frames according to RFC 6455.
@@ -100,78 +98,6 @@ public final class WebSocketFrameWriter {
     }
 
     /**
-     * Writes a binary frame with payload from a memory address.
-     *
-     * @param buf        the buffer to write to
-     * @param payloadPtr pointer to the payload data
-     * @param payloadLen length of payload
-     * @return the total number of bytes written
-     */
-    public static int writeBinaryFrame(long buf, long payloadPtr, int payloadLen) {
-        int headerLen = writeHeader(buf, true, WebSocketOpcode.BINARY, payloadLen, false);
-
-        // Copy payload from memory
-        Unsafe.getUnsafe().copyMemory(payloadPtr, buf + headerLen, payloadLen);
-
-        return headerLen + payloadLen;
-    }
-
-    /**
-     * Writes a binary frame header only (for when payload is written separately).
-     *
-     * @param buf        the buffer to write to
-     * @param payloadLen length of payload that will follow
-     * @return the header size in bytes
-     */
-    public static int writeBinaryFrameHeader(long buf, int payloadLen) {
-        return writeHeader(buf, true, WebSocketOpcode.BINARY, payloadLen, false);
-    }
-
-    /**
-     * Writes a complete Close frame to the buffer.
-     *
-     * @param buf    the buffer to write to
-     * @param code   the close status code
-     * @param reason the close reason (may be null)
-     * @return the total number of bytes written (header + payload)
-     */
-    public static int writeCloseFrame(long buf, int code, String reason) {
-        int payloadLen = 2; // status code
-        if (reason != null && !reason.isEmpty()) {
-            payloadLen += reason.getBytes(StandardCharsets.UTF_8).length;
-        }
-
-        int headerLen = writeHeader(buf, true, WebSocketOpcode.CLOSE, payloadLen, false);
-        int payloadOffset = writeClosePayload(buf + headerLen, code, reason);
-
-        return headerLen + payloadOffset;
-    }
-
-    /**
-     * Writes the payload for a Close frame.
-     *
-     * @param buf    the buffer to write to (after the header)
-     * @param code   the close status code
-     * @param reason the close reason (may be null)
-     * @return the number of bytes written
-     */
-    public static int writeClosePayload(long buf, int code, String reason) {
-        // Write status code in network byte order (big-endian)
-        Unsafe.getUnsafe().putShort(buf, Short.reverseBytes((short) code));
-        int offset = 2;
-
-        // Write reason if provided
-        if (reason != null && !reason.isEmpty()) {
-            byte[] reasonBytes = reason.getBytes(StandardCharsets.UTF_8);
-            for (byte reasonByte : reasonBytes) {
-                Unsafe.getUnsafe().putByte(buf + offset++, reasonByte);
-            }
-        }
-
-        return offset;
-    }
-
-    /**
      * Writes a WebSocket frame header to the buffer.
      *
      * @param buf           the buffer to write to
@@ -220,62 +146,5 @@ public final class WebSocketFrameWriter {
         int offset = writeHeader(buf, fin, opcode, payloadLength, true);
         Unsafe.getUnsafe().putInt(buf + offset, maskKey);
         return offset + 4;
-    }
-
-    /**
-     * Writes a complete Ping frame to the buffer.
-     *
-     * @param buf        the buffer to write to
-     * @param payload    the ping payload
-     * @param payloadOff offset into payload array
-     * @param payloadLen length of payload to write
-     * @return the total number of bytes written
-     */
-    public static int writePingFrame(long buf, byte[] payload, int payloadOff, int payloadLen) {
-        int headerLen = writeHeader(buf, true, WebSocketOpcode.PING, payloadLen, false);
-
-        // Copy payload
-        for (int i = 0; i < payloadLen; i++) {
-            Unsafe.getUnsafe().putByte(buf + headerLen + i, payload[payloadOff + i]);
-        }
-
-        return headerLen + payloadLen;
-    }
-
-    /**
-     * Writes a complete Pong frame to the buffer.
-     *
-     * @param buf        the buffer to write to
-     * @param payload    the pong payload (should match the received ping)
-     * @param payloadOff offset into payload array
-     * @param payloadLen length of payload to write
-     * @return the total number of bytes written
-     */
-    public static int writePongFrame(long buf, byte[] payload, int payloadOff, int payloadLen) {
-        int headerLen = writeHeader(buf, true, WebSocketOpcode.PONG, payloadLen, false);
-
-        // Copy payload
-        for (int i = 0; i < payloadLen; i++) {
-            Unsafe.getUnsafe().putByte(buf + headerLen + i, payload[payloadOff + i]);
-        }
-
-        return headerLen + payloadLen;
-    }
-
-    /**
-     * Writes a Pong frame with payload from a memory address.
-     *
-     * @param buf        the buffer to write to
-     * @param payloadPtr pointer to the ping payload to echo
-     * @param payloadLen length of payload
-     * @return the total number of bytes written
-     */
-    public static int writePongFrame(long buf, long payloadPtr, int payloadLen) {
-        int headerLen = writeHeader(buf, true, WebSocketOpcode.PONG, payloadLen, false);
-
-        // Copy payload from memory
-        Unsafe.getUnsafe().copyMemory(payloadPtr, buf + headerLen, payloadLen);
-
-        return headerLen + payloadLen;
     }
 }
