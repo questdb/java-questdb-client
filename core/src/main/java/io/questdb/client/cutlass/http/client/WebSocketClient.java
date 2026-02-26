@@ -37,7 +37,7 @@ import io.questdb.client.network.TlsSessionInitFailedException;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Misc;
 import io.questdb.client.std.QuietCloseable;
-import io.questdb.client.std.Rnd;
+import io.questdb.client.std.SecureRnd;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
 import org.slf4j.Logger;
@@ -76,7 +76,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private final int defaultTimeout;
     private final WebSocketFrameParser frameParser;
     private final int maxRecvBufSize;
-    private final Rnd rnd;
+    private final SecureRnd rnd;
     private final WebSocketSendBuffer sendBuffer;
     private boolean closed;
     private int fragmentBufPos;
@@ -116,7 +116,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         this.recvReadPos = 0;
 
         this.frameParser = new WebSocketFrameParser();
-        this.rnd = new Rnd(System.nanoTime(), System.currentTimeMillis());
+        this.rnd = new SecureRnd();
         this.upgraded = false;
         this.closed = false;
     }
@@ -405,7 +405,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         // Generate random key
         byte[] keyBytes = new byte[16];
         for (int i = 0; i < 16; i++) {
-            keyBytes[i] = (byte) rnd.nextInt(256);
+            keyBytes[i] = (byte) rnd.nextInt();
         }
         handshakeKey = Base64.getEncoder().encodeToString(keyBytes);
 
