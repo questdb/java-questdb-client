@@ -145,20 +145,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @return Builder object to create a new Sender instance.
      */
     static LineSenderBuilder builder(Transport transport) {
-        int protocol;
-        switch (transport) {
-            case HTTP:
-                protocol = LineSenderBuilder.PROTOCOL_HTTP;
-                break;
-            case TCP:
-                protocol = LineSenderBuilder.PROTOCOL_TCP;
-                break;
-            case WEBSOCKET:
-                protocol = LineSenderBuilder.PROTOCOL_WEBSOCKET;
-                break;
-            default:
-                throw new LineSenderException("unknown transport: " + transport);
-        }
+        int protocol = switch (transport) {
+            case HTTP -> LineSenderBuilder.PROTOCOL_HTTP;
+            case TCP -> LineSenderBuilder.PROTOCOL_TCP;
+            case WEBSOCKET -> LineSenderBuilder.PROTOCOL_WEBSOCKET;
+        };
         return new LineSenderBuilder(protocol);
     }
 
@@ -562,7 +553,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpToken;
-        // WebSocket-specific fields
         private int inFlightWindowSize = PARAMETER_NOT_SET_EXPLICITLY;
         private String keyId;
         private int maxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
