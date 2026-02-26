@@ -449,7 +449,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         upgrade(path, defaultTimeout);
     }
 
-    private static boolean containsHeaderValue(String response, String headerName, String expectedValue) {
+    private static boolean containsHeaderValue(String response, String headerName, String expectedValue, boolean ignoreValueCase) {
         int headerLen = headerName.length();
         int responseLen = response.length();
         for (int i = 0; i <= responseLen - headerLen; i++) {
@@ -460,7 +460,9 @@ public abstract class WebSocketClient implements QuietCloseable {
                     lineEnd = responseLen;
                 }
                 String actualValue = response.substring(valueStart, lineEnd).trim();
-                return actualValue.equals(expectedValue);
+                return ignoreValueCase
+                        ? actualValue.equalsIgnoreCase(expectedValue)
+                        : actualValue.equals(expectedValue);
             }
         }
         return false;
@@ -842,9 +844,19 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);
         }
 
-        // Verify Sec-WebSocket-Accept (case-insensitive per RFC 7230)
+        // Verify Upgrade: websocket (case-insensitive value per RFC 6455 Section 4.1)
+        if (!containsHeaderValue(response, "Upgrade:", "websocket", true)) {
+            throw new HttpClientException("Missing or invalid Upgrade header in WebSocket response");
+        }
+
+        // Verify Connection: Upgrade (case-insensitive value per RFC 6455 Section 4.1)
+        if (!containsHeaderValue(response, "Connection:", "Upgrade", true)) {
+            throw new HttpClientException("Missing or invalid Connection header in WebSocket response");
+        }
+
+        // Verify Sec-WebSocket-Accept (exact value match per RFC 6455 Section 4.1)
         String expectedAccept = WebSocketHandshake.computeAcceptKey(handshakeKey);
-        if (!containsHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept)) {
+        if (!containsHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept, false)) {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
     }
