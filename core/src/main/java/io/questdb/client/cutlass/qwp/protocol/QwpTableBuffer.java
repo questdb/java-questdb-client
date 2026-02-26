@@ -471,6 +471,10 @@ public class QwpTableBuffer implements QuietCloseable {
                 rescaleTemp.ofRaw(value.getHigh(), value.getLow());
                 rescaleTemp.setScale(value.getScale());
                 rescaleTemp.rescale(decimalScale);
+                if (!rescaleTemp.fitsInStorageSizePow2(4)) {
+                    throw new LineSenderException("Decimal128 overflow: rescaling from scale "
+                            + value.getScale() + " to " + decimalScale + " exceeds 128-bit capacity");
+                }
                 dataBuffer.putLong(rescaleTemp.getLh());
                 dataBuffer.putLong(rescaleTemp.getLl());
                 valueCount++;
@@ -518,6 +522,10 @@ public class QwpTableBuffer implements QuietCloseable {
                 rescaleTemp.ofRaw(value.getValue());
                 rescaleTemp.setScale(value.getScale());
                 rescaleTemp.rescale(decimalScale);
+                if (!rescaleTemp.fitsInStorageSizePow2(3)) {
+                    throw new LineSenderException("Decimal64 overflow: rescaling from scale "
+                            + value.getScale() + " to " + decimalScale + " exceeds 64-bit capacity");
+                }
                 dataBuffer.putLong(rescaleTemp.getLl());
             } else {
                 dataBuffer.putLong(value.getValue());

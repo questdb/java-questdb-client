@@ -24,15 +24,56 @@
 
 package io.questdb.client.test.cutlass.qwp.protocol;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.Decimal128;
+import io.questdb.client.std.Decimal64;
 import org.junit.Test;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
 
 public class QwpTableBufferTest {
+
+    @Test
+    public void testAddDecimal128RescaleOverflow() {
+        try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+            QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL128, true);
+            // First row sets decimalScale = 10
+            col.addDecimal128(Decimal128.fromLong(1, 10));
+            table.nextRow();
+            // Second row at scale 0 with a large value — rescaling to scale 10
+            // multiplies by 10^10, which exceeds 128-bit capacity
+            try {
+                col.addDecimal128(new Decimal128(Long.MAX_VALUE / 2, Long.MAX_VALUE, 0));
+                fail("Expected LineSenderException for 128-bit overflow");
+            } catch (LineSenderException e) {
+                assertEquals("Decimal128 overflow: rescaling from scale 0 to 10 exceeds 128-bit capacity", e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void testAddDecimal64RescaleOverflow() {
+        try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+            QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL64, true);
+            // First row sets decimalScale = 5
+            col.addDecimal64(Decimal64.fromLong(1, 5));
+            table.nextRow();
+            // Second row at scale 0 with a large value — rescaling to scale 5
+            // multiplies by 10^5 = 100_000, which exceeds 64-bit capacity
+            // Long.MAX_VALUE / 10 ≈ 9.2 * 10^17, * 10^5 ≈ 9.2 * 10^22 >> 2^63
+            try {
+                col.addDecimal64(Decimal64.fromLong(Long.MAX_VALUE / 10, 0));
+                fail("Expected LineSenderException for 64-bit overflow");
+            } catch (LineSenderException e) {
+                assertEquals("Decimal64 overflow: rescaling from scale 0 to 5 exceeds 64-bit capacity", e.getMessage());
+            }
+        }
+    }
 
     @Test
     public void testAddDoubleArrayNullOnNonNullableColumn() {
