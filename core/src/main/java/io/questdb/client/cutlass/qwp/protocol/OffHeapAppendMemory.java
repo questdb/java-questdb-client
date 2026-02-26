@@ -83,6 +83,7 @@ public class OffHeapAppendMemory implements QuietCloseable {
      * Used for truncateTo operations on column buffers.
      */
     public void jumpTo(long offset) {
+        assert offset >= 0 && offset <= getAppendOffset();
         appendAddress = pageAddress + offset;
     }
 
