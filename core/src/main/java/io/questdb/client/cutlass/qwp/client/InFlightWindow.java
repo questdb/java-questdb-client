@@ -28,6 +28,8 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
@@ -63,6 +65,18 @@ public class InFlightWindow {
     private static final long PARK_NANOS = 100_000; // 100 microseconds
     // Spin parameters
     private static final int SPIN_TRIES = 100;
+    private static final VarHandle TOTAL_ACKED;
+    private static final VarHandle TOTAL_FAILED;
+
+    static {
+        try {
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            TOTAL_ACKED = lookup.findVarHandle(InFlightWindow.class, "totalAcked", long.class);
+            TOTAL_FAILED = lookup.findVarHandle(InFlightWindow.class, "totalFailed", long.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
     // Error state
     private final AtomicReference<Throwable> lastError = new AtomicReference<>();
     private final int maxWindowSize;
@@ -73,9 +87,9 @@ public class InFlightWindow {
     // Core state
     // highestSent: the sequence number of the last batch added to the window
     private volatile long highestSent = -1;
-    // Statistics (not strictly accurate under contention, but good enough for monitoring)
-    private volatile long totalAcked = 0;
-    private volatile long totalFailed = 0;
+    // Statistics — updated atomically via VarHandle
+    private long totalAcked = 0;
+    private long totalFailed = 0;
     // Thread waiting for empty (flush thread)
     private volatile Thread waitingForEmpty;
     // Thread waiting for space (sender thread)
@@ -145,7 +159,7 @@ public class InFlightWindow {
         highestAcked = effectiveSequence;
 
         int acknowledged = (int) (effectiveSequence - prevAcked);
-        totalAcked += acknowledged;
+        TOTAL_ACKED.getAndAdd(this, (long) acknowledged);
 
         LOG.debug("Cumulative ACK [upTo={}, acknowledged={}, remaining={}]", sequence, acknowledged, getInFlightCount());
 
@@ -298,7 +312,7 @@ public class InFlightWindow {
     public void fail(long batchId, Throwable error) {
         this.failedBatchId = batchId;
         this.lastError.set(error);
-        totalFailed++;
+        TOTAL_FAILED.getAndAdd(this, 1L);
 
         LOG.error("Batch failed [batchId={}, error={}]", batchId, String.valueOf(error));
 
@@ -320,7 +334,7 @@ public class InFlightWindow {
 
         this.failedBatchId = sent;
         this.lastError.set(error);
-        totalFailed += Math.max(1, inFlight);
+        TOTAL_FAILED.getAndAdd(this, Math.max(1L, inFlight));
 
         LOG.error("All in-flight batches failed [inFlight={}, error={}]", inFlight, String.valueOf(error));
 
@@ -356,14 +370,14 @@ public class InFlightWindow {
      * Returns the total number of batches acknowledged.
      */
     public long getTotalAcked() {
-        return totalAcked;
+        return (long) TOTAL_ACKED.getOpaque(this);
     }
 
     /**
      * Returns the total number of batches that failed.
      */
     public long getTotalFailed() {
-        return totalFailed;
+        return (long) TOTAL_FAILED.getOpaque(this);
     }
 
     /**
