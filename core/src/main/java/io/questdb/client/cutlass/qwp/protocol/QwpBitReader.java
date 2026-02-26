@@ -63,70 +63,6 @@ public class QwpBitReader {
     }
 
     /**
-     * Aligns the reader to the next byte boundary by skipping any partial bits.
-     *
-     * @throws IllegalStateException if alignment fails
-     */
-    public void alignToByte() {
-        int remainder = (int) (totalBitsRead % 8);
-        if (remainder != 0) {
-            skipBits(8 - remainder);
-        }
-    }
-
-    /**
-     * Returns the number of bits remaining to be read.
-     *
-     * @return available bits
-     */
-    public long getAvailableBits() {
-        return totalBitsAvailable - totalBitsRead;
-    }
-
-    /**
-     * Returns the current position in bits from the start.
-     *
-     * @return bits read since reset
-     */
-    public long getBitPosition() {
-        return totalBitsRead;
-    }
-
-    /**
-     * Returns the current byte address being read.
-     * Note: This is approximate due to bit buffering.
-     *
-     * @return current address
-     */
-    public long getCurrentAddress() {
-        return currentAddress;
-    }
-
-    /**
-     * Returns true if there are more bits to read.
-     *
-     * @return true if bits available
-     */
-    public boolean hasMoreBits() {
-        return totalBitsRead < totalBitsAvailable;
-    }
-
-    /**
-     * Peeks at the next bit without consuming it.
-     *
-     * @return 0 or 1, or -1 if no more bits
-     */
-    public int peekBit() {
-        if (totalBitsRead >= totalBitsAvailable) {
-            return -1;
-        }
-        if (!ensureBits(1)) {
-            return -1;
-        }
-        return (int) (bitBuffer & 1);
-    }
-
-    /**
      * Reads a single bit.
      *
      * @return 0 or 1
@@ -194,16 +130,6 @@ public class QwpBitReader {
     }
 
     /**
-     * Reads a complete byte, ensuring byte alignment first.
-     *
-     * @return the byte value (0-255)
-     * @throws IllegalStateException if not enough data
-     */
-    public int readByte() {
-        return (int) readBits(8) & 0xFF;
-    }
-
-    /**
      * Reads a complete 32-bit integer in little-endian order.
      *
      * @return the integer value
@@ -211,16 +137,6 @@ public class QwpBitReader {
      */
     public int readInt() {
         return (int) readBits(32);
-    }
-
-    /**
-     * Reads a complete 64-bit long in little-endian order.
-     *
-     * @return the long value
-     * @throws IllegalStateException if not enough data
-     */
-    public long readLong() {
-        return readBits(64);
     }
 
     /**
@@ -253,59 +169,6 @@ public class QwpBitReader {
         this.bitsInBuffer = 0;
         this.totalBitsAvailable = length * 8L;
         this.totalBitsRead = 0;
-    }
-
-    /**
-     * Resets the reader to read from the specified byte array.
-     *
-     * @param buf    the byte array
-     * @param offset the starting offset
-     * @param length the number of bytes available
-     */
-    public void reset(byte[] buf, int offset, int length) {
-        // For byte array, we'll store position info differently
-        // This is mainly for testing - in production we use direct memory
-        throw new UnsupportedOperationException("Use direct memory version");
-    }
-
-    /**
-     * Skips the specified number of bits.
-     *
-     * @param numBits bits to skip
-     * @throws IllegalStateException if not enough bits available
-     */
-    public void skipBits(int numBits) {
-        if (totalBitsRead + numBits > totalBitsAvailable) {
-            throw new IllegalStateException("bit read overflow");
-        }
-
-        // Fast path: skip bits in current buffer
-        if (numBits <= bitsInBuffer) {
-            bitBuffer >>>= numBits;
-            bitsInBuffer -= numBits;
-            totalBitsRead += numBits;
-            return;
-        }
-
-        // Consume all buffered bits
-        int bitsToSkip = numBits - bitsInBuffer;
-        totalBitsRead += bitsInBuffer;
-        bitsInBuffer = 0;
-        bitBuffer = 0;
-
-        // Skip whole bytes
-        int bytesToSkip = bitsToSkip / 8;
-        currentAddress += bytesToSkip;
-        totalBitsRead += bytesToSkip * 8L;
-
-        // Handle remaining bits
-        int remainingBits = bitsToSkip % 8;
-        if (remainingBits > 0) {
-            ensureBits(remainingBits);
-            bitBuffer >>>= remainingBits;
-            bitsInBuffer -= remainingBits;
-            totalBitsRead += remainingBits;
-        }
     }
 
     /**
