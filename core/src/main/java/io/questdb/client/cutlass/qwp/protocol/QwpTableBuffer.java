@@ -787,13 +787,6 @@ public class QwpTableBuffer implements QuietCloseable {
             if (nullable) {
                 ensureNullCapacity(size + 1);
                 markNull(size);
-                // GEOHASH uses dense wire format: all rows (including nulls)
-                // occupy space in the values array. Write a placeholder value
-                // so the data buffer stays aligned with the row index.
-                if (type == TYPE_GEOHASH) {
-                    dataBuffer.putLong(0L);
-                    valueCount++;
-                }
                 size++;
             } else {
                 // For non-nullable columns, store a sentinel/default value
