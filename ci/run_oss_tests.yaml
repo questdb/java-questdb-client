@@ -1,7 +1,7 @@
 # Run the tests from OSS using the current client version
 steps:
   - task: Maven@3
-    displayName: "Run OSS line tests"
+    displayName: "Run server line tests"
     inputs:
       mavenPOMFile: "questdb/pom.xml"
       jdkVersionOption: "default"
