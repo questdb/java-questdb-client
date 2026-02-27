@@ -612,8 +612,9 @@ public class InFlightWindowTest {
                     if (highest > lastAcked) {
                         window.acknowledgeUpTo(highest);
                         lastAcked = highest;
+                    } else {
+                        Thread.sleep(1);
                     }
-                    // No sleep - maximum contention
                 }
             } catch (Throwable t) {
                 error.set(t);
