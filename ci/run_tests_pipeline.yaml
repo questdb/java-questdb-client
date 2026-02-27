@@ -90,8 +90,9 @@ stages:
               goals: "install"
               options: "-DskipTests --batch-mode"
           - bash: |
-              sed -i 's|<questdb.client.version>.*</questdb.client.version>|<questdb.client.version>9.9.9</questdb.client.version>|' \
+              sed -i.bak 's|<questdb.client.version>.*</questdb.client.version>|<questdb.client.version>9.9.9</questdb.client.version>|' \
                 questdb/core/pom.xml questdb/benchmarks/pom.xml questdb/utils/pom.xml
+              rm -f questdb/core/pom.xml.bak questdb/benchmarks/pom.xml.bak questdb/utils/pom.xml.bak
             displayName: "Update QuestDB client version to 9.9.9"
           - task: Maven@3
             displayName: "Compile QuestDB"
