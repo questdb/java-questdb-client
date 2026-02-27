@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.network.PlainSocketFactory;
 import org.junit.Assert;
 import org.junit.Test;
@@ -118,6 +119,30 @@ public class QwpWebSocketSenderTest {
             Assert.fail("Expected LineSenderException");
         } catch (LineSenderException e) {
             Assert.assertTrue(e.getMessage().contains("closed"));
+        }
+    }
+
+    @Test
+    public void testCancelRowDiscardsPartialRow() {
+        try (QwpWebSocketSender sender = createUnconnectedSender()) {
+            sender.table("test");
+            sender.longColumn("x", 1);
+            sender.boolColumn("y", true);
+
+            // Row is not yet committed (no at/atNow call), cancel it
+            sender.cancelRow();
+
+            // Buffer should have no committed rows
+            QwpTableBuffer buf = sender.getTableBuffer("test");
+            Assert.assertEquals(0, buf.getRowCount());
+        }
+    }
+
+    @Test
+    public void testCancelRowNoOpWithoutTable() {
+        try (QwpWebSocketSender sender = createUnconnectedSender()) {
+            // cancelRow without table() should be a no-op (no NPE)
+            sender.cancelRow();
         }
     }
 
