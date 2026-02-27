@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.line;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;

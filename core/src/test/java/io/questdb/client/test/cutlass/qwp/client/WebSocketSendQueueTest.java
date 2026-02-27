@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
 import java.util.concurrent.CountDownLatch;
@@ -46,211 +47,223 @@ import static org.junit.Assert.*;
 public class WebSocketSendQueueTest {
 
     @Test
-    public void testEnqueueTimeoutWhenPendingSlotOccupied() {
-        InFlightWindow window = new InFlightWindow(1, 1_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
-        MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
-        WebSocketSendQueue queue = null;
-
-        try {
-            // Keep window full so I/O thread cannot drain pending slot.
-            window.addInFlight(0);
-            queue = new WebSocketSendQueue(client, window, 100, 500);
-            queue.enqueue(batch0);
+    public void testEnqueueTimeoutWhenPendingSlotOccupied() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(1, 1_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
+            MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
+            WebSocketSendQueue queue = null;
 
             try {
-                queue.enqueue(batch1);
-                fail("Expected enqueue timeout");
-            } catch (LineSenderException e) {
-                assertTrue(e.getMessage().contains("Enqueue timeout"));
+                // Keep window full so I/O thread cannot drain pending slot.
+                window.addInFlight(0);
+                queue = new WebSocketSendQueue(client, window, 100, 500);
+                queue.enqueue(batch0);
+
+                try {
+                    queue.enqueue(batch1);
+                    fail("Expected enqueue timeout");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Enqueue timeout"));
+                }
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+                batch0.close();
+                batch1.close();
+                client.close();
             }
-        } finally {
-            window.acknowledgeUpTo(Long.MAX_VALUE);
-            closeQuietly(queue);
-            batch0.close();
-            batch1.close();
-            client.close();
-        }
+        });
     }
 
     @Test
     public void testEnqueueWaitsUntilSlotAvailable() throws Exception {
-        InFlightWindow window = new InFlightWindow(1, 1_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
-        MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
-        WebSocketSendQueue queue = null;
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(1, 1_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
+            MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
+            WebSocketSendQueue queue = null;
 
-        try {
-            window.addInFlight(0);
-            queue = new WebSocketSendQueue(client, window, 2_000, 500);
-            final WebSocketSendQueue finalQueue = queue;
-            queue.enqueue(batch0);
+            try {
+                window.addInFlight(0);
+                queue = new WebSocketSendQueue(client, window, 2_000, 500);
+                final WebSocketSendQueue finalQueue = queue;
+                queue.enqueue(batch0);
 
-            CountDownLatch started = new CountDownLatch(1);
-            CountDownLatch finished = new CountDownLatch(1);
-            AtomicReference<Throwable> errorRef = new AtomicReference<>();
+                CountDownLatch started = new CountDownLatch(1);
+                CountDownLatch finished = new CountDownLatch(1);
+                AtomicReference<Throwable> errorRef = new AtomicReference<>();
 
-            Thread t = new Thread(() -> {
-                started.countDown();
-                try {
-                    finalQueue.enqueue(batch1);
-                } catch (Throwable t1) {
-                    errorRef.set(t1);
-                } finally {
-                    finished.countDown();
-                }
-            });
-            t.start();
+                Thread t = new Thread(() -> {
+                    started.countDown();
+                    try {
+                        finalQueue.enqueue(batch1);
+                    } catch (Throwable t1) {
+                        errorRef.set(t1);
+                    } finally {
+                        finished.countDown();
+                    }
+                });
+                t.start();
 
-            assertTrue(started.await(1, TimeUnit.SECONDS));
-            Thread.sleep(100);
-            assertEquals("Second enqueue should still be waiting", 1, finished.getCount());
+                assertTrue(started.await(1, TimeUnit.SECONDS));
+                Thread.sleep(100);
+                assertEquals("Second enqueue should still be waiting", 1, finished.getCount());
 
-            // Free space so I/O thread can poll pending slot.
-            window.acknowledgeUpTo(0);
+                // Free space so I/O thread can poll pending slot.
+                window.acknowledgeUpTo(0);
 
-            assertTrue("Second enqueue should complete", finished.await(2, TimeUnit.SECONDS));
-            assertNull(errorRef.get());
-        } finally {
-            window.acknowledgeUpTo(Long.MAX_VALUE);
-            closeQuietly(queue);
-            batch0.close();
-            batch1.close();
-            client.close();
-        }
+                assertTrue("Second enqueue should complete", finished.await(2, TimeUnit.SECONDS));
+                assertNull(errorRef.get());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+                batch0.close();
+                batch1.close();
+                client.close();
+            }
+        });
     }
 
     @Test
     public void testFlushFailsOnInvalidAckPayload() throws Exception {
-        InFlightWindow window = new InFlightWindow(8, 5_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        WebSocketSendQueue queue = null;
-        CountDownLatch payloadDelivered = new CountDownLatch(1);
-        AtomicBoolean fired = new AtomicBoolean(false);
-
-        try {
-            window.addInFlight(0);
-            client.setTryReceiveBehavior(handler -> {
-                if (fired.compareAndSet(false, true)) {
-                    emitBinary(handler, new byte[]{1, 2, 3});
-                    payloadDelivered.countDown();
-                    return true;
-                }
-                return false;
-            });
-
-            queue = new WebSocketSendQueue(client, window, 1_000, 500);
-            assertTrue("Expected invalid payload callback", payloadDelivered.await(2, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            WebSocketSendQueue queue = null;
+            CountDownLatch payloadDelivered = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean(false);
 
             try {
-                queue.flush();
-                fail("Expected flush failure on invalid payload");
-            } catch (LineSenderException e) {
-                assertTrue(e.getMessage().contains("Invalid ACK response payload"));
+                window.addInFlight(0);
+                client.setTryReceiveBehavior(handler -> {
+                    if (fired.compareAndSet(false, true)) {
+                        emitBinary(handler, new byte[]{1, 2, 3});
+                        payloadDelivered.countDown();
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue("Expected invalid payload callback", payloadDelivered.await(2, TimeUnit.SECONDS));
+
+                try {
+                    queue.flush();
+                    fail("Expected flush failure on invalid payload");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Invalid ACK response payload"));
+                }
+            } finally {
+                closeQuietly(queue);
+                client.close();
             }
-        } finally {
-            closeQuietly(queue);
-            client.close();
-        }
+        });
     }
 
     @Test
     public void testFlushFailsOnReceiveIoError() throws Exception {
-        InFlightWindow window = new InFlightWindow(8, 5_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        WebSocketSendQueue queue = null;
-        CountDownLatch receiveAttempted = new CountDownLatch(1);
-
-        try {
-            window.addInFlight(0);
-            client.setTryReceiveBehavior(handler -> {
-                receiveAttempted.countDown();
-                throw new RuntimeException("recv-fail");
-            });
-
-            queue = new WebSocketSendQueue(client, window, 1_000, 500);
-            assertTrue("Expected receive attempt", receiveAttempted.await(2, TimeUnit.SECONDS));
-            long deadline = System.currentTimeMillis() + 2_000;
-            while (queue.getLastError() == null && System.currentTimeMillis() < deadline) {
-                Thread.sleep(5);
-            }
-            assertNotNull("Expected queue error after receive failure", queue.getLastError());
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            WebSocketSendQueue queue = null;
+            CountDownLatch receiveAttempted = new CountDownLatch(1);
 
             try {
-                queue.flush();
-                fail("Expected flush failure after receive error");
-            } catch (LineSenderException e) {
-                assertTrue(e.getMessage().contains("Error receiving response"));
+                window.addInFlight(0);
+                client.setTryReceiveBehavior(handler -> {
+                    receiveAttempted.countDown();
+                    throw new RuntimeException("recv-fail");
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue("Expected receive attempt", receiveAttempted.await(2, TimeUnit.SECONDS));
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (queue.getLastError() == null && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                assertNotNull("Expected queue error after receive failure", queue.getLastError());
+
+                try {
+                    queue.flush();
+                    fail("Expected flush failure after receive error");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Error receiving response"));
+                }
+            } finally {
+                closeQuietly(queue);
+                client.close();
             }
-        } finally {
-            closeQuietly(queue);
-            client.close();
-        }
+        });
     }
 
     @Test
-    public void testFlushFailsOnSendIoError() {
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        MicrobatchBuffer batch = sealedBuffer((byte) 42);
-        WebSocketSendQueue queue = null;
-
-        try {
-            client.setSendBehavior((dataPtr, length) -> {
-                throw new RuntimeException("send-fail");
-            });
-            queue = new WebSocketSendQueue(client, null, 1_000, 500);
-            queue.enqueue(batch);
+    public void testFlushFailsOnSendIoError() throws Exception {
+        assertMemoryLeak(() -> {
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            MicrobatchBuffer batch = sealedBuffer((byte) 42);
+            WebSocketSendQueue queue = null;
 
             try {
-                queue.flush();
-                fail("Expected flush failure after send error");
-            } catch (LineSenderException e) {
-                assertTrue(
-                        e.getMessage().contains("Error sending batch")
-                                || e.getMessage().contains("Error in send queue I/O thread")
-                );
+                client.setSendBehavior((dataPtr, length) -> {
+                    throw new RuntimeException("send-fail");
+                });
+                queue = new WebSocketSendQueue(client, null, 1_000, 500);
+                queue.enqueue(batch);
+
+                try {
+                    queue.flush();
+                    fail("Expected flush failure after send error");
+                } catch (LineSenderException e) {
+                    assertTrue(
+                            e.getMessage().contains("Error sending batch")
+                                    || e.getMessage().contains("Error in send queue I/O thread")
+                    );
+                }
+            } finally {
+                closeQuietly(queue);
+                batch.close();
+                client.close();
             }
-        } finally {
-            closeQuietly(queue);
-            batch.close();
-            client.close();
-        }
+        });
     }
 
     @Test
     public void testFlushFailsWhenServerClosesConnection() throws Exception {
-        InFlightWindow window = new InFlightWindow(8, 5_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        WebSocketSendQueue queue = null;
-        CountDownLatch closeDelivered = new CountDownLatch(1);
-        AtomicBoolean fired = new AtomicBoolean(false);
-
-        try {
-            window.addInFlight(0);
-            client.setTryReceiveBehavior(handler -> {
-                if (fired.compareAndSet(false, true)) {
-                    handler.onClose(1006, "boom");
-                    closeDelivered.countDown();
-                    return true;
-                }
-                return false;
-            });
-
-            queue = new WebSocketSendQueue(client, window, 1_000, 500);
-            assertTrue("Expected close callback", closeDelivered.await(2, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            WebSocketSendQueue queue = null;
+            CountDownLatch closeDelivered = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean(false);
 
             try {
-                queue.flush();
-                fail("Expected flush failure after close");
-            } catch (LineSenderException e) {
-                assertTrue(e.getMessage().contains("closed"));
+                window.addInFlight(0);
+                client.setTryReceiveBehavior(handler -> {
+                    if (fired.compareAndSet(false, true)) {
+                        handler.onClose(1006, "boom");
+                        closeDelivered.countDown();
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue("Expected close callback", closeDelivered.await(2, TimeUnit.SECONDS));
+
+                try {
+                    queue.flush();
+                    fail("Expected flush failure after close");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("closed"));
+                }
+            } finally {
+                closeQuietly(queue);
+                client.close();
             }
-        } finally {
-            closeQuietly(queue);
-            client.close();
-        }
+        });
     }
 
     private static void closeQuietly(WebSocketSendQueue queue) {

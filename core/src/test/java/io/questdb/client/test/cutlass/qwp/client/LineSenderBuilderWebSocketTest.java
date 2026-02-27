@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.AbstractTest;
 import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -243,25 +244,29 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testBuilderWithWebSocketTransportCreatesCorrectSenderType() throws Exception {
-        int port;
-        try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
-            port = s.getLocalPort();
-        }
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST + ":" + port),
-                "connect", "Failed"
-        );
+        assertMemoryLeak(() -> {
+            int port;
+            try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
+                port = s.getLocalPort();
+            }
+            assertThrowsAny(
+                    Sender.builder(Sender.Transport.WEBSOCKET)
+                            .address(LOCALHOST + ":" + port),
+                    "connect", "Failed"
+            );
+        });
     }
 
     @Test
     public void testConnectionRefused() throws Exception {
-        int port = findUnusedPort();
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST + ":" + port),
-                "connect", "Failed"
-        );
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertThrowsAny(
+                    Sender.builder(Sender.Transport.WEBSOCKET)
+                            .address(LOCALHOST + ":" + port),
+                    "connect", "Failed"
+            );
+        });
     }
 
     @Test
@@ -283,12 +288,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testDnsResolutionFailure() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address("this-domain-does-not-exist-i-hope-better-to-use-a-silly-tld.silly-tld:9000"),
-                "resolve", "connect", "Failed"
-        );
+    public void testDnsResolutionFailure() throws Exception {
+        assertMemoryLeak(() -> {
+            assertThrowsAny(
+                    Sender.builder(Sender.Transport.WEBSOCKET)
+                            .address("this-domain-does-not-exist-i-hope-better-to-use-a-silly-tld.silly-tld:9000"),
+                    "resolve", "connect", "Failed"
+            );
+        });
     }
 
     @Test
@@ -526,7 +533,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // Regression test: sync-mode connect() must not hardcode autoFlush to 0.
         // createForTesting(host, port, windowSize) mirrors what connect(h,p,tls)
         // creates internally. Verify it uses sensible defaults.
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
             try {
                 Assert.assertEquals(
@@ -629,25 +636,31 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testWsConfigString() throws Exception {
-        int port = findUnusedPort();
-        assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
+        });
     }
 
     @Test
     public void testWsConfigString_missingAddr_fails() throws Exception {
-        int port = findUnusedPort();
-        assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
-        assertBadConfig("ws::foo=bar;", "addr is missing");
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
+            assertBadConfig("ws::foo=bar;", "addr is missing");
+        });
     }
 
     @Test
     public void testWsConfigString_protocolAlreadyConfigured_fails() throws Exception {
-        int port = findUnusedPort();
-        assertThrowsAny(
-                Sender.builder("ws::addr=localhost:" + port + ";")
-                        .enableTls(),
-                "TLS", "connect", "Failed"
-        );
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertThrowsAny(
+                    Sender.builder("ws::addr=localhost:" + port + ";")
+                            .enableTls(),
+                    "TLS", "connect", "Failed"
+            );
+        });
     }
 
     @Test
@@ -668,8 +681,10 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWssConfigString() {
-        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;", "connect", "Failed", "SSL");
+    public void testWssConfigString() throws Exception {
+        assertMemoryLeak(() -> {
+            assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;", "connect", "Failed", "SSL");
+        });
     }
 
     @Test

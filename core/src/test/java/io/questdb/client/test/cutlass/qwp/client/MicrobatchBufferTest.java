@@ -27,7 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -45,7 +45,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testAwaitRecycled() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.markSending();
@@ -74,7 +74,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testAwaitRecycledWithTimeout() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.markSending();
@@ -94,7 +94,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testBatchIdIncrementsOnReset() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 long id1 = buffer.getBatchId();
 
@@ -205,7 +205,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testConcurrentStateTransitions() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 AtomicReference<Throwable> error = new AtomicReference<>();
                 CountDownLatch userDone = new CountDownLatch(1);
@@ -261,7 +261,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testConstructionWithCustomThresholds() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 100, 4096, 1_000_000_000L)) {
                 Assert.assertEquals(1024, buffer.getBufferCapacity());
                 Assert.assertTrue(buffer.isFilling());
@@ -271,7 +271,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testConstructionWithDefaultThresholds() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 Assert.assertEquals(1024, buffer.getBufferCapacity());
                 Assert.assertEquals(0, buffer.getBufferPos());
@@ -284,7 +284,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalArgumentException.class)
     public void testConstructionWithNegativeCapacity() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer ignored = new MicrobatchBuffer(-1)) {
                 Assert.fail("Should have thrown");
             }
@@ -293,7 +293,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalArgumentException.class)
     public void testConstructionWithZeroCapacity() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer ignored = new MicrobatchBuffer(0)) {
                 Assert.fail("Should have thrown");
             }
@@ -302,7 +302,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testEnsureCapacityGrows() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.ensureCapacity(2000);
                 Assert.assertTrue(buffer.getBufferCapacity() >= 2000);
@@ -312,7 +312,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testEnsureCapacityNoGrowth() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.ensureCapacity(512);
                 Assert.assertEquals(1024, buffer.getBufferCapacity()); // No change
@@ -322,7 +322,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testFirstRowTimeIsRecorded() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 Assert.assertEquals(0, buffer.getAgeNanos());
 
@@ -340,7 +340,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testFullStateLifecycle() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 // FILLING
                 Assert.assertTrue(buffer.isFilling());
@@ -369,7 +369,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testIncrementRowCount() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 Assert.assertEquals(0, buffer.getRowCount());
                 buffer.incrementRowCount();
@@ -382,7 +382,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalStateException.class)
     public void testIncrementRowCountWhenSealed() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.incrementRowCount(); // Should throw
@@ -392,7 +392,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testInitialState() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 Assert.assertEquals(MicrobatchBuffer.STATE_FILLING, buffer.getState());
                 Assert.assertTrue(buffer.isFilling());
@@ -406,7 +406,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testMarkRecycledTransition() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.markSending();
@@ -421,7 +421,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalStateException.class)
     public void testMarkRecycledWhenNotSending() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.markRecycled(); // Should throw - not sending
@@ -431,7 +431,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testMarkSendingTransition() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.markSending();
@@ -445,7 +445,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalStateException.class)
     public void testMarkSendingWhenNotSealed() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.markSending(); // Should throw - not sealed
             }
@@ -454,7 +454,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testResetFromRecycled() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.writeByte((byte) 1);
                 buffer.incrementRowCount();
@@ -475,7 +475,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalStateException.class)
     public void testResetWhenSealed() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.reset(); // Should throw
@@ -485,7 +485,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalStateException.class)
     public void testResetWhenSending() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.markSending();
@@ -496,7 +496,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testRollbackSealForRetry() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.writeByte((byte) 1);
                 buffer.incrementRowCount();
@@ -518,7 +518,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalStateException.class)
     public void testRollbackSealWhenNotSealed() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.rollbackSealForRetry(); // Should throw - not sealed
             }
@@ -527,7 +527,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testSealTransition() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.writeByte((byte) 1);
                 buffer.seal();
@@ -542,7 +542,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalStateException.class)
     public void testSealWhenNotFilling() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.seal(); // Should throw
@@ -552,7 +552,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testSetBufferPos() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.setBufferPos(100);
                 Assert.assertEquals(100, buffer.getBufferPos());
@@ -562,7 +562,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalArgumentException.class)
     public void testSetBufferPosNegative() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.setBufferPos(-1);
             }
@@ -571,7 +571,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalArgumentException.class)
     public void testSetBufferPosOutOfBounds() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.setBufferPos(2000);
             }
@@ -580,7 +580,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testShouldFlushAgeLimit() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             // 50ms timeout
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 0, 0, 50_000_000L)) {
                 buffer.writeByte((byte) 1);
@@ -597,7 +597,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testShouldFlushByteLimit() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 0, 10, 0)) {
                 for (int i = 0; i < 9; i++) {
                     buffer.writeByte((byte) i);
@@ -614,7 +614,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testShouldFlushEmptyBuffer() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 1, 1, 1)) {
                 Assert.assertFalse(buffer.shouldFlush()); // Empty buffer never flushes
             }
@@ -623,7 +623,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testShouldFlushRowLimit() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 5, 0, 0)) {
                 for (int i = 0; i < 4; i++) {
                     buffer.writeByte((byte) i);
@@ -640,7 +640,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testShouldFlushWithNoThresholds() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.writeByte((byte) 1);
                 buffer.incrementRowCount();
@@ -660,7 +660,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testToString() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.writeByte((byte) 1);
                 buffer.incrementRowCount();
@@ -676,7 +676,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testWriteBeyondInitialCapacity() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(16)) {
                 // Write more than initial capacity
                 for (int i = 0; i < 100; i++) {
@@ -696,7 +696,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testWriteByte() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.writeByte((byte) 0x42);
                 Assert.assertEquals(1, buffer.getBufferPos());
@@ -710,7 +710,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testWriteFromNativeMemory() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             long src = Unsafe.malloc(10, MemoryTag.NATIVE_DEFAULT);
             try {
                 // Fill source with test data
@@ -736,7 +736,7 @@ public class MicrobatchBufferTest {
 
     @Test
     public void testWriteMultipleBytes() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 for (int i = 0; i < 100; i++) {
                     buffer.writeByte((byte) i);
@@ -754,7 +754,7 @@ public class MicrobatchBufferTest {
 
     @Test(expected = IllegalStateException.class)
     public void testWriteWhenSealed() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.seal();
                 buffer.writeByte((byte) 1); // Should throw

@@ -27,7 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.AbstractTest;
-import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -43,7 +43,7 @@ public class QwpDeltaDictRollbackTest extends AbstractTest {
 
     @Test
     public void testSyncFlushFailureDoesNotAdvanceMaxSentSymbolId() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             // Sync mode (window=1), not connected to any server
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
             try {

@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.http.client;
 
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
 import io.questdb.client.std.Unsafe;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -33,14 +34,16 @@ import static org.junit.Assert.assertEquals;
 public class WebSocketSendBufferTest {
 
     @Test
-    public void testPutUtf8InvalidSurrogatePair() {
-        try (WebSocketSendBuffer buf = new WebSocketSendBuffer(256)) {
-            // High surrogate \uD800 followed by non-low-surrogate 'X'.
-            // Should produce '?' for the lone high surrogate, then 'X'.
-            buf.putUtf8("\uD800X");
-            assertEquals(2, buf.getWritePos());
-            assertEquals((byte) '?', Unsafe.getUnsafe().getByte(buf.getBufferPtr()));
-            assertEquals((byte) 'X', Unsafe.getUnsafe().getByte(buf.getBufferPtr() + 1));
-        }
+    public void testPutUtf8InvalidSurrogatePair() throws Exception {
+        assertMemoryLeak(() -> {
+            try (WebSocketSendBuffer buf = new WebSocketSendBuffer(256)) {
+                // High surrogate \uD800 followed by non-low-surrogate 'X'.
+                // Should produce '?' for the lone high surrogate, then 'X'.
+                buf.putUtf8("\uD800X");
+                assertEquals(2, buf.getWritePos());
+                assertEquals((byte) '?', Unsafe.getUnsafe().getByte(buf.getBufferPtr()));
+                assertEquals((byte) 'X', Unsafe.getUnsafe().getByte(buf.getBufferPtr() + 1));
+            }
+        });
     }
 }

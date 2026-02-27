@@ -33,6 +33,7 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Mutable;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
@@ -78,7 +79,7 @@ public class JsonLexerTest {
 
     @Test
     public void testCacheDisabled() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             String json = "{\"a\":1, \"b\": \"123456789012345678901234567890\"}";
             int len = json.length();
             long address = TestUtils.toMemory(json);
@@ -251,7 +252,7 @@ public class JsonLexerTest {
 
     @Test
     public void testStringTooLong() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             String json = "{\"a\":1, \"b\": \"123456789012345678901234567890\"]}";
             int len = json.length() - 6;
             long address = TestUtils.toMemory(json);

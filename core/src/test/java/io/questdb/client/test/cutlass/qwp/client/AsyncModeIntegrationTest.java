@@ -35,6 +35,7 @@ import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
 import java.util.concurrent.CountDownLatch;
@@ -64,106 +65,108 @@ public class AsyncModeIntegrationTest {
      */
     @Test
     public void testBackpressureBlocksEnqueueUntilAck() throws Exception {
-        InFlightWindow window = new InFlightWindow(2, 5_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        AtomicLong highestSent = new AtomicLong(-1);
-        AtomicLong highestAcked = new AtomicLong(-1);
-        CountDownLatch twoSent = new CountDownLatch(2);
-        AtomicBoolean deliverAcks = new AtomicBoolean(false);
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(2, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicLong highestAcked = new AtomicLong(-1);
+            CountDownLatch twoSent = new CountDownLatch(2);
+            AtomicBoolean deliverAcks = new AtomicBoolean(false);
 
-        client.setSendBehavior((ptr, len) -> {
-            highestSent.incrementAndGet();
-            twoSent.countDown();
-        });
-        client.setTryReceiveBehavior(handler -> {
-            if (deliverAcks.get()) {
-                long sent = highestSent.get();
-                long acked = highestAcked.get();
-                if (sent > acked) {
-                    highestAcked.set(sent);
-                    emitAck(handler, sent);
-                    return true;
-                }
-            }
-            return false;
-        });
-
-        WebSocketSendQueue queue = null;
-        MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
-        MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
-
-        try {
-            queue = new WebSocketSendQueue(client, window, 3_000, 500);
-
-            // Send 2 batches to fill the window.
-            buf0.writeByte((byte) 1);
-            buf0.incrementRowCount();
-            buf0.seal();
-            queue.enqueue(buf0);
-
-            buf1.writeByte((byte) 2);
-            buf1.incrementRowCount();
-            buf1.seal();
-            queue.enqueue(buf1);
-
-            assertTrue("Both batches should be sent", twoSent.await(2, TimeUnit.SECONDS));
-            assertEquals("Window should be full", 2, window.getInFlightCount());
-
-            // Reuse buf0 (recycled by I/O thread) and enqueue a 3rd batch.
-            // The I/O thread cannot poll it because the window is full.
-            assertTrue(buf0.awaitRecycled(2, TimeUnit.SECONDS));
-            buf0.reset();
-            buf0.writeByte((byte) 3);
-            buf0.incrementRowCount();
-            buf0.seal();
-            queue.enqueue(buf0);
-
-            // Reuse buf1 and try to enqueue a 4th batch on a background
-            // thread. It should block because the pending slot is still
-            // occupied by the 3rd batch.
-            assertTrue(buf1.awaitRecycled(2, TimeUnit.SECONDS));
-            buf1.reset();
-            buf1.writeByte((byte) 4);
-            buf1.incrementRowCount();
-            buf1.seal();
-
-            CountDownLatch enqueueStarted = new CountDownLatch(1);
-            CountDownLatch enqueueDone = new CountDownLatch(1);
-            AtomicReference<Throwable> errorRef = new AtomicReference<>();
-            WebSocketSendQueue q = queue;
-
-            Thread enqueueThread = new Thread(() -> {
-                enqueueStarted.countDown();
-                try {
-                    q.enqueue(buf1);
-                } catch (Throwable t) {
-                    errorRef.set(t);
-                } finally {
-                    enqueueDone.countDown();
-                }
+            client.setSendBehavior((ptr, len) -> {
+                highestSent.incrementAndGet();
+                twoSent.countDown();
             });
-            enqueueThread.start();
+            client.setTryReceiveBehavior(handler -> {
+                if (deliverAcks.get()) {
+                    long sent = highestSent.get();
+                    long acked = highestAcked.get();
+                    if (sent > acked) {
+                        highestAcked.set(sent);
+                        emitAck(handler, sent);
+                        return true;
+                    }
+                }
+                return false;
+            });
 
-            assertTrue(enqueueStarted.await(1, TimeUnit.SECONDS));
-            Thread.sleep(200);
-            assertEquals("Enqueue should still be blocked", 1, enqueueDone.getCount());
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
+            MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
 
-            // Deliver ACKs to unblock the pipeline.
-            deliverAcks.set(true);
+            try {
+                queue = new WebSocketSendQueue(client, window, 3_000, 500);
 
-            assertTrue("Enqueue should complete after ACK", enqueueDone.await(3, TimeUnit.SECONDS));
-            assertNull("No error expected", errorRef.get());
+                // Send 2 batches to fill the window.
+                buf0.writeByte((byte) 1);
+                buf0.incrementRowCount();
+                buf0.seal();
+                queue.enqueue(buf0);
 
-            queue.flush();
-            window.awaitEmpty();
-        } finally {
-            deliverAcks.set(true);
-            window.acknowledgeUpTo(Long.MAX_VALUE);
-            closeQuietly(queue);
-            buf0.close();
-            buf1.close();
-            client.close();
-        }
+                buf1.writeByte((byte) 2);
+                buf1.incrementRowCount();
+                buf1.seal();
+                queue.enqueue(buf1);
+
+                assertTrue("Both batches should be sent", twoSent.await(2, TimeUnit.SECONDS));
+                assertEquals("Window should be full", 2, window.getInFlightCount());
+
+                // Reuse buf0 (recycled by I/O thread) and enqueue a 3rd batch.
+                // The I/O thread cannot poll it because the window is full.
+                assertTrue(buf0.awaitRecycled(2, TimeUnit.SECONDS));
+                buf0.reset();
+                buf0.writeByte((byte) 3);
+                buf0.incrementRowCount();
+                buf0.seal();
+                queue.enqueue(buf0);
+
+                // Reuse buf1 and try to enqueue a 4th batch on a background
+                // thread. It should block because the pending slot is still
+                // occupied by the 3rd batch.
+                assertTrue(buf1.awaitRecycled(2, TimeUnit.SECONDS));
+                buf1.reset();
+                buf1.writeByte((byte) 4);
+                buf1.incrementRowCount();
+                buf1.seal();
+
+                CountDownLatch enqueueStarted = new CountDownLatch(1);
+                CountDownLatch enqueueDone = new CountDownLatch(1);
+                AtomicReference<Throwable> errorRef = new AtomicReference<>();
+                WebSocketSendQueue q = queue;
+
+                Thread enqueueThread = new Thread(() -> {
+                    enqueueStarted.countDown();
+                    try {
+                        q.enqueue(buf1);
+                    } catch (Throwable t) {
+                        errorRef.set(t);
+                    } finally {
+                        enqueueDone.countDown();
+                    }
+                });
+                enqueueThread.start();
+
+                assertTrue(enqueueStarted.await(1, TimeUnit.SECONDS));
+                Thread.sleep(200);
+                assertEquals("Enqueue should still be blocked", 1, enqueueDone.getCount());
+
+                // Deliver ACKs to unblock the pipeline.
+                deliverAcks.set(true);
+
+                assertTrue("Enqueue should complete after ACK", enqueueDone.await(3, TimeUnit.SECONDS));
+                assertNull("No error expected", errorRef.get());
+
+                queue.flush();
+                window.awaitEmpty();
+            } finally {
+                deliverAcks.set(true);
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+                buf0.close();
+                buf1.close();
+                client.close();
+            }
+        });
     }
 
     /**
@@ -173,67 +176,69 @@ public class AsyncModeIntegrationTest {
      */
     @Test
     public void testBatchesCycleThroughDoubleBuffers() throws Exception {
-        InFlightWindow window = new InFlightWindow(4, 5_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        AtomicLong highestSent = new AtomicLong(-1);
-        AtomicLong highestAcked = new AtomicLong(-1);
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(4, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicLong highestAcked = new AtomicLong(-1);
 
-        client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
-        client.setTryReceiveBehavior(handler -> {
-            long sent = highestSent.get();
-            long acked = highestAcked.get();
-            if (sent > acked) {
-                highestAcked.set(sent);
-                emitAck(handler, sent);
-                return true;
+            client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
+            client.setTryReceiveBehavior(handler -> {
+                long sent = highestSent.get();
+                long acked = highestAcked.get();
+                if (sent > acked) {
+                    highestAcked.set(sent);
+                    emitAck(handler, sent);
+                    return true;
+                }
+                return false;
+            });
+
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
+            MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
+            int batchCount = 10;
+
+            try {
+                queue = new WebSocketSendQueue(client, window, 5_000, 500);
+                MicrobatchBuffer active = buf0;
+
+                for (int i = 0; i < batchCount; i++) {
+                    if (active.isRecycled()) {
+                        active.reset();
+                    }
+                    assertTrue("Buffer should be FILLING on iteration " + i, active.isFilling());
+
+                    active.writeByte((byte) (i & 0xFF));
+                    active.incrementRowCount();
+                    active.seal();
+                    queue.enqueue(active);
+
+                    // Swap to the other buffer, waiting for it if still in use.
+                    MicrobatchBuffer other = (active == buf0) ? buf1 : buf0;
+                    if (other.isInUse()) {
+                        assertTrue("Other buffer should recycle",
+                                other.awaitRecycled(2, TimeUnit.SECONDS));
+                    }
+                    if (other.isRecycled()) {
+                        other.reset();
+                    }
+                    active = other;
+                }
+
+                queue.flush();
+                window.awaitEmpty();
+
+                assertEquals(batchCount, queue.getTotalBatchesSent());
+                assertEquals(0, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+                buf0.close();
+                buf1.close();
+                client.close();
             }
-            return false;
         });
-
-        WebSocketSendQueue queue = null;
-        MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
-        MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
-        int batchCount = 10;
-
-        try {
-            queue = new WebSocketSendQueue(client, window, 5_000, 500);
-            MicrobatchBuffer active = buf0;
-
-            for (int i = 0; i < batchCount; i++) {
-                if (active.isRecycled()) {
-                    active.reset();
-                }
-                assertTrue("Buffer should be FILLING on iteration " + i, active.isFilling());
-
-                active.writeByte((byte) (i & 0xFF));
-                active.incrementRowCount();
-                active.seal();
-                queue.enqueue(active);
-
-                // Swap to the other buffer, waiting for it if still in use.
-                MicrobatchBuffer other = (active == buf0) ? buf1 : buf0;
-                if (other.isInUse()) {
-                    assertTrue("Other buffer should recycle",
-                            other.awaitRecycled(2, TimeUnit.SECONDS));
-                }
-                if (other.isRecycled()) {
-                    other.reset();
-                }
-                active = other;
-            }
-
-            queue.flush();
-            window.awaitEmpty();
-
-            assertEquals(batchCount, queue.getTotalBatchesSent());
-            assertEquals(0, window.getInFlightCount());
-        } finally {
-            window.acknowledgeUpTo(Long.MAX_VALUE);
-            closeQuietly(queue);
-            buf0.close();
-            buf1.close();
-            client.close();
-        }
     }
 
     /**
@@ -244,86 +249,88 @@ public class AsyncModeIntegrationTest {
      */
     @Test
     public void testBufferSwapWaitsForSlowSend() throws Exception {
-        InFlightWindow window = new InFlightWindow(4, 5_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        AtomicLong highestSent = new AtomicLong(-1);
-        AtomicLong highestAcked = new AtomicLong(-1);
-        CountDownLatch sendStarted = new CountDownLatch(1);
-        CountDownLatch sendGate = new CountDownLatch(1);
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(4, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicLong highestAcked = new AtomicLong(-1);
+            CountDownLatch sendStarted = new CountDownLatch(1);
+            CountDownLatch sendGate = new CountDownLatch(1);
 
-        client.setSendBehavior((ptr, len) -> {
-            long seq = highestSent.incrementAndGet();
-            if (seq == 0) {
-                // Block on first send to simulate slow I/O.
-                sendStarted.countDown();
-                try {
-                    if (!sendGate.await(5, TimeUnit.SECONDS)) {
-                        throw new RuntimeException("sendGate timed out");
+            client.setSendBehavior((ptr, len) -> {
+                long seq = highestSent.incrementAndGet();
+                if (seq == 0) {
+                    // Block on first send to simulate slow I/O.
+                    sendStarted.countDown();
+                    try {
+                        if (!sendGate.await(5, TimeUnit.SECONDS)) {
+                            throw new RuntimeException("sendGate timed out");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
                 }
+            });
+            client.setTryReceiveBehavior(handler -> {
+                long sent = highestSent.get();
+                long acked = highestAcked.get();
+                if (sent > acked) {
+                    highestAcked.set(sent);
+                    emitAck(handler, sent);
+                    return true;
+                }
+                return false;
+            });
+
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
+            MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
+
+            try {
+                queue = new WebSocketSendQueue(client, window, 5_000, 500);
+
+                // Enqueue buf0. The I/O thread starts sending and blocks.
+                buf0.writeByte((byte) 1);
+                buf0.incrementRowCount();
+                buf0.seal();
+                queue.enqueue(buf0);
+
+                assertTrue("I/O thread should start sending", sendStarted.await(2, TimeUnit.SECONDS));
+                assertTrue("buf0 should be in use (SENDING)", buf0.isInUse());
+
+                // Enqueue buf1 into the pending slot (I/O thread is blocked).
+                buf1.writeByte((byte) 2);
+                buf1.incrementRowCount();
+                buf1.seal();
+                queue.enqueue(buf1);
+
+                // The user wants to reuse buf0, but it is still SENDING.
+                assertTrue("buf0 should still be in use", buf0.isInUse());
+
+                // Release the gate so the I/O thread can finish sending buf0.
+                sendGate.countDown();
+
+                // buf0 transitions SENDING -> RECYCLED.
+                assertTrue("buf0 should be recycled after send completes",
+                        buf0.awaitRecycled(2, TimeUnit.SECONDS));
+                assertTrue(buf0.isRecycled());
+
+                // Reset and verify buf0 is reusable.
+                buf0.reset();
+                assertTrue(buf0.isFilling());
+
+                queue.flush();
+                window.awaitEmpty();
+                assertEquals(2, queue.getTotalBatchesSent());
+            } finally {
+                sendGate.countDown();
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+                buf0.close();
+                buf1.close();
+                client.close();
             }
         });
-        client.setTryReceiveBehavior(handler -> {
-            long sent = highestSent.get();
-            long acked = highestAcked.get();
-            if (sent > acked) {
-                highestAcked.set(sent);
-                emitAck(handler, sent);
-                return true;
-            }
-            return false;
-        });
-
-        WebSocketSendQueue queue = null;
-        MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
-        MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
-
-        try {
-            queue = new WebSocketSendQueue(client, window, 5_000, 500);
-
-            // Enqueue buf0. The I/O thread starts sending and blocks.
-            buf0.writeByte((byte) 1);
-            buf0.incrementRowCount();
-            buf0.seal();
-            queue.enqueue(buf0);
-
-            assertTrue("I/O thread should start sending", sendStarted.await(2, TimeUnit.SECONDS));
-            assertTrue("buf0 should be in use (SENDING)", buf0.isInUse());
-
-            // Enqueue buf1 into the pending slot (I/O thread is blocked).
-            buf1.writeByte((byte) 2);
-            buf1.incrementRowCount();
-            buf1.seal();
-            queue.enqueue(buf1);
-
-            // The user wants to reuse buf0, but it is still SENDING.
-            assertTrue("buf0 should still be in use", buf0.isInUse());
-
-            // Release the gate so the I/O thread can finish sending buf0.
-            sendGate.countDown();
-
-            // buf0 transitions SENDING -> RECYCLED.
-            assertTrue("buf0 should be recycled after send completes",
-                    buf0.awaitRecycled(2, TimeUnit.SECONDS));
-            assertTrue(buf0.isRecycled());
-
-            // Reset and verify buf0 is reusable.
-            buf0.reset();
-            assertTrue(buf0.isFilling());
-
-            queue.flush();
-            window.awaitEmpty();
-            assertEquals(2, queue.getTotalBatchesSent());
-        } finally {
-            sendGate.countDown();
-            window.acknowledgeUpTo(Long.MAX_VALUE);
-            closeQuietly(queue);
-            buf0.close();
-            buf1.close();
-            client.close();
-        }
     }
 
     /**
@@ -334,49 +341,51 @@ public class AsyncModeIntegrationTest {
      */
     @Test
     public void testFlushWaitsForSendButNotForAcks() throws Exception {
-        InFlightWindow window = new InFlightWindow(4, 5_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        AtomicLong highestSent = new AtomicLong(-1);
-        AtomicBoolean deliverAcks = new AtomicBoolean(false);
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(4, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicBoolean deliverAcks = new AtomicBoolean(false);
 
-        client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
-        client.setTryReceiveBehavior(handler -> {
-            if (deliverAcks.get()) {
-                long sent = highestSent.get();
-                if (sent >= 0 && window.getInFlightCount() > 0) {
-                    emitAck(handler, sent);
-                    return true;
+            client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
+            client.setTryReceiveBehavior(handler -> {
+                if (deliverAcks.get()) {
+                    long sent = highestSent.get();
+                    if (sent >= 0 && window.getInFlightCount() > 0) {
+                        emitAck(handler, sent);
+                        return true;
+                    }
                 }
+                return false;
+            });
+
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
+
+            try {
+                queue = new WebSocketSendQueue(client, window, 2_000, 500);
+
+                buf0.writeByte((byte) 1);
+                buf0.incrementRowCount();
+                buf0.seal();
+                queue.enqueue(buf0);
+
+                // flush() returns once the batch is sent, not when ACKed.
+                queue.flush();
+                assertEquals(1, queue.getTotalBatchesSent());
+                assertEquals("Batch should still be in flight", 1, window.getInFlightCount());
+
+                // Deliver ACK and wait for the window to drain.
+                deliverAcks.set(true);
+                window.awaitEmpty();
+                assertEquals(0, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+                buf0.close();
+                client.close();
             }
-            return false;
         });
-
-        WebSocketSendQueue queue = null;
-        MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
-
-        try {
-            queue = new WebSocketSendQueue(client, window, 2_000, 500);
-
-            buf0.writeByte((byte) 1);
-            buf0.incrementRowCount();
-            buf0.seal();
-            queue.enqueue(buf0);
-
-            // flush() returns once the batch is sent, not when ACKed.
-            queue.flush();
-            assertEquals(1, queue.getTotalBatchesSent());
-            assertEquals("Batch should still be in flight", 1, window.getInFlightCount());
-
-            // Deliver ACK and wait for the window to drain.
-            deliverAcks.set(true);
-            window.awaitEmpty();
-            assertEquals(0, window.getInFlightCount());
-        } finally {
-            window.acknowledgeUpTo(Long.MAX_VALUE);
-            closeQuietly(queue);
-            buf0.close();
-            client.close();
-        }
     }
 
     /**
@@ -386,65 +395,67 @@ public class AsyncModeIntegrationTest {
      */
     @Test
     public void testHighThroughputWithManyBatches() throws Exception {
-        int batchCount = 50;
-        int windowSize = 4;
+        assertMemoryLeak(() -> {
+            int batchCount = 50;
+            int windowSize = 4;
 
-        InFlightWindow window = new InFlightWindow(windowSize, 10_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        AtomicLong highestSent = new AtomicLong(-1);
-        AtomicLong highestAcked = new AtomicLong(-1);
+            InFlightWindow window = new InFlightWindow(windowSize, 10_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicLong highestAcked = new AtomicLong(-1);
 
-        client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
-        client.setTryReceiveBehavior(handler -> {
-            long sent = highestSent.get();
-            long acked = highestAcked.get();
-            if (sent > acked) {
-                // ACK one batch at a time to test sustained flow.
-                long next = acked + 1;
-                highestAcked.set(next);
-                emitAck(handler, next);
-                return true;
-            }
-            return false;
-        });
+            client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
+            client.setTryReceiveBehavior(handler -> {
+                long sent = highestSent.get();
+                long acked = highestAcked.get();
+                if (sent > acked) {
+                    // ACK one batch at a time to test sustained flow.
+                    long next = acked + 1;
+                    highestAcked.set(next);
+                    emitAck(handler, next);
+                    return true;
+                }
+                return false;
+            });
 
-        WebSocketSendQueue queue = null;
-        MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
-        MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
+            MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
 
-        try {
-            queue = new WebSocketSendQueue(client, window, 10_000, 2_000);
-            MicrobatchBuffer active = buf0;
+            try {
+                queue = new WebSocketSendQueue(client, window, 10_000, 2_000);
+                MicrobatchBuffer active = buf0;
 
-            for (int i = 0; i < batchCount; i++) {
-                if (!active.isFilling()) {
-                    if (active.isInUse()) {
-                        assertTrue("Buffer should recycle on iteration " + i,
-                                active.awaitRecycled(5, TimeUnit.SECONDS));
+                for (int i = 0; i < batchCount; i++) {
+                    if (!active.isFilling()) {
+                        if (active.isInUse()) {
+                            assertTrue("Buffer should recycle on iteration " + i,
+                                    active.awaitRecycled(5, TimeUnit.SECONDS));
+                        }
+                        active.reset();
                     }
-                    active.reset();
+
+                    active.writeByte((byte) (i & 0xFF));
+                    active.incrementRowCount();
+                    active.seal();
+                    queue.enqueue(active);
+
+                    active = (active == buf0) ? buf1 : buf0;
                 }
 
-                active.writeByte((byte) (i & 0xFF));
-                active.incrementRowCount();
-                active.seal();
-                queue.enqueue(active);
+                queue.flush();
+                window.awaitEmpty();
 
-                active = (active == buf0) ? buf1 : buf0;
+                assertEquals(batchCount, queue.getTotalBatchesSent());
+                assertEquals(0, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+                buf0.close();
+                buf1.close();
+                client.close();
             }
-
-            queue.flush();
-            window.awaitEmpty();
-
-            assertEquals(batchCount, queue.getTotalBatchesSent());
-            assertEquals(0, window.getInFlightCount());
-        } finally {
-            window.acknowledgeUpTo(Long.MAX_VALUE);
-            closeQuietly(queue);
-            buf0.close();
-            buf1.close();
-            client.close();
-        }
+        });
     }
 
     /**
@@ -454,62 +465,64 @@ public class AsyncModeIntegrationTest {
      */
     @Test
     public void testServerErrorPropagatesOnFlush() throws Exception {
-        InFlightWindow window = new InFlightWindow(4, 5_000);
-        FakeWebSocketClient client = new FakeWebSocketClient();
-        AtomicLong highestSent = new AtomicLong(-1);
-        AtomicLong highestDelivered = new AtomicLong(-1);
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(4, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicLong highestDelivered = new AtomicLong(-1);
 
-        client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
-        client.setTryReceiveBehavior(handler -> {
-            long sent = highestSent.get();
-            long delivered = highestDelivered.get();
-            if (sent > delivered) {
-                long next = delivered + 1;
-                highestDelivered.set(next);
-                if (next == 1) {
-                    emitError(handler, next, WebSocketResponse.STATUS_WRITE_ERROR, "disk full");
-                } else {
-                    emitAck(handler, next);
+            client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
+            client.setTryReceiveBehavior(handler -> {
+                long sent = highestSent.get();
+                long delivered = highestDelivered.get();
+                if (sent > delivered) {
+                    long next = delivered + 1;
+                    highestDelivered.set(next);
+                    if (next == 1) {
+                        emitError(handler, next, WebSocketResponse.STATUS_WRITE_ERROR, "disk full");
+                    } else {
+                        emitAck(handler, next);
+                    }
+                    return true;
                 }
-                return true;
-            }
-            return false;
-        });
+                return false;
+            });
 
-        WebSocketSendQueue queue = null;
-        MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
-        MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer buf0 = new MicrobatchBuffer(256);
+            MicrobatchBuffer buf1 = new MicrobatchBuffer(256);
 
-        try {
-            queue = new WebSocketSendQueue(client, window, 2_000, 500);
-
-            buf0.writeByte((byte) 1);
-            buf0.incrementRowCount();
-            buf0.seal();
-            queue.enqueue(buf0);
-
-            buf1.writeByte((byte) 2);
-            buf1.incrementRowCount();
-            buf1.seal();
-            queue.enqueue(buf1);
-
-            // flush() waits for the queue to drain (both batches sent).
-            queue.flush();
-
-            // awaitEmpty() surfaces the server error for batch 1.
             try {
-                window.awaitEmpty();
-                fail("Expected server error to propagate");
-            } catch (LineSenderException e) {
-                assertTrue("Error should mention server failure",
-                        e.getMessage().contains("disk full") || e.getMessage().contains("Server error"));
+                queue = new WebSocketSendQueue(client, window, 2_000, 500);
+
+                buf0.writeByte((byte) 1);
+                buf0.incrementRowCount();
+                buf0.seal();
+                queue.enqueue(buf0);
+
+                buf1.writeByte((byte) 2);
+                buf1.incrementRowCount();
+                buf1.seal();
+                queue.enqueue(buf1);
+
+                // flush() waits for the queue to drain (both batches sent).
+                queue.flush();
+
+                // awaitEmpty() surfaces the server error for batch 1.
+                try {
+                    window.awaitEmpty();
+                    fail("Expected server error to propagate");
+                } catch (LineSenderException e) {
+                    assertTrue("Error should mention server failure",
+                            e.getMessage().contains("disk full") || e.getMessage().contains("Server error"));
+                }
+            } finally {
+                closeQuietly(queue);
+                buf0.close();
+                buf1.close();
+                client.close();
             }
-        } finally {
-            closeQuietly(queue);
-            buf0.close();
-            buf1.close();
-            client.close();
-        }
+        });
     }
 
     private static void closeQuietly(WebSocketSendQueue queue) {

@@ -30,7 +30,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -40,7 +40,7 @@ public class WebSocketClientTest {
 
     @Test
     public void testSendCloseFrameDoesNotClobberSendBuffer() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (StubWebSocketClient client = new StubWebSocketClient()) {
                 WebSocketSendBuffer sendBuffer = client.getSendBuffer();
 
@@ -69,7 +69,7 @@ public class WebSocketClientTest {
 
     @Test
     public void testSendPingDoesNotClobberSendBuffer() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             try (StubWebSocketClient client = new StubWebSocketClient()) {
                 // Set upgraded=true so checkConnected() passes
                 setField(client, "upgraded", true);

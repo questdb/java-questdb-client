@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.protocol;
 import io.questdb.client.cutlass.qwp.protocol.QwpSchemaHash;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -238,21 +239,23 @@ public class QwpSchemaHashTest {
     }
 
     @Test
-    public void testXXHash64DirectMemory() {
-        byte[] data = "test data".getBytes(StandardCharsets.UTF_8);
-        long addr = Unsafe.malloc(data.length, MemoryTag.NATIVE_ILP_RSS);
-        try {
-            for (int i = 0; i < data.length; i++) {
-                Unsafe.getUnsafe().putByte(addr + i, data[i]);
+    public void testXXHash64DirectMemory() throws Exception {
+        assertMemoryLeak(() -> {
+            byte[] data = "test data".getBytes(StandardCharsets.UTF_8);
+            long addr = Unsafe.malloc(data.length, MemoryTag.NATIVE_ILP_RSS);
+            try {
+                for (int i = 0; i < data.length; i++) {
+                    Unsafe.getUnsafe().putByte(addr + i, data[i]);
+                }
+
+                long hashFromBytes = QwpSchemaHash.hash(data);
+                long hashFromMem = QwpSchemaHash.hash(addr, data.length);
+
+                Assert.assertEquals("Direct memory hash should match byte array hash", hashFromBytes, hashFromMem);
+            } finally {
+                Unsafe.free(addr, data.length, MemoryTag.NATIVE_ILP_RSS);
             }
-
-            long hashFromBytes = QwpSchemaHash.hash(data);
-            long hashFromMem = QwpSchemaHash.hash(addr, data.length);
-
-            Assert.assertEquals("Direct memory hash should match byte array hash", hashFromBytes, hashFromMem);
-        } finally {
-            Unsafe.free(addr, data.length, MemoryTag.NATIVE_ILP_RSS);
-        }
+        });
     }
 
     @Test

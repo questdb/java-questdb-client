@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.protocol;
 import io.questdb.client.cutlass.qwp.protocol.QwpVarint;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -35,22 +36,24 @@ import java.util.Random;
 public class QwpVarintTest {
 
     @Test
-    public void testDecodeFromDirectMemory() {
-        long addr = Unsafe.malloc(16, MemoryTag.NATIVE_ILP_RSS);
-        try {
-            // Encode using byte array, decode from direct memory
-            byte[] buf = new byte[10];
-            int len = QwpVarint.encode(buf, 0, 300);
+    public void testDecodeFromDirectMemory() throws Exception {
+        assertMemoryLeak(() -> {
+            long addr = Unsafe.malloc(16, MemoryTag.NATIVE_ILP_RSS);
+            try {
+                // Encode using byte array, decode from direct memory
+                byte[] buf = new byte[10];
+                int len = QwpVarint.encode(buf, 0, 300);
 
-            for (int i = 0; i < len; i++) {
-                Unsafe.getUnsafe().putByte(addr + i, buf[i]);
+                for (int i = 0; i < len; i++) {
+                    Unsafe.getUnsafe().putByte(addr + i, buf[i]);
+                }
+
+                long decoded = QwpVarint.decode(addr, addr + len);
+                Assert.assertEquals(300, decoded);
+            } finally {
+                Unsafe.free(addr, 16, MemoryTag.NATIVE_ILP_RSS);
             }
-
-            long decoded = QwpVarint.decode(addr, addr + len);
-            Assert.assertEquals(300, decoded);
-        } finally {
-            Unsafe.free(addr, 16, MemoryTag.NATIVE_ILP_RSS);
-        }
+        });
     }
 
     @Test
@@ -95,20 +98,22 @@ public class QwpVarintTest {
     }
 
     @Test
-    public void testDecodeResultFromDirectMemory() {
-        long addr = Unsafe.malloc(16, MemoryTag.NATIVE_ILP_RSS);
-        try {
-            long endAddr = QwpVarint.encode(addr, 999999);
-            int expectedLen = (int) (endAddr - addr);
+    public void testDecodeResultFromDirectMemory() throws Exception {
+        assertMemoryLeak(() -> {
+            long addr = Unsafe.malloc(16, MemoryTag.NATIVE_ILP_RSS);
+            try {
+                long endAddr = QwpVarint.encode(addr, 999999);
+                int expectedLen = (int) (endAddr - addr);
 
-            QwpVarint.DecodeResult result = new QwpVarint.DecodeResult();
-            QwpVarint.decode(addr, endAddr, result);
+                QwpVarint.DecodeResult result = new QwpVarint.DecodeResult();
+                QwpVarint.decode(addr, endAddr, result);
 
-            Assert.assertEquals(999999, result.value);
-            Assert.assertEquals(expectedLen, result.bytesRead);
-        } finally {
-            Unsafe.free(addr, 16, MemoryTag.NATIVE_ILP_RSS);
-        }
+                Assert.assertEquals(999999, result.value);
+                Assert.assertEquals(expectedLen, result.bytesRead);
+            } finally {
+                Unsafe.free(addr, 16, MemoryTag.NATIVE_ILP_RSS);
+            }
+        });
     }
 
     @Test
@@ -216,19 +221,21 @@ public class QwpVarintTest {
     }
 
     @Test
-    public void testEncodeToDirectMemory() {
-        long addr = Unsafe.malloc(16, MemoryTag.NATIVE_ILP_RSS);
-        try {
-            long endAddr = QwpVarint.encode(addr, 12345);
-            int len = (int) (endAddr - addr);
-            Assert.assertTrue(len > 0);
+    public void testEncodeToDirectMemory() throws Exception {
+        assertMemoryLeak(() -> {
+            long addr = Unsafe.malloc(16, MemoryTag.NATIVE_ILP_RSS);
+            try {
+                long endAddr = QwpVarint.encode(addr, 12345);
+                int len = (int) (endAddr - addr);
+                Assert.assertTrue(len > 0);
 
-            // Read back and verify
-            long decoded = QwpVarint.decode(addr, endAddr);
-            Assert.assertEquals(12345, decoded);
-        } finally {
-            Unsafe.free(addr, 16, MemoryTag.NATIVE_ILP_RSS);
-        }
+                // Read back and verify
+                long decoded = QwpVarint.decode(addr, endAddr);
+                Assert.assertEquals(12345, decoded);
+            } finally {
+                Unsafe.free(addr, 16, MemoryTag.NATIVE_ILP_RSS);
+            }
+        });
     }
 
     @Test

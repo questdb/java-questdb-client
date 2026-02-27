@@ -28,7 +28,7 @@ import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.test.AbstractTest;
-import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -47,7 +47,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
 
     @Test
     public void testCachedTimestampColumnInvalidatedDuringFlush() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
                     "localhost", 0, 1, 10_000_000, 0, 1
             );
@@ -89,7 +89,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
 
     @Test
     public void testCachedTimestampNanosColumnInvalidatedDuringFlush() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
                     "localhost", 0, 1, 10_000_000, 0, 1
             );
@@ -124,7 +124,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
 
     @Test
     public void testResetClearsAllTableBuffersAndPendingRowCount() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             // Use high autoFlushRows to prevent auto-flush during the test
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
                     "localhost", 0, 10_000, 10_000_000, 0, 1
