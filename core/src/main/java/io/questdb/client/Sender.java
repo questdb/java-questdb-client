@@ -1414,7 +1414,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (maxNameLength == PARAMETER_NOT_SET_EXPLICITLY) {
                 maxNameLength = DEFAULT_MAX_NAME_LEN;
             }
-            if (maxBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY) {
+            if (maxBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY && protocol == PROTOCOL_HTTP) {
                 maxBackoffMillis = DEFAULT_MAX_BACKOFF_MILLIS;
             }
         }
@@ -1764,6 +1764,27 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY && !asyncMode) {
                     throw new LineSenderException("in-flight window size requires async mode");
+                }
+                if (httpPath != null) {
+                    throw new LineSenderException("HTTP path is not supported for WebSocket protocol");
+                }
+                if (httpTimeout != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("HTTP timeout is not supported for WebSocket protocol");
+                }
+                if (retryTimeoutMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("retry timeout is not supported for WebSocket protocol");
+                }
+                if (minRequestThroughput != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("minimum request throughput is not supported for WebSocket protocol");
+                }
+                if (maxBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("max backoff is not supported for WebSocket protocol");
+                }
+                if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("protocol version is not supported for WebSocket protocol");
+                }
+                if (autoFlushIntervalMillis == Integer.MAX_VALUE) {
+                    throw new LineSenderException("disabling auto-flush is not supported for WebSocket protocol");
                 }
             } else {
                 throw new LineSenderException("unsupported protocol ")

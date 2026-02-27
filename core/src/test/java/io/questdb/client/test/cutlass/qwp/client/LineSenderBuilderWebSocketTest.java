@@ -279,12 +279,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    @Ignore("Disable auto flush may need different semantics for WebSocket")
-    public void testDisableAutoFlush_semantics() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .disableAutoFlush();
-        Assert.assertNotNull(builder);
+    public void testDisableAutoFlush_notSupportedForWebSocket() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .disableAutoFlush(),
+                "not supported for WebSocket");
     }
 
     @Test
@@ -343,21 +343,21 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    @Ignore("HTTP path is HTTP-specific and may not apply to WebSocket")
-    public void testHttpPath_mayNotApply() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .httpPath("/custom/path");
-        Assert.assertNotNull(builder);
+    public void testHttpPath_notSupportedForWebSocket() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .httpPath("/custom/path"),
+                "not supported for WebSocket");
     }
 
     @Test
-    @Ignore("HTTP timeout is HTTP-specific and may not apply to WebSocket")
-    public void testHttpTimeout_mayNotApply() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .httpTimeoutMillis(5000);
-        Assert.assertNotNull(builder);
+    public void testHttpTimeout_notSupportedForWebSocket() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .httpTimeoutMillis(5000),
+                "not supported for WebSocket");
     }
 
     @Test
@@ -443,12 +443,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    @Ignore("Max backoff is HTTP-specific and may not apply to WebSocket")
-    public void testMaxBackoff_mayNotApply() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .maxBackoffMillis(1000);
-        Assert.assertNotNull(builder);
+    public void testMaxBackoff_notSupportedForWebSocket() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .maxBackoffMillis(1000),
+                "not supported for WebSocket");
     }
 
     @Test
@@ -477,12 +477,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    @Ignore("Min request throughput is HTTP-specific and may not apply to WebSocket")
-    public void testMinRequestThroughput_mayNotApply() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .minRequestThroughput(10000);
-        Assert.assertNotNull(builder);
+    public void testMinRequestThroughput_notSupportedForWebSocket() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .minRequestThroughput(10000),
+                "not supported for WebSocket");
     }
 
     @Test
@@ -511,21 +511,21 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    @Ignore("Protocol version is for ILP text protocol, WebSocket uses ILP v4 binary protocol")
-    public void testProtocolVersion_notApplicable() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .protocolVersion(Sender.PROTOCOL_VERSION_V2);
-        Assert.assertNotNull(builder);
+    public void testProtocolVersion_notSupportedForWebSocket() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V2),
+                "not supported for WebSocket");
     }
 
     @Test
-    @Ignore("Retry timeout is HTTP-specific and may not apply to WebSocket")
-    public void testRetryTimeout_mayNotApply() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .retryTimeoutMillis(5000);
-        Assert.assertNotNull(builder);
+    public void testRetryTimeout_notSupportedForWebSocket() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .retryTimeoutMillis(5000),
+                "not supported for WebSocket");
     }
 
     @Test
