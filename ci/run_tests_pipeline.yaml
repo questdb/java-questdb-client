@@ -72,8 +72,8 @@ stages:
             lfs: false
             submodules: false
           - template: setup.yaml
-          # TODO: remove branch once rd_strip_ilp_sender is merged
-          - script: git clone --depth 1 -b rd_strip_ilp_sender https://github.com/questdb/questdb.git ./questdb
+          # TODO: remove branch once jh_experiment_new_ilp is merged
+          - script: git clone --depth 1 -b jh_experiment_new_ilp https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Update client version"
