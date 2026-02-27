@@ -725,6 +725,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         }
     }
 
+    // There is a TOCTOU race between closing the ServerSocket and the caller's
+    // connect attempt — another process could bind the port in between. This is
+    // acceptable because every caller is a negative test that expects the connection
+    // to fail. If the port is stolen, the test connects to a non-QuestDB endpoint,
+    // which also fails with the same error.
     private static int findUnusedPort() throws Exception {
         try (java.net.ServerSocket s = new java.net.ServerSocket(0)) {
             return s.getLocalPort();
