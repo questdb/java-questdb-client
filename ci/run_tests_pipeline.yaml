@@ -30,9 +30,9 @@ stages:
             displayName: "Checkout PR source branch"
             condition: eq(variables['Build.Reason'], 'PullRequest')
           - task: JavaToolInstaller@0
-            displayName: "Install Java 11"
+            displayName: "Install Java 17"
             inputs:
-              versionSpec: "11"
+              versionSpec: "17"
               jdkArchitectureOption: "x64"
               jdkSourceOption: "PreInstalled"
           - bash: mvn -f core/pom.xml javadoc:javadoc -Pjavadoc --batch-mode
