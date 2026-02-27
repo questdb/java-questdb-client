@@ -406,6 +406,54 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testGetOrCreateColumnConflictingTypeFastPath() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                // First call creates the column as LONG
+                table.getOrCreateColumn("x", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.nextRow();
+
+                // Second call with the same name but a different type hits the fast path
+                // (sequential cursor matches the column name) and must throw
+                try {
+                    table.getOrCreateColumn("x", QwpConstants.TYPE_DOUBLE, false);
+                    fail("Expected LineSenderException for column type mismatch");
+                } catch (LineSenderException e) {
+                    assertEquals(
+                            "Column type mismatch for x: existing=" + QwpConstants.TYPE_LONG + " new=" + QwpConstants.TYPE_DOUBLE,
+                            e.getMessage()
+                    );
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testGetOrCreateColumnConflictingTypeSlowPath() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                // Create two columns so the fast-path cursor can be defeated
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1L);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true).addString("v");
+                table.nextRow();
+
+                // Access column "b" first — cursor now expects "a" at index 0,
+                // but we ask for "b", so the fast path misses and falls through
+                // to the hash-map lookup, which must detect the type conflict
+                try {
+                    table.getOrCreateColumn("b", QwpConstants.TYPE_LONG, false);
+                    fail("Expected LineSenderException for column type mismatch");
+                } catch (LineSenderException e) {
+                    assertEquals(
+                            "Column type mismatch for b: existing=" + QwpConstants.TYPE_STRING + " new=" + QwpConstants.TYPE_LONG,
+                            e.getMessage()
+                    );
+                }
+            }
+        });
+    }
+
+    @Test
     public void testLongArrayMultipleRows() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
