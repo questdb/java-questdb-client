@@ -146,7 +146,7 @@ public class InFlightWindowTest {
         waitThread.start();
 
         assertTrue(started.await(1, TimeUnit.SECONDS));
-        Thread.sleep(100);
+        awaitThreadBlocked(waitThread);
         assertTrue(waiting.get());
 
         // Single cumulative ACK clears all
@@ -181,7 +181,7 @@ public class InFlightWindowTest {
         addThread.start();
 
         assertTrue(started.await(1, TimeUnit.SECONDS));
-        Thread.sleep(100); // Give time to block
+        awaitThreadBlocked(addThread);
         assertTrue(blocked.get());
 
         // Cumulative ACK frees multiple slots
@@ -215,7 +215,7 @@ public class InFlightWindowTest {
         waitThread.start();
 
         assertTrue(started.await(1, TimeUnit.SECONDS));
-        Thread.sleep(100);
+        awaitThreadBlocked(waitThread);
         assertTrue(waiting.get());
 
         // Cumulative ACK all batches
@@ -494,7 +494,7 @@ public class InFlightWindowTest {
         waitThread.start();
 
         assertTrue(started.await(1, TimeUnit.SECONDS));
-        Thread.sleep(100); // Let it block
+        awaitThreadBlocked(waitThread);
 
         // Fail a batch - should wake the blocked thread
         window.fail(0, new RuntimeException("Test error"));
@@ -528,7 +528,7 @@ public class InFlightWindowTest {
         addThread.start();
 
         assertTrue(started.await(1, TimeUnit.SECONDS));
-        Thread.sleep(100); // Let it block
+        awaitThreadBlocked(addThread);
 
         // Fail a batch - should wake the blocked thread
         window.fail(0, new RuntimeException("Test error"));
@@ -787,7 +787,7 @@ public class InFlightWindowTest {
 
         // Wait for thread to start and block
         assertTrue(started.await(1, TimeUnit.SECONDS));
-        Thread.sleep(100); // Give time to block
+        awaitThreadBlocked(addThread);
         assertTrue(blocked.get());
 
         // Free a slot
@@ -826,5 +826,17 @@ public class InFlightWindowTest {
 
         assertTrue(window.acknowledge(0));
         assertTrue(window.isEmpty());
+    }
+
+    private static void awaitThreadBlocked(Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            Thread.State state = thread.getState();
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
+                return;
+            }
+            Thread.sleep(1);
+        }
+        fail("Thread did not reach blocked state within 5s, state: " + thread.getState());
     }
 }

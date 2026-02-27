@@ -109,7 +109,7 @@ public class WebSocketSendQueueTest {
                 t.start();
 
                 assertTrue(started.await(1, TimeUnit.SECONDS));
-                Thread.sleep(100);
+                awaitThreadBlocked(t);
                 assertEquals("Second enqueue should still be waiting", 1, finished.getCount());
 
                 // Free space so I/O thread can poll pending slot.
@@ -264,6 +264,18 @@ public class WebSocketSendQueueTest {
                 client.close();
             }
         });
+    }
+
+    private static void awaitThreadBlocked(Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            Thread.State state = thread.getState();
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
+                return;
+            }
+            Thread.sleep(1);
+        }
+        fail("Thread did not reach blocked state within 5s, state: " + thread.getState());
     }
 
     private static void closeQuietly(WebSocketSendQueue queue) {
