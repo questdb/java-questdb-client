@@ -725,7 +725,12 @@ public abstract class WebSocketClient implements QuietCloseable {
 
         if (frameParser.getState() == WebSocketFrameParser.STATE_COMPLETE) {
             long payloadPtr = recvBufPtr + recvReadPos + frameParser.getHeaderSize();
-            int payloadLen = (int) frameParser.getPayloadLength();
+            long payloadLength = frameParser.getPayloadLength();
+            if (payloadLength > Integer.MAX_VALUE) {
+                throw new HttpClientException("WebSocket frame payload too large [length=")
+                        .put(payloadLength).put(']');
+            }
+            int payloadLen = (int) payloadLength;
 
             // Unmask if needed (server frames should not be masked)
             if (frameParser.isMasked()) {
