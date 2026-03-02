@@ -1008,12 +1008,12 @@ public class QwpWebSocketSender implements Sender {
 
         // If current buffer can't hold the data, seal and swap
         if (activeBuffer.hasData() &&
-                activeBuffer.getBufferPos() + length > activeBuffer.getBufferCapacity()) {
+                (long) activeBuffer.getBufferPos() + length > activeBuffer.getBufferCapacity()) {
             sealAndSwapBuffer();
         }
 
         // Ensure buffer can hold the data
-        activeBuffer.ensureCapacity(activeBuffer.getBufferPos() + length);
+        activeBuffer.ensureCapacity((int) Math.min((long) activeBuffer.getBufferPos() + length, Integer.MAX_VALUE));
 
         // Copy data to buffer
         activeBuffer.write(dataPtr, length);

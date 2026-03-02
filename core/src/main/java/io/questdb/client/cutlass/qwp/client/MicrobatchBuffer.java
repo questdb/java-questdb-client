@@ -180,7 +180,7 @@ public class MicrobatchBuffer implements QuietCloseable {
             throw new IllegalStateException("Cannot resize when state is " + stateName(state));
         }
         if (requiredCapacity > bufferCapacity) {
-            int newCapacity = Math.max(bufferCapacity * 2, requiredCapacity);
+            int newCapacity = (int) Math.min(Math.max((long) bufferCapacity * 2, requiredCapacity), Integer.MAX_VALUE);
             bufferPtr = Unsafe.realloc(bufferPtr, bufferCapacity, newCapacity, MemoryTag.NATIVE_ILP_RSS);
             bufferCapacity = newCapacity;
         }
@@ -463,7 +463,7 @@ public class MicrobatchBuffer implements QuietCloseable {
         if (state != STATE_FILLING) {
             throw new IllegalStateException("Cannot write when state is " + stateName(state));
         }
-        ensureCapacity(bufferPos + length);
+        ensureCapacity((int) Math.min((long) bufferPos + length, Integer.MAX_VALUE));
         Unsafe.getUnsafe().copyMemory(src, bufferPtr + bufferPos, length);
         bufferPos += length;
     }
@@ -477,7 +477,7 @@ public class MicrobatchBuffer implements QuietCloseable {
         if (state != STATE_FILLING) {
             throw new IllegalStateException("Cannot write when state is " + stateName(state));
         }
-        ensureCapacity(bufferPos + 1);
+        ensureCapacity((int) Math.min((long) bufferPos + 1, Integer.MAX_VALUE));
         Unsafe.getUnsafe().putByte(bufferPtr + bufferPos, b);
         bufferPos++;
     }
