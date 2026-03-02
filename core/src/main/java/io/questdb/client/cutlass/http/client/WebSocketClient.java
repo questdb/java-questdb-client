@@ -103,22 +103,26 @@ public abstract class WebSocketClient implements QuietCloseable {
 
         int sendBufSize = Math.max(configuration.getInitialRequestBufferSize(), DEFAULT_SEND_BUFFER_SIZE);
         int maxSendBufSize = Math.max(configuration.getMaximumRequestBufferSize(), sendBufSize);
+        WebSocketSendBuffer sendBuf = null;
+        WebSocketSendBuffer controlBuf = null;
         try {
-            this.sendBuffer = new WebSocketSendBuffer(sendBufSize, maxSendBufSize);
+            sendBuf = new WebSocketSendBuffer(sendBufSize, maxSendBufSize);
             // Control frames (ping/pong/close) have max 125-byte payload + 14-byte header.
             // This dedicated buffer prevents sendPongFrame from clobbering an in-progress
             // frame being built in the main sendBuffer.
-            this.controlFrameBuffer = new WebSocketSendBuffer(256, 256);
+            controlBuf = new WebSocketSendBuffer(256, 256);
 
             this.recvBufSize = Math.max(configuration.getResponseBufferSize(), DEFAULT_RECV_BUFFER_SIZE);
             this.maxRecvBufSize = Math.max(configuration.getMaximumResponseBufferSize(), recvBufSize);
             this.recvBufPtr = Unsafe.malloc(recvBufSize, MemoryTag.NATIVE_DEFAULT);
         } catch (Throwable t) {
-            Misc.free(controlFrameBuffer);
-            Misc.free(sendBuffer);
+            Misc.free(controlBuf);
+            Misc.free(sendBuf);
             Misc.free(socket);
             throw t;
         }
+        this.sendBuffer = sendBuf;
+        this.controlFrameBuffer = controlBuf;
         this.recvPos = 0;
         this.recvReadPos = 0;
 
@@ -285,13 +289,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Receives frame with default timeout.
-     */
-    public boolean receiveFrame(WebSocketFrameHandler handler) {
-        return receiveFrame(handler, defaultTimeout);
-    }
-
-    /**
      * Sends binary data as a WebSocket binary frame.
      *
      * @param dataPtr pointer to data
@@ -326,24 +323,6 @@ public abstract class WebSocketClient implements QuietCloseable {
         } finally {
             controlFrameBuffer.reset();
         }
-    }
-
-    /**
-     * Sends a complete WebSocket frame.
-     *
-     * @param frame   frame info from endBinaryFrame()
-     * @param timeout timeout in milliseconds
-     */
-    public void sendFrame(WebSocketSendBuffer.FrameInfo frame, int timeout) {
-        checkConnected();
-        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
-    }
-
-    /**
-     * Sends a complete WebSocket frame with default timeout.
-     */
-    public void sendFrame(WebSocketSendBuffer.FrameInfo frame) {
-        sendFrame(frame, defaultTimeout);
     }
 
     /**
