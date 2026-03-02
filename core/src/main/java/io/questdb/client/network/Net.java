@@ -118,10 +118,6 @@ public final class Net {
 
     public static native int recv(int fd, long ptr, int len);
 
-    public static int send(long fd, long ptr, int len) {
-        return send(fd, ptr, len);
-    }
-
     public static native int send(int fd, long ptr, int len);
 
     public native static int sendTo(int fd, long ptr, int len, long sockaddr);
