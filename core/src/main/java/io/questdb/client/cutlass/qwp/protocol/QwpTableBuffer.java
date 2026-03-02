@@ -568,7 +568,8 @@ public class QwpTableBuffer implements QuietCloseable {
                     throw new LineSenderException("irregular array shape");
                 }
             }
-            ensureArrayCapacity(2, dim0 * dim1);
+            int elemCount = checkedElementCount((long) dim0 * dim1);
+            ensureArrayCapacity(2, elemCount);
             arrayDims[valueCount] = 2;
             arrayShapes[arrayShapeOffset++] = dim0;
             arrayShapes[arrayShapeOffset++] = dim1;
@@ -599,7 +600,8 @@ public class QwpTableBuffer implements QuietCloseable {
                     }
                 }
             }
-            ensureArrayCapacity(3, dim0 * dim1 * dim2);
+            int elemCount = checkedElementCount((long) dim0 * dim1 * dim2);
+            ensureArrayCapacity(3, elemCount);
             arrayDims[valueCount] = 3;
             arrayShapes[arrayShapeOffset++] = dim0;
             arrayShapes[arrayShapeOffset++] = dim1;
@@ -716,7 +718,8 @@ public class QwpTableBuffer implements QuietCloseable {
                     throw new LineSenderException("irregular array shape");
                 }
             }
-            ensureArrayCapacity(2, dim0 * dim1);
+            int elemCount = checkedElementCount((long) dim0 * dim1);
+            ensureArrayCapacity(2, elemCount);
             arrayDims[valueCount] = 2;
             arrayShapes[arrayShapeOffset++] = dim0;
             arrayShapes[arrayShapeOffset++] = dim1;
@@ -747,7 +750,8 @@ public class QwpTableBuffer implements QuietCloseable {
                     }
                 }
             }
-            ensureArrayCapacity(3, dim0 * dim1 * dim2);
+            int elemCount = checkedElementCount((long) dim0 * dim1 * dim2);
+            ensureArrayCapacity(3, elemCount);
             arrayDims[valueCount] = 3;
             arrayShapes[arrayShapeOffset++] = dim0;
             arrayShapes[arrayShapeOffset++] = dim1;
@@ -1212,6 +1216,13 @@ public class QwpTableBuffer implements QuietCloseable {
                     arrayCapture = new ArrayCapture();
                     break;
             }
+        }
+
+        private static int checkedElementCount(long product) {
+            if (product > Integer.MAX_VALUE) {
+                throw new LineSenderException("array too large: total element count exceeds int range");
+            }
+            return (int) product;
         }
 
         private void ensureArrayCapacity(int nDims, int dataElements) {

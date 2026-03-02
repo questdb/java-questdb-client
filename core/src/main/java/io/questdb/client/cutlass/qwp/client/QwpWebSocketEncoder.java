@@ -366,7 +366,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             for (int d = 0; d < nDims; d++) {
                 int dimLen = shapes[shapeIdx++];
                 buffer.putInt(dimLen);
-                elemCount *= dimLen;
+                elemCount = Math.multiplyExact(elemCount, dimLen);
             }
 
             for (int e = 0; e < elemCount; e++) {
@@ -390,7 +390,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             for (int d = 0; d < nDims; d++) {
                 int dimLen = shapes[shapeIdx++];
                 buffer.putInt(dimLen);
-                elemCount *= dimLen;
+                elemCount = Math.multiplyExact(elemCount, dimLen);
             }
 
             for (int e = 0; e < elemCount; e++) {
