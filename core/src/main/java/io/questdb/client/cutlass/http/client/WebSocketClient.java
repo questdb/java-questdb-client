@@ -103,15 +103,22 @@ public abstract class WebSocketClient implements QuietCloseable {
 
         int sendBufSize = Math.max(configuration.getInitialRequestBufferSize(), DEFAULT_SEND_BUFFER_SIZE);
         int maxSendBufSize = Math.max(configuration.getMaximumRequestBufferSize(), sendBufSize);
-        this.sendBuffer = new WebSocketSendBuffer(sendBufSize, maxSendBufSize);
-        // Control frames (ping/pong/close) have max 125-byte payload + 14-byte header.
-        // This dedicated buffer prevents sendPongFrame from clobbering an in-progress
-        // frame being built in the main sendBuffer.
-        this.controlFrameBuffer = new WebSocketSendBuffer(256, 256);
+        try {
+            this.sendBuffer = new WebSocketSendBuffer(sendBufSize, maxSendBufSize);
+            // Control frames (ping/pong/close) have max 125-byte payload + 14-byte header.
+            // This dedicated buffer prevents sendPongFrame from clobbering an in-progress
+            // frame being built in the main sendBuffer.
+            this.controlFrameBuffer = new WebSocketSendBuffer(256, 256);
 
-        this.recvBufSize = Math.max(configuration.getResponseBufferSize(), DEFAULT_RECV_BUFFER_SIZE);
-        this.maxRecvBufSize = Math.max(configuration.getMaximumResponseBufferSize(), recvBufSize);
-        this.recvBufPtr = Unsafe.malloc(recvBufSize, MemoryTag.NATIVE_DEFAULT);
+            this.recvBufSize = Math.max(configuration.getResponseBufferSize(), DEFAULT_RECV_BUFFER_SIZE);
+            this.maxRecvBufSize = Math.max(configuration.getMaximumResponseBufferSize(), recvBufSize);
+            this.recvBufPtr = Unsafe.malloc(recvBufSize, MemoryTag.NATIVE_DEFAULT);
+        } catch (Throwable t) {
+            Misc.free(controlFrameBuffer);
+            Misc.free(sendBuffer);
+            Misc.free(socket);
+            throw t;
+        }
         this.recvPos = 0;
         this.recvReadPos = 0;
 
