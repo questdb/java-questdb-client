@@ -479,9 +479,6 @@ public class QwpWebSocketSender implements Sender {
                     if (inFlightWindow != null) {
                         inFlightWindow.awaitEmpty();
                     }
-                    if (sendQueue != null) {
-                        sendQueue.close();
-                    }
                 } else {
                     // Sync mode (window=1): flush pending rows synchronously
                     if (pendingRowCount > 0 && client != null && client.isConnected()) {
@@ -490,6 +487,16 @@ public class QwpWebSocketSender implements Sender {
                 }
             } catch (Exception e) {
                 LOG.error("Error during close: {}", String.valueOf(e));
+            }
+
+            // Shut down the I/O thread before closing the socket or buffers
+            // it may be using. This must run even if the flush above failed.
+            if (sendQueue != null) {
+                try {
+                    sendQueue.close();
+                } catch (Exception e) {
+                    LOG.error("Error closing send queue: {}", String.valueOf(e));
+                }
             }
 
             // Close buffers (async mode only, window > 1)
