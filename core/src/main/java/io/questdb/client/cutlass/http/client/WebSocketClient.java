@@ -420,7 +420,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         doSend(sendBuffer.getBufferPtr(), sendBuffer.getWritePos(), timeout);
 
         // Read response
-        int remainingTimeout = remainingTime(timeout, startTime);
+        int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
         readUpgradeResponse(remainingTimeout);
 
         upgraded = true;
@@ -560,11 +560,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     private void doSend(long ptr, int len, int timeout) {
         long startTime = System.nanoTime();
         while (len > 0) {
-            int remainingTimeout = remainingTime(timeout, startTime);
+            int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
             ioWait(remainingTimeout, IOOperation.WRITE);
             int sent = dieIfNegative(socket.send(ptr, len));
             while (socket.wantsTlsWrite()) {
-                remainingTimeout = remainingTime(timeout, startTime);
+                remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
                 ioWait(remainingTimeout, IOOperation.WRITE);
                 dieIfNegative(socket.tlsIO(Socket.WRITE_FLAG));
             }
@@ -609,7 +609,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         long startTime = System.nanoTime();
 
         while (true) {
-            int remainingTimeout = remainingTime(timeout, startTime);
+            int remainingTimeout = getRemainingTimeOrThrow(timeout, startTime);
             int bytesRead = recvOrDie(recvBufPtr + recvPos, recvBufSize - recvPos, remainingTimeout);
             if (bytesRead > 0) {
                 recvPos += bytesRead;
@@ -639,7 +639,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         long startTime = System.nanoTime();
         int n = dieIfNegative(socket.recv(ptr, len));
         if (n == 0) {
-            ioWait(remainingTime(timeout, startTime), IOOperation.READ);
+            ioWait(getRemainingTimeOrThrow(timeout, startTime), IOOperation.READ);
             n = dieIfNegative(socket.recv(ptr, len));
         }
         return n;
@@ -666,12 +666,16 @@ public abstract class WebSocketClient implements QuietCloseable {
         return n;
     }
 
-    private int remainingTime(int timeoutMillis, long startTimeNanos) {
-        timeoutMillis -= (int) NANOSECONDS.toMillis(System.nanoTime() - startTimeNanos);
-        if (timeoutMillis <= 0) {
+    private int getRemainingTimeOrThrow(int timeoutMillis, long startTimeNanos) {
+        int remaining = remainingTime(timeoutMillis, startTimeNanos);
+        if (remaining <= 0) {
             throw new HttpClientException("timed out [errno=").errno(nf.errno()).put(']');
         }
-        return timeoutMillis;
+        return remaining;
+    }
+
+    private static int remainingTime(int timeoutMillis, long startTimeNanos) {
+        return timeoutMillis - (int) NANOSECONDS.toMillis(System.nanoTime() - startTimeNanos);
     }
 
     private void resetFragmentState() {
