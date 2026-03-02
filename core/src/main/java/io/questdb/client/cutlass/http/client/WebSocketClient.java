@@ -470,7 +470,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             fragmentBufSize = Math.max(required, DEFAULT_RECV_BUFFER_SIZE);
             fragmentBufPtr = Unsafe.malloc(fragmentBufSize, MemoryTag.NATIVE_DEFAULT);
         } else if (required > fragmentBufSize) {
-            int newSize = Math.min(Math.max(fragmentBufSize * 2, required), maxRecvBufSize);
+            int newSize = (int) Math.min(Math.max((long) fragmentBufSize * 2, required), maxRecvBufSize);
             fragmentBufPtr = Unsafe.realloc(fragmentBufPtr, fragmentBufSize, newSize, MemoryTag.NATIVE_DEFAULT);
             fragmentBufSize = newSize;
         }
@@ -589,8 +589,8 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     private void growRecvBuffer() {
-        int newSize = recvBufSize * 2;
-        if (newSize > maxRecvBufSize) {
+        int newSize = (int) Math.min((long) recvBufSize * 2, maxRecvBufSize);
+        if (newSize >= maxRecvBufSize) {
             if (recvBufSize >= maxRecvBufSize) {
                 throw new HttpClientException("WebSocket receive buffer size exceeded maximum [current=")
                         .put(recvBufSize)
