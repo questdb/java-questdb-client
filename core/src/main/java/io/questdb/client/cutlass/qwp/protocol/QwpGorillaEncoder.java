@@ -148,18 +148,13 @@ public class QwpGorillaEncoder {
      */
     public static int getBitsRequired(long deltaOfDelta) {
         int bucket = getBucket(deltaOfDelta);
-        switch (bucket) {
-            case 0:
-                return 1;
-            case 1:
-                return 9;
-            case 2:
-                return 12;
-            case 3:
-                return 16;
-            default:
-                return 36;
-        }
+        return switch (bucket) {
+            case 0 -> 1;
+            case 1 -> 9;
+            case 2 -> 12;
+            case 3 -> 16;
+            default -> 36;
+        };
     }
 
     /**
@@ -199,25 +194,23 @@ public class QwpGorillaEncoder {
     public void encodeDoD(long deltaOfDelta) {
         int bucket = getBucket(deltaOfDelta);
         switch (bucket) {
-            case 0: // DoD == 0
-                bitWriter.writeBit(0);
-                break;
-            case 1: // [-64, 63] -> '10' + 7-bit
+            case 0 -> bitWriter.writeBit(0);
+            case 1 -> {
                 bitWriter.writeBits(0b01, 2);
                 bitWriter.writeSigned(deltaOfDelta, 7);
-                break;
-            case 2: // [-256, 255] -> '110' + 9-bit
+            }
+            case 2 -> {
                 bitWriter.writeBits(0b011, 3);
                 bitWriter.writeSigned(deltaOfDelta, 9);
-                break;
-            case 3: // [-2048, 2047] -> '1110' + 12-bit
+            }
+            case 3 -> {
                 bitWriter.writeBits(0b0111, 4);
                 bitWriter.writeSigned(deltaOfDelta, 12);
-                break;
-            default: // '1111' + 32-bit
+            }
+            default -> {
                 bitWriter.writeBits(0b1111, 4);
                 bitWriter.writeSigned(deltaOfDelta, 32);
-                break;
+            }
         }
     }
 

@@ -271,34 +271,16 @@ public class QwpTableBuffer implements QuietCloseable {
      * @see QwpConstants#getFixedTypeSize(byte) for wire-format sizes
      */
     static int elementSizeInBuffer(byte type) {
-        switch (type) {
-            case TYPE_BOOLEAN:
-            case TYPE_BYTE:
-                return 1;
-            case TYPE_SHORT:
-            case TYPE_CHAR:
-                return 2;
-            case TYPE_INT:
-            case TYPE_SYMBOL:
-            case TYPE_FLOAT:
-                return 4;
-            case TYPE_GEOHASH:
-            case TYPE_LONG:
-            case TYPE_TIMESTAMP:
-            case TYPE_TIMESTAMP_NANOS:
-            case TYPE_DATE:
-            case TYPE_DECIMAL64:
-            case TYPE_DOUBLE:
-                return 8;
-            case TYPE_UUID:
-            case TYPE_DECIMAL128:
-                return 16;
-            case TYPE_LONG256:
-            case TYPE_DECIMAL256:
-                return 32;
-            default:
-                return 0;
-        }
+        return switch (type) {
+            case TYPE_BOOLEAN, TYPE_BYTE -> 1;
+            case TYPE_SHORT, TYPE_CHAR -> 2;
+            case TYPE_INT, TYPE_SYMBOL, TYPE_FLOAT -> 4;
+            case TYPE_GEOHASH, TYPE_LONG, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS,
+                 TYPE_DATE, TYPE_DECIMAL64, TYPE_DOUBLE -> 8;
+            case TYPE_UUID, TYPE_DECIMAL128 -> 16;
+            case TYPE_LONG256, TYPE_DECIMAL256 -> 32;
+            default -> 0;
+        };
     }
 
     /**
@@ -1173,6 +1155,13 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
+        private static int checkedElementCount(long product) {
+            if (product > Integer.MAX_VALUE) {
+                throw new LineSenderException("array too large: total element count exceeds int range");
+            }
+            return (int) product;
+        }
+
         private void allocateStorage(byte type) {
             switch (type) {
                 case TYPE_BOOLEAN:
@@ -1227,13 +1216,6 @@ public class QwpTableBuffer implements QuietCloseable {
                     arrayCapture = new ArrayCapture();
                     break;
             }
-        }
-
-        private static int checkedElementCount(long product) {
-            if (product > Integer.MAX_VALUE) {
-                throw new LineSenderException("array too large: total element count exceeds int range");
-            }
-            return (int) product;
         }
 
         private void ensureArrayCapacity(int nDims, int dataElements) {

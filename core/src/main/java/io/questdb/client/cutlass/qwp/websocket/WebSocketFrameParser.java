@@ -147,7 +147,8 @@ public class WebSocketFrameParser {
             return 0;
         }
 
-        masked = (byte1 & MASK_BIT) != 0;
+        final boolean masked = (byte1 & MASK_BIT) != 0;
+        this.masked = masked;
         int lengthField = byte1 & LENGTH_MASK;
 
         // Validate masking based on mode
@@ -213,18 +214,7 @@ public class WebSocketFrameParser {
             return 0;
         }
 
-        // Parse mask key if present
-        if (masked) {
-            if (available < offset + 4) {
-                state = STATE_NEED_MORE;
-                return 0;
-            }
-            maskKey = Unsafe.getUnsafe().getInt(buf + offset);
-            offset += 4;
-        } else {
-            maskKey = 0;
-        }
-
+        maskKey = 0;
         headerSize = offset;
 
         // Check if we have the complete payload
@@ -260,6 +250,7 @@ public class WebSocketFrameParser {
      */
     public void unmaskPayload(long buf, long len) {
         if (!masked || maskKey == 0) {
+            // a zero maskKey is a no-op (makes no change to the data)
             return;
         }
 

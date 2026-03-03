@@ -113,10 +113,13 @@ public class QwpWebSocketSender implements Sender {
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
     private static final String WRITE_PATH = "/write/v4";
+    private final AckFrameHandler ackHandler = new AckFrameHandler(this);
+    private final WebSocketResponse ackResponse = new WebSocketResponse();
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
     // Auto-flush configuration
     private final int autoFlushRows;
+    private final Decimal256 currentDecimal256 = new Decimal256();
     // Encoder for ILP v4 messages
     private final QwpWebSocketEncoder encoder;
     // Global symbol dictionary for delta encoding
@@ -131,8 +134,6 @@ public class QwpWebSocketSender implements Sender {
     private final LongHashSet sentSchemaHashes = new LongHashSet();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     private final boolean tlsEnabled;
-    private final AckFrameHandler ackHandler = new AckFrameHandler(this);
-    private final WebSocketResponse ackResponse = new WebSocketResponse();
     private MicrobatchBuffer activeBuffer;
     // Double-buffering for async I/O
     private MicrobatchBuffer buffer0;
@@ -146,7 +147,6 @@ public class QwpWebSocketSender implements Sender {
     private boolean connected;
     // Track max global symbol ID used in current batch (for delta calculation)
     private int currentBatchMaxSymbolId = -1;
-    private final Decimal256 currentDecimal256 = new Decimal256();
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
     private long firstPendingRowTimeNanos;
@@ -711,14 +711,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns the number of pending rows not yet flushed.
-     * For testing.
-     */
-    public int getPendingRowCount() {
-        return pendingRowCount;
-    }
-
-    /**
      * Registers a symbol in the global dictionary and returns its ID.
      * For use with fast-path column buffer access.
      */
@@ -728,6 +720,14 @@ public class QwpWebSocketSender implements Sender {
             currentBatchMaxSymbolId = globalId;
         }
         return globalId;
+    }
+
+    /**
+     * Returns the number of pending rows not yet flushed.
+     * For testing.
+     */
+    public int getPendingRowCount() {
+        return pendingRowCount;
     }
 
     /**
@@ -886,10 +886,9 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Sets whether to use Gorilla timestamp encoding.
      */
-    public QwpWebSocketSender setGorillaEnabled(boolean enabled) {
+    public void setGorillaEnabled(boolean enabled) {
         this.gorillaEnabled = enabled;
         this.encoder.setGorillaEnabled(enabled);
-        return this;
     }
 
     /**
@@ -1382,33 +1381,23 @@ public class QwpWebSocketSender implements Sender {
         // Time limit
         if (autoFlushIntervalNanos > 0) {
             long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
-            if (ageNanos >= autoFlushIntervalNanos) {
-                return true;
-            }
+            return ageNanos >= autoFlushIntervalNanos;
         }
         // Byte limit is harder to estimate without encoding, skip for now
         return false;
     }
 
     private long toMicros(long value, ChronoUnit unit) {
-        switch (unit) {
-            case NANOS:
-                return value / 1000L;
-            case MICROS:
-                return value;
-            case MILLIS:
-                return value * 1000L;
-            case SECONDS:
-                return value * 1_000_000L;
-            case MINUTES:
-                return value * 60_000_000L;
-            case HOURS:
-                return value * 3_600_000_000L;
-            case DAYS:
-                return value * 86_400_000_000L;
-            default:
-                throw new LineSenderException("Unsupported time unit: " + unit);
-        }
+        return switch (unit) {
+            case NANOS -> value / 1000L;
+            case MICROS -> value;
+            case MILLIS -> value * 1000L;
+            case SECONDS -> value * 1_000_000L;
+            case MINUTES -> value * 60_000_000L;
+            case HOURS -> value * 3_600_000_000L;
+            case DAYS -> value * 86_400_000_000L;
+            default -> throw new LineSenderException("Unsupported time unit: " + unit);
+        };
     }
 
     /**

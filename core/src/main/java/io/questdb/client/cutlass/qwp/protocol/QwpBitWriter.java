@@ -104,16 +104,6 @@ public class QwpBitWriter {
     }
 
     /**
-     * Returns the number of bits remaining in the partial byte buffer.
-     * This is 0 after a flush or when aligned on a byte boundary.
-     *
-     * @return bits in buffer (0-7)
-     */
-    public int getBitsInBuffer() {
-        return bitsInBuffer;
-    }
-
-    /**
      * Returns the current write position (address).
      * Note: Call {@link #flush()} first to ensure all buffered bits are written.
      *
@@ -121,15 +111,6 @@ public class QwpBitWriter {
      */
     public long getPosition() {
         return currentAddress;
-    }
-
-    /**
-     * Returns the number of bits that have been written (including buffered bits).
-     *
-     * @return total bits written since reset
-     */
-    public long getTotalBitsWritten() {
-        return (currentAddress - startAddress) * 8L + bitsInBuffer;
     }
 
     /**
@@ -166,7 +147,7 @@ public class QwpBitWriter {
      */
     public void writeBits(long value, int numBits) {
         if (numBits <= 0 || numBits > 64) {
-            return;
+            throw new AssertionError("Asked to write more than 64 bits of a long");
         }
 
         // Mask the value to only include the requested bits
