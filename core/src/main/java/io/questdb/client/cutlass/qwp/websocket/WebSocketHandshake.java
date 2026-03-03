@@ -41,10 +41,6 @@ import java.util.Base64;
 public final class WebSocketHandshake {
     public static final Utf8String VALUE_WEBSOCKET = new Utf8String("websocket");
     /**
-     * The WebSocket magic GUID used in the Sec-WebSocket-Accept calculation.
-     */
-    public static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    /**
      * The required WebSocket version (RFC 6455).
      */
     public static final int WEBSOCKET_VERSION = 13;
@@ -55,6 +51,10 @@ public final class WebSocketHandshake {
             throw new RuntimeException("SHA-1 not available", e);
         }
     });
+    /**
+     * The WebSocket magic GUID used in the Sec-WebSocket-Accept calculation.
+     */
+    private static final byte[] WEBSOCKET_GUID_BYTES = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11".getBytes(StandardCharsets.US_ASCII);
 
     private WebSocketHandshake() {
         // Static utility class
@@ -70,9 +70,10 @@ public final class WebSocketHandshake {
         MessageDigest sha1 = SHA1_DIGEST.get();
         sha1.reset();
 
-        // Concatenate key + GUID
-        sha1.update(key.getBytes(StandardCharsets.US_ASCII));
-        sha1.update(WEBSOCKET_GUID.getBytes(StandardCharsets.US_ASCII));
+        for (int i = 0, n = key.length(); i < n; i++) {
+            sha1.update((byte) key.charAt(i));
+        }
+        sha1.update(WEBSOCKET_GUID_BYTES);
 
         // Compute SHA-1 hash and base64 encode
         byte[] hash = sha1.digest();
@@ -91,7 +92,23 @@ public final class WebSocketHandshake {
         }
         // Connection header may contain multiple values, e.g., "keep-alive, Upgrade"
         // Perform case-insensitive substring search
-        return containsIgnoreCaseAscii(connectionHeader, VALUE_UPGRADE);
+        int seqLen = connectionHeader.size();
+        if (seqLen < 7) {
+            return false;
+        }
+        for (int i = 0; i <= seqLen - 7; i++) {
+            if ((connectionHeader.byteAt(i) | 32) == 'u'
+                    && (connectionHeader.byteAt(i + 1) | 32) == 'p'
+                    && (connectionHeader.byteAt(i + 2) | 32) == 'g'
+                    && (connectionHeader.byteAt(i + 3) | 32) == 'r'
+                    && (connectionHeader.byteAt(i + 4) | 32) == 'a'
+                    && (connectionHeader.byteAt(i + 5) | 32) == 'd'
+                    && (connectionHeader.byteAt(i + 6) | 32) == 'e'
+            ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
