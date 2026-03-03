@@ -52,12 +52,68 @@ public class QwpSchemaHashSurrogateTest {
     }
 
     @Test
+    public void testComputeSchemaHashLoneHighSurrogateAtEnd() {
+        byte[] types = {TYPE_LONG};
+
+        // "\uD800" is a lone high surrogate at end of string.
+        // Must hash as '?' to match OffHeapAppendMemory.putUtf8().
+        long hashInvalid = QwpSchemaHash.computeSchemaHash(
+                new String[]{"col\uD800"}, types
+        );
+        long hashExpected = QwpSchemaHash.computeSchemaHash(
+                new String[]{"col?"}, types
+        );
+        assertEquals(hashExpected, hashInvalid);
+    }
+
+    @Test
+    public void testComputeSchemaHashLoneLowSurrogate() {
+        byte[] types = {TYPE_LONG};
+
+        // "\uDC00" is a lone low surrogate (not preceded by a high surrogate).
+        // Must hash as '?' to match OffHeapAppendMemory.putUtf8().
+        long hashInvalid = QwpSchemaHash.computeSchemaHash(
+                new String[]{"col\uDC00"}, types
+        );
+        long hashExpected = QwpSchemaHash.computeSchemaHash(
+                new String[]{"col?"}, types
+        );
+        assertEquals(hashExpected, hashInvalid);
+    }
+
+    @Test
     public void testComputeSchemaHashDirectInvalidSurrogatePair() {
         ObjList<QwpTableBuffer.ColumnBuffer> invalidCols = new ObjList<>();
         invalidCols.add(new QwpTableBuffer.ColumnBuffer("\uD800X", TYPE_LONG, false));
 
         ObjList<QwpTableBuffer.ColumnBuffer> expectedCols = new ObjList<>();
         expectedCols.add(new QwpTableBuffer.ColumnBuffer("?X", TYPE_LONG, false));
+
+        long hashInvalid = QwpSchemaHash.computeSchemaHashDirect(invalidCols);
+        long hashExpected = QwpSchemaHash.computeSchemaHashDirect(expectedCols);
+        assertEquals(hashExpected, hashInvalid);
+    }
+
+    @Test
+    public void testComputeSchemaHashDirectLoneHighSurrogateAtEnd() {
+        ObjList<QwpTableBuffer.ColumnBuffer> invalidCols = new ObjList<>();
+        invalidCols.add(new QwpTableBuffer.ColumnBuffer("col\uD800", TYPE_LONG, false));
+
+        ObjList<QwpTableBuffer.ColumnBuffer> expectedCols = new ObjList<>();
+        expectedCols.add(new QwpTableBuffer.ColumnBuffer("col?", TYPE_LONG, false));
+
+        long hashInvalid = QwpSchemaHash.computeSchemaHashDirect(invalidCols);
+        long hashExpected = QwpSchemaHash.computeSchemaHashDirect(expectedCols);
+        assertEquals(hashExpected, hashInvalid);
+    }
+
+    @Test
+    public void testComputeSchemaHashDirectLoneLowSurrogate() {
+        ObjList<QwpTableBuffer.ColumnBuffer> invalidCols = new ObjList<>();
+        invalidCols.add(new QwpTableBuffer.ColumnBuffer("col\uDC00", TYPE_LONG, false));
+
+        ObjList<QwpTableBuffer.ColumnBuffer> expectedCols = new ObjList<>();
+        expectedCols.add(new QwpTableBuffer.ColumnBuffer("col?", TYPE_LONG, false));
 
         long hashInvalid = QwpSchemaHash.computeSchemaHashDirect(invalidCols);
         long hashExpected = QwpSchemaHash.computeSchemaHashDirect(expectedCols);

@@ -122,6 +122,8 @@ public final class QwpSchemaHash {
                         hasher.update((byte) '?');
                         j--;
                     }
+                } else if (Character.isSurrogate(c)) {
+                    hasher.update((byte) '?');
                 } else {
                     // Three bytes
                     hasher.update((byte) (0xE0 | (c >> 12)));
@@ -195,6 +197,8 @@ public final class QwpSchemaHash {
                         hasher.update((byte) '?');
                         j--;
                     }
+                } else if (Character.isSurrogate(c)) {
+                    hasher.update((byte) '?');
                 } else {
                     hasher.update((byte) (0xE0 | (c >> 12)));
                     hasher.update((byte) (0x80 | ((c >> 6) & 0x3F)));
