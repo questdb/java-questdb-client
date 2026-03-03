@@ -26,11 +26,7 @@ package io.questdb.client.std;
 
 // @formatter:off
 import io.questdb.client.cairo.CairoException;
-import org.jetbrains.annotations.Nullable;
-
-import java.lang.invoke.MethodHandles;
 import java.lang.reflect.AccessibleObject;
-import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.LongAdder;
@@ -43,15 +39,12 @@ public final class Unsafe {
 
     public static final long BYTE_OFFSET;
     public static final long BYTE_SCALE;
-    public static final long INT_OFFSET;
-    public static final long INT_SCALE;
     public static final Module JAVA_BASE_MODULE = System.class.getModule();
     public static final long LONG_OFFSET;
     public static final long LONG_SCALE;
     private static final LongAdder[] COUNTERS = new LongAdder[MemoryTag.SIZE];
     private static final long FREE_COUNT_ADDR;
     private static final long MALLOC_COUNT_ADDR;
-    private static final long[] NATIVE_ALLOCATORS = new long[MemoryTag.SIZE - NATIVE_DEFAULT];
     private static final long[] NATIVE_MEM_COUNTER_ADDRS = new long[MemoryTag.SIZE];
     private static final long NON_RSS_MEM_USED_ADDR;
     private static final long OVERRIDE;
@@ -59,7 +52,6 @@ public final class Unsafe {
     private static final long RSS_MEM_LIMIT_ADDR;
     private static final long RSS_MEM_USED_ADDR;
     private static final sun.misc.Unsafe UNSAFE;
-    private static final AnonymousClassDefiner anonymousClassDefiner;
     private static final Method implAddExports;
 
     private Unsafe() {
@@ -71,40 +63,6 @@ public final class Unsafe {
         } catch (ReflectiveOperationException e) {
             e.printStackTrace(System.out);
         }
-    }
-
-    public static long arrayGetVolatile(long[] array, int index) {
-        assert index > -1 && index < array.length;
-        return Unsafe.getUnsafe().getLongVolatile(array, LONG_OFFSET + ((long) index << LONG_SCALE));
-    }
-
-    public static int arrayGetVolatile(int[] array, int index) {
-        assert index > -1 && index < array.length;
-        return Unsafe.getUnsafe().getIntVolatile(array, INT_OFFSET + ((long) index << INT_SCALE));
-    }
-
-    /**
-     * This call has Atomic*#lazySet / memory_order_release semantics.
-     *
-     * @param array array to put into
-     * @param index index
-     * @param value value to put
-     */
-    public static void arrayPutOrdered(long[] array, int index, long value) {
-        assert index > -1 && index < array.length;
-        Unsafe.getUnsafe().putOrderedLong(array, LONG_OFFSET + ((long) index << LONG_SCALE), value);
-    }
-
-    /**
-     * This call has Atomic*#lazySet / memory_order_release semantics.
-     *
-     * @param array array to put into
-     * @param index index
-     * @param value value to put
-     */
-    public static void arrayPutOrdered(int[] array, int index, int value) {
-        assert index > -1 && index < array.length;
-        Unsafe.getUnsafe().putOrderedInt(array, INT_OFFSET + ((long) index << INT_SCALE), value);
     }
 
     public static int byteArrayGetInt(byte[] array, int index) {
@@ -139,21 +97,6 @@ public final class Unsafe {
     public static boolean cas(long[] array, int index, long expected, long value) {
         assert index > -1 && index < array.length;
         return Unsafe.cas(array, Unsafe.LONG_OFFSET + (((long) index) << Unsafe.LONG_SCALE), expected, value);
-    }
-
-    /**
-     * Defines a class but does not make it known to the class loader or system dictionary.
-     * <p>
-     * Equivalent to {@code Unsafe#defineAnonymousClass} and {@code Lookup#defineHiddenClass}, except that
-     * it does not support constant pool patches.
-     *
-     * @param hostClass context for linkage, access control, protection domain, and class loader
-     * @param data      bytes of a class file
-     * @return Java Class for the given bytecode
-     */
-    @Nullable
-    public static Class<?> defineAnonymousClass(Class<?> hostClass, byte[] data) {
-        return anonymousClassDefiner.define(hostClass, data);
     }
 
     public static long free(long ptr, long size, int memoryTag) {
@@ -197,11 +140,6 @@ public final class Unsafe {
     public static long getMemUsedByTag(int memoryTag) {
         assert memoryTag >= 0 && memoryTag < MemoryTag.SIZE;
         return COUNTERS[memoryTag].sum() + UNSAFE.getLongVolatile(null, NATIVE_MEM_COUNTER_ADDRS[memoryTag]);
-    }
-
-    /** Returns a `*const QdbAllocator` for use in Rust. */
-    public static long getNativeAllocator(int memoryTag) {
-        return NATIVE_ALLOCATORS[memoryTag - NATIVE_DEFAULT];
     }
 
     public static long getReallocCount() {
@@ -300,10 +238,6 @@ public final class Unsafe {
         }
     }
 
-    public static void setRssMemLimit(long limit) {
-        UNSAFE.putLongVolatile(null, RSS_MEM_LIMIT_ADDR, limit);
-    }
-
     private static long AccessibleObject_override_fieldOffset() {
         if (isJava8Or11()) {
             return getFieldOffset(AccessibleObject.class, "override");
@@ -337,19 +271,6 @@ public final class Unsafe {
                         .put(']');
             }
         }
-    }
-
-    /** Allocate a new native allocator object and return its pointer */
-    private static long constructNativeAllocator(long nativeMemCountersArray, int memoryTag) {
-        // See `allocator.rs` for the definition of `QdbAllocator`.
-        // We construct here via `Unsafe` to avoid having initialization order issues with `Os.java`.
-        final long allocSize = 8 + 8 + 4;  // two longs, one int
-        final long addr = UNSAFE.allocateMemory(allocSize);
-        Vect.memset(addr, allocSize, 0);
-        UNSAFE.putLong(addr, nativeMemCountersArray);
-        UNSAFE.putLong(addr + 8, NATIVE_MEM_COUNTER_ADDRS[memoryTag]);
-        UNSAFE.putInt(addr + 16, memoryTag);
-        return addr;
     }
 
     private static boolean getOrdinaryObjectPointersCompressionStatus(boolean is32BitJVM) {
@@ -390,92 +311,6 @@ public final class Unsafe {
         return 31 - Integer.numberOfLeadingZeros(value);
     }
 
-    interface AnonymousClassDefiner {
-        Class<?> define(Class<?> hostClass, byte[] data);
-    }
-
-    /**
-     * Based on {@code MethodHandles.Lookup#defineHiddenClass}.
-     */
-    static class MethodHandlesClassDefiner implements AnonymousClassDefiner {
-        private static Method defineMethod;
-        private static Object hiddenClassOptions;
-        private static Object lookupBase;
-        private static long lookupOffset;
-
-        @Nullable
-        public static MethodHandlesClassDefiner newInstance() {
-            if (defineMethod == null) {
-                try {
-                    Field trustedLookupField = MethodHandles.Lookup.class.getDeclaredField("IMPL_LOOKUP");
-                    lookupBase = UNSAFE.staticFieldBase(trustedLookupField);
-                    lookupOffset = UNSAFE.staticFieldOffset(trustedLookupField);
-                    hiddenClassOptions = hiddenClassOptions("NESTMATE");
-                    defineMethod = MethodHandles.Lookup.class
-                            .getMethod("defineHiddenClass", byte[].class, boolean.class, hiddenClassOptions.getClass());
-                } catch (ReflectiveOperationException e) {
-                    return null;
-                }
-            }
-            return new MethodHandlesClassDefiner();
-        }
-
-        @Override
-        public Class<?> define(Class<?> hostClass, byte[] data) {
-            try {
-                MethodHandles.Lookup trustedLookup = (MethodHandles.Lookup) UNSAFE.getObject(lookupBase, lookupOffset);
-                MethodHandles.Lookup definedLookup =
-                        (MethodHandles.Lookup) defineMethod.invoke(trustedLookup.in(hostClass), data, false, hiddenClassOptions);
-                return definedLookup.lookupClass();
-            } catch (Exception e) {
-                e.printStackTrace(System.out);
-                return null;
-            }
-        }
-
-        @SuppressWarnings("unchecked")
-        private static Object hiddenClassOptions(String... options) throws ClassNotFoundException {
-            @SuppressWarnings("rawtypes")
-            Class optionClass = Class.forName(MethodHandles.Lookup.class.getName() + "$ClassOption");
-            Object classOptions = Array.newInstance(optionClass, options.length);
-            for (int i = 0; i < options.length; i++) {
-                Array.set(classOptions, i, Enum.valueOf(optionClass, options[i]));
-            }
-            return classOptions;
-        }
-    }
-
-    /**
-     * Based on {@code Unsafe#defineAnonymousClass}.
-     */
-    static class UnsafeClassDefiner implements AnonymousClassDefiner {
-
-        private static Method defineMethod;
-
-        @Nullable
-        public static UnsafeClassDefiner newInstance() {
-            if (defineMethod == null) {
-                try {
-                    defineMethod = sun.misc.Unsafe.class
-                            .getMethod("defineAnonymousClass", Class.class, byte[].class, Object[].class);
-                } catch (ReflectiveOperationException e) {
-                    return null;
-                }
-            }
-            return new UnsafeClassDefiner();
-        }
-
-        @Override
-        public Class<?> define(Class<?> hostClass, byte[] data) {
-            try {
-                return (Class<?>) defineMethod.invoke(UNSAFE, hostClass, data, null);
-            } catch (Exception e) {
-                e.printStackTrace(System.out);
-                return null;
-            }
-        }
-    }
-
     static {
         try {
             Field theUnsafe = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
@@ -485,23 +320,11 @@ public final class Unsafe {
             BYTE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(byte[].class);
             BYTE_SCALE = msb(Unsafe.getUnsafe().arrayIndexScale(byte[].class));
 
-            INT_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(int[].class);
-            INT_SCALE = msb(Unsafe.getUnsafe().arrayIndexScale(int[].class));
-
             LONG_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(long[].class);
             LONG_SCALE = msb(Unsafe.getUnsafe().arrayIndexScale(long[].class));
 
             OVERRIDE = AccessibleObject_override_fieldOffset();
             implAddExports = Module.class.getDeclaredMethod("implAddExports", String.class, Module.class);
-
-            AnonymousClassDefiner classDefiner = UnsafeClassDefiner.newInstance();
-            if (classDefiner == null) {
-                classDefiner = MethodHandlesClassDefiner.newInstance();
-            }
-            if (classDefiner == null) {
-                throw new InstantiationException("failed to initialize class definer");
-            }
-            anonymousClassDefiner = classDefiner;
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -533,10 +356,6 @@ public final class Unsafe {
             COUNTERS[i] = new LongAdder();
             NATIVE_MEM_COUNTER_ADDRS[i] = ptr;
             ptr += 8;
-        }
-        for (int memoryTag = NATIVE_DEFAULT; memoryTag < MemoryTag.SIZE; ++memoryTag) {
-            NATIVE_ALLOCATORS[memoryTag - NATIVE_DEFAULT] = constructNativeAllocator(
-                    nativeMemCountersArray, memoryTag);
         }
     }
 }

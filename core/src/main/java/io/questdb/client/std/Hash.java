@@ -26,18 +26,7 @@ package io.questdb.client.std;
 
 public final class Hash {
 
-    // Constant from Rust compiler's FxHasher.
-    private static final long M2 = 0x517cc1b727220a95L;
-
     private static final int SPREAD_HASH_BITS = 0x7fffffff;
-
-    public static int hashLong128_32(long key1, long key2) {
-        return (int) hashLong128_64(key1, key2);
-    }
-
-    public static long hashLong128_64(long key1, long key2) {
-        return fmix64(key1 * M2 + key2);
-    }
 
     public static int hashLong32(long k) {
         return (int) hashLong64(k);

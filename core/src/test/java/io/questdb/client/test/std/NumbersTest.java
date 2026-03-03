@@ -113,11 +113,6 @@ public class NumbersTest {
     }
 
     @Test(expected = NumericException.class)
-    public void testEmptyFloat() {
-        Numbers.parseFloat("f");
-    }
-
-    @Test(expected = NumericException.class)
     public void testEmptyLong() {
         Numbers.parseLong("L");
     }
@@ -317,11 +312,6 @@ public class NumbersTest {
     public void testIntEdge() {
         Numbers.append(sink, Integer.MAX_VALUE);
         assertEquals(Integer.MAX_VALUE, Numbers.parseInt(sink));
-
-        sink.clear();
-
-        Numbers.append(sink, Integer.MIN_VALUE);
-        assertEquals(Integer.MIN_VALUE, Numbers.parseIntQuiet(sink));
     }
 
     @Test
@@ -352,40 +342,6 @@ public class NumbersTest {
     public void testLongToString() {
         Numbers.append(sink, 6103390276L);
         TestUtils.assertEquals("6103390276", sink);
-    }
-
-    @Test(expected = NumericException.class)
-    public void testParse000Greedy0() throws NumericException {
-        Numbers.parseInt000Greedy("", 0, 0);
-    }
-
-    @Test
-    public void testParse000Greedy1() throws NumericException {
-        String input = "2";
-        long val = Numbers.parseInt000Greedy(input, 0, input.length());
-        assertEquals(input.length(), Numbers.decodeHighInt(val));
-        assertEquals(200, Numbers.decodeLowInt(val));
-    }
-
-    @Test
-    public void testParse000Greedy2() throws NumericException {
-        String input = "06";
-        long val = Numbers.parseInt000Greedy(input, 0, input.length());
-        assertEquals(input.length(), Numbers.decodeHighInt(val));
-        assertEquals(60, Numbers.decodeLowInt(val));
-    }
-
-    @Test
-    public void testParse000Greedy3() throws NumericException {
-        String input = "219";
-        long val = Numbers.parseInt000Greedy(input, 0, input.length());
-        assertEquals(input.length(), Numbers.decodeHighInt(val));
-        assertEquals(219, Numbers.decodeLowInt(val));
-    }
-
-    @Test(expected = NumericException.class)
-    public void testParse000Greedy4() throws NumericException {
-        Numbers.parseInt000Greedy("1234", 0, 4);
     }
 
     @Test
@@ -497,123 +453,6 @@ public class NumbersTest {
     }
 
     @Test
-    public void testParseExplicitFloat() {
-        assertEquals(12345.02f, Numbers.parseFloat("12345.02f"), 0.0001f);
-    }
-
-    @Test(expected = NumericException.class)
-    public void testParseExplicitFloat2() {
-        Numbers.parseFloat("12345.02fx");
-    }
-
-    @Test
-    public void testParseFloat() {
-        String s1 = "0.45677899234";
-        assertEquals(Float.parseFloat(s1), Numbers.parseFloat(s1), 0.000000001);
-
-        String s2 = "1.459983E35";
-        assertEquals(Float.parseFloat(s2) / 1e35d, Numbers.parseFloat(s2) / 1e35d, 0.00001);
-
-        String s3 = "0.000000023E-30";
-        assertEquals(Float.parseFloat(s3), Numbers.parseFloat(s3), 0.000000001);
-
-        // overflow
-        try {
-            Numbers.parseFloat("1.0000E-204");
-            Assert.fail();
-        } catch (NumericException ignored) {
-        }
-
-        try {
-            Numbers.parseFloat("1E39");
-            Assert.fail();
-        } catch (NumericException ignored) {
-        }
-
-        try {
-            Numbers.parseFloat("1.0E39");
-            Assert.fail();
-        } catch (NumericException ignored) {
-        }
-
-        String s6 = "200E2";
-        assertEquals(Float.parseFloat(s6), Numbers.parseFloat(s6), 0.000000001);
-
-        String s7 = "NaN";
-        assertEquals(Float.parseFloat(s7), Numbers.parseFloat(s7), 0.000000001);
-
-        String s8 = "-Infinity";
-        assertEquals(Float.parseFloat(s8), Numbers.parseFloat(s8), 0.000000001);
-
-        // min exponent float
-        String s9 = "1.4e-45";
-        assertEquals(1.4e-45f, Numbers.parseFloat(s9), 0.001);
-
-        // false overflow
-        String s10 = "0003000.0e-46";
-        assertEquals(1.4e-45f, Numbers.parseFloat(s10), 0.001);
-
-        // false overflow
-        String s11 = "0.00001e40";
-        assertEquals(1e35f, Numbers.parseFloat(s11), 0.001);
-    }
-
-    @Test
-    public void testParseFloatCloseToZero() {
-        String s1 = "0.123456789";
-        assertEquals(Float.parseFloat(s1), Numbers.parseFloat(s1), 0.000000001);
-
-        String s2 = "0.12345678901234567890123456789E12";
-        assertEquals(Float.parseFloat(s2), Numbers.parseFloat(s2), 0.000000001);
-    }
-
-    @Test
-    public void testParseFloatIntegerLargerThanLongMaxValue() {
-        String s1 = "9223372036854775808";
-        assertEquals(Float.parseFloat(s1), Numbers.parseFloat(s1), 0.000000001);
-
-        String s2 = "9223372036854775808123";
-        assertEquals(Float.parseFloat(s2), Numbers.parseFloat(s2), 0.000000001);
-
-        String s3 = "9223372036854775808123922337203685477";
-        assertEquals(Float.parseFloat(s3), Numbers.parseFloat(s3), 0.000000001);
-
-        String s4 = "92233720368547758081239223372036854771";
-        assertEquals(Float.parseFloat(s4), Numbers.parseFloat(s4), 0.000000001);
-    }
-
-    @Test
-    public void testParseFloatLargerThanLongMaxValue() throws NumericException {
-        String s1 = "9223372036854775808.0123456789";
-        assertEquals(Float.parseFloat(s1), Numbers.parseFloat(s1), 0.000000001);
-
-        String s2 = "9223372036854775808.0123456789";
-        assertEquals(Float.parseFloat(s2), Numbers.parseFloat(s2), 0.000000001);
-
-        String s3 = "9223372036854775808123.0123456789";
-        assertEquals(Float.parseFloat(s3), Numbers.parseFloat(s3), 0.000000001);
-
-        String s4 = "922337203685477580812392233720368547758081.01239223372036854775808123"; // overflow
-        try {
-            Numbers.parseFloat(s4);
-            Assert.fail();
-        } catch (NumericException ignored) {
-        }
-    }
-
-    @Test
-    public void testParseFloatNegativeZero() throws NumericException {
-        float actual = Numbers.parseFloat("-0.0");
-
-        //check it's zero at all
-        assertEquals(0, actual, 0.0);
-
-        //check it's *negative* zero
-        float res = 1 / actual;
-        assertEquals(Float.NEGATIVE_INFINITY, res, 0.0);
-    }
-
-    @Test
     public void testParseIPv4() {
         assertEquals(84413540, Numbers.parseIPv4("5.8.12.100"));
         assertEquals(204327201, Numbers.parseIPv4("12.45.201.33"));
@@ -675,12 +514,6 @@ public class NumbersTest {
     @Test(expected = NumericException.class)
     public void testParseIPv4Overflow3() {
         Numbers.parseIPv4("12.1.3500.2");
-    }
-
-    @Test
-    public void testParseIPv4Quiet() {
-        assertEquals(0, Numbers.parseIPv4Quiet(null));
-        assertEquals(0, Numbers.parseIPv4Quiet("NaN"));
     }
 
     @Test(expected = NumericException.class)
@@ -791,28 +624,6 @@ public class NumbersTest {
     @Test(expected = NumericException.class)
     public void testParseIntSignOnly() {
         Numbers.parseInt("-");
-    }
-
-    @Test
-    public void testParseIntToDelim() {
-        String in = "1234x5";
-        long val = Numbers.parseIntSafely(in, 0, in.length());
-        assertEquals(1234, Numbers.decodeLowInt(val));
-        assertEquals(4, Numbers.decodeHighInt(val));
-    }
-
-    @Test(expected = NumericException.class)
-    public void testParseIntToDelimEmpty() {
-        String in = "x";
-        Numbers.parseIntSafely(in, 0, in.length());
-    }
-
-    @Test
-    public void testParseIntToDelimNoChar() {
-        String in = "12345";
-        long val = Numbers.parseIntSafely(in, 0, in.length());
-        assertEquals(12345, Numbers.decodeLowInt(val));
-        assertEquals(5, Numbers.decodeHighInt(val));
     }
 
     @Test(expected = NumericException.class)

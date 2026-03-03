@@ -25,7 +25,6 @@
 package io.questdb.client.std;
 
 import io.questdb.client.std.fastdouble.FastDoubleParser;
-import io.questdb.client.std.fastdouble.FastFloatParser;
 import io.questdb.client.std.str.CharSink;
 import io.questdb.client.std.str.Utf8Sequence;
 import jdk.internal.math.FDBigInteger;
@@ -490,10 +489,6 @@ public final class Numbers {
         return Float.isNaN(value) || Float.isInfinite(value);
     }
 
-    public static boolean isPow2(int value) {
-        return value > 0 && (value & (value - 1)) == 0;
-    }
-
     public static int msb(int value) {
         return 31 - Integer.numberOfLeadingZeros(value);
     }
@@ -504,10 +499,6 @@ public final class Numbers {
 
     public static double parseDouble(CharSequence sequence) throws NumericException {
         return FastDoubleParser.parseDouble(sequence, true);
-    }
-
-    public static float parseFloat(CharSequence sequence) throws NumericException {
-        return FastFloatParser.parseFloat(sequence, true);
     }
 
     public static int parseHexInt(CharSequence sequence) throws NumericException {
@@ -555,17 +546,6 @@ public final class Numbers {
             return IPv4_NULL;
         }
         return parseIPv4_0(sequence, 0, sequence.length());
-    }
-
-    public static int parseIPv4Quiet(CharSequence sequence) {
-        try {
-            if (sequence == null || Chars.equals("null", sequence)) {
-                return IPv4_NULL;
-            }
-            return parseIPv4(sequence);
-        } catch (NumericException e) {
-            return IPv4_NULL;
-        }
     }
 
     public static int parseIPv4_0(CharSequence sequence, final int p, int lim) throws NumericException {
@@ -657,101 +637,6 @@ public final class Numbers {
         return parseInt0(sequence, p, lim);
     }
 
-    public static long parseInt000Greedy(CharSequence sequence, final int p, int lim) throws NumericException {
-        if (lim == p) {
-            throw NumericException.instance().put("empty number string");
-        }
-
-        boolean negative = sequence.charAt(p) == '-';
-        int i = p;
-        if (negative) {
-            i++;
-        }
-
-        if (i >= lim || notDigit(sequence.charAt(i))) {
-            throw NumericException.instance().put("not a number: ").put(sequence);
-        }
-
-        int val = 0;
-        for (; i < lim; i++) {
-            char c = sequence.charAt(i);
-
-            if (notDigit(c)) {
-                break;
-            }
-
-            // val * 10 + (c - '0')
-            int r = (val << 3) + (val << 1) - (c - '0');
-            if (r > val) {
-                throw NumericException.instance().put("number overflow");
-            }
-            val = r;
-        }
-
-        final int len = i - p;
-
-        if (len > 3 || val == Integer.MIN_VALUE && !negative) {
-            throw NumericException.instance().put("number overflow");
-        }
-
-        while (i - p < 3) {
-            val *= 10;
-            i++;
-        }
-
-        return encodeLowHighInts(negative ? val : -val, len);
-    }
-
-    public static int parseIntQuiet(CharSequence sequence) {
-        try {
-            if (sequence == null || Chars.equals("NaN", sequence)) {
-                return Numbers.INT_NULL;
-            }
-            return parseInt0(sequence, 0, sequence.length());
-        } catch (NumericException e) {
-            return Numbers.INT_NULL;
-        }
-
-    }
-
-    public static long parseIntSafely(CharSequence sequence, final int p, int lim) throws NumericException {
-        if (lim == p) {
-            throw NumericException.instance().put("empty number string");
-        }
-
-        boolean negative = sequence.charAt(p) == '-';
-        int i = p;
-        if (negative) {
-            i++;
-        }
-
-        if (i >= lim || notDigit(sequence.charAt(i))) {
-            throw NumericException.instance().put("not a number: ").put(sequence);
-        }
-
-        int val = 0;
-        for (; i < lim; i++) {
-            char c = sequence.charAt(i);
-
-            if (notDigit(c)) {
-                break;
-            }
-
-            // val * 10 + (c - '0')
-            int r = (val << 3) + (val << 1) - (c - '0');
-            if (r > val) {
-                throw NumericException.instance().put("number overflow");
-            }
-            val = r;
-        }
-
-        if (val == Integer.MIN_VALUE && !negative) {
-            throw NumericException.instance().put("number overflow");
-        }
-
-        return encodeLowHighInts(negative ? val : -val, i - p);
-    }
-
     public static long parseLong(CharSequence sequence) throws NumericException {
         if (sequence == null) {
             throw NumericException.instance().put("null string");
@@ -764,51 +649,6 @@ public final class Numbers {
             throw NumericException.instance().put("null string");
         }
         return parseLong0(sequence.asAsciiCharSequence(), 0, sequence.size());
-    }
-
-    public static long parseLong000000Greedy(CharSequence sequence, final int p, int lim) throws NumericException {
-        if (lim == p) {
-            throw NumericException.instance().put("empty number string");
-        }
-
-        boolean negative = sequence.charAt(p) == '-';
-        int i = p;
-        if (negative) {
-            i++;
-        }
-
-        if (i >= lim || notDigit(sequence.charAt(i))) {
-            throw NumericException.instance().put("not a number: ").put(sequence);
-        }
-
-        int val = 0;
-        for (; i < lim; i++) {
-            char c = sequence.charAt(i);
-
-            if (notDigit(c)) {
-                break;
-            }
-
-            // val * 10 + (c - '0')
-            int r = (val << 3) + (val << 1) - (c - '0');
-            if (r > val) {
-                throw NumericException.instance().put("number overflow");
-            }
-            val = r;
-        }
-
-        final int len = i - p;
-
-        if (len > 6 || val == Integer.MIN_VALUE && !negative) {
-            throw NumericException.instance().put("number overflow");
-        }
-
-        while (i - p < 6) {
-            val *= 10;
-            i++;
-        }
-
-        return encodeLowHighInts(negative ? val : -val, len);
     }
 
     public static long spreadBits(long v) {

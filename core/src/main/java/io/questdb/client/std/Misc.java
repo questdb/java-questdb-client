@@ -30,7 +30,6 @@ import io.questdb.client.std.str.Utf8StringSink;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.util.Arrays;
 
 public final class Misc {
     public static final String EOL = "\r\n";
@@ -98,12 +97,6 @@ public final class Misc {
         Utf8StringSink b = tlUtf8Sink.get();
         b.clear();
         return b;
-    }
-
-    public static int[] getWorkerAffinity(int workerCount) {
-        int[] res = new int[workerCount];
-        Arrays.fill(res, -1);
-        return res;
     }
 
     private static <T> void freeObjList0(ObjList<T> list) {
