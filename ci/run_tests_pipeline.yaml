@@ -72,6 +72,13 @@ stages:
             lfs: false
             submodules: false
           - template: setup.yaml
+          - task: Cache@2
+            inputs:
+              key: 'maven | "$(Agent.OS)" | **/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+              path: $(HOME)/.m2/repository
+            displayName: "Cache Maven repository"
           # TODO: remove branch once jh_experiment_new_ilp is merged
           - script: git clone --depth 1 -b jh_experiment_new_ilp https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
