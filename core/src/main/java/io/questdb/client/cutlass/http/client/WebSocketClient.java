@@ -655,7 +655,9 @@ public abstract class WebSocketClient implements QuietCloseable {
             try {
                 ioWait(timeout, IOOperation.READ);
             } catch (HttpClientException e) {
-                // Timeout
+                if (!e.isTimeout()) {
+                    throw e;
+                }
                 return 0;
             }
             n = socket.recv(ptr, len);
@@ -669,7 +671,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int getRemainingTimeOrThrow(int timeoutMillis, long startTimeNanos) {
         int remaining = remainingTime(timeoutMillis, startTimeNanos);
         if (remaining <= 0) {
-            throw new HttpClientException("timed out [errno=").errno(nf.errno()).put(']');
+            throw new HttpClientException("timed out [errno=").errno(nf.errno()).put(']').flagAsTimeout();
         }
         return remaining;
     }
@@ -861,7 +863,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             return;
         }
         if (n == 0) {
-            throw new HttpClientException("timed out [errno=").put(nf.errno()).put(']');
+            throw new HttpClientException("timed out [errno=").put(nf.errno()).put(']').flagAsTimeout();
         }
         throw new HttpClientException("queue error [errno=").put(nf.errno()).put(']');
     }
