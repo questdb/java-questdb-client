@@ -51,27 +51,24 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     public static final byte ENCODING_GORILLA = 0x01;
     public static final byte ENCODING_UNCOMPRESSED = 0x00;
     private final QwpGorillaEncoder gorillaEncoder = new QwpGorillaEncoder();
-    private QwpBufferWriter buffer;
+    private NativeBufferWriter buffer;
     private byte flags;
-    private NativeBufferWriter ownedBuffer;
 
     public QwpWebSocketEncoder() {
-        this.ownedBuffer = new NativeBufferWriter();
-        this.buffer = ownedBuffer;
+        this.buffer = new NativeBufferWriter();
         this.flags = 0;
     }
 
     public QwpWebSocketEncoder(int bufferSize) {
-        this.ownedBuffer = new NativeBufferWriter(bufferSize);
-        this.buffer = ownedBuffer;
+        this.buffer = new NativeBufferWriter(bufferSize);
         this.flags = 0;
     }
 
     @Override
     public void close() {
-        if (ownedBuffer != null) {
-            ownedBuffer.close();
-            ownedBuffer = null;
+        if (buffer != null) {
+            buffer.close();
+            buffer = null;
         }
     }
 
@@ -124,18 +121,8 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return (flags & FLAG_GORILLA) != 0;
     }
 
-    public boolean isUsingExternalBuffer() {
-        return buffer != ownedBuffer;
-    }
-
     public void reset() {
-        if (!isUsingExternalBuffer()) {
-            buffer.reset();
-        }
-    }
-
-    public void setBuffer(QwpBufferWriter externalBuffer) {
-        this.buffer = externalBuffer != null ? externalBuffer : ownedBuffer;
+        buffer.reset();
     }
 
     public void setDeltaSymbolDictEnabled(boolean enabled) {
