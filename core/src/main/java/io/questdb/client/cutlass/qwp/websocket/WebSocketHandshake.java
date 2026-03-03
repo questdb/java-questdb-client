@@ -24,7 +24,6 @@
 
 package io.questdb.client.cutlass.qwp.websocket;
 
-import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.Utf8Sequence;
 import io.questdb.client.std.str.Utf8String;
 import io.questdb.client.std.str.Utf8s;
@@ -40,15 +39,6 @@ import java.util.Base64;
  * generating proper handshake responses.
  */
 public final class WebSocketHandshake {
-    public static final Utf8String HEADER_CONNECTION = new Utf8String("Connection");
-    public static final Utf8String HEADER_SEC_WEBSOCKET_ACCEPT = new Utf8String("Sec-WebSocket-Accept");
-    public static final Utf8String HEADER_SEC_WEBSOCKET_KEY = new Utf8String("Sec-WebSocket-Key");
-    public static final Utf8String HEADER_SEC_WEBSOCKET_PROTOCOL = new Utf8String("Sec-WebSocket-Protocol");
-    public static final Utf8String HEADER_SEC_WEBSOCKET_VERSION = new Utf8String("Sec-WebSocket-Version");
-    // Header names (case-insensitive)
-    public static final Utf8String HEADER_UPGRADE = new Utf8String("Upgrade");
-    public static final Utf8String VALUE_UPGRADE = new Utf8String("upgrade");
-    // Header values
     public static final Utf8String VALUE_WEBSOCKET = new Utf8String("websocket");
     /**
      * The WebSocket magic GUID used in the Sec-WebSocket-Accept calculation.
@@ -58,12 +48,6 @@ public final class WebSocketHandshake {
      * The required WebSocket version (RFC 6455).
      */
     public static final int WEBSOCKET_VERSION = 13;
-    // Response template
-    private static final byte[] RESPONSE_PREFIX =
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] RESPONSE_SUFFIX = "\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
-
-    // Thread-local SHA-1 digest for computing Sec-WebSocket-Accept
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
             return MessageDigest.getInstance("SHA-1");
@@ -74,29 +58,6 @@ public final class WebSocketHandshake {
 
     private WebSocketHandshake() {
         // Static utility class
-    }
-
-    /**
-     * Computes the Sec-WebSocket-Accept value for the given key.
-     *
-     * @param key the Sec-WebSocket-Key from the client
-     * @return the base64-encoded SHA-1 hash to send in the response
-     */
-    public static String computeAcceptKey(Utf8Sequence key) {
-        MessageDigest sha1 = SHA1_DIGEST.get();
-        sha1.reset();
-
-        // Concatenate key + GUID
-        byte[] keyBytes = new byte[key.size()];
-        for (int i = 0; i < key.size(); i++) {
-            keyBytes[i] = key.byteAt(i);
-        }
-        sha1.update(keyBytes);
-        sha1.update(WEBSOCKET_GUID.getBytes(StandardCharsets.US_ASCII));
-
-        // Compute SHA-1 hash and base64 encode
-        byte[] hash = sha1.digest();
-        return Base64.getEncoder().encodeToString(hash);
     }
 
     /**
@@ -199,31 +160,6 @@ public final class WebSocketHandshake {
     }
 
     /**
-     * Returns the size of the handshake response for the given accept key.
-     *
-     * @param acceptKey the computed accept key
-     * @return the total response size in bytes
-     */
-    public static int responseSize(String acceptKey) {
-        return RESPONSE_PREFIX.length + acceptKey.length() + RESPONSE_SUFFIX.length;
-    }
-
-    /**
-     * Returns the size of the handshake response with an optional subprotocol.
-     *
-     * @param acceptKey the computed accept key
-     * @param protocol  the negotiated subprotocol (may be null or empty)
-     * @return the total response size in bytes
-     */
-    public static int responseSizeWithProtocol(String acceptKey, String protocol) {
-        int size = RESPONSE_PREFIX.length + acceptKey.length() + RESPONSE_SUFFIX.length;
-        if (protocol != null && !protocol.isEmpty()) {
-            size += "\r\nSec-WebSocket-Protocol: ".length() + protocol.length();
-        }
-        return size;
-    }
-
-    /**
      * Validates all required headers for a WebSocket upgrade request.
      *
      * @param upgradeHeader    the Upgrade header value
@@ -253,165 +189,4 @@ public final class WebSocketHandshake {
         return null;
     }
 
-    /**
-     * Writes a 400 Bad Request response.
-     *
-     * @param buf    the buffer to write to
-     * @param reason the reason for the bad request
-     * @return the number of bytes written
-     */
-    public static int writeBadRequestResponse(long buf, String reason) {
-        int offset = 0;
-
-        byte[] statusLine = "HTTP/1.1 400 Bad Request\r\n".getBytes(StandardCharsets.US_ASCII);
-        for (byte b : statusLine) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        byte[] contentType = "Content-Type: text/plain\r\n".getBytes(StandardCharsets.US_ASCII);
-        for (byte b : contentType) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        byte[] reasonBytes = reason != null ? reason.getBytes(StandardCharsets.UTF_8) : new byte[0];
-        byte[] contentLength = ("Content-Length: " + reasonBytes.length + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII);
-        for (byte b : contentLength) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        for (byte b : reasonBytes) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        return offset;
-    }
-
-    /**
-     * Writes the WebSocket handshake response to the given buffer.
-     *
-     * @param buf       the buffer to write to
-     * @param acceptKey the computed Sec-WebSocket-Accept value
-     * @return the number of bytes written
-     */
-    public static int writeResponse(long buf, String acceptKey) {
-        int offset = 0;
-
-        // Write prefix
-        for (byte b : RESPONSE_PREFIX) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        // Write accept key
-        byte[] acceptBytes = acceptKey.getBytes(StandardCharsets.US_ASCII);
-        for (byte b : acceptBytes) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        // Write suffix
-        for (byte b : RESPONSE_SUFFIX) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        return offset;
-    }
-
-    /**
-     * Writes the WebSocket handshake response with an optional subprotocol.
-     *
-     * @param buf       the buffer to write to
-     * @param acceptKey the computed Sec-WebSocket-Accept value
-     * @param protocol  the negotiated subprotocol (may be null or empty)
-     * @return the number of bytes written
-     */
-    public static int writeResponseWithProtocol(long buf, String acceptKey, String protocol) {
-        int offset = 0;
-
-        // Write prefix
-        for (byte b : RESPONSE_PREFIX) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        // Write accept key
-        byte[] acceptBytes = acceptKey.getBytes(StandardCharsets.US_ASCII);
-        for (byte b : acceptBytes) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        // Write protocol header if present
-        if (protocol != null && !protocol.isEmpty()) {
-            byte[] protocolHeader = ("\r\nSec-WebSocket-Protocol: " + protocol).getBytes(StandardCharsets.US_ASCII);
-            for (byte b : protocolHeader) {
-                Unsafe.getUnsafe().putByte(buf + offset++, b);
-            }
-        }
-
-        // Write suffix
-        for (byte b : RESPONSE_SUFFIX) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        return offset;
-    }
-
-    /**
-     * Writes a 426 Upgrade Required response indicating unsupported WebSocket version.
-     *
-     * @param buf the buffer to write to
-     * @return the number of bytes written
-     */
-    public static int writeVersionNotSupportedResponse(long buf) {
-        int offset = 0;
-
-        byte[] statusLine = "HTTP/1.1 426 Upgrade Required\r\n".getBytes(StandardCharsets.US_ASCII);
-        for (byte b : statusLine) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        byte[] versionHeader = "Sec-WebSocket-Version: 13\r\n".getBytes(StandardCharsets.US_ASCII);
-        for (byte b : versionHeader) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        byte[] contentLength = "Content-Length: 0\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
-        for (byte b : contentLength) {
-            Unsafe.getUnsafe().putByte(buf + offset++, b);
-        }
-
-        return offset;
-    }
-
-    /**
-     * Checks if the sequence contains the given substring (case-insensitive).
-     */
-    private static boolean containsIgnoreCaseAscii(Utf8Sequence seq, Utf8Sequence substring) {
-        int seqLen = seq.size();
-        int subLen = substring.size();
-
-        if (subLen > seqLen) {
-            return false;
-        }
-        if (subLen == 0) {
-            return true;
-        }
-
-        outer:
-        for (int i = 0; i <= seqLen - subLen; i++) {
-            for (int j = 0; j < subLen; j++) {
-                byte a = seq.byteAt(i + j);
-                byte b = substring.byteAt(j);
-                // Convert to lowercase for comparison
-                if (a >= 'A' && a <= 'Z') {
-                    a = (byte) (a + 32);
-                }
-                if (b >= 'A' && b <= 'Z') {
-                    b = (byte) (b + 32);
-                }
-                if (a != b) {
-                    continue outer;
-                }
-            }
-            return true;
-        }
-        return false;
-    }
 }

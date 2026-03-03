@@ -144,23 +144,4 @@ public final class WebSocketCloseCode {
         }
     }
 
-    /**
-     * Checks if a close code is valid for use in a Close frame.
-     * Codes 1005 and 1006 are reserved and must not be sent.
-     *
-     * @param code the close code
-     * @return true if the code can be sent in a Close frame
-     */
-    public static boolean isValidForSending(int code) {
-        if (code < 1000) {
-            return false;
-        }
-        if (code == NO_STATUS_RECEIVED || code == ABNORMAL_CLOSURE || code == TLS_HANDSHAKE) {
-            return false;
-        }
-        // 1000-2999 are defined by RFC 6455
-        // 3000-3999 are reserved for libraries/frameworks
-        // 4000-4999 are reserved for applications
-        return code < 5000;
-    }
 }

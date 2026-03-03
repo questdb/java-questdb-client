@@ -75,7 +75,6 @@ public class WebSocketFrameParser {
     private long payloadLength;
     // Parser state
     private int state = STATE_HEADER;
-    private boolean strictMode = false;  // If true, reject non-minimal length encodings
 
     public int getErrorCode() {
         return errorCode;
@@ -164,6 +163,7 @@ public class WebSocketFrameParser {
         // Calculate header size and payload length
         int offset = 2;
 
+        // If true, reject non-minimal length encodings
         if (lengthField <= 125) {
             payloadLength = lengthField;
         } else if (lengthField == 126) {
@@ -177,11 +177,6 @@ public class WebSocketFrameParser {
             payloadLength = (high << 8) | low;
 
             // Strict mode: reject non-minimal encodings
-            if (strictMode && payloadLength < 126) {
-                state = STATE_ERROR;
-                errorCode = WebSocketCloseCode.PROTOCOL_ERROR;
-                return 0;
-            }
 
             offset = 4;
         } else {
@@ -193,11 +188,6 @@ public class WebSocketFrameParser {
             payloadLength = Long.reverseBytes(Unsafe.getUnsafe().getLong(buf + 2));
 
             // Strict mode: reject non-minimal encodings
-            if (strictMode && payloadLength <= 65535) {
-                state = STATE_ERROR;
-                errorCode = WebSocketCloseCode.PROTOCOL_ERROR;
-                return 0;
-            }
 
             // MSB must be 0 (no negative lengths)
             if (payloadLength < 0) {
