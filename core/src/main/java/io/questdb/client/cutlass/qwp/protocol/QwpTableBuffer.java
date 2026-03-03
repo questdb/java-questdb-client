@@ -437,11 +437,16 @@ public class QwpTableBuffer implements QuietCloseable {
             this.valueCount = 0;
             this.hasNulls = false;
 
-            allocateStorage(type);
-            if (nullable) {
-                nullBufCapRows = 64; // multiple of 64
-                long sizeBytes = (long) nullBufCapRows >>> 3;
-                nullBufPtr = Unsafe.calloc(sizeBytes, MemoryTag.NATIVE_ILP_RSS);
+            try {
+                allocateStorage(type);
+                if (nullable) {
+                    nullBufCapRows = 64; // multiple of 64
+                    long sizeBytes = (long) nullBufCapRows >>> 3;
+                    nullBufPtr = Unsafe.calloc(sizeBytes, MemoryTag.NATIVE_ILP_RSS);
+                }
+            } catch (Throwable t) {
+                close();
+                throw t;
             }
         }
 
@@ -1202,8 +1207,14 @@ public class QwpTableBuffer implements QuietCloseable {
                 case TYPE_STRING:
                 case TYPE_VARCHAR:
                     stringOffsets = new OffHeapAppendMemory(64);
-                    stringOffsets.putInt(0); // seed initial 0 offset
-                    stringData = new OffHeapAppendMemory(256);
+                    try {
+                        stringOffsets.putInt(0); // seed initial 0 offset
+                        stringData = new OffHeapAppendMemory(256);
+                    } catch (Throwable t) {
+                        stringOffsets.close();
+                        stringOffsets = null;
+                        throw t;
+                    }
                     break;
                 case TYPE_SYMBOL:
                     dataBuffer = new OffHeapAppendMemory(64);
