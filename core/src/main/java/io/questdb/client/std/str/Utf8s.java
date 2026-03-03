@@ -225,32 +225,6 @@ public final class Utf8s {
         return b.toString();
     }
 
-    public static String stringFromUtf8BytesSafe(@NotNull Utf8Sequence seq) {
-        if (seq.size() == 0) {
-            return "";
-        }
-        Utf16Sink b = getThreadLocalSink();
-        utf8ToUtf16(seq, b);
-        return b.toString();
-    }
-
-    public static String toString(@Nullable Utf8Sequence s) {
-        return s == null ? null : s.toString();
-    }
-
-    public static String toString(@NotNull Utf8Sequence us, int start, int end, byte unescapeAscii) {
-        final Utf8Sink sink = getThreadLocalUtf8Sink();
-        final int lastChar = end - 1;
-        for (int i = start; i < end; i++) {
-            byte b = us.byteAt(i);
-            sink.putAny(b);
-            if (b == unescapeAscii && i < lastChar && us.byteAt(i + 1) == unescapeAscii) {
-                i++;
-            }
-        }
-        return sink.toString();
-    }
-
     public static int utf8DecodeMultiByte(long lo, long hi, byte b, Utf16Sink sink) {
         if (b >> 5 == -2 && (b & 30) != 0) {
             return utf8Decode2Bytes(lo, hi, b, sink);
@@ -327,28 +301,6 @@ public final class Utf8s {
      */
     public static boolean utf8ToUtf16(@NotNull Utf8Sequence seq, @NotNull Utf16Sink sink) {
         return utf8ToUtf16(seq, 0, seq.size(), sink);
-    }
-
-    public static int validateUtf8(@NotNull Utf8Sequence seq) {
-        if (seq.isAscii()) {
-            return seq.size();
-        }
-        int len = 0;
-        for (int i = 0, hi = seq.size(); i < hi; ) {
-            byte b = seq.byteAt(i);
-            if (b < 0) {
-                int n = validateUtf8MultiByte(seq, i, b);
-                if (n == -1) {
-                    // UTF-8 error
-                    return -1;
-                }
-                i += n;
-            } else {
-                ++i;
-            }
-            ++len;
-        }
-        return len;
     }
 
     /**
@@ -674,61 +626,4 @@ public final class Utf8s {
         return utf8Decode4Bytes(seq, index, b, sink);
     }
 
-    private static int validateUtf8Decode2Bytes(@NotNull Utf8Sequence seq, int index) {
-        if (seq.size() - index < 2) {
-            return -1;
-        }
-        byte b2 = seq.byteAt(index + 1);
-        if (isNotContinuation(b2)) {
-            return -1;
-        }
-        return 2;
-    }
-
-    private static int validateUtf8Decode3Bytes(@NotNull Utf8Sequence seq, int index, byte b1) {
-        if (seq.size() - index < 3) {
-            return -1;
-        }
-        byte b2 = seq.byteAt(index + 1);
-        byte b3 = seq.byteAt(index + 2);
-
-        if (isMalformed3(b1, b2, b3)) {
-            return -1;
-        }
-
-        char c = utf8ToChar(b1, b2, b3);
-        if (Character.isSurrogate(c)) {
-            return -1;
-        }
-        return 3;
-    }
-
-    private static int validateUtf8Decode4Bytes(@NotNull Utf8Sequence seq, int index, int b) {
-        if (b >> 3 != -2 || seq.size() - index < 4) {
-            return -1;
-        }
-        byte b2 = seq.byteAt(index + 1);
-        byte b3 = seq.byteAt(index + 2);
-        byte b4 = seq.byteAt(index + 3);
-
-        if (isMalformed4(b2, b3, b4)) {
-            return -1;
-        }
-        final int codePoint = getUtf8Codepoint(b, b2, b3, b4);
-        if (!Character.isSupplementaryCodePoint(codePoint)) {
-            return -1;
-        }
-        return 4;
-    }
-
-    private static int validateUtf8MultiByte(Utf8Sequence seq, int index, byte b) {
-        if (b >> 5 == -2 && (b & 30) != 0) {
-            // we should allow 11000001, as it is a valid UTF8 byte?
-            return validateUtf8Decode2Bytes(seq, index);
-        }
-        if (b >> 4 == -2) {
-            return validateUtf8Decode3Bytes(seq, index, b);
-        }
-        return validateUtf8Decode4Bytes(seq, index, b);
-    }
 }

@@ -262,43 +262,6 @@ public final class Numbers {
         array[bit].append(sink, value);
     }
 
-    /**
-     * Append a long value to a CharSink in hex format.
-     *
-     * @param sink       the CharSink to append to
-     * @param value      the value to append
-     * @param padToBytes if non-zero, pad the output to the specified number of bytes
-     */
-    public static void appendHexPadded(CharSink<?> sink, long value, int padToBytes) {
-        assert padToBytes >= 0 && padToBytes <= 8;
-        // This code might be unclear, so here are some hints:
-        // This method uses longHexAppender() and longHexAppender() is always padding to a whole byte. It never prints
-        // just a nibble. It means the longHexAppender() will print value 0xf as "0f". Value 0xff will be printed as "ff".
-        // Value 0xfff will be printed as "0fff". Value 0xffff will be printed as "ffff" and so on.
-        // So this method needs to pad only from the next whole byte up.
-        // In other words: This method always pads with full bytes (=even number of zeros), never with just a nibble.
-
-        // Example 1: Value is 0xF and padToBytes is 2. This means the desired output is 000f.
-        // longHexAppender() pads to a full byte. This means it will output is 0f. So this method needs to pad with 2 zeros.
-
-        // Example 2: The value is 0xFF and padToBytes is 2. This means the desired output is 00ff.
-        // longHexAppender() will output "ff". This is a full byte so longHexAppender() will not do any padding on its own.
-        // So this method needs to pad with 2 zeros.
-        int leadingZeroBits = Long.numberOfLeadingZeros(value);
-        int padToBits = padToBytes << 3;
-        int bitsToPad = padToBits - (Long.SIZE - leadingZeroBits);
-        int bytesToPad = (bitsToPad >> 3);
-        for (int i = 0; i < bytesToPad; i++) {
-            sink.putAscii('0');
-            sink.putAscii('0');
-        }
-        if (value == 0) {
-            return;
-        }
-        int bit = 64 - leadingZeroBits;
-        longHexAppender[bit].append(sink, value);
-    }
-
     public static void appendHexPadded(CharSink<?> sink, final int value) {
         int i = value;
         if (i < 0) {
@@ -385,38 +348,6 @@ public final class Numbers {
         }
     }
 
-    public static void appendLong256(long a, long b, long c, long d, CharSink<?> sink) {
-        if (a == Numbers.LONG_NULL && b == Numbers.LONG_NULL && c == Numbers.LONG_NULL && d == Numbers.LONG_NULL) {
-            return;
-        }
-        sink.putAscii("0x");
-        if (d != 0) {
-            appendLong256Four(a, b, c, d, sink);
-            return;
-        }
-        if (c != 0) {
-            appendLong256Three(a, b, c, sink);
-            return;
-        }
-        if (b != 0) {
-            appendLong256Two(a, b, sink);
-            return;
-        }
-        appendHex(sink, a, false);
-    }
-
-    public static void appendUuid(long lo, long hi, CharSink<?> sink) {
-        appendHexPadded(sink, (hi >> 32) & 0xFFFFFFFFL, 4);
-        sink.putAscii('-');
-        appendHexPadded(sink, (hi >> 16) & 0xFFFF, 2);
-        sink.putAscii('-');
-        appendHexPadded(sink, hi & 0xFFFF, 2);
-        sink.putAscii('-');
-        appendHexPadded(sink, lo >> 48 & 0xFFFF, 2);
-        sink.putAscii('-');
-        appendHexPadded(sink, lo & 0xFFFFFFFFFFFFL, 6);
-    }
-
     public static int ceilPow2(int value) {
         int i = value;
         if ((i != 0) && (i & (i - 1)) > 0) {
@@ -456,17 +387,6 @@ public final class Numbers {
             throw NumericException.instance().put("invalid hex character: '").put((char) c).put('\'');
         }
         return r;
-    }
-
-    public static void intToIPv4Sink(CharSink<?> sink, int value) {
-        // NULL handling should be done outside, null here will be printed as 0.0.0.0
-        append(sink, (value >> 24) & 0xff);
-        sink.putAscii('.');
-        append(sink, (value >> 16) & 0xff);
-        sink.putAscii('.');
-        append(sink, (value >> 8) & 0xff);
-        sink.putAscii('.');
-        append(sink, value & 0xff);
     }
 
     public static long interleaveBits(long x, long y) {
@@ -1278,21 +1198,6 @@ public final class Numbers {
     private static void appendLong2(CharSink<?> sink, long i) {
         sink.putAscii((char) ('0' + i / 10));
         sink.putAscii((char) ('0' + i % 10));
-    }
-
-    private static void appendLong256Four(long a, long b, long c, long d, CharSink<?> sink) {
-        appendLong256Three(b, c, d, sink);
-        appendHex(sink, a, true);
-    }
-
-    private static void appendLong256Three(long a, long b, long c, CharSink<?> sink) {
-        appendLong256Two(b, c, sink);
-        appendHex(sink, a, true);
-    }
-
-    private static void appendLong256Two(long a, long b, CharSink<?> sink) {
-        appendHex(sink, b, false);
-        appendHex(sink, a, true);
     }
 
     private static void appendLong3(CharSink<?> sink, long i) {

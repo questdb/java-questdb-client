@@ -215,19 +215,6 @@ public final class ColumnType {
     }
 
     /**
-     * Encodes an array type with weak dimensionality. The dimensionality is still
-     * encoded but marked as tentative and can be updated based on actual data.
-     * This is useful for PostgreSQL wire protocol where type information doesn't
-     * include array dimensions.
-     * <p>
-     * The number of dimensions of this type is undefined, so the decoded number on
-     * dimensions for the returned column type will be -1.
-     */
-    public static int encodeArrayTypeWithWeakDims(short elemType, boolean checkSupportedElementTypes) {
-        return encodeArrayType(elemType, 1, checkSupportedElementTypes) | TYPE_FLAG_ARRAY_WEAK_DIMS;
-    }
-
-    /**
      * Generate a decimal type from a given precision and scale.
      * It will choose the proper subtype (DECIMAL8, DECIMAL16, etc.) from the precision, depending on the amount
      * of storage needed to store a number with the given precision.

@@ -25,12 +25,10 @@
 package io.questdb.client.test.tools;
 
 import io.questdb.client.std.BinarySequence;
-import io.questdb.client.std.Chars;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntList;
 import io.questdb.client.std.LongList;
 import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.Numbers;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
@@ -86,7 +84,7 @@ public final class TestUtils {
         if (term.length() == 0) {
             return;
         }
-        if (Chars.contains(sequence, term)) {
+        if (sequence.toString().contains(term.toString())) {
             return;
         }
         Assert.fail((message != null ? message + ": '" : "'") + sequence + "' does not contain: " + term);
@@ -351,7 +349,7 @@ public final class TestUtils {
             Assert.fail(formatted + "Cannot assert that sequence does not contain an empty term; an empty term is always considered contained by definition.");
         }
 
-        if (!Chars.contains(sequence, term)) {
+        if (!sequence.toString().contains(term.toString())) {
             return;
         }
 
@@ -448,9 +446,7 @@ public final class TestUtils {
     }
 
     public static String ipv4ToString(int ip) {
-        StringSink sink = getTlSink();
-        Numbers.intToIPv4Sink(sink, ip);
-        return sink.toString();
+        return ((ip >> 24) & 0xff) + "." + ((ip >> 16) & 0xff) + "." + ((ip >> 8) & 0xff) + "." + (ip & 0xff);
     }
 
     public static String readStringFromFile(File file) {

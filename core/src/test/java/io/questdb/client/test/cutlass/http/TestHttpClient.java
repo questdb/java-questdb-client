@@ -32,7 +32,6 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.str.MutableUtf8Sink;
 import io.questdb.client.std.str.Utf8Sequence;
 import io.questdb.client.std.str.Utf8StringSink;
-import io.questdb.client.std.str.Utf8s;
 import io.questdb.client.test.tools.TestUtils;
 import org.jetbrains.annotations.Nullable;
 import org.junit.Assert;
@@ -489,7 +488,8 @@ public class TestHttpClient implements QuietCloseable {
         @SuppressWarnings("resource") HttpClient.ResponseHeaders rsp = req.send();
         rsp.await();
 
-        String statusCode = Utf8s.toString(rsp.getStatusCode());
+        Utf8Sequence sc = rsp.getStatusCode();
+        String statusCode = sc == null ? null : sc.toString();
         sink.clear();
         rsp.getResponse().copyTextTo(sink);
         return statusCode;

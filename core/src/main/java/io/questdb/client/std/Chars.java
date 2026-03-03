@@ -51,10 +51,6 @@ public final class Chars {
         }
     }
 
-    public static boolean contains(@NotNull CharSequence sequence, @NotNull CharSequence term) {
-        return indexOf(sequence, 0, sequence.length(), term) != -1;
-    }
-
     public static boolean equals(@NotNull CharSequence l, @NotNull CharSequence r) {
         if (l == r) {
             return true;
@@ -354,18 +350,6 @@ public final class Chars {
             h = 31 * h + Character.toLowerCase(value.charAt(p));
         }
         return h;
-    }
-
-    public static boolean noMatch(CharSequence l, int llo, int lhi, CharSequence r, int rlo, int rhi) {
-        int lp = llo;
-        int rp = rlo;
-        while (lp < lhi && rp < rhi) {
-            if (Character.toLowerCase(l.charAt(lp++)) != r.charAt(rp++)) {
-                return true;
-            }
-
-        }
-        return lp != lhi || rp != rhi;
     }
 
     public static boolean startsWith(@Nullable CharSequence cs, @Nullable CharSequence starts) {

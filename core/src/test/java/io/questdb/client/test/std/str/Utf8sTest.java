@@ -272,15 +272,6 @@ public class Utf8sTest {
         }
     }
 
-    @Test
-    public void testValidateUtf8() {
-        Assert.assertEquals(0, Utf8s.validateUtf8(Utf8String.EMPTY));
-        Assert.assertEquals(3, Utf8s.validateUtf8(utf8("abc")));
-        Assert.assertEquals(10, Utf8s.validateUtf8(utf8("привет мир")));
-        // invalid UTF-8
-        Assert.assertEquals(-1, Utf8s.validateUtf8(new Utf8String(new byte[]{(byte) 0x80}, false)));
-    }
-
     private static byte b(int n) {
         return (byte) n;
     }
