@@ -778,69 +778,49 @@ public class QwpTableBuffer implements QuietCloseable {
             if (nullable) {
                 ensureNullCapacity(size + 1);
                 markNull(size);
-                size++;
             } else {
                 // For non-nullable columns, store a sentinel/default value
                 switch (type) {
-                    case TYPE_BOOLEAN, TYPE_BYTE:
-                        dataBuffer.putByte((byte) 0);
-                        break;
-                    case TYPE_SHORT, TYPE_CHAR:
-                        dataBuffer.putShort((short) 0);
-                        break;
-                    case TYPE_INT:
-                        dataBuffer.putInt(0);
-                        break;
-                    case TYPE_GEOHASH:
-                        dataBuffer.putLong(-1L);
-                        break;
-                    case TYPE_LONG, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS, TYPE_DATE:
-                        dataBuffer.putLong(Long.MIN_VALUE);
-                        break;
-                    case TYPE_FLOAT:
-                        dataBuffer.putFloat(Float.NaN);
-                        break;
-                    case TYPE_DOUBLE:
-                        dataBuffer.putDouble(Double.NaN);
-                        break;
-                    case TYPE_STRING, TYPE_VARCHAR:
-                        stringOffsets.putInt((int) stringData.getAppendOffset());
-                        break;
-                    case TYPE_SYMBOL:
-                        dataBuffer.putInt(-1);
-                        break;
-                    case TYPE_UUID:
+                    case TYPE_BOOLEAN, TYPE_BYTE -> dataBuffer.putByte((byte) 0);
+                    case TYPE_SHORT, TYPE_CHAR -> dataBuffer.putShort((short) 0);
+                    case TYPE_INT -> dataBuffer.putInt(0);
+                    case TYPE_GEOHASH -> dataBuffer.putLong(-1L);
+                    case TYPE_LONG, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS, TYPE_DATE ->
+                            dataBuffer.putLong(Long.MIN_VALUE);
+                    case TYPE_FLOAT -> dataBuffer.putFloat(Float.NaN);
+                    case TYPE_DOUBLE -> dataBuffer.putDouble(Double.NaN);
+                    case TYPE_STRING, TYPE_VARCHAR -> stringOffsets.putInt((int) stringData.getAppendOffset());
+                    case TYPE_SYMBOL -> dataBuffer.putInt(-1);
+                    case TYPE_UUID -> {
                         dataBuffer.putLong(Long.MIN_VALUE);
                         dataBuffer.putLong(Long.MIN_VALUE);
-                        break;
-                    case TYPE_LONG256:
+                    }
+                    case TYPE_LONG256 -> {
                         dataBuffer.putLong(Long.MIN_VALUE);
                         dataBuffer.putLong(Long.MIN_VALUE);
                         dataBuffer.putLong(Long.MIN_VALUE);
                         dataBuffer.putLong(Long.MIN_VALUE);
-                        break;
-                    case TYPE_DECIMAL64:
-                        dataBuffer.putLong(Decimals.DECIMAL64_NULL);
-                        break;
-                    case TYPE_DECIMAL128:
+                    }
+                    case TYPE_DECIMAL64 -> dataBuffer.putLong(Decimals.DECIMAL64_NULL);
+                    case TYPE_DECIMAL128 -> {
                         dataBuffer.putLong(Decimals.DECIMAL128_HI_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL128_LO_NULL);
-                        break;
-                    case TYPE_DECIMAL256:
+                    }
+                    case TYPE_DECIMAL256 -> {
                         dataBuffer.putLong(Decimals.DECIMAL256_HH_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL256_HL_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL256_LH_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL256_LL_NULL);
-                        break;
-                    case TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY:
+                    }
+                    case TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY -> {
                         ensureArrayCapacity(1, 0);
                         arrayDims[valueCount] = 1;
                         arrayShapes[arrayShapeOffset++] = 0;
-                        break;
+                    }
                 }
                 valueCount++;
-                size++;
             }
+            size++;
         }
 
         public void addShort(short value) {
