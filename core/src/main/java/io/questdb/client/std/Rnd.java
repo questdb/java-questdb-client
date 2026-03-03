@@ -24,7 +24,6 @@
 
 package io.questdb.client.std;
 
-import io.questdb.client.cairo.GeoHashes;
 import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf16Sink;
 
@@ -185,17 +184,6 @@ public class Rnd {
 
     public double nextDouble() {
         return (((long) (nextIntForDouble(26)) << 27) + nextIntForDouble(27)) * DOUBLE_UNIT;
-    }
-
-    public long nextGeoHash(int bits) {
-        double x = nextDouble() * 180.0 - 90.0;
-        double y = nextDouble() * 360.0 - 180.0;
-        try {
-            return GeoHashes.fromCoordinatesDeg(x, y, bits);
-        } catch (NumericException e) {
-            // Should never happen
-            return GeoHashes.NULL;
-        }
     }
 
     public int nextInt(int boundary) {
