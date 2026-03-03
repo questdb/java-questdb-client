@@ -118,18 +118,13 @@ public class MicrobatchBuffer implements QuietCloseable {
      * Returns a human-readable name for the given state.
      */
     public static String stateName(int state) {
-        switch (state) {
-            case STATE_FILLING:
-                return "FILLING";
-            case STATE_SEALED:
-                return "SEALED";
-            case STATE_SENDING:
-                return "SENDING";
-            case STATE_RECYCLED:
-                return "RECYCLED";
-            default:
-                return "UNKNOWN(" + state + ")";
-        }
+        return switch (state) {
+            case STATE_FILLING -> "FILLING";
+            case STATE_SEALED -> "SEALED";
+            case STATE_SENDING -> "SENDING";
+            case STATE_RECYCLED -> "RECYCLED";
+            default -> "UNKNOWN(" + state + ")";
+        };
     }
 
     /**

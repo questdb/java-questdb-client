@@ -104,21 +104,4 @@ public final class WebSocketOpcode {
                 || opcode == PONG;
     }
 
-    /**
-     * Returns a human-readable name for the opcode.
-     *
-     * @param opcode the opcode
-     * @return the opcode name
-     */
-    public static String name(int opcode) {
-        return switch (opcode) {
-            case CONTINUATION -> "CONTINUATION";
-            case TEXT -> "TEXT";
-            case BINARY -> "BINARY";
-            case CLOSE -> "CLOSE";
-            case PING -> "PING";
-            case PONG -> "PONG";
-            default -> "UNKNOWN(" + opcode + ")";
-        };
-    }
 }

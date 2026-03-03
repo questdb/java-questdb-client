@@ -782,14 +782,10 @@ public class QwpTableBuffer implements QuietCloseable {
             } else {
                 // For non-nullable columns, store a sentinel/default value
                 switch (type) {
-                    case TYPE_BOOLEAN:
+                    case TYPE_BOOLEAN, TYPE_BYTE:
                         dataBuffer.putByte((byte) 0);
                         break;
-                    case TYPE_BYTE:
-                        dataBuffer.putByte((byte) 0);
-                        break;
-                    case TYPE_SHORT:
-                    case TYPE_CHAR:
+                    case TYPE_SHORT, TYPE_CHAR:
                         dataBuffer.putShort((short) 0);
                         break;
                     case TYPE_INT:
@@ -798,10 +794,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     case TYPE_GEOHASH:
                         dataBuffer.putLong(-1L);
                         break;
-                    case TYPE_LONG:
-                    case TYPE_TIMESTAMP:
-                    case TYPE_TIMESTAMP_NANOS:
-                    case TYPE_DATE:
+                    case TYPE_LONG, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS, TYPE_DATE:
                         dataBuffer.putLong(Long.MIN_VALUE);
                         break;
                     case TYPE_FLOAT:
@@ -810,8 +803,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     case TYPE_DOUBLE:
                         dataBuffer.putDouble(Double.NaN);
                         break;
-                    case TYPE_STRING:
-                    case TYPE_VARCHAR:
+                    case TYPE_STRING, TYPE_VARCHAR:
                         stringOffsets.putInt((int) stringData.getAppendOffset());
                         break;
                     case TYPE_SYMBOL:
@@ -840,8 +832,7 @@ public class QwpTableBuffer implements QuietCloseable {
                         dataBuffer.putLong(Decimals.DECIMAL256_LH_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL256_LL_NULL);
                         break;
-                    case TYPE_DOUBLE_ARRAY:
-                    case TYPE_LONG_ARRAY:
+                    case TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY:
                         ensureArrayCapacity(1, 0);
                         arrayDims[valueCount] = 1;
                         arrayShapes[arrayShapeOffset++] = 0;

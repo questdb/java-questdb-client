@@ -27,7 +27,6 @@ package io.questdb.client.cutlass.http.client;
 import io.questdb.client.HttpClientConfiguration;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
-import io.questdb.client.cutlass.qwp.websocket.WebSocketHandshake;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
 import io.questdb.client.network.IOOperation;
 import io.questdb.client.network.NetworkFacade;
@@ -44,6 +43,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
 
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
@@ -70,6 +71,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int DEFAULT_RECV_BUFFER_SIZE = 65536;
     private static final int DEFAULT_SEND_BUFFER_SIZE = 65536;
     private static final Logger LOG = LoggerFactory.getLogger(WebSocketClient.class);
+    private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
+        try {
+            return MessageDigest.getInstance("SHA-1");
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("SHA-1 not available", e);
+        }
+    });
+    private static final byte[] WEBSOCKET_GUID_BYTES = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11".getBytes(StandardCharsets.US_ASCII);
     protected final NetworkFacade nf;
     protected final Socket socket;
     private final WebSocketSendBuffer controlFrameBuffer;
@@ -435,6 +444,16 @@ public abstract class WebSocketClient implements QuietCloseable {
         upgrade(path, defaultTimeout);
     }
 
+    private static String computeAcceptKey(String key) {
+        MessageDigest sha1 = SHA1_DIGEST.get();
+        sha1.reset();
+        for (int i = 0, n = key.length(); i < n; i++) {
+            sha1.update((byte) key.charAt(i));
+        }
+        sha1.update(WEBSOCKET_GUID_BYTES);
+        return Base64.getEncoder().encodeToString(sha1.digest());
+    }
+
     private static boolean containsHeaderValue(String response, String headerName, String expectedValue, boolean ignoreValueCase) {
         int headerLen = headerName.length();
         int responseLen = response.length();
@@ -452,6 +471,10 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return false;
+    }
+
+    private static int remainingTime(int timeoutMillis, long startTimeNanos) {
+        return timeoutMillis - (int) NANOSECONDS.toMillis(System.nanoTime() - startTimeNanos);
     }
 
     private void appendToFragmentBuffer(long payloadPtr, int payloadLen) {
@@ -588,6 +611,14 @@ public abstract class WebSocketClient implements QuietCloseable {
         return -1;
     }
 
+    private int getRemainingTimeOrThrow(int timeoutMillis, long startTimeNanos) {
+        int remaining = remainingTime(timeoutMillis, startTimeNanos);
+        if (remaining <= 0) {
+            throw new HttpClientException("timed out [errno=").errno(nf.errno()).put(']').flagAsTimeout();
+        }
+        return remaining;
+    }
+
     private void growRecvBuffer() {
         int newSize = (int) Math.min((long) recvBufSize * 2, maxRecvBufSize);
         if (newSize >= maxRecvBufSize) {
@@ -666,18 +697,6 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return n;
-    }
-
-    private int getRemainingTimeOrThrow(int timeoutMillis, long startTimeNanos) {
-        int remaining = remainingTime(timeoutMillis, startTimeNanos);
-        if (remaining <= 0) {
-            throw new HttpClientException("timed out [errno=").errno(nf.errno()).put(']').flagAsTimeout();
-        }
-        return remaining;
-    }
-
-    private static int remainingTime(int timeoutMillis, long startTimeNanos) {
-        return timeoutMillis - (int) NANOSECONDS.toMillis(System.nanoTime() - startTimeNanos);
     }
 
     private void resetFragmentState() {
@@ -852,7 +871,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         // Verify Sec-WebSocket-Accept (exact value match per RFC 6455 Section 4.1)
-        String expectedAccept = WebSocketHandshake.computeAcceptKey(handshakeKey);
+        String expectedAccept = computeAcceptKey(handshakeKey);
         if (!containsHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept, false)) {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }

@@ -142,32 +142,18 @@ public class WebSocketResponse {
     }
 
     /**
-     * Returns the status code.
-     */
-    public byte getStatus() {
-        return status;
-    }
-
-    /**
      * Returns a human-readable status name.
      */
     public String getStatusName() {
-        switch (status) {
-            case STATUS_OK:
-                return "OK";
-            case STATUS_PARSE_ERROR:
-                return "PARSE_ERROR";
-            case STATUS_SCHEMA_ERROR:
-                return "SCHEMA_ERROR";
-            case STATUS_WRITE_ERROR:
-                return "WRITE_ERROR";
-            case STATUS_SECURITY_ERROR:
-                return "SECURITY_ERROR";
-            case STATUS_INTERNAL_ERROR:
-                return "INTERNAL_ERROR";
-            default:
-                return "UNKNOWN(" + (status & 0xFF) + ")";
-        }
+        return switch (status) {
+            case STATUS_OK -> "OK";
+            case STATUS_PARSE_ERROR -> "PARSE_ERROR";
+            case STATUS_SCHEMA_ERROR -> "SCHEMA_ERROR";
+            case STATUS_WRITE_ERROR -> "WRITE_ERROR";
+            case STATUS_SECURITY_ERROR -> "SECURITY_ERROR";
+            case STATUS_INTERNAL_ERROR -> "INTERNAL_ERROR";
+            default -> "UNKNOWN(" + (status & 0xFF) + ")";
+        };
     }
 
     /**
@@ -210,7 +196,6 @@ public class WebSocketResponse {
                     msgBytes[i] = Unsafe.getUnsafe().getByte(ptr + offset + i);
                 }
                 errorMessage = new String(msgBytes, StandardCharsets.UTF_8);
-                offset += msgLen;
             } else {
                 errorMessage = null;
             }

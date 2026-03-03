@@ -26,7 +26,6 @@ package io.questdb.client.cutlass.qwp.protocol;
 
 
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.std.str.DirectUtf8Sequence;
 import io.questdb.client.std.str.Utf8Sequence;
 
 /**
@@ -130,31 +129,6 @@ public final class QwpSchemaHash {
                     hasher.update((byte) (0x80 | ((c >> 6) & 0x3F)));
                     hasher.update((byte) (0x80 | (c & 0x3F)));
                 }
-            }
-            hasher.update(columnTypes[i]);
-        }
-
-        return hasher.getValue();
-    }
-
-    /**
-     * Computes the schema hash for ILP v4 using DirectUtf8Sequence column names.
-     *
-     * @param columnNames array of column names
-     * @param columnTypes array of type codes
-     * @return the schema hash
-     */
-    public static long computeSchemaHash(DirectUtf8Sequence[] columnNames, byte[] columnTypes) {
-        // Use pooled hasher to avoid allocation
-        Hasher hasher = HASHER_POOL.get();
-        hasher.reset(DEFAULT_SEED);
-
-        for (int i = 0; i < columnNames.length; i++) {
-            DirectUtf8Sequence name = columnNames[i];
-            long addr = name.ptr();
-            int len = name.size();
-            for (int j = 0; j < len; j++) {
-                hasher.update(Unsafe.getUnsafe().getByte(addr + j));
             }
             hasher.update(columnTypes[i]);
         }

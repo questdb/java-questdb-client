@@ -322,20 +322,6 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
-     * Returns the number of batches waiting to be sent.
-     */
-    public int getPendingCount() {
-        return getPendingSize();
-    }
-
-    /**
-     * Returns total successful acknowledgments received.
-     */
-    public long getTotalAcks() {
-        return totalAcks.get();
-    }
-
-    /**
      * Returns the total number of batches sent.
      */
     public long getTotalBatchesSent() {
@@ -347,27 +333,6 @@ public class WebSocketSendQueue implements QuietCloseable {
      */
     public long getTotalBytesSent() {
         return totalBytesSent.get();
-    }
-
-    /**
-     * Returns total error responses received.
-     */
-    public long getTotalErrors() {
-        return totalErrors.get();
-    }
-
-    /**
-     * Returns true if the queue is empty.
-     */
-    public boolean isEmpty() {
-        return isPendingEmpty();
-    }
-
-    /**
-     * Returns true if the queue is still running.
-     */
-    public boolean isRunning() {
-        return running && !shuttingDown;
     }
 
     /**

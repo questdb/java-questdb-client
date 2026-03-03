@@ -1450,12 +1450,9 @@ public class QwpWebSocketSender implements Sender {
         throw timeout;
     }
 
-    private static class AckFrameHandler implements WebSocketFrameHandler {
-        private final QwpWebSocketSender sender;
-
-        AckFrameHandler(QwpWebSocketSender sender) {
-            this.sender = sender;
-        }
+    private record AckFrameHandler(
+            QwpWebSocketSender sender
+    ) implements WebSocketFrameHandler {
 
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
