@@ -113,24 +113,8 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return buffer;
     }
 
-    public boolean isDeltaSymbolDictEnabled() {
-        return (flags & FLAG_DELTA_SYMBOL_DICT) != 0;
-    }
-
     public boolean isGorillaEnabled() {
         return (flags & FLAG_GORILLA) != 0;
-    }
-
-    public void reset() {
-        buffer.reset();
-    }
-
-    public void setDeltaSymbolDictEnabled(boolean enabled) {
-        if (enabled) {
-            flags |= FLAG_DELTA_SYMBOL_DICT;
-        } else {
-            flags &= ~FLAG_DELTA_SYMBOL_DICT;
-        }
     }
 
     public void setGorillaEnabled(boolean enabled) {

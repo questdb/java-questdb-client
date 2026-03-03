@@ -946,13 +946,6 @@ public class QwpTableBuffer implements QuietCloseable {
             return dataBuffer != null ? dataBuffer.pageAddress() : 0;
         }
 
-        /**
-         * Returns the number of bytes of data in the off-heap buffer.
-         */
-        public long getDataSize() {
-            return dataBuffer != null ? dataBuffer.getAppendOffset() : 0;
-        }
-
         public byte getDecimalScale() {
             return decimalScale;
         }

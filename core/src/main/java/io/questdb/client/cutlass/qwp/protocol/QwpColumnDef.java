@@ -74,15 +74,6 @@ public final class QwpColumnDef {
     }
 
     /**
-     * Gets the fixed width in bytes for fixed-width types.
-     *
-     * @return width in bytes, or -1 for variable-width types
-     */
-    public int getFixedWidth() {
-        return QwpConstants.getFixedTypeSize(typeCode);
-    }
-
-    /**
      * Gets the column name.
      */
     public String getName() {
@@ -120,13 +111,6 @@ public final class QwpColumnDef {
         result = 31 * result + typeCode;
         result = 31 * result + (nullable ? 1 : 0);
         return result;
-    }
-
-    /**
-     * Returns true if this is a fixed-width type.
-     */
-    public boolean isFixedWidth() {
-        return QwpConstants.isFixedWidthType(typeCode);
     }
 
     /**

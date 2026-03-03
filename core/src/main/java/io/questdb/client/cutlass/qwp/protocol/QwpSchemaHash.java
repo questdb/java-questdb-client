@@ -26,7 +26,6 @@ package io.questdb.client.cutlass.qwp.protocol;
 
 
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.std.str.Utf8Sequence;
 
 /**
  * XXHash64 implementation for schema hashing in ILP v4 protocol.
@@ -55,32 +54,6 @@ public final class QwpSchemaHash {
 
     private QwpSchemaHash() {
         // utility class
-    }
-
-    /**
-     * Computes the schema hash for ILP v4.
-     * <p>
-     * Hash is computed over: for each column, hash(name_bytes + type_byte)
-     * This matches the spec in Appendix C.
-     *
-     * @param columnNames array of column names (UTF-8)
-     * @param columnTypes array of type codes
-     * @return the schema hash
-     */
-    public static long computeSchemaHash(Utf8Sequence[] columnNames, byte[] columnTypes) {
-        // Use pooled hasher to avoid allocation
-        Hasher hasher = HASHER_POOL.get();
-        hasher.reset(DEFAULT_SEED);
-
-        for (int i = 0; i < columnNames.length; i++) {
-            Utf8Sequence name = columnNames[i];
-            for (int j = 0, n = name.size(); j < n; j++) {
-                hasher.update(name.byteAt(j));
-            }
-            hasher.update(columnTypes[i]);
-        }
-
-        return hasher.getValue();
     }
 
     /**
@@ -266,18 +239,6 @@ public final class QwpSchemaHash {
      */
     public static long hash(byte[] data) {
         return hash(data, 0, data.length, DEFAULT_SEED);
-    }
-
-    /**
-     * Computes XXHash64 of a byte array region.
-     *
-     * @param data   the data to hash
-     * @param offset starting offset
-     * @param length number of bytes to hash
-     * @return the 64-bit hash value
-     */
-    public static long hash(byte[] data, int offset, int length) {
-        return hash(data, offset, length, DEFAULT_SEED);
     }
 
     /**

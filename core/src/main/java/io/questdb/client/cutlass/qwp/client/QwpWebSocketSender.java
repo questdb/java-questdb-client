@@ -312,28 +312,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Factory method for SenderBuilder integration.
-     */
-    public static QwpWebSocketSender create(
-            String host,
-            int port,
-            boolean tlsEnabled,
-            int bufferSize,
-            String authToken,
-            String username,
-            String password
-    ) {
-        QwpWebSocketSender sender = new QwpWebSocketSender(
-                host, port, tlsEnabled, bufferSize,
-                0, 0, 0,
-                1   // window=1 for sync behavior
-        );
-        // TODO: Store auth credentials for connection
-        sender.ensureConnected();
-        return sender;
-    }
-
-    /**
      * Creates a sender without connecting. For testing only.
      * <p>
      * This allows unit tests to test sender logic without requiring a real server.
@@ -561,7 +539,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, CharSequence value) {
-        if (value == null || value.length() == 0) return this;
+        if (value == null || value.isEmpty()) return this;
         checkNotClosed();
         checkTableSelected();
         try {
@@ -687,39 +665,11 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns the global symbol dictionary.
-     * For testing and encoder integration.
-     */
-    public GlobalSymbolDictionary getGlobalSymbolDictionary() {
-        return globalSymbolDictionary;
-    }
-
-    /**
-     * Returns the in-flight window size.
-     * Window=1 means sync mode, window>1 means async mode.
-     */
-    public int getInFlightWindowSize() {
-        return inFlightWindowSize;
-    }
-
-    /**
      * Returns the max symbol ID sent to the server.
      * Once sent over TCP, server is guaranteed to receive it (or connection dies).
      */
     public int getMaxSentSymbolId() {
         return maxSentSymbolId;
-    }
-
-    /**
-     * Registers a symbol in the global dictionary and returns its ID.
-     * For use with fast-path column buffer access.
-     */
-    public int getOrAddGlobalSymbol(String value) {
-        int globalId = globalSymbolDictionary.getOrAddSymbol(value);
-        if (globalId > currentBatchMaxSymbolId) {
-            currentBatchMaxSymbolId = globalId;
-        }
-        return globalId;
     }
 
     /**
@@ -745,28 +695,6 @@ public class QwpWebSocketSender implements Sender {
         return buffer;
     }
 
-    /**
-     * Increments the pending row count for auto-flush tracking.
-     * Call this after adding a complete row via fast-path API.
-     * Triggers auto-flush if any threshold is exceeded.
-     */
-    public void incrementPendingRowCount() {
-        if (pendingRowCount == 0) {
-            firstPendingRowTimeNanos = System.nanoTime();
-        }
-        pendingRowCount++;
-
-        // Check if any flush threshold is exceeded (same as sendRow())
-        if (shouldAutoFlush()) {
-            if (inFlightWindowSize > 1) {
-                flushPendingRows();
-            } else {
-                // Sync mode (window=1): flush directly with ACK wait
-                flushSync();
-            }
-        }
-    }
-
 
     /**
      * Adds an INT column value to the current row.
@@ -781,13 +709,6 @@ public class QwpWebSocketSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_INT, false);
         col.addInt(value);
         return this;
-    }
-
-    /**
-     * Returns whether async mode is enabled (window size > 1).
-     */
-    public boolean isAsyncMode() {
-        return inFlightWindowSize > 1;
     }
 
     /**
@@ -995,28 +916,6 @@ public class QwpWebSocketSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName.toString(), TYPE_UUID, true);
         col.addUuid(hi, lo);
         return this;
-    }
-
-    /**
-     * Adds encoded data to the active microbatch buffer.
-     * Triggers seal and swap if buffer is full.
-     */
-    private void addToMicrobatch(long dataPtr, int length) {
-        // Ensure activeBuffer is ready for writing
-        ensureActiveBufferReady();
-
-        // If current buffer can't hold the data, seal and swap
-        if (activeBuffer.hasData() &&
-                (long) activeBuffer.getBufferPos() + length > activeBuffer.getBufferCapacity()) {
-            sealAndSwapBuffer();
-        }
-
-        // Ensure buffer can hold the data
-        activeBuffer.ensureCapacity((int) Math.min((long) activeBuffer.getBufferPos() + length, Integer.MAX_VALUE));
-
-        // Copy data to buffer
-        activeBuffer.write(dataPtr, length);
-        activeBuffer.incrementRowCount();
     }
 
     private void atMicros(long timestampMicros) {

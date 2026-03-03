@@ -221,14 +221,6 @@ public class MicrobatchBuffer implements QuietCloseable {
     }
 
     /**
-     * Returns the maximum symbol ID used in this batch.
-     * Used for delta symbol dictionary tracking.
-     */
-    public int getMaxSymbolId() {
-        return maxSymbolId;
-    }
-
-    /**
      * Returns the number of rows in this buffer.
      */
     public int getRowCount() {
