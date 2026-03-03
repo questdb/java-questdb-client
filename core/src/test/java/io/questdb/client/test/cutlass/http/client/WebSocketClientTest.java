@@ -27,8 +27,12 @@ package io.questdb.client.test.cutlass.http.client;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
+import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.PlainSocketFactory;
+import io.questdb.client.network.Socket;
+import io.questdb.client.network.TlsSessionInitFailedException;
 import io.questdb.client.std.Unsafe;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
@@ -99,6 +103,70 @@ public class WebSocketClientTest {
         });
     }
 
+    @Test
+    public void testRecvOrTimeoutPropagatesNonTimeoutError() throws Exception {
+        assertMemoryLeak(() -> {
+            try (RecvTestWebSocketClient client = new RecvTestWebSocketClient()) {
+                setField(client, "upgraded", true);
+
+                // socket.recv() returns 0, triggering the ioWait path
+                // ioWait throws a non-timeout error (e.g., queue/poll failure)
+                client.ioWaitAction = () -> {
+                    throw new HttpClientException("queue error [errno=").put(5).put(']');
+                };
+
+                WebSocketFrameHandler noOpHandler = new WebSocketFrameHandler() {
+                    @Override
+                    public void onBinaryMessage(long payloadPtr, int payloadLen) {
+                    }
+
+                    @Override
+                    public void onClose(int code, String reason) {
+                    }
+                };
+
+                try {
+                    client.receiveFrame(noOpHandler, 1000);
+                    Assert.fail("expected HttpClientException for queue error");
+                } catch (HttpClientException e) {
+                    Assert.assertFalse("non-timeout error must not be flagged as timeout", e.isTimeout());
+                    Assert.assertTrue(
+                            "expected queue error message, got: " + e.getMessage(),
+                            e.getMessage().contains("queue error")
+                    );
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRecvOrTimeoutReturnsFalseOnTimeout() throws Exception {
+        assertMemoryLeak(() -> {
+            try (RecvTestWebSocketClient client = new RecvTestWebSocketClient()) {
+                setField(client, "upgraded", true);
+
+                // socket.recv() returns 0, triggering the ioWait path
+                // ioWait throws a timeout error
+                client.ioWaitAction = () -> {
+                    throw new HttpClientException("timed out [errno=").put(0).put(']').flagAsTimeout();
+                };
+
+                WebSocketFrameHandler noOpHandler = new WebSocketFrameHandler() {
+                    @Override
+                    public void onBinaryMessage(long payloadPtr, int payloadLen) {
+                    }
+
+                    @Override
+                    public void onClose(int code, String reason) {
+                    }
+                };
+
+                boolean result = client.receiveFrame(noOpHandler, 1000);
+                Assert.assertFalse("receiveFrame should return false on timeout", result);
+            }
+        });
+    }
+
     private static void setField(Object obj, String fieldName, Object value) throws Exception {
         Class<?> clazz = obj.getClass();
         while (clazz != null) {
@@ -132,6 +200,83 @@ public class WebSocketClientTest {
         @Override
         protected void setupIoWait() {
             // no-op
+        }
+    }
+
+    /**
+     * WebSocketClient subclass with a fake socket that always returns 0
+     * from recv(), forcing the ioWait path in recvOrTimeout().
+     */
+    private static class RecvTestWebSocketClient extends WebSocketClient {
+        Runnable ioWaitAction;
+
+        RecvTestWebSocketClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> new FakeSocket());
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+            ioWaitAction.run();
+        }
+
+        @Override
+        protected void setupIoWait() {
+            // no-op
+        }
+    }
+
+    /**
+     * Minimal Socket that always returns 0 from recv() (no data available),
+     * triggering the ioWait path in recvOrTimeout().
+     */
+    private static class FakeSocket implements Socket {
+
+        @Override
+        public void close() {
+        }
+
+        @Override
+        public int getFd() {
+            return 0;
+        }
+
+        @Override
+        public boolean isClosed() {
+            return false;
+        }
+
+        @Override
+        public void of(int fd) {
+        }
+
+        @Override
+        public int recv(long bufferPtr, int bufferLen) {
+            return 0;
+        }
+
+        @Override
+        public int send(long bufferPtr, int bufferLen) {
+            return 0;
+        }
+
+        @Override
+        public void startTlsSession(CharSequence peerName) throws TlsSessionInitFailedException {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean supportsTls() {
+            return false;
+        }
+
+        @Override
+        public int tlsIO(int readinessFlags) {
+            return 0;
+        }
+
+        @Override
+        public boolean wantsTlsWrite() {
+            return false;
         }
     }
 }
