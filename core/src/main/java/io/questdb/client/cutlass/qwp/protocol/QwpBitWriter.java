@@ -158,7 +158,7 @@ public class QwpBitWriter {
         int bitsToWrite = numBits;
 
         while (bitsToWrite > 0) {
-            // How many bits can we fit in current buffer (max 64 total)
+            // How many bits can fit into the current buffer (max 64 total)
             int availableInBuffer = 64 - bitsInBuffer;
             int bitsThisRound = Math.min(bitsToWrite, availableInBuffer);
 

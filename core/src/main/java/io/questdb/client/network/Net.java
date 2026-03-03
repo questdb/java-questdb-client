@@ -80,9 +80,9 @@ public final class Net {
 
     public static native int configureNonBlocking(int fd);
 
-    public native static int connect(int fd, long sockaddr);
+    public static native int connect(int fd, long sockaddr);
 
-    public native static int connectAddrInfo(int fd, long lpAddrInfo);
+    public static native int connectAddrInfo(int fd, long lpAddrInfo);
 
     public static void freeAddrInfo(long pAddrInfo) {
         if (pAddrInfo != 0) {
@@ -106,13 +106,13 @@ public final class Net {
         }
     }
 
-    public native static int getSndBuf(int fd);
+    public static native int getSndBuf(int fd);
 
     public static void init() {
         // no-op
     }
 
-    public native static boolean join(int fd, int bindIPv4Address, int groupIPv4Address);
+    public static native boolean join(int fd, int bindIPv4Address, int groupIPv4Address);
 
     public static native int peek(int fd, long ptr, int len);
 
@@ -120,28 +120,28 @@ public final class Net {
 
     public static native int send(int fd, long ptr, int len);
 
-    public native static int sendTo(int fd, long ptr, int len, long sockaddr);
+    public static native int sendTo(int fd, long ptr, int len, long sockaddr);
 
     public static native int setKeepAlive0(int fd, int seconds);
 
-    public native static int setMulticastInterface(int fd, int ipv4address);
+    public static native int setMulticastInterface(int fd, int ipv4address);
 
-    public native static int setMulticastTtl(int fd, int ttl);
+    public static native int setMulticastTtl(int fd, int ttl);
 
-    public native static int setSndBuf(int fd, int size);
+    public static native int setSndBuf(int fd, int size);
 
-    public native static int setTcpNoDelay(int fd, boolean noDelay);
+    public static native int setTcpNoDelay(int fd, boolean noDelay);
 
     public static long sockaddr(int ipv4address, int port) {
         SOCK_ADDR_COUNTER.incrementAndGet();
         return sockaddr0(ipv4address, port);
     }
 
-    public native static long sockaddr0(int ipv4address, int port);
+    public static native long sockaddr0(int ipv4address, int port);
 
-    public native static int socketTcp(boolean blocking);
+    public static native int socketTcp(boolean blocking);
 
-    public native static int socketUdp();
+    public static native int socketUdp();
 
     private static native void freeAddrInfo0(long pAddrInfo);
 
