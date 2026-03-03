@@ -72,6 +72,9 @@ stages:
             lfs: false
             submodules: false
           - template: setup.yaml
+          - bash: echo "##vso[task.setvariable variable=HOME]$USERPROFILE"
+            displayName: "Set HOME on Windows"
+            condition: eq(variables['Agent.OS'], 'Windows_NT')
           - task: Cache@2
             inputs:
               key: 'maven | "$(Agent.OS)" | **/pom.xml'
