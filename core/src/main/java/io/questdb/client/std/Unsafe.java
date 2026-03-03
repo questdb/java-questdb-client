@@ -24,14 +24,12 @@
 
 package io.questdb.client.std;
 
-// @formatter:off
 import io.questdb.client.cairo.CairoException;
+
 import java.lang.reflect.AccessibleObject;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.LongAdder;
-
-import static io.questdb.client.std.MemoryTag.NATIVE_DEFAULT;
 
 public final class Unsafe {
     // The various _ADDR fields are `long` in Java, but they are `* mut usize` in Rust, or `size_t*` in C.
@@ -49,7 +47,6 @@ public final class Unsafe {
     private static final long NON_RSS_MEM_USED_ADDR;
     private static final long OVERRIDE;
     private static final long REALLOC_COUNT_ADDR;
-    private static final long RSS_MEM_LIMIT_ADDR;
     private static final long RSS_MEM_USED_ADDR;
     private static final sun.misc.Unsafe UNSAFE;
     private static final Method implAddExports;
@@ -146,10 +143,6 @@ public final class Unsafe {
         return UNSAFE.getLongVolatile(null, REALLOC_COUNT_ADDR);
     }
 
-    public static long getRssMemLimit() {
-        return UNSAFE.getLongVolatile(null, RSS_MEM_LIMIT_ADDR);
-    }
-
     public static long getRssMemUsed() {
         return UNSAFE.getLongVolatile(null, RSS_MEM_USED_ADDR);
     }
@@ -183,7 +176,6 @@ public final class Unsafe {
     public static long malloc(long size, int memoryTag) {
         try {
             assert memoryTag >= MemoryTag.NATIVE_PATH;
-            checkAllocLimit(size, memoryTag);
             long ptr = Unsafe.getUnsafe().allocateMemory(size);
             recordMemAlloc(size, memoryTag);
             incrMallocCount();
@@ -205,7 +197,6 @@ public final class Unsafe {
     public static long realloc(long address, long oldSize, long newSize, int memoryTag) {
         try {
             assert memoryTag >= MemoryTag.NATIVE_PATH;
-            checkAllocLimit(-oldSize + newSize, memoryTag);
             long ptr = Unsafe.getUnsafe().reallocateMemory(address, newSize);
             recordMemAlloc(-oldSize + newSize, memoryTag);
             incrReallocCount();
@@ -251,26 +242,6 @@ public final class Unsafe {
             return 12L;
         }
         return 16L;
-    }
-
-    private static void checkAllocLimit(long size, int memoryTag) {
-        if (size <= 0) {
-            return;
-        }
-        // Don't check limits for mmap'd memory
-        final long rssMemLimit = getRssMemLimit();
-        if (rssMemLimit > 0 && memoryTag >= NATIVE_DEFAULT) {
-            long usage = getRssMemUsed();
-            if (usage + size > rssMemLimit) {
-                throw CairoException.nonCritical()
-                        .put("global RSS memory limit exceeded [usage=")
-                        .put(usage)
-                        .put(", RSS_MEM_LIMIT=").put(rssMemLimit)
-                        .put(", size=").put(size)
-                        .put(", memoryTag=").put(memoryTag)
-                        .put(']');
-            }
-        }
     }
 
     private static boolean getOrdinaryObjectPointersCompressionStatus(boolean is32BitJVM) {
@@ -333,16 +304,12 @@ public final class Unsafe {
         // A single allocation for all the off-heap native memory counters.
         // Might help with locality, given they're often incremented together.
         // All initial values set to 0.
-        final long nativeMemCountersArraySize = (6 + COUNTERS.length) * 8;
+        final long nativeMemCountersArraySize = (5 + COUNTERS.length) * 8;
         final long nativeMemCountersArray = UNSAFE.allocateMemory(nativeMemCountersArraySize);
         long ptr = nativeMemCountersArray;
         Vect.memset(nativeMemCountersArray, nativeMemCountersArraySize, 0);
 
-        // N.B.: The layout here is also used in `allocator.rs` for the Rust side.
-        // See: `struct MemTracking`.
         RSS_MEM_USED_ADDR = ptr;
-        ptr += 8;
-        RSS_MEM_LIMIT_ADDR = ptr;
         ptr += 8;
         MALLOC_COUNT_ADDR = ptr;
         ptr += 8;
