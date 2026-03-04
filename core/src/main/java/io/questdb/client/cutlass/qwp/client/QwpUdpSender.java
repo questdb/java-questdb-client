@@ -75,8 +75,9 @@ public class QwpUdpSender implements Sender {
     private static final byte ENTRY_TIMESTAMP_COL_NANOS = 14;
     private static final Logger LOG = LoggerFactory.getLogger(QwpUdpSender.class);
 
+    private final NativeBufferWriter buffer = new NativeBufferWriter();
     private final UdpLineChannel channel;
-    private final QwpWebSocketEncoder encoder;
+    private final QwpColumnWriter columnWriter = new QwpColumnWriter();
     private final int maxDatagramSize;
     private final ObjList<ColumnEntry> rowJournal = new ObjList<>();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
@@ -93,8 +94,6 @@ public class QwpUdpSender implements Sender {
     }
 
     public QwpUdpSender(NetworkFacade nf, int interfaceIPv4, int sendToAddress, int port, int ttl, int maxDatagramSize) {
-        this.encoder = new QwpWebSocketEncoder();
-        this.encoder.setGorillaEnabled(false);
         this.channel = new UdpLineChannel(nf, interfaceIPv4, sendToAddress, port, ttl);
         this.tableBuffers = new CharSequenceObjHashMap<>();
         this.maxDatagramSize = maxDatagramSize;
@@ -182,7 +181,7 @@ public class QwpUdpSender implements Sender {
             }
             tableBuffers.clear();
             channel.close();
-            encoder.close();
+            buffer.close();
         }
     }
 
@@ -571,6 +570,25 @@ public class QwpUdpSender implements Sender {
         }
     }
 
+    private int encodeForUdp(QwpTableBuffer tableBuffer) {
+        buffer.reset();
+        // Write 12-byte ILP4 header: magic, version, flags=0, tableCount=1, payloadLength=0 (patched later)
+        buffer.putByte((byte) 'I');
+        buffer.putByte((byte) 'L');
+        buffer.putByte((byte) 'P');
+        buffer.putByte((byte) '4');
+        buffer.putByte(VERSION_1);
+        buffer.putByte((byte) 0); // flags
+        buffer.putShort((short) 1); // tableCount
+        buffer.putInt(0); // payloadLength placeholder
+        int payloadStart = buffer.getPosition();
+        columnWriter.setBuffer(buffer);
+        columnWriter.encodeTable(tableBuffer, false, false, false);
+        int payloadLength = buffer.getPosition() - payloadStart;
+        buffer.patchInt(8, payloadLength);
+        return buffer.getPosition();
+    }
+
     private void flushInternal() {
         ObjList<CharSequence> keys = tableBuffers.keys();
         for (int i = 0, n = keys.size(); i < n; i++) {
@@ -579,9 +597,9 @@ public class QwpUdpSender implements Sender {
             QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
             if (tableBuffer == null || tableBuffer.getRowCount() == 0) continue;
 
-            int len = encoder.encode(tableBuffer, false);
+            int len = encodeForUdp(tableBuffer);
             try {
-                channel.send(encoder.getBuffer().getBufferPtr(), len);
+                channel.send(buffer.getBufferPtr(), len);
             } catch (LineSenderException e) {
                 LOG.warn("UDP send failed [table={}, errno={}]: {}", tableName, channel.errno(), String.valueOf(e));
             }
@@ -592,9 +610,9 @@ public class QwpUdpSender implements Sender {
     }
 
     private void flushSingleTable(String tableName, QwpTableBuffer tableBuffer) {
-        int len = encoder.encode(tableBuffer, false);
+        int len = encodeForUdp(tableBuffer);
         try {
-            channel.send(encoder.getBuffer().getBufferPtr(), len);
+            channel.send(buffer.getBufferPtr(), len);
         } catch (LineSenderException e) {
             LOG.warn("UDP send failed [table={}, errno={}]: {}", tableName, channel.errno(), String.valueOf(e));
         }
