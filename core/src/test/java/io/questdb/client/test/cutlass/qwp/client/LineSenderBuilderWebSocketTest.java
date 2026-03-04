@@ -433,7 +433,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testInvalidSchema_fails() {
-        assertBadConfig("invalid::addr=localhost:9000;", "invalid schema [schema=invalid, supported-schemas=[http, https, tcp, tcps, ws, wss]]");
+        assertBadConfig("invalid::addr=localhost:9000;", "invalid schema [schema=invalid, supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
     }
 
     @Test

@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.line.LineTcpSenderV3;
 import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.cutlass.line.tcp.DelegatingTlsChannel;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
+import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.network.NetworkFacade;
@@ -52,6 +53,8 @@ import org.jetbrains.annotations.NotNull;
 
 import javax.security.auth.DestroyFailedException;
 import java.io.Closeable;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.security.PrivateKey;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -148,6 +151,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         int protocol = switch (transport) {
             case HTTP -> LineSenderBuilder.PROTOCOL_HTTP;
             case TCP -> LineSenderBuilder.PROTOCOL_TCP;
+            case UDP -> LineSenderBuilder.PROTOCOL_UDP;
             case WEBSOCKET -> LineSenderBuilder.PROTOCOL_WEBSOCKET;
         };
         return new LineSenderBuilder(protocol);
@@ -470,6 +474,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         TCP,
 
         /**
+         * Fire-and-forget binary ingestion over UDP.
+         * <p>
+         * UDP transport sends datagrams without waiting for acknowledgement. It is suitable for
+         * high-throughput scenarios where occasional message loss is acceptable.
+         */
+        UDP,
+
+        /**
          * Use WebSocket transport to communicate with a QuestDB server.
          * <p>
          * WebSocket transport uses the ILP v4 binary protocol for efficient data ingestion.
@@ -520,6 +532,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
         private static final int DEFAULT_AUTO_FLUSH_ROWS = 75_000;
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
+        private static final int DEFAULT_MAX_DATAGRAM_SIZE = 1400;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
         private static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 8;
@@ -529,6 +542,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final long DEFAULT_MAX_RETRY_NANOS = TimeUnit.SECONDS.toNanos(10); // keep sync with the contract of the configuration method
         private static final long DEFAULT_MIN_REQUEST_THROUGHPUT = 100 * 1024; // 100KB/s, keep in sync with the contract of the configuration method
         private static final int DEFAULT_TCP_PORT = 9009;
+        private static final int DEFAULT_UDP_PORT = 9007;
         private static final int DEFAULT_WEBSOCKET_PORT = 9000;
         private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 1024 * 1024; // 1MB
         private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
@@ -541,6 +555,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PARAMETER_NOT_SET_EXPLICITLY = -1;
         private static final int PROTOCOL_HTTP = 1;
         private static final int PROTOCOL_TCP = 0;
+        private static final int PROTOCOL_UDP = 3;
         private static final int PROTOCOL_WEBSOCKET = 2;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
@@ -556,8 +571,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int inFlightWindowSize = PARAMETER_NOT_SET_EXPLICITLY;
         private String keyId;
         private int maxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private int maxDatagramSize = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxNameLength = PARAMETER_NOT_SET_EXPLICITLY;
         private int maximumBufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        private int multicastTtl = PARAMETER_NOT_SET_EXPLICITLY;
         private final HttpClientConfiguration httpClientConfiguration = new DefaultHttpClientConfiguration() {
             @Override
             public int getInitialRequestBufferSize() {
@@ -889,6 +906,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
             }
 
+            if (protocol == PROTOCOL_UDP) {
+                if (hosts.size() != 1 || ports.size() != 1) {
+                    throw new LineSenderException("only a single address (host:port) is supported for UDP transport");
+                }
+                int sendToAddr = resolveIPv4(hosts.getQuick(0));
+                int actualMaxDatagramSize = maxDatagramSize == PARAMETER_NOT_SET_EXPLICITLY
+                        ? DEFAULT_MAX_DATAGRAM_SIZE : maxDatagramSize;
+                int actualTtl = multicastTtl == PARAMETER_NOT_SET_EXPLICITLY ? 0 : multicastTtl;
+                return new QwpUdpSender(nf, 0, sendToAddr, ports.getQuick(0), actualTtl, actualMaxDatagramSize);
+            }
+
             assert protocol == PROTOCOL_TCP;
 
             if (hosts.size() != 1 || ports.size() != 1) {
@@ -1210,6 +1238,32 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Set the maximum datagram size in bytes for UDP transport. Only valid for UDP transport.
+         * <br>
+         * The practical limit depends on the network MTU (typically 1500 bytes for Ethernet).
+         * <br>
+         * Default value: 1400 bytes
+         *
+         * @param maxDatagramSize maximum datagram size in bytes
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder maxDatagramSize(int maxDatagramSize) {
+            if (this.maxDatagramSize != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("max datagram size was already configured ")
+                        .put("[maxDatagramSize=").put(this.maxDatagramSize).put("]");
+            }
+            if (maxDatagramSize < 1) {
+                throw new LineSenderException("max datagram size must be positive ")
+                        .put("[maxDatagramSize=").put(maxDatagramSize).put("]");
+            }
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_UDP) {
+                throw new LineSenderException("max datagram size is only supported for UDP transport");
+            }
+            this.maxDatagramSize = maxDatagramSize;
+            return this;
+        }
+
+        /**
          * Set the maximum local buffer capacity in bytes.
          * <br>
          * This is a hard limit on the maximum buffer capacity. The buffer cannot grow beyond this limit and Sender
@@ -1279,6 +1333,36 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put("[minRequestThroughput=").put(minRequestThroughput).put("]");
             }
             this.minRequestThroughput = minRequestThroughput;
+            return this;
+        }
+
+        /**
+         * Set the multicast TTL for UDP transport. Only valid for UDP transport.
+         * <br>
+         * Valid range: 0-255.
+         * <br>
+         * Default value: 0 (restricted to same host). Set to 1 for local subnet.
+         *
+         * @param multicastTtl multicast TTL value
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder multicastTtl(int multicastTtl) {
+            if (this.multicastTtl != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("multicast TTL was already configured ")
+                        .put("[multicastTtl=").put(this.multicastTtl).put("]");
+            }
+            if (multicastTtl < 0) {
+                throw new LineSenderException("multicast TTL cannot be negative ")
+                        .put("[multicastTtl=").put(multicastTtl).put("]");
+            }
+            if (multicastTtl > 255) {
+                throw new LineSenderException("multicast TTL cannot exceed 255 ")
+                        .put("[multicastTtl=").put(multicastTtl).put("]");
+            }
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_UDP) {
+                throw new LineSenderException("multicast TTL is only supported for UDP transport");
+            }
+            this.multicastTtl = multicastTtl;
             return this;
         }
 
@@ -1378,6 +1462,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
         }
 
+        private static int resolveIPv4(String host) {
+            try {
+                byte[] addr = InetAddress.getByName(host).getAddress();
+                if (addr.length != 4) {
+                    throw new LineSenderException("IPv6 addresses are not supported [host=").put(host).put("]");
+                }
+                return ((addr[0] & 0xFF) << 24)
+                        | ((addr[1] & 0xFF) << 16)
+                        | ((addr[2] & 0xFF) << 8)
+                        | (addr[3] & 0xFF);
+            } catch (UnknownHostException e) {
+                throw new LineSenderException("could not resolve host [host=" + host + "]", e);
+            }
+        }
+
         private static RuntimeException rethrow(Throwable t) {
             if (t instanceof LineSenderException) {
                 throw (LineSenderException) t;
@@ -1398,6 +1497,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (ports.size() == 0) {
                 if (protocol == PROTOCOL_HTTP) {
                     ports.add(DEFAULT_HTTP_PORT);
+                } else if (protocol == PROTOCOL_UDP) {
+                    ports.add(DEFAULT_UDP_PORT);
                 } else if (protocol == PROTOCOL_WEBSOCKET) {
                     ports.add(DEFAULT_WEBSOCKET_PORT);
                 } else {
@@ -1443,7 +1544,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
                 throw new LineSenderException("protocol was already configured ")
                         .put("[protocol=")
-                        .put(protocol == PROTOCOL_HTTP ? "http" : "tcp").put("]");
+                        .put(switch (protocol) {
+                            case PROTOCOL_HTTP -> "http";
+                            case PROTOCOL_UDP -> "udp";
+                            case PROTOCOL_WEBSOCKET -> "websocket";
+                            default -> "tcp";
+                        }).put("]");
             }
             if (Chars.equals("http", sink)) {
                 if (tlsEnabled) {
@@ -1469,8 +1575,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             } else if (Chars.equals("wss", sink)) {
                 websocket();
                 tlsEnabled = true;
+            } else if (Chars.equals("udp", sink)) {
+                udp();
+            } else if (Chars.equals("udps", sink)) {
+                throw new LineSenderException("TLS is not supported for UDP");
             } else {
-                throw new LineSenderException("invalid schema [schema=").put(sink).put(", supported-schemas=[http, https, tcp, tcps, ws, wss]]");
+                throw new LineSenderException("invalid schema [schema=").put(sink).put(", supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
             }
 
             String tcpToken = null;
@@ -1492,28 +1602,39 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     address(sink);
                     if (ports.size() == hosts.size() - 1) {
                         // not set
-                        port(protocol == PROTOCOL_TCP ? DEFAULT_TCP_PORT
+                        port(protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT
+                                : protocol == PROTOCOL_UDP ? DEFAULT_UDP_PORT
                                 : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
-                                : DEFAULT_HTTP_PORT);
+                                : DEFAULT_TCP_PORT);
                     }
                 } else if (Chars.equals("user", sink)) {
                     // deprecated key: user, new key: username
                     pos = getValue(configurationString, pos, sink, "user");
+                    if (protocol == PROTOCOL_UDP) {
+                        throw new LineSenderException("username is not supported for UDP transport");
+                    }
                     user = sink.toString();
                 } else if (Chars.equals("username", sink)) {
                     pos = getValue(configurationString, pos, sink, "username");
+                    if (protocol == PROTOCOL_UDP) {
+                        throw new LineSenderException("username is not supported for UDP transport");
+                    }
                     user = sink.toString();
                 } else if (Chars.equals("pass", sink)) {
                     // deprecated key: pass, new key: password
                     pos = getValue(configurationString, pos, sink, "pass");
                     if (protocol == PROTOCOL_TCP) {
                         throw new LineSenderException("password is not supported for TCP protocol");
+                    } else if (protocol == PROTOCOL_UDP) {
+                        throw new LineSenderException("password is not supported for UDP transport");
                     }
                     password = sink.toString();
                 } else if (Chars.equals("password", sink)) {
                     pos = getValue(configurationString, pos, sink, "password");
                     if (protocol == PROTOCOL_TCP) {
                         throw new LineSenderException("password is not supported for TCP protocol");
+                    } else if (protocol == PROTOCOL_UDP) {
+                        throw new LineSenderException("password is not supported for UDP transport");
                     }
                     password = sink.toString();
                 } else if (Chars.equals("tls_verify", sink)) {
@@ -1550,6 +1671,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         // will configure later, we need to know a keyId first
                     } else if (protocol == PROTOCOL_HTTP) {
                         httpToken(sink.toString());
+                    } else if (protocol == PROTOCOL_UDP) {
+                        throw new LineSenderException("token is not supported for UDP transport");
                     } else {
                         throw new LineSenderException("token is not supported for WebSocket protocol");
                     }
@@ -1640,6 +1763,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         int protocolVersion = parseIntValue(sink, "protocol_version");
                         protocolVersion(protocolVersion);
                     }
+                } else if (Chars.equals("max_datagram_size", sink)) {
+                    pos = getValue(configurationString, pos, sink, "max_datagram_size");
+                    int mds = parseIntValue(sink, "max_datagram_size");
+                    maxDatagramSize(mds);
+                } else if (Chars.equals("multicast_ttl", sink)) {
+                    pos = getValue(configurationString, pos, sink, "multicast_ttl");
+                    int ttl = parseIntValue(sink, "multicast_ttl");
+                    multicastTtl(ttl);
                 } else {
                     // ignore unknown keys, unless they are malformed
                     if ((pos = ConfStringParser.value(configurationString, pos, sink)) < 0) {
@@ -1754,6 +1885,52 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (autoFlushIntervalMillis != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("auto flush interval is not supported for TCP protocol");
                 }
+            } else if (protocol == PROTOCOL_UDP) {
+                if (privateKey != null) {
+                    throw new LineSenderException("authentication is not supported for UDP transport");
+                }
+                if (httpToken != null) {
+                    throw new LineSenderException("HTTP token authentication is not supported for UDP transport");
+                }
+                if (username != null || password != null) {
+                    throw new LineSenderException("username/password authentication is not supported for UDP transport");
+                }
+                if (tlsEnabled) {
+                    throw new LineSenderException("TLS is not supported for UDP transport");
+                }
+                if (retryTimeoutMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("retry timeout is not supported for UDP transport");
+                }
+                if (httpTimeout != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("HTTP timeout is not supported for UDP transport");
+                }
+                if (minRequestThroughput != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("minimum request throughput is not supported for UDP transport");
+                }
+                if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("protocol version is not supported for UDP transport");
+                }
+                if (asyncMode) {
+                    throw new LineSenderException("async mode is not supported for UDP transport");
+                }
+                if (inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("in-flight window size is not supported for UDP transport");
+                }
+                if (httpPath != null) {
+                    throw new LineSenderException("HTTP path is not supported for UDP transport");
+                }
+                if (maxBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("max backoff is not supported for UDP transport");
+                }
+                if (autoFlushRows != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("auto flush rows is not supported for UDP transport");
+                }
+                if (autoFlushIntervalMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("auto flush interval is not supported for UDP transport");
+                }
+                if (autoFlushBytes != PARAMETER_NOT_SET_EXPLICITLY) {
+                    throw new LineSenderException("auto flush bytes is not supported for UDP transport");
+                }
             } else if (protocol == PROTOCOL_WEBSOCKET) {
                 if (privateKey != null) {
                     throw new LineSenderException("TCP authentication is not supported for WebSocket protocol");
@@ -1790,6 +1967,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("unsupported protocol ")
                         .put("[protocol=").put(protocol).put("]");
             }
+        }
+
+        private void udp() {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("protocol was already configured ")
+                        .put("[protocol=").put(protocol).put("]");
+            }
+            protocol = PROTOCOL_UDP;
         }
 
         private void websocket() {

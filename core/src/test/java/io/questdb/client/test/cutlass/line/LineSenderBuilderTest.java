@@ -140,8 +140,8 @@ public class LineSenderBuilderTest {
     @Test
     public void testConfStringValidation() throws Exception {
         assertMemoryLeak(() -> {
-            assertConfStrError("foo", "invalid schema [schema=foo, supported-schemas=[http, https, tcp, tcps, ws, wss]]");
-            assertConfStrError("badschema::addr=bar;", "invalid schema [schema=badschema, supported-schemas=[http, https, tcp, tcps, ws, wss]]");
+            assertConfStrError("foo", "invalid schema [schema=foo, supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
+            assertConfStrError("badschema::addr=bar;", "invalid schema [schema=badschema, supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
             assertConfStrError("http::addr=localhost:-1;", "invalid port [port=-1]");
             assertConfStrError("http::auto_flush=on;", "addr is missing");
             assertConfStrError("http::addr=localhost;tls_roots=/some/path;", "tls_roots was configured, but tls_roots_password is missing");
@@ -171,10 +171,10 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost:8080;auto_flush=invalid;", "invalid auto_flush [value=invalid, allowed-values=[on, off]]");
             assertConfStrError("http::addr=localhost:8080;auto_flush=off;auto_flush_rows=100;", "cannot set auto flush rows when auto-flush is already disabled");
             assertConfStrError("http::addr=localhost:8080;auto_flush_rows=100;auto_flush=off;", "auto flush rows was already configured [autoFlushRows=100]");
-            assertConfStrError("HTTP::addr=localhost;", "invalid schema [schema=HTTP, supported-schemas=[http, https, tcp, tcps, ws, wss]]");
-            assertConfStrError("HTTPS::addr=localhost;", "invalid schema [schema=HTTPS, supported-schemas=[http, https, tcp, tcps, ws, wss]]");
-            assertConfStrError("TCP::addr=localhost;", "invalid schema [schema=TCP, supported-schemas=[http, https, tcp, tcps, ws, wss]]");
-            assertConfStrError("TCPS::addr=localhost;", "invalid schema [schema=TCPS, supported-schemas=[http, https, tcp, tcps, ws, wss]]");
+            assertConfStrError("HTTP::addr=localhost;", "invalid schema [schema=HTTP, supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
+            assertConfStrError("HTTPS::addr=localhost;", "invalid schema [schema=HTTPS, supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
+            assertConfStrError("TCP::addr=localhost;", "invalid schema [schema=TCP, supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
+            assertConfStrError("TCPS::addr=localhost;", "invalid schema [schema=TCPS, supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
             assertConfStrError("http::addr=localhost;auto_flush=off;auto_flush_interval=1;", "cannot set auto flush interval when interval based auto-flush is already disabled");
             assertConfStrError("http::addr=localhost;auto_flush=off;auto_flush_rows=1;", "cannot set auto flush rows when auto-flush is already disabled");
             assertConfStrError("http::addr=localhost;auto_flush_bytes=1024;", "auto_flush_bytes is only supported for TCP transport");
