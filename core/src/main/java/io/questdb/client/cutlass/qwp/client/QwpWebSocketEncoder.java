@@ -126,10 +126,10 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     }
 
     public void writeHeader(int tableCount, int payloadLength) {
-        buffer.putByte((byte) 'I');
-        buffer.putByte((byte) 'L');
+        buffer.putByte((byte) 'Q');
+        buffer.putByte((byte) 'W');
         buffer.putByte((byte) 'P');
-        buffer.putByte((byte) '4');
+        buffer.putByte((byte) '1');
         buffer.putByte(VERSION_1);
         buffer.putByte(flags);
         buffer.putShort((short) tableCount);

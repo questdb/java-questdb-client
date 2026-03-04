@@ -77,11 +77,11 @@ public class NativeBufferWriterTest {
 
                 Assert.assertEquals(12, writer.getPosition());
 
-                // Verify ILP4 header
-                Assert.assertEquals((byte) 'I', Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
-                Assert.assertEquals((byte) 'L', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 1));
+                // Verify QWP1 header
+                Assert.assertEquals((byte) 'Q', Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
+                Assert.assertEquals((byte) 'W', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 1));
                 Assert.assertEquals((byte) 'P', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 2));
-                Assert.assertEquals((byte) '4', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 3));
+                Assert.assertEquals((byte) '1', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 3));
             }
         });
     }
