@@ -114,6 +114,18 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Returns the total bytes buffered across all columns.
+     * This queries actual buffer sizes, not estimates.
+     */
+    public long getBufferedBytes() {
+        long bytes = 0;
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            bytes += fastColumns[i].getBufferedBytes();
+        }
+        return bytes;
+    }
+
+    /**
      * Returns the column at the given index.
      */
     public ColumnBuffer getColumn(int index) {
@@ -157,7 +169,8 @@ public class QwpTableBuffer implements QuietCloseable {
                 columnAccessCursor++;
                 if (candidate.type != type) {
                     throw new LineSenderException(
-                            "Column type mismatch for " + name + ": existing=" + candidate.type + " new=" + type
+                            "Column type mismatch for column '" + name + "': columnType="
+                                    + candidate.type + ", sentType=" + type
                     );
                 }
                 return candidate;
@@ -170,7 +183,8 @@ public class QwpTableBuffer implements QuietCloseable {
             ColumnBuffer existing = columns.get(idx);
             if (existing.type != type) {
                 throw new LineSenderException(
-                        "Column type mismatch for " + name + ": existing=" + existing.type + " new=" + type
+                        "Column type mismatch for column '" + name + "': columnType="
+                                + existing.type + ", sentType=" + type
                 );
             }
             return existing;
@@ -937,6 +951,32 @@ public class QwpTableBuffer implements QuietCloseable {
          */
         public long getAuxDataAddress() {
             return auxBuffer != null ? auxBuffer.pageAddress() : 0;
+        }
+
+        /**
+         * Returns the total bytes buffered in this column's storage.
+         */
+        public long getBufferedBytes() {
+            long bytes = 0;
+            if (dataBuffer != null) {
+                bytes += dataBuffer.getAppendOffset();
+            }
+            if (auxBuffer != null) {
+                bytes += auxBuffer.getAppendOffset();
+            }
+            if (stringData != null) {
+                bytes += stringData.getAppendOffset();
+            }
+            if (stringOffsets != null) {
+                bytes += stringOffsets.getAppendOffset();
+            }
+            if (doubleArrayData != null) {
+                bytes += (long) arrayDataOffset * Double.BYTES;
+            }
+            if (longArrayData != null) {
+                bytes += (long) arrayDataOffset * Long.BYTES;
+            }
+            return bytes;
         }
 
         /**

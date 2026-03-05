@@ -1192,6 +1192,21 @@ public class QwpWebSocketSender implements Sender {
         LOG.debug("Sync flush complete [totalAcked={}]", inFlightWindow.getTotalAcked());
     }
 
+    private long getPendingBytes() {
+        long bytes = 0;
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence key = keys.getQuick(i);
+            if (key != null) {
+                QwpTableBuffer tb = tableBuffers.get(key);
+                if (tb != null) {
+                    bytes += tb.getBufferedBytes();
+                }
+            }
+        }
+        return bytes;
+    }
+
     /**
      * Seals the current buffer and swaps to the other buffer.
      * Enqueues the sealed buffer for async sending.
@@ -1273,16 +1288,16 @@ public class QwpWebSocketSender implements Sender {
         if (pendingRowCount <= 0) {
             return false;
         }
-        // Row limit
         if (autoFlushRows > 0 && pendingRowCount >= autoFlushRows) {
             return true;
         }
-        // Time limit
+        if (autoFlushBytes > 0 && getPendingBytes() >= autoFlushBytes) {
+            return true;
+        }
         if (autoFlushIntervalNanos > 0) {
             long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
             return ageNanos >= autoFlushIntervalNanos;
         }
-        // Byte limit is harder to estimate without encoding, skip for now
         return false;
     }
 
