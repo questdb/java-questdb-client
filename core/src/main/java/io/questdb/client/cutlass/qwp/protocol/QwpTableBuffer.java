@@ -58,6 +58,7 @@ public class QwpTableBuffer implements QuietCloseable {
     private QwpColumnDef[] cachedColumnDefs;
     private int columnAccessCursor; // tracks expected next column index
     private boolean columnDefsCacheValid;
+    private int committedColumnCount; // columns that existed at last nextRow()
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int rowCount;
     private long schemaHash;
@@ -80,12 +81,18 @@ public class QwpTableBuffer implements QuietCloseable {
      * If no values have been added for the current row, this is a no-op.
      */
     public void cancelCurrentRow() {
-        // Reset sequential access cursor
         columnAccessCursor = 0;
-        // Truncate each column back to the committed row count
         for (int i = 0, n = columns.size(); i < n; i++) {
             ColumnBuffer col = fastColumns[i];
-            col.truncateTo(rowCount);
+            if (i >= committedColumnCount) {
+                // Column was created during the in-progress row. Remove all data.
+                col.truncateTo(0);
+            } else if (col.size > rowCount) {
+                // Pre-existing column was set for the in-progress row.
+                // Truncate to committed state.
+                col.truncateTo(rowCount);
+            }
+            // else: pre-existing column wasn't touched this row. No-op.
         }
     }
 
@@ -101,6 +108,7 @@ public class QwpTableBuffer implements QuietCloseable {
         columnNameToIndex.clear();
         fastColumns = null;
         columnAccessCursor = 0;
+        committedColumnCount = 0;
         rowCount = 0;
         schemaHash = 0;
         schemaHashComputed = false;
@@ -257,6 +265,7 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
         rowCount++;
+        committedColumnCount = columns.size();
     }
 
     /**
@@ -267,6 +276,7 @@ public class QwpTableBuffer implements QuietCloseable {
             fastColumns[i].reset();
         }
         columnAccessCursor = 0;
+        committedColumnCount = columns.size();
         rowCount = 0;
     }
 
@@ -1156,6 +1166,18 @@ public class QwpTableBuffer implements QuietCloseable {
                 }
                 arrayShapeOffset = newShapeOffset;
                 arrayDataOffset = newDataOffset;
+            }
+
+            // When all values are removed, reset type-specific metadata so the
+            // column behaves as freshly created (matches what reset() does).
+            if (newValueCount == 0) {
+                decimalScale = -1;
+                geohashPrecision = -1;
+                maxGlobalSymbolId = -1;
+                if (symbolDict != null) {
+                    symbolDict.clear();
+                    symbolList.clear();
+                }
             }
         }
 

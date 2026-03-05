@@ -634,6 +634,15 @@ public class QwpUdpSender implements Sender {
             currentTableBuffer.cancelCurrentRow();
             flushSingleTable(currentTableName, currentTableBuffer);
             replayRowJournal();
+            // Post-replay check: the replayed row alone may still exceed the limit.
+            tentativeRowCount = currentTableBuffer.getRowCount() + 1;
+            estimate = QwpDatagramSizeEstimator.estimate(currentTableBuffer, tentativeRowCount);
+            if (estimate > maxDatagramSize) {
+                throw new LineSenderException(
+                        "single row exceeds maximum datagram size (" + maxDatagramSize
+                                + " bytes), estimated " + estimate + " bytes"
+                );
+            }
         }
     }
 

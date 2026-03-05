@@ -178,6 +178,159 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testCancelRowTruncatesLateAddedColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                // Commit 3 rows with columns "a" (LONG, non-nullable) and "b" (STRING, nullable)
+                for (int i = 0; i < 3; i++) {
+                    table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(i);
+                    table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true).addString("v" + i);
+                    table.nextRow();
+                }
+
+                // Start row 4: set "a" and "b", then create a NEW column "c"
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(3);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true).addString("v3");
+                QwpTableBuffer.ColumnBuffer colC = table.getOrCreateColumn("c", QwpConstants.TYPE_STRING, true);
+                colC.addString("stale");
+
+                // Cancel the in-progress row
+                table.cancelCurrentRow();
+
+                // Column "c" was created during the in-progress row, so it must be fully cleared
+                assertEquals(0, colC.getSize());
+                assertEquals(0, colC.getValueCount());
+
+                // Start row 4 again: set "a" and "b" only (not "c")
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(3);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true).addString("v3");
+                table.nextRow();
+
+                // Column "c" should now have size == 4 (padded with nulls) and valueCount == 0
+                assertEquals(4, colC.getSize());
+                assertEquals(0, colC.getValueCount());
+
+                // All 4 rows of column "c" should be null
+                for (int i = 0; i < 4; i++) {
+                    assertTrue("row " + i + " of column c should be null", colC.isNull(i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCancelRowTruncatesLateAddedColumnWhenSizeEqualsRowCount() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                // Commit exactly 1 row so rowCount == 1
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(0);
+                table.nextRow();
+
+                // Start row 2: set "a", then create NEW column "c" with one value
+                // col_c.size will be 1, which equals rowCount — the edge case
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                QwpTableBuffer.ColumnBuffer colC = table.getOrCreateColumn("c", QwpConstants.TYPE_STRING, true);
+                colC.addString("stale");
+
+                // Cancel the in-progress row
+                table.cancelCurrentRow();
+
+                // Column "c" had size == rowCount (1 == 1) but was still late-added
+                assertEquals(0, colC.getSize());
+                assertEquals(0, colC.getValueCount());
+
+                // Start row 2 again without setting "c"
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                table.nextRow();
+
+                // Column "c" should have 2 null rows
+                assertEquals(2, colC.getSize());
+                assertEquals(0, colC.getValueCount());
+                assertTrue(colC.isNull(0));
+                assertTrue(colC.isNull(1));
+            }
+        });
+    }
+
+    @Test
+    public void testCancelRowResetsDecimalScaleOnLateAddedColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(0);
+                table.nextRow();
+
+                // Start row 2: create a decimal column with scale 5
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                QwpTableBuffer.ColumnBuffer colD = table.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL64, true);
+                colD.addDecimal64(Decimal64.fromLong(100, 5));
+                table.cancelCurrentRow();
+
+                // After cancel, decimalScale must be reset. Adding a value at scale 3
+                // should succeed and use scale 3 as the column's scale.
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                colD.addDecimal64(Decimal64.fromLong(42, 3));
+                table.nextRow();
+
+                assertEquals(2, colD.getSize());
+                assertEquals(1, colD.getValueCount());
+            }
+        });
+    }
+
+    @Test
+    public void testCancelRowResetsGeohashPrecisionOnLateAddedColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(0);
+                table.nextRow();
+
+                // Start row 2: create a geohash column with 20-bit precision
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                QwpTableBuffer.ColumnBuffer colG = table.getOrCreateColumn("g", QwpConstants.TYPE_GEOHASH, true);
+                colG.addGeoHash(123L, 20);
+                table.cancelCurrentRow();
+
+                // After cancel, geohashPrecision must be reset. Adding a value at
+                // 30-bit precision should succeed without a precision mismatch error.
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                colG.addGeoHash(456L, 30);
+                table.nextRow();
+
+                assertEquals(2, colG.getSize());
+                assertEquals(1, colG.getValueCount());
+            }
+        });
+    }
+
+    @Test
+    public void testCancelRowResetsSymbolDictOnLateAddedColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(0);
+                table.nextRow();
+
+                // Start row 2: create a symbol column with value "stale"
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                QwpTableBuffer.ColumnBuffer colS = table.getOrCreateColumn("s", QwpConstants.TYPE_SYMBOL, true);
+                colS.addSymbol("stale");
+                table.cancelCurrentRow();
+
+                // After cancel, symbol dictionary must be empty.
+                // "fresh" should get local ID 0, not 1.
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                colS.addSymbol("fresh");
+                table.nextRow();
+
+                assertEquals(2, colS.getSize());
+                assertEquals(1, colS.getValueCount());
+                String[] dict = colS.getSymbolDictionary();
+                assertEquals(1, dict.length);
+                assertEquals("fresh", dict[0]);
+            }
+        });
+    }
+
+    @Test
     public void testCancelRowRewindsDoubleArrayOffsets() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
