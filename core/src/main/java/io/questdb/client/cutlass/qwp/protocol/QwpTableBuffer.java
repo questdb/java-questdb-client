@@ -169,7 +169,8 @@ public class QwpTableBuffer implements QuietCloseable {
                 columnAccessCursor++;
                 if (candidate.type != type) {
                     throw new LineSenderException(
-                            "Column type mismatch for " + name + ": existing=" + candidate.type + " new=" + type
+                            "Column type mismatch for column '" + name + "': columnType="
+                                    + candidate.type + ", sentType=" + type
                     );
                 }
                 return candidate;
@@ -182,7 +183,8 @@ public class QwpTableBuffer implements QuietCloseable {
             ColumnBuffer existing = columns.get(idx);
             if (existing.type != type) {
                 throw new LineSenderException(
-                        "Column type mismatch for " + name + ": existing=" + existing.type + " new=" + type
+                        "Column type mismatch for column '" + name + "': columnType="
+                                + existing.type + ", sentType=" + type
                 );
             }
             return existing;
@@ -944,6 +946,14 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         /**
+         * Returns the off-heap address of the auxiliary data buffer (global symbol IDs).
+         * Returns 0 if no auxiliary data exists.
+         */
+        public long getAuxDataAddress() {
+            return auxBuffer != null ? auxBuffer.pageAddress() : 0;
+        }
+
+        /**
          * Returns the total bytes buffered in this column's storage.
          */
         public long getBufferedBytes() {
@@ -967,14 +977,6 @@ public class QwpTableBuffer implements QuietCloseable {
                 bytes += (long) arrayDataOffset * Long.BYTES;
             }
             return bytes;
-        }
-
-        /**
-         * Returns the off-heap address of the auxiliary data buffer (global symbol IDs).
-         * Returns 0 if no auxiliary data exists.
-         */
-        public long getAuxDataAddress() {
-            return auxBuffer != null ? auxBuffer.pageAddress() : 0;
         }
 
         /**

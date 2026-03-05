@@ -30,12 +30,10 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal64;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+import static org.junit.Assert.*;
 
 public class QwpTableBufferTest {
 
@@ -420,7 +418,7 @@ public class QwpTableBufferTest {
                     fail("Expected LineSenderException for column type mismatch");
                 } catch (LineSenderException e) {
                     assertEquals(
-                            "Column type mismatch for x: existing=" + QwpConstants.TYPE_LONG + " new=" + QwpConstants.TYPE_DOUBLE,
+                            "Column type mismatch for column 'x': columnType=" + QwpConstants.TYPE_LONG + ", sentType=" + QwpConstants.TYPE_DOUBLE,
                             e.getMessage()
                     );
                 }
@@ -445,7 +443,7 @@ public class QwpTableBufferTest {
                     fail("Expected LineSenderException for column type mismatch");
                 } catch (LineSenderException e) {
                     assertEquals(
-                            "Column type mismatch for b: existing=" + QwpConstants.TYPE_STRING + " new=" + QwpConstants.TYPE_LONG,
+                            "Column type mismatch for column 'b': columnType=" + QwpConstants.TYPE_STRING + ", sentType=" + QwpConstants.TYPE_LONG,
                             e.getMessage()
                     );
                 }
