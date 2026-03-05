@@ -573,10 +573,10 @@ public class QwpUdpSender implements Sender {
     private int encodeForUdp(QwpTableBuffer tableBuffer) {
         buffer.reset();
         // Write 12-byte ILP4 header: magic, version, flags=0, tableCount=1, payloadLength=0 (patched later)
-        buffer.putByte((byte) 'I');
-        buffer.putByte((byte) 'L');
+        buffer.putByte((byte) 'Q');
+        buffer.putByte((byte) 'W');
         buffer.putByte((byte) 'P');
-        buffer.putByte((byte) '4');
+        buffer.putByte((byte) '1');
         buffer.putByte(VERSION_1);
         buffer.putByte((byte) 0); // flags
         buffer.putShort((short) 1); // tableCount
