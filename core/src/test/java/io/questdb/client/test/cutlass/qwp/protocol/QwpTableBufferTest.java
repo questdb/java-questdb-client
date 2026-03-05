@@ -38,6 +38,26 @@ import static org.junit.Assert.*;
 public class QwpTableBufferTest {
 
     @Test
+    public void testAddDecimal128PrecisionLoss() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL128, true);
+                // First row sets decimalScale = 2
+                col.addDecimal128(Decimal128.fromLong(100, 2));
+                table.nextRow();
+                // Second row at scale 4 with trailing fractional digits that
+                // cannot be represented at scale 2 without rounding
+                try {
+                    col.addDecimal128(Decimal128.fromLong(12345, 4));
+                    fail("Expected LineSenderException for precision loss");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("precision loss"));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testAddDecimal128RescaleOverflow() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
@@ -52,6 +72,26 @@ public class QwpTableBufferTest {
                     fail("Expected LineSenderException for 128-bit overflow");
                 } catch (LineSenderException e) {
                     assertEquals("Decimal128 overflow: rescaling from scale 0 to 10 exceeds 128-bit capacity", e.getMessage());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAddDecimal64PrecisionLoss() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("d", QwpConstants.TYPE_DECIMAL64, true);
+                // First row sets decimalScale = 2
+                col.addDecimal64(Decimal64.fromLong(100, 2));
+                table.nextRow();
+                // Second row at scale 4 with trailing fractional digits that
+                // cannot be represented at scale 2 without rounding
+                try {
+                    col.addDecimal64(Decimal64.fromLong(12345, 4));
+                    fail("Expected LineSenderException for precision loss");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("precision loss"));
                 }
             }
         });
