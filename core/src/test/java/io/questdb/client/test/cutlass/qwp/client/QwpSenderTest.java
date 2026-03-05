@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.Decimal128;
@@ -76,9 +77,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        true\t1970-01-01T00:00:01.000000000Z
+                        false\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -104,9 +107,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        true\t1970-01-01T00:00:01.000000000Z
+                        false\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -127,9 +132,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "b\ttimestamp\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        b\ttimestamp
+                        true\t1970-01-01T00:00:01.000000000Z
+                        false\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT b, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -546,9 +553,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1970-01-01T00:00:00.100000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1970-01-01T00:00:00.100000000Z\t1970-01-01T00:00:01.000000000Z
+                        1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -574,9 +583,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -602,9 +613,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -1.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -630,9 +643,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-9.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -9.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -658,9 +673,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -1.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -686,9 +703,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -1.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -714,9 +733,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "5.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-9.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        5.0\t1970-01-01T00:00:01.000000000Z
+                        -9.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -742,9 +763,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -770,9 +793,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "f\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        f\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT f, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -826,10 +851,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "i\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "127\t1970-01-01T00:00:02.000000000Z\n" +
-                        "-128\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        i\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        127\t1970-01-01T00:00:02.000000000Z
+                        -128\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT i, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -858,10 +885,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "l\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "127\t1970-01-01T00:00:02.000000000Z\n" +
-                        "-128\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        l\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        127\t1970-01-01T00:00:02.000000000Z
+                        -128\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -915,10 +944,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-128\t1970-01-01T00:00:02.000000000Z\n" +
-                        "127\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -128\t1970-01-01T00:00:02.000000000Z
+                        127\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -947,10 +978,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -979,10 +1012,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -1\t1970-01-01T00:00:02.000000000Z
+                        0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1008,9 +1043,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "t\tts\n" +
-                        "1970-01-01T00:00:00.000100000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        t\tts
+                        1970-01-01T00:00:00.000100000Z\t1970-01-01T00:00:01.000000000Z
+                        1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT t, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1064,10 +1101,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "v\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n" +
-                        "127\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        v\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        127\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1091,10 +1130,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "c\ttimestamp\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "ü\t1970-01-01T00:00:02.000000000Z\n" +
-                        "中\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        c\ttimestamp
+                        A\t1970-01-01T00:00:01.000000000Z
+                        ü\t1970-01-01T00:00:02.000000000Z
+                        中\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT c, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -1330,9 +1371,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        A\t1970-01-01T00:00:01.000000000Z
+                        Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1400,9 +1443,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        A\t1970-01-01T00:00:01.000000000Z
+                        Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1452,9 +1497,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1480,9 +1527,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1508,9 +1557,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1537,9 +1588,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1620,9 +1673,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1648,9 +1703,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1677,9 +1734,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.4500\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1.0000\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.4500\t1970-01-01T00:00:01.000000000Z
+                        -1.0000\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -1936,9 +1995,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2048,9 +2109,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2087,14 +2150,16 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 7);
         assertSqlEventually(
-                "d\ttimestamp\n" +
-                        "42.5\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1.0E10\t1970-01-01T00:00:02.000000000Z\n" +
-                        "1.7976931348623157E308\t1970-01-01T00:00:03.000000000Z\n" +
-                        "4.9E-324\t1970-01-01T00:00:04.000000000Z\n" +
-                        "null\t1970-01-01T00:00:05.000000000Z\n" +
-                        "null\t1970-01-01T00:00:06.000000000Z\n" +
-                        "null\t1970-01-01T00:00:07.000000000Z\n",
+                """
+                        d\ttimestamp
+                        42.5\t1970-01-01T00:00:01.000000000Z
+                        -1.0E10\t1970-01-01T00:00:02.000000000Z
+                        1.7976931348623157E308\t1970-01-01T00:00:03.000000000Z
+                        4.9E-324\t1970-01-01T00:00:04.000000000Z
+                        null\t1970-01-01T00:00:05.000000000Z
+                        null\t1970-01-01T00:00:06.000000000Z
+                        null\t1970-01-01T00:00:07.000000000Z
+                        """,
                 "SELECT d, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -2246,9 +2311,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        b\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT b, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2366,9 +2433,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-42.10\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -42.10\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2463,9 +2532,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "i\tts\n" +
-                        "100000\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-42\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        i\tts
+                        100000\t1970-01-01T00:00:01.000000000Z
+                        -42\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT i, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2516,9 +2587,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "l\tts\n" +
-                        "1000000\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-42\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        l\tts
+                        1000000\t1970-01-01T00:00:01.000000000Z
+                        -42\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2565,9 +2638,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "100\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-200\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        100\t1970-01-01T00:00:01.000000000Z
+                        -200\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2593,9 +2668,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "3.14\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-42.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        3.14\t1970-01-01T00:00:01.000000000Z
+                        -42.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2618,8 +2695,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "sym\tts\n" +
-                        "3.14\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        sym\tts
+                        3.14\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT sym, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2666,9 +2745,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "3.14\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-42.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        3.14\t1970-01-01T00:00:01.000000000Z
+                        -42.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2736,9 +2817,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "7\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        7\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2806,9 +2889,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1.50\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-42.25\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1.50\t1970-01-01T00:00:01.000000000Z
+                        -42.25\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2859,9 +2944,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1.5\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-42.25\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1.5\t1970-01-01T00:00:01.000000000Z
+                        -42.25\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2908,9 +2995,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "i\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        i\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT i, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -2958,8 +3047,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "l\tts\n" +
-                        "1000\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        l\tts
+                        1000\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3006,9 +3097,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1000\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -1000\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3031,8 +3124,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "s\tts\n" +
-                        "1.5\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        s\tts
+                        1.5\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3055,8 +3150,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "sym\tts\n" +
-                        "1.5\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        sym\tts
+                        1.5\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT sym, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3100,8 +3197,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "v\tts\n" +
-                        "1.5\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        v\tts
+                        1.5\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3129,11 +3228,13 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 4);
         assertSqlEventually(
-                "i\ttimestamp\n" +
-                        "null\t1970-01-01T00:00:01.000000000Z\n" +
-                        "0\t1970-01-01T00:00:02.000000000Z\n" +
-                        "2147483647\t1970-01-01T00:00:03.000000000Z\n" +
-                        "-42\t1970-01-01T00:00:04.000000000Z\n",
+                """
+                        i\ttimestamp
+                        null\t1970-01-01T00:00:01.000000000Z
+                        0\t1970-01-01T00:00:02.000000000Z
+                        2147483647\t1970-01-01T00:00:03.000000000Z
+                        -42\t1970-01-01T00:00:04.000000000Z
+                        """,
                 "SELECT i, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -3187,10 +3288,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-128\t1970-01-01T00:00:02.000000000Z\n" +
-                        "127\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        b\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -128\t1970-01-01T00:00:02.000000000Z
+                        127\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT b, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3267,9 +3370,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1970-01-02T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1970-01-02T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3295,9 +3400,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3326,10 +3433,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0.00\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        0.00\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3358,10 +3467,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0.0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        d\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        0.0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3390,10 +3501,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0.00\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        0.00\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3422,10 +3535,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "d\tts\n" +
-                        "2147483647.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0.00\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        d\tts
+                        2147483647.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        0.00\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3454,10 +3569,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "d\tts\n" +
-                        "5.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-9.0\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0.0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        d\tts
+                        5.0\t1970-01-01T00:00:01.000000000Z
+                        -9.0\t1970-01-01T00:00:02.000000000Z
+                        0.0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3483,9 +3600,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3514,10 +3633,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "f\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0.0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        f\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        0.0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT f, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3571,10 +3692,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "l\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "2147483647\t1970-01-01T00:00:02.000000000Z\n" +
-                        "-1\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        l\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        2147483647\t1970-01-01T00:00:02.000000000Z
+                        -1\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3628,10 +3751,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "1000\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-32768\t1970-01-01T00:00:02.000000000Z\n" +
-                        "32767\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        1000\t1970-01-01T00:00:01.000000000Z
+                        -32768\t1970-01-01T00:00:02.000000000Z
+                        32767\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3685,10 +3810,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3717,10 +3844,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -1\t1970-01-01T00:00:02.000000000Z
+                        0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3747,9 +3876,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "t\tts\n" +
-                        "1970-01-01T00:00:01.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        t\tts
+                        1970-01-01T00:00:01.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT t, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3803,10 +3934,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "v\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n" +
-                        "2147483647\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        v\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        2147483647\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -3831,10 +3964,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "l\ttimestamp\n" +
-                        "null\t1970-01-01T00:00:01.000000000Z\n" +
-                        "0\t1970-01-01T00:00:02.000000000Z\n" +
-                        "9223372036854775807\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        l\ttimestamp
+                        null\t1970-01-01T00:00:01.000000000Z
+                        0\t1970-01-01T00:00:02.000000000Z
+                        9223372036854775807\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT l, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -4087,8 +4222,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "s\tts\n" +
-                        "0x04000000000000000300000000000000020000000000000001\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        s\tts
+                        0x04000000000000000300000000000000020000000000000001\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table);
     }
 
@@ -4153,8 +4290,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "v\tts\n" +
-                        "0x04000000000000000300000000000000020000000000000001\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        v\tts
+                        0x04000000000000000300000000000000020000000000000001\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table);
     }
 
@@ -4208,10 +4347,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-128\t1970-01-01T00:00:02.000000000Z\n" +
-                        "127\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        b\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -128\t1970-01-01T00:00:02.000000000Z
+                        127\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT b, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4287,9 +4428,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1970-01-02T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1970-01-02T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4315,9 +4458,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4343,9 +4488,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1000000000.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1000000000.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1000000000.00\t1970-01-01T00:00:01.000000000Z
+                        -1000000000.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4371,9 +4518,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4399,9 +4548,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "9223372036854775807.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1000000000000.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        9223372036854775807.00\t1970-01-01T00:00:01.000000000Z
+                        -1000000000000.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4427,9 +4578,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4455,9 +4608,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "5.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-9.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        5.0\t1970-01-01T00:00:01.000000000Z
+                        -9.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4483,9 +4638,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4511,9 +4668,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "f\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        f\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT f, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4565,9 +4724,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "i\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        i\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -1\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT i, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4692,9 +4853,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "9223372036854775807\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        9223372036854775807\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4720,9 +4883,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -1\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4748,9 +4913,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "t\tts\n" +
-                        "1970-01-01T00:00:01.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        t\tts
+                        1970-01-01T00:00:01.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT t, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4801,9 +4968,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "9223372036854775807\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        9223372036854775807\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4844,9 +5013,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "b\tts\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        b\tts
+                        true\t1970-01-01T00:00:01.000000000Z
+                        false\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT b, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4867,9 +5038,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        b\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT b, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4890,9 +5063,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "c\tts\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        c\tts
+                        A\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT c, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4913,9 +5088,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4936,9 +5113,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4959,9 +5138,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "f\tts\n" +
-                        "3.14\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        f\tts
+                        3.14\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT f, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -4982,9 +5163,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "g\tts\n" +
-                        "s09wh\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        g\tts
+                        s09wh\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT g, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5005,9 +5188,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "l\tts\n" +
-                        "0x01\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        l\tts
+                        0x01\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5037,9 +5222,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "i\tl\td\tts\n" +
-                        "42\t100\t3.14\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\tnull\tnull\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        i\tl\td\tts
+                        42\t100\t3.14\t1970-01-01T00:00:01.000000000Z
+                        null\tnull\tnull\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT i, l, d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5060,9 +5247,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5083,9 +5272,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        alpha\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5106,9 +5297,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "t\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        t\tts
+                        2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT t, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5129,9 +5322,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "t\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        t\tts
+                        2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT t, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5152,9 +5347,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "u\tts\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        u\tts
+                        a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT u, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5175,9 +5372,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        hello\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5198,9 +5397,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        hello\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5221,9 +5422,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        alpha\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5244,10 +5447,47 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "null\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        hello\t1970-01-01T00:00:01.000000000Z
+                        null\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
+    }
+
+    @Test
+    public void testSenderBuilderWebSocket() throws Exception {
+        String table = "test_qwp_sender_builder_ws";
+        useTable(table);
+
+        try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(getQuestDbHost() + ":" + getHttpPort())
+                .build()) {
+            sender.table(table)
+                    .symbol("city", "London")
+                    .doubleColumn("temp", 22.5)
+                    .longColumn("humidity", 48)
+                    .boolColumn("sunny", true)
+                    .stringColumn("note", "clear sky")
+                    .at(1_000_000, ChronoUnit.MICROS);
+            sender.table(table)
+                    .symbol("city", "Berlin")
+                    .doubleColumn("temp", 18.3)
+                    .longColumn("humidity", 65)
+                    .boolColumn("sunny", false)
+                    .stringColumn("note", "overcast")
+                    .at(2_000_000, ChronoUnit.MICROS);
+            sender.flush();
+        }
+
+        assertTableSizeEventually(table, 2);
+        assertSqlEventually(
+                """
+                        city\ttemp\thumidity\tsunny\tnote\ttimestamp
+                        London\t22.5\t48\ttrue\tclear sky\t1970-01-01T00:00:01.000000000Z
+                        Berlin\t18.3\t65\tfalse\tovercast\t1970-01-01T00:00:02.000000000Z
+                        """,
+                "SELECT city, temp, humidity, sunny, note, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
     @Test
@@ -5322,10 +5562,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-128\t1970-01-01T00:00:02.000000000Z\n" +
-                        "127\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        b\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -128\t1970-01-01T00:00:02.000000000Z
+                        127\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT b, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5402,9 +5644,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1970-01-01T00:00:01.000000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1970-01-01T00:00:01.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5430,9 +5674,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "32767.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-32768.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        32767.00\t1970-01-01T00:00:01.000000000Z
+                        -32768.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5458,9 +5704,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5486,9 +5734,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5514,9 +5764,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5542,9 +5794,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.00\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.00\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.00\t1970-01-01T00:00:01.000000000Z
+                        -100.00\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5570,9 +5824,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "5.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-9.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        5.0\t1970-01-01T00:00:01.000000000Z
+                        -9.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5598,9 +5854,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5626,9 +5884,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "f\tts\n" +
-                        "42.0\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100.0\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        f\tts
+                        42.0\t1970-01-01T00:00:01.000000000Z
+                        -100.0\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT f, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5679,9 +5939,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "i\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "32767\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        i\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        32767\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT i, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5707,9 +5969,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "l\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "32767\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        l\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        32767\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5763,10 +6027,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5795,10 +6061,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -1\t1970-01-01T00:00:02.000000000Z
+                        0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5824,9 +6092,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "t\tts\n" +
-                        "1970-01-01T00:00:00.001000000Z\t1970-01-01T00:00:01.000000000Z\n" +
-                        "1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        t\tts
+                        1970-01-01T00:00:00.001000000Z\t1970-01-01T00:00:01.000000000Z
+                        1970-01-01T00:00:00.000000000Z\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT t, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5880,10 +6150,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "v\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n" +
-                        "32767\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        v\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        32767\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -5910,11 +6182,13 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 4);
         assertSqlEventually(
-                "s\ttimestamp\n" +
-                        "hello world\t1970-01-01T00:00:01.000000000Z\n" +
-                        "non-ascii äöü\t1970-01-01T00:00:02.000000000Z\n" +
-                        "\t1970-01-01T00:00:03.000000000Z\n" +
-                        "null\t1970-01-01T00:00:04.000000000Z\n",
+                """
+                        s\ttimestamp
+                        hello world\t1970-01-01T00:00:01.000000000Z
+                        non-ascii äöü\t1970-01-01T00:00:02.000000000Z
+                        \t1970-01-01T00:00:03.000000000Z
+                        null\t1970-01-01T00:00:04.000000000Z
+                        """,
                 "SELECT s, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -5949,12 +6223,14 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 5);
         assertSqlEventually(
-                "b\tts\n" +
-                        "true\t1970-01-01T00:00:01.000000000Z\n" +
-                        "false\t1970-01-01T00:00:02.000000000Z\n" +
-                        "true\t1970-01-01T00:00:03.000000000Z\n" +
-                        "false\t1970-01-01T00:00:04.000000000Z\n" +
-                        "true\t1970-01-01T00:00:05.000000000Z\n",
+                """
+                        b\tts
+                        true\t1970-01-01T00:00:01.000000000Z
+                        false\t1970-01-01T00:00:02.000000000Z
+                        true\t1970-01-01T00:00:03.000000000Z
+                        false\t1970-01-01T00:00:04.000000000Z
+                        true\t1970-01-01T00:00:05.000000000Z
+                        """,
                 "SELECT b, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6008,10 +6284,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "b\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-128\t1970-01-01T00:00:02.000000000Z\n" +
-                        "127\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        b\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -128\t1970-01-01T00:00:02.000000000Z
+                        127\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT b, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6062,9 +6340,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "c\tts\n" +
-                        "A\t1970-01-01T00:00:01.000000000Z\n" +
-                        "H\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        c\tts
+                        A\t1970-01-01T00:00:01.000000000Z
+                        H\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT c, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6087,8 +6367,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "d\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        d\tts
+                        2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6135,9 +6417,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6163,9 +6447,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "12.5\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.9\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        12.5\t1970-01-01T00:00:01.000000000Z
+                        -99.9\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6191,9 +6477,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6219,9 +6507,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1234.56\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-999.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1234.56\t1970-01-01T00:00:01.000000000Z
+                        -999.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6247,9 +6537,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "123.45\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-99.99\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        123.45\t1970-01-01T00:00:01.000000000Z
+                        -99.99\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6275,9 +6567,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "1.5\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-9.9\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        1.5\t1970-01-01T00:00:01.000000000Z
+                        -9.9\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6303,9 +6597,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "d\tts\n" +
-                        "3.14\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-2.718\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        d\tts
+                        3.14\t1970-01-01T00:00:01.000000000Z
+                        -2.718\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT d, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6352,9 +6648,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "f\tts\n" +
-                        "3.14\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-2.5\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        f\tts
+                        3.14\t1970-01-01T00:00:01.000000000Z
+                        -2.5\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT f, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6401,9 +6699,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "g\tts\n" +
-                        "s24se\t1970-01-01T00:00:01.000000000Z\n" +
-                        "u33dc\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        g\tts
+                        s24se\t1970-01-01T00:00:01.000000000Z
+                        u33dc\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT g, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6453,10 +6753,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "i\tts\n" +
-                        "42\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-100\t1970-01-01T00:00:02.000000000Z\n" +
-                        "0\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        i\tts
+                        42\t1970-01-01T00:00:01.000000000Z
+                        -100\t1970-01-01T00:00:02.000000000Z
+                        0\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT i, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6503,9 +6805,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "l\tts\n" +
-                        "1000000000000\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-1\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        l\tts
+                        1000000000000\t1970-01-01T00:00:01.000000000Z
+                        -1\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6528,8 +6832,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "l\tts\n" +
-                        "0x01\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        l\tts
+                        0x01\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT l, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6600,10 +6906,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\tts\n" +
-                        "1000\t1970-01-01T00:00:01.000000000Z\n" +
-                        "-32768\t1970-01-01T00:00:02.000000000Z\n" +
-                        "32767\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\tts
+                        1000\t1970-01-01T00:00:01.000000000Z
+                        -32768\t1970-01-01T00:00:02.000000000Z
+                        32767\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6650,9 +6958,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "world\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        hello\t1970-01-01T00:00:01.000000000Z
+                        world\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6675,8 +6985,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "t\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        t\tts
+                        2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT t, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6699,8 +7011,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "ts_col\tts\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        ts_col\tts
+                        2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT ts_col, ts FROM " + table);
     }
 
@@ -6744,8 +7058,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "u\tts\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        u\tts
+                        a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT u, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6787,9 +7103,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         }
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "world\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        hello\t1970-01-01T00:00:01.000000000Z
+                        world\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -6814,10 +7132,12 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 3);
         assertSqlEventually(
-                "s\ttimestamp\n" +
-                        "alpha\t1970-01-01T00:00:01.000000000Z\n" +
-                        "beta\t1970-01-01T00:00:02.000000000Z\n" +
-                        "alpha\t1970-01-01T00:00:03.000000000Z\n",
+                """
+                        s\ttimestamp
+                        alpha\t1970-01-01T00:00:01.000000000Z
+                        beta\t1970-01-01T00:00:02.000000000Z
+                        alpha\t1970-01-01T00:00:03.000000000Z
+                        """,
                 "SELECT s, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -7095,9 +7415,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "s\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "world\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        s\tts
+                        hello\t1970-01-01T00:00:01.000000000Z
+                        world\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -7186,9 +7508,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "v\tts\n" +
-                        "hello\t1970-01-01T00:00:01.000000000Z\n" +
-                        "world\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        v\tts
+                        hello\t1970-01-01T00:00:01.000000000Z
+                        world\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -7207,8 +7531,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "ts_col\ttimestamp\n" +
-                        "2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        ts_col\ttimestamp
+                        2022-02-25T00:00:00.000000000Z\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT ts_col, timestamp FROM " + table);
     }
 
@@ -7233,8 +7559,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         assertTableSizeEventually(table, 1);
         // Microseconds scaled to nanoseconds
         assertSqlEventually(
-                "ts_col\tts\n" +
-                        "2022-02-25T00:00:00.111111000Z\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        ts_col\tts
+                        2022-02-25T00:00:00.111111000Z\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT ts_col, ts FROM " + table);
     }
 
@@ -7275,8 +7603,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
         assertTableSizeEventually(table, 1);
         // Nanoseconds truncated to microseconds
         assertSqlEventually(
-                "ts_col\tts\n" +
-                        "2022-02-25T00:00:00.123456000Z\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        ts_col\tts
+                        2022-02-25T00:00:00.123456000Z\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT ts_col, ts FROM " + table);
     }
 
@@ -7552,8 +7882,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "s\tts\n" +
-                        "2022-02-25T00:00:00.000Z\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        s\tts
+                        2022-02-25T00:00:00.000Z\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -7619,8 +7951,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "v\tts\n" +
-                        "2022-02-25T00:00:00.000Z\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        v\tts
+                        2022-02-25T00:00:00.000Z\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table + " ORDER BY ts");
     }
 
@@ -7644,9 +7978,11 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 2);
         assertSqlEventually(
-                "u\ttimestamp\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n" +
-                        "11111111-2222-3333-4444-555555555555\t1970-01-01T00:00:02.000000000Z\n",
+                """
+                        u\ttimestamp
+                        a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z
+                        11111111-2222-3333-4444-555555555555\t1970-01-01T00:00:02.000000000Z
+                        """,
                 "SELECT u, timestamp FROM " + table + " ORDER BY timestamp");
     }
 
@@ -7916,8 +8252,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "s\tts\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        s\tts
+                        a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT s, ts FROM " + table);
     }
 
@@ -7963,8 +8301,10 @@ public class QwpSenderTest extends AbstractLineSenderTest {
 
         assertTableSizeEventually(table, 1);
         assertSqlEventually(
-                "v\tts\n" +
-                        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z\n",
+                """
+                        v\tts
+                        a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1970-01-01T00:00:01.000000000Z
+                        """,
                 "SELECT v, ts FROM " + table);
     }
 
