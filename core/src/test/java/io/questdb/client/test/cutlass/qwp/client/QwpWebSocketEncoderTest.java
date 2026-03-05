@@ -29,11 +29,11 @@ import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * Unit tests for QwpWebSocketEncoder.
@@ -446,10 +446,10 @@ public class QwpWebSocketEncoderTest {
                 // Verify header
                 QwpBufferWriter buf = encoder.getBuffer();
                 long ptr = buf.getBufferPtr();
-                Assert.assertEquals((byte) 'I', Unsafe.getUnsafe().getByte(ptr));
-                Assert.assertEquals((byte) 'L', Unsafe.getUnsafe().getByte(ptr + 1));
+                Assert.assertEquals((byte) 'Q', Unsafe.getUnsafe().getByte(ptr));
+                Assert.assertEquals((byte) 'W', Unsafe.getUnsafe().getByte(ptr + 1));
                 Assert.assertEquals((byte) 'P', Unsafe.getUnsafe().getByte(ptr + 2));
-                Assert.assertEquals((byte) '4', Unsafe.getUnsafe().getByte(ptr + 3));
+                Assert.assertEquals((byte) '1', Unsafe.getUnsafe().getByte(ptr + 3));
             }
         });
     }
@@ -692,10 +692,10 @@ public class QwpWebSocketEncoderTest {
                 long ptr = buf.getBufferPtr();
 
                 // Verify header magic
-                Assert.assertEquals((byte) 'I', Unsafe.getUnsafe().getByte(ptr));
-                Assert.assertEquals((byte) 'L', Unsafe.getUnsafe().getByte(ptr + 1));
+                Assert.assertEquals((byte) 'Q', Unsafe.getUnsafe().getByte(ptr));
+                Assert.assertEquals((byte) 'W', Unsafe.getUnsafe().getByte(ptr + 1));
                 Assert.assertEquals((byte) 'P', Unsafe.getUnsafe().getByte(ptr + 2));
-                Assert.assertEquals((byte) '4', Unsafe.getUnsafe().getByte(ptr + 3));
+                Assert.assertEquals((byte) '1', Unsafe.getUnsafe().getByte(ptr + 3));
 
                 // Version
                 Assert.assertEquals(VERSION_1, Unsafe.getUnsafe().getByte(ptr + 4));

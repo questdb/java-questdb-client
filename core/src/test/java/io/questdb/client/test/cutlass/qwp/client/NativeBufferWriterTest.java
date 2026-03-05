@@ -26,10 +26,10 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.*;
 
 public class NativeBufferWriterTest {
@@ -66,10 +66,10 @@ public class NativeBufferWriterTest {
     public void testMultipleWrites() throws Exception {
         assertMemoryLeak(() -> {
             try (NativeBufferWriter writer = new NativeBufferWriter()) {
-                writer.putByte((byte) 'I');
-                writer.putByte((byte) 'L');
+                writer.putByte((byte) 'Q');
+                writer.putByte((byte) 'W');
                 writer.putByte((byte) 'P');
-                writer.putByte((byte) '4');
+                writer.putByte((byte) '1');
                 writer.putByte((byte) 1);  // Version
                 writer.putByte((byte) 0);  // Flags
                 writer.putShort((short) 1);  // Table count
