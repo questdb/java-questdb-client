@@ -34,6 +34,7 @@ import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Decimals;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
@@ -471,7 +472,12 @@ public class QwpTableBuffer implements QuietCloseable {
             } else if (decimalScale != value.getScale()) {
                 rescaleTemp.ofRaw(value.getHigh(), value.getLow());
                 rescaleTemp.setScale(value.getScale());
-                rescaleTemp.rescale(decimalScale);
+                try {
+                    rescaleTemp.rescale(decimalScale);
+                } catch (NumericException e) {
+                    throw new LineSenderException("column '" + name + "' cannot rescale decimal from scale "
+                            + value.getScale() + " to " + decimalScale + " without precision loss", e);
+                }
                 if (!rescaleTemp.fitsInStorageSizePow2(4)) {
                     throw new LineSenderException("Decimal128 overflow: rescaling from scale "
                             + value.getScale() + " to " + decimalScale + " exceeds 128-bit capacity");
@@ -499,7 +505,12 @@ public class QwpTableBuffer implements QuietCloseable {
                 decimalScale = (byte) value.getScale();
             } else if (decimalScale != value.getScale()) {
                 rescaleTemp.copyFrom(value);
-                rescaleTemp.rescale(decimalScale);
+                try {
+                    rescaleTemp.rescale(decimalScale);
+                } catch (NumericException e) {
+                    throw new LineSenderException("column '" + name + "' cannot rescale decimal from scale "
+                            + value.getScale() + " to " + decimalScale + " without precision loss", e);
+                }
                 src = rescaleTemp;
             }
             dataBuffer.putLong(src.getHh());
@@ -522,7 +533,12 @@ public class QwpTableBuffer implements QuietCloseable {
             } else if (decimalScale != value.getScale()) {
                 rescaleTemp.ofRaw(value.getValue());
                 rescaleTemp.setScale(value.getScale());
-                rescaleTemp.rescale(decimalScale);
+                try {
+                    rescaleTemp.rescale(decimalScale);
+                } catch (NumericException e) {
+                    throw new LineSenderException("column '" + name + "' cannot rescale decimal from scale "
+                            + value.getScale() + " to " + decimalScale + " without precision loss", e);
+                }
                 if (!rescaleTemp.fitsInStorageSizePow2(3)) {
                     throw new LineSenderException("Decimal64 overflow: rescaling from scale "
                             + value.getScale() + " to " + decimalScale + " exceeds 64-bit capacity");
