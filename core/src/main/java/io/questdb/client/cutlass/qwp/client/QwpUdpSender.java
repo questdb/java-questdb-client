@@ -134,13 +134,12 @@ public class QwpUdpSender implements Sender {
     public Sender boolColumn(CharSequence columnName, boolean value) {
         checkNotClosed();
         checkTableSelected();
-        String name = columnName.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_BOOLEAN, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_BOOLEAN, false);
         col.addBoolean(value);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_BOOL;
-            e.name = name;
+            e.name = col.getName();
             e.boolValue = value;
         }
         return this;
@@ -190,13 +189,12 @@ public class QwpUdpSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_DECIMAL64, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DECIMAL64, true);
         col.addDecimal64(value);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL64;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = value;
         }
         return this;
@@ -207,13 +205,12 @@ public class QwpUdpSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_DECIMAL128, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DECIMAL128, true);
         col.addDecimal128(value);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL128;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = value;
         }
         return this;
@@ -224,13 +221,12 @@ public class QwpUdpSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_DECIMAL256, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DECIMAL256, true);
         col.addDecimal256(value);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL256;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = value;
         }
         return this;
@@ -241,13 +237,12 @@ public class QwpUdpSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE_ARRAY, true);
         col.addDoubleArray(values);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE_ARRAY;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = values;
         }
         return this;
@@ -258,13 +253,12 @@ public class QwpUdpSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE_ARRAY, true);
         col.addDoubleArray(values);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE_ARRAY;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = values;
         }
         return this;
@@ -275,13 +269,12 @@ public class QwpUdpSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE_ARRAY, true);
         col.addDoubleArray(values);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE_ARRAY;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = values;
         }
         return this;
@@ -292,13 +285,12 @@ public class QwpUdpSender implements Sender {
         if (array == null) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE_ARRAY, true);
         col.addDoubleArray(array);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE_ARRAY;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = array;
         }
         return this;
@@ -308,13 +300,12 @@ public class QwpUdpSender implements Sender {
     public Sender doubleColumn(CharSequence columnName, double value) {
         checkNotClosed();
         checkTableSelected();
-        String name = columnName.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_DOUBLE, false);
         col.addDouble(value);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE;
-            e.name = name;
+            e.name = col.getName();
             e.doubleValue = value;
         }
         return this;
@@ -331,13 +322,12 @@ public class QwpUdpSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG_ARRAY, true);
         col.addLongArray(values);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG_ARRAY;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = values;
         }
         return this;
@@ -348,13 +338,12 @@ public class QwpUdpSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG_ARRAY, true);
         col.addLongArray(values);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG_ARRAY;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = values;
         }
         return this;
@@ -365,13 +354,12 @@ public class QwpUdpSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG_ARRAY, true);
         col.addLongArray(values);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG_ARRAY;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = values;
         }
         return this;
@@ -382,13 +370,12 @@ public class QwpUdpSender implements Sender {
         if (array == null) return this;
         checkNotClosed();
         checkTableSelected();
-        String colName = name.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(colName, TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG_ARRAY, true);
         col.addLongArray(array);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG_ARRAY;
-            e.name = colName;
+            e.name = col.getName();
             e.objectValue = array;
         }
         return this;
@@ -398,13 +385,12 @@ public class QwpUdpSender implements Sender {
     public Sender longColumn(CharSequence columnName, long value) {
         checkNotClosed();
         checkTableSelected();
-        String name = columnName.toString();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_LONG, false);
         col.addLong(value);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG;
-            e.name = name;
+            e.name = col.getName();
             e.longValue = value;
         }
         return this;
@@ -431,15 +417,13 @@ public class QwpUdpSender implements Sender {
     public Sender stringColumn(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        String name = columnName.toString();
-        String strValue = value != null ? value.toString() : null;
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_STRING, true);
-        col.addString(strValue);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_STRING, true);
+        col.addString(value);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_STRING;
-            e.name = name;
-            e.stringValue = strValue;
+            e.name = col.getName();
+            e.stringValue = Chars.toString(value); // todo: allocation!
         }
         return this;
     }
@@ -448,15 +432,13 @@ public class QwpUdpSender implements Sender {
     public Sender symbol(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        String name = columnName.toString();
-        String strValue = value != null ? value.toString() : null;
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_SYMBOL, true);
-        col.addSymbol(strValue);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_SYMBOL, true);
+        col.addSymbol(value);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_SYMBOL;
-            e.name = name;
-            e.stringValue = strValue;
+            e.name = col.getName();
+            e.stringValue = Chars.toString(value); // todo: allocation!
         }
         return this;
     }
@@ -474,7 +456,7 @@ public class QwpUdpSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
         rowJournalSize = 0;
-        currentTableName = tableName.toString();
+        currentTableName = tableName.toString(); // todo: allocation!
         currentTableBuffer = tableBuffers.get(currentTableName);
         if (currentTableBuffer == null) {
             currentTableBuffer = new QwpTableBuffer(currentTableName);
@@ -487,24 +469,23 @@ public class QwpUdpSender implements Sender {
     public Sender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
         checkNotClosed();
         checkTableSelected();
-        String name = columnName.toString();
         if (unit == ChronoUnit.NANOS) {
-            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_TIMESTAMP_NANOS, true);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_TIMESTAMP_NANOS, true);
             col.addLong(value);
             if (maxDatagramSize > 0) {
                 ColumnEntry e = nextJournalEntry();
                 e.kind = ENTRY_TIMESTAMP_COL_NANOS;
-                e.name = name;
+                e.name = col.getName();
                 e.longValue = value;
             }
         } else {
             long micros = toMicros(value, unit);
-            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_TIMESTAMP, true);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_TIMESTAMP, true);
             col.addLong(micros);
             if (maxDatagramSize > 0) {
                 ColumnEntry e = nextJournalEntry();
                 e.kind = ENTRY_TIMESTAMP_COL_MICROS;
-                e.name = name;
+                e.name = col.getName();
                 e.longValue = micros;
             }
         }
@@ -515,14 +496,13 @@ public class QwpUdpSender implements Sender {
     public Sender timestampColumn(CharSequence columnName, Instant value) {
         checkNotClosed();
         checkTableSelected();
-        String name = columnName.toString();
         long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_TIMESTAMP, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_TIMESTAMP, true);
         col.addLong(micros);
         if (maxDatagramSize > 0) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_TIMESTAMP_COL_MICROS;
-            e.name = name;
+            e.name = col.getName();
             e.longValue = micros;
         }
         return this;

@@ -138,7 +138,7 @@ public class OffHeapAppendMemory implements QuietCloseable {
      * Encodes a Java String to UTF-8 directly into the off-heap buffer.
      * Pre-ensures worst-case capacity to avoid per-byte checks.
      */
-    public void putUtf8(String value) {
+    public void putUtf8(CharSequence value) {
         if (value == null || value.isEmpty()) {
             return;
         }

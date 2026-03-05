@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.std.CharSequenceIntHashMap;
+import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
@@ -169,12 +170,12 @@ public class QwpTableBuffer implements QuietCloseable {
      * Optimized for the common case where columns are accessed in the same
      * order every row: a sequential cursor avoids hash map lookups entirely.
      */
-    public ColumnBuffer getOrCreateColumn(String name, byte type, boolean nullable) {
+    public ColumnBuffer getOrCreateColumn(CharSequence name, byte type, boolean nullable) {
         // Fast path: predict next column in sequence
         int n = columns.size();
         if (columnAccessCursor < n) {
             ColumnBuffer candidate = fastColumns[columnAccessCursor];
-            if (candidate.name.equals(name)) {
+            if (Chars.equals(candidate.name, name)) {
                 columnAccessCursor++;
                 if (candidate.type != type) {
                     throw new LineSenderException(
@@ -200,7 +201,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         // Create new column
-        ColumnBuffer col = new ColumnBuffer(name, type, nullable);
+        ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
         int index = columns.size();
         columns.add(col);
         columnNameToIndex.put(name, index);
@@ -870,7 +871,7 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
-        public void addString(String value) {
+        public void addString(CharSequence value) {
             if (value == null && nullable) {
                 ensureNullCapacity(size + 1);
                 markNull(size);
@@ -885,7 +886,7 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
-        public void addSymbol(String value) {
+        public void addSymbol(CharSequence value) {
             if (value == null) {
                 addNull();
                 return;
@@ -895,7 +896,7 @@ public class QwpTableBuffer implements QuietCloseable {
             if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
                 idx = symbolList.size();
                 symbolDict.put(value, idx);
-                symbolList.add(value);
+                symbolList.add(Chars.toString(value));
             }
             dataBuffer.putInt(idx);
             valueCount++;
