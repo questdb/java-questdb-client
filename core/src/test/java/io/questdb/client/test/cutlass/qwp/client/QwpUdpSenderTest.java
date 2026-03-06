@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpColumnDef;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.network.NetworkFacadeImpl;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
@@ -800,6 +801,127 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testSchemaChangeMidRowPreservesExistingStringAndSymbolValues() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .stringColumn("s", "alpha")
+                        .symbol("sym", "one")
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.stringColumn("s", "beta");
+                sender.symbol("sym", "two");
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L, "s", "alpha", "sym", "one"),
+                    decodedRow("t", "a", 2L, "s", "beta", "sym", "two", "b", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeMidRowPreservesExistingArrayValues() throws Exception {
+        assertMemoryLeak(() -> {
+            double[] first = {1.0, 2.0};
+            double[] second = {3.5, 4.5, 5.5};
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .doubleArray("da", first)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.doubleArray("da", second);
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L, "da", doubleArrayValue(shape(2), first)),
+                    decodedRow("t", "a", 2L, "da", doubleArrayValue(shape(3), second), "b", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testNullableArrayReplayKeepsNullArrayStateWithoutReflection() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longArray("la", new long[]{1, 2})
+                        .doubleArray("da", new double[]{1.0, 2.0})
+                        .atNow();
+
+                sender.stageNullLongArrayForTest("la");
+                sender.stageNullDoubleArrayForTest("da");
+                sender.longColumn("b", 3);
+
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+
+                QwpTableBuffer tableBuffer = sender.currentTableBufferForTest();
+                Assert.assertNotNull(tableBuffer);
+                Assert.assertEquals(1, tableBuffer.getRowCount());
+
+                assertNullableArrayNullState(tableBuffer.getExistingColumn("la", TYPE_LONG_ARRAY));
+                assertNullableArrayNullState(tableBuffer.getExistingColumn("da", TYPE_DOUBLE_ARRAY));
+
+                QwpTableBuffer.ColumnBuffer longColumn = tableBuffer.getExistingColumn("b", TYPE_LONG);
+                Assert.assertNotNull(longColumn);
+                Assert.assertEquals(1, longColumn.getSize());
+                Assert.assertEquals(1, longColumn.getValueCount());
+                Assert.assertEquals(3L, Unsafe.getUnsafe().getLong(longColumn.getDataAddress()));
+            }
+        });
+    }
+
+    @Test
+    public void testDuplicateColumnAfterSchemaFlushReplayIsRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                assertThrowsContains("column 'a' already set for current row", () -> sender.longColumn("a", 4));
+
+                sender.cancelRow();
+                sender.longColumn("a", 5).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 5L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
     public void testCancelRowAfterMidRowSchemaChangeDoesNotLeakSchema() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -873,6 +995,36 @@ public class QwpUdpSenderTest {
             Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
             assertPacketsWithinLimit(result, maxDatagramSize);
             assertRowsEqual(expectedRows(rows), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testRepeatedUtf8SymbolsAcrossRowsPreserveRows() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("sym", sender -> sender.table("sym")
+                                    .longColumn("x", 1)
+                                    .symbol("sym", "東京")
+                                    .atNow(),
+                            "x", 1L,
+                            "sym", "東京"),
+                    row("sym", sender -> sender.table("sym")
+                                    .longColumn("x", 2)
+                                    .symbol("sym", "東京")
+                                    .atNow(),
+                            "x", 2L,
+                            "sym", "東京"),
+                    row("sym", sender -> sender.table("sym")
+                                    .longColumn("x", 3)
+                                    .symbol("sym", "Αθηνα")
+                                    .atNow(),
+                            "x", 3L,
+                            "sym", "Αθηνα")
+            );
+
+            RunResult result = runScenario(rows, 1024 * 1024);
+            Assert.assertEquals(1, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }
 
@@ -1234,6 +1386,16 @@ public class QwpUdpSenderTest {
         } catch (Exception e) {
             throw new AssertionError("Unexpected exception type", e);
         }
+    }
+
+    private static void assertNullableArrayNullState(QwpTableBuffer.ColumnBuffer column) {
+        Assert.assertNotNull(column);
+        Assert.assertEquals(1, column.getSize());
+        Assert.assertEquals(0, column.getValueCount());
+        Assert.assertTrue(column.isNullable());
+        Assert.assertTrue(column.isNull(0));
+        Assert.assertEquals(0, column.getArrayShapeOffset());
+        Assert.assertEquals(0, column.getArrayDataOffset());
     }
 
     private static BigDecimal decimal(long unscaled, int scale) {

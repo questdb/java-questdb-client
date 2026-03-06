@@ -24,16 +24,20 @@
 
 package io.questdb.client.test.cutlass.qwp.protocol;
 
+import io.questdb.client.cairo.CairoException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.protocol.OffHeapAppendMemory;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
-import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import org.junit.Test;
+
+import java.nio.charset.StandardCharsets;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.*;
@@ -399,6 +403,81 @@ public class QwpTableBufferTest {
                 String[] dict = colS.getSymbolDictionary();
                 assertEquals(1, dict.length);
                 assertEquals("fresh", dict[0]);
+            }
+        });
+    }
+
+    @Test
+    public void testAddSymbolUtf8ReusesExistingDictionaryEntry() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, true);
+                addSymbolUtf8(col, "東京");
+                table.nextRow();
+
+                addSymbolUtf8(col, "東京");
+                table.nextRow();
+
+                addSymbolUtf8(col, "Αθηνα");
+                table.nextRow();
+
+                assertEquals(3, col.getSize());
+                assertEquals(3, col.getValueCount());
+                assertEquals(2, col.getSymbolDictionarySize());
+                assertArrayEquals(new String[]{"東京", "Αθηνα"}, col.getSymbolDictionary());
+
+                long dataAddress = col.getDataAddress();
+                assertEquals(0, Unsafe.getUnsafe().getInt(dataAddress));
+                assertEquals(0, Unsafe.getUnsafe().getInt(dataAddress + 4));
+                assertEquals(1, Unsafe.getUnsafe().getInt(dataAddress + 8));
+            }
+        });
+    }
+
+    @Test
+    public void testAddSymbolUtf8CancelRowRewindsDictionary() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(0);
+                table.nextRow();
+
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("s", QwpConstants.TYPE_SYMBOL, true);
+                addSymbolUtf8(col, "stale");
+                table.cancelCurrentRow();
+
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                addSymbolUtf8(col, "fresh");
+                table.nextRow();
+
+                assertEquals(2, col.getSize());
+                assertEquals(1, col.getValueCount());
+                assertArrayEquals(new String[]{"fresh"}, col.getSymbolDictionary());
+                assertEquals(0, Unsafe.getUnsafe().getInt(col.getDataAddress()));
+            }
+        });
+    }
+
+    @Test
+    public void testAddSymbolUtf8RejectsInvalidUtf8() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, true);
+                byte[] invalid = {(byte) 0xC3, 0x28};
+                long ptr = copyToNative(invalid);
+                try {
+                    try {
+                        col.addSymbolUtf8(ptr, invalid.length);
+                        fail("Expected CairoException");
+                    } catch (CairoException ex) {
+                        assertTrue(ex.getFlyweightMessage().toString().contains("cannot convert invalid UTF-8 sequence"));
+                    }
+                    assertEquals(0, col.getSize());
+                    assertEquals(0, col.getValueCount());
+                    assertEquals(0, col.getSymbolDictionarySize());
+                } finally {
+                    Unsafe.free(ptr, invalid.length, MemoryTag.NATIVE_DEFAULT);
+                }
             }
         });
     }
@@ -1049,5 +1128,23 @@ public class QwpTableBufferTest {
             }
         }
         return result;
+    }
+
+    private static void addSymbolUtf8(QwpTableBuffer.ColumnBuffer col, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        long ptr = copyToNative(bytes);
+        try {
+            col.addSymbolUtf8(ptr, bytes.length);
+        } finally {
+            Unsafe.free(ptr, bytes.length, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static long copyToNative(byte[] bytes) {
+        long ptr = Unsafe.malloc(bytes.length, MemoryTag.NATIVE_DEFAULT);
+        for (int i = 0; i < bytes.length; i++) {
+            Unsafe.getUnsafe().putByte(ptr + i, bytes[i]);
+        }
+        return ptr;
     }
 }

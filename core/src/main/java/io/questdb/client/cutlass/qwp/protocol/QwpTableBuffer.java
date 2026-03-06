@@ -41,6 +41,7 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
+import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf8s;
 
 import java.util.Arrays;
@@ -522,6 +523,7 @@ public class QwpTableBuffer implements QuietCloseable {
         private OffHeapAppendMemory stringOffsets;
         // Symbol specific (dictionary stays on-heap)
         private CharSequenceIntHashMap symbolDict;
+        private StringSink symbolLookupSink;
         private ObjList<String> symbolList;
         private int valueCount;   // Actual stored values (excludes nulls)
 
@@ -1004,12 +1006,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 return;
             }
             ensureNullBitmapForNonNull();
-            int idx = symbolDict.get(value);
-            if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-                idx = symbolList.size();
-                symbolDict.put(value, idx);
-                symbolList.add(Chars.toString(value));
-            }
+            int idx = getOrAddLocalSymbol(value);
             dataBuffer.putInt(idx);
             valueCount++;
             size++;
@@ -1020,7 +1017,22 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            addSymbol(Utf8s.stringFromUtf8Bytes(ptr, ptr + len));
+            ensureNullBitmapForNonNull();
+            StringSink lookupSink = symbolLookupSink;
+            if (lookupSink == null) {
+                symbolLookupSink = lookupSink = new StringSink(Math.max(16, len));
+            } else {
+                lookupSink.clear();
+            }
+            if (!Utf8s.utf8ToUtf16(ptr, ptr + len, lookupSink)) {
+                // Reuse the existing error path with the same diagnostic payload.
+                Utf8s.stringFromUtf8Bytes(ptr, ptr + len);
+                throw new AssertionError("unreachable");
+            }
+            int idx = getOrAddLocalSymbol(lookupSink);
+            dataBuffer.putInt(idx);
+            valueCount++;
+            size++;
         }
 
         public void addSymbolWithGlobalId(String value, int globalId) {
@@ -1029,12 +1041,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 return;
             }
             ensureNullBitmapForNonNull();
-            int localIdx = symbolDict.get(value);
-            if (localIdx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-                localIdx = symbolList.size();
-                symbolDict.put(value, localIdx);
-                symbolList.add(value);
-            }
+            int localIdx = getOrAddLocalSymbol(value);
             dataBuffer.putInt(localIdx);
 
             if (auxBuffer == null) {
@@ -1048,6 +1055,17 @@ public class QwpTableBuffer implements QuietCloseable {
 
             valueCount++;
             size++;
+        }
+
+        private int getOrAddLocalSymbol(CharSequence value) {
+            int idx = symbolDict.get(value);
+            if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+                String symbol = Chars.toString(value);
+                idx = symbolList.size();
+                symbolDict.put(symbol, idx);
+                symbolList.add(symbol);
+            }
+            return idx;
         }
 
         public void addUuid(long high, long low) {
@@ -1086,6 +1104,14 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public byte[] getArrayDims() {
             return arrayDims;
+        }
+
+        public int getArrayDataOffset() {
+            return arrayDataOffset;
+        }
+
+        public int getArrayShapeOffset() {
+            return arrayShapeOffset;
         }
 
         public int[] getArrayShapes() {
@@ -1194,6 +1220,10 @@ public class QwpTableBuffer implements QuietCloseable {
 
         public int getSymbolDictionarySize() {
             return symbolList != null ? symbolList.size() : 0;
+        }
+
+        public CharSequence getSymbolValue(int index) {
+            return symbolList != null ? symbolList.getQuick(index) : null;
         }
 
         public boolean hasSymbol(CharSequence value) {
