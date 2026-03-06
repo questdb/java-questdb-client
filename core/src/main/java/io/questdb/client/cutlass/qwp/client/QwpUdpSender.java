@@ -26,7 +26,6 @@ package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
-import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.line.udp.UdpLineChannel;
@@ -82,7 +81,6 @@ public class QwpUdpSender implements Sender {
     private static final int SAFETY_MARGIN_BYTES = 8;
     private static final Logger LOG = LoggerFactory.getLogger(QwpUdpSender.class);
 
-    private final ArraySizeCounter arraySizeCounter = new ArraySizeCounter();
     private final UdpLineChannel channel;
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
     private final NativeBufferWriter headerBuffer = new NativeBufferWriter();
@@ -140,14 +138,24 @@ public class QwpUdpSender implements Sender {
     public void atNow() {
         checkNotClosed();
         checkTableSelected();
-        commitCurrentRow();
+        try {
+            commitCurrentRow();
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
     }
 
     @Override
     public Sender boolColumn(CharSequence columnName, boolean value) {
         checkNotClosed();
         checkTableSelected();
-        stageBooleanColumnValue(columnName, value);
+        try {
+            stageBooleanColumnValue(columnName, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -159,13 +167,7 @@ public class QwpUdpSender implements Sender {
     @Override
     public void cancelRow() {
         checkNotClosed();
-        if (currentTableBuffer != null) {
-            currentTableBuffer.cancelCurrentRow();
-            currentTableBuffer.rollbackUncommittedColumns();
-        }
-        cachedTimestampColumn = null;
-        cachedTimestampNanosColumn = null;
-        clearStagedRow();
+        rollbackCurrentRowToCommittedState();
     }
 
     @Override
@@ -173,11 +175,7 @@ public class QwpUdpSender implements Sender {
         if (!closed) {
             try {
                 if (hasInProgressRow()) {
-                    currentTableBuffer.cancelCurrentRow();
-                    currentTableBuffer.rollbackUncommittedColumns();
-                    cachedTimestampColumn = null;
-                    cachedTimestampNanosColumn = null;
-                    clearStagedRow();
+                    rollbackCurrentRowToCommittedState();
                 }
                 flushInternal();
             } catch (Exception e) {
@@ -210,7 +208,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageDecimal64ColumnValue(name, value);
+        try {
+            stageDecimal64ColumnValue(name, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -221,7 +224,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageDecimal128ColumnValue(name, value);
+        try {
+            stageDecimal128ColumnValue(name, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -232,7 +240,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageDecimal256ColumnValue(name, value);
+        try {
+            stageDecimal256ColumnValue(name, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -243,7 +256,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageDoubleArrayColumnValue(name, values);
+        try {
+            stageDoubleArrayColumnValue(name, values);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -254,7 +272,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageDoubleArrayColumnValue(name, values);
+        try {
+            stageDoubleArrayColumnValue(name, values);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -265,7 +288,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageDoubleArrayColumnValue(name, values);
+        try {
+            stageDoubleArrayColumnValue(name, values);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -276,7 +304,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageDoubleArrayColumnValue(name, array);
+        try {
+            stageDoubleArrayColumnValue(name, array);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -284,7 +317,12 @@ public class QwpUdpSender implements Sender {
     public Sender doubleColumn(CharSequence columnName, double value) {
         checkNotClosed();
         checkTableSelected();
-        stageDoubleColumnValue(columnName, value);
+        try {
+            stageDoubleColumnValue(columnName, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -302,7 +340,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageLongArrayColumnValue(name, values);
+        try {
+            stageLongArrayColumnValue(name, values);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -313,7 +356,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageLongArrayColumnValue(name, values);
+        try {
+            stageLongArrayColumnValue(name, values);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -324,7 +372,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageLongArrayColumnValue(name, values);
+        try {
+            stageLongArrayColumnValue(name, values);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -335,7 +388,12 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        stageLongArrayColumnValue(name, array);
+        try {
+            stageLongArrayColumnValue(name, array);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -343,7 +401,12 @@ public class QwpUdpSender implements Sender {
     public Sender longColumn(CharSequence columnName, long value) {
         checkNotClosed();
         checkTableSelected();
-        stageLongColumnValue(columnName, value);
+        try {
+            stageLongColumnValue(columnName, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -370,7 +433,12 @@ public class QwpUdpSender implements Sender {
     public Sender stringColumn(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        stageStringColumnValue(columnName, value);
+        try {
+            stageStringColumnValue(columnName, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -378,7 +446,12 @@ public class QwpUdpSender implements Sender {
     public Sender symbol(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        stageSymbolColumnValue(columnName, value);
+        try {
+            stageSymbolColumnValue(columnName, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -410,11 +483,16 @@ public class QwpUdpSender implements Sender {
     public Sender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
         checkNotClosed();
         checkTableSelected();
-        if (unit == ChronoUnit.NANOS) {
-            stageTimestampColumnValue(columnName, TYPE_TIMESTAMP_NANOS, value, ENTRY_TIMESTAMP_COL_NANOS);
-        } else {
-            long micros = toMicros(value, unit);
-            stageTimestampColumnValue(columnName, TYPE_TIMESTAMP, micros, ENTRY_TIMESTAMP_COL_MICROS);
+        try {
+            if (unit == ChronoUnit.NANOS) {
+                stageTimestampColumnValue(columnName, TYPE_TIMESTAMP_NANOS, value, ENTRY_TIMESTAMP_COL_NANOS);
+            } else {
+                long micros = toMicros(value, unit);
+                stageTimestampColumnValue(columnName, TYPE_TIMESTAMP, micros, ENTRY_TIMESTAMP_COL_MICROS);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
         }
         return this;
     }
@@ -423,8 +501,13 @@ public class QwpUdpSender implements Sender {
     public Sender timestampColumn(CharSequence columnName, Instant value) {
         checkNotClosed();
         checkTableSelected();
-        long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
-        stageTimestampColumnValue(columnName, TYPE_TIMESTAMP, micros, ENTRY_TIMESTAMP_COL_MICROS);
+        try {
+            long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
+            stageTimestampColumnValue(columnName, TYPE_TIMESTAMP, micros, ENTRY_TIMESTAMP_COL_MICROS);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
         return this;
     }
 
@@ -487,9 +570,9 @@ public class QwpUdpSender implements Sender {
 
     private void stageDoubleArrayColumnValue(CharSequence name, Object value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DOUBLE_ARRAY, true);
+        stagedRow.stageDoubleArray(col, value);
         stagedRowValueCount++;
         addStagedColumn(col);
-        stagedRow.stageDoubleArray(col, value, estimateDoubleArrayPayload(value));
     }
 
     private void stageDoubleColumnValue(CharSequence name, double value) {
@@ -501,9 +584,9 @@ public class QwpUdpSender implements Sender {
 
     private void stageLongArrayColumnValue(CharSequence name, Object value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_LONG_ARRAY, true);
+        stagedRow.stageLongArray(col, value);
         stagedRowValueCount++;
         addStagedColumn(col);
-        stagedRow.stageLongArray(col, value, estimateLongArrayPayload(value));
     }
 
     private void stageLongColumnValue(CharSequence name, long value) {
@@ -538,16 +621,26 @@ public class QwpUdpSender implements Sender {
         if (stagedRowValueCount == 0) {
             throw new LineSenderException("no columns were provided");
         }
-        stageDesignatedTimestampValue(timestampMicros, false);
-        commitCurrentRow();
+        try {
+            stageDesignatedTimestampValue(timestampMicros, false);
+            commitCurrentRow();
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
     }
 
     private void atNanos(long timestampNanos) {
         if (stagedRowValueCount == 0) {
             throw new LineSenderException("no columns were provided");
         }
-        stageDesignatedTimestampValue(timestampNanos, true);
-        commitCurrentRow();
+        try {
+            stageDesignatedTimestampValue(timestampNanos, true);
+            commitCurrentRow();
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
     }
 
     private void checkNotClosed() {
@@ -567,6 +660,16 @@ public class QwpUdpSender implements Sender {
         stagedRowValueCount = 0;
         stagedColumnCount = 0;
         rowFillColumnCount = 0;
+    }
+
+    private void rollbackCurrentRowToCommittedState() {
+        if (currentTableBuffer != null) {
+            currentTableBuffer.cancelCurrentRow();
+            currentTableBuffer.rollbackUncommittedColumns();
+        }
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
+        clearStagedRow();
     }
 
     private void collectRowFillColumns(int targetRows) {
@@ -632,22 +735,6 @@ public class QwpUdpSender implements Sender {
         return payloadWriter.getPosition();
     }
 
-    private long estimateArrayValueSize(int nDims, long elementCount) {
-        return 1L + (long) nDims * 4 + elementCount * 8;
-    }
-
-    private long estimateArrayValueSize(DoubleArray array) {
-        arraySizeCounter.reset();
-        array.appendToBufPtr(arraySizeCounter);
-        return arraySizeCounter.size;
-    }
-
-    private long estimateArrayValueSize(LongArray array) {
-        arraySizeCounter.reset();
-        array.appendToBufPtr(arraySizeCounter);
-        return arraySizeCounter.size;
-    }
-
     private long estimateBaseForCurrentSchema() {
         long estimate = HEADER_SIZE;
         int tableNameUtf8 = NativeBufferWriter.utf8Length(currentTableName);
@@ -710,48 +797,6 @@ public class QwpUdpSender implements Sender {
             case ENTRY_SYMBOL -> stagedRow.getLong1(entryIndex);
             default -> throw new LineSenderException("unknown staged row entry type: " + stagedRow.getKind(entryIndex));
         };
-    }
-
-    private long estimateDoubleArrayPayload(Object value) {
-        if (value instanceof double[] values) {
-            return estimateArrayValueSize(1, values.length);
-        }
-        if (value instanceof double[][] values) {
-            int dim0 = values.length;
-            int dim1 = dim0 > 0 ? values[0].length : 0;
-            return estimateArrayValueSize(2, (long) dim0 * dim1);
-        }
-        if (value instanceof double[][][] values) {
-            int dim0 = values.length;
-            int dim1 = dim0 > 0 ? values[0].length : 0;
-            int dim2 = dim0 > 0 && dim1 > 0 ? values[0][0].length : 0;
-            return estimateArrayValueSize(3, (long) dim0 * dim1 * dim2);
-        }
-        if (value instanceof DoubleArray values) {
-            return estimateArrayValueSize(values);
-        }
-        throw new LineSenderException("unsupported double array type");
-    }
-
-    private long estimateLongArrayPayload(Object value) {
-        if (value instanceof long[] values) {
-            return estimateArrayValueSize(1, values.length);
-        }
-        if (value instanceof long[][] values) {
-            int dim0 = values.length;
-            int dim1 = dim0 > 0 ? values[0].length : 0;
-            return estimateArrayValueSize(2, (long) dim0 * dim1);
-        }
-        if (value instanceof long[][][] values) {
-            int dim0 = values.length;
-            int dim1 = dim0 > 0 ? values[0].length : 0;
-            int dim2 = dim0 > 0 && dim1 > 0 ? values[0][0].length : 0;
-            return estimateArrayValueSize(3, (long) dim0 * dim1 * dim2);
-        }
-        if (value instanceof LongArray values) {
-            return estimateArrayValueSize(values);
-        }
-        throw new LineSenderException("unsupported long array type");
     }
 
     private void ensureRowFillColumnCapacity(int required) {
@@ -875,34 +920,6 @@ public class QwpUdpSender implements Sender {
         stagedRow.commitIntoTableBuffer(currentTableBuffer, rowFillColumns, rowFillColumnCount);
     }
 
-    private static void commitDoubleArrayValue(QwpTableBuffer.ColumnBuffer col, Object value) {
-        if (value instanceof double[] values) {
-            col.addDoubleArray(values);
-        } else if (value instanceof double[][] values) {
-            col.addDoubleArray(values);
-        } else if (value instanceof double[][][] values) {
-            col.addDoubleArray(values);
-        } else if (value instanceof DoubleArray values) {
-            col.addDoubleArray(values);
-        } else {
-            throw new LineSenderException("unsupported double array type");
-        }
-    }
-
-    private static void commitLongArrayValue(QwpTableBuffer.ColumnBuffer col, Object value) {
-        if (value instanceof long[] values) {
-            col.addLongArray(values);
-        } else if (value instanceof long[][] values) {
-            col.addLongArray(values);
-        } else if (value instanceof long[][][] values) {
-            col.addLongArray(values);
-        } else if (value instanceof LongArray values) {
-            col.addLongArray(values);
-        } else {
-            throw new LineSenderException("unsupported long array type");
-        }
-    }
-
     private static long nonNullablePaddingCost(byte type, int valuesBefore, int missing) {
         return switch (type) {
             case TYPE_BOOLEAN -> packedBytes(valuesBefore + missing) - packedBytes(valuesBefore);
@@ -1005,39 +1022,6 @@ public class QwpUdpSender implements Sender {
         return len;
     }
 
-    private static final class ArraySizeCounter implements ArrayBufferAppender {
-        private long size;
-
-        @Override
-        public void putBlockOfBytes(long from, long len) {
-            size += len;
-        }
-
-        @Override
-        public void putByte(byte b) {
-            size++;
-        }
-
-        @Override
-        public void putDouble(double value) {
-            size += 8;
-        }
-
-        @Override
-        public void putInt(int value) {
-            size += 4;
-        }
-
-        @Override
-        public void putLong(long value) {
-            size += 8;
-        }
-
-        private void reset() {
-            size = 0;
-        }
-    }
-
     private static final class NativeRowStaging {
         private static final int AUX_INT_OFFSET = 4;
         private static final int ENTRY_SIZE = 40;
@@ -1053,20 +1037,18 @@ public class QwpUdpSender implements Sender {
         private final OffHeapAppendMemory varData = new OffHeapAppendMemory(128);
         private QwpTableBuffer.ColumnBuffer[] columns = new QwpTableBuffer.ColumnBuffer[8];
         private int size;
-        private Object[] sidecarObjects = new Object[8];
 
         void stageBoolean(QwpTableBuffer.ColumnBuffer column, boolean value) {
-            stageEntry(column, null, ENTRY_BOOL, 0, value ? 1 : 0, 0, 0, 0);
+            stageEntry(column, ENTRY_BOOL, 0, value ? 1 : 0, 0, 0, 0);
         }
 
         void stageDecimal128(QwpTableBuffer.ColumnBuffer column, Decimal128 value) {
-            stageEntry(column, null, ENTRY_DECIMAL128, value.getScale(), value.getHigh(), value.getLow(), 0, 0);
+            stageEntry(column, ENTRY_DECIMAL128, value.getScale(), value.getHigh(), value.getLow(), 0, 0);
         }
 
         void stageDecimal256(QwpTableBuffer.ColumnBuffer column, Decimal256 value) {
             stageEntry(
                     column,
-                    null,
                     ENTRY_DECIMAL256,
                     value.getScale(),
                     value.getHh(),
@@ -1077,23 +1059,39 @@ public class QwpUdpSender implements Sender {
         }
 
         void stageDecimal64(QwpTableBuffer.ColumnBuffer column, Decimal64 value) {
-            stageEntry(column, null, ENTRY_DECIMAL64, value.getScale(), value.getValue(), 0, 0, 0);
+            stageEntry(column, ENTRY_DECIMAL64, value.getScale(), value.getValue(), 0, 0, 0);
         }
 
         void stageDouble(QwpTableBuffer.ColumnBuffer column, double value) {
-            stageEntry(column, null, ENTRY_DOUBLE, 0, Double.doubleToRawLongBits(value), 0, 0, 0);
+            stageEntry(column, ENTRY_DOUBLE, 0, Double.doubleToRawLongBits(value), 0, 0, 0);
         }
 
-        void stageDoubleArray(QwpTableBuffer.ColumnBuffer column, Object value, long estimatePayload) {
-            stageEntry(column, value, ENTRY_DOUBLE_ARRAY, 0, estimatePayload, 0, 0, 0);
+        void stageDoubleArray(QwpTableBuffer.ColumnBuffer column, Object value) {
+            long offset = varData.getAppendOffset();
+            try {
+                appendDoubleArrayPayload(value);
+                long payloadLength = varData.getAppendOffset() - offset;
+                stageEntry(column, ENTRY_DOUBLE_ARRAY, 0, payloadLength, offset, 0, 0);
+            } catch (Throwable t) {
+                varData.jumpTo(offset);
+                throw t;
+            }
         }
 
         void stageLong(QwpTableBuffer.ColumnBuffer column, int kind, long value) {
-            stageEntry(column, null, kind, 0, value, 0, 0, 0);
+            stageEntry(column, kind, 0, value, 0, 0, 0);
         }
 
-        void stageLongArray(QwpTableBuffer.ColumnBuffer column, Object value, long estimatePayload) {
-            stageEntry(column, value, ENTRY_LONG_ARRAY, 0, estimatePayload, 0, 0, 0);
+        void stageLongArray(QwpTableBuffer.ColumnBuffer column, Object value) {
+            long offset = varData.getAppendOffset();
+            try {
+                appendLongArrayPayload(value);
+                long payloadLength = varData.getAppendOffset() - offset;
+                stageEntry(column, ENTRY_LONG_ARRAY, 0, payloadLength, offset, 0, 0);
+            } catch (Throwable t) {
+                varData.jumpTo(offset);
+                throw t;
+            }
         }
 
         void stageUtf8(QwpTableBuffer.ColumnBuffer column, int kind, CharSequence value, long long1) {
@@ -1104,13 +1102,12 @@ public class QwpUdpSender implements Sender {
                 varData.putUtf8(value);
                 len = (int) (varData.getAppendOffset() - offset);
             }
-            stageEntry(column, null, kind, len, offset, long1, 0, 0);
+            stageEntry(column, kind, len, offset, long1, 0, 0);
         }
 
         void clear() {
             for (int i = 0; i < size; i++) {
                 columns[i] = null;
-                sidecarObjects[i] = null;
             }
             size = 0;
             entries.truncate();
@@ -1175,8 +1172,8 @@ public class QwpUdpSender implements Sender {
                         column.addDecimal256(decimal256Sink);
                     }
                     case ENTRY_DOUBLE -> column.addDouble(Double.longBitsToDouble(long0));
-                    case ENTRY_DOUBLE_ARRAY -> commitDoubleArrayValue(column, sidecarObjects[i]);
-                    case ENTRY_LONG_ARRAY -> commitLongArrayValue(column, sidecarObjects[i]);
+                    case ENTRY_DOUBLE_ARRAY -> column.addDoubleArrayPayload(varData.addressOf(long1), long0);
+                    case ENTRY_LONG_ARRAY -> column.addLongArrayPayload(varData.addressOf(long1), long0);
                     case ENTRY_STRING -> column.addStringUtf8(varData.addressOf(long0), auxInt);
                     case ENTRY_SYMBOL -> {
                         if (auxInt < 0) {
@@ -1197,7 +1194,6 @@ public class QwpUdpSender implements Sender {
 
         private void stageEntry(
                 QwpTableBuffer.ColumnBuffer column,
-                Object sidecarObject,
                 int kind,
                 int auxInt,
                 long long0,
@@ -1207,7 +1203,6 @@ public class QwpUdpSender implements Sender {
         ) {
             ensureCapacity(size + 1);
             columns[size] = column;
-            sidecarObjects[size] = sidecarObject;
             entries.putInt(kind);
             entries.putInt(auxInt);
             entries.putLong(long0);
@@ -1234,10 +1229,139 @@ public class QwpUdpSender implements Sender {
             QwpTableBuffer.ColumnBuffer[] newColumns = new QwpTableBuffer.ColumnBuffer[newCapacity];
             System.arraycopy(columns, 0, newColumns, 0, size);
             columns = newColumns;
+        }
 
-            Object[] newSidecarObjects = new Object[newCapacity];
-            System.arraycopy(sidecarObjects, 0, newSidecarObjects, 0, size);
-            sidecarObjects = newSidecarObjects;
+        private static int checkedArrayElementCount(long product) {
+            if (product > Integer.MAX_VALUE) {
+                throw new LineSenderException("array too large: total element count exceeds int range");
+            }
+            return (int) product;
+        }
+
+        private void appendDoubleArrayPayload(Object value) {
+            if (value instanceof double[] values) {
+                varData.putByte((byte) 1);
+                varData.putInt(values.length);
+                for (double v : values) {
+                    varData.putDouble(v);
+                }
+                return;
+            }
+            if (value instanceof double[][] values) {
+                int dim0 = values.length;
+                int dim1 = dim0 > 0 ? values[0].length : 0;
+                for (int i = 1; i < dim0; i++) {
+                    if (values[i].length != dim1) {
+                        throw new LineSenderException("irregular array shape");
+                    }
+                }
+                checkedArrayElementCount((long) dim0 * dim1);
+                varData.putByte((byte) 2);
+                varData.putInt(dim0);
+                varData.putInt(dim1);
+                for (double[] row : values) {
+                    for (double v : row) {
+                        varData.putDouble(v);
+                    }
+                }
+                return;
+            }
+            if (value instanceof double[][][] values) {
+                int dim0 = values.length;
+                int dim1 = dim0 > 0 ? values[0].length : 0;
+                int dim2 = dim0 > 0 && dim1 > 0 ? values[0][0].length : 0;
+                for (int i = 0; i < dim0; i++) {
+                    if (values[i].length != dim1) {
+                        throw new LineSenderException("irregular array shape");
+                    }
+                    for (int j = 0; j < dim1; j++) {
+                        if (values[i][j].length != dim2) {
+                            throw new LineSenderException("irregular array shape");
+                        }
+                    }
+                }
+                checkedArrayElementCount((long) dim0 * dim1 * dim2);
+                varData.putByte((byte) 3);
+                varData.putInt(dim0);
+                varData.putInt(dim1);
+                varData.putInt(dim2);
+                for (double[][] plane : values) {
+                    for (double[] row : plane) {
+                        for (double v : row) {
+                            varData.putDouble(v);
+                        }
+                    }
+                }
+                return;
+            }
+            if (value instanceof DoubleArray values) {
+                values.appendToBufPtr(varData);
+                return;
+            }
+            throw new LineSenderException("unsupported double array type");
+        }
+
+        private void appendLongArrayPayload(Object value) {
+            if (value instanceof long[] values) {
+                varData.putByte((byte) 1);
+                varData.putInt(values.length);
+                for (long v : values) {
+                    varData.putLong(v);
+                }
+                return;
+            }
+            if (value instanceof long[][] values) {
+                int dim0 = values.length;
+                int dim1 = dim0 > 0 ? values[0].length : 0;
+                for (int i = 1; i < dim0; i++) {
+                    if (values[i].length != dim1) {
+                        throw new LineSenderException("irregular array shape");
+                    }
+                }
+                checkedArrayElementCount((long) dim0 * dim1);
+                varData.putByte((byte) 2);
+                varData.putInt(dim0);
+                varData.putInt(dim1);
+                for (long[] row : values) {
+                    for (long v : row) {
+                        varData.putLong(v);
+                    }
+                }
+                return;
+            }
+            if (value instanceof long[][][] values) {
+                int dim0 = values.length;
+                int dim1 = dim0 > 0 ? values[0].length : 0;
+                int dim2 = dim0 > 0 && dim1 > 0 ? values[0][0].length : 0;
+                for (int i = 0; i < dim0; i++) {
+                    if (values[i].length != dim1) {
+                        throw new LineSenderException("irregular array shape");
+                    }
+                    for (int j = 0; j < dim1; j++) {
+                        if (values[i][j].length != dim2) {
+                            throw new LineSenderException("irregular array shape");
+                        }
+                    }
+                }
+                checkedArrayElementCount((long) dim0 * dim1 * dim2);
+                varData.putByte((byte) 3);
+                varData.putInt(dim0);
+                varData.putInt(dim1);
+                varData.putInt(dim2);
+                for (long[][] plane : values) {
+                    for (long[] row : plane) {
+                        for (long v : row) {
+                            varData.putLong(v);
+                        }
+                    }
+                }
+                return;
+            }
+            if (value instanceof LongArray values) {
+                values.appendToBufPtr(varData);
+                return;
+            }
+            throw new LineSenderException("unsupported long array type");
         }
     }
 }

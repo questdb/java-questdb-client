@@ -26,6 +26,8 @@ package io.questdb.client.test.cutlass.qwp.protocol;
 
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
+import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.protocol.OffHeapAppendMemory;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Unsafe;
@@ -512,6 +514,35 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testAddDoubleArrayPayloadSupportsHigherDimensionalShape() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test");
+                 DoubleArray array = new DoubleArray(2, 1, 1, 2);
+                 OffHeapAppendMemory payload = new OffHeapAppendMemory(128)) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("arr", QwpConstants.TYPE_DOUBLE_ARRAY, false);
+
+                array.append(1.0).append(2.0).append(3.0).append(4.0);
+                array.appendToBufPtr(payload);
+
+                col.addDoubleArrayPayload(payload.pageAddress(), payload.getAppendOffset());
+                table.nextRow();
+
+                assertEquals(1, col.getValueCount());
+
+                byte[] dims = col.getArrayDims();
+                int[] shapes = col.getArrayShapes();
+                assertEquals(4, dims[0]);
+                assertEquals(2, shapes[0]);
+                assertEquals(1, shapes[1]);
+                assertEquals(1, shapes[2]);
+                assertEquals(2, shapes[3]);
+
+                assertArrayEquals(new double[]{1.0, 2.0, 3.0, 4.0}, readDoubleArraysLikeEncoder(col), 0.0);
+            }
+        });
+    }
+
+    @Test
     public void testDoubleArrayWrapperMultipleRows() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test");
@@ -538,6 +569,39 @@ public class QwpTableBufferTest {
                         encoded,
                         0.0
                 );
+
+                byte[] dims = col.getArrayDims();
+                int[] shapes = col.getArrayShapes();
+                for (int i = 0; i < 3; i++) {
+                    assertEquals(1, dims[i]);
+                    assertEquals(3, shapes[i]);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testLongArrayWrapperMultipleRows() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test");
+                 LongArray arr = new LongArray(3)) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("arr", QwpConstants.TYPE_LONG_ARRAY, false);
+
+                arr.append(10).append(20).append(30);
+                col.addLongArray(arr);
+                table.nextRow();
+
+                arr.append(40).append(50).append(60);
+                col.addLongArray(arr);
+                table.nextRow();
+
+                arr.append(70).append(80).append(90);
+                col.addLongArray(arr);
+                table.nextRow();
+
+                assertEquals(3, col.getValueCount());
+                long[] encoded = readLongArraysLikeEncoder(col);
+                assertArrayEquals(new long[]{10, 20, 30, 40, 50, 60, 70, 80, 90}, encoded);
 
                 byte[] dims = col.getArrayDims();
                 int[] shapes = col.getArrayShapes();

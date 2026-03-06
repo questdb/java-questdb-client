@@ -25,6 +25,8 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.line.array.DoubleArray;
+import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpColumnDef;
 import io.questdb.client.network.NetworkFacadeImpl;
@@ -262,6 +264,114 @@ public class QwpUdpSenderTest {
             Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
             assertPacketsWithinLimit(result, maxDatagramSize);
             assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderHigherDimensionalDoubleArrayWrapperPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("arrays", sender -> {
+                                try (DoubleArray doubleArray = new DoubleArray(2, 1, 1, 2)) {
+                                    doubleArray.append(1.25).append(2.25).append(3.25).append(4.25);
+                                    sender.table("arrays")
+                                            .symbol("sym", "alpha")
+                                            .longArray("la", new long[][][]{{{1, 2}}, {{3, 4}}})
+                                            .doubleArray("da", doubleArray)
+                                            .atNow();
+                                }
+                            },
+                            "sym", "alpha",
+                            "la", longArrayValue(shape(2, 1, 2), 1, 2, 3, 4),
+                            "da", doubleArrayValue(shape(2, 1, 1, 2), 1.25, 2.25, 3.25, 4.25)),
+                    row("arrays", sender -> {
+                                try (DoubleArray doubleArray = new DoubleArray(1, 2, 1, 2)) {
+                                    doubleArray.append(10.5).append(20.5).append(30.5).append(40.5);
+                                    sender.table("arrays")
+                                            .symbol("sym", "beta")
+                                            .longArray("la", new long[][]{{10, 20}, {30, 40}})
+                                            .doubleArray("da", doubleArray)
+                                            .atNow();
+                                }
+                            },
+                            "sym", "beta",
+                            "la", longArrayValue(shape(2, 2), 10, 20, 30, 40),
+                            "da", doubleArrayValue(shape(1, 2, 1, 2), 10.5, 20.5, 30.5, 40.5))
+            );
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testArrayWrapperStagingSnapshotsMutationAndCancelRow() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024);
+                 DoubleArray doubleArray = new DoubleArray(2)) {
+                sender.table("arrays");
+                long[] longValues = {1, 2};
+
+                doubleArray.append(1.5).append(2.5);
+                sender.longArray("la", longValues);
+                sender.doubleArray("da", doubleArray);
+
+                longValues[0] = 9;
+                longValues[1] = 10;
+                doubleArray.clear();
+                doubleArray.append(9.5).append(10.5);
+                sender.cancelRow();
+
+                sender.longArray("la", longValues);
+                sender.doubleArray("da", doubleArray);
+                longValues[0] = 100;
+                longValues[1] = 200;
+                doubleArray.clear();
+                doubleArray.append(100.5).append(200.5);
+                sender.atNow();
+                sender.flush();
+            }
+
+            assertRowsEqual(
+                    Arrays.asList(decodedRow(
+                            "arrays",
+                            "la", longArrayValue(shape(2), 9, 10),
+                            "da", doubleArrayValue(shape(2), 9.5, 10.5)
+                    )),
+                    decodeRows(nf.packets)
+            );
+        });
+    }
+
+    @Test
+    public void testLongArrayWrapperStagingSnapshotsMutation() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024);
+                 LongArray longArray = new LongArray(2, 2)) {
+                sender.table("arrays");
+
+                longArray.append(1).append(2).append(3).append(4);
+                sender.longArray("la", longArray);
+
+                longArray.clear();
+                longArray.append(10).append(20).append(30).append(40);
+                sender.atNow();
+                sender.flush();
+            }
+
+            assertRowsEqual(
+                    Arrays.asList(decodedRow(
+                            "arrays",
+                            "la", longArrayValue(shape(2, 2), 1, 2, 3, 4)
+                    )),
+                    decodeRows(nf.packets)
+            );
         });
     }
 
@@ -567,6 +677,45 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testIrregularArrayRejectedDuringStagingAndSenderRemainsUsable() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("arrays");
+                assertThrowsContains("irregular array shape", () ->
+                        sender.doubleArray("da", new double[][]{{1.0}, {2.0, 3.0}})
+                );
+
+                sender.table("ok");
+                sender.longColumn("x", 1).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertRowsEqual(Arrays.asList(decodedRow("ok", "x", 1L)), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testIrregularArrayRejectedDuringStagingDoesNotLeakColumnIntoSameTable() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("arrays");
+                assertThrowsContains("irregular array shape", () ->
+                        sender.doubleArray("bad", new double[][]{{1.0}, {2.0, 3.0}})
+                );
+
+                sender.longColumn("x", 1).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertRowsEqual(Arrays.asList(decodedRow("arrays", "x", 1L)), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
     public void testSchemaChangeMidRowFlushesImmediatelyAndPreservesRows() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -763,6 +912,125 @@ public class QwpUdpSenderTest {
             assertRowsEqual(Arrays.asList(
                     decodedRow("t", "a", 1L),
                     decodedRow("t", "a", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testAtNowOversizeFailureRollsBackWithoutExplicitCancel() throws Exception {
+        assertMemoryLeak(() -> {
+            String large = repeat('x', 5000);
+            List<ScenarioRow> oversizedRow = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("a", 2)
+                                    .stringColumn("s", large)
+                                    .atNow(),
+                            "a", 2L,
+                            "s", large)
+            );
+            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("a", 2)
+                                .stringColumn("s", large)
+                                .atNow()
+                );
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.longColumn("a", 3).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testAtMicrosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
+        assertMemoryLeak(() -> {
+            String large = repeat('x', 5000);
+            List<ScenarioRow> oversizedRow = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("a", 2)
+                                    .stringColumn("s", large)
+                                    .at(2_000_000L, ChronoUnit.MICROS),
+                            "a", 2L,
+                            "s", large,
+                            "", 2_000_000L)
+            );
+            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .at(1_000_000L, ChronoUnit.MICROS);
+
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("a", 2)
+                                .stringColumn("s", large)
+                                .at(2_000_000L, ChronoUnit.MICROS)
+                );
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.longColumn("a", 3).at(3_000_000L, ChronoUnit.MICROS);
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L, "", 1_000_000L),
+                    decodedRow("t", "a", 3L, "", 3_000_000L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testAtNanosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
+        assertMemoryLeak(() -> {
+            String large = repeat('x', 5000);
+            List<ScenarioRow> oversizedRow = Arrays.asList(
+                    row("tn", sender -> sender.table("tn")
+                                    .longColumn("a", 2)
+                                    .stringColumn("s", large)
+                                    .at(2_000_000L, ChronoUnit.NANOS),
+                            "a", 2L,
+                            "s", large,
+                            "", 2_000_000L)
+            );
+            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("tn")
+                        .longColumn("a", 1)
+                        .at(1_000_000L, ChronoUnit.NANOS);
+
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("a", 2)
+                                .stringColumn("s", large)
+                                .at(2_000_000L, ChronoUnit.NANOS)
+                );
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.longColumn("a", 3).at(3_000_000L, ChronoUnit.NANOS);
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("tn", "a", 1L, "", 1_000_000L),
+                    decodedRow("tn", "a", 3L, "", 3_000_000L)
             ), decodeRows(nf.packets));
         });
     }

@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.protocol;
 
+import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
@@ -487,6 +488,8 @@ public class QwpTableBuffer implements QuietCloseable {
      * operation and efficient bulk copy to network buffers.
      */
     public static class ColumnBuffer implements QuietCloseable {
+        private static final long DOUBLE_ARRAY_BASE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(double[].class);
+        private static final long LONG_ARRAY_BASE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(long[].class);
         final int elemSize;
         final String name;
         final boolean nullable;
@@ -751,6 +754,10 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
+        public void addDoubleArrayPayload(long ptr, long len) {
+            appendArrayPayload(ptr, len, false);
+        }
+
         public void addFloat(float value) {
             ensureNullBitmapForNonNull();
             dataBuffer.putFloat(value);
@@ -899,6 +906,10 @@ public class QwpTableBuffer implements QuietCloseable {
             }
             valueCount++;
             size++;
+        }
+
+        public void addLongArrayPayload(long ptr, long len) {
+            appendArrayPayload(ptr, len, true);
         }
 
         public void addNull() {
@@ -1324,6 +1335,75 @@ public class QwpTableBuffer implements QuietCloseable {
                 throw new LineSenderException("array too large: total element count exceeds int range");
             }
             return (int) product;
+        }
+
+        private void appendArrayPayload(long ptr, long len, boolean forLong) {
+            if (len < 0) {
+                addNull();
+                return;
+            }
+            if (len == 0) {
+                throw new LineSenderException("invalid array payload: empty payload");
+            }
+
+            int nDims = Unsafe.getUnsafe().getByte(ptr) & 0xFF;
+            if (nDims < 1 || nDims > ColumnType.ARRAY_NDIMS_LIMIT) {
+                throw new LineSenderException("invalid array payload: bad dimensionality " + nDims);
+            }
+
+            long cursor = ptr + 1;
+            long headerBytes = 1L + (long) nDims * Integer.BYTES;
+            if (len < headerBytes) {
+                throw new LineSenderException("invalid array payload: truncated shape header");
+            }
+
+            int elemCount = 1;
+            for (int d = 0; d < nDims; d++) {
+                int dimLen = Unsafe.getUnsafe().getInt(cursor);
+                if (dimLen < 0) {
+                    throw new LineSenderException("invalid array payload: negative dimension length");
+                }
+                elemCount = checkedElementCount((long) elemCount * dimLen);
+                cursor += Integer.BYTES;
+            }
+
+            long dataBytes = (long) elemCount * (forLong ? Long.BYTES : Double.BYTES);
+            if (len != headerBytes + dataBytes) {
+                throw new LineSenderException("invalid array payload: length mismatch");
+            }
+
+            ensureArrayCapacity(nDims, elemCount);
+            arrayDims[valueCount] = (byte) nDims;
+
+            cursor = ptr + 1;
+            for (int d = 0; d < nDims; d++) {
+                arrayShapes[arrayShapeOffset++] = Unsafe.getUnsafe().getInt(cursor);
+                cursor += Integer.BYTES;
+            }
+
+            if (dataBytes > 0) {
+                if (forLong) {
+                    Unsafe.getUnsafe().copyMemory(
+                            null,
+                            cursor,
+                            longArrayData,
+                            LONG_ARRAY_BASE_OFFSET + (long) arrayDataOffset * Long.BYTES,
+                            dataBytes
+                    );
+                } else {
+                    Unsafe.getUnsafe().copyMemory(
+                            null,
+                            cursor,
+                            doubleArrayData,
+                            DOUBLE_ARRAY_BASE_OFFSET + (long) arrayDataOffset * Double.BYTES,
+                            dataBytes
+                    );
+                }
+            }
+
+            arrayDataOffset += elemCount;
+            valueCount++;
+            size++;
         }
 
         private void allocateStorage(byte type) {

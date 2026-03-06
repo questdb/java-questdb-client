@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.protocol;
 
+import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
@@ -38,7 +39,7 @@ import io.questdb.client.std.Vect;
  * <p>
  * Growth strategy: capacity doubles on each resize via {@link Unsafe#realloc}.
  */
-public class OffHeapAppendMemory implements QuietCloseable {
+public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable {
 
     private static final int DEFAULT_INITIAL_CAPACITY = 128;
     private long appendAddress;

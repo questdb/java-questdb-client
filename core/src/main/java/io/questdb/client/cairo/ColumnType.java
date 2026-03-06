@@ -352,6 +352,7 @@ public final class ColumnType {
         typeNameMap.put(NULL, "NULL");
 
         arrayTypeSet.add(DOUBLE);
+        arrayTypeSet.add(LONG);
 
         TYPE_SIZE_POW2[UNDEFINED] = -1;
         TYPE_SIZE_POW2[BOOLEAN] = 0;
