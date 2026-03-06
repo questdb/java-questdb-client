@@ -149,6 +149,10 @@ public class QwpTableBuffer implements QuietCloseable {
         return columns.size();
     }
 
+    public boolean hasColumn(CharSequence name) {
+        return columnNameToIndex.get(name) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
+    }
+
     /**
      * Returns the column definitions (cached for efficiency).
      */
@@ -225,6 +229,15 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public int getRowCount() {
         return rowCount;
+    }
+
+    public boolean hasInProgressRow() {
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            if (fastColumns[i].size > rowCount) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1072,8 +1085,16 @@ public class QwpTableBuffer implements QuietCloseable {
             return dict;
         }
 
+        public int getSymbolDictionarySize() {
+            return symbolList != null ? symbolList.size() : 0;
+        }
+
         public byte getType() {
             return type;
+        }
+
+        public boolean isNullable() {
+            return nullable;
         }
 
         public int getValueCount() {

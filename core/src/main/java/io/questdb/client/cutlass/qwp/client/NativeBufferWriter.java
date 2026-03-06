@@ -81,6 +81,17 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
         return len;
     }
 
+    /**
+     * Returns the number of bytes required to encode {@code value} as an
+     * unsigned LEB128 varint.
+     */
+    public static int varintSize(long value) {
+        if (value == 0) {
+            return 1;
+        }
+        return (64 - Long.numberOfLeadingZeros(value) + 6) / 7;
+    }
+
     @Override
     public void close() {
         if (bufferPtr != 0) {

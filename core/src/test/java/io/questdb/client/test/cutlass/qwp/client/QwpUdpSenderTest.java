@@ -1,0 +1,1254 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.qwp.client;
+
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
+import io.questdb.client.cutlass.qwp.protocol.QwpColumnDef;
+import io.questdb.client.network.NetworkFacadeImpl;
+import io.questdb.client.std.Decimal128;
+import io.questdb.client.std.Decimal256;
+import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.Unsafe;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.SCHEMA_MODE_FULL;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_BOOLEAN;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DECIMAL128;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DECIMAL256;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DECIMAL64;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DOUBLE;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DOUBLE_ARRAY;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_LONG;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_LONG_ARRAY;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_STRING;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_SYMBOL;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_TIMESTAMP;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_TIMESTAMP_NANOS;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_VARCHAR;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.VERSION_1;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
+public class QwpUdpSenderTest {
+
+    @Test
+    public void testFirstRowAllowsMultipleNewColumnsAndEncodesRow() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("a", 1)
+                                    .doubleColumn("b", 2.0)
+                                    .stringColumn("c", "x")
+                                    .atNow(),
+                            "a", 1L,
+                            "b", 2.0,
+                            "c", "x")
+            );
+
+            RunResult result = runScenario(rows, 1024 * 1024);
+            Assert.assertEquals(1, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderMixedNullablePaddingPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            String alpha = repeat('a', 256);
+            String omega = repeat('z', 256);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .symbol("sym", "v1")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", alpha)
+                                    .atNow(),
+                            "sym", "v1",
+                            "x", 1L,
+                            "s", alpha),
+                    row("t", sender -> sender.table("t")
+                                    .symbol("sym", null)
+                                    .longColumn("x", 2)
+                                    .atNow(),
+                            "sym", null,
+                            "x", 2L,
+                            "s", null),
+                    row("t", sender -> sender.table("t")
+                                    .symbol("sym", null)
+                                    .longColumn("x", 3)
+                                    .stringColumn("s", null)
+                                    .atNow(),
+                            "sym", null,
+                            "x", 3L,
+                            "s", null),
+                    row("t", sender -> sender.table("t")
+                                    .symbol("sym", "v2")
+                                    .longColumn("x", 4)
+                                    .stringColumn("s", omega)
+                                    .atNow(),
+                            "sym", "v2",
+                            "x", 4L,
+                            "s", omega)
+            );
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderArrayReplayPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            long[] longValues = new long[128];
+            double[] doubleValues = new double[128];
+            for (int i = 0; i < 128; i++) {
+                longValues[i] = i * 3L;
+                doubleValues[i] = i * 1.25;
+            }
+
+            long[][] longMatrix = new long[8][8];
+            double[][] doubleMatrix = new double[8][8];
+            for (int i = 0; i < 8; i++) {
+                for (int j = 0; j < 8; j++) {
+                    longMatrix[i][j] = i * 100L + j;
+                    doubleMatrix[i][j] = i * 10.0 + j + 0.5;
+                }
+            }
+
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("arrays", sender -> sender.table("arrays")
+                                    .symbol("sym", "alpha")
+                                    .longColumn("x", 1)
+                                    .longArray("la", longValues)
+                                    .doubleArray("da", doubleValues)
+                                    .atNow(),
+                            "sym", "alpha",
+                            "x", 1L,
+                            "la", longArrayValue(shape(128), longValues),
+                            "da", doubleArrayValue(shape(128), doubleValues)),
+                    row("arrays", sender -> sender.table("arrays")
+                                    .symbol("sym", "beta")
+                                    .longColumn("x", 2)
+                                    .longArray("la", longMatrix)
+                                    .doubleArray("da", doubleMatrix)
+                                    .atNow(),
+                            "sym", "beta",
+                            "x", 2L,
+                            "la", longArrayValue(shape(8, 8), flatten(longMatrix)),
+                            "da", doubleArrayValue(shape(8, 8), flatten(doubleMatrix))),
+                    row("arrays", sender -> sender.table("arrays")
+                                    .symbol("sym", "gamma")
+                                    .longColumn("x", 3)
+                                    .longArray("la", (long[]) null)
+                                    .doubleArray("da", (double[]) null)
+                                    .atNow(),
+                            "sym", "gamma",
+                            "x", 3L,
+                            "la", null,
+                            "da", null)
+            );
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderMixedTypesPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            String msg1 = repeat('m', 240);
+            String msg2 = repeat('n', 240);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("mix", sender -> sender.table("mix")
+                                    .symbol("sym", "alpha")
+                                    .boolColumn("active", true)
+                                    .longColumn("count", 1)
+                                    .doubleColumn("value", 1.5)
+                                    .stringColumn("msg", msg1)
+                                    .decimalColumn("d64", Decimal64.fromLong(12345L, 2))
+                                    .decimalColumn("d128", Decimal128.fromLong(678901234L, 4))
+                                    .decimalColumn("d256", Decimal256.fromLong(9876543210L, 3))
+                                    .timestampColumn("eventMicros", 123456L, ChronoUnit.MICROS)
+                                    .timestampColumn("eventNanos", 999L, ChronoUnit.NANOS)
+                                    .at(1_000_000L, ChronoUnit.MICROS),
+                            "sym", "alpha",
+                            "active", true,
+                            "count", 1L,
+                            "value", 1.5,
+                            "msg", msg1,
+                            "d64", decimal(12345L, 2),
+                            "d128", decimal(678901234L, 4),
+                            "d256", decimal(9876543210L, 3),
+                            "eventMicros", 123456L,
+                            "eventNanos", 999L,
+                            "", 1_000_000L),
+                    row("mix", sender -> sender.table("mix")
+                                    .symbol("sym", "beta")
+                                    .boolColumn("active", false)
+                                    .longColumn("count", 2)
+                                    .doubleColumn("value", 2.5)
+                                    .stringColumn("msg", msg2)
+                                    .decimalColumn("d64", Decimal64.fromLong(-67890L, 2))
+                                    .decimalColumn("d128", Decimal128.fromLong(2222333344L, 4))
+                                    .decimalColumn("d256", Decimal256.fromLong(7777777770L, 3))
+                                    .timestampColumn("eventMicros", 654321L, ChronoUnit.MICROS)
+                                    .timestampColumn("eventNanos", 12345L, ChronoUnit.NANOS)
+                                    .at(2_000_000L, ChronoUnit.MICROS),
+                            "sym", "beta",
+                            "active", false,
+                            "count", 2L,
+                            "value", 2.5,
+                            "msg", msg2,
+                            "d64", decimal(-67890L, 2),
+                            "d128", decimal(2222333344L, 4),
+                            "d256", decimal(7777777770L, 3),
+                            "eventMicros", 654321L,
+                            "eventNanos", 12345L,
+                            "", 2_000_000L)
+            );
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testMixingAtNowAndAtMicrosAfterCommittedRowsThrowsSchemaChange() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("x", 1)
+                        .atNow();
+
+                sender.longColumn("x", 2);
+                assertThrowsContains("schema change in middle of row is not supported",
+                        () -> sender.at(2, ChronoUnit.MICROS));
+                sender.cancelRow();
+            }
+        });
+    }
+
+    @Test
+    public void testFlushWhileRowInProgressThrowsAndPreservesRow() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("t").longColumn("x", 1);
+
+                assertThrowsContains("Cannot flush buffer while row is in progress", sender::flush);
+
+                sender.atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertRowsEqual(Arrays.asList(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSwitchTableWhileRowInProgressThrowsAndPreservesRows() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("t1").longColumn("x", 1);
+
+                assertThrowsContains("Cannot switch tables while row is in progress",
+                        () -> sender.table("t2"));
+
+                sender.atNow();
+                sender.table("t2").longColumn("y", 2).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqualIgnoringOrder(
+                    Arrays.asList(decodedRow("t1", "x", 1L), decodedRow("t2", "y", 2L)),
+                    decodeRows(nf.packets)
+            );
+        });
+    }
+
+    @Test
+    public void testCloseDropsInProgressRowButFlushesCommittedRows() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("t").longColumn("x", 1).atNow();
+                sender.longColumn("x", 2);
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertRowsEqual(Arrays.asList(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testOversizedSingleRowRejectedAfterReplayUsesActualEncodedSize() throws Exception {
+        assertMemoryLeak(() -> {
+            String small = repeat('s', 32);
+            String large = repeat('x', 5000);
+            List<ScenarioRow> largeRow = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 2)
+                                    .stringColumn("s", large)
+                                    .atNow(),
+                            "x", 2L,
+                            "s", large)
+            );
+            int maxDatagramSize = fullPacketSize(largeRow) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t")
+                        .longColumn("x", 1)
+                        .stringColumn("s", small)
+                        .atNow();
+
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("x", 2)
+                                .stringColumn("s", large)
+                                .atNow()
+                );
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
+            assertRowsEqual(
+                    Arrays.asList(decodedRow("t", "x", 1L, "s", small)),
+                    decodeRows(nf.packets)
+            );
+        });
+    }
+
+    @Test
+    public void testOversizedSingleRowRejectedBeforeReplayUsesActualEncodedSize() throws Exception {
+        assertMemoryLeak(() -> {
+            String large = repeat('x', 5000);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", large)
+                                    .atNow(),
+                            "x", 1L,
+                            "s", large)
+            );
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t");
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("x", 1)
+                                .stringColumn("s", large)
+                                .atNow()
+                );
+            }
+
+            Assert.assertEquals(0, nf.sendCount);
+        });
+    }
+
+    @Test
+    public void testOversizedArrayRowRejectedUsesActualEncodedSize() throws Exception {
+        assertMemoryLeak(() -> {
+            long[] longValues = new long[1024];
+            double[] doubleValues = new double[1024];
+            for (int i = 0; i < 1024; i++) {
+                longValues[i] = i;
+                doubleValues[i] = i + 0.25;
+            }
+
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("arrays", sender -> sender.table("arrays")
+                                    .longColumn("x", 1)
+                                    .longArray("la", longValues)
+                                    .doubleArray("da", doubleValues)
+                                    .atNow(),
+                            "x", 1L,
+                            "la", longArrayValue(shape(1024), longValues),
+                            "da", doubleArrayValue(shape(1024), doubleValues))
+            );
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("arrays");
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("x", 1)
+                                .longArray("la", longValues)
+                                .doubleArray("da", doubleValues)
+                                .atNow()
+                );
+            }
+
+            Assert.assertEquals(0, nf.sendCount);
+        });
+    }
+
+    @Test
+    public void testSchemaChangeMidRowThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                assertThrowsContains("schema change in middle of row is not supported", () -> sender.longColumn("b", 3));
+
+                sender.cancelRow();
+                Assert.assertEquals(0, nf.sendCount);
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertRowsEqual(Arrays.asList(decodedRow("t", "a", 1L)), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeWithCommittedRowsFlushesImmediately() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+                Assert.assertEquals(0, nf.sendCount);
+
+                sender.longColumn("b", 2);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.flush();
+                Assert.assertEquals(2, nf.sendCount);
+            }
+        });
+    }
+
+    @Test
+    public void testSymbolBoundary16383To16384PreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = new ArrayList<>(16_390);
+            for (int i = 0; i < 16_390; i++) {
+                final int value = i;
+                rows.add(row("t", sender -> sender.table("t")
+                                .symbol("sym", "v" + value)
+                                .longColumn("x", value)
+                                .atNow(),
+                        "sym", "v" + value,
+                        "x", (long) value));
+            }
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testSymbolBoundary127To128PreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = new ArrayList<>(130);
+            for (int i = 0; i < 130; i++) {
+                final int value = i;
+                rows.add(row("t", sender -> sender.table("t")
+                                .symbol("sym", "v" + value)
+                                .longColumn("x", value)
+                                .atNow(),
+                        "sym", "v" + value,
+                        "x", (long) value));
+            }
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testZeroColumnRowsThrow() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t");
+
+                assertThrowsContains("no columns were provided", sender::atNow);
+                assertThrowsContains("no columns were provided", () -> sender.at(1, ChronoUnit.MICROS));
+                assertThrowsContains("no columns were provided", () -> sender.at(1, ChronoUnit.NANOS));
+            }
+        });
+    }
+
+    private static void assertPacketsWithinLimit(RunResult result, int maxDatagramSize) {
+        for (int i = 0; i < result.lengths.size(); i++) {
+            int len = result.lengths.get(i);
+            Assert.assertTrue(
+                    "packet " + i + " exceeds maxDatagramSize: " + len + " > " + maxDatagramSize,
+                    len <= maxDatagramSize
+            );
+        }
+    }
+
+    private static void assertRowsEqual(List<DecodedRow> expected, List<DecodedRow> actual) {
+        Assert.assertEquals("row count mismatch", expected.size(), actual.size());
+        for (int i = 0; i < expected.size(); i++) {
+            Assert.assertEquals("row mismatch at index " + i, expected.get(i), actual.get(i));
+        }
+    }
+
+    private static void assertRowsEqualIgnoringOrder(List<DecodedRow> expected, List<DecodedRow> actual) {
+        Map<DecodedRow, Integer> counts = new HashMap<>();
+        for (DecodedRow row : expected) {
+            counts.merge(row, 1, Integer::sum);
+        }
+        for (DecodedRow row : actual) {
+            Integer count = counts.get(row);
+            if (count == null) {
+                Assert.fail("unexpected row: " + row);
+            }
+            if (count == 1) {
+                counts.remove(row);
+            } else {
+                counts.put(row, count - 1);
+            }
+        }
+        if (!counts.isEmpty()) {
+            Assert.fail("missing rows: " + counts);
+        }
+    }
+
+    private static void assertThrowsContains(String expected, ThrowingRunnable runnable) {
+        try {
+            runnable.run();
+            Assert.fail("Expected exception containing: " + expected);
+        } catch (LineSenderException e) {
+            Assert.assertTrue("Expected message to contain '" + expected + "' but got: " + e.getMessage(),
+                    e.getMessage().contains(expected));
+        } catch (Exception e) {
+            throw new AssertionError("Unexpected exception type", e);
+        }
+    }
+
+    private static BigDecimal decimal(long unscaled, int scale) {
+        return BigDecimal.valueOf(unscaled, scale);
+    }
+
+    private static DecodedRow decodedRow(String table, Object... kvs) {
+        return new DecodedRow(table, columns(kvs));
+    }
+
+    private static List<DecodedRow> decodeRows(List<byte[]> packets) {
+        ArrayList<DecodedRow> rows = new ArrayList<>();
+        for (byte[] packet : packets) {
+            rows.addAll(new DatagramDecoder(packet).decode());
+        }
+        return rows;
+    }
+
+    private static DoubleArrayValue doubleArrayValue(int[] shape, double... values) {
+        ArrayList<Integer> dims = new ArrayList<>(shape.length);
+        for (int dim : shape) {
+            dims.add(dim);
+        }
+        ArrayList<Double> elems = new ArrayList<>(values.length);
+        for (double value : values) {
+            elems.add(value);
+        }
+        return new DoubleArrayValue(dims, elems);
+    }
+
+    private static List<DecodedRow> expectedRows(List<ScenarioRow> rows) {
+        ArrayList<DecodedRow> expected = new ArrayList<>(rows.size());
+        for (ScenarioRow row : rows) {
+            expected.add(row.expected);
+        }
+        return expected;
+    }
+
+    private static double[] flatten(double[][] matrix) {
+        int size = 0;
+        for (double[] row : matrix) {
+            size += row.length;
+        }
+        double[] flat = new double[size];
+        int offset = 0;
+        for (double[] row : matrix) {
+            System.arraycopy(row, 0, flat, offset, row.length);
+            offset += row.length;
+        }
+        return flat;
+    }
+
+    private static int fullPacketSize(List<ScenarioRow> rows) throws Exception {
+        RunResult result = runScenario(rows, 0);
+        Assert.assertEquals("expected a single unbounded packet", 1, result.packets.size());
+        return result.lengths.get(0);
+    }
+
+    private static long[] flatten(long[][] matrix) {
+        int size = 0;
+        for (long[] row : matrix) {
+            size += row.length;
+        }
+        long[] flat = new long[size];
+        int offset = 0;
+        for (long[] row : matrix) {
+            System.arraycopy(row, 0, flat, offset, row.length);
+            offset += row.length;
+        }
+        return flat;
+    }
+
+    private static LinkedHashMap<String, Object> columns(Object... kvs) {
+        if ((kvs.length & 1) != 0) {
+            throw new IllegalArgumentException("key/value pairs expected");
+        }
+        LinkedHashMap<String, Object> columns = new LinkedHashMap<>();
+        for (int i = 0; i < kvs.length; i += 2) {
+            columns.put((String) kvs[i], kvs[i + 1]);
+        }
+        return columns;
+    }
+
+    private static LongArrayValue longArrayValue(int[] shape, long... values) {
+        ArrayList<Integer> dims = new ArrayList<>(shape.length);
+        for (int dim : shape) {
+            dims.add(dim);
+        }
+        ArrayList<Long> elems = new ArrayList<>(values.length);
+        for (long value : values) {
+            elems.add(value);
+        }
+        return new LongArrayValue(dims, elems);
+    }
+
+    private static String repeat(char value, int count) {
+        char[] chars = new char[count];
+        Arrays.fill(chars, value);
+        return new String(chars);
+    }
+
+    private static ScenarioRow row(String table, ThrowingConsumer<QwpUdpSender> writer, Object... kvs) {
+        return new ScenarioRow(decodedRow(table, kvs), writer);
+    }
+
+    private static RunResult runScenario(List<ScenarioRow> rows, int maxDatagramSize) throws Exception {
+        CapturingNetworkFacade nf = new CapturingNetworkFacade();
+        if (maxDatagramSize > 0) {
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                for (ScenarioRow row : rows) {
+                    row.writer.accept(sender);
+                }
+                sender.flush();
+            }
+        } else {
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                for (ScenarioRow row : rows) {
+                    row.writer.accept(sender);
+                }
+                sender.flush();
+            }
+        }
+        return new RunResult(nf.packets, nf.lengths, nf.sendCount);
+    }
+
+    private static int[] shape(int... dims) {
+        return dims;
+    }
+
+    @FunctionalInterface
+    private interface ThrowingConsumer<T> {
+        void accept(T value) throws Exception;
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
+    private static final class CapturingNetworkFacade extends NetworkFacadeImpl {
+        private final List<Integer> lengths = new ArrayList<>();
+        private final List<byte[]> packets = new ArrayList<>();
+        private int sendCount;
+
+        @Override
+        public int close(int fd) {
+            return 0;
+        }
+
+        @Override
+        public void freeSockAddr(long pSockaddr) {
+            // no-op
+        }
+
+        @Override
+        public int sendToRaw(int fd, long lo, int len, long socketAddress) {
+            byte[] packet = new byte[len];
+            Unsafe.getUnsafe().copyMemory(null, lo, packet, Unsafe.BYTE_OFFSET, len);
+            packets.add(packet);
+            lengths.add(len);
+            sendCount++;
+            return len;
+        }
+
+        @Override
+        public int setMulticastInterface(int fd, int ipv4Address) {
+            return 0;
+        }
+
+        @Override
+        public int setMulticastTtl(int fd, int ttl) {
+            return 0;
+        }
+
+        @Override
+        public long sockaddr(int address, int port) {
+            return 1;
+        }
+
+        @Override
+        public int socketUdp() {
+            return 1;
+        }
+    }
+
+    private static final class ColumnValues {
+        private final Object[] rows;
+
+        private ColumnValues(Object[] rows) {
+            this.rows = rows;
+        }
+    }
+
+    private static final class DatagramDecoder {
+        private final PacketReader reader;
+
+        private DatagramDecoder(byte[] packet) {
+            this.reader = new PacketReader(packet);
+        }
+
+        private List<DecodedRow> decode() {
+            Assert.assertEquals(MAGIC_MESSAGE, reader.readIntLE());
+            Assert.assertEquals(VERSION_1, reader.readByte());
+            reader.readByte();
+            int tableCount = reader.readUnsignedShortLE();
+            int payloadLength = reader.readIntLE();
+            Assert.assertEquals(reader.length() - HEADER_SIZE, payloadLength);
+
+            ArrayList<DecodedRow> rows = new ArrayList<>();
+            for (int table = 0; table < tableCount; table++) {
+                rows.addAll(decodeTable());
+            }
+            Assert.assertEquals(reader.length(), reader.position());
+            return rows;
+        }
+
+        private List<DecodedRow> decodeTable() {
+            String tableName = reader.readString();
+            int rowCount = (int) reader.readVarint();
+            int columnCount = (int) reader.readVarint();
+            Assert.assertEquals(SCHEMA_MODE_FULL, reader.readByte());
+
+            QwpColumnDef[] defs = new QwpColumnDef[columnCount];
+            for (int i = 0; i < columnCount; i++) {
+                defs[i] = new QwpColumnDef(reader.readString(), reader.readByte());
+            }
+
+            ColumnValues[] columns = new ColumnValues[columnCount];
+            for (int i = 0; i < columnCount; i++) {
+                columns[i] = decodeColumn(defs[i], rowCount);
+            }
+
+            ArrayList<DecodedRow> rows = new ArrayList<>(rowCount);
+            for (int row = 0; row < rowCount; row++) {
+                LinkedHashMap<String, Object> values = new LinkedHashMap<>();
+                for (int col = 0; col < columnCount; col++) {
+                    values.put(defs[col].getName(), columns[col].rows[row]);
+                }
+                rows.add(new DecodedRow(tableName, values));
+            }
+            return rows;
+        }
+
+        private ColumnValues decodeColumn(QwpColumnDef def, int rowCount) {
+            boolean[] nulls = def.isNullable() ? reader.readNullBitmap(rowCount) : new boolean[rowCount];
+            int valueCount = rowCount - countNulls(nulls);
+            Object[] values = new Object[rowCount];
+
+            switch (def.getTypeCode()) {
+                case TYPE_BOOLEAN:
+                    decodeBooleans(values, nulls, valueCount);
+                    break;
+                case TYPE_DECIMAL64:
+                    decodeDecimals(values, nulls, valueCount, 8);
+                    break;
+                case TYPE_DECIMAL128:
+                    decodeDecimals(values, nulls, valueCount, 16);
+                    break;
+                case TYPE_DECIMAL256:
+                    decodeDecimals(values, nulls, valueCount, 32);
+                    break;
+                case TYPE_DOUBLE:
+                    decodeDoubles(values, nulls, valueCount);
+                    break;
+                case TYPE_DOUBLE_ARRAY:
+                    decodeDoubleArrays(values, nulls, valueCount);
+                    break;
+                case TYPE_LONG:
+                case TYPE_TIMESTAMP:
+                case TYPE_TIMESTAMP_NANOS:
+                    decodeLongs(values, nulls, valueCount);
+                    break;
+                case TYPE_LONG_ARRAY:
+                    decodeLongArrays(values, nulls, valueCount);
+                    break;
+                case TYPE_STRING:
+                case TYPE_VARCHAR:
+                    decodeStrings(values, nulls, valueCount);
+                    break;
+                case TYPE_SYMBOL:
+                    decodeSymbols(values, nulls, valueCount);
+                    break;
+                default:
+                    throw new AssertionError("Unsupported test decoder type: " + def.getTypeCode());
+            }
+
+            return new ColumnValues(values);
+        }
+
+        private void decodeBooleans(Object[] values, boolean[] nulls, int valueCount) {
+            byte[] packed = reader.readBytes((valueCount + 7) / 8);
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                } else {
+                    int byteIndex = valueIndex >>> 3;
+                    int bitIndex = valueIndex & 7;
+                    values[row] = (packed[byteIndex] & (1 << bitIndex)) != 0;
+                    valueIndex++;
+                }
+            }
+        }
+
+        private void decodeDecimals(Object[] values, boolean[] nulls, int valueCount, int width) {
+            int scale = reader.readByte();
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                } else {
+                    byte[] bytes = reader.readBytes(width);
+                    values[row] = new BigDecimal(new BigInteger(bytes), scale);
+                    valueIndex++;
+                }
+            }
+            Assert.assertEquals(valueCount, valueIndex);
+        }
+
+        private void decodeDoubleArrays(Object[] values, boolean[] nulls, int valueCount) {
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                    continue;
+                }
+                int dims = reader.readUnsignedByte();
+                ArrayList<Integer> shape = new ArrayList<>(dims);
+                int elementCount = 1;
+                for (int d = 0; d < dims; d++) {
+                    int dim = reader.readIntLE();
+                    shape.add(dim);
+                    elementCount = Math.multiplyExact(elementCount, dim);
+                }
+                ArrayList<Double> elements = new ArrayList<>(elementCount);
+                for (int i = 0; i < elementCount; i++) {
+                    elements.add(reader.readDoubleLE());
+                }
+                values[row] = new DoubleArrayValue(shape, elements);
+                valueIndex++;
+            }
+            Assert.assertEquals(valueCount, valueIndex);
+        }
+
+        private void decodeDoubles(Object[] values, boolean[] nulls, int valueCount) {
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                } else {
+                    values[row] = reader.readDoubleLE();
+                    valueIndex++;
+                }
+            }
+            Assert.assertEquals(valueCount, valueIndex);
+        }
+
+        private void decodeLongArrays(Object[] values, boolean[] nulls, int valueCount) {
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                    continue;
+                }
+                int dims = reader.readUnsignedByte();
+                ArrayList<Integer> shape = new ArrayList<>(dims);
+                int elementCount = 1;
+                for (int d = 0; d < dims; d++) {
+                    int dim = reader.readIntLE();
+                    shape.add(dim);
+                    elementCount = Math.multiplyExact(elementCount, dim);
+                }
+                ArrayList<Long> elements = new ArrayList<>(elementCount);
+                for (int i = 0; i < elementCount; i++) {
+                    elements.add(reader.readLongLE());
+                }
+                values[row] = new LongArrayValue(shape, elements);
+                valueIndex++;
+            }
+            Assert.assertEquals(valueCount, valueIndex);
+        }
+
+        private void decodeLongs(Object[] values, boolean[] nulls, int valueCount) {
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                } else {
+                    values[row] = reader.readLongLE();
+                    valueIndex++;
+                }
+            }
+            Assert.assertEquals(valueCount, valueIndex);
+        }
+
+        private void decodeStrings(Object[] values, boolean[] nulls, int valueCount) {
+            int[] offsets = new int[valueCount + 1];
+            for (int i = 0; i <= valueCount; i++) {
+                offsets[i] = reader.readIntLE();
+            }
+            byte[] data = reader.readBytes(offsets[valueCount]);
+
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                } else {
+                    int start = offsets[valueIndex];
+                    int end = offsets[valueIndex + 1];
+                    values[row] = new String(data, start, end - start, StandardCharsets.UTF_8);
+                    valueIndex++;
+                }
+            }
+            Assert.assertEquals(valueCount, valueIndex);
+        }
+
+        private void decodeSymbols(Object[] values, boolean[] nulls, int valueCount) {
+            int dictSize = (int) reader.readVarint();
+            String[] dict = new String[dictSize];
+            for (int i = 0; i < dictSize; i++) {
+                dict[i] = reader.readString();
+            }
+
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                } else {
+                    int index = (int) reader.readVarint();
+                    values[row] = dict[index];
+                    valueIndex++;
+                }
+            }
+            Assert.assertEquals(valueCount, valueIndex);
+        }
+
+        private static int countNulls(boolean[] nulls) {
+            int count = 0;
+            for (boolean value : nulls) {
+                if (value) {
+                    count++;
+                }
+            }
+            return count;
+        }
+    }
+
+    private static final class DecodedRow {
+        private final String table;
+        private final LinkedHashMap<String, Object> values;
+
+        private DecodedRow(String table, LinkedHashMap<String, Object> values) {
+            this.table = table;
+            this.values = values;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            DecodedRow that = (DecodedRow) o;
+            return Objects.equals(table, that.table) && Objects.equals(values, that.values);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(table, values);
+        }
+
+        @Override
+        public String toString() {
+            return "DecodedRow{" +
+                    "table='" + table + '\'' +
+                    ", values=" + values +
+                    '}';
+        }
+    }
+
+    private static final class DoubleArrayValue {
+        private final List<Integer> shape;
+        private final List<Double> values;
+
+        private DoubleArrayValue(List<Integer> shape, List<Double> values) {
+            this.shape = shape;
+            this.values = values;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            DoubleArrayValue that = (DoubleArrayValue) o;
+            return Objects.equals(shape, that.shape) && Objects.equals(values, that.values);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(shape, values);
+        }
+
+        @Override
+        public String toString() {
+            return "DoubleArrayValue{" +
+                    "shape=" + shape +
+                    ", values=" + values +
+                    '}';
+        }
+    }
+
+    private static final class LongArrayValue {
+        private final List<Integer> shape;
+        private final List<Long> values;
+
+        private LongArrayValue(List<Integer> shape, List<Long> values) {
+            this.shape = shape;
+            this.values = values;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            LongArrayValue that = (LongArrayValue) o;
+            return Objects.equals(shape, that.shape) && Objects.equals(values, that.values);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(shape, values);
+        }
+
+        @Override
+        public String toString() {
+            return "LongArrayValue{" +
+                    "shape=" + shape +
+                    ", values=" + values +
+                    '}';
+        }
+    }
+
+    private static final class PacketReader {
+        private final byte[] data;
+        private int position;
+
+        private PacketReader(byte[] data) {
+            this.data = data;
+        }
+
+        private byte readByte() {
+            return data[position++];
+        }
+
+        private byte[] readBytes(int len) {
+            byte[] bytes = Arrays.copyOfRange(data, position, position + len);
+            position += len;
+            return bytes;
+        }
+
+        private boolean[] readNullBitmap(int rowCount) {
+            byte[] bitmap = readBytes((rowCount + 7) / 8);
+            boolean[] nulls = new boolean[rowCount];
+            for (int row = 0; row < rowCount; row++) {
+                int byteIndex = row >>> 3;
+                int bitIndex = row & 7;
+                nulls[row] = (bitmap[byteIndex] & (1 << bitIndex)) != 0;
+            }
+            return nulls;
+        }
+
+        private double readDoubleLE() {
+            double value = Unsafe.getUnsafe().getDouble(data, Unsafe.BYTE_OFFSET + position);
+            position += Double.BYTES;
+            return value;
+        }
+
+        private int readIntLE() {
+            int value = Unsafe.byteArrayGetInt(data, position);
+            position += Integer.BYTES;
+            return value;
+        }
+
+        private long readLongLE() {
+            long value = Unsafe.byteArrayGetLong(data, position);
+            position += Long.BYTES;
+            return value;
+        }
+
+        private String readString() {
+            int len = (int) readVarint();
+            if (len == 0) {
+                return "";
+            }
+            String value = new String(data, position, len, StandardCharsets.UTF_8);
+            position += len;
+            return value;
+        }
+
+        private int readUnsignedByte() {
+            return readByte() & 0xff;
+        }
+
+        private int readUnsignedShortLE() {
+            int value = Unsafe.byteArrayGetShort(data, position) & 0xffff;
+            position += Short.BYTES;
+            return value;
+        }
+
+        private long readVarint() {
+            long value = 0;
+            int shift = 0;
+            while (true) {
+                int b = readUnsignedByte();
+                value |= (long) (b & 0x7f) << shift;
+                if ((b & 0x80) == 0) {
+                    return value;
+                }
+                shift += 7;
+                if (shift > 63) {
+                    throw new AssertionError("varint too long");
+                }
+            }
+        }
+
+        private int length() {
+            return data.length;
+        }
+
+        private int position() {
+            return position;
+        }
+    }
+
+    private static final class RunResult {
+        private final List<Integer> lengths;
+        private final List<byte[]> packets;
+        private final int sendCount;
+
+        private RunResult(List<byte[]> packets, List<Integer> lengths, int sendCount) {
+            this.packets = new ArrayList<>(packets);
+            this.lengths = new ArrayList<>(lengths);
+            this.sendCount = sendCount;
+        }
+    }
+
+    private static final class ScenarioRow {
+        private final DecodedRow expected;
+        private final ThrowingConsumer<QwpUdpSender> writer;
+
+        private ScenarioRow(DecodedRow expected, ThrowingConsumer<QwpUdpSender> writer) {
+            this.expected = expected;
+            this.writer = writer;
+        }
+    }
+}

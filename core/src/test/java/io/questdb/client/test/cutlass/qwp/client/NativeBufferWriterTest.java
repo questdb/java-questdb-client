@@ -498,6 +498,20 @@ public class NativeBufferWriterTest {
     }
 
     @Test
+    public void testVarintSizeMatchesEncodedLength() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter()) {
+                long[] values = {0, 1, 127, 128, 16383, 16384, 2_097_151, 2_097_152, Long.MAX_VALUE};
+                for (long value : values) {
+                    writer.reset();
+                    writer.putVarint(value);
+                    Assert.assertEquals("value=" + value, NativeBufferWriter.varintSize(value), writer.getPosition());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testWriteVarintMedium() throws Exception {
         assertMemoryLeak(() -> {
             try (NativeBufferWriter writer = new NativeBufferWriter()) {
