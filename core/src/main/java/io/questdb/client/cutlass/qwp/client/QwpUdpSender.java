@@ -84,6 +84,7 @@ public class QwpUdpSender implements Sender {
     private final UdpLineChannel channel;
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
     private final int maxDatagramSize;
+    private final boolean trackDatagramEstimate;
     private final ObjList<ColumnEntry> rowJournal = new ObjList<>();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
 
@@ -96,6 +97,8 @@ public class QwpUdpSender implements Sender {
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
     private int estimateColumnCount;
+    private QwpTableBuffer.ColumnBuffer[] missingColumns = new QwpTableBuffer.ColumnBuffer[8];
+    private int missingColumnCount;
     private int rowJournalSize;
     private long runningEstimate;
 
@@ -107,6 +110,7 @@ public class QwpUdpSender implements Sender {
         this.channel = new UdpLineChannel(nf, interfaceIPv4, sendToAddress, port, ttl);
         this.tableBuffers = new CharSequenceObjHashMap<>();
         this.maxDatagramSize = maxDatagramSize;
+        this.trackDatagramEstimate = maxDatagramSize > 0;
     }
 
     @Override
@@ -374,7 +378,7 @@ public class QwpUdpSender implements Sender {
             return this;
         }
         ensureNoInProgressRow("switch tables");
-        if (maxDatagramSize > 0 && currentTableBuffer != null && currentTableBuffer.getRowCount() > 0) {
+        if (trackDatagramEstimate && currentTableBuffer != null && currentTableBuffer.getRowCount() > 0) {
             flushSingleTable(currentTableName, currentTableBuffer);
         }
         cachedTimestampColumn = null;
@@ -440,7 +444,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_BOOL;
             e.name = col.getName();
@@ -458,7 +462,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL128;
             e.name = col.getName();
@@ -476,7 +480,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL256;
             e.name = col.getName();
@@ -494,7 +498,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL64;
             e.name = col.getName();
@@ -527,7 +531,7 @@ public class QwpUdpSender implements Sender {
         long payloadDelta = (long) (col.getValueCount() - valueCountBefore) * 8;
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = nanos ? ENTRY_AT_NANOS : ENTRY_AT_MICROS;
             e.longValue = value;
@@ -563,7 +567,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE_ARRAY;
             e.name = col.getName();
@@ -581,7 +585,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE;
             e.name = col.getName();
@@ -618,7 +622,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG_ARRAY;
             e.name = col.getName();
@@ -636,7 +640,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG;
             e.name = col.getName();
@@ -656,7 +660,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_STRING;
             e.name = col.getName();
@@ -675,7 +679,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_SYMBOL;
             e.name = col.getName();
@@ -693,7 +697,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && maxDatagramSize > 0) {
+        if (addJournal && trackDatagramEstimate) {
             ColumnEntry e = nextJournalEntry();
             e.kind = journalKind;
             e.name = col.getName();
@@ -701,12 +705,20 @@ public class QwpUdpSender implements Sender {
         }
     }
 
-    private void applyRowPaddingEstimate(int targetRows) {
+    private void collectMissingColumns(int targetRows) {
+        missingColumnCount = 0;
         for (int i = 0, n = currentTableBuffer.getColumnCount(); i < n; i++) {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getColumn(i);
             int sizeBefore = col.getSize();
             int missing = targetRows - sizeBefore;
             if (missing <= 0) {
+                continue;
+            }
+
+            ensureMissingColumnCapacity(missingColumnCount + 1);
+            missingColumns[missingColumnCount++] = col;
+
+            if (!trackDatagramEstimate) {
                 continue;
             }
 
@@ -721,6 +733,9 @@ public class QwpUdpSender implements Sender {
     }
 
     private void applyValueEstimate(QwpTableBuffer.ColumnBuffer col, int sizeBefore, int sizeAfter, long payloadDelta) {
+        if (!trackDatagramEstimate) {
+            return;
+        }
         runningEstimate += payloadDelta;
         if (col.isNullable()) {
             runningEstimate += bitmapBytes(sizeAfter) - bitmapBytes(sizeBefore);
@@ -761,16 +776,19 @@ public class QwpUdpSender implements Sender {
         }
 
         int targetRows = currentTableBuffer.getRowCount() + 1;
-        applyRowPaddingEstimate(targetRows);
+        collectMissingColumns(targetRows);
 
-        if (maxDatagramSize > 0) {
+        if (trackDatagramEstimate) {
             maybeAutoFlush();
         }
 
-        currentTableBuffer.nextRow();
-        committedEstimate = runningEstimate;
-        committedEstimateColumnCount = estimateColumnCount;
+        currentTableBuffer.nextRow(missingColumns, missingColumnCount);
+        if (trackDatagramEstimate) {
+            committedEstimate = runningEstimate;
+            committedEstimateColumnCount = estimateColumnCount;
+        }
         currentRowColumnCount = 0;
+        missingColumnCount = 0;
         rowJournalSize = 0;
     }
 
@@ -816,6 +834,21 @@ public class QwpUdpSender implements Sender {
         arraySizeCounter.reset();
         array.appendToBufPtr(arraySizeCounter);
         return arraySizeCounter.size;
+    }
+
+    private void ensureMissingColumnCapacity(int required) {
+        if (required <= missingColumns.length) {
+            return;
+        }
+
+        int newCapacity = missingColumns.length;
+        while (newCapacity < required) {
+            newCapacity *= 2;
+        }
+
+        QwpTableBuffer.ColumnBuffer[] newArr = new QwpTableBuffer.ColumnBuffer[newCapacity];
+        System.arraycopy(missingColumns, 0, newArr, 0, missingColumnCount);
+        missingColumns = newArr;
     }
 
     private long estimateSymbolPayloadDelta(
@@ -908,7 +941,7 @@ public class QwpUdpSender implements Sender {
 
         flushSingleTable(currentTableName, currentTableBuffer);
         replayRowJournal();
-        applyRowPaddingEstimate(currentTableBuffer.getRowCount() + 1);
+        collectMissingColumns(currentTableBuffer.getRowCount() + 1);
 
         if (runningEstimate > maxDatagramSize) {
             throw singleRowTooLarge(runningEstimate);
@@ -983,6 +1016,7 @@ public class QwpUdpSender implements Sender {
         estimateColumnCount = 0;
         committedEstimateColumnCount = 0;
         currentRowColumnCount = 0;
+        missingColumnCount = 0;
     }
 
     private boolean hasInProgressRow() {
@@ -993,6 +1027,7 @@ public class QwpUdpSender implements Sender {
         runningEstimate = committedEstimate;
         estimateColumnCount = committedEstimateColumnCount;
         currentRowColumnCount = 0;
+        missingColumnCount = 0;
     }
 
     private LineSenderException singleRowTooLarge(long estimate) {
@@ -1003,6 +1038,10 @@ public class QwpUdpSender implements Sender {
     }
 
     private void syncSchemaEstimate() {
+        if (!trackDatagramEstimate) {
+            return;
+        }
+
         int newColumnCount = currentTableBuffer.getColumnCount();
         if (newColumnCount == estimateColumnCount) {
             return;

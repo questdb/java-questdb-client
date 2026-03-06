@@ -293,6 +293,30 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testNextRowWithPreparedMissingColumnsPadsListedColumns() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+
+                colA.addLong(10);
+                colB.addString("x");
+                table.nextRow();
+
+                colA.addLong(20);
+                table.nextRow(new QwpTableBuffer.ColumnBuffer[]{colB}, 1);
+
+                assertEquals(2, colA.getSize());
+                assertEquals(2, colA.getValueCount());
+                assertEquals(2, colB.getSize());
+                assertEquals(1, colB.getValueCount());
+                assertFalse(colB.isNull(0));
+                assertTrue(colB.isNull(1));
+            }
+        });
+    }
+
+    @Test
     public void testCancelRowResetsDecimalScaleOnLateAddedColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {

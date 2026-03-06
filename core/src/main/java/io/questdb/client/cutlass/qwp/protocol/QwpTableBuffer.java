@@ -301,6 +301,24 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Advances to the next row using a prepared list of columns that need null padding.
+     * <p>
+     * This avoids rescanning every column when the caller has already identified
+     * which columns were omitted in the current row.
+     */
+    public void nextRow(ColumnBuffer[] missingColumns, int missingColumnCount) {
+        columnAccessCursor = 0;
+        for (int i = 0; i < missingColumnCount; i++) {
+            ColumnBuffer col = missingColumns[i];
+            while (col.size < rowCount + 1) {
+                col.addNull();
+            }
+        }
+        rowCount++;
+        committedColumnCount = columns.size();
+    }
+
+    /**
      * Resets the buffer for reuse. Keeps column definitions and allocated memory.
      */
     public void reset() {
