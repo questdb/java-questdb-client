@@ -117,6 +117,7 @@ public class QwpWebSocketSender implements Sender {
     private static final String WRITE_PATH = "/write/v4";
     private final AckFrameHandler ackHandler = new AckFrameHandler(this);
     private final WebSocketResponse ackResponse = new WebSocketResponse();
+    private final String authorizationHeader;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
     // Auto-flush configuration
@@ -174,8 +175,10 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize
+            int inFlightWindowSize,
+            String authorizationHeader
     ) {
+        this.authorizationHeader = authorizationHeader;
         this.host = host;
         this.port = port;
         this.tlsEnabled = tlsEnabled;
@@ -224,8 +227,9 @@ public class QwpWebSocketSender implements Sender {
      * @return connected sender
      */
     public static QwpWebSocketSender connect(String host, int port, boolean tlsEnabled) {
-        return connect(host, port, tlsEnabled,
-                DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS);
+        return connect(
+                host, port, tlsEnabled, DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS
+        );
     }
 
     /**
@@ -240,13 +244,30 @@ public class QwpWebSocketSender implements Sender {
      * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
      * @return connected sender
      */
-    public static QwpWebSocketSender connect(String host, int port, boolean tlsEnabled,
-                                             int autoFlushRows, int autoFlushBytes,
-                                             long autoFlushIntervalNanos) {
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            boolean tlsEnabled,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos
+    ) {
+        return connect(host, port, tlsEnabled, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos, null);
+    }
+
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            boolean tlsEnabled,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
-                host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
-                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                1   // window=1 for sync behavior
+                host, port, tlsEnabled, DEFAULT_BUFFER_SIZE, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                1,   // window=1 for sync behavior
+                authorizationHeader
         );
         sender.ensureConnected();
         return sender;
@@ -263,11 +284,17 @@ public class QwpWebSocketSender implements Sender {
      * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
      * @return connected sender
      */
-    public static QwpWebSocketSender connectAsync(String host, int port, boolean tlsEnabled,
-                                                  int autoFlushRows, int autoFlushBytes,
-                                                  long autoFlushIntervalNanos) {
-        return connectAsync(host, port, tlsEnabled, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                DEFAULT_IN_FLIGHT_WINDOW_SIZE);
+    public static QwpWebSocketSender connectAsync(
+            String host,
+            int port,
+            boolean tlsEnabled,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos
+    ) {
+        return connectAsync(
+                host, port, tlsEnabled, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos, DEFAULT_IN_FLIGHT_WINDOW_SIZE
+        );
     }
 
     /**
@@ -291,10 +318,23 @@ public class QwpWebSocketSender implements Sender {
             long autoFlushIntervalNanos,
             int inFlightWindowSize
     ) {
+        return connectAsync(
+                host, port, tlsEnabled, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos, inFlightWindowSize, null
+        );
+    }
+
+    public static QwpWebSocketSender connectAsync(
+            String host,
+            int port,
+            boolean tlsEnabled,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
-                host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
-                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize
+                host, port, tlsEnabled, DEFAULT_BUFFER_SIZE, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader
         );
         sender.ensureConnected();
         return sender;
@@ -309,8 +349,9 @@ public class QwpWebSocketSender implements Sender {
      * @return connected sender
      */
     public static QwpWebSocketSender connectAsync(String host, int port, boolean tlsEnabled) {
-        return connectAsync(host, port, tlsEnabled,
-                DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS);
+        return connectAsync(
+                host, port, tlsEnabled, DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS
+        );
     }
 
     /**
@@ -326,9 +367,7 @@ public class QwpWebSocketSender implements Sender {
      */
     public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
         return new QwpWebSocketSender(
-                host, port, false, DEFAULT_BUFFER_SIZE,
-                DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                inFlightWindowSize
+                host, port, false, DEFAULT_BUFFER_SIZE, DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS, inFlightWindowSize, null
         );
         // Note: does NOT call ensureConnected()
     }
@@ -345,13 +384,15 @@ public class QwpWebSocketSender implements Sender {
      * @return unconnected sender
      */
     public static QwpWebSocketSender createForTesting(
-            String host, int port,
-            int autoFlushRows, int autoFlushBytes, long autoFlushIntervalNanos,
-            int inFlightWindowSize) {
+            String host,
+            int port,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize
+    ) {
         return new QwpWebSocketSender(
-                host, port, false, DEFAULT_BUFFER_SIZE,
-                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize
+                host, port, false, DEFAULT_BUFFER_SIZE, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos, inFlightWindowSize, null
         );
         // Note: does NOT call ensureConnected()
     }
@@ -1012,7 +1053,7 @@ public class QwpWebSocketSender implements Sender {
             // Connect and upgrade to WebSocket
             try {
                 client.connect(host, port);
-                client.upgrade(WRITE_PATH);
+                client.upgrade(WRITE_PATH, authorizationHeader);
             } catch (Exception e) {
                 client.close();
                 client = null;

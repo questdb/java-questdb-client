@@ -27,7 +27,6 @@ package io.questdb.client.test.cutlass.line;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.tools.TestUtils;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -151,8 +150,8 @@ public class LineSenderBuilderTest {
             assertConfStrError("tcp::addr=localhost;token=foo;", "TCP token is configured, but user is missing");
             assertConfStrError("http::addr=localhost;user=foo;", "password cannot be empty nor null");
             assertConfStrError("http::addr=localhost;username=foo;", "password cannot be empty nor null");
-            assertConfStrError("http::addr=localhost;pass=foo;", "HTTP password is configured, but username is missing");
-            assertConfStrError("http::addr=localhost;password=foo;", "HTTP password is configured, but username is missing");
+            assertConfStrError("http::addr=localhost;pass=foo;", "password is configured, but username is missing");
+            assertConfStrError("http::addr=localhost;password=foo;", "password is configured, but username is missing");
             assertConfStrError("tcp::addr=localhost;pass=foo;", "password is not supported for TCP protocol");
             assertConfStrError("tcp::addr=localhost;password=foo;", "password is not supported for TCP protocol");
             assertConfStrError("tcp::addr=localhost;retry_timeout=;", "retry_timeout cannot be empty");

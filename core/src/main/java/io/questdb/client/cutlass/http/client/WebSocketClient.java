@@ -383,10 +383,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     /**
      * Performs WebSocket upgrade handshake.
      *
-     * @param path    the WebSocket endpoint path (e.g., "/ws")
-     * @param timeout timeout in milliseconds
+     * @param path                the WebSocket endpoint path (e.g., "/ws")
+     * @param timeout             timeout in milliseconds
+     * @param authorizationHeader the Authorization header value (e.g., "Basic ..."), or null
      */
-    public void upgrade(CharSequence path, int timeout) {
+    public void upgrade(CharSequence path, int timeout, CharSequence authorizationHeader) {
         if (closed) {
             throw new HttpClientException("WebSocket client is closed");
         }
@@ -422,6 +423,11 @@ public abstract class WebSocketClient implements QuietCloseable {
         sendBuffer.putAscii(handshakeKey);
         sendBuffer.putAscii("\r\n");
         sendBuffer.putAscii("Sec-WebSocket-Version: 13\r\n");
+        if (authorizationHeader != null) {
+            sendBuffer.putAscii("Authorization: ");
+            sendBuffer.putAscii(authorizationHeader);
+            sendBuffer.putAscii("\r\n");
+        }
         sendBuffer.putAscii("\r\n");
 
         // Send request
@@ -441,7 +447,21 @@ public abstract class WebSocketClient implements QuietCloseable {
      * Performs upgrade with default timeout.
      */
     public void upgrade(CharSequence path) {
-        upgrade(path, defaultTimeout);
+        upgrade(path, defaultTimeout, null);
+    }
+
+    /**
+     * Performs upgrade with default timeout and authorization header.
+     */
+    public void upgrade(CharSequence path, CharSequence authorizationHeader) {
+        upgrade(path, defaultTimeout, authorizationHeader);
+    }
+
+    /**
+     * Performs upgrade without authorization header.
+     */
+    public void upgrade(CharSequence path, int timeout) {
+        upgrade(path, timeout, null);
     }
 
     private static String computeAcceptKey(String key) {

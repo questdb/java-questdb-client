@@ -55,7 +55,9 @@ import javax.security.auth.DestroyFailedException;
 import java.io.Closeable;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
 import java.security.PrivateKey;
+import java.util.Base64;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.TimeUnit;
@@ -884,6 +886,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
                 int actualInFlightWindowSize = inFlightWindowSize == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_IN_FLIGHT_WINDOW_SIZE : inFlightWindowSize;
 
+                String wsAuthHeader = buildWebSocketAuthHeader();
+
                 if (asyncMode) {
                     return QwpWebSocketSender.connectAsync(
                             hosts.getQuick(0),
@@ -892,7 +896,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualAutoFlushRows,
                             actualAutoFlushBytes,
                             actualAutoFlushIntervalNanos,
-                            actualInFlightWindowSize
+                            actualInFlightWindowSize,
+                            wsAuthHeader
                     );
                 } else {
                     return QwpWebSocketSender.connect(
@@ -901,7 +906,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             tlsEnabled,
                             actualAutoFlushRows,
                             actualAutoFlushBytes,
-                            actualAutoFlushIntervalNanos
+                            actualAutoFlushIntervalNanos,
+                            wsAuthHeader
                     );
                 }
             }
@@ -1666,15 +1672,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                 } else if (Chars.equals("token", sink)) {
                     pos = getValue(configurationString, pos, sink, "token");
-                    if (protocol == PROTOCOL_TCP) {
+                    if (protocol == PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("token is not supported for WebSocket protocol");
+                    } else if (protocol == PROTOCOL_TCP) {
                         tcpToken = sink.toString();
                         // will configure later, we need to know a keyId first
-                    } else if (protocol == PROTOCOL_HTTP) {
-                        httpToken(sink.toString());
                     } else if (protocol == PROTOCOL_UDP) {
                         throw new LineSenderException("token is not supported for UDP transport");
                     } else {
-                        throw new LineSenderException("token is not supported for WebSocket protocol");
+                        httpToken(sink.toString());
                     }
                 } else if (Chars.equals("retry_timeout", sink)) {
                     pos = getValue(configurationString, pos, sink, "retry_timeout");
@@ -1788,11 +1794,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             } else if (trustStorePassword != null) {
                 throw new LineSenderException("tls_roots_password was configured, but tls_roots is missing");
             }
-            if (protocol == PROTOCOL_HTTP) {
+            if (protocol == PROTOCOL_HTTP || protocol == PROTOCOL_WEBSOCKET) {
                 if (user != null) {
                     httpUsernamePassword(user, password);
                 } else if (password != null) {
-                    throw new LineSenderException("HTTP password is configured, but username is missing");
+                    throw new LineSenderException("password is configured, but username is missing");
                 }
             } else {
                 if (user != null) {
@@ -1935,9 +1941,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (privateKey != null) {
                     throw new LineSenderException("TCP authentication is not supported for WebSocket protocol");
                 }
-                if (httpToken != null || username != null || password != null) {
-                    // TODO: WebSocket auth not yet implemented
-                    throw new LineSenderException("Authentication is not yet supported for WebSocket protocol");
+                if (httpToken != null && (username != null || password != null)) {
+                    throw new LineSenderException("cannot use both token and username/password authentication");
                 }
                 if (inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY && !asyncMode) {
                     throw new LineSenderException("in-flight window size requires async mode");
@@ -1967,6 +1972,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("unsupported protocol ")
                         .put("[protocol=").put(protocol).put("]");
             }
+        }
+
+        private String buildWebSocketAuthHeader() {
+            if (username != null && password != null) {
+                String credentials = username + ":" + password;
+                return "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+            }
+            if (httpToken != null) {
+                return "Bearer " + httpToken;
+            }
+            return null;
         }
 
         private void udp() {
