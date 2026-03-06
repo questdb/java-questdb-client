@@ -1551,7 +1551,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                 } else if (Chars.equals("token", sink)) {
                     pos = getValue(configurationString, pos, sink, "token");
-                    if (protocol == PROTOCOL_TCP) {
+                    if (protocol == PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("token is not supported for WebSocket protocol");
+                    } else if (protocol == PROTOCOL_TCP) {
                         tcpToken = sink.toString();
                         // will configure later, we need to know a keyId first
                     } else {
