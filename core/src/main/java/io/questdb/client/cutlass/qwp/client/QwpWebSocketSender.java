@@ -53,7 +53,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 
 /**
- * ILP v4 WebSocket client sender for streaming data to QuestDB.
+ * QWP v1 WebSocket client sender for streaming data to QuestDB.
  * <p>
  * This sender uses a double-buffering scheme with asynchronous I/O for high throughput:
  * <ul>
@@ -123,7 +123,7 @@ public class QwpWebSocketSender implements Sender {
     // Auto-flush configuration
     private final int autoFlushRows;
     private final Decimal256 currentDecimal256 = new Decimal256();
-    // Encoder for ILP v4 messages
+    // Encoder for QWP v1 messages
     private final QwpWebSocketEncoder encoder;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
@@ -1088,7 +1088,7 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Flushes pending rows by encoding and sending them.
-     * Each table's rows are encoded into a separate ILP v4 message and sent as one WebSocket frame.
+     * Each table's rows are encoded into a separate QWP v1 message and sent as one WebSocket frame.
      */
     private void flushPendingRows() {
         if (pendingRowCount <= 0) {
@@ -1139,7 +1139,7 @@ public class QwpWebSocketSender implements Sender {
                 QwpBufferWriter buffer = encoder.getBuffer();
 
                 // Copy to microbatch buffer and seal immediately
-                // Each ILP v4 message must be in its own WebSocket frame
+                // Each QWP v1 message must be in its own WebSocket frame
                 activeBuffer.ensureCapacity(messageSize);
                 activeBuffer.write(buffer.getBufferPtr(), messageSize);
                 activeBuffer.incrementRowCount();

@@ -486,7 +486,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Use WebSocket transport to communicate with a QuestDB server.
          * <p>
-         * WebSocket transport uses the ILP v4 binary protocol for efficient data ingestion.
+         * WebSocket transport uses the QWP v1 binary protocol for efficient data ingestion.
          * It supports both synchronous and asynchronous modes with flow control.
          */
         WEBSOCKET
@@ -1490,6 +1490,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             throw new LineSenderException(t);
         }
 
+        private String buildWebSocketAuthHeader() {
+            if (username != null && password != null) {
+                String credentials = username + ":" + password;
+                return "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+            }
+            if (httpToken != null) {
+                return "Bearer " + httpToken;
+            }
+            return null;
+        }
+
         private void configureDefaults() {
             if (protocol == PARAMETER_NOT_SET_EXPLICITLY) {
                 protocol = PROTOCOL_TCP;
@@ -1972,17 +1983,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("unsupported protocol ")
                         .put("[protocol=").put(protocol).put("]");
             }
-        }
-
-        private String buildWebSocketAuthHeader() {
-            if (username != null && password != null) {
-                String credentials = username + ":" + password;
-                return "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
-            }
-            if (httpToken != null) {
-                return "Bearer " + httpToken;
-            }
-            return null;
         }
 
         private void udp() {

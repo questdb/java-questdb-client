@@ -27,10 +27,10 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 
 /**
- * Buffer writer interface for ILP v4 message encoding.
+ * Buffer writer interface for QWP v1 message encoding.
  * <p>
  * This interface extends {@link ArrayBufferAppender} with additional methods
- * required for encoding ILP v4 messages, including varint encoding, string
+ * required for encoding QWP v1 messages, including varint encoding, string
  * handling, and buffer manipulation.
  * <p>
  * Implementations include:

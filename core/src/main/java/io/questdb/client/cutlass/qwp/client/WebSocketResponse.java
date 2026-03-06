@@ -29,7 +29,7 @@ import io.questdb.client.std.Unsafe;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Binary response format for WebSocket ILP v4 protocol.
+ * Binary response format for WebSocket QWP v1 protocol.
  * <p>
  * Response format (little-endian):
  * <pre>
