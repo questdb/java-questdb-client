@@ -34,7 +34,7 @@ import io.questdb.client.std.Unsafe;
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 /**
- * Encodes ILP v4 messages for WebSocket transport.
+ * Encodes QWP v1 messages for WebSocket transport.
  * <p>
  * This encoder reads column data from off-heap {@link io.questdb.client.cutlass.qwp.protocol.OffHeapAppendMemory}
  * buffers in {@link QwpTableBuffer.ColumnBuffer} and uses bulk {@code putBlockOfBytes} for fixed-width

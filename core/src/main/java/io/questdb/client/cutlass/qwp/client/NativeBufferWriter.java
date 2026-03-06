@@ -29,7 +29,7 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 
 /**
- * A simple native memory buffer writer for encoding ILP v4 messages.
+ * A simple native memory buffer writer for encoding QWP v1 messages.
  * <p>
  * This class provides write methods similar to HttpClient.Request but writes
  * to a native memory buffer that can be sent over WebSocket.

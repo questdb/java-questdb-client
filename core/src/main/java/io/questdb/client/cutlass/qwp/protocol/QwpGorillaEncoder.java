@@ -28,7 +28,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.Unsafe;
 
 /**
- * Gorilla delta-of-delta encoder for timestamps in ILP v4 format.
+ * Gorilla delta-of-delta encoder for timestamps in QWP v1 format.
  * <p>
  * This encoder is used by the WebSocket encoder to compress timestamp columns.
  * It uses delta-of-delta compression where:
