@@ -29,10 +29,11 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.AbstractTest;
 import io.questdb.client.test.tools.TestUtils;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * Tests for WebSocket transport support in the Sender.builder() API.
@@ -650,7 +651,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     public void testWsConfigString_withToken() throws Exception {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
-            assertBadConfig("ws::addr=localhost:" + port + ";token=mytoken;", "connect", "Failed");
+            assertBadConfig("ws::addr=localhost:" + port + ";token=mytoken;", "token is not supported");
         });
     }
 
