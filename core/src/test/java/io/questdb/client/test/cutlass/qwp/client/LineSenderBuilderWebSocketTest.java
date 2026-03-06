@@ -361,22 +361,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testHttpToken_fails() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .httpToken("token"),
-                "not yet supported");
-    }
-
-    @Test
-    @Ignore("HTTP token authentication is not yet supported for WebSocket protocol")
-    public void testHttpToken_notYetSupported() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .httpToken("token"),
-                "not yet supported");
+    public void testHttpToken_accepted() {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .httpToken("token");
+        Assert.assertNotNull(builder);
     }
 
     @Test
@@ -616,22 +605,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testUsernamePassword_fails() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .httpUsernamePassword("user", "pass"),
-                "not yet supported");
-    }
-
-    @Test
-    @Ignore("Username/password authentication is not yet supported for WebSocket protocol")
-    public void testUsernamePassword_notYetSupported() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .httpUsernamePassword("user", "pass"),
-                "not yet supported");
+    public void testUsernamePassword_accepted() {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .httpUsernamePassword("user", "pass");
+        Assert.assertNotNull(builder);
     }
 
     @Test
@@ -669,15 +647,19 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    @Ignore("Token authentication in ws config string is not yet supported")
-    public void testWsConfigString_withToken_notYetSupported() {
-        assertBadConfig("ws::addr=localhost:9000;token=mytoken;", "not yet supported");
+    public void testWsConfigString_withToken() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertBadConfig("ws::addr=localhost:" + port + ";token=mytoken;", "connect", "Failed");
+        });
     }
 
     @Test
-    @Ignore("Username/password in ws config string is not yet supported")
-    public void testWsConfigString_withUsernamePassword_notYetSupported() {
-        assertBadConfig("ws::addr=localhost:9000;username=user;password=pass;", "not yet supported");
+    public void testWsConfigString_withUsernamePassword() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertBadConfig("ws::addr=localhost:" + port + ";username=user;password=pass;", "connect", "Failed");
+        });
     }
 
     @Test
