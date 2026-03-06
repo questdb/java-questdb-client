@@ -85,4 +85,10 @@ public final class UdpLineChannel implements LineChannel {
             throw new LineSenderException("send error").errno(nf.errno());
         }
     }
+
+    public void sendSegments(long segmentsPtr, int segmentCount, int totalLen) {
+        if (nf.sendToRawScatter(fd, segmentsPtr, segmentCount, sockaddr) != totalLen) {
+            throw new LineSenderException("send error").errno(nf.errno());
+        }
+    }
 }

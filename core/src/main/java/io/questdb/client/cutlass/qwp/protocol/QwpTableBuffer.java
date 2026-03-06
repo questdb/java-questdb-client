@@ -1161,6 +1161,10 @@ public class QwpTableBuffer implements QuietCloseable {
             return symbolList != null ? symbolList.size() : 0;
         }
 
+        public boolean hasSymbol(CharSequence value) {
+            return symbolDict != null && symbolDict.get(value) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
+        }
+
         public byte getType() {
             return type;
         }

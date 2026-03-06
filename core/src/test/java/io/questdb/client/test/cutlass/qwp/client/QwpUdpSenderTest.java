@@ -410,6 +410,23 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testSimpleLongRowUsesScatterSendPath() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("t").longColumn("x", 42L).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            Assert.assertEquals(1, nf.scatterSendCount);
+            Assert.assertEquals(0, nf.rawSendCount);
+            Assert.assertTrue("expected multiple segments for header/schema/data", nf.segmentCounts.get(0) > 1);
+            assertRowsEqual(Arrays.asList(decodedRow("t", "x", 42L)), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
     public void testSwitchTableWhileRowInProgressThrowsAndPreservesRows() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -1038,9 +1055,14 @@ public class QwpUdpSenderTest {
     }
 
     private static final class CapturingNetworkFacade extends NetworkFacadeImpl {
+        private static final int SEGMENT_SIZE = 16;
+
         private final List<Integer> lengths = new ArrayList<>();
         private final List<byte[]> packets = new ArrayList<>();
+        private final List<Integer> segmentCounts = new ArrayList<>();
+        private int rawSendCount;
         private int sendCount;
+        private int scatterSendCount;
 
         @Override
         public int close(int fd) {
@@ -1058,8 +1080,37 @@ public class QwpUdpSenderTest {
             Unsafe.getUnsafe().copyMemory(null, lo, packet, Unsafe.BYTE_OFFSET, len);
             packets.add(packet);
             lengths.add(len);
+            rawSendCount++;
             sendCount++;
             return len;
+        }
+
+        @Override
+        public int sendToRawScatter(int fd, long segmentsPtr, int segmentCount, long socketAddress) {
+            int packetLength = 0;
+            long segmentPtr = segmentsPtr;
+            for (int i = 0; i < segmentCount; i++) {
+                packetLength += (int) Unsafe.getUnsafe().getLong(segmentPtr + 8);
+                segmentPtr += SEGMENT_SIZE;
+            }
+
+            byte[] packet = new byte[packetLength];
+            int offset = 0;
+            segmentPtr = segmentsPtr;
+            for (int i = 0; i < segmentCount; i++) {
+                long dataAddress = Unsafe.getUnsafe().getLong(segmentPtr);
+                int dataLength = (int) Unsafe.getUnsafe().getLong(segmentPtr + 8);
+                Unsafe.getUnsafe().copyMemory(null, dataAddress, packet, Unsafe.BYTE_OFFSET + offset, dataLength);
+                offset += dataLength;
+                segmentPtr += SEGMENT_SIZE;
+            }
+
+            packets.add(packet);
+            lengths.add(packetLength);
+            segmentCounts.add(segmentCount);
+            scatterSendCount++;
+            sendCount++;
+            return packetLength;
         }
 
         @Override

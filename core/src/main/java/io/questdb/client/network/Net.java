@@ -122,6 +122,8 @@ public final class Net {
 
     public static native int sendTo(int fd, long ptr, int len, long sockaddr);
 
+    public static native int sendToScatter(int fd, long segmentsPtr, int segmentCount, long sockaddr);
+
     public static native int setKeepAlive0(int fd, int seconds);
 
     public static native int setMulticastInterface(int fd, int ipv4address);
