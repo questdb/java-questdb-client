@@ -677,6 +677,57 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testUtf8StringAndSymbolStagingSupportsCancelAndPacketSizing() throws Exception {
+        assertMemoryLeak(() -> {
+            String msg1 = "Gruesse 東京";
+            String msg2 = "Privet 👋 kosme";
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("utf8", sender -> sender.table("utf8")
+                                    .longColumn("x", 1)
+                                    .symbol("sym", "東京")
+                                    .stringColumn("msg", msg1)
+                                    .atNow(),
+                            "x", 1L,
+                            "sym", "東京",
+                            "msg", msg1),
+                    row("utf8", sender -> sender.table("utf8")
+                                    .longColumn("x", 2)
+                                    .symbol("sym", "Αθηνα")
+                                    .stringColumn("msg", msg2)
+                                    .atNow(),
+                            "x", 2L,
+                            "sym", "Αθηνα",
+                            "msg", msg2)
+            );
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("utf8")
+                        .longColumn("x", 0)
+                        .symbol("sym", "キャンセル")
+                        .stringColumn("msg", "should not ship 👎");
+                sender.cancelRow();
+
+                sender.longColumn("x", 1)
+                        .symbol("sym", "東京")
+                        .stringColumn("msg", msg1)
+                        .atNow();
+                sender.longColumn("x", 2)
+                        .symbol("sym", "Αθηνα")
+                        .stringColumn("msg", msg2)
+                        .atNow();
+                sender.flush();
+            }
+
+            RunResult result = new RunResult(nf.packets, nf.lengths, nf.sendCount);
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
     public void testOversizedRowAfterMidRowSchemaChangeCancelDoesNotLeakSchema() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);

@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.protocol;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.Vect;
 
 /**
  * Lightweight append-only off-heap buffer for columnar data storage.
@@ -102,6 +103,15 @@ public class OffHeapAppendMemory implements QuietCloseable {
         ensureCapacity(1);
         Unsafe.getUnsafe().putByte(appendAddress, value);
         appendAddress++;
+    }
+
+    public void putBlockOfBytes(long from, long len) {
+        if (len <= 0) {
+            return;
+        }
+        ensureCapacity(len);
+        Vect.memcpy(appendAddress, from, len);
+        appendAddress += len;
     }
 
     public void putDouble(double value) {

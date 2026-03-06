@@ -40,6 +40,7 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
+import io.questdb.client.std.str.Utf8s;
 
 import java.util.Arrays;
 
@@ -971,6 +972,21 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
+        public void addStringUtf8(long ptr, int len) {
+            if (len < 0 && nullable) {
+                ensureNullCapacity(size + 1);
+                markNull(size);
+            } else {
+                ensureNullBitmapForNonNull();
+                if (len > 0) {
+                    stringData.putBlockOfBytes(ptr, len);
+                }
+                stringOffsets.putInt((int) stringData.getAppendOffset());
+                valueCount++;
+            }
+            size++;
+        }
+
         public void addSymbol(CharSequence value) {
             if (value == null) {
                 addNull();
@@ -986,6 +1002,14 @@ public class QwpTableBuffer implements QuietCloseable {
             dataBuffer.putInt(idx);
             valueCount++;
             size++;
+        }
+
+        public void addSymbolUtf8(long ptr, int len) {
+            if (len < 0) {
+                addNull();
+                return;
+            }
+            addSymbol(Utf8s.stringFromUtf8Bytes(ptr, ptr + len));
         }
 
         public void addSymbolWithGlobalId(String value, int globalId) {
