@@ -87,23 +87,23 @@ public class QwpUdpSender implements Sender {
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
     private final NativeBufferWriter headerBuffer = new NativeBufferWriter();
     private final int maxDatagramSize;
-    private final SegmentedNativeBufferWriter payloadBuffer = new SegmentedNativeBufferWriter();
+    private final SegmentedNativeBufferWriter payloadWriter = new SegmentedNativeBufferWriter();
     private final NativeRowStaging stagedRow = new NativeRowStaging();
     private final boolean trackDatagramEstimate;
-    private final NativeSegmentList sendSegments = new NativeSegmentList();
+    private final NativeSegmentList datagramSegments = new NativeSegmentList();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
-    private QwpTableBuffer.ColumnBuffer[] touchedColumns = new QwpTableBuffer.ColumnBuffer[8];
+    private QwpTableBuffer.ColumnBuffer[] stagedColumns = new QwpTableBuffer.ColumnBuffer[8];
 
     private QwpTableBuffer.ColumnBuffer cachedTimestampColumn;
     private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
     private boolean closed;
-    private long committedEstimate;
-    private int currentRowColumnCount;
+    private long committedDatagramEstimate;
+    private int stagedRowValueCount;
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
-    private QwpTableBuffer.ColumnBuffer[] missingColumns = new QwpTableBuffer.ColumnBuffer[8];
-    private int missingColumnCount;
-    private int touchedColumnCount;
+    private QwpTableBuffer.ColumnBuffer[] rowFillColumns = new QwpTableBuffer.ColumnBuffer[8];
+    private int rowFillColumnCount;
+    private int stagedColumnCount;
 
     public QwpUdpSender(NetworkFacade nf, int interfaceIPv4, int sendToAddress, int port, int ttl) {
         this(nf, interfaceIPv4, sendToAddress, port, ttl, 0);
@@ -147,7 +147,7 @@ public class QwpUdpSender implements Sender {
     public Sender boolColumn(CharSequence columnName, boolean value) {
         checkNotClosed();
         checkTableSelected();
-        appendBooleanColumn(columnName, value);
+        stageBooleanColumnValue(columnName, value);
         return this;
     }
 
@@ -196,8 +196,8 @@ public class QwpUdpSender implements Sender {
             }
             tableBuffers.clear();
             channel.close();
-            payloadBuffer.close();
-            sendSegments.close();
+            payloadWriter.close();
+            datagramSegments.close();
             headerBuffer.close();
             stagedRow.close();
         }
@@ -210,7 +210,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendDecimal64Column(name, value);
+        stageDecimal64ColumnValue(name, value);
         return this;
     }
 
@@ -221,7 +221,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendDecimal128Column(name, value);
+        stageDecimal128ColumnValue(name, value);
         return this;
     }
 
@@ -232,7 +232,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendDecimal256Column(name, value);
+        stageDecimal256ColumnValue(name, value);
         return this;
     }
 
@@ -243,7 +243,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendDoubleArrayColumn(name, values);
+        stageDoubleArrayColumnValue(name, values);
         return this;
     }
 
@@ -254,7 +254,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendDoubleArrayColumn(name, values);
+        stageDoubleArrayColumnValue(name, values);
         return this;
     }
 
@@ -265,7 +265,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendDoubleArrayColumn(name, values);
+        stageDoubleArrayColumnValue(name, values);
         return this;
     }
 
@@ -276,7 +276,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendDoubleArrayColumn(name, array);
+        stageDoubleArrayColumnValue(name, array);
         return this;
     }
 
@@ -284,7 +284,7 @@ public class QwpUdpSender implements Sender {
     public Sender doubleColumn(CharSequence columnName, double value) {
         checkNotClosed();
         checkTableSelected();
-        appendDoubleColumn(columnName, value);
+        stageDoubleColumnValue(columnName, value);
         return this;
     }
 
@@ -302,7 +302,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendLongArrayColumn(name, values);
+        stageLongArrayColumnValue(name, values);
         return this;
     }
 
@@ -313,7 +313,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendLongArrayColumn(name, values);
+        stageLongArrayColumnValue(name, values);
         return this;
     }
 
@@ -324,7 +324,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendLongArrayColumn(name, values);
+        stageLongArrayColumnValue(name, values);
         return this;
     }
 
@@ -335,7 +335,7 @@ public class QwpUdpSender implements Sender {
         }
         checkNotClosed();
         checkTableSelected();
-        appendLongArrayColumn(name, array);
+        stageLongArrayColumnValue(name, array);
         return this;
     }
 
@@ -343,7 +343,7 @@ public class QwpUdpSender implements Sender {
     public Sender longColumn(CharSequence columnName, long value) {
         checkNotClosed();
         checkTableSelected();
-        appendLongColumn(columnName, value);
+        stageLongColumnValue(columnName, value);
         return this;
     }
 
@@ -363,14 +363,14 @@ public class QwpUdpSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
         clearStagedRow();
-        resetCommittedEstimate();
+        resetCommittedDatagramEstimate();
     }
 
     @Override
     public Sender stringColumn(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        appendStringColumn(columnName, value);
+        stageStringColumnValue(columnName, value);
         return this;
     }
 
@@ -378,7 +378,7 @@ public class QwpUdpSender implements Sender {
     public Sender symbol(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        appendSymbolColumn(columnName, value);
+        stageSymbolColumnValue(columnName, value);
         return this;
     }
 
@@ -395,7 +395,7 @@ public class QwpUdpSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
         clearStagedRow();
-        resetCommittedEstimate();
+        resetCommittedDatagramEstimate();
 
         currentTableName = tableName.toString();
         currentTableBuffer = tableBuffers.get(currentTableName);
@@ -411,10 +411,10 @@ public class QwpUdpSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         if (unit == ChronoUnit.NANOS) {
-            appendTimestampColumn(columnName, TYPE_TIMESTAMP_NANOS, value, ENTRY_TIMESTAMP_COL_NANOS);
+            stageTimestampColumnValue(columnName, TYPE_TIMESTAMP_NANOS, value, ENTRY_TIMESTAMP_COL_NANOS);
         } else {
             long micros = toMicros(value, unit);
-            appendTimestampColumn(columnName, TYPE_TIMESTAMP, micros, ENTRY_TIMESTAMP_COL_MICROS);
+            stageTimestampColumnValue(columnName, TYPE_TIMESTAMP, micros, ENTRY_TIMESTAMP_COL_MICROS);
         }
         return this;
     }
@@ -424,7 +424,7 @@ public class QwpUdpSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
-        appendTimestampColumn(columnName, TYPE_TIMESTAMP, micros, ENTRY_TIMESTAMP_COL_MICROS);
+        stageTimestampColumnValue(columnName, TYPE_TIMESTAMP, micros, ENTRY_TIMESTAMP_COL_MICROS);
         return this;
     }
 
@@ -440,35 +440,35 @@ public class QwpUdpSender implements Sender {
         return col;
     }
 
-    private void appendBooleanColumn(CharSequence name, boolean value) {
+    private void stageBooleanColumnValue(CharSequence name, boolean value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_BOOLEAN, false);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendBoolean(col, value);
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageBoolean(col, value);
     }
 
-    private void appendDecimal128Column(CharSequence name, Decimal128 value) {
+    private void stageDecimal128ColumnValue(CharSequence name, Decimal128 value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DECIMAL128, true);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendDecimal128(col, value);
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageDecimal128(col, value);
     }
 
-    private void appendDecimal256Column(CharSequence name, Decimal256 value) {
+    private void stageDecimal256ColumnValue(CharSequence name, Decimal256 value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DECIMAL256, true);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendDecimal256(col, value);
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageDecimal256(col, value);
     }
 
-    private void appendDecimal64Column(CharSequence name, Decimal64 value) {
+    private void stageDecimal64ColumnValue(CharSequence name, Decimal64 value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DECIMAL64, true);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendDecimal64(col, value);
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageDecimal64(col, value);
     }
 
-    private void appendDesignatedTimestamp(long value, boolean nanos) {
+    private void stageDesignatedTimestampValue(long value, boolean nanos) {
         QwpTableBuffer.ColumnBuffer col;
         if (nanos) {
             if (cachedTimestampNanosColumn == null) {
@@ -481,72 +481,72 @@ public class QwpUdpSender implements Sender {
             }
             col = cachedTimestampColumn;
         }
-        addTouchedColumn(col);
-        stagedRow.appendLong(col, nanos ? ENTRY_AT_NANOS : ENTRY_AT_MICROS, value);
+        addStagedColumn(col);
+        stagedRow.stageLong(col, nanos ? ENTRY_AT_NANOS : ENTRY_AT_MICROS, value);
     }
 
-    private void appendDoubleArrayColumn(CharSequence name, Object value) {
+    private void stageDoubleArrayColumnValue(CharSequence name, Object value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DOUBLE_ARRAY, true);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendDoubleArray(col, value, estimateDoubleArrayPayload(value));
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageDoubleArray(col, value, estimateDoubleArrayPayload(value));
     }
 
-    private void appendDoubleColumn(CharSequence name, double value) {
+    private void stageDoubleColumnValue(CharSequence name, double value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DOUBLE, false);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendDouble(col, value);
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageDouble(col, value);
     }
 
-    private void appendLongArrayColumn(CharSequence name, Object value) {
+    private void stageLongArrayColumnValue(CharSequence name, Object value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_LONG_ARRAY, true);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendLongArray(col, value, estimateLongArrayPayload(value));
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageLongArray(col, value, estimateLongArrayPayload(value));
     }
 
-    private void appendLongColumn(CharSequence name, long value) {
+    private void stageLongColumnValue(CharSequence name, long value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_LONG, false);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendLong(col, ENTRY_LONG, value);
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageLong(col, ENTRY_LONG, value);
     }
 
-    private void appendStringColumn(CharSequence name, CharSequence value) {
+    private void stageStringColumnValue(CharSequence name, CharSequence value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_STRING, true);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendUtf8(col, ENTRY_STRING, value, 0);
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageUtf8(col, ENTRY_STRING, value, 0);
     }
 
-    private void appendSymbolColumn(CharSequence name, CharSequence value) {
+    private void stageSymbolColumnValue(CharSequence name, CharSequence value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_SYMBOL, true);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendUtf8(col, ENTRY_SYMBOL, value, estimateSymbolPayloadDelta(col, col.getValueCount(), value));
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageUtf8(col, ENTRY_SYMBOL, value, estimateSymbolPayloadDelta(col, col.getValueCount(), value));
     }
 
-    private void appendTimestampColumn(CharSequence name, byte type, long value, byte journalKind) {
+    private void stageTimestampColumnValue(CharSequence name, byte type, long value, byte entryKind) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, type, true);
-        currentRowColumnCount++;
-        addTouchedColumn(col);
-        stagedRow.appendLong(col, journalKind, value);
+        stagedRowValueCount++;
+        addStagedColumn(col);
+        stagedRow.stageLong(col, entryKind, value);
     }
 
     private void atMicros(long timestampMicros) {
-        if (currentRowColumnCount == 0) {
+        if (stagedRowValueCount == 0) {
             throw new LineSenderException("no columns were provided");
         }
-        appendDesignatedTimestamp(timestampMicros, false);
+        stageDesignatedTimestampValue(timestampMicros, false);
         commitCurrentRow();
     }
 
     private void atNanos(long timestampNanos) {
-        if (currentRowColumnCount == 0) {
+        if (stagedRowValueCount == 0) {
             throw new LineSenderException("no columns were provided");
         }
-        appendDesignatedTimestamp(timestampNanos, true);
+        stageDesignatedTimestampValue(timestampNanos, true);
         commitCurrentRow();
     }
 
@@ -564,34 +564,34 @@ public class QwpUdpSender implements Sender {
 
     private void clearStagedRow() {
         stagedRow.clear();
-        currentRowColumnCount = 0;
-        touchedColumnCount = 0;
-        missingColumnCount = 0;
+        stagedRowValueCount = 0;
+        stagedColumnCount = 0;
+        rowFillColumnCount = 0;
     }
 
-    private void collectMissingColumns(int targetRows) {
-        missingColumnCount = 0;
+    private void collectRowFillColumns(int targetRows) {
+        rowFillColumnCount = 0;
         for (int i = 0, n = currentTableBuffer.getColumnCount(); i < n; i++) {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getColumn(i);
-            if (isTouchedColumn(col)) {
+            if (isStagedColumn(col)) {
                 continue;
             }
             if (col.getSize() >= targetRows) {
                 continue;
             }
-            ensureMissingColumnCapacity(missingColumnCount + 1);
-            missingColumns[missingColumnCount++] = col;
+            ensureRowFillColumnCapacity(rowFillColumnCount + 1);
+            rowFillColumns[rowFillColumnCount++] = col;
         }
     }
 
     private void commitCurrentRow() {
-        if (currentRowColumnCount == 0) {
+        if (stagedRowValueCount == 0) {
             throw new LineSenderException("no columns were provided");
         }
 
         long estimate = 0;
         int targetRows = currentTableBuffer.getRowCount() + 1;
-        collectMissingColumns(targetRows);
+        collectRowFillColumns(targetRows);
         if (trackDatagramEstimate) {
             estimate = estimateCurrentDatagramSizeWithStagedRow(targetRows);
             if (estimate > maxDatagramSize) {
@@ -600,7 +600,7 @@ public class QwpUdpSender implements Sender {
                 }
                 flushCommittedRowsOfCurrentTable();
                 targetRows = currentTableBuffer.getRowCount() + 1;
-                collectMissingColumns(targetRows);
+                collectRowFillColumns(targetRows);
                 estimate = estimateCurrentDatagramSizeWithStagedRow(targetRows);
                 if (estimate > maxDatagramSize) {
                     throw singleRowTooLarge(estimate);
@@ -608,9 +608,9 @@ public class QwpUdpSender implements Sender {
             }
         }
 
-        materializeCurrentRow();
+        commitStagedRow();
         if (trackDatagramEstimate) {
-            committedEstimate = estimate;
+            committedDatagramEstimate = estimate;
         }
         clearStagedRow();
     }
@@ -624,12 +624,12 @@ public class QwpUdpSender implements Sender {
         }
     }
 
-    private int encodePayloadForUdp(QwpTableBuffer tableBuffer) {
-        payloadBuffer.reset();
-        columnWriter.setBuffer(payloadBuffer);
+    private int encodeTablePayloadForUdp(QwpTableBuffer tableBuffer) {
+        payloadWriter.reset();
+        columnWriter.setBuffer(payloadWriter);
         columnWriter.encodeTable(tableBuffer, false, false, false);
-        payloadBuffer.finish();
-        return payloadBuffer.getPosition();
+        payloadWriter.finish();
+        return payloadWriter.getPosition();
     }
 
     private long estimateArrayValueSize(int nDims, long elementCount) {
@@ -676,16 +676,16 @@ public class QwpUdpSender implements Sender {
     }
 
     private long estimateCurrentDatagramSizeWithStagedRow(int targetRows) {
-        long estimate = currentTableBuffer.getRowCount() > 0 ? committedEstimate : estimateBaseForCurrentSchema();
+        long estimate = currentTableBuffer.getRowCount() > 0 ? committedDatagramEstimate : estimateBaseForCurrentSchema();
         for (int i = 0, n = stagedRow.size(); i < n; i++) {
             QwpTableBuffer.ColumnBuffer col = stagedRow.getColumn(i);
-            estimate += estimateEntryPayload(i, col);
+            estimate += estimateStagedEntryPayload(i, col);
             if (col.isNullable()) {
                 estimate += bitmapBytes(targetRows) - bitmapBytes(col.getSize());
             }
         }
-        for (int i = 0; i < missingColumnCount; i++) {
-            QwpTableBuffer.ColumnBuffer col = missingColumns[i];
+        for (int i = 0; i < rowFillColumnCount; i++) {
+            QwpTableBuffer.ColumnBuffer col = rowFillColumns[i];
             int missing = targetRows - col.getSize();
             if (col.isNullable()) {
                 estimate += bitmapBytes(targetRows) - bitmapBytes(col.getSize());
@@ -696,7 +696,7 @@ public class QwpUdpSender implements Sender {
         return estimate;
     }
 
-    private long estimateEntryPayload(int entryIndex, QwpTableBuffer.ColumnBuffer col) {
+    private long estimateStagedEntryPayload(int entryIndex, QwpTableBuffer.ColumnBuffer col) {
         int valueCountBefore = col.getValueCount();
         return switch (stagedRow.getKind(entryIndex)) {
             case ENTRY_AT_MICROS, ENTRY_AT_NANOS, ENTRY_DOUBLE, ENTRY_LONG,
@@ -754,34 +754,34 @@ public class QwpUdpSender implements Sender {
         throw new LineSenderException("unsupported long array type");
     }
 
-    private void ensureMissingColumnCapacity(int required) {
-        if (required <= missingColumns.length) {
+    private void ensureRowFillColumnCapacity(int required) {
+        if (required <= rowFillColumns.length) {
             return;
         }
 
-        int newCapacity = missingColumns.length;
+        int newCapacity = rowFillColumns.length;
         while (newCapacity < required) {
             newCapacity *= 2;
         }
 
         QwpTableBuffer.ColumnBuffer[] newArr = new QwpTableBuffer.ColumnBuffer[newCapacity];
-        System.arraycopy(missingColumns, 0, newArr, 0, missingColumnCount);
-        missingColumns = newArr;
+        System.arraycopy(rowFillColumns, 0, newArr, 0, rowFillColumnCount);
+        rowFillColumns = newArr;
     }
 
-    private void ensureTouchedColumnCapacity(int required) {
-        if (required <= touchedColumns.length) {
+    private void ensureStagedColumnCapacity(int required) {
+        if (required <= stagedColumns.length) {
             return;
         }
 
-        int newCapacity = touchedColumns.length;
+        int newCapacity = stagedColumns.length;
         while (newCapacity < required) {
             newCapacity *= 2;
         }
 
         QwpTableBuffer.ColumnBuffer[] newArr = new QwpTableBuffer.ColumnBuffer[newCapacity];
-        System.arraycopy(touchedColumns, 0, newArr, 0, touchedColumnCount);
-        touchedColumns = newArr;
+        System.arraycopy(stagedColumns, 0, newArr, 0, stagedColumnCount);
+        stagedColumns = newArr;
     }
 
     private long estimateSymbolPayloadDelta(QwpTableBuffer.ColumnBuffer col, int valueCountBefore, CharSequence value) {
@@ -820,7 +820,7 @@ public class QwpUdpSender implements Sender {
         sendTableBuffer(currentTableName, currentTableBuffer);
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
-        resetCommittedEstimate();
+        resetCommittedDatagramEstimate();
     }
 
     private void flushInternal() {
@@ -839,7 +839,7 @@ public class QwpUdpSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
         clearStagedRow();
-        resetCommittedEstimate();
+        resetCommittedDatagramEstimate();
     }
 
     private void flushSingleTable(String tableName, QwpTableBuffer tableBuffer) {
@@ -847,35 +847,35 @@ public class QwpUdpSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
         clearStagedRow();
-        resetCommittedEstimate();
+        resetCommittedDatagramEstimate();
     }
 
     private boolean hasInProgressRow() {
         return stagedRow.size() > 0;
     }
 
-    private boolean isTouchedColumn(QwpTableBuffer.ColumnBuffer col) {
-        for (int i = 0; i < touchedColumnCount; i++) {
-            if (touchedColumns[i] == col) {
+    private boolean isStagedColumn(QwpTableBuffer.ColumnBuffer col) {
+        for (int i = 0; i < stagedColumnCount; i++) {
+            if (stagedColumns[i] == col) {
                 return true;
             }
         }
         return false;
     }
 
-    private void addTouchedColumn(QwpTableBuffer.ColumnBuffer col) {
-        if (isTouchedColumn(col)) {
+    private void addStagedColumn(QwpTableBuffer.ColumnBuffer col) {
+        if (isStagedColumn(col)) {
             return;
         }
-        ensureTouchedColumnCapacity(touchedColumnCount + 1);
-        touchedColumns[touchedColumnCount++] = col;
+        ensureStagedColumnCapacity(stagedColumnCount + 1);
+        stagedColumns[stagedColumnCount++] = col;
     }
 
-    private void materializeCurrentRow() {
-        stagedRow.materializeInto(currentTableBuffer, missingColumns, missingColumnCount);
+    private void commitStagedRow() {
+        stagedRow.commitIntoTableBuffer(currentTableBuffer, rowFillColumns, rowFillColumnCount);
     }
 
-    private static void appendDoubleArrayValue(QwpTableBuffer.ColumnBuffer col, Object value) {
+    private static void commitDoubleArrayValue(QwpTableBuffer.ColumnBuffer col, Object value) {
         if (value instanceof double[] values) {
             col.addDoubleArray(values);
         } else if (value instanceof double[][] values) {
@@ -889,7 +889,7 @@ public class QwpUdpSender implements Sender {
         }
     }
 
-    private static void appendLongArrayValue(QwpTableBuffer.ColumnBuffer col, Object value) {
+    private static void commitLongArrayValue(QwpTableBuffer.ColumnBuffer col, Object value) {
         if (value instanceof long[] values) {
             col.addLongArray(values);
         } else if (value instanceof long[][] values) {
@@ -926,12 +926,12 @@ public class QwpUdpSender implements Sender {
         return (valueCount + 7) / 8;
     }
 
-    private void resetCommittedEstimate() {
-        committedEstimate = 0;
+    private void resetCommittedDatagramEstimate() {
+        committedDatagramEstimate = 0;
     }
 
     private void sendTableBuffer(CharSequence tableName, QwpTableBuffer tableBuffer) {
-        int payloadLength = encodePayloadForUdp(tableBuffer);
+        int payloadLength = encodeTablePayloadForUdp(tableBuffer);
         headerBuffer.reset();
         headerBuffer.putByte((byte) 'Q');
         headerBuffer.putByte((byte) 'W');
@@ -942,15 +942,15 @@ public class QwpUdpSender implements Sender {
         headerBuffer.putShort((short) 1);
         headerBuffer.putInt(payloadLength);
 
-        sendSegments.reset();
-        sendSegments.add(headerBuffer.getBufferPtr(), headerBuffer.getPosition());
-        sendSegments.appendFrom(payloadBuffer.getSegments());
+        datagramSegments.reset();
+        datagramSegments.add(headerBuffer.getBufferPtr(), headerBuffer.getPosition());
+        datagramSegments.appendFrom(payloadWriter.getSegments());
 
         try {
             channel.sendSegments(
-                    sendSegments.getAddress(),
-                    sendSegments.getSegmentCount(),
-                    (int) sendSegments.getTotalLength()
+                    datagramSegments.getAddress(),
+                    datagramSegments.getSegmentCount(),
+                    (int) datagramSegments.getTotalLength()
             );
         } catch (LineSenderException e) {
             LOG.warn("UDP send failed [table={}, errno={}]: {}", tableName, channel.errno(), String.valueOf(e));
@@ -1055,16 +1055,16 @@ public class QwpUdpSender implements Sender {
         private int size;
         private Object[] sidecarObjects = new Object[8];
 
-        void appendBoolean(QwpTableBuffer.ColumnBuffer column, boolean value) {
-            appendEntry(column, null, ENTRY_BOOL, 0, value ? 1 : 0, 0, 0, 0);
+        void stageBoolean(QwpTableBuffer.ColumnBuffer column, boolean value) {
+            stageEntry(column, null, ENTRY_BOOL, 0, value ? 1 : 0, 0, 0, 0);
         }
 
-        void appendDecimal128(QwpTableBuffer.ColumnBuffer column, Decimal128 value) {
-            appendEntry(column, null, ENTRY_DECIMAL128, value.getScale(), value.getHigh(), value.getLow(), 0, 0);
+        void stageDecimal128(QwpTableBuffer.ColumnBuffer column, Decimal128 value) {
+            stageEntry(column, null, ENTRY_DECIMAL128, value.getScale(), value.getHigh(), value.getLow(), 0, 0);
         }
 
-        void appendDecimal256(QwpTableBuffer.ColumnBuffer column, Decimal256 value) {
-            appendEntry(
+        void stageDecimal256(QwpTableBuffer.ColumnBuffer column, Decimal256 value) {
+            stageEntry(
                     column,
                     null,
                     ENTRY_DECIMAL256,
@@ -1076,27 +1076,27 @@ public class QwpUdpSender implements Sender {
             );
         }
 
-        void appendDecimal64(QwpTableBuffer.ColumnBuffer column, Decimal64 value) {
-            appendEntry(column, null, ENTRY_DECIMAL64, value.getScale(), value.getValue(), 0, 0, 0);
+        void stageDecimal64(QwpTableBuffer.ColumnBuffer column, Decimal64 value) {
+            stageEntry(column, null, ENTRY_DECIMAL64, value.getScale(), value.getValue(), 0, 0, 0);
         }
 
-        void appendDouble(QwpTableBuffer.ColumnBuffer column, double value) {
-            appendEntry(column, null, ENTRY_DOUBLE, 0, Double.doubleToRawLongBits(value), 0, 0, 0);
+        void stageDouble(QwpTableBuffer.ColumnBuffer column, double value) {
+            stageEntry(column, null, ENTRY_DOUBLE, 0, Double.doubleToRawLongBits(value), 0, 0, 0);
         }
 
-        void appendDoubleArray(QwpTableBuffer.ColumnBuffer column, Object value, long estimatePayload) {
-            appendEntry(column, value, ENTRY_DOUBLE_ARRAY, 0, estimatePayload, 0, 0, 0);
+        void stageDoubleArray(QwpTableBuffer.ColumnBuffer column, Object value, long estimatePayload) {
+            stageEntry(column, value, ENTRY_DOUBLE_ARRAY, 0, estimatePayload, 0, 0, 0);
         }
 
-        void appendLong(QwpTableBuffer.ColumnBuffer column, int kind, long value) {
-            appendEntry(column, null, kind, 0, value, 0, 0, 0);
+        void stageLong(QwpTableBuffer.ColumnBuffer column, int kind, long value) {
+            stageEntry(column, null, kind, 0, value, 0, 0, 0);
         }
 
-        void appendLongArray(QwpTableBuffer.ColumnBuffer column, Object value, long estimatePayload) {
-            appendEntry(column, value, ENTRY_LONG_ARRAY, 0, estimatePayload, 0, 0, 0);
+        void stageLongArray(QwpTableBuffer.ColumnBuffer column, Object value, long estimatePayload) {
+            stageEntry(column, value, ENTRY_LONG_ARRAY, 0, estimatePayload, 0, 0, 0);
         }
 
-        void appendUtf8(QwpTableBuffer.ColumnBuffer column, int kind, CharSequence value, long long1) {
+        void stageUtf8(QwpTableBuffer.ColumnBuffer column, int kind, CharSequence value, long long1) {
             int len = -1;
             long offset = 0;
             if (value != null) {
@@ -1104,7 +1104,7 @@ public class QwpUdpSender implements Sender {
                 varData.putUtf8(value);
                 len = (int) (varData.getAppendOffset() - offset);
             }
-            appendEntry(column, null, kind, len, offset, long1, 0, 0);
+            stageEntry(column, null, kind, len, offset, long1, 0, 0);
         }
 
         void clear() {
@@ -1142,7 +1142,7 @@ public class QwpUdpSender implements Sender {
             return Unsafe.getUnsafe().getLong(entryAddress(index) + LONG1_OFFSET);
         }
 
-        void materializeInto(QwpTableBuffer tableBuffer, QwpTableBuffer.ColumnBuffer[] missingColumns, int missingColumnCount) {
+        void commitIntoTableBuffer(QwpTableBuffer tableBuffer, QwpTableBuffer.ColumnBuffer[] rowFillColumns, int rowFillColumnCount) {
             for (int i = 0; i < size; i++) {
                 QwpTableBuffer.ColumnBuffer column = columns[i];
                 long entryAddress = entryAddress(i);
@@ -1175,8 +1175,8 @@ public class QwpUdpSender implements Sender {
                         column.addDecimal256(decimal256Sink);
                     }
                     case ENTRY_DOUBLE -> column.addDouble(Double.longBitsToDouble(long0));
-                    case ENTRY_DOUBLE_ARRAY -> appendDoubleArrayValue(column, sidecarObjects[i]);
-                    case ENTRY_LONG_ARRAY -> appendLongArrayValue(column, sidecarObjects[i]);
+                    case ENTRY_DOUBLE_ARRAY -> commitDoubleArrayValue(column, sidecarObjects[i]);
+                    case ENTRY_LONG_ARRAY -> commitLongArrayValue(column, sidecarObjects[i]);
                     case ENTRY_STRING -> column.addStringUtf8(varData.addressOf(long0), auxInt);
                     case ENTRY_SYMBOL -> {
                         if (auxInt < 0) {
@@ -1188,14 +1188,14 @@ public class QwpUdpSender implements Sender {
                     default -> throw new LineSenderException("unknown staged row entry type: " + kind);
                 }
             }
-            tableBuffer.nextRow(missingColumns, missingColumnCount);
+            tableBuffer.nextRow(rowFillColumns, rowFillColumnCount);
         }
 
         int size() {
             return size;
         }
 
-        private void appendEntry(
+        private void stageEntry(
                 QwpTableBuffer.ColumnBuffer column,
                 Object sidecarObject,
                 int kind,
