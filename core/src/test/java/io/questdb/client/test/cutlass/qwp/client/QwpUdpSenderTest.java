@@ -137,6 +137,74 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testUnboundedSenderOmittedNullableAndNonNullableColumnsPreservesRows() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", "alpha")
+                                    .symbol("sym", "one")
+                                    .atNow(),
+                            "x", 1L,
+                            "s", "alpha",
+                            "sym", "one"),
+                    row("t", sender -> sender.table("t")
+                                    .stringColumn("s", "beta")
+                                    .atNow(),
+                            "x", Long.MIN_VALUE,
+                            "s", "beta",
+                            "sym", null),
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 3)
+                                    .atNow(),
+                            "x", 3L,
+                            "s", null,
+                            "sym", null)
+            );
+
+            RunResult result = runScenario(rows, 0);
+
+            Assert.assertEquals(1, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderOmittedNonNullableColumnsPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            String alpha = repeat('a', 256);
+            String beta = repeat('b', 192);
+            String omega = repeat('z', 256);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("mix", sender -> sender.table("mix")
+                                    .longColumn("x", 1)
+                                    .stringColumn("msg", alpha)
+                                    .atNow(),
+                            "x", 1L,
+                            "msg", alpha),
+                    row("mix", sender -> sender.table("mix")
+                                    .stringColumn("msg", beta)
+                                    .atNow(),
+                            "x", Long.MIN_VALUE,
+                            "msg", beta),
+                    row("mix", sender -> sender.table("mix")
+                                    .longColumn("x", 3)
+                                    .stringColumn("msg", omega)
+                                    .atNow(),
+                            "x", 3L,
+                            "msg", omega)
+            );
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
     public void testBoundedSenderArrayReplayPreservesRowsAndPacketLimit() throws Exception {
         assertMemoryLeak(() -> {
             long[] longValues = new long[128];
@@ -548,6 +616,40 @@ public class QwpUdpSenderTest {
             RunResult result = runScenario(rows, 1024 * 1024);
 
             Assert.assertEquals(2, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderSchemaFlushThenOmittedNullableColumnsPreservesRows() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("schema", sender -> sender.table("schema")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", "alpha")
+                                    .atNow(),
+                            "x", 1L,
+                            "s", "alpha"),
+                    row("schema", sender -> sender.table("schema")
+                                    .symbol("sym", "new")
+                                    .longColumn("x", 2)
+                                    .stringColumn("s", "beta")
+                                    .atNow(),
+                            "sym", "new",
+                            "x", 2L,
+                            "s", "beta"),
+                    row("schema", sender -> sender.table("schema")
+                                    .longColumn("x", 3)
+                                    .atNow(),
+                            "sym", null,
+                            "x", 3L,
+                            "s", null)
+            );
+
+            RunResult result = runScenario(rows, 1024 * 1024);
+
+            Assert.assertEquals(2, result.sendCount);
+            assertPacketsWithinLimit(result, 1024 * 1024);
             assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }

@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal64;
 import org.junit.Test;
@@ -298,13 +299,15 @@ public class QwpTableBufferTest {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
                 QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer colC = table.getOrCreateColumn("c", QwpConstants.TYPE_LONG, false);
 
                 colA.addLong(10);
                 colB.addString("x");
+                colC.addLong(100);
                 table.nextRow();
 
                 colA.addLong(20);
-                table.nextRow(new QwpTableBuffer.ColumnBuffer[]{colB}, 1);
+                table.nextRow(new QwpTableBuffer.ColumnBuffer[]{colB, colC}, 2);
 
                 assertEquals(2, colA.getSize());
                 assertEquals(2, colA.getValueCount());
@@ -312,6 +315,10 @@ public class QwpTableBufferTest {
                 assertEquals(1, colB.getValueCount());
                 assertFalse(colB.isNull(0));
                 assertTrue(colB.isNull(1));
+                assertEquals(2, colC.getSize());
+                assertEquals(2, colC.getValueCount());
+                assertEquals(100L, Unsafe.getUnsafe().getLong(colC.getDataAddress()));
+                assertEquals(Long.MIN_VALUE, Unsafe.getUnsafe().getLong(colC.getDataAddress() + Long.BYTES));
             }
         });
     }
