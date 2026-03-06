@@ -149,8 +149,14 @@ public class QwpTableBuffer implements QuietCloseable {
         return columns.size();
     }
 
-    public boolean hasColumn(CharSequence name) {
-        return columnNameToIndex.get(name) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
+    /**
+     * Returns an existing column with the given name and type, or {@code null} if absent.
+     * <p>
+     * Uses the same sequential access optimization as {@link #getOrCreateColumn(CharSequence, byte, boolean)}.
+     * When the next expected column is accessed in order, the internal cursor advances without a hash lookup.
+     */
+    public ColumnBuffer getExistingColumn(CharSequence name, byte type) {
+        return lookupColumn(name, type);
     }
 
     /**
@@ -175,36 +181,15 @@ public class QwpTableBuffer implements QuietCloseable {
      * order every row: a sequential cursor avoids hash map lookups entirely.
      */
     public ColumnBuffer getOrCreateColumn(CharSequence name, byte type, boolean nullable) {
-        // Fast path: predict next column in sequence
-        int n = columns.size();
-        if (columnAccessCursor < n) {
-            ColumnBuffer candidate = fastColumns[columnAccessCursor];
-            if (Chars.equals(candidate.name, name)) {
-                columnAccessCursor++;
-                if (candidate.type != type) {
-                    throw new LineSenderException(
-                            "Column type mismatch for column '" + name + "': columnType="
-                                    + candidate.type + ", sentType=" + type
-                    );
-                }
-                return candidate;
-            }
-        }
-
-        // Slow path: hash map lookup
-        int idx = columnNameToIndex.get(name);
-        if (idx != CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-            ColumnBuffer existing = columns.get(idx);
-            if (existing.type != type) {
-                throw new LineSenderException(
-                        "Column type mismatch for column '" + name + "': columnType="
-                                + existing.type + ", sentType=" + type
-                );
-            }
+        ColumnBuffer existing = lookupColumn(name, type);
+        if (existing != null) {
             return existing;
         }
 
-        // Create new column
+        return createColumn(name, type, nullable);
+    }
+
+    private ColumnBuffer createColumn(CharSequence name, byte type, boolean nullable) {
         ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
         int index = columns.size();
         columns.add(col);
@@ -222,6 +207,38 @@ public class QwpTableBuffer implements QuietCloseable {
         schemaHashComputed = false;
         columnDefsCacheValid = false;
         return col;
+    }
+
+    private ColumnBuffer lookupColumn(CharSequence name, byte type) {
+        // Fast path: predict next column in sequence
+        int n = columns.size();
+        if (columnAccessCursor < n) {
+            ColumnBuffer candidate = fastColumns[columnAccessCursor];
+            if (Chars.equals(candidate.name, name)) {
+                columnAccessCursor++;
+                assertColumnType(name, type, candidate);
+                return candidate;
+            }
+        }
+
+        // Slow path: hash map lookup
+        int idx = columnNameToIndex.get(name);
+        if (idx != CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+            ColumnBuffer existing = columns.get(idx);
+            assertColumnType(name, type, existing);
+            return existing;
+        }
+
+        return null;
+    }
+
+    private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {
+        if (column.type != type) {
+            throw new LineSenderException(
+                    "Column type mismatch for column '" + name + "': columnType="
+                            + column.type + ", sentType=" + type
+            );
+        }
     }
 
     /**

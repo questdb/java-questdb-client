@@ -701,6 +701,183 @@ public class QwpTableBufferTest {
         });
     }
 
+    @Test
+    public void testGetExistingColumnReturnsOrderedColumnsAcrossRows() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                colA.addLong(1);
+                colB.addString("x");
+                table.nextRow();
+
+                QwpTableBuffer.ColumnBuffer existingA = table.getExistingColumn("a", QwpConstants.TYPE_LONG);
+                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_STRING);
+
+                assertSame(colA, existingA);
+                assertSame(colB, existingB);
+
+                existingA.addLong(2);
+                existingB.addString("y");
+                table.nextRow();
+
+                assertEquals(2, table.getRowCount());
+                assertEquals(2, colA.getSize());
+                assertEquals(2, colA.getValueCount());
+                assertEquals(2, colB.getSize());
+                assertEquals(2, colB.getValueCount());
+            }
+        });
+    }
+
+    @Test
+    public void testGetExistingColumnReturnsOutOfOrderColumns() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                colA.addLong(1);
+                colB.addString("x");
+                table.nextRow();
+
+                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_STRING);
+                QwpTableBuffer.ColumnBuffer existingA = table.getExistingColumn("a", QwpConstants.TYPE_LONG);
+
+                assertSame(colB, existingB);
+                assertSame(colA, existingA);
+
+                existingB.addString("y");
+                existingA.addLong(2);
+                table.nextRow();
+
+                assertEquals(2, table.getRowCount());
+                assertEquals(2, colA.getSize());
+                assertEquals(2, colA.getValueCount());
+                assertEquals(2, colB.getSize());
+                assertEquals(2, colB.getValueCount());
+            }
+        });
+    }
+
+    @Test
+    public void testGetExistingColumnReturnsNullWithoutCreatingColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
+                colA.addLong(1);
+                table.nextRow();
+
+                assertNull(table.getExistingColumn("missing", QwpConstants.TYPE_STRING));
+                assertEquals(1, table.getColumnCount());
+
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                assertNotNull(colB);
+                assertEquals(2, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
+    public void testGetExistingColumnTypeMismatchOnOrderedPathThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                colA.addLong(1);
+                table.nextRow();
+
+                try {
+                    table.getExistingColumn("a", QwpConstants.TYPE_STRING);
+                    fail("Expected LineSenderException for ordered-path type mismatch");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Column type mismatch"));
+                    assertTrue(e.getMessage().contains("column 'a'"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testGetExistingColumnTypeMismatchOnHashPathThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                colA.addLong(1);
+                colB.addString("x");
+                table.nextRow();
+
+                try {
+                    table.getExistingColumn("b", QwpConstants.TYPE_LONG);
+                    fail("Expected LineSenderException for hash-path type mismatch");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Column type mismatch"));
+                    assertTrue(e.getMessage().contains("column 'b'"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testGetExistingColumnWorksAfterReset() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                colA.addLong(1);
+                colB.addString("x");
+                table.nextRow();
+
+                table.reset();
+
+                QwpTableBuffer.ColumnBuffer existingA = table.getExistingColumn("a", QwpConstants.TYPE_LONG);
+                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_STRING);
+
+                assertSame(colA, existingA);
+                assertSame(colB, existingB);
+
+                existingA.addLong(2);
+                existingB.addString("y");
+                table.nextRow();
+
+                assertEquals(1, table.getRowCount());
+                assertEquals(1, colA.getSize());
+                assertEquals(1, colA.getValueCount());
+                assertEquals(1, colB.getSize());
+                assertEquals(1, colB.getValueCount());
+            }
+        });
+    }
+
+    @Test
+    public void testGetExistingColumnWorksForLateAddedColumnAfterCancelRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                table.nextRow();
+
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(2);
+                QwpTableBuffer.ColumnBuffer late = table.getOrCreateColumn("late", QwpConstants.TYPE_STRING, true);
+                late.addString("stale");
+                table.cancelCurrentRow();
+
+                QwpTableBuffer.ColumnBuffer existingLate = table.getExistingColumn("late", QwpConstants.TYPE_STRING);
+                assertSame(late, existingLate);
+                assertEquals(0, existingLate.getSize());
+                assertEquals(0, existingLate.getValueCount());
+
+                table.getExistingColumn("a", QwpConstants.TYPE_LONG).addLong(2);
+                table.nextRow();
+
+                assertEquals(2, table.getRowCount());
+                assertEquals(2, existingLate.getSize());
+                assertEquals(0, existingLate.getValueCount());
+                assertTrue(existingLate.isNull(0));
+                assertTrue(existingLate.isNull(1));
+            }
+        });
+    }
+
     /**
      * Simulates the encoder's walk over array data — the same logic as
      * QwpWebSocketEncoder.writeDoubleArrayColumn(). Returns the flat

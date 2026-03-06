@@ -261,6 +261,45 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testBoundedSenderOutOfOrderExistingColumnsPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("order", sender -> sender.table("order")
+                                    .longColumn("a", 1)
+                                    .stringColumn("b", "x")
+                                    .symbol("c", "alpha")
+                                    .atNow(),
+                            "a", 1L,
+                            "b", "x",
+                            "c", "alpha"),
+                    row("order", sender -> sender.table("order")
+                                    .symbol("c", "beta")
+                                    .stringColumn("b", "y")
+                                    .longColumn("a", 2)
+                                    .atNow(),
+                            "a", 2L,
+                            "b", "y",
+                            "c", "beta"),
+                    row("order", sender -> sender.table("order")
+                                    .stringColumn("b", "z")
+                                    .longColumn("a", 3)
+                                    .symbol("c", null)
+                                    .atNow(),
+                            "a", 3L,
+                            "b", "z",
+                            "c", null)
+            );
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
     public void testMixingAtNowAndAtMicrosAfterCommittedRowsThrowsSchemaChange() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -475,6 +514,41 @@ public class QwpUdpSenderTest {
                 sender.flush();
                 Assert.assertEquals(2, nf.sendCount);
             }
+        });
+    }
+
+    @Test
+    public void testSchemaChangeAfterOutOfOrderExistingColumnsPreservesRows() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("schema", sender -> sender.table("schema")
+                                    .longColumn("a", 1)
+                                    .stringColumn("b", "x")
+                                    .atNow(),
+                            "a", 1L,
+                            "b", "x"),
+                    row("schema", sender -> sender.table("schema")
+                                    .symbol("c", "new")
+                                    .stringColumn("b", "y")
+                                    .longColumn("a", 2)
+                                    .atNow(),
+                            "a", 2L,
+                            "b", "y",
+                            "c", "new"),
+                    row("schema", sender -> sender.table("schema")
+                                    .symbol("c", "next")
+                                    .longColumn("a", 3)
+                                    .stringColumn("b", "z")
+                                    .atNow(),
+                            "a", 3L,
+                            "b", "z",
+                            "c", "next")
+            );
+
+            RunResult result = runScenario(rows, 1024 * 1024);
+
+            Assert.assertEquals(2, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }
 

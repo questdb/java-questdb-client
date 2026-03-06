@@ -414,15 +414,18 @@ public class QwpUdpSender implements Sender {
     }
 
     private QwpTableBuffer.ColumnBuffer acquireColumn(CharSequence name, byte type, boolean nullable) {
-        boolean exists = currentTableBuffer.hasColumn(name);
-        if (!exists && currentTableBuffer.getRowCount() > 0) {
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getExistingColumn(name, type);
+        if (col == null && currentTableBuffer.getRowCount() > 0) {
             if (currentRowColumnCount > 0) {
                 throw new LineSenderException("schema change in middle of row is not supported");
             }
             flushSingleTable(currentTableName, currentTableBuffer);
+            col = currentTableBuffer.getOrCreateColumn(name, type, nullable);
         }
 
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, type, nullable);
+        if (col == null) {
+            col = currentTableBuffer.getOrCreateColumn(name, type, nullable);
+        }
         syncSchemaEstimate();
         return col;
     }
