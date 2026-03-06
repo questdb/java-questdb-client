@@ -99,6 +99,7 @@ public class QwpUdpSender implements Sender {
     private int estimateColumnCount;
     private QwpTableBuffer.ColumnBuffer[] missingColumns = new QwpTableBuffer.ColumnBuffer[8];
     private int missingColumnCount;
+    private boolean replayingRowJournal;
     private int rowJournalSize;
     private long runningEstimate;
 
@@ -158,6 +159,7 @@ public class QwpUdpSender implements Sender {
         checkNotClosed();
         if (currentTableBuffer != null) {
             currentTableBuffer.cancelCurrentRow();
+            currentTableBuffer.rollbackUncommittedColumns();
             rollbackEstimateToCommitted();
         }
         rowJournalSize = 0;
@@ -169,6 +171,7 @@ public class QwpUdpSender implements Sender {
             try {
                 if (hasInProgressRow()) {
                     currentTableBuffer.cancelCurrentRow();
+                    currentTableBuffer.rollbackUncommittedColumns();
                     rollbackEstimateToCommitted();
                     rowJournalSize = 0;
                 }
@@ -419,12 +422,13 @@ public class QwpUdpSender implements Sender {
 
     private QwpTableBuffer.ColumnBuffer acquireColumn(CharSequence name, byte type, boolean nullable) {
         QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getExistingColumn(name, type);
-        if (col == null && currentTableBuffer.getRowCount() > 0) {
+        assert !replayingRowJournal || currentTableBuffer.getRowCount() == 0;
+        if (col == null && !replayingRowJournal && currentTableBuffer.getRowCount() > 0) {
             if (currentRowColumnCount > 0) {
-                throw new LineSenderException("schema change in middle of row is not supported");
+                flushCommittedRowsAndReplayCurrentRow();
+            } else {
+                flushSingleTable(currentTableName, currentTableBuffer);
             }
-            flushSingleTable(currentTableName, currentTableBuffer);
-            col = currentTableBuffer.getOrCreateColumn(name, type, nullable);
         }
 
         if (col == null) {
@@ -444,7 +448,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_BOOL;
             e.name = col.getName();
@@ -462,7 +466,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL128;
             e.name = col.getName();
@@ -480,7 +484,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL256;
             e.name = col.getName();
@@ -498,7 +502,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DECIMAL64;
             e.name = col.getName();
@@ -531,7 +535,7 @@ public class QwpUdpSender implements Sender {
         long payloadDelta = (long) (col.getValueCount() - valueCountBefore) * 8;
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = nanos ? ENTRY_AT_NANOS : ENTRY_AT_MICROS;
             e.longValue = value;
@@ -567,7 +571,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE_ARRAY;
             e.name = col.getName();
@@ -585,7 +589,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_DOUBLE;
             e.name = col.getName();
@@ -622,7 +626,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG_ARRAY;
             e.name = col.getName();
@@ -640,7 +644,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_LONG;
             e.name = col.getName();
@@ -660,7 +664,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_STRING;
             e.name = col.getName();
@@ -679,7 +683,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = ENTRY_SYMBOL;
             e.name = col.getName();
@@ -697,7 +701,7 @@ public class QwpUdpSender implements Sender {
         applyValueEstimate(col, sizeBefore, col.getSize(), payloadDelta);
         currentRowColumnCount++;
 
-        if (addJournal && trackDatagramEstimate) {
+        if (shouldJournal(addJournal)) {
             ColumnEntry e = nextJournalEntry();
             e.kind = journalKind;
             e.name = col.getName();
@@ -927,6 +931,14 @@ public class QwpUdpSender implements Sender {
         resetEstimateState();
     }
 
+    private void flushCommittedRowsAndReplayCurrentRow() {
+        currentTableBuffer.cancelCurrentRow();
+        currentTableBuffer.rollbackUncommittedColumns();
+        rollbackEstimateToCommitted();
+        flushSingleTable(currentTableName, currentTableBuffer);
+        replayRowJournal();
+    }
+
     private void maybeAutoFlush() {
         if (runningEstimate <= maxDatagramSize) {
             return;
@@ -936,11 +948,7 @@ public class QwpUdpSender implements Sender {
             throw singleRowTooLarge(runningEstimate);
         }
 
-        currentTableBuffer.cancelCurrentRow();
-        rollbackEstimateToCommitted();
-
-        flushSingleTable(currentTableName, currentTableBuffer);
-        replayRowJournal();
+        flushCommittedRowsAndReplayCurrentRow();
         collectMissingColumns(currentTableBuffer.getRowCount() + 1);
 
         if (runningEstimate > maxDatagramSize) {
@@ -986,27 +994,33 @@ public class QwpUdpSender implements Sender {
     }
 
     private void replayRowJournal() {
-        for (int i = 0; i < rowJournalSize; i++) {
-            ColumnEntry entry = rowJournal.getQuick(i);
-            switch (entry.kind) {
-                case ENTRY_AT_MICROS -> appendDesignatedTimestamp(entry.longValue, false, false);
-                case ENTRY_AT_NANOS -> appendDesignatedTimestamp(entry.longValue, true, false);
-                case ENTRY_BOOL -> appendBooleanColumn(entry.name, entry.boolValue, false);
-                case ENTRY_DECIMAL128 -> appendDecimal128Column(entry.name, (Decimal128) entry.objectValue, false);
-                case ENTRY_DECIMAL256 -> appendDecimal256Column(entry.name, (Decimal256) entry.objectValue, false);
-                case ENTRY_DECIMAL64 -> appendDecimal64Column(entry.name, (Decimal64) entry.objectValue, false);
-                case ENTRY_DOUBLE -> appendDoubleColumn(entry.name, entry.doubleValue, false);
-                case ENTRY_DOUBLE_ARRAY -> appendDoubleArrayColumn(entry.name, entry.objectValue, false);
-                case ENTRY_LONG -> appendLongColumn(entry.name, entry.longValue, false);
-                case ENTRY_LONG_ARRAY -> appendLongArrayColumn(entry.name, entry.objectValue, false);
-                case ENTRY_STRING -> appendStringColumn(entry.name, entry.stringValue, false);
-                case ENTRY_SYMBOL -> appendSymbolColumn(entry.name, entry.stringValue, false);
-                case ENTRY_TIMESTAMP_COL_MICROS ->
-                        appendTimestampColumn(entry.name, TYPE_TIMESTAMP, entry.longValue, ENTRY_TIMESTAMP_COL_MICROS, false);
-                case ENTRY_TIMESTAMP_COL_NANOS ->
-                        appendTimestampColumn(entry.name, TYPE_TIMESTAMP_NANOS, entry.longValue, ENTRY_TIMESTAMP_COL_NANOS, false);
-                default -> throw new LineSenderException("unknown row journal entry type: " + entry.kind);
+        assert currentTableBuffer.getRowCount() == 0 : "row journal replay requires a reset table buffer";
+        replayingRowJournal = true;
+        try {
+            for (int i = 0; i < rowJournalSize; i++) {
+                ColumnEntry entry = rowJournal.getQuick(i);
+                switch (entry.kind) {
+                    case ENTRY_AT_MICROS -> appendDesignatedTimestamp(entry.longValue, false, false);
+                    case ENTRY_AT_NANOS -> appendDesignatedTimestamp(entry.longValue, true, false);
+                    case ENTRY_BOOL -> appendBooleanColumn(entry.name, entry.boolValue, false);
+                    case ENTRY_DECIMAL128 -> appendDecimal128Column(entry.name, (Decimal128) entry.objectValue, false);
+                    case ENTRY_DECIMAL256 -> appendDecimal256Column(entry.name, (Decimal256) entry.objectValue, false);
+                    case ENTRY_DECIMAL64 -> appendDecimal64Column(entry.name, (Decimal64) entry.objectValue, false);
+                    case ENTRY_DOUBLE -> appendDoubleColumn(entry.name, entry.doubleValue, false);
+                    case ENTRY_DOUBLE_ARRAY -> appendDoubleArrayColumn(entry.name, entry.objectValue, false);
+                    case ENTRY_LONG -> appendLongColumn(entry.name, entry.longValue, false);
+                    case ENTRY_LONG_ARRAY -> appendLongArrayColumn(entry.name, entry.objectValue, false);
+                    case ENTRY_STRING -> appendStringColumn(entry.name, entry.stringValue, false);
+                    case ENTRY_SYMBOL -> appendSymbolColumn(entry.name, entry.stringValue, false);
+                    case ENTRY_TIMESTAMP_COL_MICROS ->
+                            appendTimestampColumn(entry.name, TYPE_TIMESTAMP, entry.longValue, ENTRY_TIMESTAMP_COL_MICROS, false);
+                    case ENTRY_TIMESTAMP_COL_NANOS ->
+                            appendTimestampColumn(entry.name, TYPE_TIMESTAMP_NANOS, entry.longValue, ENTRY_TIMESTAMP_COL_NANOS, false);
+                    default -> throw new LineSenderException("unknown row journal entry type: " + entry.kind);
+                }
             }
+        } finally {
+            replayingRowJournal = false;
         }
     }
 
@@ -1028,6 +1042,10 @@ public class QwpUdpSender implements Sender {
         estimateColumnCount = committedEstimateColumnCount;
         currentRowColumnCount = 0;
         missingColumnCount = 0;
+    }
+
+    private boolean shouldJournal(boolean addJournal) {
+        return addJournal && (trackDatagramEstimate || currentTableBuffer.getRowCount() > 0 || rowJournalSize > 0);
     }
 
     private LineSenderException singleRowTooLarge(long estimate) {

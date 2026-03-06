@@ -209,6 +209,43 @@ public class QwpTableBuffer implements QuietCloseable {
         return col;
     }
 
+    public void rollbackUncommittedColumns() {
+        if (columns.size() <= committedColumnCount) {
+            return;
+        }
+
+        for (int i = columns.size() - 1; i >= committedColumnCount; i--) {
+            ColumnBuffer col = columns.getQuick(i);
+            if (col != null) {
+                col.close();
+            }
+            columns.remove(i);
+        }
+        rebuildColumnAccessStructures();
+    }
+
+    private void rebuildColumnAccessStructures() {
+        columnNameToIndex.clear();
+
+        int columnCount = columns.size();
+        int minCapacity = Math.max(8, columnCount + 4);
+        if (fastColumns == null || fastColumns.length < minCapacity) {
+            fastColumns = new ColumnBuffer[minCapacity];
+        } else {
+            Arrays.fill(fastColumns, null);
+        }
+
+        for (int i = 0; i < columnCount; i++) {
+            ColumnBuffer col = columns.getQuick(i);
+            fastColumns[i] = col;
+            columnNameToIndex.put(col.name, i);
+        }
+
+        schemaHashComputed = false;
+        columnDefsCacheValid = false;
+        cachedColumnDefs = null;
+    }
+
     private ColumnBuffer lookupColumn(CharSequence name, byte type) {
         // Fast path: predict next column in sequence
         int n = columns.size();
