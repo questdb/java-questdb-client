@@ -46,8 +46,16 @@ class QwpColumnWriter {
     private final QwpGorillaEncoder gorillaEncoder = new QwpGorillaEncoder();
     private QwpBufferWriter buffer;
 
-    private void encodeColumn(QwpTableBuffer.ColumnBuffer col, QwpColumnDef colDef, int rowCount, boolean useGorilla, boolean useGlobalSymbols) {
-        int valueCount = col.getValueCount();
+    private void encodeColumn(
+            QwpTableBuffer.ColumnBuffer col,
+            QwpColumnDef colDef,
+            int rowCount,
+            int valueCount,
+            long stringDataSize,
+            int symbolDictionarySize,
+            boolean useGorilla,
+            boolean useGlobalSymbols
+    ) {
         long dataAddr = col.getDataAddress();
 
         if (colDef.isNullable()) {
@@ -80,13 +88,13 @@ class QwpColumnWriter {
                 break;
             case TYPE_STRING:
             case TYPE_VARCHAR:
-                writeStringColumn(col, valueCount);
+                writeStringColumn(col, valueCount, stringDataSize);
                 break;
             case TYPE_SYMBOL:
                 if (useGlobalSymbols) {
                     writeSymbolColumnWithGlobalIds(col, valueCount);
                 } else {
-                    writeSymbolColumn(col, valueCount);
+                    writeSymbolColumn(col, valueCount, symbolDictionarySize);
                 }
                 break;
             case TYPE_UUID:
@@ -118,8 +126,20 @@ class QwpColumnWriter {
     }
 
     void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef, boolean useGlobalSymbols, boolean useGorilla) {
+        encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useSchemaRef, useGlobalSymbols, useGorilla);
+    }
+
+    void encodeTable(
+            QwpTableBuffer tableBuffer,
+            int rowCount,
+            int[] limitedValueCounts,
+            long[] limitedStringDataSizes,
+            int[] limitedSymbolDictionarySizes,
+            boolean useSchemaRef,
+            boolean useGlobalSymbols,
+            boolean useGorilla
+    ) {
         QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
-        int rowCount = tableBuffer.getRowCount();
 
         if (useSchemaRef) {
             writeTableHeaderWithSchemaRef(
@@ -135,7 +155,17 @@ class QwpColumnWriter {
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
             QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
             QwpColumnDef colDef = columnDefs[i];
-            encodeColumn(col, colDef, rowCount, useGorilla, useGlobalSymbols);
+            int valueCount = col.getValueCount();
+            long stringDataSize = col.getStringDataSize();
+            int symbolDictionarySize = col.getSymbolDictionarySize();
+
+            if (limitedValueCounts != null && limitedValueCounts[i] > -1) {
+                valueCount = limitedValueCounts[i];
+                stringDataSize = limitedStringDataSizes[i];
+                symbolDictionarySize = limitedSymbolDictionarySizes[i];
+            }
+
+            encodeColumn(col, colDef, rowCount, valueCount, stringDataSize, symbolDictionarySize, useGorilla, useGlobalSymbols);
         }
     }
 
@@ -261,18 +291,16 @@ class QwpColumnWriter {
         }
     }
 
-    private void writeStringColumn(QwpTableBuffer.ColumnBuffer col, int valueCount) {
+    private void writeStringColumn(QwpTableBuffer.ColumnBuffer col, int valueCount, long stringDataSize) {
         buffer.putBlockOfBytes(col.getStringOffsetsAddress(), (long) (valueCount + 1) * 4);
-        buffer.putBlockOfBytes(col.getStringDataAddress(), col.getStringDataSize());
+        buffer.putBlockOfBytes(col.getStringDataAddress(), stringDataSize);
     }
 
-    private void writeSymbolColumn(QwpTableBuffer.ColumnBuffer col, int count) {
+    private void writeSymbolColumn(QwpTableBuffer.ColumnBuffer col, int count, int dictionarySize) {
         long dataAddr = col.getDataAddress();
-        String[] dictionary = col.getSymbolDictionary();
-
-        buffer.putVarint(dictionary.length);
-        for (String symbol : dictionary) {
-            buffer.putString(symbol);
+        buffer.putVarint(dictionarySize);
+        for (int i = 0; i < dictionarySize; i++) {
+            buffer.putString((String) col.getSymbolValue(i));
         }
 
         for (int i = 0; i < count; i++) {

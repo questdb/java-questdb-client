@@ -330,6 +330,73 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testRetainInProgressRowFastClearsUnstagedNullableColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer keep = table.getOrCreateColumn("keep", QwpConstants.TYPE_LONG, false);
+                QwpTableBuffer.ColumnBuffer drop = table.getOrCreateColumn("drop", QwpConstants.TYPE_STRING, true);
+
+                for (int i = 0; i < 130; i++) {
+                    keep.addLong(i);
+                    if ((i & 1) == 0) {
+                        drop.addString("v" + i);
+                    } else {
+                        drop.addNull();
+                    }
+                    table.nextRow();
+                }
+
+                int keepSizeBefore = keep.getSize();
+                int keepValueCountBefore = keep.getValueCount();
+                long keepStringDataSizeBefore = keep.getStringDataSize();
+                int keepArrayShapeOffsetBefore = keep.getArrayShapeOffset();
+                int keepArrayDataOffsetBefore = keep.getArrayDataOffset();
+                int keepIndex = keep.getIndex();
+
+                keep.addLong(130);
+
+                int[] sizeBefore = {-1, -1};
+                int[] valueCountBefore = {-1, -1};
+                long[] stringDataSizeBefore = new long[2];
+                int[] arrayShapeOffsetBefore = new int[2];
+                int[] arrayDataOffsetBefore = new int[2];
+
+                sizeBefore[keepIndex] = keepSizeBefore;
+                valueCountBefore[keepIndex] = keepValueCountBefore;
+                stringDataSizeBefore[keepIndex] = keepStringDataSizeBefore;
+                arrayShapeOffsetBefore[keepIndex] = keepArrayShapeOffsetBefore;
+                arrayDataOffsetBefore[keepIndex] = keepArrayDataOffsetBefore;
+
+                table.retainInProgressRow(
+                        sizeBefore,
+                        valueCountBefore,
+                        stringDataSizeBefore,
+                        arrayShapeOffsetBefore,
+                        arrayDataOffsetBefore
+                );
+
+                assertEquals(0, table.getRowCount());
+
+                assertEquals(1, keep.getSize());
+                assertEquals(1, keep.getValueCount());
+                assertEquals(130L, Unsafe.getUnsafe().getLong(keep.getDataAddress()));
+
+                assertEquals(0, drop.getSize());
+                assertEquals(0, drop.getValueCount());
+                assertEquals(0, drop.getStringDataSize());
+                assertFalse(drop.isNull(0));
+                assertFalse(drop.isNull(63));
+                assertFalse(drop.isNull(64));
+                assertFalse(drop.isNull(129));
+                assertEquals(0, Unsafe.getUnsafe().getLong(drop.getNullBitmapAddress()));
+                assertEquals(0, Unsafe.getUnsafe().getLong(drop.getNullBitmapAddress() + Long.BYTES));
+                assertEquals(0, Unsafe.getUnsafe().getLong(drop.getNullBitmapAddress() + 2L * Long.BYTES));
+                assertEquals(0, Unsafe.getUnsafe().getInt(drop.getStringOffsetsAddress()));
+            }
+        });
+    }
+
+    @Test
     public void testCancelRowResetsDecimalScaleOnLateAddedColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {

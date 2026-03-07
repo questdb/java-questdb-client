@@ -195,6 +195,7 @@ public class QwpTableBuffer implements QuietCloseable {
     private ColumnBuffer createColumn(CharSequence name, byte type, boolean nullable) {
         ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
         int index = columns.size();
+        col.index = index;
         columns.add(col);
         columnNameToIndex.put(name, index);
         // Update fast access array
@@ -240,6 +241,7 @@ public class QwpTableBuffer implements QuietCloseable {
 
         for (int i = 0; i < columnCount; i++) {
             ColumnBuffer col = columns.getQuick(i);
+            col.index = i;
             fastColumns[i] = col;
             columnNameToIndex.put(col.name, i);
         }
@@ -355,6 +357,32 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
         rowCount++;
+        committedColumnCount = columns.size();
+    }
+
+    public void retainInProgressRow(
+            int[] sizeBefore,
+            int[] valueCountBefore,
+            long[] stringDataSizeBefore,
+            int[] arrayShapeOffsetBefore,
+            int[] arrayDataOffsetBefore
+    ) {
+        columnAccessCursor = 0;
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            ColumnBuffer col = fastColumns[i];
+            if (sizeBefore[i] > -1) {
+                col.retainTailRow(
+                        sizeBefore[i],
+                        valueCountBefore[i],
+                        stringDataSizeBefore[i],
+                        arrayShapeOffsetBefore[i],
+                        arrayDataOffsetBefore[i]
+                );
+            } else {
+                col.clearToEmptyFast();
+            }
+        }
+        rowCount = 0;
         committedColumnCount = columns.size();
     }
 
@@ -512,6 +540,7 @@ public class QwpTableBuffer implements QuietCloseable {
         // GeoHash precision (number of bits, 1-60)
         private int geohashPrecision = -1;
         private boolean hasNulls;
+        private int index;
         private long[] longArrayData;
         private int maxGlobalSymbolId = -1;
         private int nullBufCapRows;
@@ -1057,6 +1086,10 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
+        public int getIndex() {
+            return index;
+        }
+
         private int getOrAddLocalSymbol(CharSequence value) {
             int idx = symbolDict.get(value);
             if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
@@ -1282,6 +1315,36 @@ public class QwpTableBuffer implements QuietCloseable {
             geohashPrecision = -1;
         }
 
+        public void retainTailRow(
+                int sizeBefore,
+                int valueCountBefore,
+                long stringDataSizeBefore,
+                int arrayShapeOffsetBefore,
+                int arrayDataOffsetBefore
+        ) {
+            assert size == sizeBefore + 1;
+
+            compactNullBitmap(sizeBefore);
+
+            if (valueCount == valueCountBefore) {
+                clearValuePayload();
+                size = 1;
+                valueCount = 0;
+                return;
+            }
+
+            switch (type) {
+                case TYPE_STRING, TYPE_VARCHAR -> retainStringValue(valueCountBefore);
+                case TYPE_SYMBOL -> retainSymbolValue(valueCountBefore);
+                case TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY ->
+                        retainArrayValue(valueCountBefore, arrayShapeOffsetBefore, arrayDataOffsetBefore);
+                default -> retainFixedWidthValue(valueCountBefore);
+            }
+
+            size = 1;
+            valueCount = 1;
+        }
+
         public void truncateTo(int newSize) {
             if (newSize >= size) {
                 return;
@@ -1365,6 +1428,51 @@ public class QwpTableBuffer implements QuietCloseable {
                 throw new LineSenderException("array too large: total element count exceeds int range");
             }
             return (int) product;
+        }
+
+        private void clearValuePayload() {
+            if (dataBuffer != null && elemSize > 0) {
+                dataBuffer.jumpTo(0);
+            }
+            if (auxBuffer != null) {
+                auxBuffer.truncate();
+            }
+            if (stringOffsets != null) {
+                stringOffsets.truncate();
+                stringOffsets.putInt(0);
+            }
+            if (stringData != null) {
+                stringData.truncate();
+            }
+            arrayShapeOffset = 0;
+            arrayDataOffset = 0;
+            resetEmptyMetadata();
+        }
+
+        private void clearToEmptyFast() {
+            int sizeBefore = size;
+            clearValuePayload();
+            if (nullBufPtr != 0 && sizeBefore > 0) {
+                long usedLongs = ((long) sizeBefore + 63) >>> 6;
+                Vect.memset(nullBufPtr, usedLongs * Long.BYTES, 0);
+            }
+            size = 0;
+            valueCount = 0;
+            hasNulls = false;
+        }
+
+        private void compactNullBitmap(int sourceRow) {
+            if (nullBufPtr == 0) {
+                return;
+            }
+
+            boolean retainedNull = isNull(sourceRow);
+            long usedLongs = ((long) size + 63) >>> 6;
+            Vect.memset(nullBufPtr, usedLongs * Long.BYTES, 0);
+            if (retainedNull) {
+                Unsafe.getUnsafe().putLong(nullBufPtr, 1L);
+            }
+            hasNulls = retainedNull;
         }
 
         private void appendArrayPayload(long ptr, long len, boolean forLong) {
@@ -1551,6 +1659,89 @@ public class QwpTableBuffer implements QuietCloseable {
             long current = Unsafe.getUnsafe().getLong(longAddr);
             Unsafe.getUnsafe().putLong(longAddr, current | (1L << bitIndex));
             hasNulls = true;
+        }
+
+        private void retainArrayValue(int valueIndex, int shapeOffsetBefore, int dataOffsetBefore) {
+            int nDims = arrayDims[valueIndex] & 0xFF;
+            arrayDims[0] = (byte) nDims;
+
+            int shapeCount = arrayShapeOffset - shapeOffsetBefore;
+            if (shapeCount > 0 && shapeOffsetBefore > 0) {
+                System.arraycopy(arrayShapes, shapeOffsetBefore, arrayShapes, 0, shapeCount);
+            }
+            arrayShapeOffset = shapeCount;
+
+            int dataCount = arrayDataOffset - dataOffsetBefore;
+            if (dataCount > 0 && dataOffsetBefore > 0) {
+                if (type == TYPE_LONG_ARRAY) {
+                    System.arraycopy(longArrayData, dataOffsetBefore, longArrayData, 0, dataCount);
+                } else {
+                    System.arraycopy(doubleArrayData, dataOffsetBefore, doubleArrayData, 0, dataCount);
+                }
+            }
+            arrayDataOffset = dataCount;
+        }
+
+        private void retainFixedWidthValue(int valueIndex) {
+            if (dataBuffer == null || elemSize == 0) {
+                return;
+            }
+
+            long srcOffset = (long) valueIndex * elemSize;
+            long dataAddress = dataBuffer.pageAddress();
+            if (srcOffset > 0) {
+                Vect.memmove(dataAddress, dataAddress + srcOffset, elemSize);
+            }
+            dataBuffer.jumpTo(elemSize);
+
+            if (auxBuffer != null) {
+                long auxAddress = auxBuffer.pageAddress();
+                long auxOffset = (long) valueIndex * Integer.BYTES;
+                if (auxOffset > 0) {
+                    Vect.memmove(auxAddress, auxAddress + auxOffset, Integer.BYTES);
+                }
+                auxBuffer.jumpTo(Integer.BYTES);
+                maxGlobalSymbolId = Unsafe.getUnsafe().getInt(auxAddress);
+            }
+        }
+
+        private void retainStringValue(int valueIndex) {
+            long offsetsAddress = stringOffsets.pageAddress();
+            int start = Unsafe.getUnsafe().getInt(offsetsAddress + (long) valueIndex * Integer.BYTES);
+            int end = Unsafe.getUnsafe().getInt(offsetsAddress + (long) (valueIndex + 1) * Integer.BYTES);
+            int len = end - start;
+
+            if (len > 0 && start > 0) {
+                Vect.memmove(stringData.pageAddress(), stringData.pageAddress() + start, len);
+            }
+
+            stringData.jumpTo(len);
+            stringOffsets.truncate();
+            stringOffsets.putInt(0);
+            stringOffsets.putInt(len);
+        }
+
+        private void retainSymbolValue(int valueIndex) {
+            retainFixedWidthValue(valueIndex);
+
+            int localIndex = Unsafe.getUnsafe().getInt(dataBuffer.pageAddress());
+            String symbol = symbolList.get(localIndex);
+
+            symbolDict.clear();
+            symbolList.clear();
+            symbolList.add(symbol);
+            symbolDict.put(symbol, 0);
+            Unsafe.getUnsafe().putInt(dataBuffer.pageAddress(), 0);
+        }
+
+        private void resetEmptyMetadata() {
+            decimalScale = -1;
+            geohashPrecision = -1;
+            maxGlobalSymbolId = -1;
+            if (symbolDict != null) {
+                symbolDict.clear();
+                symbolList.clear();
+            }
         }
     }
 }
