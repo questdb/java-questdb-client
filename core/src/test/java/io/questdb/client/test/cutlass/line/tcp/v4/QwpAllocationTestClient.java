@@ -33,11 +33,12 @@ import java.util.concurrent.TimeUnit;
 /**
  * Test client for ILP allocation profiling.
  * <p>
- * Supports 3 protocol modes:
+ * Supports 4 protocol modes:
  * <ul>
  *   <li>ilp-tcp: Old ILP text protocol over TCP (port 9009)</li>
  *   <li>ilp-http: Old ILP text protocol over HTTP (port 9000)</li>
  *   <li>qwp-websocket: New QWP binary protocol over WebSocket (port 9000)</li>
+ *   <li>qwp-udp: New QWP binary protocol over UDP (port 9007)</li>
  * </ul>
  * <p>
  * Sends rows with various column types to exercise all code paths.
@@ -48,18 +49,21 @@ import java.util.concurrent.TimeUnit;
  * java -cp ... QwpAllocationTestClient [options]
  *
  * Options:
- *   --protocol=PROTOCOL   Protocol: ilp-tcp, ilp-http, qwp-websocket (default: qwp-websocket)
- *   --host=HOST           Server host (default: localhost)
- *   --port=PORT           Server port (default: 9009 for TCP, 9000 for HTTP)
- *   --rows=N              Total rows to send (default: 10000000)
- *   --batch=N             Batch/flush size (default: 10000)
- *   --warmup=N            Warmup rows (default: 100000)
- *   --report=N            Report progress every N rows (default: 1000000)
- *   --no-warmup           Skip warmup phase
- *   --help                Show this help
+ *   --protocol=PROTOCOL       Protocol: ilp-tcp, ilp-http, qwp-websocket, qwp-udp (default: qwp-websocket)
+ *   --host=HOST               Server host (default: localhost)
+ *   --port=PORT               Server port (default: 9009 for TCP, 9000 for HTTP/WS, 9007 for UDP)
+ *   --rows=N                  Total rows to send (default: 10000000)
+ *   --batch=N                 Batch/flush size (default: 10000)
+ *   --max-datagram-size=N     Max datagram size in bytes (UDP only, default: 1400)
+ *   --warmup=N                Warmup rows (default: 100000)
+ *   --report=N                Report progress every N rows (default: 1000000)
+ *   --target-throughput=N      Target throughput in rows/sec (0 = unlimited, default: 0)
+ *   --no-warmup               Skip warmup phase
+ *   --help                    Show this help
  *
  * Examples:
  *   QwpAllocationTestClient --protocol=qwp-websocket --rows=1000000 --batch=5000
+ *   QwpAllocationTestClient --protocol=qwp-udp --rows=1000000 --max-datagram-size=8192
  *   QwpAllocationTestClient --protocol=ilp-tcp --host=remote-server --port=9009
  * </pre>
  */
@@ -71,12 +75,15 @@ public class QwpAllocationTestClient {
     // Default configuration
     private static final String DEFAULT_HOST = "localhost";
     private static final int DEFAULT_IN_FLIGHT_WINDOW = 0; // 0 = use protocol default (8)
+    private static final int DEFAULT_MAX_DATAGRAM_SIZE = 0; // 0 = use protocol default (1400)
     private static final int DEFAULT_REPORT_INTERVAL = 1_000_000;
     private static final int DEFAULT_ROWS = 80_000_000;
+    private static final int DEFAULT_TARGET_THROUGHPUT = 0; // 0 = unlimited
     private static final int DEFAULT_WARMUP_ROWS = 100_000;
     private static final String PROTOCOL_ILP_HTTP = "ilp-http";
     // Protocol modes
     private static final String PROTOCOL_ILP_TCP = "ilp-tcp";
+    private static final String PROTOCOL_QWP_UDP = "qwp-udp";
     private static final String PROTOCOL_QWP_WEBSOCKET = "qwp-websocket";
     private static final String[] STRINGS = {
             "New York", "London", "Tokyo", "Paris", "Berlin", "Sydney", "Toronto", "Singapore",
@@ -99,8 +106,10 @@ public class QwpAllocationTestClient {
         int flushBytes = DEFAULT_FLUSH_BYTES;
         long flushIntervalMs = DEFAULT_FLUSH_INTERVAL_MS;
         int inFlightWindow = DEFAULT_IN_FLIGHT_WINDOW;
+        int maxDatagramSize = DEFAULT_MAX_DATAGRAM_SIZE;
         int warmupRows = DEFAULT_WARMUP_ROWS;
         int reportInterval = DEFAULT_REPORT_INTERVAL;
+        int targetThroughput = DEFAULT_TARGET_THROUGHPUT;
 
         for (String arg : args) {
             if (arg.equals("--help") || arg.equals("-h")) {
@@ -122,10 +131,14 @@ public class QwpAllocationTestClient {
                 flushIntervalMs = Long.parseLong(arg.substring("--flush-interval-ms=".length()));
             } else if (arg.startsWith("--in-flight-window=")) {
                 inFlightWindow = Integer.parseInt(arg.substring("--in-flight-window=".length()));
+            } else if (arg.startsWith("--max-datagram-size=")) {
+                maxDatagramSize = Integer.parseInt(arg.substring("--max-datagram-size=".length()));
             } else if (arg.startsWith("--warmup=")) {
                 warmupRows = Integer.parseInt(arg.substring("--warmup=".length()));
             } else if (arg.startsWith("--report=")) {
                 reportInterval = Integer.parseInt(arg.substring("--report=".length()));
+            } else if (arg.startsWith("--target-throughput=")) {
+                targetThroughput = Integer.parseInt(arg.substring("--target-throughput=".length()));
             } else if (arg.equals("--no-warmup")) {
                 warmupRows = 0;
             } else if (!arg.startsWith("--")) {
@@ -153,13 +166,15 @@ public class QwpAllocationTestClient {
         System.out.println("Flush bytes: " + (flushBytes == 0 ? "(default)" : String.format("%,d", flushBytes)));
         System.out.println("Flush interval: " + (flushIntervalMs == 0 ? "(default)" : flushIntervalMs + " ms"));
         System.out.println("In-flight window: " + (inFlightWindow == 0 ? "(default: 8)" : inFlightWindow));
+        System.out.println("Max datagram size: " + (maxDatagramSize == 0 ? "(default: 1400)" : maxDatagramSize));
         System.out.println("Warmup rows: " + String.format("%,d", warmupRows));
         System.out.println("Report interval: " + String.format("%,d", reportInterval));
+        System.out.println("Target throughput: " + (targetThroughput == 0 ? "(unlimited)" : String.format("%,d", targetThroughput) + " rows/sec"));
         System.out.println();
 
         try {
             runTest(protocol, host, port, totalRows, batchSize, flushBytes, flushIntervalMs,
-                    inFlightWindow, warmupRows, reportInterval);
+                    inFlightWindow, maxDatagramSize, warmupRows, reportInterval, targetThroughput);
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace(System.err);
@@ -169,7 +184,7 @@ public class QwpAllocationTestClient {
 
     private static Sender createSender(String protocol, String host, int port,
                                        int batchSize, int flushBytes, long flushIntervalMs,
-                                       int inFlightWindow) {
+                                       int inFlightWindow, int maxDatagramSize) {
         switch (protocol) {
             case PROTOCOL_ILP_TCP:
                 return Sender.builder(Sender.Transport.TCP)
@@ -183,18 +198,24 @@ public class QwpAllocationTestClient {
                         .autoFlushRows(batchSize)
                         .build();
             case PROTOCOL_QWP_WEBSOCKET:
-                Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET)
+                Sender.LineSenderBuilder wsBuilder = Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(host)
                         .port(port)
                         .asyncMode(true);
-                if (batchSize > 0) b.autoFlushRows(batchSize);
-                if (flushBytes > 0) b.autoFlushBytes(flushBytes);
-                if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
-                if (inFlightWindow > 0) b.inFlightWindowSize(inFlightWindow);
-                return b.build();
+                if (batchSize > 0) wsBuilder.autoFlushRows(batchSize);
+                if (flushBytes > 0) wsBuilder.autoFlushBytes(flushBytes);
+                if (flushIntervalMs > 0) wsBuilder.autoFlushIntervalMillis((int) flushIntervalMs);
+                if (inFlightWindow > 0) wsBuilder.inFlightWindowSize(inFlightWindow);
+                return wsBuilder.build();
+            case PROTOCOL_QWP_UDP:
+                Sender.LineSenderBuilder udpBuilder = Sender.builder(Sender.Transport.UDP)
+                        .address(host)
+                        .port(port);
+                if (maxDatagramSize > 0) udpBuilder.maxDatagramSize(maxDatagramSize);
+                return udpBuilder.build();
             default:
                 throw new IllegalArgumentException("Unknown protocol: " + protocol +
-                        ". Use one of: ilp-tcp, ilp-http, qwp-websocket");
+                        ". Use one of: ilp-tcp, ilp-http, qwp-websocket, qwp-udp");
         }
     }
 
@@ -218,6 +239,9 @@ public class QwpAllocationTestClient {
         if (PROTOCOL_ILP_HTTP.equals(protocol) || PROTOCOL_QWP_WEBSOCKET.equals(protocol)) {
             return 9000;
         }
+        if (PROTOCOL_QWP_UDP.equals(protocol)) {
+            return 9007;
+        }
         return 9009;
     }
 
@@ -229,15 +253,17 @@ public class QwpAllocationTestClient {
         System.out.println("Options:");
         System.out.println("  --protocol=PROTOCOL      Protocol to use (default: qwp-websocket)");
         System.out.println("  --host=HOST              Server host (default: localhost)");
-        System.out.println("  --port=PORT              Server port (default: 9009 for TCP, 9000 for HTTP/WebSocket)");
+        System.out.println("  --port=PORT              Server port (default: 9009 for TCP, 9000 for HTTP/WS, 9007 for UDP)");
         System.out.println("  --rows=N                 Total rows to send (default: 80000000)");
         System.out.println("  --batch=N                Auto-flush after N rows (default: 10000)");
         System.out.println("  --flush-bytes=N          Auto-flush after N bytes (default: protocol default)");
         System.out.println("  --flush-interval-ms=N    Auto-flush after N ms (default: protocol default)");
         System.out.println("  --in-flight-window=N     Max batches awaiting server ACK (default: 8, WebSocket only)");
         System.out.println("  --send-queue=N           Max batches waiting to send (default: 16, WebSocket only)");
+        System.out.println("  --max-datagram-size=N    Max datagram size in bytes (default: 1400, UDP only)");
         System.out.println("  --warmup=N               Warmup rows (default: 100000)");
         System.out.println("  --report=N               Report progress every N rows (default: 1000000)");
+        System.out.println("  --target-throughput=N     Target throughput in rows/sec (0 = unlimited, default: 0)");
         System.out.println("  --no-warmup              Skip warmup phase");
         System.out.println("  --help                   Show this help");
         System.out.println();
@@ -245,21 +271,24 @@ public class QwpAllocationTestClient {
         System.out.println("  ilp-tcp          Old ILP text protocol over TCP (default port: 9009)");
         System.out.println("  ilp-http         Old ILP text protocol over HTTP (default port: 9000)");
         System.out.println("  qwp-websocket    New QWP binary protocol over WebSocket (default port: 9000)");
+        System.out.println("  qwp-udp          New QWP binary protocol over UDP (default port: 9007)");
         System.out.println();
         System.out.println("Examples:");
         System.out.println("  QwpAllocationTestClient --protocol=qwp-websocket --rows=1000000 --batch=5000");
+        System.out.println("  QwpAllocationTestClient --protocol=qwp-udp --rows=1000000 --max-datagram-size=8192");
         System.out.println("  QwpAllocationTestClient --protocol=ilp-tcp --host=remote-server");
         System.out.println("  QwpAllocationTestClient --protocol=ilp-tcp --rows=100000 --no-warmup");
     }
 
     private static void runTest(String protocol, String host, int port, int totalRows,
                                 int batchSize, int flushBytes, long flushIntervalMs,
-                                int inFlightWindow,
-                                int warmupRows, int reportInterval) throws IOException {
+                                int inFlightWindow, int maxDatagramSize,
+                                int warmupRows, int reportInterval,
+                                int targetThroughput) throws IOException {
         System.out.println("Connecting to " + host + ":" + port + "...");
 
         try (Sender sender = createSender(protocol, host, port, batchSize, flushBytes, flushIntervalMs,
-                inFlightWindow)) {
+                inFlightWindow, maxDatagramSize)) {
             System.out.println("Connected! Protocol: " + protocol);
             System.out.println();
 
@@ -290,9 +319,20 @@ public class QwpAllocationTestClient {
             long startTime = System.nanoTime();
             long lastReportTime = startTime;
             int lastReportRows = 0;
+            // Pacing: check every ~0.1ms worth of rows to keep bursts small
+            int paceCheckInterval = targetThroughput > 0 ? Math.max(1, targetThroughput / 10_000) : 0;
+            double nanosPerRow = targetThroughput > 0 ? 1_000_000_000.0 / targetThroughput : 0;
 
             for (int i = 0; i < totalRows; i++) {
                 sendRow(sender, i);
+
+                // Pacing: busy-spin until we're back on schedule
+                if (nanosPerRow > 0 && (i + 1) % paceCheckInterval == 0) {
+                    long expectedElapsedNanos = (long) ((i + 1) * nanosPerRow);
+                    while (System.nanoTime() - startTime < expectedElapsedNanos) {
+                        Thread.onSpinWait();
+                    }
+                }
 
                 // Report progress
                 if (reportInterval > 0 && (i + 1) % reportInterval == 0) {
