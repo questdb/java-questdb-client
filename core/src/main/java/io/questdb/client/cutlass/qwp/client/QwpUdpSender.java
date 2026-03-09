@@ -65,7 +65,6 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  */
 public class QwpUdpSender implements Sender {
     private static final int VARINT_INT_UPPER_BOUND = 5;
-    private static final int SAFETY_MARGIN_BYTES = 8;
     private static final Logger LOG = LoggerFactory.getLogger(QwpUdpSender.class);
 
     private final UdpLineChannel channel;
@@ -85,15 +84,24 @@ public class QwpUdpSender implements Sender {
     private int inProgressRowValueCount;
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
+
+    // prefix* arrays: per-column snapshots captured before the in-progress row,
+    // used to encode and flush only the committed prefix when a row is still being built.
+    // Indexed by column index. -1 means the column has no in-progress data.
     private int[] prefixArrayDataOffsetBefore = new int[8];
     private int[] prefixArrayShapeOffsetBefore = new int[8];
     private long[] prefixStringDataSizeBefore = new long[8];
     private int[] prefixSymbolDictionarySizeBefore = new int[8];
     private int[] prefixSizeBefore = new int[8];
     private int[] prefixValueCountBefore = new int[8];
+
+    // columns that need NULL/default fill for the current row (columns not yet written to)
     private QwpTableBuffer.ColumnBuffer[] rowFillColumns = new QwpTableBuffer.ColumnBuffer[8];
+    // maps column index -> 1-based position in rowFillColumns (0 means absent)
     private int[] rowFillColumnPositions = new int[8];
+    // per-column marks to detect duplicate writes within a single row; compared against currentRowMark
     private int[] stagedColumnMarks = new int[8];
+    // monotonically increasing mark; incremented per row to invalidate stagedColumnMarks without clearing
     private int currentRowMark = 1;
     private int rowFillColumnCount;
     private int inProgressColumnCount;
@@ -845,7 +853,6 @@ public class QwpUdpSender implements Sender {
                 estimate += 1;
             }
         }
-        estimate += SAFETY_MARGIN_BYTES;
         return estimate;
     }
 
@@ -1085,6 +1092,11 @@ public class QwpUdpSender implements Sender {
         return currentTableBuffer;
     }
 
+    @TestOnly
+    public long committedDatagramEstimateForTest() {
+        return committedDatagramEstimate;
+    }
+
     private void captureInProgressColumnPrefixState() {
         int columnCount = currentTableBuffer.getColumnCount();
         ensurePrefixColumnCapacity(columnCount);
@@ -1299,6 +1311,11 @@ public class QwpUdpSender implements Sender {
         return len;
     }
 
+    /**
+     * Captures the state of a column buffer at the moment the in-progress row starts
+     * writing to it. The snapshot allows the sender to compute incremental datagram
+     * size estimates and to roll back the column to its pre-row state on error or cancel.
+     */
     private static final class InProgressColumnState {
         private int arrayDataOffsetBefore;
         private int arrayShapeOffsetBefore;

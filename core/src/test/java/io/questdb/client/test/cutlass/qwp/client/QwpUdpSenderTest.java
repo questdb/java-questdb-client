@@ -140,6 +140,14 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testEstimateMatchesActualEncodedSize() throws Exception {
+        assertMemoryLeak(() -> {
+            auditEstimateWithStableSchemaAndNullableValues();
+            auditEstimateAcrossSymbolDictionaryVarintBoundary();
+        });
+    }
+
+    @Test
     public void testBoundedSenderNullableStringNullAcrossOverflowBoundaryPreservesRowsAndPacketLimit() throws Exception {
         assertMemoryLeak(() -> {
             String alpha = repeat('a', 512);
@@ -1700,6 +1708,91 @@ public class QwpUdpSenderTest {
             elems.add(value);
         }
         return new DoubleArrayValue(dims, elems);
+    }
+
+    private static void auditEstimateAcrossSymbolDictionaryVarintBoundary() throws Exception {
+        ArrayList<ScenarioRow> rows = new ArrayList<>();
+        for (int i = 0; i < 160; i++) {
+            final int rowId = i;
+            rows.add(row(
+                    "sym_audit",
+                    sender -> sender.table("sym_audit")
+                            .longColumn("x", rowId)
+                            .symbol("sym", "sym-" + rowId)
+                            .atNow(),
+                    "x", (long) rowId,
+                    "sym", "sym-" + rowId
+            ));
+        }
+        assertEstimateAtLeastActual(rows);
+    }
+
+    private static void auditEstimateWithStableSchemaAndNullableValues() throws Exception {
+        ArrayList<ScenarioRow> rows = new ArrayList<>();
+        for (int i = 0; i < 96; i++) {
+            final int rowId = i;
+            final String stringValue = (i & 1) == 0 ? "tokyo-" + i + "-" + repeat('x', (i % 31) + 1) : null;
+            final long[] longArray = i % 3 == 0 ? new long[]{i, i + 1L, i + 2L} : null;
+            final double[][] doubleArray = i % 5 == 0 ? new double[][]{{i + 0.5, i + 1.5}, {i + 2.5, i + 3.5}} : null;
+            final Decimal64 decimal64 = i % 7 == 0 ? Decimal64.fromLong(i * 100L + 7, 2) : null;
+            final Decimal128 decimal128 = i % 11 == 0 ? Decimal128.fromLong(i * 1000L + 11, 4) : null;
+            final Decimal256 decimal256 = i % 13 == 0 ? Decimal256.fromLong(i * 10000L + 13, 3) : null;
+
+            rows.add(row(
+                    "audit",
+                    sender -> {
+                        sender.table("audit")
+                                .longColumn("l", rowId)
+                                .doubleColumn("d", rowId + 0.25)
+                                .symbol("sym", "stable");
+                        if (stringValue != null) {
+                            sender.stringColumn("s", stringValue);
+                        }
+                        if (longArray != null) {
+                            sender.longArray("la", longArray);
+                        }
+                        if (doubleArray != null) {
+                            sender.doubleArray("da", doubleArray);
+                        }
+                        if (decimal64 != null) {
+                            sender.decimalColumn("d64", decimal64);
+                        }
+                        if (decimal128 != null) {
+                            sender.decimalColumn("d128", decimal128);
+                        }
+                        if (decimal256 != null) {
+                            sender.decimalColumn("d256", decimal256);
+                        }
+                        sender.at(rowId + 1L, ChronoUnit.MICROS);
+                    },
+                    "l", (long) rowId,
+                    "d", rowId + 0.25,
+                    "sym", "stable",
+                    "s", stringValue,
+                    "la", longArray == null ? null : longArrayValue(shape(longArray.length), longArray),
+                    "da", doubleArray == null ? null : doubleArrayValue(shape(doubleArray.length, doubleArray[0].length), flatten(doubleArray)),
+                    "d64", decimal64 == null ? null : decimal(i * 100L + 7, 2),
+                    "d128", decimal128 == null ? null : decimal(i * 1000L + 11, 4),
+                    "d256", decimal256 == null ? null : decimal(i * 10000L + 13, 3),
+                    "", rowId + 1L
+            ));
+        }
+        assertEstimateAtLeastActual(rows);
+    }
+
+    private static void assertEstimateAtLeastActual(List<ScenarioRow> rows) throws Exception {
+        CapturingNetworkFacade nf = new CapturingNetworkFacade();
+        try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+            for (int i = 0; i < rows.size(); i++) {
+                rows.get(i).writer.accept(sender);
+                long estimate = sender.committedDatagramEstimateForTest();
+                long actual = fullPacketSize(rows.subList(0, i + 1));
+                Assert.assertTrue(
+                        "row " + i + " estimate underflow: estimate=" + estimate + ", actual=" + actual,
+                        estimate >= actual
+                );
+            }
+        }
     }
 
     private static List<DecodedRow> expectedRows(List<ScenarioRow> rows) {
