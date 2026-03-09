@@ -64,6 +64,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  * the row back into column storage.
  */
 public class QwpUdpSender implements Sender {
+    private static final int ADAPTIVE_HEADROOM_EWMA_SHIFT = 2;
     private static final int VARINT_INT_UPPER_BOUND = 5;
     private static final Logger LOG = LoggerFactory.getLogger(QwpUdpSender.class);
 
@@ -74,6 +75,7 @@ public class QwpUdpSender implements Sender {
     private final SegmentedNativeBufferWriter payloadWriter = new SegmentedNativeBufferWriter();
     private final boolean trackDatagramEstimate;
     private final NativeSegmentList datagramSegments = new NativeSegmentList();
+    private final CharSequenceObjHashMap<TableHeadroomState> tableHeadroomStates;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     private InProgressColumnState[] inProgressColumns = new InProgressColumnState[8];
 
@@ -82,6 +84,7 @@ public class QwpUdpSender implements Sender {
     private boolean closed;
     private long committedDatagramEstimate;
     private int inProgressRowValueCount;
+    private TableHeadroomState currentTableHeadroomState;
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
 
@@ -95,15 +98,10 @@ public class QwpUdpSender implements Sender {
     private int[] prefixSizeBefore = new int[8];
     private int[] prefixValueCountBefore = new int[8];
 
-    // columns that need NULL/default fill for the current row (columns not yet written to)
-    private QwpTableBuffer.ColumnBuffer[] rowFillColumns = new QwpTableBuffer.ColumnBuffer[8];
-    // maps column index -> 1-based position in rowFillColumns (0 means absent)
-    private int[] rowFillColumnPositions = new int[8];
     // per-column marks to detect duplicate writes within a single row; compared against currentRowMark
     private int[] stagedColumnMarks = new int[8];
     // monotonically increasing mark; incremented per row to invalidate stagedColumnMarks without clearing
     private int currentRowMark = 1;
-    private int rowFillColumnCount;
     private int inProgressColumnCount;
 
     public QwpUdpSender(NetworkFacade nf, int interfaceIPv4, int sendToAddress, int port, int ttl) {
@@ -112,6 +110,7 @@ public class QwpUdpSender implements Sender {
 
     public QwpUdpSender(NetworkFacade nf, int interfaceIPv4, int sendToAddress, int port, int ttl, int maxDatagramSize) {
         this.channel = new UdpLineChannel(nf, interfaceIPv4, sendToAddress, port, ttl);
+        this.tableHeadroomStates = new CharSequenceObjHashMap<>();
         this.tableBuffers = new CharSequenceObjHashMap<>();
         this.maxDatagramSize = maxDatagramSize;
         this.trackDatagramEstimate = maxDatagramSize > 0;
@@ -196,6 +195,8 @@ public class QwpUdpSender implements Sender {
                 }
             }
             tableBuffers.clear();
+            tableHeadroomStates.clear();
+            currentTableHeadroomState = null;
             channel.close();
             payloadWriter.close();
             datagramSegments.close();
@@ -424,9 +425,11 @@ public class QwpUdpSender implements Sender {
             }
         }
         currentTableBuffer = null;
+        currentTableHeadroomState = null;
         currentTableName = null;
         clearTransientRowState();
         resetCommittedDatagramEstimate();
+        tableHeadroomStates.clear();
     }
 
     @Override
@@ -475,7 +478,11 @@ public class QwpUdpSender implements Sender {
             currentTableBuffer = new QwpTableBuffer(currentTableName);
             tableBuffers.put(currentTableName, currentTableBuffer);
         }
-        rebuildPendingFillColumnsForCurrentTable();
+        currentTableHeadroomState = tableHeadroomStates.get(currentTableName);
+        if (currentTableHeadroomState == null) {
+            currentTableHeadroomState = new TableHeadroomState();
+            tableHeadroomStates.put(currentTableName, currentTableHeadroomState);
+        }
         return this;
     }
 
@@ -534,7 +541,6 @@ public class QwpUdpSender implements Sender {
     private void beginColumnWrite(QwpTableBuffer.ColumnBuffer column, CharSequence columnName) {
         int columnIndex = column.getIndex();
         ensureStagedColumnMarkCapacity(columnIndex + 1);
-        ensureRowFillPositionCapacity(columnIndex + 1);
         if (stagedColumnMarks[columnIndex] == currentRowMark) {
             if (columnName != null && columnName.isEmpty()) {
                 throw new LineSenderException("designated timestamp already set for current row");
@@ -543,7 +549,6 @@ public class QwpUdpSender implements Sender {
         }
         stagedColumnMarks[columnIndex] = currentRowMark;
         appendInProgressColumnState(column);
-        removePendingFillColumn(column);
     }
 
     private void appendInProgressColumnState(QwpTableBuffer.ColumnBuffer column) {
@@ -557,10 +562,15 @@ public class QwpUdpSender implements Sender {
         inProgressColumnCount++;
     }
 
+    private void completeColumnWrite() {
+        inProgressColumns[inProgressColumnCount - 1].captureAfterWrite();
+    }
+
     private void stageBooleanColumnValue(CharSequence name, boolean value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_BOOLEAN, false);
         beginColumnWrite(col, name);
         col.addBoolean(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -568,6 +578,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DECIMAL128, true);
         beginColumnWrite(col, name);
         col.addDecimal128(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -575,6 +586,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DECIMAL256, true);
         beginColumnWrite(col, name);
         col.addDecimal256(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -582,6 +594,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DECIMAL64, true);
         beginColumnWrite(col, name);
         col.addDecimal64(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -600,12 +613,14 @@ public class QwpUdpSender implements Sender {
         }
         beginColumnWrite(col, "");
         col.addLong(value);
+        completeColumnWrite();
     }
 
     private void stageDoubleArrayColumnValue(CharSequence name, Object value) {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DOUBLE_ARRAY, true);
         beginColumnWrite(col, name);
         appendDoubleArrayValue(col, value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -613,6 +628,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DOUBLE, false);
         beginColumnWrite(col, name);
         col.addDouble(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -620,6 +636,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_LONG_ARRAY, true);
         beginColumnWrite(col, name);
         appendLongArrayValue(col, value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -627,6 +644,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_LONG, false);
         beginColumnWrite(col, name);
         col.addLong(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -634,6 +652,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_STRING, true);
         beginColumnWrite(col, name);
         col.addString(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -641,6 +660,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_SYMBOL, true);
         beginColumnWrite(col, name);
         col.addSymbol(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -648,6 +668,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, type, true);
         beginColumnWrite(col, name);
         col.addLong(value);
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -697,6 +718,7 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, type, true);
         beginColumnWrite(col, name);
         col.addNull();
+        completeColumnWrite();
         inProgressRowValueCount++;
     }
 
@@ -761,7 +783,6 @@ public class QwpUdpSender implements Sender {
             currentTableBuffer.cancelCurrentRow();
             currentTableBuffer.rollbackUncommittedColumns();
         }
-        restorePendingFillColumnsFromInProgressColumns();
         clearCachedTimestampColumns();
         clearInProgressRow();
     }
@@ -772,8 +793,12 @@ public class QwpUdpSender implements Sender {
         }
 
         long estimate = 0;
+        long committedEstimateBeforeRow = 0;
         int targetRows = currentTableBuffer.getRowCount() + 1;
         if (trackDatagramEstimate) {
+            committedEstimateBeforeRow = currentTableBuffer.getRowCount() > 0
+                    ? committedDatagramEstimate
+                    : estimateBaseForCurrentSchema();
             estimate = estimateCurrentDatagramSizeWithInProgressRow(targetRows);
             if (estimate > maxDatagramSize) {
                 if (currentTableBuffer.getRowCount() == 0) {
@@ -781,6 +806,7 @@ public class QwpUdpSender implements Sender {
                 }
                 flushCommittedPrefixPreservingCurrentRow();
                 targetRows = currentTableBuffer.getRowCount() + 1;
+                committedEstimateBeforeRow = estimateBaseForCurrentSchema();
                 estimate = estimateCurrentDatagramSizeWithInProgressRow(targetRows);
                 if (estimate > maxDatagramSize) {
                     throw singleRowTooLarge(estimate);
@@ -788,12 +814,15 @@ public class QwpUdpSender implements Sender {
             }
         }
 
-        currentTableBuffer.nextRow(rowFillColumns, rowFillColumnCount);
-        restorePendingFillColumnsFromInProgressColumns();
+        currentTableBuffer.nextRow();
         if (trackDatagramEstimate) {
             committedDatagramEstimate = estimate;
         }
         clearInProgressRow();
+        if (trackDatagramEstimate) {
+            long rowDatagramGrowth = estimate - committedEstimateBeforeRow;
+            recordCommittedRowAndMaybeFlush(rowDatagramGrowth);
+        }
     }
 
     private void ensureNoInProgressRow(String operation) {
@@ -831,6 +860,13 @@ public class QwpUdpSender implements Sender {
     }
 
     private long estimateBaseForCurrentSchema() {
+        if (currentTableHeadroomState != null) {
+            long cachedEstimate = currentTableHeadroomState.getCachedBaseEstimate(currentTableBuffer.getColumnCount());
+            if (cachedEstimate > -1) {
+                return cachedEstimate;
+            }
+        }
+
         long estimate = HEADER_SIZE;
         int tableNameUtf8 = NativeBufferWriter.utf8Length(currentTableName);
         estimate += NativeBufferWriter.varintSize(tableNameUtf8) + tableNameUtf8;
@@ -853,6 +889,9 @@ public class QwpUdpSender implements Sender {
                 estimate += 1;
             }
         }
+        if (currentTableHeadroomState != null) {
+            currentTableHeadroomState.cacheBaseEstimate(currentTableBuffer.getColumnCount(), estimate);
+        }
         return estimate;
     }
 
@@ -860,14 +899,17 @@ public class QwpUdpSender implements Sender {
         long estimate = currentTableBuffer.getRowCount() > 0 ? committedDatagramEstimate : estimateBaseForCurrentSchema();
         for (int i = 0; i < inProgressColumnCount; i++) {
             InProgressColumnState state = inProgressColumns[i];
-            QwpTableBuffer.ColumnBuffer col = state.column;
-            estimate += estimateInProgressColumnPayload(state);
-            if (col.isNullable()) {
+            estimate += state.payloadEstimateDelta;
+            if (state.nullable) {
                 estimate += bitmapBytes(targetRows) - bitmapBytes(state.sizeBefore);
             }
         }
-        for (int i = 0; i < rowFillColumnCount; i++) {
-            QwpTableBuffer.ColumnBuffer col = rowFillColumns[i];
+        ensureStagedColumnMarkCapacity(currentTableBuffer.getColumnCount());
+        for (int i = 0, columnCount = currentTableBuffer.getColumnCount(); i < columnCount; i++) {
+            if (stagedColumnMarks[i] == currentRowMark) {
+                continue;
+            }
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getColumn(i);
             int missing = targetRows - col.getSize();
             if (col.isNullable()) {
                 estimate += bitmapBytes(targetRows) - bitmapBytes(col.getSize());
@@ -878,7 +920,7 @@ public class QwpUdpSender implements Sender {
         return estimate;
     }
 
-    private long estimateInProgressColumnPayload(InProgressColumnState state) {
+    private static long estimateInProgressColumnPayload(InProgressColumnState state) {
         QwpTableBuffer.ColumnBuffer col = state.column;
         int valueCountBefore = state.valueCountBefore;
         int valueCountAfter = col.getValueCount();
@@ -897,36 +939,6 @@ public class QwpUdpSender implements Sender {
             case TYPE_SYMBOL -> estimateSymbolPayloadDelta(col, state);
             default -> throw new LineSenderException("unsupported in-progress column type: " + col.getType());
         };
-    }
-
-    private void ensureRowFillColumnCapacity(int required) {
-        if (required <= rowFillColumns.length) {
-            return;
-        }
-
-        int newCapacity = rowFillColumns.length;
-        while (newCapacity < required) {
-            newCapacity *= 2;
-        }
-
-        QwpTableBuffer.ColumnBuffer[] newArr = new QwpTableBuffer.ColumnBuffer[newCapacity];
-        System.arraycopy(rowFillColumns, 0, newArr, 0, rowFillColumnCount);
-        rowFillColumns = newArr;
-    }
-
-    private void ensureRowFillPositionCapacity(int required) {
-        if (required <= rowFillColumnPositions.length) {
-            return;
-        }
-
-        int newCapacity = rowFillColumnPositions.length;
-        while (newCapacity < required) {
-            newCapacity *= 2;
-        }
-
-        int[] newArr = new int[newCapacity];
-        System.arraycopy(rowFillColumnPositions, 0, newArr, 0, rowFillColumnPositions.length);
-        rowFillColumnPositions = newArr;
     }
 
     private void ensureInProgressColumnCapacity(int required) {
@@ -959,14 +971,14 @@ public class QwpUdpSender implements Sender {
         stagedColumnMarks = newArr;
     }
 
-    private long estimateArrayPayloadBytes(QwpTableBuffer.ColumnBuffer col, InProgressColumnState state) {
+    private static long estimateArrayPayloadBytes(QwpTableBuffer.ColumnBuffer col, InProgressColumnState state) {
         int shapeCount = col.getArrayShapeOffset() - state.arrayShapeOffsetBefore;
         int dataCount = col.getArrayDataOffset() - state.arrayDataOffsetBefore;
         int elementSize = col.getType() == TYPE_LONG_ARRAY ? Long.BYTES : Double.BYTES;
         return 1L + (long) shapeCount * Integer.BYTES + (long) dataCount * elementSize;
     }
 
-    private long estimateSymbolPayloadDelta(QwpTableBuffer.ColumnBuffer col, InProgressColumnState state) {
+    private static long estimateSymbolPayloadDelta(QwpTableBuffer.ColumnBuffer col, InProgressColumnState state) {
         int valueCountBefore = state.valueCountBefore;
         int valueCountAfter = col.getValueCount();
         if (valueCountAfter == valueCountBefore) {
@@ -1006,7 +1018,6 @@ public class QwpUdpSender implements Sender {
         }
         sendWholeTableBuffer(currentTableName, currentTableBuffer);
         clearCachedTimestampColumns();
-        rebuildPendingFillColumnsForCurrentTable();
         resetCommittedDatagramEstimate();
     }
 
@@ -1024,7 +1035,6 @@ public class QwpUdpSender implements Sender {
             sendWholeTableBuffer(tableName, tableBuffer);
         }
         clearTransientRowState();
-        rebuildPendingFillColumnsForCurrentTable();
         resetCommittedDatagramEstimate();
     }
 
@@ -1061,6 +1071,17 @@ public class QwpUdpSender implements Sender {
         return (valueCount + 7) / 8;
     }
 
+    private void recordCommittedRowAndMaybeFlush(long rowDatagramGrowth) {
+        if (currentTableBuffer == null || currentTableBuffer.getRowCount() == 0 || currentTableHeadroomState == null) {
+            return;
+        }
+
+        currentTableHeadroomState.recordCommittedRow(currentTableBuffer.getColumnCount(), rowDatagramGrowth);
+        if (shouldFlushCommittedRowsAfterCommit()) {
+            flushCommittedRowsOfCurrentTable();
+        }
+    }
+
     private void resetCommittedDatagramEstimate() {
         committedDatagramEstimate = 0;
     }
@@ -1073,7 +1094,6 @@ public class QwpUdpSender implements Sender {
     private void clearTransientRowState() {
         clearCachedTimestampColumns();
         clearInProgressRow();
-        clearPendingFillColumns();
     }
 
     // Public test hooks because module boundaries prevent tests from sharing this package.
@@ -1154,79 +1174,6 @@ public class QwpUdpSender implements Sender {
         }
     }
 
-    private void clearPendingFillColumns() {
-        for (int i = 0; i < rowFillColumnCount; i++) {
-            QwpTableBuffer.ColumnBuffer column = rowFillColumns[i];
-            if (column != null) {
-                rowFillColumnPositions[column.getIndex()] = 0;
-                rowFillColumns[i] = null;
-            }
-        }
-        rowFillColumnCount = 0;
-    }
-
-    private void rebuildPendingFillColumnsForCurrentTable() {
-        clearPendingFillColumns();
-        if (currentTableBuffer == null) {
-            return;
-        }
-
-        int columnCount = currentTableBuffer.getColumnCount();
-        ensureRowFillColumnCapacity(columnCount);
-        ensureRowFillPositionCapacity(columnCount);
-        for (int i = 0; i < columnCount; i++) {
-            QwpTableBuffer.ColumnBuffer column = currentTableBuffer.getColumn(i);
-            rowFillColumns[rowFillColumnCount] = column;
-            rowFillColumnPositions[i] = rowFillColumnCount + 1;
-            rowFillColumnCount++;
-        }
-    }
-
-    private void removePendingFillColumn(QwpTableBuffer.ColumnBuffer column) {
-        int columnIndex = column.getIndex();
-        if (columnIndex >= rowFillColumnPositions.length) {
-            return;
-        }
-
-        int position = rowFillColumnPositions[columnIndex] - 1;
-        if (position < 0) {
-            return;
-        }
-
-        int lastIndex = rowFillColumnCount - 1;
-        QwpTableBuffer.ColumnBuffer lastColumn = rowFillColumns[lastIndex];
-        rowFillColumns[lastIndex] = null;
-        rowFillColumnCount = lastIndex;
-        rowFillColumnPositions[columnIndex] = 0;
-        if (position != lastIndex) {
-            rowFillColumns[position] = lastColumn;
-            rowFillColumnPositions[lastColumn.getIndex()] = position + 1;
-        }
-    }
-
-    private void restorePendingFillColumnsFromInProgressColumns() {
-        if (currentTableBuffer == null) {
-            return;
-        }
-
-        int columnCount = currentTableBuffer.getColumnCount();
-        ensureRowFillColumnCapacity(rowFillColumnCount + inProgressColumnCount);
-        ensureRowFillPositionCapacity(columnCount);
-        for (int i = 0; i < inProgressColumnCount; i++) {
-            QwpTableBuffer.ColumnBuffer column = inProgressColumns[i].column;
-            int columnIndex = column.getIndex();
-            if (columnIndex >= columnCount || currentTableBuffer.getColumn(columnIndex) != column) {
-                continue;
-            }
-            if (rowFillColumnPositions[columnIndex] != 0) {
-                continue;
-            }
-            rowFillColumns[rowFillColumnCount] = column;
-            rowFillColumnPositions[columnIndex] = rowFillColumnCount + 1;
-            rowFillColumnCount++;
-        }
-    }
-
     private void sendCommittedPrefix(CharSequence tableName, QwpTableBuffer tableBuffer) {
         int payloadLength = encodeCommittedPrefixPayloadForUdp(tableBuffer);
         sendEncodedPayload(tableName, payloadLength);
@@ -1262,6 +1209,18 @@ public class QwpUdpSender implements Sender {
         int payloadLength = encodeTablePayloadForUdp(tableBuffer);
         sendEncodedPayload(tableName, payloadLength);
         tableBuffer.reset();
+    }
+
+    private boolean shouldFlushCommittedRowsAfterCommit() {
+        if (committedDatagramEstimate >= maxDatagramSize) {
+            return true;
+        }
+
+        long predictedNextRowGrowth = currentTableHeadroomState.predictNextRowGrowth();
+        if (predictedNextRowGrowth <= 0) {
+            return false;
+        }
+        return committedDatagramEstimate > maxDatagramSize - predictedNextRowGrowth;
     }
 
     private LineSenderException singleRowTooLarge(long estimate) {
@@ -1320,6 +1279,8 @@ public class QwpUdpSender implements Sender {
         private int arrayDataOffsetBefore;
         private int arrayShapeOffsetBefore;
         private QwpTableBuffer.ColumnBuffer column;
+        private boolean nullable;
+        private long payloadEstimateDelta;
         private int sizeBefore;
         private long stringDataSizeBefore;
         private int symbolDictionarySizeBefore;
@@ -1327,16 +1288,24 @@ public class QwpUdpSender implements Sender {
 
         void clear() {
             column = null;
+            nullable = false;
+            payloadEstimateDelta = 0;
         }
 
         void of(QwpTableBuffer.ColumnBuffer column) {
             this.column = column;
+            this.nullable = column.isNullable();
+            this.payloadEstimateDelta = 0;
             this.sizeBefore = column.getSize();
             this.valueCountBefore = column.getValueCount();
             this.stringDataSizeBefore = column.getStringDataSize();
             this.arrayShapeOffsetBefore = column.getArrayShapeOffset();
             this.arrayDataOffsetBefore = column.getArrayDataOffset();
             this.symbolDictionarySizeBefore = column.getSymbolDictionarySize();
+        }
+
+        void captureAfterWrite() {
+            this.payloadEstimateDelta = estimateInProgressColumnPayload(this);
         }
 
         void rebaseToEmptyTable() {
@@ -1346,6 +1315,51 @@ public class QwpUdpSender implements Sender {
             this.arrayShapeOffsetBefore = 0;
             this.arrayDataOffsetBefore = 0;
             this.symbolDictionarySizeBefore = 0;
+            captureAfterWrite();
+        }
+    }
+
+    private static final class TableHeadroomState {
+        private long cachedBaseEstimate = -1;
+        private int cachedBaseEstimateColumnCount = -1;
+        private int committedSampleCount;
+        private int schemaColumnCount = -1;
+        private long ewmaRowDatagramGrowth;
+        private long lastRowDatagramGrowth;
+
+        void cacheBaseEstimate(int currentSchemaColumnCount, long estimate) {
+            cachedBaseEstimateColumnCount = currentSchemaColumnCount;
+            cachedBaseEstimate = estimate;
+        }
+
+        long getCachedBaseEstimate(int currentSchemaColumnCount) {
+            return cachedBaseEstimateColumnCount == currentSchemaColumnCount ? cachedBaseEstimate : -1;
+        }
+
+        long predictNextRowGrowth() {
+            if (committedSampleCount < 2) {
+                return 0;
+            }
+            return Math.max(lastRowDatagramGrowth, ewmaRowDatagramGrowth);
+        }
+
+        void recordCommittedRow(int currentSchemaColumnCount, long rowDatagramGrowth) {
+            if (schemaColumnCount != currentSchemaColumnCount) {
+                committedSampleCount = 0;
+                ewmaRowDatagramGrowth = 0;
+                lastRowDatagramGrowth = 0;
+                schemaColumnCount = currentSchemaColumnCount;
+            }
+
+            lastRowDatagramGrowth = rowDatagramGrowth;
+            if (committedSampleCount == 0) {
+                ewmaRowDatagramGrowth = rowDatagramGrowth;
+            } else {
+                ewmaRowDatagramGrowth += (rowDatagramGrowth - ewmaRowDatagramGrowth) >> ADAPTIVE_HEADROOM_EWMA_SHIFT;
+            }
+            if (committedSampleCount < Integer.MAX_VALUE) {
+                committedSampleCount++;
+            }
         }
     }
 }

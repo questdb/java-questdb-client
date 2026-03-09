@@ -148,6 +148,138 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testAdaptiveHeadroomFlushesCommittedRowsBeforeNextRowStarts() throws Exception {
+        assertMemoryLeak(() -> {
+            String alpha = repeat('a', 256);
+            String beta = repeat('b', 256);
+            String gamma = repeat('c', 256);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", alpha)
+                                    .atNow(),
+                            "x", 1L,
+                            "s", alpha),
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 2)
+                                    .stringColumn("s", beta)
+                                    .atNow(),
+                            "x", 2L,
+                            "s", beta),
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 3)
+                                    .stringColumn("s", gamma)
+                                    .atNow(),
+                            "x", 3L,
+                            "s", gamma)
+            );
+
+            int oneRowPacket = fullPacketSize(rows.subList(0, 1));
+            int twoRowPacket = fullPacketSize(rows.subList(0, 2));
+            int maxDatagramSize = oneRowPacket + 16;
+            Assert.assertTrue("expected overflow boundary between rows 1 and 2", maxDatagramSize < twoRowPacket);
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t")
+                        .longColumn("x", 1)
+                        .stringColumn("s", alpha)
+                        .atNow();
+                Assert.assertEquals(0, nf.sendCount);
+
+                sender.longColumn("x", 2)
+                        .stringColumn("s", beta)
+                        .atNow();
+                Assert.assertEquals("expected adaptive post-commit flush for row 2", 2, nf.sendCount);
+
+                sender.longColumn("x", 3)
+                        .stringColumn("s", gamma)
+                        .atNow();
+                Assert.assertEquals("expected row 3 to start on a fresh datagram", 3, nf.sendCount);
+
+                sender.flush();
+            }
+
+            RunResult result = new RunResult(nf.packets, nf.lengths, nf.sendCount);
+            Assert.assertEquals(3, result.sendCount);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testAdaptiveHeadroomStateIsPerTable() throws Exception {
+        assertMemoryLeak(() -> {
+            String alpha = repeat('a', 256);
+            String beta = repeat('b', 256);
+            List<ScenarioRow> bigRows = Arrays.asList(
+                    row("big", sender -> sender.table("big")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", alpha)
+                                    .atNow(),
+                            "x", 1L,
+                            "s", alpha),
+                    row("big", sender -> sender.table("big")
+                                    .longColumn("x", 2)
+                                    .stringColumn("s", beta)
+                                    .atNow(),
+                            "x", 2L,
+                            "s", beta)
+            );
+            List<ScenarioRow> smallRows = Arrays.asList(
+                    row("small", sender -> sender.table("small")
+                                    .longColumn("x", 10)
+                                    .atNow(),
+                            "x", 10L),
+                    row("small", sender -> sender.table("small")
+                                    .longColumn("x", 11)
+                                    .atNow(),
+                            "x", 11L)
+            );
+
+            int oneBigRowPacket = fullPacketSize(bigRows.subList(0, 1));
+            int twoBigRowPacket = fullPacketSize(bigRows);
+            int twoSmallRowPacket = fullPacketSize(smallRows);
+            int maxDatagramSize = oneBigRowPacket + 16;
+            Assert.assertTrue("expected overflow boundary between big rows", maxDatagramSize < twoBigRowPacket);
+            Assert.assertTrue("expected small rows to fit together", twoSmallRowPacket <= maxDatagramSize);
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("big")
+                        .longColumn("x", 1)
+                        .stringColumn("s", alpha)
+                        .atNow();
+                sender.longColumn("x", 2)
+                        .stringColumn("s", beta)
+                        .atNow();
+                Assert.assertEquals(2, nf.sendCount);
+
+                sender.table("small")
+                        .longColumn("x", 10)
+                        .atNow();
+                Assert.assertEquals("big-table headroom must not flush small-table row 1", 2, nf.sendCount);
+
+                sender.longColumn("x", 11)
+                        .atNow();
+                Assert.assertEquals("small-table rows should share a datagram", 2, nf.sendCount);
+
+                sender.flush();
+            }
+
+            RunResult result = new RunResult(nf.packets, nf.lengths, nf.sendCount);
+            Assert.assertEquals(3, result.sendCount);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("big", "x", 1L, "s", alpha),
+                    decodedRow("big", "x", 2L, "s", beta),
+                    decodedRow("small", "x", 10L),
+                    decodedRow("small", "x", 11L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
     public void testBoundedSenderNullableStringNullAcrossOverflowBoundaryPreservesRowsAndPacketLimit() throws Exception {
         assertMemoryLeak(() -> {
             String alpha = repeat('a', 512);
