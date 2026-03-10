@@ -738,7 +738,6 @@ public class QwpWebSocketSender implements Sender {
         return buffer;
     }
 
-
     /**
      * Adds an INT column value to the current row.
      *
@@ -996,7 +995,7 @@ public class QwpWebSocketSender implements Sender {
 
     private String checkedColumnName(CharSequence name) {
         if (name == null || !TableUtils.isValidColumnName(name, DEFAULT_MAX_NAME_LENGTH)) {
-            if (name == null || name.length() == 0) {
+            if (name == null || name.isEmpty()) {
                 throw new LineSenderException("column name cannot be empty");
             }
             if (name.length() > DEFAULT_MAX_NAME_LENGTH) {
