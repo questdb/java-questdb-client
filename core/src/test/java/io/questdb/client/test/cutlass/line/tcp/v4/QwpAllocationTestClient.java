@@ -182,9 +182,16 @@ public class QwpAllocationTestClient {
         }
     }
 
-    private static Sender createSender(String protocol, String host, int port,
-                                       int batchSize, int flushBytes, long flushIntervalMs,
-                                       int inFlightWindow, int maxDatagramSize) {
+    private static Sender createSender(
+            String protocol,
+            String host,
+            int port,
+            int batchSize,
+            int flushBytes,
+            long flushIntervalMs,
+            int inFlightWindow,
+            int maxDatagramSize
+    ) {
         switch (protocol) {
             case PROTOCOL_ILP_TCP:
                 return Sender.builder(Sender.Transport.TCP)

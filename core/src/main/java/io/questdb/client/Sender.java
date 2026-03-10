@@ -57,9 +57,9 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.security.PrivateKey;
-import java.util.Base64;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Base64;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -534,12 +534,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
         private static final int DEFAULT_AUTO_FLUSH_ROWS = 75_000;
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
-        private static final int DEFAULT_MAX_DATAGRAM_SIZE = 1400;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
         private static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 8;
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
         private static final int DEFAULT_MAX_BACKOFF_MILLIS = 1_000;
+        private static final int DEFAULT_MAX_DATAGRAM_SIZE = 1400;
         private static final int DEFAULT_MAX_NAME_LEN = 127;
         private static final long DEFAULT_MAX_RETRY_NANOS = TimeUnit.SECONDS.toNanos(10); // keep sync with the contract of the configuration method
         private static final long DEFAULT_MIN_REQUEST_THROUGHPUT = 100 * 1024; // 100KB/s, keep in sync with the contract of the configuration method
@@ -576,7 +576,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int maxDatagramSize = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxNameLength = PARAMETER_NOT_SET_EXPLICITLY;
         private int maximumBufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
-        private int multicastTtl = PARAMETER_NOT_SET_EXPLICITLY;
         private final HttpClientConfiguration httpClientConfiguration = new DefaultHttpClientConfiguration() {
             @Override
             public int getInitialRequestBufferSize() {
@@ -599,6 +598,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
         };
         private long minRequestThroughput = PARAMETER_NOT_SET_EXPLICITLY;
+        private int multicastTtl = PARAMETER_NOT_SET_EXPLICITLY;
         private String password;
         private PrivateKey privateKey;
         private int protocol = PARAMETER_NOT_SET_EXPLICITLY;
@@ -942,19 +942,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 channel = tlsChannel;
             }
             try {
-                switch (protocolVersion) {
-                    case PROTOCOL_VERSION_V1:
-                        sender = new LineTcpSenderV1(channel, bufferCapacity, maxNameLength);
-                        break;
-                    case PROTOCOL_VERSION_V2:
-                        sender = new LineTcpSenderV2(channel, bufferCapacity, maxNameLength);
-                        break;
-                    case PROTOCOL_VERSION_V3:
-                        sender = new LineTcpSenderV3(channel, bufferCapacity, maxNameLength);
-                        break;
-                    default:
-                        throw new LineSenderException("unknown protocol version [version=").put(protocolVersion).put("]");
-                }
+                sender = switch (protocolVersion) {
+                    case PROTOCOL_VERSION_V1 -> new LineTcpSenderV1(channel, bufferCapacity, maxNameLength);
+                    case PROTOCOL_VERSION_V2 -> new LineTcpSenderV2(channel, bufferCapacity, maxNameLength);
+                    case PROTOCOL_VERSION_V3 -> new LineTcpSenderV3(channel, bufferCapacity, maxNameLength);
+                    default ->
+                            throw new LineSenderException("unknown protocol version [version=").put(protocolVersion).put("]");
+                };
             } catch (Throwable t) {
                 channel.close();
                 throw rethrow(t);
@@ -1244,32 +1238,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Set the maximum datagram size in bytes for UDP transport. Only valid for UDP transport.
-         * <br>
-         * The practical limit depends on the network MTU (typically 1500 bytes for Ethernet).
-         * <br>
-         * Default value: 1400 bytes
-         *
-         * @param maxDatagramSize maximum datagram size in bytes
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder maxDatagramSize(int maxDatagramSize) {
-            if (this.maxDatagramSize != PARAMETER_NOT_SET_EXPLICITLY) {
-                throw new LineSenderException("max datagram size was already configured ")
-                        .put("[maxDatagramSize=").put(this.maxDatagramSize).put("]");
-            }
-            if (maxDatagramSize < 1) {
-                throw new LineSenderException("max datagram size must be positive ")
-                        .put("[maxDatagramSize=").put(maxDatagramSize).put("]");
-            }
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_UDP) {
-                throw new LineSenderException("max datagram size is only supported for UDP transport");
-            }
-            this.maxDatagramSize = maxDatagramSize;
-            return this;
-        }
-
-        /**
          * Set the maximum local buffer capacity in bytes.
          * <br>
          * This is a hard limit on the maximum buffer capacity. The buffer cannot grow beyond this limit and Sender
@@ -1292,6 +1260,32 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put("]");
             }
             this.maximumBufferCapacity = maximumBufferCapacity;
+            return this;
+        }
+
+        /**
+         * Set the maximum datagram size in bytes for UDP transport. Only valid for UDP transport.
+         * <br>
+         * The practical limit depends on the network MTU (typically 1500 bytes for Ethernet).
+         * <br>
+         * Default value: 1400 bytes
+         *
+         * @param maxDatagramSize maximum datagram size in bytes
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder maxDatagramSize(int maxDatagramSize) {
+            if (this.maxDatagramSize != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("max datagram size was already configured ")
+                        .put("[maxDatagramSize=").put(this.maxDatagramSize).put("]");
+            }
+            if (maxDatagramSize < 1) {
+                throw new LineSenderException("max datagram size must be positive ")
+                        .put("[maxDatagramSize=").put(maxDatagramSize).put("]");
+            }
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_UDP) {
+                throw new LineSenderException("max datagram size is only supported for UDP transport");
+            }
+            this.maxDatagramSize = maxDatagramSize;
             return this;
         }
 
@@ -1842,6 +1836,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             protocol = PROTOCOL_TCP;
         }
 
+        private void udp() {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("protocol was already configured ")
+                        .put("[protocol=").put(protocol).put("]");
+            }
+            protocol = PROTOCOL_UDP;
+        }
+
         private void validateParameters() {
             if (hosts.size() == 0) {
                 throw new LineSenderException("questdb server address not set");
@@ -1983,14 +1985,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("unsupported protocol ")
                         .put("[protocol=").put(protocol).put("]");
             }
-        }
-
-        private void udp() {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
-                throw new LineSenderException("protocol was already configured ")
-                        .put("[protocol=").put(protocol).put("]");
-            }
-            protocol = PROTOCOL_UDP;
         }
 
         private void websocket() {

@@ -697,7 +697,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     private int recvOrTimeout(long ptr, int len, int timeout) {
-        long startTime = System.nanoTime();
         int n = socket.recv(ptr, len);
         if (n < 0) {
             throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
