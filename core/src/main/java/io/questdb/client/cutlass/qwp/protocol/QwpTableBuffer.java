@@ -153,16 +153,6 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
-     * Returns an existing column with the given name and type, or {@code null} if absent.
-     * <p>
-     * Uses the same sequential access optimization as {@link #getOrCreateColumn(CharSequence, byte, boolean)}.
-     * When the next expected column is accessed in order, the internal cursor advances without a hash lookup.
-     */
-    public ColumnBuffer getExistingColumn(CharSequence name, byte type) {
-        return lookupColumn(name, type);
-    }
-
-    /**
      * Returns the column definitions (cached for efficiency).
      */
     public QwpColumnDef[] getColumnDefs() {
@@ -175,6 +165,16 @@ public class QwpTableBuffer implements QuietCloseable {
             columnDefsCacheValid = true;
         }
         return cachedColumnDefs;
+    }
+
+    /**
+     * Returns an existing column with the given name and type, or {@code null} if absent.
+     * <p>
+     * Uses the same sequential access optimization as {@link #getOrCreateColumn(CharSequence, byte, boolean)}.
+     * When the next expected column is accessed in order, the internal cursor advances without a hash lookup.
+     */
+    public ColumnBuffer getExistingColumn(CharSequence name, byte type) {
+        return lookupColumn(name, type);
     }
 
     /**
@@ -192,111 +192,11 @@ public class QwpTableBuffer implements QuietCloseable {
         return createColumn(name, type, nullable);
     }
 
-    private ColumnBuffer createColumn(CharSequence name, byte type, boolean nullable) {
-        ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
-        int index = columns.size();
-        col.index = index;
-        columns.add(col);
-        columnNameToIndex.put(name, index);
-        // Update fast access array
-        if (fastColumns == null || index >= fastColumns.length) {
-            int newLen = Math.max(8, index + 4);
-            ColumnBuffer[] newArr = new ColumnBuffer[newLen];
-            if (fastColumns != null) {
-                System.arraycopy(fastColumns, 0, newArr, 0, index);
-            }
-            fastColumns = newArr;
-        }
-        fastColumns[index] = col;
-        schemaHashComputed = false;
-        columnDefsCacheValid = false;
-        return col;
-    }
-
-    public void rollbackUncommittedColumns() {
-        if (columns.size() <= committedColumnCount) {
-            return;
-        }
-
-        for (int i = columns.size() - 1; i >= committedColumnCount; i--) {
-            ColumnBuffer col = columns.getQuick(i);
-            if (col != null) {
-                col.close();
-            }
-            columns.remove(i);
-        }
-        rebuildColumnAccessStructures();
-    }
-
-    private void rebuildColumnAccessStructures() {
-        columnNameToIndex.clear();
-
-        int columnCount = columns.size();
-        int minCapacity = Math.max(8, columnCount + 4);
-        if (fastColumns == null || fastColumns.length < minCapacity) {
-            fastColumns = new ColumnBuffer[minCapacity];
-        } else {
-            Arrays.fill(fastColumns, null);
-        }
-
-        for (int i = 0; i < columnCount; i++) {
-            ColumnBuffer col = columns.getQuick(i);
-            col.index = i;
-            fastColumns[i] = col;
-            columnNameToIndex.put(col.name, i);
-        }
-
-        schemaHashComputed = false;
-        columnDefsCacheValid = false;
-        cachedColumnDefs = null;
-    }
-
-    private ColumnBuffer lookupColumn(CharSequence name, byte type) {
-        // Fast path: predict next column in sequence
-        int n = columns.size();
-        if (columnAccessCursor < n) {
-            ColumnBuffer candidate = fastColumns[columnAccessCursor];
-            if (Chars.equals(candidate.name, name)) {
-                columnAccessCursor++;
-                assertColumnType(name, type, candidate);
-                return candidate;
-            }
-        }
-
-        // Slow path: hash map lookup
-        int idx = columnNameToIndex.get(name);
-        if (idx != CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-            ColumnBuffer existing = columns.get(idx);
-            assertColumnType(name, type, existing);
-            return existing;
-        }
-
-        return null;
-    }
-
-    private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {
-        if (column.type != type) {
-            throw new LineSenderException(
-                    "Column type mismatch for column '" + name + "': columnType="
-                            + column.type + ", sentType=" + type
-            );
-        }
-    }
-
     /**
      * Returns the number of rows buffered.
      */
     public int getRowCount() {
         return rowCount;
-    }
-
-    public boolean hasInProgressRow() {
-        for (int i = 0, n = columns.size(); i < n; i++) {
-            if (fastColumns[i].size > rowCount) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
@@ -320,6 +220,15 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public String getTableName() {
         return tableName;
+    }
+
+    public boolean hasInProgressRow() {
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            if (fastColumns[i].size > rowCount) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -360,10 +269,21 @@ public class QwpTableBuffer implements QuietCloseable {
         committedColumnCount = columns.size();
     }
 
+    /**
+     * Resets the buffer for reuse. Keeps column definitions and allocated memory.
+     */
+    public void reset() {
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            fastColumns[i].reset();
+        }
+        columnAccessCursor = 0;
+        committedColumnCount = columns.size();
+        rowCount = 0;
+    }
+
     public void retainInProgressRow(
             int[] sizeBefore,
             int[] valueCountBefore,
-            long[] stringDataSizeBefore,
             int[] arrayShapeOffsetBefore,
             int[] arrayDataOffsetBefore
     ) {
@@ -374,7 +294,6 @@ public class QwpTableBuffer implements QuietCloseable {
                 col.retainTailRow(
                         sizeBefore[i],
                         valueCountBefore[i],
-                        stringDataSizeBefore[i],
                         arrayShapeOffsetBefore[i],
                         arrayDataOffsetBefore[i]
                 );
@@ -386,16 +305,95 @@ public class QwpTableBuffer implements QuietCloseable {
         committedColumnCount = columns.size();
     }
 
-    /**
-     * Resets the buffer for reuse. Keeps column definitions and allocated memory.
-     */
-    public void reset() {
-        for (int i = 0, n = columns.size(); i < n; i++) {
-            fastColumns[i].reset();
+    public void rollbackUncommittedColumns() {
+        if (columns.size() <= committedColumnCount) {
+            return;
         }
-        columnAccessCursor = 0;
-        committedColumnCount = columns.size();
-        rowCount = 0;
+
+        for (int i = columns.size() - 1; i >= committedColumnCount; i--) {
+            ColumnBuffer col = columns.getQuick(i);
+            if (col != null) {
+                col.close();
+            }
+            columns.remove(i);
+        }
+        rebuildColumnAccessStructures();
+    }
+
+    private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {
+        if (column.type != type) {
+            throw new LineSenderException(
+                    "Column type mismatch for column '" + name + "': columnType="
+                            + column.type + ", sentType=" + type
+            );
+        }
+    }
+
+    private ColumnBuffer createColumn(CharSequence name, byte type, boolean nullable) {
+        ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
+        int index = columns.size();
+        col.index = index;
+        columns.add(col);
+        columnNameToIndex.put(name, index);
+        // Update fast access array
+        if (fastColumns == null || index >= fastColumns.length) {
+            int newLen = Math.max(8, index + 4);
+            ColumnBuffer[] newArr = new ColumnBuffer[newLen];
+            if (fastColumns != null) {
+                System.arraycopy(fastColumns, 0, newArr, 0, index);
+            }
+            fastColumns = newArr;
+        }
+        fastColumns[index] = col;
+        schemaHashComputed = false;
+        columnDefsCacheValid = false;
+        return col;
+    }
+
+    private ColumnBuffer lookupColumn(CharSequence name, byte type) {
+        // Fast path: predict next column in sequence
+        int n = columns.size();
+        if (columnAccessCursor < n) {
+            ColumnBuffer candidate = fastColumns[columnAccessCursor];
+            if (Chars.equals(candidate.name, name)) {
+                columnAccessCursor++;
+                assertColumnType(name, type, candidate);
+                return candidate;
+            }
+        }
+
+        // Slow path: hash map lookup
+        int idx = columnNameToIndex.get(name);
+        if (idx != CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+            ColumnBuffer existing = columns.get(idx);
+            assertColumnType(name, type, existing);
+            return existing;
+        }
+
+        return null;
+    }
+
+    private void rebuildColumnAccessStructures() {
+        columnNameToIndex.clear();
+
+        int columnCount = columns.size();
+        int minCapacity = Math.max(8, columnCount + 4);
+        if (fastColumns == null || fastColumns.length < minCapacity) {
+            fastColumns = new ColumnBuffer[minCapacity];
+        } else {
+            Arrays.fill(fastColumns, null);
+        }
+
+        for (int i = 0; i < columnCount; i++) {
+            ColumnBuffer col = columns.getQuick(i);
+            col.index = i;
+            fastColumns[i] = col;
+            columnNameToIndex.put(col.name, i);
+        }
+
+        schemaHashComputed = false;
+        columnDefsCacheValid = false;
+        cachedColumnDefs = null;
     }
 
     /**
@@ -552,8 +550,8 @@ public class QwpTableBuffer implements QuietCloseable {
         private OffHeapAppendMemory stringOffsets;
         // Symbol specific (dictionary stays on-heap)
         private CharSequenceIntHashMap symbolDict;
-        private StringSink symbolLookupSink;
         private ObjList<String> symbolList;
+        private StringSink symbolLookupSink;
         private int valueCount;   // Actual stored values (excludes nulls)
 
         public ColumnBuffer(String name, byte type, boolean nullable) {
@@ -786,7 +784,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addDoubleArrayPayload(long ptr, long len) {
-            appendArrayPayload(ptr, len, false);
+            appendArrayPayload(ptr, len);
         }
 
         public void addFloat(float value) {
@@ -939,10 +937,6 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
-        public void addLongArrayPayload(long ptr, long len) {
-            appendArrayPayload(ptr, len, true);
-        }
-
         public void addNull() {
             if (nullable) {
                 ensureNullCapacity(size + 1);
@@ -1086,21 +1080,6 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
-        public int getIndex() {
-            return index;
-        }
-
-        private int getOrAddLocalSymbol(CharSequence value) {
-            int idx = symbolDict.get(value);
-            if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
-                String symbol = Chars.toString(value);
-                idx = symbolList.size();
-                symbolDict.put(symbol, idx);
-                symbolList.add(symbol);
-            }
-            return idx;
-        }
-
         public void addUuid(long high, long low) {
             ensureNullBitmapForNonNull();
             // Store in wire order: lo first, hi second
@@ -1135,12 +1114,12 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
-        public byte[] getArrayDims() {
-            return arrayDims;
-        }
-
         public int getArrayDataOffset() {
             return arrayDataOffset;
+        }
+
+        public byte[] getArrayDims() {
+            return arrayDims;
         }
 
         public int getArrayShapeOffset() {
@@ -1204,6 +1183,10 @@ public class QwpTableBuffer implements QuietCloseable {
             return geohashPrecision;
         }
 
+        public int getIndex() {
+            return index;
+        }
+
         public long[] getLongArrayData() {
             return longArrayData;
         }
@@ -1259,20 +1242,16 @@ public class QwpTableBuffer implements QuietCloseable {
             return symbolList != null ? symbolList.getQuick(index) : null;
         }
 
-        public boolean hasSymbol(CharSequence value) {
-            return symbolDict != null && symbolDict.get(value) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
-        }
-
         public byte getType() {
             return type;
         }
 
-        public boolean isNullable() {
-            return nullable;
-        }
-
         public int getValueCount() {
             return valueCount;
+        }
+
+        public boolean hasSymbol(CharSequence value) {
+            return symbolDict != null && symbolDict.get(value) != CharSequenceIntHashMap.NO_ENTRY_VALUE;
         }
 
         public boolean isNull(int index) {
@@ -1282,6 +1261,10 @@ public class QwpTableBuffer implements QuietCloseable {
             long longAddr = nullBufPtr + ((long) (index >>> 6)) * 8;
             int bitIndex = index & 63;
             return (Unsafe.getUnsafe().getLong(longAddr) & (1L << bitIndex)) != 0;
+        }
+
+        public boolean isNullable() {
+            return nullable;
         }
 
         public void reset() {
@@ -1318,7 +1301,6 @@ public class QwpTableBuffer implements QuietCloseable {
         public void retainTailRow(
                 int sizeBefore,
                 int valueCountBefore,
-                long stringDataSizeBefore,
                 int arrayShapeOffsetBefore,
                 int arrayDataOffsetBefore
         ) {
@@ -1430,120 +1412,6 @@ public class QwpTableBuffer implements QuietCloseable {
             return (int) product;
         }
 
-        private void clearValuePayload() {
-            if (dataBuffer != null && elemSize > 0) {
-                dataBuffer.jumpTo(0);
-            }
-            if (auxBuffer != null) {
-                auxBuffer.truncate();
-            }
-            if (stringOffsets != null) {
-                stringOffsets.truncate();
-                stringOffsets.putInt(0);
-            }
-            if (stringData != null) {
-                stringData.truncate();
-            }
-            arrayShapeOffset = 0;
-            arrayDataOffset = 0;
-            resetEmptyMetadata();
-        }
-
-        private void clearToEmptyFast() {
-            int sizeBefore = size;
-            clearValuePayload();
-            if (nullBufPtr != 0 && sizeBefore > 0) {
-                long usedLongs = ((long) sizeBefore + 63) >>> 6;
-                Vect.memset(nullBufPtr, usedLongs * Long.BYTES, 0);
-            }
-            size = 0;
-            valueCount = 0;
-            hasNulls = false;
-        }
-
-        private void compactNullBitmap(int sourceRow) {
-            if (nullBufPtr == 0) {
-                return;
-            }
-
-            boolean retainedNull = isNull(sourceRow);
-            long usedLongs = ((long) size + 63) >>> 6;
-            Vect.memset(nullBufPtr, usedLongs * Long.BYTES, 0);
-            if (retainedNull) {
-                Unsafe.getUnsafe().putLong(nullBufPtr, 1L);
-            }
-            hasNulls = retainedNull;
-        }
-
-        private void appendArrayPayload(long ptr, long len, boolean forLong) {
-            if (len < 0) {
-                addNull();
-                return;
-            }
-            if (len == 0) {
-                throw new LineSenderException("invalid array payload: empty payload");
-            }
-
-            int nDims = Unsafe.getUnsafe().getByte(ptr) & 0xFF;
-            if (nDims < 1 || nDims > ColumnType.ARRAY_NDIMS_LIMIT) {
-                throw new LineSenderException("invalid array payload: bad dimensionality " + nDims);
-            }
-
-            long cursor = ptr + 1;
-            long headerBytes = 1L + (long) nDims * Integer.BYTES;
-            if (len < headerBytes) {
-                throw new LineSenderException("invalid array payload: truncated shape header");
-            }
-
-            int elemCount = 1;
-            for (int d = 0; d < nDims; d++) {
-                int dimLen = Unsafe.getUnsafe().getInt(cursor);
-                if (dimLen < 0) {
-                    throw new LineSenderException("invalid array payload: negative dimension length");
-                }
-                elemCount = checkedElementCount((long) elemCount * dimLen);
-                cursor += Integer.BYTES;
-            }
-
-            long dataBytes = (long) elemCount * (forLong ? Long.BYTES : Double.BYTES);
-            if (len != headerBytes + dataBytes) {
-                throw new LineSenderException("invalid array payload: length mismatch");
-            }
-
-            ensureArrayCapacity(nDims, elemCount);
-            arrayDims[valueCount] = (byte) nDims;
-
-            cursor = ptr + 1;
-            for (int d = 0; d < nDims; d++) {
-                arrayShapes[arrayShapeOffset++] = Unsafe.getUnsafe().getInt(cursor);
-                cursor += Integer.BYTES;
-            }
-
-            if (dataBytes > 0) {
-                if (forLong) {
-                    Unsafe.getUnsafe().copyMemory(
-                            null,
-                            cursor,
-                            longArrayData,
-                            LONG_ARRAY_BASE_OFFSET + (long) arrayDataOffset * Long.BYTES,
-                            dataBytes
-                    );
-                } else {
-                    Unsafe.getUnsafe().copyMemory(
-                            null,
-                            cursor,
-                            doubleArrayData,
-                            DOUBLE_ARRAY_BASE_OFFSET + (long) arrayDataOffset * Double.BYTES,
-                            dataBytes
-                    );
-                }
-            }
-
-            arrayDataOffset += elemCount;
-            valueCount++;
-            size++;
-        }
-
         private void allocateStorage(byte type) {
             switch (type) {
                 case TYPE_BOOLEAN:
@@ -1600,6 +1468,110 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
+        private void appendArrayPayload(long ptr, long len) {
+            if (len < 0) {
+                addNull();
+                return;
+            }
+            if (len == 0) {
+                throw new LineSenderException("invalid array payload: empty payload");
+            }
+
+            int nDims = Unsafe.getUnsafe().getByte(ptr) & 0xFF;
+            if (nDims < 1 || nDims > ColumnType.ARRAY_NDIMS_LIMIT) {
+                throw new LineSenderException("invalid array payload: bad dimensionality " + nDims);
+            }
+
+            long cursor = ptr + 1;
+            long headerBytes = 1L + (long) nDims * Integer.BYTES;
+            if (len < headerBytes) {
+                throw new LineSenderException("invalid array payload: truncated shape header");
+            }
+
+            int elemCount = 1;
+            for (int d = 0; d < nDims; d++) {
+                int dimLen = Unsafe.getUnsafe().getInt(cursor);
+                if (dimLen < 0) {
+                    throw new LineSenderException("invalid array payload: negative dimension length");
+                }
+                elemCount = checkedElementCount((long) elemCount * dimLen);
+                cursor += Integer.BYTES;
+            }
+
+            long dataBytes = (long) elemCount * Double.BYTES;
+            if (len != headerBytes + dataBytes) {
+                throw new LineSenderException("invalid array payload: length mismatch");
+            }
+
+            ensureArrayCapacity(nDims, elemCount);
+            arrayDims[valueCount] = (byte) nDims;
+
+            cursor = ptr + 1;
+            for (int d = 0; d < nDims; d++) {
+                arrayShapes[arrayShapeOffset++] = Unsafe.getUnsafe().getInt(cursor);
+                cursor += Integer.BYTES;
+            }
+
+            if (dataBytes > 0) {
+                Unsafe.getUnsafe().copyMemory(
+                        null,
+                        cursor,
+                        doubleArrayData,
+                        DOUBLE_ARRAY_BASE_OFFSET + (long) arrayDataOffset * Double.BYTES,
+                        dataBytes
+                );
+            }
+
+            arrayDataOffset += elemCount;
+            valueCount++;
+            size++;
+        }
+
+        private void clearToEmptyFast() {
+            int sizeBefore = size;
+            clearValuePayload();
+            if (nullBufPtr != 0 && sizeBefore > 0) {
+                long usedLongs = ((long) sizeBefore + 63) >>> 6;
+                Vect.memset(nullBufPtr, usedLongs * Long.BYTES, 0);
+            }
+            size = 0;
+            valueCount = 0;
+            hasNulls = false;
+        }
+
+        private void clearValuePayload() {
+            if (dataBuffer != null && elemSize > 0) {
+                dataBuffer.jumpTo(0);
+            }
+            if (auxBuffer != null) {
+                auxBuffer.truncate();
+            }
+            if (stringOffsets != null) {
+                stringOffsets.truncate();
+                stringOffsets.putInt(0);
+            }
+            if (stringData != null) {
+                stringData.truncate();
+            }
+            arrayShapeOffset = 0;
+            arrayDataOffset = 0;
+            resetEmptyMetadata();
+        }
+
+        private void compactNullBitmap(int sourceRow) {
+            if (nullBufPtr == 0) {
+                return;
+            }
+
+            boolean retainedNull = isNull(sourceRow);
+            long usedLongs = ((long) size + 63) >>> 6;
+            Vect.memset(nullBufPtr, usedLongs * Long.BYTES, 0);
+            if (retainedNull) {
+                Unsafe.getUnsafe().putLong(nullBufPtr, 1L);
+            }
+            hasNulls = retainedNull;
+        }
+
         private void ensureArrayCapacity(int nDims, int dataElements) {
             // Ensure per-row array dims capacity
             if (valueCount >= arrayDims.length) {
@@ -1653,12 +1625,33 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
+        private int getOrAddLocalSymbol(CharSequence value) {
+            int idx = symbolDict.get(value);
+            if (idx == CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+                String symbol = Chars.toString(value);
+                idx = symbolList.size();
+                symbolDict.put(symbol, idx);
+                symbolList.add(symbol);
+            }
+            return idx;
+        }
+
         private void markNull(int index) {
             long longAddr = nullBufPtr + ((long) (index >>> 6)) * 8;
             int bitIndex = index & 63;
             long current = Unsafe.getUnsafe().getLong(longAddr);
             Unsafe.getUnsafe().putLong(longAddr, current | (1L << bitIndex));
             hasNulls = true;
+        }
+
+        private void resetEmptyMetadata() {
+            decimalScale = -1;
+            geohashPrecision = -1;
+            maxGlobalSymbolId = -1;
+            if (symbolDict != null) {
+                symbolDict.clear();
+                symbolList.clear();
+            }
         }
 
         private void retainArrayValue(int valueIndex, int shapeOffsetBefore, int dataOffsetBefore) {
@@ -1732,16 +1725,6 @@ public class QwpTableBuffer implements QuietCloseable {
             symbolList.add(symbol);
             symbolDict.put(symbol, 0);
             Unsafe.getUnsafe().putInt(dataBuffer.pageAddress(), 0);
-        }
-
-        private void resetEmptyMetadata() {
-            decimalScale = -1;
-            geohashPrecision = -1;
-            maxGlobalSymbolId = -1;
-            if (symbolDict != null) {
-                symbolDict.clear();
-                symbolList.clear();
-            }
         }
     }
 }
