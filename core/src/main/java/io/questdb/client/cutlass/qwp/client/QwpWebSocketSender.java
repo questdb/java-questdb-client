@@ -639,7 +639,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender doubleColumn(CharSequence columnName, double value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_DOUBLE, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_DOUBLE, true);
         col.addDouble(value);
         return this;
     }
@@ -654,7 +654,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender floatColumn(CharSequence columnName, float value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_FLOAT, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_FLOAT, true);
         col.addFloat(value);
         return this;
     }
@@ -749,7 +749,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender intColumn(CharSequence columnName, int value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_INT, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_INT, true);
         col.addInt(value);
         return this;
     }
@@ -823,7 +823,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender longColumn(CharSequence columnName, long value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_LONG, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_LONG, true);
         col.addLong(value);
         return this;
     }
