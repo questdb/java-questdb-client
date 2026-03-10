@@ -160,7 +160,7 @@ public class QwpTableBuffer implements QuietCloseable {
             cachedColumnDefs = new QwpColumnDef[columns.size()];
             for (int i = 0; i < columns.size(); i++) {
                 ColumnBuffer col = columns.get(i);
-                cachedColumnDefs[i] = new QwpColumnDef(col.name, col.type, col.nullable);
+                cachedColumnDefs[i] = new QwpColumnDef(col.name, col.type, col.useNullBitmap);
             }
             columnDefsCacheValid = true;
         }
@@ -507,11 +507,10 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public static class ColumnBuffer implements QuietCloseable {
         private static final long DOUBLE_ARRAY_BASE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(double[].class);
-        private static final long LONG_ARRAY_BASE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(long[].class);
         final int elemSize;
         final String name;
-        final boolean nullable;
         final byte type;
+        final boolean useNullBitmap;
         private final Decimal256 rescaleTemp = new Decimal256();
         private ArrayCapture arrayCapture;
         private int arrayDataOffset;
@@ -545,10 +544,10 @@ public class QwpTableBuffer implements QuietCloseable {
         private StringSink symbolLookupSink;
         private int valueCount;   // Actual stored values (excludes nulls)
 
-        public ColumnBuffer(String name, byte type, boolean nullable) {
+        public ColumnBuffer(String name, byte type, boolean useNullBitmap) {
             this.name = name;
             this.type = type;
-            this.nullable = nullable;
+            this.useNullBitmap = useNullBitmap;
             this.elemSize = elementSizeInBuffer(type);
             this.size = 0;
             this.valueCount = 0;
@@ -556,7 +555,7 @@ public class QwpTableBuffer implements QuietCloseable {
 
             try {
                 allocateStorage(type);
-                if (nullable) {
+                if (useNullBitmap) {
                     nullBufCapRows = 64; // multiple of 64
                     long sizeBytes = (long) nullBufCapRows >>> 3;
                     nullBufPtr = Unsafe.calloc(sizeBytes, MemoryTag.NATIVE_ILP_RSS);
@@ -568,14 +567,14 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addBoolean(boolean value) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putByte(value ? (byte) 1 : (byte) 0);
             valueCount++;
             size++;
         }
 
         public void addByte(byte value) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putByte(value);
             valueCount++;
             size++;
@@ -586,7 +585,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             if (decimalScale == -1) {
                 decimalScale = (byte) value.getScale();
             } else if (decimalScale != value.getScale()) {
@@ -619,7 +618,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             Decimal256 src = value;
             if (decimalScale == -1) {
                 decimalScale = (byte) value.getScale();
@@ -646,7 +645,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             if (decimalScale == -1) {
                 decimalScale = (byte) value.getScale();
                 dataBuffer.putLong(value.getValue());
@@ -672,7 +671,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addDouble(double value) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putDouble(value);
             valueCount++;
             size++;
@@ -779,7 +778,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addFloat(float value) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putFloat(value);
             valueCount++;
             size++;
@@ -802,28 +801,28 @@ public class QwpTableBuffer implements QuietCloseable {
                         "GeoHash precision mismatch: column has " + geohashPrecision + " bits, got " + precision
                 );
             }
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putLong(value);
             valueCount++;
             size++;
         }
 
         public void addInt(int value) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putInt(value);
             valueCount++;
             size++;
         }
 
         public void addLong(long value) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putLong(value);
             valueCount++;
             size++;
         }
 
         public void addLong256(long l0, long l1, long l2, long l3) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putLong(l0);
             dataBuffer.putLong(l1);
             dataBuffer.putLong(l2);
@@ -929,8 +928,8 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addNull() {
-            if (nullable) {
-                ensureNullCapacity(size + 1);
+            if (useNullBitmap) {
+                ensureNullBitmapCapacity();
                 markNull(size);
             } else {
                 // For non-nullable columns, store a sentinel/default value
@@ -978,35 +977,20 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addShort(short value) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             dataBuffer.putShort(value);
             valueCount++;
             size++;
         }
 
         public void addString(CharSequence value) {
-            if (value == null && nullable) {
-                ensureNullCapacity(size + 1);
+            if (value == null && useNullBitmap) {
+                ensureNullBitmapCapacity();
                 markNull(size);
             } else {
-                ensureNullBitmapForNonNull();
+                ensureNullBitmapCapacity();
                 if (value != null) {
                     stringData.putUtf8(value);
-                }
-                stringOffsets.putInt((int) stringData.getAppendOffset());
-                valueCount++;
-            }
-            size++;
-        }
-
-        public void addStringUtf8(long ptr, int len) {
-            if (len < 0 && nullable) {
-                ensureNullCapacity(size + 1);
-                markNull(size);
-            } else {
-                ensureNullBitmapForNonNull();
-                if (len > 0) {
-                    stringData.putBlockOfBytes(ptr, len);
                 }
                 stringOffsets.putInt((int) stringData.getAppendOffset());
                 valueCount++;
@@ -1019,7 +1003,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             int idx = getOrAddLocalSymbol(value);
             dataBuffer.putInt(idx);
             valueCount++;
@@ -1031,7 +1015,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             StringSink lookupSink = symbolLookupSink;
             if (lookupSink == null) {
                 symbolLookupSink = lookupSink = new StringSink(Math.max(16, len));
@@ -1054,7 +1038,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             int localIdx = getOrAddLocalSymbol(value);
             dataBuffer.putInt(localIdx);
 
@@ -1072,7 +1056,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public void addUuid(long high, long low) {
-            ensureNullBitmapForNonNull();
+            ensureNullBitmapCapacity();
             // Store in wire order: lo first, hi second
             dataBuffer.putLong(low);
             dataBuffer.putLong(high);
@@ -1254,10 +1238,6 @@ public class QwpTableBuffer implements QuietCloseable {
             return (Unsafe.getUnsafe().getLong(longAddr) & (1L << bitIndex)) != 0;
         }
 
-        public boolean isNullable() {
-            return nullable;
-        }
-
         public void reset() {
             size = 0;
             valueCount = 0;
@@ -1324,7 +1304,7 @@ public class QwpTableBuffer implements QuietCloseable {
             }
 
             int newValueCount = 0;
-            if (nullable && nullBufPtr != 0) {
+            if (useNullBitmap && nullBufPtr != 0) {
                 for (int i = 0; i < newSize; i++) {
                     if (!isNull(i)) {
                         newValueCount++;
@@ -1394,6 +1374,10 @@ public class QwpTableBuffer implements QuietCloseable {
                     symbolList.clear();
                 }
             }
+        }
+
+        public boolean usesNullBitmap() {
+            return useNullBitmap;
         }
 
         private static int checkedElementCount(long product) {
@@ -1570,8 +1554,8 @@ public class QwpTableBuffer implements QuietCloseable {
             }
 
             // Ensure null bitmap capacity
-            if (nullable) {
-                ensureNullCapacity(size + 1);
+            if (useNullBitmap) {
+                ensureNullBitmapCapacity();
             }
 
             // Ensure shape array capacity
@@ -1599,21 +1583,16 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
-        private void ensureNullBitmapForNonNull() {
-            if (nullBufPtr != 0) {
-                ensureNullCapacity(size + 1);
+        private void ensureNullBitmapCapacity() {
+            if (nullBufPtr == 0 || nullBufCapRows > size) {
+                return;
             }
-        }
-
-        private void ensureNullCapacity(int rows) {
-            if (rows > nullBufCapRows) {
-                int newCapRows = Math.max(nullBufCapRows * 2, ((rows + 63) >>> 6) << 6);
-                long newSizeBytes = (long) newCapRows >>> 3;
-                long oldSizeBytes = (long) nullBufCapRows >>> 3;
-                nullBufPtr = Unsafe.realloc(nullBufPtr, oldSizeBytes, newSizeBytes, MemoryTag.NATIVE_ILP_RSS);
-                Vect.memset(nullBufPtr + oldSizeBytes, newSizeBytes - oldSizeBytes, 0);
-                nullBufCapRows = newCapRows;
-            }
+            int newCapRows = Math.max(nullBufCapRows * 2, ((size + 64) >>> 6) << 6);
+            long newSizeBytes = (long) newCapRows >>> 3;
+            long oldSizeBytes = (long) nullBufCapRows >>> 3;
+            nullBufPtr = Unsafe.realloc(nullBufPtr, oldSizeBytes, newSizeBytes, MemoryTag.NATIVE_ILP_RSS);
+            Vect.memset(nullBufPtr + oldSizeBytes, newSizeBytes - oldSizeBytes, 0);
+            nullBufCapRows = newCapRows;
         }
 
         private int getOrAddLocalSymbol(CharSequence value) {

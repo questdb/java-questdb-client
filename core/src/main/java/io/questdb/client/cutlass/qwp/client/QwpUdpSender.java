@@ -992,7 +992,7 @@ public class QwpUdpSender implements Sender {
             }
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getColumn(i);
             int missing = targetRows - col.getSize();
-            if (col.isNullable()) {
+            if (col.usesNullBitmap()) {
                 estimate += bitmapBytes(targetRows) - bitmapBytes(col.getSize());
             } else {
                 estimate += nonNullablePaddingCost(col.getType(), col.getValueCount(), missing);
@@ -1293,7 +1293,7 @@ public class QwpUdpSender implements Sender {
 
         void of(QwpTableBuffer.ColumnBuffer column) {
             this.column = column;
-            this.nullable = column.isNullable();
+            this.nullable = column.usesNullBitmap();
             this.payloadEstimateDelta = 0;
             this.sizeBefore = column.getSize();
             this.valueCountBefore = column.getValueCount();
