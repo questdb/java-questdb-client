@@ -85,12 +85,12 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  * }
  * </pre>
  * <p>
- * <b>Fast-path API for high-throughput generators</b>
+ * <h2>Fast-path API for high-throughput generators</h2>
  * <p>
  * For maximum throughput, bypass the fluent API to avoid per-row overhead
  * (no column-name hashmap lookups, no {@code checkNotClosed()}/{@code checkTableSelected()}
- * per column, direct access to column buffers). Use {@link #getTableBuffer(String)},
- * {@link #getOrAddGlobalSymbol(String)}, and {@link #incrementPendingRowCount()}:
+ * per column, direct access to column buffers). The entry point is
+ * {@link #getTableBuffer(String)}.
  * <pre>
  * // Setup (once)
  * QwpTableBuffer tableBuffer = sender.getTableBuffer("q");
@@ -724,8 +724,10 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Gets or creates a table buffer for direct access.
-     * For high-throughput generators that want to bypass fluent API overhead.
+     * <strong>DANGER:</strong>: gets or creates a low-level table buffer,
+     * allowing you to bypass some validation and enforcement of invariants
+     * present in the higher-level API. When used incorrectly, it may result
+     * in silent data loss.
      */
     public QwpTableBuffer getTableBuffer(String tableName) {
         QwpTableBuffer buffer = tableBuffers.get(tableName);
