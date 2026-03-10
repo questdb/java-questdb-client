@@ -42,6 +42,7 @@ import io.questdb.client.std.LongHashSet;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -697,6 +698,21 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Registers a symbol value in the global dictionary and returns its global ID.
+     * Called from {@link QwpTableBuffer.ColumnBuffer#addSymbol(CharSequence)}.
+     *
+     * @param symbol the symbol value to register
+     * @return the global symbol ID
+     */
+    public int getOrAddGlobalSymbol(String symbol) {
+        int globalId = globalSymbolDictionary.getOrAddSymbol(symbol);
+        if (globalId > currentBatchMaxSymbolId) {
+            currentBatchMaxSymbolId = globalId;
+        }
+        return globalId;
+    }
+
+    /**
      * Returns the number of pending rows not yet flushed.
      * For testing.
      */
@@ -861,19 +877,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_SYMBOL, true);
-
-        if (value != null) {
-            // Register symbol in global dictionary and track max ID for delta calculation
-            String symbolValue = value.toString();
-            int globalId = globalSymbolDictionary.getOrAddSymbol(symbolValue);
-            if (globalId > currentBatchMaxSymbolId) {
-                currentBatchMaxSymbolId = globalId;
-            }
-            // Store global ID in the column buffer
-            col.addSymbolWithGlobalId(symbolValue, globalId);
-        } else {
-            col.addSymbol(null);
-        }
+        col.addSymbol(value);
         return this;
     }
 
@@ -891,7 +895,7 @@ public class QwpWebSocketSender implements Sender {
         currentTableName = tableName.toString();
         currentTableBuffer = tableBuffers.get(currentTableName);
         if (currentTableBuffer == null) {
-            currentTableBuffer = new QwpTableBuffer(currentTableName);
+            currentTableBuffer = new QwpTableBuffer(currentTableName, this);
             tableBuffers.put(currentTableName, currentTableBuffer);
         }
         // Both modes accumulate rows until flush

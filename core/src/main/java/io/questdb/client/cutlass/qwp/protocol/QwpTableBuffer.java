@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.CharSequenceIntHashMap;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
@@ -59,6 +60,7 @@ public class QwpTableBuffer implements QuietCloseable {
 
     private final CharSequenceIntHashMap columnNameToIndex;
     private final ObjList<ColumnBuffer> columns;
+    private final QwpWebSocketSender sender;
     private final String tableName;
     private QwpColumnDef[] cachedColumnDefs;
     private int columnAccessCursor; // tracks expected next column index
@@ -70,7 +72,18 @@ public class QwpTableBuffer implements QuietCloseable {
     private boolean schemaHashComputed;
 
     public QwpTableBuffer(String tableName) {
+        this(tableName, null);
+    }
+
+    /**
+     * Use this constructor overload to allow writing to a symbol column.
+     * {@link ColumnBuffer#addSymbol(CharSequence)} needs the sender to
+     * call {@link QwpWebSocketSender#getOrAddGlobalSymbol(String)}, registering
+     * the symbol in the global dictionary shared with the server.
+     */
+    public QwpTableBuffer(String tableName, QwpWebSocketSender sender) {
         this.tableName = tableName;
+        this.sender = sender;
         this.columns = new ObjList<>();
         this.columnNameToIndex = new CharSequenceIntHashMap();
         this.rowCount = 0;
@@ -322,6 +335,7 @@ public class QwpTableBuffer implements QuietCloseable {
 
     private ColumnBuffer createColumn(CharSequence name, byte type, boolean nullable) {
         ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
+        col.sender = sender;
         int index = columns.size();
         col.index = index;
         columns.add(col);
@@ -534,6 +548,7 @@ public class QwpTableBuffer implements QuietCloseable {
         private int nullBufCapRows;
         // Off-heap null bitmap (bit-packed, 1 bit per row)
         private long nullBufPtr;
+        private QwpWebSocketSender sender;
         private int size;         // Total row count (including nulls)
         private OffHeapAppendMemory stringData;
         // Off-heap storage for string/varchar column data
@@ -1003,6 +1018,12 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
+            if (sender != null) {
+                String symbolValue = value.toString();
+                int globalId = sender.getOrAddGlobalSymbol(symbolValue);
+                addSymbolWithGlobalId(symbolValue, globalId);
+                return;
+            }
             ensureNullBitmapCapacity();
             int idx = getOrAddLocalSymbol(value);
             dataBuffer.putInt(idx);
@@ -1015,7 +1036,6 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            ensureNullBitmapCapacity();
             StringSink lookupSink = symbolLookupSink;
             if (lookupSink == null) {
                 symbolLookupSink = lookupSink = new StringSink(Math.max(16, len));
@@ -1027,6 +1047,13 @@ public class QwpTableBuffer implements QuietCloseable {
                 Utf8s.stringFromUtf8Bytes(ptr, ptr + len);
                 throw new AssertionError("unreachable");
             }
+            if (sender != null) {
+                String symbolValue = lookupSink.toString();
+                int globalId = sender.getOrAddGlobalSymbol(symbolValue);
+                addSymbolWithGlobalId(symbolValue, globalId);
+                return;
+            }
+            ensureNullBitmapCapacity();
             int idx = getOrAddLocalSymbol(lookupSink);
             dataBuffer.putInt(idx);
             valueCount++;
