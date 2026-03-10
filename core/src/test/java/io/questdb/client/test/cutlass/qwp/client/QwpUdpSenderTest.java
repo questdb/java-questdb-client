@@ -50,102 +50,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.SCHEMA_MODE_FULL;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_BOOLEAN;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DECIMAL128;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DECIMAL256;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DECIMAL64;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DOUBLE;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_DOUBLE_ARRAY;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_LONG;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_LONG_ARRAY;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_STRING;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_SYMBOL;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_TIMESTAMP;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_TIMESTAMP_NANOS;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.TYPE_VARCHAR;
-import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.VERSION_1;
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class QwpUdpSenderTest {
-
-    @Test
-    public void testFirstRowAllowsMultipleNewColumnsAndEncodesRow() throws Exception {
-        assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("a", 1)
-                                    .doubleColumn("b", 2.0)
-                                    .stringColumn("c", "x")
-                                    .atNow(),
-                            "a", 1L,
-                            "b", 2.0,
-                            "c", "x")
-            );
-
-            RunResult result = runScenario(rows, 1024 * 1024);
-            Assert.assertEquals(1, result.sendCount);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
-        });
-    }
-
-    @Test
-    public void testBoundedSenderMixedNullablePaddingPreservesRowsAndPacketLimit() throws Exception {
-        assertMemoryLeak(() -> {
-            String alpha = repeat('a', 256);
-            String omega = repeat('z', 256);
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("t", sender -> sender.table("t")
-                                    .symbol("sym", "v1")
-                                    .longColumn("x", 1)
-                                    .stringColumn("s", alpha)
-                                    .atNow(),
-                            "sym", "v1",
-                            "x", 1L,
-                            "s", alpha),
-                    row("t", sender -> sender.table("t")
-                                    .symbol("sym", null)
-                                    .longColumn("x", 2)
-                                    .atNow(),
-                            "sym", null,
-                            "x", 2L,
-                            "s", null),
-                    row("t", sender -> sender.table("t")
-                                    .symbol("sym", null)
-                                    .longColumn("x", 3)
-                                    .stringColumn("s", null)
-                                    .atNow(),
-                            "sym", null,
-                            "x", 3L,
-                            "s", null),
-                    row("t", sender -> sender.table("t")
-                                    .symbol("sym", "v2")
-                                    .longColumn("x", 4)
-                                    .stringColumn("s", omega)
-                                    .atNow(),
-                            "sym", "v2",
-                            "x", 4L,
-                            "s", omega)
-            );
-
-            int maxDatagramSize = fullPacketSize(rows) - 1;
-            RunResult result = runScenario(rows, maxDatagramSize);
-
-            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
-            assertPacketsWithinLimit(result, maxDatagramSize);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
-        });
-    }
-
-    @Test
-    public void testEstimateMatchesActualEncodedSize() throws Exception {
-        assertMemoryLeak(() -> {
-            auditEstimateWithStableSchemaAndNullableValues();
-            auditEstimateAcrossSymbolDictionaryVarintBoundary();
-        });
-    }
 
     @Test
     public void testAdaptiveHeadroomFlushesCommittedRowsBeforeNextRowStarts() throws Exception {
@@ -280,165 +188,161 @@ public class QwpUdpSenderTest {
     }
 
     @Test
-    public void testBoundedSenderNullableStringNullAcrossOverflowBoundaryPreservesRowsAndPacketLimit() throws Exception {
+    public void testArrayWrapperStagingSnapshotsMutationAndCancelRow() throws Exception {
         assertMemoryLeak(() -> {
-            String alpha = repeat('a', 512);
-            String marker1 = repeat('m', 64);
-            String marker2 = repeat('n', 64);
-            String marker3 = repeat('o', 64);
-            String omega = repeat('z', 128);
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("x", 1)
-                                    .stringColumn("s", alpha)
-                                    .stringColumn("m", marker1)
-                                    .atNow(),
-                            "x", 1L,
-                            "s", alpha,
-                            "m", marker1),
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("x", 2)
-                                    .stringColumn("s", null)
-                                    .stringColumn("m", marker2)
-                                    .atNow(),
-                            "x", 2L,
-                            "s", null,
-                            "m", marker2),
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("x", 3)
-                                    .stringColumn("s", omega)
-                                    .stringColumn("m", marker3)
-                                    .atNow(),
-                            "x", 3L,
-                            "s", omega,
-                            "m", marker3)
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024);
+                 DoubleArray doubleArray = new DoubleArray(2)) {
+                sender.table("arrays");
+                long[] longValues = {1, 2};
+
+                doubleArray.append(1.5).append(2.5);
+                sender.longArray("la", longValues);
+                sender.doubleArray("da", doubleArray);
+
+                longValues[0] = 9;
+                longValues[1] = 10;
+                doubleArray.clear();
+                doubleArray.append(9.5).append(10.5);
+                sender.cancelRow();
+
+                sender.longArray("la", longValues);
+                sender.doubleArray("da", doubleArray);
+                longValues[0] = 100;
+                longValues[1] = 200;
+                doubleArray.clear();
+                doubleArray.append(100.5).append(200.5);
+                sender.atNow();
+                sender.flush();
+            }
+
+            assertRowsEqual(
+                    Arrays.asList(decodedRow(
+                            "arrays",
+                            "la", longArrayValue(shape(2), 9, 10),
+                            "da", doubleArrayValue(shape(2), 9.5, 10.5)
+                    )),
+                    decodeRows(nf.packets)
             );
-            int firstRowPacket = fullPacketSize(rows.subList(0, 1));
-            int twoRowPacket = fullPacketSize(rows.subList(0, 2));
-            int maxDatagramSize = firstRowPacket + 16;
-            Assert.assertTrue("expected overflow boundary between row 1 and row 2", maxDatagramSize < twoRowPacket);
-
-            RunResult result = runScenario(rows, maxDatagramSize);
-
-            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
-            assertPacketsWithinLimit(result, maxDatagramSize);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }
 
     @Test
-    public void testUnboundedSenderOmittedNullableAndNonNullableColumnsPreservesRows() throws Exception {
+    public void testAtMicrosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
         assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = Arrays.asList(
+            String large = repeat('x', 5000);
+            List<ScenarioRow> oversizedRow = Arrays.asList(
                     row("t", sender -> sender.table("t")
-                                    .longColumn("x", 1)
-                                    .stringColumn("s", "alpha")
-                                    .symbol("sym", "one")
-                                    .atNow(),
-                            "x", 1L,
-                            "s", "alpha",
-                            "sym", "one"),
-                    row("t", sender -> sender.table("t")
-                                    .stringColumn("s", "beta")
-                                    .atNow(),
-                            "x", Long.MIN_VALUE,
-                            "s", "beta",
-                            "sym", null),
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("x", 3)
-                                    .atNow(),
-                            "x", 3L,
-                            "s", null,
-                            "sym", null)
+                                    .longColumn("a", 2)
+                                    .stringColumn("s", large)
+                                    .at(2_000_000L, ChronoUnit.MICROS),
+                            "a", 2L,
+                            "s", large,
+                            "", 2_000_000L)
             );
+            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
 
-            RunResult result = runScenario(rows, 0);
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .at(1_000_000L, ChronoUnit.MICROS);
 
-            Assert.assertEquals(1, result.sendCount);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("a", 2)
+                                .stringColumn("s", large)
+                                .at(2_000_000L, ChronoUnit.MICROS)
+                );
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.longColumn("a", 3).at(3_000_000L, ChronoUnit.MICROS);
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L, "", 1_000_000L),
+                    decodedRow("t", "a", 3L, "", 3_000_000L)
+            ), decodeRows(nf.packets));
         });
     }
 
     @Test
-    public void testUnboundedSenderWideSchemaWithLowIndexWritePreservesRows() throws Exception {
+    public void testAtNanosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
         assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("wide", sender -> sender.table("wide")
-                                    .longColumn("c0", 0)
-                                    .longColumn("c1", 1)
-                                    .longColumn("c2", 2)
-                                    .longColumn("c3", 3)
-                                    .longColumn("c4", 4)
-                                    .longColumn("c5", 5)
-                                    .longColumn("c6", 6)
-                                    .longColumn("c7", 7)
-                                    .longColumn("c8", 8)
-                                    .longColumn("c9", 9)
-                                    .atNow(),
-                            "c0", 0L,
-                            "c1", 1L,
-                            "c2", 2L,
-                            "c3", 3L,
-                            "c4", 4L,
-                            "c5", 5L,
-                            "c6", 6L,
-                            "c7", 7L,
-                            "c8", 8L,
-                            "c9", 9L),
-                    row("wide", sender -> sender.table("wide")
-                                    .longColumn("c0", 10)
-                                    .atNow(),
-                            "c0", 10L,
-                            "c1", Long.MIN_VALUE,
-                            "c2", Long.MIN_VALUE,
-                            "c3", Long.MIN_VALUE,
-                            "c4", Long.MIN_VALUE,
-                            "c5", Long.MIN_VALUE,
-                            "c6", Long.MIN_VALUE,
-                            "c7", Long.MIN_VALUE,
-                            "c8", Long.MIN_VALUE,
-                            "c9", Long.MIN_VALUE)
+            String large = repeat('x', 5000);
+            List<ScenarioRow> oversizedRow = Arrays.asList(
+                    row("tn", sender -> sender.table("tn")
+                                    .longColumn("a", 2)
+                                    .stringColumn("s", large)
+                                    .at(2_000_000L, ChronoUnit.NANOS),
+                            "a", 2L,
+                            "s", large,
+                            "", 2_000_000L)
             );
+            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
 
-            RunResult result = runScenario(rows, 0);
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("tn")
+                        .longColumn("a", 1)
+                        .at(1_000_000L, ChronoUnit.NANOS);
 
-            Assert.assertEquals(1, result.sendCount);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("a", 2)
+                                .stringColumn("s", large)
+                                .at(2_000_000L, ChronoUnit.NANOS)
+                );
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.longColumn("a", 3).at(3_000_000L, ChronoUnit.NANOS);
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("tn", "a", 1L, "", 1_000_000L),
+                    decodedRow("tn", "a", 3L, "", 3_000_000L)
+            ), decodeRows(nf.packets));
         });
     }
 
     @Test
-    public void testBoundedSenderOmittedNonNullableColumnsPreservesRowsAndPacketLimit() throws Exception {
+    public void testAtNowOversizeFailureRollsBackWithoutExplicitCancel() throws Exception {
         assertMemoryLeak(() -> {
-            String alpha = repeat('a', 256);
-            String beta = repeat('b', 192);
-            String omega = repeat('z', 256);
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("mix", sender -> sender.table("mix")
-                                    .longColumn("x", 1)
-                                    .stringColumn("msg", alpha)
+            String large = repeat('x', 5000);
+            List<ScenarioRow> oversizedRow = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("a", 2)
+                                    .stringColumn("s", large)
                                     .atNow(),
-                            "x", 1L,
-                            "msg", alpha),
-                    row("mix", sender -> sender.table("mix")
-                                    .stringColumn("msg", beta)
-                                    .atNow(),
-                            "x", Long.MIN_VALUE,
-                            "msg", beta),
-                    row("mix", sender -> sender.table("mix")
-                                    .longColumn("x", 3)
-                                    .stringColumn("msg", omega)
-                                    .atNow(),
-                            "x", 3L,
-                            "msg", omega)
+                            "a", 2L,
+                            "s", large)
             );
+            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
 
-            int maxDatagramSize = fullPacketSize(rows) - 1;
-            RunResult result = runScenario(rows, maxDatagramSize);
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
 
-            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
-            assertPacketsWithinLimit(result, maxDatagramSize);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("a", 2)
+                                .stringColumn("s", large)
+                                .atNow()
+                );
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.longColumn("a", 3).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 3L)
+            ), decodeRows(nf.packets));
         });
     }
 
@@ -545,69 +449,50 @@ public class QwpUdpSenderTest {
     }
 
     @Test
-    public void testArrayWrapperStagingSnapshotsMutationAndCancelRow() throws Exception {
+    public void testBoundedSenderMixedNullablePaddingPreservesRowsAndPacketLimit() throws Exception {
         assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024);
-                 DoubleArray doubleArray = new DoubleArray(2)) {
-                sender.table("arrays");
-                long[] longValues = {1, 2};
-
-                doubleArray.append(1.5).append(2.5);
-                sender.longArray("la", longValues);
-                sender.doubleArray("da", doubleArray);
-
-                longValues[0] = 9;
-                longValues[1] = 10;
-                doubleArray.clear();
-                doubleArray.append(9.5).append(10.5);
-                sender.cancelRow();
-
-                sender.longArray("la", longValues);
-                sender.doubleArray("da", doubleArray);
-                longValues[0] = 100;
-                longValues[1] = 200;
-                doubleArray.clear();
-                doubleArray.append(100.5).append(200.5);
-                sender.atNow();
-                sender.flush();
-            }
-
-            assertRowsEqual(
-                    Arrays.asList(decodedRow(
-                            "arrays",
-                            "la", longArrayValue(shape(2), 9, 10),
-                            "da", doubleArrayValue(shape(2), 9.5, 10.5)
-                    )),
-                    decodeRows(nf.packets)
+            String alpha = repeat('a', 256);
+            String omega = repeat('z', 256);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .symbol("sym", "v1")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", alpha)
+                                    .atNow(),
+                            "sym", "v1",
+                            "x", 1L,
+                            "s", alpha),
+                    row("t", sender -> sender.table("t")
+                                    .symbol("sym", null)
+                                    .longColumn("x", 2)
+                                    .atNow(),
+                            "sym", null,
+                            "x", 2L,
+                            "s", null),
+                    row("t", sender -> sender.table("t")
+                                    .symbol("sym", null)
+                                    .longColumn("x", 3)
+                                    .stringColumn("s", null)
+                                    .atNow(),
+                            "sym", null,
+                            "x", 3L,
+                            "s", null),
+                    row("t", sender -> sender.table("t")
+                                    .symbol("sym", "v2")
+                                    .longColumn("x", 4)
+                                    .stringColumn("s", omega)
+                                    .atNow(),
+                            "sym", "v2",
+                            "x", 4L,
+                            "s", omega)
             );
-        });
-    }
 
-    @Test
-    public void testLongArrayWrapperStagingSnapshotsMutation() throws Exception {
-        assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024);
-                 LongArray longArray = new LongArray(2, 2)) {
-                sender.table("arrays");
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
 
-                longArray.append(1).append(2).append(3).append(4);
-                sender.longArray("la", longArray);
-
-                longArray.clear();
-                longArray.append(10).append(20).append(30).append(40);
-                sender.atNow();
-                sender.flush();
-            }
-
-            assertRowsEqual(
-                    Arrays.asList(decodedRow(
-                            "arrays",
-                            "la", longArrayValue(shape(2, 2), 1, 2, 3, 4)
-                    )),
-                    decodeRows(nf.packets)
-            );
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }
 
@@ -663,6 +548,127 @@ public class QwpUdpSenderTest {
                             "eventMicros", 654321L,
                             "eventNanos", 12345L,
                             "", 2_000_000L)
+            );
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderNullableStringNullAcrossOverflowBoundaryPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            String alpha = repeat('a', 512);
+            String marker1 = repeat('m', 64);
+            String marker2 = repeat('n', 64);
+            String marker3 = repeat('o', 64);
+            String omega = repeat('z', 128);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", alpha)
+                                    .stringColumn("m", marker1)
+                                    .atNow(),
+                            "x", 1L,
+                            "s", alpha,
+                            "m", marker1),
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 2)
+                                    .stringColumn("s", null)
+                                    .stringColumn("m", marker2)
+                                    .atNow(),
+                            "x", 2L,
+                            "s", null,
+                            "m", marker2),
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 3)
+                                    .stringColumn("s", omega)
+                                    .stringColumn("m", marker3)
+                                    .atNow(),
+                            "x", 3L,
+                            "s", omega,
+                            "m", marker3)
+            );
+            int firstRowPacket = fullPacketSize(rows.subList(0, 1));
+            int twoRowPacket = fullPacketSize(rows.subList(0, 2));
+            int maxDatagramSize = firstRowPacket + 16;
+            Assert.assertTrue("expected overflow boundary between row 1 and row 2", maxDatagramSize < twoRowPacket);
+
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderOmittedNonNullableColumnsPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            String alpha = repeat('a', 256);
+            String beta = repeat('b', 192);
+            String omega = repeat('z', 256);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("mix", sender -> sender.table("mix")
+                                    .longColumn("x", 1)
+                                    .stringColumn("msg", alpha)
+                                    .atNow(),
+                            "x", 1L,
+                            "msg", alpha),
+                    row("mix", sender -> sender.table("mix")
+                                    .stringColumn("msg", beta)
+                                    .atNow(),
+                            "x", Long.MIN_VALUE,
+                            "msg", beta),
+                    row("mix", sender -> sender.table("mix")
+                                    .longColumn("x", 3)
+                                    .stringColumn("msg", omega)
+                                    .atNow(),
+                            "x", 3L,
+                            "msg", omega)
+            );
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testBoundedSenderOutOfOrderExistingColumnsPreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("order", sender -> sender.table("order")
+                                    .longColumn("a", 1)
+                                    .stringColumn("b", "x")
+                                    .symbol("c", "alpha")
+                                    .atNow(),
+                            "a", 1L,
+                            "b", "x",
+                            "c", "alpha"),
+                    row("order", sender -> sender.table("order")
+                                    .symbol("c", "beta")
+                                    .stringColumn("b", "y")
+                                    .longColumn("a", 2)
+                                    .atNow(),
+                            "a", 2L,
+                            "b", "y",
+                            "c", "beta"),
+                    row("order", sender -> sender.table("order")
+                                    .stringColumn("b", "z")
+                                    .longColumn("a", 3)
+                                    .symbol("c", null)
+                                    .atNow(),
+                            "a", 3L,
+                            "b", "z",
+                            "c", null)
             );
 
             int maxDatagramSize = fullPacketSize(rows) - 1;
@@ -731,83 +737,132 @@ public class QwpUdpSenderTest {
     }
 
     @Test
-    public void testBoundedSenderOutOfOrderExistingColumnsPreservesRowsAndPacketLimit() throws Exception {
+    public void testBoundedSenderSchemaFlushThenOmittedNullableColumnsPreservesRows() throws Exception {
         assertMemoryLeak(() -> {
             List<ScenarioRow> rows = Arrays.asList(
-                    row("order", sender -> sender.table("order")
-                                    .longColumn("a", 1)
-                                    .stringColumn("b", "x")
-                                    .symbol("c", "alpha")
+                    row("schema", sender -> sender.table("schema")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", "alpha")
                                     .atNow(),
-                            "a", 1L,
-                            "b", "x",
-                            "c", "alpha"),
-                    row("order", sender -> sender.table("order")
-                                    .symbol("c", "beta")
-                                    .stringColumn("b", "y")
-                                    .longColumn("a", 2)
+                            "x", 1L,
+                            "s", "alpha"),
+                    row("schema", sender -> sender.table("schema")
+                                    .symbol("sym", "new")
+                                    .longColumn("x", 2)
+                                    .stringColumn("s", "beta")
                                     .atNow(),
-                            "a", 2L,
-                            "b", "y",
-                            "c", "beta"),
-                    row("order", sender -> sender.table("order")
-                                    .stringColumn("b", "z")
-                                    .longColumn("a", 3)
-                                    .symbol("c", null)
+                            "sym", "new",
+                            "x", 2L,
+                            "s", "beta"),
+                    row("schema", sender -> sender.table("schema")
+                                    .longColumn("x", 3)
                                     .atNow(),
-                            "a", 3L,
-                            "b", "z",
-                            "c", null)
+                            "sym", null,
+                            "x", 3L,
+                            "s", null)
             );
 
-            int maxDatagramSize = fullPacketSize(rows) - 1;
-            RunResult result = runScenario(rows, maxDatagramSize);
+            RunResult result = runScenario(rows, 1024 * 1024);
 
-            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
-            assertPacketsWithinLimit(result, maxDatagramSize);
+            Assert.assertEquals(2, result.sendCount);
+            assertPacketsWithinLimit(result, 1024 * 1024);
             assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }
 
     @Test
-    public void testMixingAtNowAndAtMicrosAfterCommittedRowsSplitsDatagramAndPreservesRows() throws Exception {
+    public void testCancelRowAfterMidRowSchemaChangeDoesNotLeakSchema() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
             try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
                 sender.table("t")
-                        .longColumn("x", 1)
+                        .longColumn("a", 1)
                         .atNow();
 
-                sender.longColumn("x", 2);
-                sender.at(2, ChronoUnit.MICROS);
+                sender.longColumn("a", 2);
+                sender.longColumn("b", 3);
                 Assert.assertEquals(1, nf.sendCount);
 
+                sender.cancelRow();
+                sender.longColumn("a", 4).atNow();
                 sender.flush();
             }
 
             Assert.assertEquals(2, nf.sendCount);
             assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "x", 1L),
-                    decodedRow("t", "x", 2L, "", 2L)
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 4L)
             ), decodeRows(nf.packets));
         });
     }
 
     @Test
-    public void testFlushWhileRowInProgressThrowsAndPreservesRow() throws Exception {
+    public void testCloseDropsInProgressRowButFlushesCommittedRows() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
             try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
-                sender.table("t").longColumn("x", 1);
-
-                assertThrowsContains("Cannot flush buffer while row is in progress", sender::flush);
-
-                sender.atNow();
-                sender.flush();
+                sender.table("t").longColumn("x", 1).atNow();
+                sender.longColumn("x", 2);
             }
 
             Assert.assertEquals(1, nf.sendCount);
             assertRowsEqual(Arrays.asList(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testDuplicateColumnAfterSchemaFlushReplayIsRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                assertThrowsContains("column 'a' already set for current row", () -> sender.longColumn("a", 4));
+
+                sender.cancelRow();
+                sender.longColumn("a", 5).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 5L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testEstimateMatchesActualEncodedSize() throws Exception {
+        assertMemoryLeak(() -> {
+            auditEstimateWithStableSchemaAndNullableValues();
+            auditEstimateAcrossSymbolDictionaryVarintBoundary();
+        });
+    }
+
+    @Test
+    public void testFirstRowAllowsMultipleNewColumnsAndEncodesRow() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("a", 1)
+                                    .doubleColumn("b", 2.0)
+                                    .stringColumn("c", "x")
+                                    .atNow(),
+                            "a", 1L,
+                            "b", 2.0,
+                            "c", "x")
+            );
+
+            RunResult result = runScenario(rows, 1024 * 1024);
+            Assert.assertEquals(1, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }
 
@@ -836,159 +891,20 @@ public class QwpUdpSenderTest {
     }
 
     @Test
-    public void testSimpleLongRowUsesScatterSendPath() throws Exception {
+    public void testFlushWhileRowInProgressThrowsAndPreservesRow() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
             try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
-                sender.table("t").longColumn("x", 42L).atNow();
-                sender.flush();
-            }
+                sender.table("t").longColumn("x", 1);
 
-            Assert.assertEquals(1, nf.sendCount);
-            Assert.assertEquals(1, nf.scatterSendCount);
-            Assert.assertEquals(0, nf.rawSendCount);
-            Assert.assertTrue("expected multiple segments for header/schema/data", nf.segmentCounts.get(0) > 1);
-            assertRowsEqual(Arrays.asList(decodedRow("t", "x", 42L)), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testSwitchTableWhileRowInProgressThrowsAndPreservesRows() throws Exception {
-        assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
-                sender.table("t1").longColumn("x", 1);
-
-                assertThrowsContains("Cannot switch tables while row is in progress",
-                        () -> sender.table("t2"));
+                assertThrowsContains("Cannot flush buffer while row is in progress", sender::flush);
 
                 sender.atNow();
-                sender.table("t2").longColumn("y", 2).atNow();
                 sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqualIgnoringOrder(
-                    Arrays.asList(decodedRow("t1", "x", 1L), decodedRow("t2", "y", 2L)),
-                    decodeRows(nf.packets)
-            );
-        });
-    }
-
-    @Test
-    public void testCloseDropsInProgressRowButFlushesCommittedRows() throws Exception {
-        assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
-                sender.table("t").longColumn("x", 1).atNow();
-                sender.longColumn("x", 2);
             }
 
             Assert.assertEquals(1, nf.sendCount);
             assertRowsEqual(Arrays.asList(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testOversizedSingleRowRejectedAfterReplayUsesActualEncodedSize() throws Exception {
-        assertMemoryLeak(() -> {
-            String small = repeat('s', 32);
-            String large = repeat('x', 5000);
-            List<ScenarioRow> largeRow = Arrays.asList(
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("x", 2)
-                                    .stringColumn("s", large)
-                                    .atNow(),
-                            "x", 2L,
-                            "s", large)
-            );
-            int maxDatagramSize = fullPacketSize(largeRow) - 1;
-
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
-                sender.table("t")
-                        .longColumn("x", 1)
-                        .stringColumn("s", small)
-                        .atNow();
-
-                assertThrowsContains("single row exceeds maximum datagram size", () ->
-                        sender.longColumn("x", 2)
-                                .stringColumn("s", large)
-                                .atNow()
-                );
-            }
-
-            Assert.assertEquals(1, nf.sendCount);
-            assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
-            assertRowsEqual(
-                    Arrays.asList(decodedRow("t", "x", 1L, "s", small)),
-                    decodeRows(nf.packets)
-            );
-        });
-    }
-
-    @Test
-    public void testOversizedSingleRowRejectedBeforeReplayUsesActualEncodedSize() throws Exception {
-        assertMemoryLeak(() -> {
-            String large = repeat('x', 5000);
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("x", 1)
-                                    .stringColumn("s", large)
-                                    .atNow(),
-                            "x", 1L,
-                            "s", large)
-            );
-            int maxDatagramSize = fullPacketSize(rows) - 1;
-
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
-                sender.table("t");
-                assertThrowsContains("single row exceeds maximum datagram size", () ->
-                        sender.longColumn("x", 1)
-                                .stringColumn("s", large)
-                                .atNow()
-                );
-            }
-
-            Assert.assertEquals(0, nf.sendCount);
-        });
-    }
-
-    @Test
-    public void testOversizedArrayRowRejectedUsesActualEncodedSize() throws Exception {
-        assertMemoryLeak(() -> {
-            long[] longValues = new long[1024];
-            double[] doubleValues = new double[1024];
-            for (int i = 0; i < 1024; i++) {
-                longValues[i] = i;
-                doubleValues[i] = i + 0.25;
-            }
-
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("arrays", sender -> sender.table("arrays")
-                                    .longColumn("x", 1)
-                                    .longArray("la", longValues)
-                                    .doubleArray("da", doubleValues)
-                                    .atNow(),
-                            "x", 1L,
-                            "la", longArrayValue(shape(1024), longValues),
-                            "da", doubleArrayValue(shape(1024), doubleValues))
-            );
-            int maxDatagramSize = fullPacketSize(rows) - 1;
-
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
-                sender.table("arrays");
-                assertThrowsContains("single row exceeds maximum datagram size", () ->
-                        sender.longColumn("x", 1)
-                                .longArray("la", longValues)
-                                .doubleArray("da", doubleValues)
-                                .atNow()
-                );
-            }
-
-            Assert.assertEquals(0, nf.sendCount);
         });
     }
 
@@ -1032,144 +948,52 @@ public class QwpUdpSenderTest {
     }
 
     @Test
-    public void testSchemaChangeMidRowFlushesImmediatelyAndPreservesRows() throws Exception {
+    public void testLongArrayWrapperStagingSnapshotsMutation() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .atNow();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024);
+                 LongArray longArray = new LongArray(2, 2)) {
+                sender.table("arrays");
 
-                sender.longColumn("a", 2);
-                sender.longColumn("b", 3);
-                Assert.assertEquals(1, nf.sendCount);
+                longArray.append(1).append(2).append(3).append(4);
+                sender.longArray("la", longArray);
 
+                longArray.clear();
+                longArray.append(10).append(20).append(30).append(40);
                 sender.atNow();
-                Assert.assertEquals(1, nf.sendCount);
                 sender.flush();
             }
 
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L),
-                    decodedRow("t", "a", 2L, "b", 3L)
-            ), decodeRows(nf.packets));
+            assertRowsEqual(
+                    Arrays.asList(decodedRow(
+                            "arrays",
+                            "la", longArrayValue(shape(2, 2), 1, 2, 3, 4)
+                    )),
+                    decodeRows(nf.packets)
+            );
         });
     }
 
     @Test
-    public void testSchemaChangeMidRowAllowsMultipleNewColumnsAfterReplay() throws Exception {
+    public void testMixingAtNowAndAtMicrosAfterCommittedRowsSplitsDatagramAndPreservesRows() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
             try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
                 sender.table("t")
-                        .longColumn("a", 1)
+                        .longColumn("x", 1)
                         .atNow();
 
-                sender.longColumn("a", 2);
-                sender.longColumn("b", 3);
+                sender.longColumn("x", 2);
+                sender.at(2, ChronoUnit.MICROS);
                 Assert.assertEquals(1, nf.sendCount);
 
-                sender.stringColumn("c", "x");
-                sender.longColumn("d", 4);
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.atNow();
                 sender.flush();
             }
 
             Assert.assertEquals(2, nf.sendCount);
             assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L),
-                    decodedRow("t", "a", 2L, "b", 3L, "c", "x", "d", 4L)
-            ), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testSchemaChangeMidRowAllowsMultipleNewColumnsAfterReplayWithoutDatagramTracking() throws Exception {
-        assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .atNow();
-
-                sender.longColumn("a", 2);
-                sender.longColumn("b", 3);
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.stringColumn("c", "x");
-                sender.longColumn("d", 4);
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.atNow();
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L),
-                    decodedRow("t", "a", 2L, "b", 3L, "c", "x", "d", 4L)
-            ), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testSchemaChangeMidRowPreservesExistingStringAndSymbolValues() throws Exception {
-        assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .stringColumn("s", "alpha")
-                        .symbol("sym", "one")
-                        .atNow();
-
-                sender.longColumn("a", 2);
-                sender.stringColumn("s", "beta");
-                sender.symbol("sym", "two");
-                sender.longColumn("b", 3);
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.atNow();
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L, "s", "alpha", "sym", "one"),
-                    decodedRow("t", "a", 2L, "s", "beta", "sym", "two", "b", 3L)
-            ), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testSchemaChangeMidRowPreservesExistingArrayValues() throws Exception {
-        assertMemoryLeak(() -> {
-            double[] first = {1.0, 2.0};
-            double[] second = {3.5, 4.5, 5.5};
-
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .doubleArray("da", first)
-                        .atNow();
-
-                sender.longColumn("a", 2);
-                sender.doubleArray("da", second);
-                sender.longColumn("b", 3);
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.atNow();
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L, "da", doubleArrayValue(shape(2), first)),
-                    decodedRow("t", "a", 2L, "da", doubleArrayValue(shape(3), second), "b", 3L)
+                    decodedRow("t", "x", 1L),
+                    decodedRow("t", "x", 2L, "", 2L)
             ), decodeRows(nf.packets));
         });
     }
@@ -1256,6 +1080,465 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testOversizedArrayRowRejectedUsesActualEncodedSize() throws Exception {
+        assertMemoryLeak(() -> {
+            long[] longValues = new long[1024];
+            double[] doubleValues = new double[1024];
+            for (int i = 0; i < 1024; i++) {
+                longValues[i] = i;
+                doubleValues[i] = i + 0.25;
+            }
+
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("arrays", sender -> sender.table("arrays")
+                                    .longColumn("x", 1)
+                                    .longArray("la", longValues)
+                                    .doubleArray("da", doubleValues)
+                                    .atNow(),
+                            "x", 1L,
+                            "la", longArrayValue(shape(1024), longValues),
+                            "da", doubleArrayValue(shape(1024), doubleValues))
+            );
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("arrays");
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("x", 1)
+                                .longArray("la", longValues)
+                                .doubleArray("da", doubleValues)
+                                .atNow()
+                );
+            }
+
+            Assert.assertEquals(0, nf.sendCount);
+        });
+    }
+
+    @Test
+    public void testOversizedRowAfterMidRowSchemaChangeCancelDoesNotLeakSchema() throws Exception {
+        assertMemoryLeak(() -> {
+            String large = repeat('x', 5000);
+            List<ScenarioRow> oversizedRow = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("a", 2)
+                                    .stringColumn("s", large)
+                                    .atNow(),
+                            "a", 2L,
+                            "s", large)
+            );
+            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                assertThrowsContains("single row exceeds maximum datagram size", () -> {
+                    sender.stringColumn("s", large);
+                    sender.atNow();
+                });
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.cancelRow();
+                sender.longColumn("a", 3).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testOversizedSingleRowRejectedAfterReplayUsesActualEncodedSize() throws Exception {
+        assertMemoryLeak(() -> {
+            String small = repeat('s', 32);
+            String large = repeat('x', 5000);
+            List<ScenarioRow> largeRow = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 2)
+                                    .stringColumn("s", large)
+                                    .atNow(),
+                            "x", 2L,
+                            "s", large)
+            );
+            int maxDatagramSize = fullPacketSize(largeRow) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t")
+                        .longColumn("x", 1)
+                        .stringColumn("s", small)
+                        .atNow();
+
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("x", 2)
+                                .stringColumn("s", large)
+                                .atNow()
+                );
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
+            assertRowsEqual(
+                    Arrays.asList(decodedRow("t", "x", 1L, "s", small)),
+                    decodeRows(nf.packets)
+            );
+        });
+    }
+
+    @Test
+    public void testOversizedSingleRowRejectedBeforeReplayUsesActualEncodedSize() throws Exception {
+        assertMemoryLeak(() -> {
+            String large = repeat('x', 5000);
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", large)
+                                    .atNow(),
+                            "x", 1L,
+                            "s", large)
+            );
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t");
+                assertThrowsContains("single row exceeds maximum datagram size", () ->
+                        sender.longColumn("x", 1)
+                                .stringColumn("s", large)
+                                .atNow()
+                );
+            }
+
+            Assert.assertEquals(0, nf.sendCount);
+        });
+    }
+
+    @Test
+    public void testRepeatedUtf8SymbolsAcrossRowsPreserveRows() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("sym", sender -> sender.table("sym")
+                                    .longColumn("x", 1)
+                                    .symbol("sym", "東京")
+                                    .atNow(),
+                            "x", 1L,
+                            "sym", "東京"),
+                    row("sym", sender -> sender.table("sym")
+                                    .longColumn("x", 2)
+                                    .symbol("sym", "東京")
+                                    .atNow(),
+                            "x", 2L,
+                            "sym", "東京"),
+                    row("sym", sender -> sender.table("sym")
+                                    .longColumn("x", 3)
+                                    .symbol("sym", "Αθηνα")
+                                    .atNow(),
+                            "x", 3L,
+                            "sym", "Αθηνα")
+            );
+
+            RunResult result = runScenario(rows, 1024 * 1024);
+            Assert.assertEquals(1, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeAfterOutOfOrderExistingColumnsPreservesRows() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("schema", sender -> sender.table("schema")
+                                    .longColumn("a", 1)
+                                    .stringColumn("b", "x")
+                                    .atNow(),
+                            "a", 1L,
+                            "b", "x"),
+                    row("schema", sender -> sender.table("schema")
+                                    .symbol("c", "new")
+                                    .stringColumn("b", "y")
+                                    .longColumn("a", 2)
+                                    .atNow(),
+                            "a", 2L,
+                            "b", "y",
+                            "c", "new"),
+                    row("schema", sender -> sender.table("schema")
+                                    .symbol("c", "next")
+                                    .longColumn("a", 3)
+                                    .stringColumn("b", "z")
+                                    .atNow(),
+                            "a", 3L,
+                            "b", "z",
+                            "c", "next")
+            );
+
+            RunResult result = runScenario(rows, 1024 * 1024);
+
+            Assert.assertEquals(2, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeMidRowAllowsMultipleNewColumnsAfterReplay() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.stringColumn("c", "x");
+                sender.longColumn("d", 4);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 2L, "b", 3L, "c", "x", "d", 4L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeMidRowAllowsMultipleNewColumnsAfterReplayWithoutDatagramTracking() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.stringColumn("c", "x");
+                sender.longColumn("d", 4);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 2L, "b", 3L, "c", "x", "d", 4L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeMidRowFlushesImmediatelyAndPreservesRows() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                Assert.assertEquals(1, nf.sendCount);
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L),
+                    decodedRow("t", "a", 2L, "b", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeMidRowPreservesExistingArrayValues() throws Exception {
+        assertMemoryLeak(() -> {
+            double[] first = {1.0, 2.0};
+            double[] second = {3.5, 4.5, 5.5};
+
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .doubleArray("da", first)
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.doubleArray("da", second);
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L, "da", doubleArrayValue(shape(2), first)),
+                    decodedRow("t", "a", 2L, "da", doubleArrayValue(shape(3), second), "b", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeMidRowPreservesExistingStringAndSymbolValues() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .stringColumn("s", "alpha")
+                        .symbol("sym", "one")
+                        .atNow();
+
+                sender.longColumn("a", 2);
+                sender.stringColumn("s", "beta");
+                sender.symbol("sym", "two");
+                sender.longColumn("b", 3);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "a", 1L, "s", "alpha", "sym", "one"),
+                    decodedRow("t", "a", 2L, "s", "beta", "sym", "two", "b", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSchemaChangeWithCommittedRowsFlushesImmediately() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+                Assert.assertEquals(0, nf.sendCount);
+
+                sender.longColumn("b", 2);
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.atNow();
+                Assert.assertEquals(1, nf.sendCount);
+
+                sender.flush();
+                Assert.assertEquals(2, nf.sendCount);
+            }
+        });
+    }
+
+    @Test
+    public void testSimpleLongRowUsesScatterSendPath() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("t").longColumn("x", 42L).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            Assert.assertEquals(1, nf.scatterSendCount);
+            Assert.assertEquals(0, nf.rawSendCount);
+            Assert.assertTrue("expected multiple segments for header/schema/data", nf.segmentCounts.get(0) > 1);
+            assertRowsEqual(Arrays.asList(decodedRow("t", "x", 42L)), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testSwitchTableWhileRowInProgressThrowsAndPreservesRows() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("t1").longColumn("x", 1);
+
+                assertThrowsContains("Cannot switch tables while row is in progress",
+                        () -> sender.table("t2"));
+
+                sender.atNow();
+                sender.table("t2").longColumn("y", 2).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(2, nf.sendCount);
+            assertRowsEqualIgnoringOrder(
+                    Arrays.asList(decodedRow("t1", "x", 1L), decodedRow("t2", "y", 2L)),
+                    decodeRows(nf.packets)
+            );
+        });
+    }
+
+    @Test
+    public void testSymbolBoundary127To128PreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = new ArrayList<>(130);
+            for (int i = 0; i < 130; i++) {
+                final int value = i;
+                rows.add(row("t", sender -> sender.table("t")
+                                .symbol("sym", "v" + value)
+                                .longColumn("x", value)
+                                .atNow(),
+                        "sym", "v" + value,
+                        "x", (long) value));
+            }
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testSymbolBoundary16383To16384PreservesRowsAndPacketLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            List<ScenarioRow> rows = new ArrayList<>(16_390);
+            for (int i = 0; i < 16_390; i++) {
+                final int value = i;
+                rows.add(row("t", sender -> sender.table("t")
+                                .symbol("sym", "v" + value)
+                                .longColumn("x", value)
+                                .atNow(),
+                        "sym", "v" + value,
+                        "x", (long) value));
+            }
+
+            int maxDatagramSize = fullPacketSize(rows) - 1;
+            RunResult result = runScenario(rows, maxDatagramSize);
+
+            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
+            assertPacketsWithinLimit(result, maxDatagramSize);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
     public void testSymbolPrefixFlushKeepsSingleRetainedDictionaryEntry() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -1298,56 +1581,83 @@ public class QwpUdpSenderTest {
     }
 
     @Test
-    public void testDuplicateColumnAfterSchemaFlushReplayIsRejected() throws Exception {
+    public void testUnboundedSenderOmittedNullableAndNonNullableColumnsPreservesRows() throws Exception {
         assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .atNow();
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 1)
+                                    .stringColumn("s", "alpha")
+                                    .symbol("sym", "one")
+                                    .atNow(),
+                            "x", 1L,
+                            "s", "alpha",
+                            "sym", "one"),
+                    row("t", sender -> sender.table("t")
+                                    .stringColumn("s", "beta")
+                                    .atNow(),
+                            "x", Long.MIN_VALUE,
+                            "s", "beta",
+                            "sym", null),
+                    row("t", sender -> sender.table("t")
+                                    .longColumn("x", 3)
+                                    .atNow(),
+                            "x", 3L,
+                            "s", null,
+                            "sym", null)
+            );
 
-                sender.longColumn("a", 2);
-                sender.longColumn("b", 3);
-                Assert.assertEquals(1, nf.sendCount);
+            RunResult result = runScenario(rows, 0);
 
-                assertThrowsContains("column 'a' already set for current row", () -> sender.longColumn("a", 4));
-
-                sender.cancelRow();
-                sender.longColumn("a", 5).atNow();
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L),
-                    decodedRow("t", "a", 5L)
-            ), decodeRows(nf.packets));
+            Assert.assertEquals(1, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }
 
     @Test
-    public void testCancelRowAfterMidRowSchemaChangeDoesNotLeakSchema() throws Exception {
+    public void testUnboundedSenderWideSchemaWithLowIndexWritePreservesRows() throws Exception {
         assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .atNow();
+            List<ScenarioRow> rows = Arrays.asList(
+                    row("wide", sender -> sender.table("wide")
+                                    .longColumn("c0", 0)
+                                    .longColumn("c1", 1)
+                                    .longColumn("c2", 2)
+                                    .longColumn("c3", 3)
+                                    .longColumn("c4", 4)
+                                    .longColumn("c5", 5)
+                                    .longColumn("c6", 6)
+                                    .longColumn("c7", 7)
+                                    .longColumn("c8", 8)
+                                    .longColumn("c9", 9)
+                                    .atNow(),
+                            "c0", 0L,
+                            "c1", 1L,
+                            "c2", 2L,
+                            "c3", 3L,
+                            "c4", 4L,
+                            "c5", 5L,
+                            "c6", 6L,
+                            "c7", 7L,
+                            "c8", 8L,
+                            "c9", 9L),
+                    row("wide", sender -> sender.table("wide")
+                                    .longColumn("c0", 10)
+                                    .atNow(),
+                            "c0", 10L,
+                            "c1", Long.MIN_VALUE,
+                            "c2", Long.MIN_VALUE,
+                            "c3", Long.MIN_VALUE,
+                            "c4", Long.MIN_VALUE,
+                            "c5", Long.MIN_VALUE,
+                            "c6", Long.MIN_VALUE,
+                            "c7", Long.MIN_VALUE,
+                            "c8", Long.MIN_VALUE,
+                            "c9", Long.MIN_VALUE)
+            );
 
-                sender.longColumn("a", 2);
-                sender.longColumn("b", 3);
-                Assert.assertEquals(1, nf.sendCount);
+            RunResult result = runScenario(rows, 0);
 
-                sender.cancelRow();
-                sender.longColumn("a", 4).atNow();
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L),
-                    decodedRow("t", "a", 4L)
-            ), decodeRows(nf.packets));
+            Assert.assertEquals(1, result.sendCount);
+            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
         });
     }
 
@@ -1403,332 +1713,6 @@ public class QwpUdpSenderTest {
     }
 
     @Test
-    public void testRepeatedUtf8SymbolsAcrossRowsPreserveRows() throws Exception {
-        assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("sym", sender -> sender.table("sym")
-                                    .longColumn("x", 1)
-                                    .symbol("sym", "東京")
-                                    .atNow(),
-                            "x", 1L,
-                            "sym", "東京"),
-                    row("sym", sender -> sender.table("sym")
-                                    .longColumn("x", 2)
-                                    .symbol("sym", "東京")
-                                    .atNow(),
-                            "x", 2L,
-                            "sym", "東京"),
-                    row("sym", sender -> sender.table("sym")
-                                    .longColumn("x", 3)
-                                    .symbol("sym", "Αθηνα")
-                                    .atNow(),
-                            "x", 3L,
-                            "sym", "Αθηνα")
-            );
-
-            RunResult result = runScenario(rows, 1024 * 1024);
-            Assert.assertEquals(1, result.sendCount);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
-        });
-    }
-
-    @Test
-    public void testOversizedRowAfterMidRowSchemaChangeCancelDoesNotLeakSchema() throws Exception {
-        assertMemoryLeak(() -> {
-            String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = Arrays.asList(
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("a", 2)
-                                    .stringColumn("s", large)
-                                    .atNow(),
-                            "a", 2L,
-                            "s", large)
-            );
-            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
-
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .atNow();
-
-                sender.longColumn("a", 2);
-                assertThrowsContains("single row exceeds maximum datagram size", () -> {
-                    sender.stringColumn("s", large);
-                    sender.atNow();
-                });
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.cancelRow();
-                sender.longColumn("a", 3).atNow();
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L),
-                    decodedRow("t", "a", 3L)
-            ), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testAtNowOversizeFailureRollsBackWithoutExplicitCancel() throws Exception {
-        assertMemoryLeak(() -> {
-            String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = Arrays.asList(
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("a", 2)
-                                    .stringColumn("s", large)
-                                    .atNow(),
-                            "a", 2L,
-                            "s", large)
-            );
-            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
-
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .atNow();
-
-                assertThrowsContains("single row exceeds maximum datagram size", () ->
-                        sender.longColumn("a", 2)
-                                .stringColumn("s", large)
-                                .atNow()
-                );
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.longColumn("a", 3).atNow();
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L),
-                    decodedRow("t", "a", 3L)
-            ), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testAtMicrosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
-        assertMemoryLeak(() -> {
-            String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = Arrays.asList(
-                    row("t", sender -> sender.table("t")
-                                    .longColumn("a", 2)
-                                    .stringColumn("s", large)
-                                    .at(2_000_000L, ChronoUnit.MICROS),
-                            "a", 2L,
-                            "s", large,
-                            "", 2_000_000L)
-            );
-            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
-
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .at(1_000_000L, ChronoUnit.MICROS);
-
-                assertThrowsContains("single row exceeds maximum datagram size", () ->
-                        sender.longColumn("a", 2)
-                                .stringColumn("s", large)
-                                .at(2_000_000L, ChronoUnit.MICROS)
-                );
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.longColumn("a", 3).at(3_000_000L, ChronoUnit.MICROS);
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("t", "a", 1L, "", 1_000_000L),
-                    decodedRow("t", "a", 3L, "", 3_000_000L)
-            ), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testAtNanosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
-        assertMemoryLeak(() -> {
-            String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = Arrays.asList(
-                    row("tn", sender -> sender.table("tn")
-                                    .longColumn("a", 2)
-                                    .stringColumn("s", large)
-                                    .at(2_000_000L, ChronoUnit.NANOS),
-                            "a", 2L,
-                            "s", large,
-                            "", 2_000_000L)
-            );
-            int maxDatagramSize = fullPacketSize(oversizedRow) - 1;
-
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
-                sender.table("tn")
-                        .longColumn("a", 1)
-                        .at(1_000_000L, ChronoUnit.NANOS);
-
-                assertThrowsContains("single row exceeds maximum datagram size", () ->
-                        sender.longColumn("a", 2)
-                                .stringColumn("s", large)
-                                .at(2_000_000L, ChronoUnit.NANOS)
-                );
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.longColumn("a", 3).at(3_000_000L, ChronoUnit.NANOS);
-                sender.flush();
-            }
-
-            Assert.assertEquals(2, nf.sendCount);
-            assertRowsEqual(Arrays.asList(
-                    decodedRow("tn", "a", 1L, "", 1_000_000L),
-                    decodedRow("tn", "a", 3L, "", 3_000_000L)
-            ), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testSchemaChangeWithCommittedRowsFlushesImmediately() throws Exception {
-        assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
-                sender.table("t")
-                        .longColumn("a", 1)
-                        .atNow();
-                Assert.assertEquals(0, nf.sendCount);
-
-                sender.longColumn("b", 2);
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.atNow();
-                Assert.assertEquals(1, nf.sendCount);
-
-                sender.flush();
-                Assert.assertEquals(2, nf.sendCount);
-            }
-        });
-    }
-
-    @Test
-    public void testSchemaChangeAfterOutOfOrderExistingColumnsPreservesRows() throws Exception {
-        assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("schema", sender -> sender.table("schema")
-                                    .longColumn("a", 1)
-                                    .stringColumn("b", "x")
-                                    .atNow(),
-                            "a", 1L,
-                            "b", "x"),
-                    row("schema", sender -> sender.table("schema")
-                                    .symbol("c", "new")
-                                    .stringColumn("b", "y")
-                                    .longColumn("a", 2)
-                                    .atNow(),
-                            "a", 2L,
-                            "b", "y",
-                            "c", "new"),
-                    row("schema", sender -> sender.table("schema")
-                                    .symbol("c", "next")
-                                    .longColumn("a", 3)
-                                    .stringColumn("b", "z")
-                                    .atNow(),
-                            "a", 3L,
-                            "b", "z",
-                            "c", "next")
-            );
-
-            RunResult result = runScenario(rows, 1024 * 1024);
-
-            Assert.assertEquals(2, result.sendCount);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
-        });
-    }
-
-    @Test
-    public void testBoundedSenderSchemaFlushThenOmittedNullableColumnsPreservesRows() throws Exception {
-        assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = Arrays.asList(
-                    row("schema", sender -> sender.table("schema")
-                                    .longColumn("x", 1)
-                                    .stringColumn("s", "alpha")
-                                    .atNow(),
-                            "x", 1L,
-                            "s", "alpha"),
-                    row("schema", sender -> sender.table("schema")
-                                    .symbol("sym", "new")
-                                    .longColumn("x", 2)
-                                    .stringColumn("s", "beta")
-                                    .atNow(),
-                            "sym", "new",
-                            "x", 2L,
-                            "s", "beta"),
-                    row("schema", sender -> sender.table("schema")
-                                    .longColumn("x", 3)
-                                    .atNow(),
-                            "sym", null,
-                            "x", 3L,
-                            "s", null)
-            );
-
-            RunResult result = runScenario(rows, 1024 * 1024);
-
-            Assert.assertEquals(2, result.sendCount);
-            assertPacketsWithinLimit(result, 1024 * 1024);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
-        });
-    }
-
-    @Test
-    public void testSymbolBoundary16383To16384PreservesRowsAndPacketLimit() throws Exception {
-        assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = new ArrayList<>(16_390);
-            for (int i = 0; i < 16_390; i++) {
-                final int value = i;
-                rows.add(row("t", sender -> sender.table("t")
-                                .symbol("sym", "v" + value)
-                                .longColumn("x", value)
-                                .atNow(),
-                        "sym", "v" + value,
-                        "x", (long) value));
-            }
-
-            int maxDatagramSize = fullPacketSize(rows) - 1;
-            RunResult result = runScenario(rows, maxDatagramSize);
-
-            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
-            assertPacketsWithinLimit(result, maxDatagramSize);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
-        });
-    }
-
-    @Test
-    public void testSymbolBoundary127To128PreservesRowsAndPacketLimit() throws Exception {
-        assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = new ArrayList<>(130);
-            for (int i = 0; i < 130; i++) {
-                final int value = i;
-                rows.add(row("t", sender -> sender.table("t")
-                                .symbol("sym", "v" + value)
-                                .longColumn("x", value)
-                                .atNow(),
-                        "sym", "v" + value,
-                        "x", (long) value));
-            }
-
-            int maxDatagramSize = fullPacketSize(rows) - 1;
-            RunResult result = runScenario(rows, maxDatagramSize);
-
-            Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
-            assertPacketsWithinLimit(result, maxDatagramSize);
-            assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
-        });
-    }
-
-    @Test
     public void testZeroColumnRowsThrow() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -1740,6 +1724,43 @@ public class QwpUdpSenderTest {
                 assertThrowsContains("no columns were provided", () -> sender.at(1, ChronoUnit.NANOS));
             }
         });
+    }
+
+    private static void assertEstimateAtLeastActual(List<ScenarioRow> rows) throws Exception {
+        CapturingNetworkFacade nf = new CapturingNetworkFacade();
+        try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+            for (int i = 0; i < rows.size(); i++) {
+                rows.get(i).writer.accept(sender);
+                long estimate = sender.committedDatagramEstimateForTest();
+                long actual = fullPacketSize(rows.subList(0, i + 1));
+                Assert.assertTrue(
+                        "row " + i + " estimate underflow: estimate=" + estimate + ", actual=" + actual,
+                        estimate >= actual
+                );
+            }
+        }
+    }
+
+    private static void assertNullableArrayNullState(QwpTableBuffer.ColumnBuffer column) {
+        Assert.assertNotNull(column);
+        Assert.assertEquals(1, column.getSize());
+        Assert.assertEquals(0, column.getValueCount());
+        Assert.assertTrue(column.usesNullBitmap());
+        Assert.assertTrue(column.isNull(0));
+        Assert.assertEquals(0, column.getArrayShapeOffset());
+        Assert.assertEquals(0, column.getArrayDataOffset());
+    }
+
+    private static void assertNullableStringNullState(QwpTableBuffer.ColumnBuffer column) {
+        Assert.assertNotNull(column);
+        Assert.assertEquals(1, column.getSize());
+        Assert.assertEquals(0, column.getValueCount());
+        Assert.assertTrue(column.usesNullBitmap());
+        Assert.assertTrue(column.isNull(0));
+        Assert.assertEquals(0, column.getStringDataSize());
+        long offsetsAddress = column.getStringOffsetsAddress();
+        Assert.assertTrue(offsetsAddress != 0);
+        Assert.assertEquals(0, Unsafe.getUnsafe().getInt(offsetsAddress));
     }
 
     private static void assertPacketsWithinLimit(RunResult result, int maxDatagramSize) {
@@ -1790,56 +1811,6 @@ public class QwpUdpSenderTest {
         } catch (Exception e) {
             throw new AssertionError("Unexpected exception type", e);
         }
-    }
-
-    private static void assertNullableArrayNullState(QwpTableBuffer.ColumnBuffer column) {
-        Assert.assertNotNull(column);
-        Assert.assertEquals(1, column.getSize());
-        Assert.assertEquals(0, column.getValueCount());
-        Assert.assertTrue(column.isNullable());
-        Assert.assertTrue(column.isNull(0));
-        Assert.assertEquals(0, column.getArrayShapeOffset());
-        Assert.assertEquals(0, column.getArrayDataOffset());
-    }
-
-    private static void assertNullableStringNullState(QwpTableBuffer.ColumnBuffer column) {
-        Assert.assertNotNull(column);
-        Assert.assertEquals(1, column.getSize());
-        Assert.assertEquals(0, column.getValueCount());
-        Assert.assertTrue(column.isNullable());
-        Assert.assertTrue(column.isNull(0));
-        Assert.assertEquals(0, column.getStringDataSize());
-        long offsetsAddress = column.getStringOffsetsAddress();
-        Assert.assertTrue(offsetsAddress != 0);
-        Assert.assertEquals(0, Unsafe.getUnsafe().getInt(offsetsAddress));
-    }
-
-    private static BigDecimal decimal(long unscaled, int scale) {
-        return BigDecimal.valueOf(unscaled, scale);
-    }
-
-    private static DecodedRow decodedRow(String table, Object... kvs) {
-        return new DecodedRow(table, columns(kvs));
-    }
-
-    private static List<DecodedRow> decodeRows(List<byte[]> packets) {
-        ArrayList<DecodedRow> rows = new ArrayList<>();
-        for (byte[] packet : packets) {
-            rows.addAll(new DatagramDecoder(packet).decode());
-        }
-        return rows;
-    }
-
-    private static DoubleArrayValue doubleArrayValue(int[] shape, double... values) {
-        ArrayList<Integer> dims = new ArrayList<>(shape.length);
-        for (int dim : shape) {
-            dims.add(dim);
-        }
-        ArrayList<Double> elems = new ArrayList<>(values.length);
-        for (double value : values) {
-            elems.add(value);
-        }
-        return new DoubleArrayValue(dims, elems);
     }
 
     private static void auditEstimateAcrossSymbolDictionaryVarintBoundary() throws Exception {
@@ -1912,19 +1883,43 @@ public class QwpUdpSenderTest {
         assertEstimateAtLeastActual(rows);
     }
 
-    private static void assertEstimateAtLeastActual(List<ScenarioRow> rows) throws Exception {
-        CapturingNetworkFacade nf = new CapturingNetworkFacade();
-        try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
-            for (int i = 0; i < rows.size(); i++) {
-                rows.get(i).writer.accept(sender);
-                long estimate = sender.committedDatagramEstimateForTest();
-                long actual = fullPacketSize(rows.subList(0, i + 1));
-                Assert.assertTrue(
-                        "row " + i + " estimate underflow: estimate=" + estimate + ", actual=" + actual,
-                        estimate >= actual
-                );
-            }
+    private static LinkedHashMap<String, Object> columns(Object... kvs) {
+        if ((kvs.length & 1) != 0) {
+            throw new IllegalArgumentException("key/value pairs expected");
         }
+        LinkedHashMap<String, Object> columns = new LinkedHashMap<>();
+        for (int i = 0; i < kvs.length; i += 2) {
+            columns.put((String) kvs[i], kvs[i + 1]);
+        }
+        return columns;
+    }
+
+    private static BigDecimal decimal(long unscaled, int scale) {
+        return BigDecimal.valueOf(unscaled, scale);
+    }
+
+    private static List<DecodedRow> decodeRows(List<byte[]> packets) {
+        ArrayList<DecodedRow> rows = new ArrayList<>();
+        for (byte[] packet : packets) {
+            rows.addAll(new DatagramDecoder(packet).decode());
+        }
+        return rows;
+    }
+
+    private static DecodedRow decodedRow(String table, Object... kvs) {
+        return new DecodedRow(table, columns(kvs));
+    }
+
+    private static DoubleArrayValue doubleArrayValue(int[] shape, double... values) {
+        ArrayList<Integer> dims = new ArrayList<>(shape.length);
+        for (int dim : shape) {
+            dims.add(dim);
+        }
+        ArrayList<Double> elems = new ArrayList<>(values.length);
+        for (double value : values) {
+            elems.add(value);
+        }
+        return new DoubleArrayValue(dims, elems);
     }
 
     private static List<DecodedRow> expectedRows(List<ScenarioRow> rows) {
@@ -1949,12 +1944,6 @@ public class QwpUdpSenderTest {
         return flat;
     }
 
-    private static int fullPacketSize(List<ScenarioRow> rows) throws Exception {
-        RunResult result = runScenario(rows, 0);
-        Assert.assertEquals("expected a single unbounded packet", 1, result.packets.size());
-        return result.lengths.get(0);
-    }
-
     private static long[] flatten(long[][] matrix) {
         int size = 0;
         for (long[] row : matrix) {
@@ -1969,15 +1958,10 @@ public class QwpUdpSenderTest {
         return flat;
     }
 
-    private static LinkedHashMap<String, Object> columns(Object... kvs) {
-        if ((kvs.length & 1) != 0) {
-            throw new IllegalArgumentException("key/value pairs expected");
-        }
-        LinkedHashMap<String, Object> columns = new LinkedHashMap<>();
-        for (int i = 0; i < kvs.length; i += 2) {
-            columns.put((String) kvs[i], kvs[i + 1]);
-        }
-        return columns;
+    private static int fullPacketSize(List<ScenarioRow> rows) throws Exception {
+        RunResult result = runScenario(rows, 0);
+        Assert.assertEquals("expected a single unbounded packet", 1, result.packets.size());
+        return result.lengths.get(0);
     }
 
     private static LongArrayValue longArrayValue(int[] shape, long... values) {
@@ -2043,8 +2027,8 @@ public class QwpUdpSenderTest {
         private final List<byte[]> packets = new ArrayList<>();
         private final List<Integer> segmentCounts = new ArrayList<>();
         private int rawSendCount;
-        private int sendCount;
         private int scatterSendCount;
+        private int sendCount;
 
         @Override
         public int close(int fd) {
@@ -2131,6 +2115,16 @@ public class QwpUdpSenderTest {
             this.reader = new PacketReader(packet);
         }
 
+        private static int countNulls(boolean[] nulls) {
+            int count = 0;
+            for (boolean value : nulls) {
+                if (value) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
         private List<DecodedRow> decode() {
             Assert.assertEquals(MAGIC_MESSAGE, reader.readIntLE());
             Assert.assertEquals(VERSION_1, reader.readByte());
@@ -2147,31 +2141,19 @@ public class QwpUdpSenderTest {
             return rows;
         }
 
-        private List<DecodedRow> decodeTable() {
-            String tableName = reader.readString();
-            int rowCount = (int) reader.readVarint();
-            int columnCount = (int) reader.readVarint();
-            Assert.assertEquals(SCHEMA_MODE_FULL, reader.readByte());
-
-            QwpColumnDef[] defs = new QwpColumnDef[columnCount];
-            for (int i = 0; i < columnCount; i++) {
-                defs[i] = new QwpColumnDef(reader.readString(), reader.readByte());
-            }
-
-            ColumnValues[] columns = new ColumnValues[columnCount];
-            for (int i = 0; i < columnCount; i++) {
-                columns[i] = decodeColumn(defs[i], rowCount);
-            }
-
-            ArrayList<DecodedRow> rows = new ArrayList<>(rowCount);
-            for (int row = 0; row < rowCount; row++) {
-                LinkedHashMap<String, Object> values = new LinkedHashMap<>();
-                for (int col = 0; col < columnCount; col++) {
-                    values.put(defs[col].getName(), columns[col].rows[row]);
+        private void decodeBooleans(Object[] values, boolean[] nulls, int valueCount) {
+            byte[] packed = reader.readBytes((valueCount + 7) / 8);
+            int valueIndex = 0;
+            for (int row = 0; row < values.length; row++) {
+                if (nulls[row]) {
+                    values[row] = null;
+                } else {
+                    int byteIndex = valueIndex >>> 3;
+                    int bitIndex = valueIndex & 7;
+                    values[row] = (packed[byteIndex] & (1 << bitIndex)) != 0;
+                    valueIndex++;
                 }
-                rows.add(new DecodedRow(tableName, values));
             }
-            return rows;
         }
 
         private ColumnValues decodeColumn(QwpColumnDef def, int rowCount) {
@@ -2218,21 +2200,6 @@ public class QwpUdpSenderTest {
             }
 
             return new ColumnValues(values);
-        }
-
-        private void decodeBooleans(Object[] values, boolean[] nulls, int valueCount) {
-            byte[] packed = reader.readBytes((valueCount + 7) / 8);
-            int valueIndex = 0;
-            for (int row = 0; row < values.length; row++) {
-                if (nulls[row]) {
-                    values[row] = null;
-                } else {
-                    int byteIndex = valueIndex >>> 3;
-                    int bitIndex = valueIndex & 7;
-                    values[row] = (packed[byteIndex] & (1 << bitIndex)) != 0;
-                    valueIndex++;
-                }
-            }
         }
 
         private void decodeDecimals(Object[] values, boolean[] nulls, int valueCount, int width) {
@@ -2367,14 +2334,31 @@ public class QwpUdpSenderTest {
             Assert.assertEquals(valueCount, valueIndex);
         }
 
-        private static int countNulls(boolean[] nulls) {
-            int count = 0;
-            for (boolean value : nulls) {
-                if (value) {
-                    count++;
-                }
+        private List<DecodedRow> decodeTable() {
+            String tableName = reader.readString();
+            int rowCount = (int) reader.readVarint();
+            int columnCount = (int) reader.readVarint();
+            Assert.assertEquals(SCHEMA_MODE_FULL, reader.readByte());
+
+            QwpColumnDef[] defs = new QwpColumnDef[columnCount];
+            for (int i = 0; i < columnCount; i++) {
+                defs[i] = new QwpColumnDef(reader.readString(), reader.readByte());
             }
-            return count;
+
+            ColumnValues[] columns = new ColumnValues[columnCount];
+            for (int i = 0; i < columnCount; i++) {
+                columns[i] = decodeColumn(defs[i], rowCount);
+            }
+
+            ArrayList<DecodedRow> rows = new ArrayList<>(rowCount);
+            for (int row = 0; row < rowCount; row++) {
+                LinkedHashMap<String, Object> values = new LinkedHashMap<>();
+                for (int col = 0; col < columnCount; col++) {
+                    values.put(defs[col].getName(), columns[col].rows[row]);
+                }
+                rows.add(new DecodedRow(tableName, values));
+            }
+            return rows;
         }
     }
 
@@ -2491,6 +2475,14 @@ public class QwpUdpSenderTest {
             this.data = data;
         }
 
+        private int length() {
+            return data.length;
+        }
+
+        private int position() {
+            return position;
+        }
+
         private byte readByte() {
             return data[position++];
         }
@@ -2499,17 +2491,6 @@ public class QwpUdpSenderTest {
             byte[] bytes = Arrays.copyOfRange(data, position, position + len);
             position += len;
             return bytes;
-        }
-
-        private boolean[] readNullBitmap(int rowCount) {
-            byte[] bitmap = readBytes((rowCount + 7) / 8);
-            boolean[] nulls = new boolean[rowCount];
-            for (int row = 0; row < rowCount; row++) {
-                int byteIndex = row >>> 3;
-                int bitIndex = row & 7;
-                nulls[row] = (bitmap[byteIndex] & (1 << bitIndex)) != 0;
-            }
-            return nulls;
         }
 
         private double readDoubleLE() {
@@ -2528,6 +2509,17 @@ public class QwpUdpSenderTest {
             long value = Unsafe.byteArrayGetLong(data, position);
             position += Long.BYTES;
             return value;
+        }
+
+        private boolean[] readNullBitmap(int rowCount) {
+            byte[] bitmap = readBytes((rowCount + 7) / 8);
+            boolean[] nulls = new boolean[rowCount];
+            for (int row = 0; row < rowCount; row++) {
+                int byteIndex = row >>> 3;
+                int bitIndex = row & 7;
+                nulls[row] = (bitmap[byteIndex] & (1 << bitIndex)) != 0;
+            }
+            return nulls;
         }
 
         private String readString() {
@@ -2564,14 +2556,6 @@ public class QwpUdpSenderTest {
                     throw new AssertionError("varint too long");
                 }
             }
-        }
-
-        private int length() {
-            return data.length;
-        }
-
-        private int position() {
-            return position;
         }
     }
 
