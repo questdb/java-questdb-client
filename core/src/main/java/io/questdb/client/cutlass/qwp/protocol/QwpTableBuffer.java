@@ -222,15 +222,6 @@ public class QwpTableBuffer implements QuietCloseable {
         return tableName;
     }
 
-    public boolean hasInProgressRow() {
-        for (int i = 0, n = columns.size(); i < n; i++) {
-            if (fastColumns[i].size > rowCount) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     /**
      * Advances to the next row.
      * <p>
