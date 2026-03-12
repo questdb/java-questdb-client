@@ -2,8 +2,6 @@ package io.questdb.client.test.cutlass.line;
 
 import io.questdb.client.cutlass.line.AbstractLineSender;
 import io.questdb.client.test.AbstractQdbTest;
-import org.junit.Assume;
-import org.junit.BeforeClass;
 
 import java.lang.reflect.Array;
 
@@ -14,12 +12,6 @@ public class AbstractLineSenderTest extends AbstractQdbTest {
     public static <T> T createDoubleArray(int... shape) {
         int[] indices = new int[shape.length];
         return buildNestedArray(ArrayDataType.DOUBLE, shape, 0, indices);
-    }
-
-    @BeforeClass
-    public static void setUpStatic() {
-        AbstractQdbTest.setUpStatic();
-        Assume.assumeTrue(getQuestDBRunning());
     }
 
     @SuppressWarnings("unchecked")
