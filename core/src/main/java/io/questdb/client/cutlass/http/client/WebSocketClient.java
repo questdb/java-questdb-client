@@ -772,11 +772,6 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
             int payloadLen = (int) payloadLength;
 
-            // Unmask if needed (server frames should not be masked)
-            if (frameParser.isMasked()) {
-                frameParser.unmaskPayload(payloadPtr, payloadLen);
-            }
-
             // Handle frame by opcode
             int opcode = frameParser.getOpcode();
             switch (opcode) {

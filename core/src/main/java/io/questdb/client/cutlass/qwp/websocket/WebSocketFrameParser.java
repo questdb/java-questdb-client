@@ -60,7 +60,6 @@ public class WebSocketFrameParser {
     // Frame header bits
     private static final int FIN_BIT = 0x80;
     private static final int LENGTH_MASK = 0x7F;
-    private static final int MASK_BIT = 0x80;
     // Control frame max payload size (RFC 6455)
     private static final int MAX_CONTROL_FRAME_PAYLOAD = 125;
     private static final int OPCODE_MASK = 0x0F;
@@ -69,8 +68,6 @@ public class WebSocketFrameParser {
     // Parsed frame data
     private boolean fin;
     private int headerSize;
-    private int maskKey;
-    private boolean masked;
     private int opcode;
     private long payloadLength;
     // Parser state
@@ -98,10 +95,6 @@ public class WebSocketFrameParser {
 
     public boolean isFin() {
         return fin;
-    }
-
-    public boolean isMasked() {
-        return masked;
     }
 
     /**
@@ -147,15 +140,10 @@ public class WebSocketFrameParser {
             return 0;
         }
 
-        final boolean masked = (byte1 & MASK_BIT) != 0;
-        this.masked = masked;
         int lengthField = byte1 & LENGTH_MASK;
 
-        // Validate masking based on mode
-        // Configuration
-        // If true, expect masked frames from clients
-        if (masked) {
-            // Server frames MUST NOT be masked
+        // Server frames MUST NOT be masked (RFC 6455 section 5.1)
+        if ((byte1 & 0x80) != 0) {
             state = STATE_ERROR;
             errorCode = WebSocketCloseCode.PROTOCOL_ERROR;
             return 0;
@@ -164,7 +152,6 @@ public class WebSocketFrameParser {
         // Calculate header size and payload length
         int offset = 2;
 
-        // If true, reject non-minimal length encodings
         if (lengthField <= 125) {
             payloadLength = lengthField;
         } else if (lengthField == 126) {
@@ -176,9 +163,6 @@ public class WebSocketFrameParser {
             int high = Unsafe.getUnsafe().getByte(buf + 2) & 0xFF;
             int low = Unsafe.getUnsafe().getByte(buf + 3) & 0xFF;
             payloadLength = (high << 8) | low;
-
-            // Strict mode: reject non-minimal encodings
-
             offset = 4;
         } else {
             // 64-bit extended length
@@ -187,8 +171,6 @@ public class WebSocketFrameParser {
                 return 0;
             }
             payloadLength = Long.reverseBytes(Unsafe.getUnsafe().getLong(buf + 2));
-
-            // Strict mode: reject non-minimal encodings
 
             // MSB must be 0 (no negative lengths)
             if (payloadLength < 0) {
@@ -214,7 +196,6 @@ public class WebSocketFrameParser {
             return 0;
         }
 
-        maskKey = 0;
         headerSize = offset;
 
         // Check if we have the complete payload
@@ -235,50 +216,9 @@ public class WebSocketFrameParser {
         state = STATE_HEADER;
         fin = false;
         opcode = 0;
-        masked = false;
-        maskKey = 0;
         payloadLength = 0;
         headerSize = 0;
         errorCode = 0;
     }
 
-    /**
-     * Unmasks the payload data in place.
-     *
-     * @param buf the start of the payload data
-     * @param len the length of the payload
-     */
-    public void unmaskPayload(long buf, long len) {
-        if (!masked || maskKey == 0) {
-            // a zero maskKey is a no-op (makes no change to the data)
-            return;
-        }
-
-        // Process 8 bytes at a time when possible for better performance
-        long i = 0;
-        long longMask = ((long) maskKey << 32) | (maskKey & 0xFFFFFFFFL);
-
-        // Process 8-byte chunks
-        while (i + 8 <= len) {
-            long value = Unsafe.getUnsafe().getLong(buf + i);
-            Unsafe.getUnsafe().putLong(buf + i, value ^ longMask);
-            i += 8;
-        }
-
-        // Process 4-byte chunk if remaining
-        if (i + 4 <= len) {
-            int value = Unsafe.getUnsafe().getInt(buf + i);
-            Unsafe.getUnsafe().putInt(buf + i, value ^ maskKey);
-            i += 4;
-        }
-
-        // Process remaining bytes
-        while (i < len) {
-            byte b = Unsafe.getUnsafe().getByte(buf + i);
-            int shift = ((int) (i % 4)) << 3;  // 0, 8, 16, or 24
-            byte maskByte = (byte) ((maskKey >> shift) & 0xFF);
-            Unsafe.getUnsafe().putByte(buf + i, (byte) (b ^ maskByte));
-            i++;
-        }
-    }
 }

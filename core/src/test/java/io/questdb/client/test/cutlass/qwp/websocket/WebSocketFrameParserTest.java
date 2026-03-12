@@ -466,7 +466,6 @@ public class WebSocketFrameParserTest {
                 Assert.assertTrue(parser.isFin());
                 Assert.assertEquals(WebSocketOpcode.BINARY, parser.getOpcode());
                 Assert.assertEquals(1, parser.getPayloadLength());
-                Assert.assertFalse(parser.isMasked());
             } finally {
                 freeBuffer(buf, 16);
             }
