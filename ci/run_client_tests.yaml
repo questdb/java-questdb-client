@@ -1,11 +1,4 @@
-parameters:
-  - name: configPath
-    type: string
-
 steps:
-  - template: questdb_start.yaml
-    parameters:
-      configPath: ${{ parameters.configPath }}
   - task: Maven@3
     displayName: "Run Client Tests"
     inputs:
@@ -25,4 +18,3 @@ steps:
     inputs:
       pathToPublish: $(ARCHIVED_LOGS)
       artifactName: MavenFailedTestsLogs
-  - template: questdb_stop.yaml

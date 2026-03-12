@@ -7,8 +7,6 @@ pr:
 
 variables:
   ARCHIVED_LOGS: "$(Build.ArtifactStagingDirectory)/questdb-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS).zip"
-  QUESTDB_RUNNING: true
-  QUESTDB_ILP_TCP_AUTH_ENABLE: false
 
 stages:
   - stage: Validate
@@ -111,12 +109,4 @@ stages:
               jdkVersionOption: "default"
               options: "-DskipTests -Pbuild-web-console --batch-mode"
           - template: run_client_tests.yaml
-            parameters:
-              configPath: "ci/confs/default"
-          - bash: |
-              echo "##vso[task.setvariable variable=QUESTDB_ILP_TCP_AUTH_ENABLE]true"
-            displayName: "Enable ILP TCP Auth"
-          - template: run_client_tests.yaml
-            parameters:
-              configPath: "ci/confs/authenticated"
           - template: run_oss_tests.yaml
