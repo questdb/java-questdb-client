@@ -150,12 +150,23 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @return Builder object to create a new Sender instance.
      */
     static LineSenderBuilder builder(Transport transport) {
-        int protocol = switch (transport) {
-            case HTTP -> LineSenderBuilder.PROTOCOL_HTTP;
-            case TCP -> LineSenderBuilder.PROTOCOL_TCP;
-            case UDP -> LineSenderBuilder.PROTOCOL_UDP;
-            case WEBSOCKET -> LineSenderBuilder.PROTOCOL_WEBSOCKET;
-        };
+        int protocol;
+        switch (transport) {
+            case HTTP:
+                protocol = LineSenderBuilder.PROTOCOL_HTTP;
+                break;
+            case TCP:
+                protocol = LineSenderBuilder.PROTOCOL_TCP;
+                break;
+            case UDP:
+                protocol = LineSenderBuilder.PROTOCOL_UDP;
+                break;
+            case WEBSOCKET:
+                protocol = LineSenderBuilder.PROTOCOL_WEBSOCKET;
+                break;
+            default:
+                throw new IllegalArgumentException("unknown transport: " + transport);
+        }
         return new LineSenderBuilder(protocol);
     }
 
@@ -927,13 +938,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 channel = tlsChannel;
             }
             try {
-                sender = switch (protocolVersion) {
-                    case PROTOCOL_VERSION_V1 -> new LineTcpSenderV1(channel, bufferCapacity, maxNameLength);
-                    case PROTOCOL_VERSION_V2 -> new LineTcpSenderV2(channel, bufferCapacity, maxNameLength);
-                    case PROTOCOL_VERSION_V3 -> new LineTcpSenderV3(channel, bufferCapacity, maxNameLength);
-                    default ->
-                            throw new LineSenderException("unknown protocol version [version=").put(protocolVersion).put("]");
-                };
+                switch (protocolVersion) {
+                    case PROTOCOL_VERSION_V1:
+                        sender = new LineTcpSenderV1(channel, bufferCapacity, maxNameLength);
+                        break;
+                    case PROTOCOL_VERSION_V2:
+                        sender = new LineTcpSenderV2(channel, bufferCapacity, maxNameLength);
+                        break;
+                    case PROTOCOL_VERSION_V3:
+                        sender = new LineTcpSenderV3(channel, bufferCapacity, maxNameLength);
+                        break;
+                    default:
+                        throw new LineSenderException("unknown protocol version [version=").put(protocolVersion).put("]");
+                }
             } catch (Throwable t) {
                 channel.close();
                 throw rethrow(t);
@@ -1541,14 +1558,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("invalid configuration string: ").put(sink);
             }
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
+                String protocolName;
+                switch (protocol) {
+                    case PROTOCOL_HTTP:
+                        protocolName = "http";
+                        break;
+                    case PROTOCOL_UDP:
+                        protocolName = "udp";
+                        break;
+                    case PROTOCOL_WEBSOCKET:
+                        protocolName = "websocket";
+                        break;
+                    default:
+                        protocolName = "tcp";
+                        break;
+                }
                 throw new LineSenderException("protocol was already configured ")
                         .put("[protocol=")
-                        .put(switch (protocol) {
-                            case PROTOCOL_HTTP -> "http";
-                            case PROTOCOL_UDP -> "udp";
-                            case PROTOCOL_WEBSOCKET -> "websocket";
-                            default -> "tcp";
-                        }).put("]");
+                        .put(protocolName).put("]");
             }
             if (Chars.equals("http", sink)) {
                 if (tlsEnabled) {

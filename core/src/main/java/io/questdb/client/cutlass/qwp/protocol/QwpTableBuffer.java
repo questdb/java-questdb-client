@@ -416,16 +416,34 @@ public class QwpTableBuffer implements QuietCloseable {
      * @see QwpConstants#getFixedTypeSize(byte) for wire-format sizes
      */
     static int elementSizeInBuffer(byte type) {
-        return switch (type) {
-            case TYPE_BOOLEAN, TYPE_BYTE -> 1;
-            case TYPE_SHORT, TYPE_CHAR -> 2;
-            case TYPE_INT, TYPE_SYMBOL, TYPE_FLOAT -> 4;
-            case TYPE_GEOHASH, TYPE_LONG, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS,
-                 TYPE_DATE, TYPE_DECIMAL64, TYPE_DOUBLE -> 8;
-            case TYPE_UUID, TYPE_DECIMAL128 -> 16;
-            case TYPE_LONG256, TYPE_DECIMAL256 -> 32;
-            default -> 0;
-        };
+        switch (type) {
+            case TYPE_BOOLEAN:
+            case TYPE_BYTE:
+                return 1;
+            case TYPE_SHORT:
+            case TYPE_CHAR:
+                return 2;
+            case TYPE_INT:
+            case TYPE_SYMBOL:
+            case TYPE_FLOAT:
+                return 4;
+            case TYPE_GEOHASH:
+            case TYPE_LONG:
+            case TYPE_TIMESTAMP:
+            case TYPE_TIMESTAMP_NANOS:
+            case TYPE_DATE:
+            case TYPE_DECIMAL64:
+            case TYPE_DOUBLE:
+                return 8;
+            case TYPE_UUID:
+            case TYPE_DECIMAL128:
+                return 16;
+            case TYPE_LONG256:
+            case TYPE_DECIMAL256:
+                return 32;
+            default:
+                return 0;
+        }
     }
 
     /**
@@ -949,42 +967,68 @@ public class QwpTableBuffer implements QuietCloseable {
             } else {
                 // For non-nullable columns, store a sentinel/default value
                 switch (type) {
-                    case TYPE_BOOLEAN, TYPE_BYTE -> dataBuffer.putByte((byte) 0);
-                    case TYPE_SHORT, TYPE_CHAR -> dataBuffer.putShort((short) 0);
-                    case TYPE_INT -> dataBuffer.putInt(0);
-                    case TYPE_GEOHASH -> dataBuffer.putLong(-1L);
-                    case TYPE_LONG, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS, TYPE_DATE ->
-                            dataBuffer.putLong(Long.MIN_VALUE);
-                    case TYPE_FLOAT -> dataBuffer.putFloat(Float.NaN);
-                    case TYPE_DOUBLE -> dataBuffer.putDouble(Double.NaN);
-                    case TYPE_STRING, TYPE_VARCHAR -> stringOffsets.putInt((int) stringData.getAppendOffset());
-                    case TYPE_SYMBOL -> dataBuffer.putInt(-1);
-                    case TYPE_UUID -> {
+                    case TYPE_BOOLEAN:
+                    case TYPE_BYTE:
+                        dataBuffer.putByte((byte) 0);
+                        break;
+                    case TYPE_SHORT:
+                    case TYPE_CHAR:
+                        dataBuffer.putShort((short) 0);
+                        break;
+                    case TYPE_INT:
+                        dataBuffer.putInt(0);
+                        break;
+                    case TYPE_GEOHASH:
+                        dataBuffer.putLong(-1L);
+                        break;
+                    case TYPE_LONG:
+                    case TYPE_TIMESTAMP:
+                    case TYPE_TIMESTAMP_NANOS:
+                    case TYPE_DATE:
+                        dataBuffer.putLong(Long.MIN_VALUE);
+                        break;
+                    case TYPE_FLOAT:
+                        dataBuffer.putFloat(Float.NaN);
+                        break;
+                    case TYPE_DOUBLE:
+                        dataBuffer.putDouble(Double.NaN);
+                        break;
+                    case TYPE_STRING:
+                    case TYPE_VARCHAR:
+                        stringOffsets.putInt((int) stringData.getAppendOffset());
+                        break;
+                    case TYPE_SYMBOL:
+                        dataBuffer.putInt(-1);
+                        break;
+                    case TYPE_UUID:
                         dataBuffer.putLong(Long.MIN_VALUE);
                         dataBuffer.putLong(Long.MIN_VALUE);
-                    }
-                    case TYPE_LONG256 -> {
+                        break;
+                    case TYPE_LONG256:
                         dataBuffer.putLong(Long.MIN_VALUE);
                         dataBuffer.putLong(Long.MIN_VALUE);
                         dataBuffer.putLong(Long.MIN_VALUE);
                         dataBuffer.putLong(Long.MIN_VALUE);
-                    }
-                    case TYPE_DECIMAL64 -> dataBuffer.putLong(Decimals.DECIMAL64_NULL);
-                    case TYPE_DECIMAL128 -> {
+                        break;
+                    case TYPE_DECIMAL64:
+                        dataBuffer.putLong(Decimals.DECIMAL64_NULL);
+                        break;
+                    case TYPE_DECIMAL128:
                         dataBuffer.putLong(Decimals.DECIMAL128_HI_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL128_LO_NULL);
-                    }
-                    case TYPE_DECIMAL256 -> {
+                        break;
+                    case TYPE_DECIMAL256:
                         dataBuffer.putLong(Decimals.DECIMAL256_HH_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL256_HL_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL256_LH_NULL);
                         dataBuffer.putLong(Decimals.DECIMAL256_LL_NULL);
-                    }
-                    case TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY -> {
+                        break;
+                    case TYPE_DOUBLE_ARRAY:
+                    case TYPE_LONG_ARRAY:
                         ensureArrayCapacity(1, 0);
                         arrayDims[valueCount] = 1;
                         arrayShapes[arrayShapeOffset++] = 0;
-                    }
+                        break;
                 }
                 valueCount++;
             }
@@ -1314,11 +1358,20 @@ public class QwpTableBuffer implements QuietCloseable {
             }
 
             switch (type) {
-                case TYPE_STRING, TYPE_VARCHAR -> retainStringValue(valueCountBefore);
-                case TYPE_SYMBOL -> retainSymbolValue(valueCountBefore);
-                case TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY ->
-                        retainArrayValue(valueCountBefore, arrayShapeOffsetBefore, arrayDataOffsetBefore);
-                default -> retainFixedWidthValue(valueCountBefore);
+                case TYPE_STRING:
+                case TYPE_VARCHAR:
+                    retainStringValue(valueCountBefore);
+                    break;
+                case TYPE_SYMBOL:
+                    retainSymbolValue(valueCountBefore);
+                    break;
+                case TYPE_DOUBLE_ARRAY:
+                case TYPE_LONG_ARRAY:
+                    retainArrayValue(valueCountBefore, arrayShapeOffsetBefore, arrayDataOffsetBefore);
+                    break;
+                default:
+                    retainFixedWidthValue(valueCountBefore);
+                    break;
             }
 
             size = 1;

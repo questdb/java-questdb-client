@@ -1262,16 +1262,24 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private long toMicros(long value, ChronoUnit unit) {
-        return switch (unit) {
-            case NANOS -> value / 1000L;
-            case MICROS -> value;
-            case MILLIS -> value * 1000L;
-            case SECONDS -> value * 1_000_000L;
-            case MINUTES -> value * 60_000_000L;
-            case HOURS -> value * 3_600_000_000L;
-            case DAYS -> value * 86_400_000_000L;
-            default -> throw new LineSenderException("Unsupported time unit: " + unit);
-        };
+        switch (unit) {
+            case NANOS:
+                return value / 1000L;
+            case MICROS:
+                return value;
+            case MILLIS:
+                return value * 1000L;
+            case SECONDS:
+                return value * 1_000_000L;
+            case MINUTES:
+                return value * 60_000_000L;
+            case HOURS:
+                return value * 3_600_000_000L;
+            case DAYS:
+                return value * 86_400_000_000L;
+            default:
+                throw new LineSenderException("Unsupported time unit: " + unit);
+        }
     }
 
     private void validateTableName(CharSequence name) {
@@ -1336,9 +1344,12 @@ public class QwpWebSocketSender implements Sender {
         throw timeout;
     }
 
-    private record AckFrameHandler(
-            QwpWebSocketSender sender
-    ) implements WebSocketFrameHandler {
+    private static class AckFrameHandler implements WebSocketFrameHandler {
+        private final QwpWebSocketSender sender;
+
+        AckFrameHandler(QwpWebSocketSender sender) {
+            this.sender = sender;
+        }
 
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {

@@ -73,10 +73,13 @@ class QwpColumnWriter {
             case TYPE_CHAR:
                 buffer.putBlockOfBytes(dataAddr, (long) valueCount * 2);
                 break;
-            case TYPE_INT, TYPE_FLOAT:
+            case TYPE_INT:
+            case TYPE_FLOAT:
                 buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
                 break;
-            case TYPE_LONG, TYPE_DATE, TYPE_DOUBLE:
+            case TYPE_LONG:
+            case TYPE_DATE:
+            case TYPE_DOUBLE:
                 buffer.putBlockOfBytes(dataAddr, (long) valueCount * 8);
                 break;
             case TYPE_TIMESTAMP:

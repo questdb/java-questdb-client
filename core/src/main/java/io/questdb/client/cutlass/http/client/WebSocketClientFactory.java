@@ -86,12 +86,17 @@ public class WebSocketClientFactory {
      * @return a new platform-specific WebSocket client
      */
     public static WebSocketClient newInstance(HttpClientConfiguration configuration, SocketFactory socketFactory) {
-        return switch (Os.type) {
-            case Os.LINUX -> new WebSocketClientLinux(configuration, socketFactory);
-            case Os.DARWIN, Os.FREEBSD -> new WebSocketClientOsx(configuration, socketFactory);
-            case Os.WINDOWS -> new WebSocketClientWindows(configuration, socketFactory);
-            default -> throw new UnsupportedOperationException("Unsupported platform: " + Os.type);
-        };
+        switch (Os.type) {
+            case Os.LINUX:
+                return new WebSocketClientLinux(configuration, socketFactory);
+            case Os.DARWIN:
+            case Os.FREEBSD:
+                return new WebSocketClientOsx(configuration, socketFactory);
+            case Os.WINDOWS:
+                return new WebSocketClientWindows(configuration, socketFactory);
+            default:
+                throw new UnsupportedOperationException("Unsupported platform: " + Os.type);
+        }
     }
 
     /**
