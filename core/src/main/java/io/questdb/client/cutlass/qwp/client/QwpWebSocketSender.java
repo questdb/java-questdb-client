@@ -88,10 +88,10 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  */
 public class QwpWebSocketSender implements Sender {
 
-    public static final int DEFAULT_AUTO_FLUSH_BYTES = 1024 * 1024; // 1MB
+    public static final int DEFAULT_AUTO_FLUSH_BYTES = 128 * 1024; // 128KB
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
-    public static final int DEFAULT_AUTO_FLUSH_ROWS = 500;
-    public static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = InFlightWindow.DEFAULT_WINDOW_SIZE; // 8
+    public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
+    public static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MAX_NAME_LENGTH = 127;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
@@ -251,7 +251,12 @@ public class QwpWebSocketSender implements Sender {
                 1,   // window=1 for sync behavior
                 authorizationHeader
         );
-        sender.ensureConnected();
+        try {
+            sender.ensureConnected();
+        } catch (Throwable t) {
+            sender.close();
+            throw t;
+        }
         return sender;
     }
 
@@ -318,7 +323,12 @@ public class QwpWebSocketSender implements Sender {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsEnabled, DEFAULT_BUFFER_SIZE, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader
         );
-        sender.ensureConnected();
+        try {
+            sender.ensureConnected();
+        } catch (Throwable t) {
+            sender.close();
+            throw t;
+        }
         return sender;
     }
 

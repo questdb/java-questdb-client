@@ -207,8 +207,7 @@ public class QwpAllocationTestClient {
             case PROTOCOL_QWP_WEBSOCKET:
                 Sender.LineSenderBuilder wsBuilder = Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(host)
-                        .port(port)
-                        .asyncMode(true);
+                        .port(port);
                 if (batchSize > 0) wsBuilder.autoFlushRows(batchSize);
                 if (flushBytes > 0) wsBuilder.autoFlushBytes(flushBytes);
                 if (flushIntervalMs > 0) wsBuilder.autoFlushIntervalMillis((int) flushIntervalMs);

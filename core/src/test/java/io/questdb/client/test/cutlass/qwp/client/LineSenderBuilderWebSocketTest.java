@@ -77,35 +77,9 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testAsyncModeCanBeSetMultipleTimes() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .asyncMode(true)
-                .asyncMode(false);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testAsyncModeDisabled() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .asyncMode(false);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testAsyncModeEnabled() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .asyncMode(true);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
     public void testAsyncModeWithAllOptions() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
-                .asyncMode(true)
                 .autoFlushRows(500)
                 .autoFlushBytes(512 * 1024)
                 .autoFlushIntervalMillis(50)
@@ -322,7 +296,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     public void testFullAsyncConfiguration() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
-                .asyncMode(true)
                 .autoFlushRows(1000)
                 .autoFlushBytes(1024 * 1024)
                 .autoFlushIntervalMillis(100)
@@ -336,7 +309,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .address(LOCALHOST)
                 .enableTls()
                 .advancedTls().disableCertificateValidation()
-                .asyncMode(true)
                 .autoFlushRows(1000)
                 .autoFlushBytes(1024 * 1024)
                 .inFlightWindowSize(16);
@@ -374,7 +346,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertThrows("already configured",
                 () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
-                        .asyncMode(true)
                         .inFlightWindowSize(8)
                         .inFlightWindowSize(16));
     }
@@ -384,8 +355,15 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertThrows("must be positive",
                 () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
-                        .asyncMode(true)
                         .inFlightWindowSize(-1));
+    }
+
+    @Test
+    public void testInFlightWindowSizeOne_syncMode() {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .inFlightWindowSize(1);
+        Assert.assertNotNull(builder);
     }
 
     @Test
@@ -393,26 +371,15 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertThrows("must be positive",
                 () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
-                        .asyncMode(true)
                         .inFlightWindowSize(0));
     }
 
     @Test
-    public void testInFlightWindowSize_withAsyncMode() {
+    public void testInFlightWindowSize_customValue() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
-                .asyncMode(true)
                 .inFlightWindowSize(16);
         Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testInFlightWindowSize_withoutAsyncMode_fails() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .inFlightWindowSize(16),
-                "requires async mode");
     }
 
     @Test
@@ -545,17 +512,8 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testSyncModeDoesNotAllowInFlightWindowSize() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .asyncMode(false)
-                        .inFlightWindowSize(16),
-                "requires async mode");
-    }
-
-    @Test
-    public void testSyncModeIsDefault() {
+    public void testDefaultIsAsync() {
+        // Default in-flight window size is 128 (async)
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST);
         Assert.assertNotNull(builder);
@@ -611,6 +569,37 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .address(LOCALHOST)
                 .httpUsernamePassword("user", "pass");
         Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_inFlightWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertBadConfig("ws::addr=localhost:" + port + ";in_flight_window=64;", "connect", "Failed");
+        });
+    }
+
+    @Test
+    public void testWsConfigString_inFlightWindowDoubleSet_fails() {
+        assertBadConfig("ws::addr=localhost:9000;in_flight_window=64;in_flight_window=128;", "already configured");
+    }
+
+    @Test
+    public void testWsConfigString_inFlightWindowInvalid_fails() {
+        assertBadConfig("ws::addr=localhost:9000;in_flight_window=0;", "must be positive");
+    }
+
+    @Test
+    public void testWsConfigString_inFlightWindowNotSupportedForHttp_fails() {
+        assertBadConfig("http::addr=localhost:9000;in_flight_window=64;", "only supported for WebSocket");
+    }
+
+    @Test
+    public void testWsConfigString_inFlightWindowSync() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertBadConfig("ws::addr=localhost:" + port + ";in_flight_window=1;", "connect", "Failed");
+        });
     }
 
     @Test

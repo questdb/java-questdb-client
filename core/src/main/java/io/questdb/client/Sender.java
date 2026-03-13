@@ -536,7 +536,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
-        private static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 8;
+        private static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128;
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
         private static final int DEFAULT_MAX_BACKOFF_MILLIS = 1_000;
         private static final int DEFAULT_MAX_DATAGRAM_SIZE = 1400;
@@ -546,9 +546,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_TCP_PORT = 9009;
         private static final int DEFAULT_UDP_PORT = 9007;
         private static final int DEFAULT_WEBSOCKET_PORT = 9000;
-        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 1024 * 1024; // 1MB
+        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 128 * 1024; // 128KB
         private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
-        private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 500;
+        private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 1_000;
         private static final int MIN_BUFFER_SIZE = AuthUtils.CHALLENGE_LEN + 1; // challenge size + 1;
         // The PARAMETER_NOT_SET_EXPLICITLY constant is used to detect if a parameter was set explicitly in configuration parameters
         // where it matters. This is needed to detect invalid combinations of parameters. Why?
@@ -561,7 +561,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_WEBSOCKET = 2;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
-        private boolean asyncMode = false;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
@@ -701,20 +700,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Enable asynchronous mode for WebSocket transport.
+         * @deprecated Async mode is now derived from {@link #inFlightWindowSize(int)}.
+         * Window size 1 implies synchronous mode, greater than 1 implies asynchronous mode.
+         * The default window size is 128 (asynchronous). Call {@code inFlightWindowSize(1)}
+         * for synchronous behavior.
          * <br>
-         * In async mode, rows are batched and sent asynchronously with flow control.
-         * This provides higher throughput at the cost of more complex error handling.
-         * <br>
-         * This is only used when communicating over WebSocket transport.
-         * <br>
-         * Default is synchronous mode (false).
+         * This method is a no-op and will be removed in a future release.
          *
-         * @param enabled whether to enable async mode
+         * @param enabled ignored
          * @return this instance for method chaining
          */
+        @Deprecated
         public LineSenderBuilder asyncMode(boolean enabled) {
-            this.asyncMode = enabled;
             return this;
         }
 
@@ -723,7 +720,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * This is only used when communicating over WebSocket transport.
          * <br>
-         * Default value is 1MB.
+         * Default value is 128KB.
          *
          * @param bytes maximum bytes per batch
          * @return this instance for method chaining
@@ -888,28 +885,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
                 String wsAuthHeader = buildWebSocketAuthHeader();
 
-                if (asyncMode) {
-                    return QwpWebSocketSender.connectAsync(
-                            hosts.getQuick(0),
-                            ports.getQuick(0),
-                            tlsEnabled,
-                            actualAutoFlushRows,
-                            actualAutoFlushBytes,
-                            actualAutoFlushIntervalNanos,
-                            actualInFlightWindowSize,
-                            wsAuthHeader
-                    );
-                } else {
-                    return QwpWebSocketSender.connect(
-                            hosts.getQuick(0),
-                            ports.getQuick(0),
-                            tlsEnabled,
-                            actualAutoFlushRows,
-                            actualAutoFlushBytes,
-                            actualAutoFlushIntervalNanos,
-                            wsAuthHeader
-                    );
-                }
+                return QwpWebSocketSender.connectAsync(
+                        hosts.getQuick(0),
+                        ports.getQuick(0),
+                        tlsEnabled,
+                        actualAutoFlushRows,
+                        actualAutoFlushBytes,
+                        actualAutoFlushIntervalNanos,
+                        actualInFlightWindowSize,
+                        wsAuthHeader
+                );
             }
 
             if (protocol == PROTOCOL_UDP) {
@@ -1177,9 +1162,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Set the maximum number of batches that can be in-flight awaiting server acknowledgment.
          * <br>
-         * This is only used when communicating over WebSocket transport with async mode enabled.
+         * This is only used when communicating over WebSocket transport.
          * <br>
-         * Default value is 8.
+         * A value of 1 means synchronous mode: each batch waits for an ACK before sending the next one.
+         * A value greater than 1 enables asynchronous mode with pipelined sends and a background I/O thread.
+         * <br>
+         * Default value is 128 (asynchronous).
          *
          * @param size maximum number of in-flight batches
          * @return this instance for method chaining
@@ -1774,6 +1762,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         int protocolVersion = parseIntValue(sink, "protocol_version");
                         protocolVersion(protocolVersion);
                     }
+                } else if (Chars.equals("in_flight_window", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("in_flight_window is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "in_flight_window");
+                    int windowSize = parseIntValue(sink, "in_flight_window");
+                    inFlightWindowSize(windowSize);
                 } else if (Chars.equals("max_datagram_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");
                     int mds = parseIntValue(sink, "max_datagram_size");
@@ -1929,9 +1924,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("protocol version is not supported for UDP transport");
                 }
-                if (asyncMode) {
-                    throw new LineSenderException("async mode is not supported for UDP transport");
-                }
                 if (inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("in-flight window size is not supported for UDP transport");
                 }
@@ -1956,9 +1948,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (httpToken != null && (username != null || password != null)) {
                     throw new LineSenderException("cannot use both token and username/password authentication");
-                }
-                if (inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY && !asyncMode) {
-                    throw new LineSenderException("in-flight window size requires async mode");
                 }
                 if (httpPath != null) {
                     throw new LineSenderException("HTTP path is not supported for WebSocket protocol");

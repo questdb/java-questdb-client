@@ -189,8 +189,7 @@ public class StacBenchmarkClient {
             case PROTOCOL_QWP_WEBSOCKET:
                 Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(host)
-                        .port(port)
-                        .asyncMode(true);
+                        .port(port);
                 if (batchSize > 0) b.autoFlushRows(batchSize);
                 if (flushBytes > 0) b.autoFlushBytes(flushBytes);
                 if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
