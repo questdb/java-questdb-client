@@ -554,17 +554,31 @@ public class QwpUdpSender implements Sender {
             return 0;
         }
 
-        return switch (col.getType()) {
-            case TYPE_BOOLEAN -> packedBytes(valueCountAfter) - packedBytes(valueCountBefore);
-            case TYPE_DECIMAL64 -> 8;
-            case TYPE_DECIMAL128 -> 16;
-            case TYPE_DECIMAL256 -> 32;
-            case TYPE_DOUBLE, TYPE_LONG, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS -> 8;
-            case TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY -> estimateArrayPayloadBytes(col, state);
-            case TYPE_STRING, TYPE_VARCHAR -> 4L + (col.getStringDataSize() - state.stringDataSizeBefore);
-            case TYPE_SYMBOL -> estimateSymbolPayloadDelta(col, state);
-            default -> throw new LineSenderException("unsupported in-progress column type: " + col.getType());
-        };
+        switch (col.getType()) {
+            case TYPE_BOOLEAN:
+                return packedBytes(valueCountAfter) - packedBytes(valueCountBefore);
+            case TYPE_DECIMAL64:
+                return 8;
+            case TYPE_DECIMAL128:
+                return 16;
+            case TYPE_DECIMAL256:
+                return 32;
+            case TYPE_DOUBLE:
+            case TYPE_LONG:
+            case TYPE_TIMESTAMP:
+            case TYPE_TIMESTAMP_NANOS:
+                return 8;
+            case TYPE_DOUBLE_ARRAY:
+            case TYPE_LONG_ARRAY:
+                return estimateArrayPayloadBytes(col, state);
+            case TYPE_STRING:
+            case TYPE_VARCHAR:
+                return 4L + (col.getStringDataSize() - state.stringDataSizeBefore);
+            case TYPE_SYMBOL:
+                return estimateSymbolPayloadDelta(col, state);
+            default:
+                throw new LineSenderException("unsupported in-progress column type: " + col.getType());
+        }
     }
 
     private static long estimateSymbolPayloadDelta(QwpTableBuffer.ColumnBuffer col, InProgressColumnState state) {
@@ -602,22 +616,44 @@ public class QwpUdpSender implements Sender {
     }
 
     private static long nonNullablePaddingCost(byte type, int valuesBefore, int missing) {
-        return switch (type) {
-            case TYPE_BOOLEAN -> packedBytes(valuesBefore + missing) - packedBytes(valuesBefore);
-            case TYPE_BYTE -> missing;
-            case TYPE_SHORT, TYPE_CHAR -> (long) missing * 2;
-            case TYPE_INT, TYPE_FLOAT -> (long) missing * 4;
-            case TYPE_LONG, TYPE_DOUBLE, TYPE_DATE, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS -> (long) missing * 8;
-            case TYPE_UUID -> (long) missing * 16;
-            case TYPE_LONG256 -> (long) missing * 32;
-            case TYPE_DECIMAL64 -> (long) missing * 8;
-            case TYPE_DECIMAL128 -> (long) missing * 16;
-            case TYPE_DECIMAL256 -> (long) missing * 32;
-            case TYPE_STRING, TYPE_VARCHAR -> (long) missing * 4;
-            case TYPE_DOUBLE_ARRAY, TYPE_LONG_ARRAY -> (long) missing * 5;
-            case TYPE_SYMBOL -> throw new IllegalStateException("symbol columns must be nullable");
-            default -> 0;
-        };
+        switch (type) {
+            case TYPE_BOOLEAN:
+                return packedBytes(valuesBefore + missing) - packedBytes(valuesBefore);
+            case TYPE_BYTE:
+                return missing;
+            case TYPE_SHORT:
+            case TYPE_CHAR:
+                return (long) missing * 2;
+            case TYPE_INT:
+            case TYPE_FLOAT:
+                return (long) missing * 4;
+            case TYPE_LONG:
+            case TYPE_DOUBLE:
+            case TYPE_DATE:
+            case TYPE_TIMESTAMP:
+            case TYPE_TIMESTAMP_NANOS:
+                return (long) missing * 8;
+            case TYPE_UUID:
+                return (long) missing * 16;
+            case TYPE_LONG256:
+                return (long) missing * 32;
+            case TYPE_DECIMAL64:
+                return (long) missing * 8;
+            case TYPE_DECIMAL128:
+                return (long) missing * 16;
+            case TYPE_DECIMAL256:
+                return (long) missing * 32;
+            case TYPE_STRING:
+            case TYPE_VARCHAR:
+                return (long) missing * 4;
+            case TYPE_DOUBLE_ARRAY:
+            case TYPE_LONG_ARRAY:
+                return (long) missing * 5;
+            case TYPE_SYMBOL:
+                throw new IllegalStateException("symbol columns must be nullable");
+            default:
+                return 0;
+        }
     }
 
     private static int packedBytes(int valueCount) {
@@ -668,20 +704,20 @@ public class QwpUdpSender implements Sender {
     }
 
     private void appendDoubleArrayValue(QwpTableBuffer.ColumnBuffer column, Object value) {
-        if (value instanceof double[] values) {
-            column.addDoubleArray(values);
+        if (value instanceof double[]) {
+            column.addDoubleArray((double[]) value);
             return;
         }
-        if (value instanceof double[][] values) {
-            column.addDoubleArray(values);
+        if (value instanceof double[][]) {
+            column.addDoubleArray((double[][]) value);
             return;
         }
-        if (value instanceof double[][][] values) {
-            column.addDoubleArray(values);
+        if (value instanceof double[][][]) {
+            column.addDoubleArray((double[][][]) value);
             return;
         }
-        if (value instanceof DoubleArray values) {
-            column.addDoubleArray(values);
+        if (value instanceof DoubleArray) {
+            column.addDoubleArray((DoubleArray) value);
             return;
         }
         throw new LineSenderException("unsupported double array type");
@@ -699,20 +735,20 @@ public class QwpUdpSender implements Sender {
     }
 
     private void appendLongArrayValue(QwpTableBuffer.ColumnBuffer column, Object value) {
-        if (value instanceof long[] values) {
-            column.addLongArray(values);
+        if (value instanceof long[]) {
+            column.addLongArray((long[]) value);
             return;
         }
-        if (value instanceof long[][] values) {
-            column.addLongArray(values);
+        if (value instanceof long[][]) {
+            column.addLongArray((long[][]) value);
             return;
         }
-        if (value instanceof long[][][] values) {
-            column.addLongArray(values);
+        if (value instanceof long[][][]) {
+            column.addLongArray((long[][][]) value);
             return;
         }
-        if (value instanceof LongArray values) {
-            column.addLongArray(values);
+        if (value instanceof LongArray) {
+            column.addLongArray((LongArray) value);
             return;
         }
         throw new LineSenderException("unsupported long array type");
@@ -1243,16 +1279,24 @@ public class QwpUdpSender implements Sender {
     }
 
     private long toMicros(long value, ChronoUnit unit) {
-        return switch (unit) {
-            case NANOS -> value / 1000L;
-            case MICROS -> value;
-            case MILLIS -> value * 1000L;
-            case SECONDS -> value * 1_000_000L;
-            case MINUTES -> value * 60_000_000L;
-            case HOURS -> value * 3_600_000_000L;
-            case DAYS -> value * 86_400_000_000L;
-            default -> throw new LineSenderException("Unsupported time unit: " + unit);
-        };
+        switch (unit) {
+            case NANOS:
+                return value / 1000L;
+            case MICROS:
+                return value;
+            case MILLIS:
+                return value * 1000L;
+            case SECONDS:
+                return value * 1_000_000L;
+            case MINUTES:
+                return value * 60_000_000L;
+            case HOURS:
+                return value * 3_600_000_000L;
+            case DAYS:
+                return value * 86_400_000_000L;
+            default:
+                throw new LineSenderException("Unsupported time unit: " + unit);
+        }
     }
 
     /**

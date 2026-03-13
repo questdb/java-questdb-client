@@ -245,15 +245,17 @@ public class TestWebSocketServer implements Closeable {
                 }
 
                 switch (opcode) {
-                    case WebSocketOpcode.BINARY -> handler.onBinaryMessage(this, payload);
-                    case WebSocketOpcode.PING -> {
+                    case WebSocketOpcode.BINARY:
+                        handler.onBinaryMessage(this, payload);
+                        break;
+                    case WebSocketOpcode.PING:
                         try {
                             writeFrame(WebSocketOpcode.PONG, payload, payload.length);
                         } catch (IOException e) {
                             LOG.error("Failed to send pong", e);
                         }
-                    }
-                    case WebSocketOpcode.CLOSE -> {
+                        break;
+                    case WebSocketOpcode.CLOSE: {
                         int code = WebSocketCloseCode.NORMAL_CLOSURE;
                         if (payload.length >= 2) {
                             code = ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
@@ -265,6 +267,7 @@ public class TestWebSocketServer implements Closeable {
                         }
                         ClientHandler.this.running.set(false);
                         isClosed = true;
+                        break;
                     }
                 }
             }

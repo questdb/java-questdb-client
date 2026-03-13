@@ -270,17 +270,35 @@ public final class QwpConstants {
      */
     public static int getFixedTypeSize(byte typeCode) {
         int code = typeCode & TYPE_MASK;
-        return switch (code) {
-            case TYPE_BOOLEAN -> 0; // Special: bit-packed
-            case TYPE_BYTE -> 1;
-            case TYPE_SHORT, TYPE_CHAR -> 2;
-            case TYPE_INT, TYPE_FLOAT -> 4;
-            case TYPE_LONG, TYPE_DOUBLE, TYPE_TIMESTAMP, TYPE_TIMESTAMP_NANOS, TYPE_DATE, TYPE_DECIMAL64 -> 8;
-            case TYPE_UUID, TYPE_DECIMAL128 -> 16;
-            case TYPE_LONG256, TYPE_DECIMAL256 -> 32;
-            case TYPE_GEOHASH -> -1; // Variable width: varint precision + packed values
-            default -> -1; // Variable width
-        };
+        switch (code) {
+            case TYPE_BOOLEAN:
+                return 0; // Special: bit-packed
+            case TYPE_BYTE:
+                return 1;
+            case TYPE_SHORT:
+            case TYPE_CHAR:
+                return 2;
+            case TYPE_INT:
+            case TYPE_FLOAT:
+                return 4;
+            case TYPE_LONG:
+            case TYPE_DOUBLE:
+            case TYPE_TIMESTAMP:
+            case TYPE_TIMESTAMP_NANOS:
+            case TYPE_DATE:
+            case TYPE_DECIMAL64:
+                return 8;
+            case TYPE_UUID:
+            case TYPE_DECIMAL128:
+                return 16;
+            case TYPE_LONG256:
+            case TYPE_DECIMAL256:
+                return 32;
+            case TYPE_GEOHASH:
+                return -1; // Variable width: varint precision + packed values
+            default:
+                return -1; // Variable width
+        }
     }
 
     /**
@@ -292,31 +310,78 @@ public final class QwpConstants {
     public static String getTypeName(byte typeCode) {
         int code = typeCode & TYPE_MASK;
         boolean nullable = (typeCode & TYPE_NULLABLE_FLAG) != 0;
-        String name = switch (code) {
-            case TYPE_BOOLEAN -> "BOOLEAN";
-            case TYPE_BYTE -> "BYTE";
-            case TYPE_SHORT -> "SHORT";
-            case TYPE_CHAR -> "CHAR";
-            case TYPE_INT -> "INT";
-            case TYPE_LONG -> "LONG";
-            case TYPE_FLOAT -> "FLOAT";
-            case TYPE_DOUBLE -> "DOUBLE";
-            case TYPE_STRING -> "STRING";
-            case TYPE_SYMBOL -> "SYMBOL";
-            case TYPE_TIMESTAMP -> "TIMESTAMP";
-            case TYPE_TIMESTAMP_NANOS -> "TIMESTAMP_NANOS";
-            case TYPE_DATE -> "DATE";
-            case TYPE_UUID -> "UUID";
-            case TYPE_LONG256 -> "LONG256";
-            case TYPE_GEOHASH -> "GEOHASH";
-            case TYPE_VARCHAR -> "VARCHAR";
-            case TYPE_DOUBLE_ARRAY -> "DOUBLE_ARRAY";
-            case TYPE_LONG_ARRAY -> "LONG_ARRAY";
-            case TYPE_DECIMAL64 -> "DECIMAL64";
-            case TYPE_DECIMAL128 -> "DECIMAL128";
-            case TYPE_DECIMAL256 -> "DECIMAL256";
-            default -> "UNKNOWN(" + code + ")";
-        };
+        String name;
+        switch (code) {
+            case TYPE_BOOLEAN:
+                name = "BOOLEAN";
+                break;
+            case TYPE_BYTE:
+                name = "BYTE";
+                break;
+            case TYPE_SHORT:
+                name = "SHORT";
+                break;
+            case TYPE_CHAR:
+                name = "CHAR";
+                break;
+            case TYPE_INT:
+                name = "INT";
+                break;
+            case TYPE_LONG:
+                name = "LONG";
+                break;
+            case TYPE_FLOAT:
+                name = "FLOAT";
+                break;
+            case TYPE_DOUBLE:
+                name = "DOUBLE";
+                break;
+            case TYPE_STRING:
+                name = "STRING";
+                break;
+            case TYPE_SYMBOL:
+                name = "SYMBOL";
+                break;
+            case TYPE_TIMESTAMP:
+                name = "TIMESTAMP";
+                break;
+            case TYPE_TIMESTAMP_NANOS:
+                name = "TIMESTAMP_NANOS";
+                break;
+            case TYPE_DATE:
+                name = "DATE";
+                break;
+            case TYPE_UUID:
+                name = "UUID";
+                break;
+            case TYPE_LONG256:
+                name = "LONG256";
+                break;
+            case TYPE_GEOHASH:
+                name = "GEOHASH";
+                break;
+            case TYPE_VARCHAR:
+                name = "VARCHAR";
+                break;
+            case TYPE_DOUBLE_ARRAY:
+                name = "DOUBLE_ARRAY";
+                break;
+            case TYPE_LONG_ARRAY:
+                name = "LONG_ARRAY";
+                break;
+            case TYPE_DECIMAL64:
+                name = "DECIMAL64";
+                break;
+            case TYPE_DECIMAL128:
+                name = "DECIMAL128";
+                break;
+            case TYPE_DECIMAL256:
+                name = "DECIMAL256";
+                break;
+            default:
+                name = "UNKNOWN(" + code + ")";
+                break;
+        }
         return nullable ? name + "?" : name;
     }
 
