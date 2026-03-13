@@ -64,6 +64,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class WebSocketSendQueue implements QuietCloseable {
 
+    private static final int DRAIN_SPIN_TRIES = 16;
     public static final long DEFAULT_ENQUEUE_TIMEOUT_MS = 30_000;
     public static final long DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
     private static final Logger LOG = LoggerFactory.getLogger(WebSocketSendQueue.class);
@@ -264,7 +265,6 @@ public class WebSocketSendQueue implements QuietCloseable {
                 }
             }
         }
-
         LOG.debug("Enqueued batch [id={}, bytes={}, rows={}]", buffer.getBatchId(), buffer.getBufferPos(), buffer.getRowCount());
         return true;
     }
@@ -282,7 +282,7 @@ public class WebSocketSendQueue implements QuietCloseable {
 
         long startTime = System.currentTimeMillis();
 
-        // Wait under lock - I/O thread will notify when processingCount decrements
+        // Wait under lock until the queue becomes empty and no batch is being sent.
         synchronized (processingLock) {
             while (running) {
                 // Atomically check: queue empty AND not processing
@@ -290,17 +290,17 @@ public class WebSocketSendQueue implements QuietCloseable {
                     break; // All done
                 }
 
+                long remaining = enqueueTimeoutMs - (System.currentTimeMillis() - startTime);
+                if (remaining <= 0) {
+                    throw new LineSenderException("Flush timeout after " + enqueueTimeoutMs + "ms, " +
+                            "queue=" + getPendingSize() + ", processing=" + processingCount.get());
+                }
+
                 try {
-                    processingLock.wait(10);
+                    processingLock.wait(remaining);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new LineSenderException("Interrupted while flushing", e);
-                }
-
-                // Check timeout
-                if (System.currentTimeMillis() - startTime > enqueueTimeoutMs) {
-                    throw new LineSenderException("Flush timeout after " + enqueueTimeoutMs + "ms, " +
-                            "queue=" + getPendingSize() + ", processing=" + processingCount.get());
                 }
 
                 // Check for errors
@@ -312,6 +312,19 @@ public class WebSocketSendQueue implements QuietCloseable {
         checkError();
 
         LOG.debug("Flush complete");
+    }
+
+    /**
+     * Waits for all in-flight batches to be acknowledged.
+     */
+    public void awaitPendingAcks() {
+        if (inFlightWindow == null) {
+            return;
+        }
+
+        checkError();
+        inFlightWindow.awaitEmpty();
+        checkError();
     }
 
     /**
@@ -387,6 +400,15 @@ public class WebSocketSendQueue implements QuietCloseable {
         return pendingBuffer == null ? 0 : 1;
     }
 
+    private int idleDuringDrain(int idleCycles) {
+        if (idleCycles < DRAIN_SPIN_TRIES) {
+            Thread.onSpinWait();
+            return idleCycles + 1;
+        }
+        Thread.yield();
+        return DRAIN_SPIN_TRIES;
+    }
+
     /**
      * The main I/O loop that handles both sending batches and receiving ACKs.
      * <p>
@@ -394,20 +416,23 @@ public class WebSocketSendQueue implements QuietCloseable {
      * <ul>
      *   <li>IDLE: block on processingLock.wait() until work arrives</li>
      *   <li>ACTIVE: non-blocking poll queue, send batches, check for ACKs</li>
-     *   <li>DRAINING: no batches but ACKs pending - poll for ACKs with short wait</li>
+     *   <li>DRAINING: no batches but ACKs pending - poll for ACKs with non-blocking backoff</li>
      * </ul>
      */
     private void ioLoop() {
         LOG.info("I/O loop started");
 
         try {
+            int drainIdleCycles = 0;
             while (running || !isPendingEmpty()) {
                 MicrobatchBuffer batch = null;
                 boolean hasInFlight = (inFlightWindow != null && inFlightWindow.getInFlightCount() > 0);
                 IoState state = computeState(hasInFlight);
+                boolean receivedAcks = false;
 
                 switch (state) {
                     case IDLE:
+                        drainIdleCycles = 0;
                         // Nothing to do - wait for work under lock
                         synchronized (processingLock) {
                             // Re-check under lock to avoid missed wakeup
@@ -425,7 +450,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                     case DRAINING:
                         // Try to receive any pending ACKs (non-blocking)
                         if (hasInFlight && client.isConnected()) {
-                            tryReceiveAcks();
+                            receivedAcks = tryReceiveAcks();
                         }
 
                         // Try to dequeue and send a batch
@@ -452,15 +477,16 @@ public class WebSocketSendQueue implements QuietCloseable {
                             }
                         }
 
-                        // In DRAINING state with no work, short wait to avoid busy loop
+                        // In DRAINING state with no work, stay non-blocking and use
+                        // a simple spin/yield backoff.
                         if (state == IoState.DRAINING && batch == null) {
-                            synchronized (processingLock) {
-                                try {
-                                    processingLock.wait(10);
-                                } catch (InterruptedException e) {
-                                    if (!running) return;
-                                }
+                            if (receivedAcks) {
+                                drainIdleCycles = 0;
+                            } else {
+                                drainIdleCycles = idleDuringDrain(drainIdleCycles);
                             }
+                        } else {
+                            drainIdleCycles = 0;
                         }
                         break;
                 }
@@ -553,9 +579,11 @@ public class WebSocketSendQueue implements QuietCloseable {
     /**
      * Tries to receive ACKs from the server (non-blocking).
      */
-    private void tryReceiveAcks() {
+    private boolean tryReceiveAcks() {
+        boolean received = false;
         try {
             while (client.tryReceiveFrame(responseHandler)) {
+                received = true;
                 // Drain all buffered ACKs before returning to the I/O loop.
             }
         } catch (Exception e) {
@@ -564,6 +592,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                 failTransport(new LineSenderException("Error receiving response: " + e.getMessage(), e));
             }
         }
+        return received;
     }
 
     /**
@@ -571,7 +600,7 @@ public class WebSocketSendQueue implements QuietCloseable {
      * <ul>
      *   <li>IDLE: queue empty, no in-flight batches - can block waiting for work</li>
      *   <li>ACTIVE: have batches to send - non-blocking loop</li>
-     *   <li>DRAINING: queue empty but ACKs pending - poll for ACKs, short wait</li>
+     *   <li>DRAINING: queue empty but ACKs pending - poll for ACKs with non-blocking backoff</li>
      * </ul>
      */
     private enum IoState {

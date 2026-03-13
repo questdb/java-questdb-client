@@ -400,8 +400,8 @@ public class QwpWebSocketSender implements Sender {
                     // Wait for all batches to be sent and acknowledged before closing
                     if (sendQueue != null) {
                         sendQueue.flush();
-                    }
-                    if (inFlightWindow != null) {
+                        sendQueue.awaitPendingAcks();
+                    } else if (inFlightWindow != null) {
                         inFlightWindow.awaitEmpty();
                     }
                 } else {
@@ -581,7 +581,11 @@ public class QwpWebSocketSender implements Sender {
             sendQueue.flush();
 
             // Wait for all in-flight batches to be acknowledged by the server
-            inFlightWindow.awaitEmpty();
+            if (sendQueue != null) {
+                sendQueue.awaitPendingAcks();
+            } else {
+                inFlightWindow.awaitEmpty();
+            }
 
             LOG.debug("Flush complete [totalBatches={}, totalBytes={}, totalAcked={}]", sendQueue.getTotalBatchesSent(), sendQueue.getTotalBytesSent(), inFlightWindow.getTotalAcked());
         } else {

@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
@@ -40,6 +41,8 @@ import org.junit.Test;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.*;
@@ -266,6 +269,84 @@ public class WebSocketSendQueueTest {
         });
     }
 
+    @Test
+    public void testAwaitPendingAcksKeepsDrainNonBlocking() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
+            MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
+            CountDownLatch secondBatchSent = new CountDownLatch(1);
+            AtomicBoolean deliverAcks = new AtomicBoolean(false);
+            AtomicInteger tryReceivePolls = new AtomicInteger();
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicReference<Throwable> errorRef = new AtomicReference<>();
+
+            try {
+                client.setSendBehavior((dataPtr, length) -> {
+                    long sent = highestSent.incrementAndGet();
+                    if (sent == 1) {
+                        secondBatchSent.countDown();
+                    }
+                });
+                client.setReceiveBehavior((handler, timeout) -> {
+                    throw new AssertionError("receiveFrame() must not be used while draining ACKs");
+                });
+                client.setTryReceiveBehavior(handler -> {
+                    tryReceivePolls.incrementAndGet();
+                    if (deliverAcks.get()) {
+                        long sent = highestSent.get();
+                        if (sent >= 0 && window.getInFlightCount() > 0) {
+                            emitAck(handler, sent);
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                queue.enqueue(batch0);
+                queue.flush();
+
+                CountDownLatch finished = new CountDownLatch(1);
+                WebSocketSendQueue finalQueue = queue;
+                Thread waiter = new Thread(() -> {
+                    try {
+                        finalQueue.awaitPendingAcks();
+                    } catch (Throwable t) {
+                        errorRef.set(t);
+                    } finally {
+                        finished.countDown();
+                    }
+                });
+                waiter.start();
+
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (tryReceivePolls.get() == 0 && System.nanoTime() < deadline) {
+                    Thread.onSpinWait();
+                }
+                assertTrue("Expected non-blocking ACK polls while draining", tryReceivePolls.get() > 0);
+
+                queue.enqueue(batch1);
+                assertTrue("I/O thread should still send new work while ACK drain is active",
+                        secondBatchSent.await(1, TimeUnit.SECONDS));
+
+                deliverAcks.set(true);
+
+                assertTrue("awaitPendingAcks should complete once ACK arrives",
+                        finished.await(2, TimeUnit.SECONDS));
+                assertNull(errorRef.get());
+                assertEquals(0, window.getInFlightCount());
+            } finally {
+                closeQuietly(queue);
+                batch0.close();
+                batch1.close();
+                client.close();
+            }
+        });
+    }
+
     private static void awaitThreadBlocked(Thread thread) throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
@@ -296,6 +377,18 @@ public class WebSocketSendQueueTest {
         }
     }
 
+    private static void emitAck(WebSocketFrameHandler handler, long sequence) {
+        WebSocketResponse response = WebSocketResponse.success(sequence);
+        int size = response.serializedSize();
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            response.writeTo(ptr);
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     private static MicrobatchBuffer sealedBuffer(byte value) {
         MicrobatchBuffer buffer = new MicrobatchBuffer(64);
         buffer.writeByte(value);
@@ -312,9 +405,14 @@ public class WebSocketSendQueueTest {
         boolean tryReceive(WebSocketFrameHandler handler);
     }
 
+    private interface ReceiveBehavior {
+        boolean receive(WebSocketFrameHandler handler, int timeout);
+    }
+
     private static class FakeWebSocketClient extends WebSocketClient {
         private volatile TryReceiveBehavior behavior = handler -> false;
         private volatile boolean connected = true;
+        private volatile ReceiveBehavior receiveBehavior = (handler, timeout) -> false;
         private volatile SendBehavior sendBehavior = (dataPtr, length) -> {
         };
 
@@ -344,6 +442,15 @@ public class WebSocketSendQueueTest {
 
         public void setTryReceiveBehavior(TryReceiveBehavior behavior) {
             this.behavior = behavior;
+        }
+
+        public void setReceiveBehavior(ReceiveBehavior receiveBehavior) {
+            this.receiveBehavior = receiveBehavior;
+        }
+
+        @Override
+        public boolean receiveFrame(WebSocketFrameHandler handler, int timeout) {
+            return receiveBehavior.receive(handler, timeout);
         }
 
         @Override
