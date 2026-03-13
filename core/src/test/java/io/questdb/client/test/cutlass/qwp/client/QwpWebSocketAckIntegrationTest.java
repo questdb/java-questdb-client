@@ -55,8 +55,8 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
 
             boolean errorCaught = false;
             long start = System.currentTimeMillis();
-            try (QwpWebSocketSender sender = QwpWebSocketSender.connectAsync(
-                    "localhost", port, false, 0, 0, 0)) {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", port, false, 0, 0, 0, QwpWebSocketSender.DEFAULT_IN_FLIGHT_WINDOW_SIZE, null)) {
                 sender.table("test")
                         .longColumn("value", 1)
                         .atNow();
@@ -86,8 +86,8 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
 
             boolean errorCaught = false;
             long start = System.currentTimeMillis();
-            try (QwpWebSocketSender sender = QwpWebSocketSender.connectAsync(
-                    "localhost", port, false, 0, 0, 0)) {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", port, false, 0, 0, 0, QwpWebSocketSender.DEFAULT_IN_FLIGHT_WINDOW_SIZE, null)) {
                 sender.table("test")
                         .longColumn("value", 1)
                         .atNow();
@@ -121,8 +121,8 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
             server.start();
             Assert.assertTrue("Server failed to start", server.awaitStart(5, TimeUnit.SECONDS));
 
-            try (QwpWebSocketSender sender = QwpWebSocketSender.connectAsync(
-                    "localhost", port, false, 0, 0, 0)) {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", port, false, 0, 0, 0, QwpWebSocketSender.DEFAULT_IN_FLIGHT_WINDOW_SIZE, null)) {
 
                 sender.table("test")
                         .longColumn("value", 42)

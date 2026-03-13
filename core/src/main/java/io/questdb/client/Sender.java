@@ -885,7 +885,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
                 String wsAuthHeader = buildWebSocketAuthHeader();
 
-                return QwpWebSocketSender.connectAsync(
+                return QwpWebSocketSender.connect(
                         hosts.getQuick(0),
                         ports.getQuick(0),
                         tlsEnabled,
