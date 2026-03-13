@@ -41,9 +41,58 @@ import java.time.temporal.ChronoUnit;
  *   <li>{@code reset()} discards all pending state, not just the current table buffer.</li>
  *   <li>Cached timestamp column references are invalidated during flush operations,
  *       preventing stale writes through freed {@code ColumnBuffer} instances.</li>
+ *   <li>Auto-flush accumulates rows globally across all tables rather than flushing
+ *       per-table on each table switch.</li>
  * </ul>
  */
 public class QwpWebSocketSenderStateTest extends AbstractTest {
+
+    @Test
+    public void testAutoFlushAccumulatesRowsAcrossAllTables() throws Exception {
+        assertMemoryLeak(() -> {
+            // autoFlushRows=5; bytes and interval are disabled to isolate the row-count check.
+            // The test verifies that switching tables does NOT trigger a flush — flush fires
+            // only when the TOTAL pending-row count reaches the configured threshold.
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 0, 5, 0, 0L, 1
+            );
+            try {
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                // Write 4 rows interleaved between t1 and t2.
+                // None of these should trigger auto-flush (4 < 5 = autoFlushRows).
+                sender.table("t1").longColumn("x", 1).at(1, ChronoUnit.MICROS);
+                sender.table("t2").longColumn("y", 1).at(1, ChronoUnit.MICROS);
+                sender.table("t1").longColumn("x", 2).at(2, ChronoUnit.MICROS);
+                sender.table("t2").longColumn("y", 2).at(2, ChronoUnit.MICROS);
+
+                // All 4 rows must still be buffered — switching tables must not flush.
+                QwpTableBuffer t1 = sender.getTableBuffer("t1");
+                QwpTableBuffer t2 = sender.getTableBuffer("t2");
+                Assert.assertEquals("t1 should have 2 buffered rows (no premature flush)",
+                        2, t1.getRowCount());
+                Assert.assertEquals("t2 should have 2 buffered rows (no premature flush)",
+                        2, t2.getRowCount());
+                Assert.assertEquals("pendingRowCount must reflect all 4 rows across both tables",
+                        4, sender.getPendingRowCount());
+
+                // The 5th row hits the global threshold and triggers auto-flush.
+                // The flush fails because client is null, confirming that flush
+                // was triggered by the row-count threshold, not by the table switch.
+                boolean flushTriggered = false;
+                try {
+                    sender.table("t1").longColumn("x", 3).at(3, ChronoUnit.MICROS);
+                } catch (Exception expected) {
+                    flushTriggered = true;
+                }
+                Assert.assertTrue("auto-flush must be triggered on the 5th row", flushTriggered);
+            } finally {
+                setField(sender, "connected", false);
+                sender.close();
+            }
+        });
+    }
 
     @Test
     public void testCachedTimestampColumnInvalidatedDuringFlush() throws Exception {
