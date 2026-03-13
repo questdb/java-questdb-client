@@ -555,7 +555,9 @@ public class WebSocketSendQueue implements QuietCloseable {
      */
     private void tryReceiveAcks() {
         try {
-            client.tryReceiveFrame(responseHandler);
+            while (client.tryReceiveFrame(responseHandler)) {
+                // Drain all buffered ACKs before returning to the I/O loop.
+            }
         } catch (Exception e) {
             if (running) {
                 LOG.error("Error receiving response: {}", e.getMessage());
