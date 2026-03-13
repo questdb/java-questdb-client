@@ -287,6 +287,11 @@ public class InFlightWindow {
                 }
             }
 
+            // The I/O thread may have called fail() and then acknowledgeUpTo()
+            // before this thread was scheduled, draining the window while an
+            // error is pending. Check one final time after the window is empty.
+            checkError();
+
             LOG.debug("Window empty, all batches ACKed");
         } finally {
             waitingForEmpty = null;
