@@ -719,9 +719,6 @@ public class QwpUdpSender implements Sender {
     }
 
     private void atMicros(long timestampMicros) {
-        if (inProgressRowValueCount == 0) {
-            throw new LineSenderException("no columns were provided");
-        }
         try {
             stageDesignatedTimestampValue(timestampMicros, false);
             commitCurrentRow();
@@ -732,9 +729,6 @@ public class QwpUdpSender implements Sender {
     }
 
     private void atNanos(long timestampNanos) {
-        if (inProgressRowValueCount == 0) {
-            throw new LineSenderException("no columns were provided");
-        }
         try {
             stageDesignatedTimestampValue(timestampNanos, true);
             commitCurrentRow();
@@ -817,10 +811,6 @@ public class QwpUdpSender implements Sender {
     }
 
     private void commitCurrentRow() {
-        if (inProgressRowValueCount == 0) {
-            throw new LineSenderException("no columns were provided");
-        }
-
         long estimate = 0;
         long committedEstimateBeforeRow = 0;
         int targetRows = currentTableBuffer.getRowCount() + 1;

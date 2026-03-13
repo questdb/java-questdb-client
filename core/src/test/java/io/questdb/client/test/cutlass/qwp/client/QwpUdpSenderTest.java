@@ -1581,6 +1581,27 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testTimestampOnlyRows() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                // at() with no other columns: designated timestamp is staged
+                sender.table("t").at(1_000L, ChronoUnit.MICROS);
+                // atNow() with no other columns: server assigns the timestamp
+                sender.table("t").atNow();
+                sender.flush();
+            }
+
+            List<DecodedRow> rows = decodeRows(nf.packets);
+            Assert.assertEquals("expected 2 timestamp-only rows", 2, rows.size());
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "", 1_000L),
+                    decodedRow("t", "", null)
+            ), rows);
+        });
+    }
+
+    @Test
     public void testUnboundedSenderOmittedNullableAndNonNullableColumnsPreservesRows() throws Exception {
         assertMemoryLeak(() -> {
             List<ScenarioRow> rows = Arrays.asList(
@@ -1709,20 +1730,6 @@ public class QwpUdpSenderTest {
             Assert.assertTrue("expected at least one auto-flush", result.packets.size() > 1);
             assertPacketsWithinLimit(result, maxDatagramSize);
             assertRowsEqual(expectedRows(rows), decodeRows(nf.packets));
-        });
-    }
-
-    @Test
-    public void testZeroColumnRowsThrow() throws Exception {
-        assertMemoryLeak(() -> {
-            CapturingNetworkFacade nf = new CapturingNetworkFacade();
-            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
-                sender.table("t");
-
-                assertThrowsContains("no columns were provided", sender::atNow);
-                assertThrowsContains("no columns were provided", () -> sender.at(1, ChronoUnit.MICROS));
-                assertThrowsContains("no columns were provided", () -> sender.at(1, ChronoUnit.NANOS));
-            }
         });
     }
 

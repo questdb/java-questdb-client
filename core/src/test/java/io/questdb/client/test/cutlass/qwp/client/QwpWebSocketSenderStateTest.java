@@ -218,6 +218,34 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
         });
     }
 
+    @Test
+    public void testTimestampOnlyRows() throws Exception {
+        assertMemoryLeak(() -> {
+            // autoFlushRows=10_000 prevents auto-flush; bytes and interval disabled
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 0, 10_000, 0, 0L, 1
+            );
+            try {
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                // at(micros) with no other columns
+                sender.table("t").at(1_000L, ChronoUnit.MICROS);
+                // atNow() with no other columns
+                sender.table("t").atNow();
+
+                QwpTableBuffer tb = sender.getTableBuffer("t");
+                Assert.assertEquals(
+                        "at() and atNow() with no other columns must each buffer a row",
+                        2, tb.getRowCount()
+                );
+            } finally {
+                setField(sender, "connected", false);
+                sender.close();
+            }
+        });
+    }
+
     private static void setField(Object target, String fieldName, Object value) throws Exception {
         Field f = target.getClass().getDeclaredField(fieldName);
         f.setAccessible(true);
