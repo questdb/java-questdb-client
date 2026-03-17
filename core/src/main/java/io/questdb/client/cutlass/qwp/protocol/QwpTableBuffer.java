@@ -78,7 +78,7 @@ public class QwpTableBuffer implements QuietCloseable {
     /**
      * Use this constructor overload to allow writing to a symbol column.
      * {@link ColumnBuffer#addSymbol(CharSequence)} needs the sender to
-     * call {@link QwpWebSocketSender#getOrAddGlobalSymbol(String)}, registering
+     * call {@link QwpWebSocketSender#getOrAddGlobalSymbol(CharSequence)}, registering
      * the symbol in the global dictionary shared with the server.
      */
     public QwpTableBuffer(String tableName, QwpWebSocketSender sender) {
@@ -1063,9 +1063,8 @@ public class QwpTableBuffer implements QuietCloseable {
                 return;
             }
             if (sender != null) {
-                String symbolValue = value.toString();
-                int globalId = sender.getOrAddGlobalSymbol(symbolValue);
-                addSymbolWithGlobalId(symbolValue, globalId);
+                int globalId = sender.getOrAddGlobalSymbol(value);
+                addSymbolWithGlobalId(value, globalId);
                 return;
             }
             ensureNullBitmapCapacity();
@@ -1092,9 +1091,8 @@ public class QwpTableBuffer implements QuietCloseable {
                 throw new AssertionError("unreachable");
             }
             if (sender != null) {
-                String symbolValue = lookupSink.toString();
-                int globalId = sender.getOrAddGlobalSymbol(symbolValue);
-                addSymbolWithGlobalId(symbolValue, globalId);
+                int globalId = sender.getOrAddGlobalSymbol(lookupSink);
+                addSymbolWithGlobalId(lookupSink, globalId);
                 return;
             }
             ensureNullBitmapCapacity();
@@ -1104,7 +1102,7 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
-        public void addSymbolWithGlobalId(String value, int globalId) {
+        public void addSymbolWithGlobalId(CharSequence value, int globalId) {
             if (value == null) {
                 addNull();
                 return;

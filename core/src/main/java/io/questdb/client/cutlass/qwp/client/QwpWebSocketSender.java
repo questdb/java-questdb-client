@@ -636,7 +636,7 @@ public class QwpWebSocketSender implements Sender {
      * @param symbol the symbol value to register
      * @return the global symbol ID
      */
-    public int getOrAddGlobalSymbol(String symbol) {
+    public int getOrAddGlobalSymbol(CharSequence symbol) {
         int globalId = globalSymbolDictionary.getOrAddSymbol(symbol);
         if (globalId > currentBatchMaxSymbolId) {
             currentBatchMaxSymbolId = globalId;
@@ -801,7 +801,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_STRING, true);
-        col.addString(value != null ? value.toString() : null);
+        col.addString(value);
         return this;
     }
 

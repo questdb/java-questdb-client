@@ -94,7 +94,7 @@ public class GlobalSymbolDictionary {
      * @return the global ID for this symbol (>= 0)
      * @throws IllegalArgumentException if symbol is null
      */
-    public int getOrAddSymbol(String symbol) {
+    public int getOrAddSymbol(CharSequence symbol) {
         if (symbol == null) {
             throw new IllegalArgumentException("symbol cannot be null");
         }
@@ -104,10 +104,11 @@ public class GlobalSymbolDictionary {
             return existingId;
         }
 
-        // Assign new ID
+        // Assign new ID — toString() only for new symbols that must be stored
+        String symbolStr = symbol.toString();
         int newId = idToSymbol.size();
-        symbolToId.put(symbol, newId);
-        idToSymbol.add(symbol);
+        symbolToId.put(symbolStr, newId);
+        idToSymbol.add(symbolStr);
         return newId;
     }
 
