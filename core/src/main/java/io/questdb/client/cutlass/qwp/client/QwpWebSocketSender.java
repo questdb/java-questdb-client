@@ -145,6 +145,7 @@ public class QwpWebSocketSender implements Sender {
     // Batch sequence counter (must match server's messageSequence)
     private long nextBatchSequence = 0;
     // Async mode: pending row tracking
+    private long pendingBytes;
     private int pendingRowCount;
     private boolean sawBinaryAck;
     private WebSocketSendQueue sendQueue;
@@ -758,6 +759,7 @@ public class QwpWebSocketSender implements Sender {
                 buf.reset();
             }
         }
+        pendingBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
         currentTableBuffer = null;
@@ -1071,6 +1073,7 @@ public class QwpWebSocketSender implements Sender {
         }
 
         // Reset pending count
+        pendingBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
     }
@@ -1150,6 +1153,7 @@ public class QwpWebSocketSender implements Sender {
         }
 
         // Reset pending row tracking
+        pendingBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
 
@@ -1157,18 +1161,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private long getPendingBytes() {
-        long bytes = 0;
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence key = keys.getQuick(i);
-            if (key != null) {
-                QwpTableBuffer tb = tableBuffers.get(key);
-                if (tb != null) {
-                    bytes += tb.getBufferedBytes();
-                }
-            }
-        }
-        return bytes;
+        return pendingBytes;
     }
 
     /**
@@ -1226,7 +1219,9 @@ public class QwpWebSocketSender implements Sender {
      */
     private void sendRow() {
         ensureConnected();
+        long bytesBefore = currentTableBuffer.getBufferedBytes();
         currentTableBuffer.nextRow();
+        pendingBytes += currentTableBuffer.getBufferedBytes() - bytesBefore;
 
         // Both modes: accumulate rows, don't encode yet
         if (pendingRowCount == 0) {
