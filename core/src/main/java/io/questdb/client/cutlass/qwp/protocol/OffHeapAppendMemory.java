@@ -150,7 +150,7 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
      * Pre-ensures worst-case capacity to avoid per-byte checks.
      */
     public void putUtf8(CharSequence value) {
-        if (value == null || value.isEmpty()) {
+        if (value == null || value.length() == 0) {
             return;
         }
         int len = value.length();

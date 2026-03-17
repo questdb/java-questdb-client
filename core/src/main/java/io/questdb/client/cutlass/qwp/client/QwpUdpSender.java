@@ -778,7 +778,7 @@ public class QwpUdpSender implements Sender {
         int columnIndex = column.getIndex();
         ensureStagedColumnMarkCapacity(columnIndex + 1);
         if (stagedColumnMarks[columnIndex] == currentRowMark) {
-            if (columnName != null && columnName.isEmpty()) {
+            if (columnName != null && columnName.length() == 0) {
                 throw new LineSenderException("designated timestamp already set for current row");
             }
             throw new LineSenderException("column '" + columnName + "' already set for current row");

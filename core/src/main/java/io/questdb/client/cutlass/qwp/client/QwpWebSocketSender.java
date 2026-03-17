@@ -486,7 +486,7 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, CharSequence value) {
-        if (value == null || value.isEmpty()) return this;
+        if (value == null || value.length() == 0) return this;
         checkNotClosed();
         checkTableSelected();
         try {
@@ -903,7 +903,7 @@ public class QwpWebSocketSender implements Sender {
 
     private String checkedColumnName(CharSequence name) {
         if (name == null || !TableUtils.isValidColumnName(name, DEFAULT_MAX_NAME_LENGTH)) {
-            if (name == null || name.isEmpty()) {
+            if (name == null || name.length() == 0) {
                 throw new LineSenderException("column name cannot be empty");
             }
             if (name.length() > DEFAULT_MAX_NAME_LENGTH) {
