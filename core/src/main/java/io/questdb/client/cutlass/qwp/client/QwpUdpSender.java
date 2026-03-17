@@ -37,6 +37,7 @@ import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.Misc;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.bytes.DirectByteSlice;
@@ -69,10 +70,10 @@ public class QwpUdpSender implements Sender {
     private static final int VARINT_INT_UPPER_BOUND = 5;
     private final UdpLineChannel channel;
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
-    private final NativeSegmentList datagramSegments = new NativeSegmentList();
-    private final NativeBufferWriter headerBuffer = new NativeBufferWriter();
+    private final NativeSegmentList datagramSegments;
+    private final NativeBufferWriter headerBuffer;
     private final int maxDatagramSize;
-    private final SegmentedNativeBufferWriter payloadWriter = new SegmentedNativeBufferWriter();
+    private final SegmentedNativeBufferWriter payloadWriter;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     private final CharSequenceObjHashMap<TableHeadroomState> tableHeadroomStates;
     private final boolean trackDatagramEstimate;
@@ -105,9 +106,28 @@ public class QwpUdpSender implements Sender {
     }
 
     public QwpUdpSender(NetworkFacade nf, int interfaceIPv4, int sendToAddress, int port, int ttl, int maxDatagramSize) {
-        this.channel = new UdpLineChannel(nf, interfaceIPv4, sendToAddress, port, ttl);
-        this.tableHeadroomStates = new CharSequenceObjHashMap<>();
-        this.tableBuffers = new CharSequenceObjHashMap<>();
+        NativeSegmentList segments = null;
+        NativeBufferWriter header = null;
+        SegmentedNativeBufferWriter payload = null;
+        UdpLineChannel ch = null;
+        try {
+            segments = new NativeSegmentList();
+            header = new NativeBufferWriter();
+            payload = new SegmentedNativeBufferWriter();
+            ch = new UdpLineChannel(nf, interfaceIPv4, sendToAddress, port, ttl);
+            this.tableHeadroomStates = new CharSequenceObjHashMap<>();
+            this.tableBuffers = new CharSequenceObjHashMap<>();
+        } catch (Throwable t) {
+            Misc.free(ch);
+            Misc.free(payload);
+            Misc.free(header);
+            Misc.free(segments);
+            throw t;
+        }
+        this.channel = ch;
+        this.datagramSegments = segments;
+        this.headerBuffer = header;
+        this.payloadWriter = payload;
         this.maxDatagramSize = maxDatagramSize;
         this.trackDatagramEstimate = maxDatagramSize > 0;
     }
