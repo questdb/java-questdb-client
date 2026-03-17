@@ -105,6 +105,10 @@ final class NativeSegmentList implements QuietCloseable {
 
         int newCapacity = capacity;
         while (newCapacity < required) {
+            if (newCapacity > Integer.MAX_VALUE / 2) {
+                newCapacity = required;
+                break;
+            }
             newCapacity *= 2;
         }
 
