@@ -40,8 +40,13 @@ public class WebSocketClientWindows extends WebSocketClient {
 
     public WebSocketClientWindows(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         super(configuration, socketFactory);
-        this.fdSet = new FDSet(configuration.getWaitQueueCapacity());
-        this.sf = configuration.getSelectFacade();
+        try {
+            this.fdSet = new FDSet(configuration.getWaitQueueCapacity());
+            this.sf = configuration.getSelectFacade();
+        } catch (Throwable t) {
+            close();
+            throw t;
+        }
     }
 
     @Override

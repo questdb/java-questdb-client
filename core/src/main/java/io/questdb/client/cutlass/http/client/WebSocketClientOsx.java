@@ -38,10 +38,15 @@ public class WebSocketClientOsx extends WebSocketClient {
 
     public WebSocketClientOsx(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         super(configuration, socketFactory);
-        this.kqueue = new Kqueue(
-                configuration.getKQueueFacade(),
-                configuration.getWaitQueueCapacity()
-        );
+        try {
+            this.kqueue = new Kqueue(
+                    configuration.getKQueueFacade(),
+                    configuration.getWaitQueueCapacity()
+            );
+        } catch (Throwable t) {
+            close();
+            throw t;
+        }
     }
 
     @Override

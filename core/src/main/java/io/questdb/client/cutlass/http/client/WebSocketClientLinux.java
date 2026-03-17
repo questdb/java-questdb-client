@@ -39,10 +39,15 @@ public class WebSocketClientLinux extends WebSocketClient {
 
     public WebSocketClientLinux(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         super(configuration, socketFactory);
-        epoll = new Epoll(
-                configuration.getEpollFacade(),
-                configuration.getWaitQueueCapacity()
-        );
+        try {
+            epoll = new Epoll(
+                    configuration.getEpollFacade(),
+                    configuration.getWaitQueueCapacity()
+            );
+        } catch (Throwable t) {
+            close();
+            throw t;
+        }
     }
 
     @Override
