@@ -183,7 +183,12 @@ public class QwpWebSocketSender implements Sender {
         if (inFlightWindowSize > 1) {
             int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
             this.buffer0 = new MicrobatchBuffer(microbatchBufferSize, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos);
-            this.buffer1 = new MicrobatchBuffer(microbatchBufferSize, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos);
+            try {
+                this.buffer1 = new MicrobatchBuffer(microbatchBufferSize, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos);
+            } catch (Throwable t) {
+                buffer0.close();
+                throw t;
+            }
             this.activeBuffer = buffer0;
         }
     }
