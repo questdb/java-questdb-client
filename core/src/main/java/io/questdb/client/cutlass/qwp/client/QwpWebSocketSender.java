@@ -182,11 +182,14 @@ public class QwpWebSocketSender implements Sender {
         // Initialize double-buffering if async mode (window > 1)
         if (inFlightWindowSize > 1) {
             int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
-            this.buffer0 = new MicrobatchBuffer(microbatchBufferSize, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos);
             try {
+                this.buffer0 = new MicrobatchBuffer(microbatchBufferSize, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos);
                 this.buffer1 = new MicrobatchBuffer(microbatchBufferSize, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos);
             } catch (Throwable t) {
-                buffer0.close();
+                if (buffer0 != null) {
+                    buffer0.close();
+                }
+                encoder.close();
                 throw t;
             }
             this.activeBuffer = buffer0;
@@ -980,9 +983,16 @@ public class QwpWebSocketSender implements Sender {
             // Initialize send queue for async mode (window > 1)
             // The send queue handles both sending AND receiving (single I/O thread)
             if (inFlightWindowSize > 1) {
-                sendQueue = new WebSocketSendQueue(client, inFlightWindow,
-                        WebSocketSendQueue.DEFAULT_ENQUEUE_TIMEOUT_MS,
-                        WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS);
+                try {
+                    sendQueue = new WebSocketSendQueue(client, inFlightWindow,
+                            WebSocketSendQueue.DEFAULT_ENQUEUE_TIMEOUT_MS,
+                            WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS);
+                } catch (Throwable t) {
+                    inFlightWindow = null;
+                    client.close();
+                    client = null;
+                    throw new LineSenderException("Failed to start I/O thread for " + host + ":" + port, t);
+                }
             }
             // Sync mode (window=1): no send queue - we send and read ACKs synchronously
 
@@ -1134,8 +1144,18 @@ public class QwpWebSocketSender implements Sender {
 
                 LOG.debug("Sending sync batch [seq={}, bytes={}, rows={}, maxSentSymbolId={}, useSchemaRef={}]", batchSequence, messageSize, tableBuffer.getRowCount(), currentBatchMaxSymbolId, useSchemaRef);
 
-                // Send over WebSocket
-                client.sendBinary(buffer.getBufferPtr(), messageSize);
+                // Send over WebSocket and fail the in-flight entry if send throws,
+                // so close() does not hang waiting for an ACK that will never arrive.
+                try {
+                    client.sendBinary(buffer.getBufferPtr(), messageSize);
+                } catch (LineSenderException e) {
+                    failExpectedIfNeeded(batchSequence, e);
+                    throw e;
+                } catch (Throwable t) {
+                    LineSenderException error = new LineSenderException("Failed to send batch " + batchSequence, t);
+                    failExpectedIfNeeded(batchSequence, error);
+                    throw error;
+                }
 
                 // Wait for ACK synchronously
                 waitForAck(batchSequence);
