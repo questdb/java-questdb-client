@@ -243,7 +243,8 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
 
         int utf8Len = utf8Length(value);
         putVarint(utf8Len);
-        putUtf8(value);
+        ensureCapacity(utf8Len);
+        encodeUtf8(value);
     }
 
     /**
@@ -254,33 +255,9 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
         if (value == null || value.isEmpty()) {
             return;
         }
-        for (int i = 0, n = value.length(); i < n; i++) {
-            char c = value.charAt(i);
-            if (c < 0x80) {
-                putByte((byte) c);
-            } else if (c < 0x800) {
-                putByte((byte) (0xC0 | (c >> 6)));
-                putByte((byte) (0x80 | (c & 0x3F)));
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
-                char c2 = value.charAt(++i);
-                if (Character.isLowSurrogate(c2)) {
-                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
-                    putByte((byte) (0xF0 | (codePoint >> 18)));
-                    putByte((byte) (0x80 | ((codePoint >> 12) & 0x3F)));
-                    putByte((byte) (0x80 | ((codePoint >> 6) & 0x3F)));
-                    putByte((byte) (0x80 | (codePoint & 0x3F)));
-                } else {
-                    putByte((byte) '?');
-                    i--;
-                }
-            } else if (Character.isSurrogate(c)) {
-                putByte((byte) '?');
-            } else {
-                putByte((byte) (0xE0 | (c >> 12)));
-                putByte((byte) (0x80 | ((c >> 6) & 0x3F)));
-                putByte((byte) (0x80 | (c & 0x3F)));
-            }
-        }
+        int utf8Len = utf8Length(value);
+        ensureCapacity(utf8Len);
+        encodeUtf8(value);
     }
 
     /**
@@ -313,5 +290,37 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     public void skip(int bytes) {
         ensureCapacity(bytes);
         position += bytes;
+    }
+
+    private void encodeUtf8(String value) {
+        long addr = bufferPtr + position;
+        for (int i = 0, n = value.length(); i < n; i++) {
+            char c = value.charAt(i);
+            if (c < 0x80) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) c);
+            } else if (c < 0x800) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0xC0 | (c >> 6)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (c & 0x3F)));
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
+                char c2 = value.charAt(++i);
+                if (Character.isLowSurrogate(c2)) {
+                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0xF0 | (codePoint >> 18)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((codePoint >> 12) & 0x3F)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((codePoint >> 6) & 0x3F)));
+                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (codePoint & 0x3F)));
+                } else {
+                    Unsafe.getUnsafe().putByte(addr++, (byte) '?');
+                    i--;
+                }
+            } else if (Character.isSurrogate(c)) {
+                Unsafe.getUnsafe().putByte(addr++, (byte) '?');
+            } else {
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0xE0 | (c >> 12)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((c >> 6) & 0x3F)));
+                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (c & 0x3F)));
+            }
+        }
+        position = (int) (addr - bufferPtr);
     }
 }
