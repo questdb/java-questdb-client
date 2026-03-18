@@ -28,7 +28,7 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 
 final class NativeSegmentList implements QuietCloseable {
-    static final int SEGMENT_SIZE = 16;
+    static final int ENTRY_SIZE = 16;
 
     private int capacity;
     private long ptr;
@@ -41,61 +41,18 @@ final class NativeSegmentList implements QuietCloseable {
 
     NativeSegmentList(int initialCapacity) {
         this.capacity = Math.max(initialCapacity, 4);
-        this.ptr = Unsafe.malloc((long) capacity * SEGMENT_SIZE, MemoryTag.NATIVE_DEFAULT);
-    }
-
-    void add(long address, long length) {
-        if (length <= 0) {
-            return;
-        }
-        ensureCapacity(size + 1);
-        long segmentPtr = ptr + (long) size * SEGMENT_SIZE;
-        Unsafe.getUnsafe().putLong(segmentPtr, address);
-        Unsafe.getUnsafe().putLong(segmentPtr + 8, length);
-        size++;
-        totalLength += length;
-    }
-
-    void appendFrom(NativeSegmentList other) {
-        if (other.size == 0) {
-            return;
-        }
-        ensureCapacity(size + other.size);
-        Unsafe.getUnsafe().copyMemory(
-                other.ptr,
-                ptr + (long) size * SEGMENT_SIZE,
-                (long) other.size * SEGMENT_SIZE
-        );
-        size += other.size;
-        totalLength += other.totalLength;
-    }
-
-    long getAddress() {
-        return ptr;
-    }
-
-    int getSegmentCount() {
-        return size;
-    }
-
-    long getTotalLength() {
-        return totalLength;
+        this.ptr = Unsafe.malloc((long) capacity * ENTRY_SIZE, MemoryTag.NATIVE_DEFAULT);
     }
 
     @Override
     public void close() {
         if (ptr != 0) {
-            Unsafe.free(ptr, (long) capacity * SEGMENT_SIZE, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(ptr, (long) capacity * ENTRY_SIZE, MemoryTag.NATIVE_DEFAULT);
             ptr = 0;
             capacity = 0;
             size = 0;
             totalLength = 0;
         }
-    }
-
-    void reset() {
-        size = 0;
-        totalLength = 0;
     }
 
     private void ensureCapacity(int required) {
@@ -114,10 +71,53 @@ final class NativeSegmentList implements QuietCloseable {
 
         ptr = Unsafe.realloc(
                 ptr,
-                (long) capacity * SEGMENT_SIZE,
-                (long) newCapacity * SEGMENT_SIZE,
+                (long) capacity * ENTRY_SIZE,
+                (long) newCapacity * ENTRY_SIZE,
                 MemoryTag.NATIVE_DEFAULT
         );
         capacity = newCapacity;
+    }
+
+    void add(long address, long length) {
+        if (length <= 0) {
+            return;
+        }
+        ensureCapacity(size + 1);
+        long segmentPtr = ptr + (long) size * ENTRY_SIZE;
+        Unsafe.getUnsafe().putLong(segmentPtr, address);
+        Unsafe.getUnsafe().putLong(segmentPtr + 8, length);
+        size++;
+        totalLength += length;
+    }
+
+    void appendFrom(NativeSegmentList other) {
+        if (other.size == 0) {
+            return;
+        }
+        ensureCapacity(size + other.size);
+        Unsafe.getUnsafe().copyMemory(
+                other.ptr,
+                ptr + (long) size * ENTRY_SIZE,
+                (long) other.size * ENTRY_SIZE
+        );
+        size += other.size;
+        totalLength += other.totalLength;
+    }
+
+    long getAddress() {
+        return ptr;
+    }
+
+    int getSegmentCount() {
+        return size;
+    }
+
+    long getTotalLength() {
+        return totalLength;
+    }
+
+    void reset() {
+        size = 0;
+        totalLength = 0;
     }
 }
