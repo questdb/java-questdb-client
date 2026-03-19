@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.AbstractTest;
@@ -65,9 +66,9 @@ public class QwpDeltaDictRollbackTest extends AbstractTest {
                 // because client is null (we never actually connected)
                 try {
                     sender.flush();
-                    Assert.fail("Expected NullPointerException from null client");
-                } catch (NullPointerException expected) {
-                    // sendBinary() on null client
+                    Assert.fail("Expected LineSenderException from null client");
+                } catch (LineSenderException expected) {
+                    // sendBinary() on null client, wrapped by flushSync()
                 }
 
                 // The fix: maxSentSymbolId must remain -1 because the send failed.
