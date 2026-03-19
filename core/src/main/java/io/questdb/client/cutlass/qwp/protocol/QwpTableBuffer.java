@@ -351,6 +351,11 @@ public class QwpTableBuffer implements QuietCloseable {
             fastColumns = newArr;
         }
         fastColumns[index] = col;
+        // Pre-pad with nulls for already-committed rows so the next
+        // value the caller adds lands at the correct row position.
+        for (int r = 0; r < rowCount; r++) {
+            col.addNull();
+        }
         schemaHashComputed = false;
         columnDefsCacheValid = false;
         return col;
