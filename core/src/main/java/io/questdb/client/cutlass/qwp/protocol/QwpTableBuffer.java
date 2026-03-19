@@ -32,11 +32,11 @@ import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.CharSequenceIntHashMap;
 import io.questdb.client.std.Chars;
-import io.questdb.client.std.LowerCaseAsciiCharSequenceIntHashMap;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Decimals;
+import io.questdb.client.std.LowerCaseAsciiCharSequenceIntHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
@@ -196,13 +196,21 @@ public class QwpTableBuffer implements QuietCloseable {
      * <p>
      * Optimized for the common case where columns are accessed in the same
      * order every row: a sequential cursor avoids hash map lookups entirely.
+     * <p>
+     * Returns {@code null} when the column has already been written in the current
+     * (uncommitted) row.  Callers must treat a {@code null} return as "duplicate
+     * column in this row — skip the write", matching the ILP first-value-wins
+     * semantics.  The check is a single field comparison on the hot path and has
+     * no measurable cost.
      */
     public ColumnBuffer getOrCreateColumn(CharSequence name, byte type, boolean nullable) {
         ColumnBuffer existing = lookupColumn(name, type);
         if (existing != null) {
-            return existing;
+            // col.size > rowCount means this column already received a value
+            // for the in-progress row.  Silently ignore the duplicate (first
+            // value wins, same as the ILP server behaviour).
+            return existing.size <= rowCount ? existing : null;
         }
-
         return createColumn(name, type, nullable);
     }
 
