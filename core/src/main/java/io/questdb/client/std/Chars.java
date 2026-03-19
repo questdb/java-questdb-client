@@ -364,6 +364,22 @@ public final class Chars {
         return _this.length() > 0 && _this.charAt(0) == c;
     }
 
+    public static String toLowerCase(@Nullable CharSequence value) {
+        if (value == null) {
+            return null;
+        }
+        final int len = value.length();
+        if (len == 0) {
+            return "";
+        }
+
+        final Utf16Sink b = Misc.getThreadLocalSink();
+        for (int i = 0; i < len; i++) {
+            b.put(Character.toLowerCase(value.charAt(i)));
+        }
+        return b.toString();
+    }
+
     public static String toLowerCaseAscii(@Nullable CharSequence value) {
         if (value == null) {
             return null;

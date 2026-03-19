@@ -54,13 +54,13 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
     }
 
     public int keyIndex(CharSequence key) {
-        int index = Chars.lowerCaseAsciiHashCode(key) & mask;
+        int index = Chars.lowerCaseHashCode(key) & mask;
 
         if (keys[index] == noEntryKey) {
             return index;
         }
 
-        if (Chars.equalsLowerCaseAscii(key, keys[index])) {
+        if (Chars.equalsIgnoreCase(key, keys[index])) {
             return -index - 1;
         }
 
@@ -77,7 +77,7 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
             if (keys[index] == noEntryKey) {
                 return index;
             }
-            if (Chars.equalsLowerCaseAscii(key, keys[index])) {
+            if (Chars.equalsIgnoreCase(key, keys[index])) {
                 return -index - 1;
             }
         } while (true);
