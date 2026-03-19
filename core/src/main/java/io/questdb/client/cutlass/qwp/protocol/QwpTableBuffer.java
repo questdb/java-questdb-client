@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.CharSequenceIntHashMap;
 import io.questdb.client.std.Chars;
+import io.questdb.client.std.LowerCaseAsciiCharSequenceIntHashMap;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
@@ -58,7 +59,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  */
 public class QwpTableBuffer implements QuietCloseable {
 
-    private final CharSequenceIntHashMap columnNameToIndex;
+    private final LowerCaseAsciiCharSequenceIntHashMap columnNameToIndex;
     private final ObjList<ColumnBuffer> columns;
     private final QwpWebSocketSender sender;
     private final String tableName;
@@ -85,7 +86,7 @@ public class QwpTableBuffer implements QuietCloseable {
         this.tableName = tableName;
         this.sender = sender;
         this.columns = new ObjList<>();
-        this.columnNameToIndex = new CharSequenceIntHashMap();
+        this.columnNameToIndex = new LowerCaseAsciiCharSequenceIntHashMap();
         this.rowCount = 0;
         this.schemaHash = 0;
         this.schemaHashComputed = false;
@@ -360,7 +361,7 @@ public class QwpTableBuffer implements QuietCloseable {
         int n = columns.size();
         if (columnAccessCursor < n) {
             ColumnBuffer candidate = fastColumns[columnAccessCursor];
-            if (Chars.equals(candidate.name, name)) {
+            if (Chars.equalsIgnoreCase(candidate.name, name)) {
                 columnAccessCursor++;
                 assertColumnType(name, type, candidate);
                 return candidate;
@@ -369,7 +370,7 @@ public class QwpTableBuffer implements QuietCloseable {
 
         // Slow path: hash map lookup
         int idx = columnNameToIndex.get(name);
-        if (idx != CharSequenceIntHashMap.NO_ENTRY_VALUE) {
+        if (idx >= 0) {
             ColumnBuffer existing = columns.get(idx);
             assertColumnType(name, type, existing);
             return existing;
