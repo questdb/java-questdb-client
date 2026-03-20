@@ -1344,10 +1344,10 @@ public class QwpWebSocketSender implements Sender {
         if (autoFlushBytes > 0 && getPendingBytes() >= autoFlushBytes) {
             return true;
         }
-//        if (autoFlushIntervalNanos > 0) {
-//            long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
-//            return ageNanos >= autoFlushIntervalNanos;
-//        }
+        if (autoFlushIntervalNanos > 0) {
+            long ageNanos = System.nanoTime() - firstPendingRowTimeNanos;
+            return ageNanos >= autoFlushIntervalNanos;
+        }
         return false;
     }
 
