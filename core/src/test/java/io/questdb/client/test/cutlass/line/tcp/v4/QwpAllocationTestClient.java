@@ -27,7 +27,11 @@ package io.questdb.client.test.cutlass.line.tcp.v4;
 import io.questdb.client.Sender;
 
 import java.io.IOException;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
 import java.time.temporal.ChronoUnit;
+import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -95,6 +99,7 @@ public class QwpAllocationTestClient {
             "AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", "TSLA", "BRK.A", "JPM", "JNJ",
             "V", "PG", "UNH", "HD", "MA", "DIS", "PYPL", "BAC", "ADBE", "CMCSA"
     };
+    private static final String TABLE_NAME = "ilp_alloc_test";
 
     public static void main(String[] args) {
         // Parse command-line options
@@ -173,6 +178,7 @@ public class QwpAllocationTestClient {
         System.out.println();
 
         try {
+            recreateTable(host);
             runTest(protocol, host, port, totalRows, batchSize, flushBytes, flushIntervalMs,
                     inFlightWindow, maxDatagramSize, warmupRows, reportInterval, targetThroughput);
         } catch (Exception e) {
@@ -286,6 +292,35 @@ public class QwpAllocationTestClient {
         System.out.println("  QwpAllocationTestClient --protocol=ilp-tcp --rows=100000 --no-warmup");
     }
 
+    private static void recreateTable(String host) throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty("user", "admin");
+        properties.setProperty("password", "quest");
+        properties.setProperty("sslmode", "disable");
+        String url = "jdbc:postgresql://" + host + ":8812/qdb";
+        try (Connection conn = DriverManager.getConnection(url, properties);
+             Statement st = conn.createStatement()
+        ) {
+            st.execute("DROP TABLE IF EXISTS " + TABLE_NAME);
+            st.execute("CREATE TABLE " + TABLE_NAME + " ("
+                    + " timestamp TIMESTAMP,"
+                    + " exchange SYMBOL,"
+                    + " currency SYMBOL,"
+                    + " trade_id LONG,"
+                    + " volume LONG,"
+                    + " price DOUBLE,"
+                    + " bid DOUBLE,"
+                    + " ask DOUBLE,"
+                    + " sequence LONG,"
+                    + " spread DOUBLE,"
+                    + " venue VARCHAR,"
+                    + " is_buy BOOLEAN,"
+                    + " event_time TIMESTAMP"
+                    + ") TIMESTAMP(timestamp) PARTITION BY DAY WAL");
+        }
+        System.out.println("Recreated table " + TABLE_NAME);
+    }
+
     private static void runTest(String protocol, String host, int port, int totalRows,
                                 int batchSize, int flushBytes, long flushIntervalMs,
                                 int inFlightWindow, int maxDatagramSize,
@@ -345,9 +380,9 @@ public class QwpAllocationTestClient {
                     long now = System.nanoTime();
                     long elapsedSinceReport = now - lastReportTime;
                     int rowsSinceReport = (i + 1) - lastReportRows;
-                    double rowsPerSec = rowsSinceReport / (elapsedSinceReport / 1_000_000_000.0);
+                    int rowsPerSec = (int) (rowsSinceReport / (elapsedSinceReport / 1_000_000_000.0));
 
-                    System.out.printf("Progress: %,d / %,d rows (%.1f%%) - %.0f rows/sec%n",
+                    System.out.printf("Progress: %,d / %,d rows (%.1f%%) - %,d rows/sec%n",
                             i + 1, totalRows,
                             (i + 1) * 100.0 / totalRows,
                             rowsPerSec);
@@ -386,7 +421,7 @@ public class QwpAllocationTestClient {
         long baseTimestamp = 1704067200000000L; // 2024-01-01 00:00:00 UTC in micros
         long timestamp = baseTimestamp + (rowIndex * 1000L) + (rowIndex % 100);
 
-        sender.table("ilp_alloc_test")
+        sender.table(TABLE_NAME)
                 // Symbol columns
                 .symbol("exchange", SYMBOLS[rowIndex % SYMBOLS.length])
                 .symbol("currency", rowIndex % 2 == 0 ? "USD" : "EUR")
