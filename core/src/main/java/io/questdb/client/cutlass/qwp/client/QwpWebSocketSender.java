@@ -1298,9 +1298,13 @@ public class QwpWebSocketSender implements Sender {
      */
     private void sendRow() {
         ensureConnected();
-        long bytesBefore = currentTableBuffer.getBufferedBytes();
-        currentTableBuffer.nextRow();
-        pendingBytes += currentTableBuffer.getBufferedBytes() - bytesBefore;
+        if (autoFlushBytes > 0) {
+            long bytesBefore = currentTableBuffer.getBufferedBytes();
+            currentTableBuffer.nextRow();
+            pendingBytes += currentTableBuffer.getBufferedBytes() - bytesBefore;
+        } else {
+            currentTableBuffer.nextRow();
+        }
 
         // Both modes: accumulate rows, don't encode yet
         if (pendingRowCount == 0) {

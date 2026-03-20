@@ -209,7 +209,7 @@ public class QwpAllocationTestClient {
                         .address(host)
                         .port(port);
                 if (batchSize > 0) wsBuilder.autoFlushRows(batchSize);
-                if (flushBytes > 0) wsBuilder.autoFlushBytes(flushBytes);
+                if (flushBytes >= 0) wsBuilder.autoFlushBytes(flushBytes);
                 if (flushIntervalMs > 0) wsBuilder.autoFlushIntervalMillis((int) flushIntervalMs);
                 if (inFlightWindow > 0) wsBuilder.inFlightWindowSize(inFlightWindow);
                 return wsBuilder.build();
