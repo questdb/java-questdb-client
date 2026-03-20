@@ -965,7 +965,7 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    private String checkedColumnName(CharSequence name) {
+    private CharSequence checkedColumnName(CharSequence name) {
         if (name == null || !TableUtils.isValidColumnName(name, DEFAULT_MAX_NAME_LENGTH)) {
             if (name == null || name.length() == 0) {
                 throw new LineSenderException("column name cannot be empty");
@@ -975,7 +975,7 @@ public class QwpWebSocketSender implements Sender {
             }
             throw new LineSenderException("column name contains illegal characters: " + name);
         }
-        return name.toString();
+        return name;
     }
 
     /**
