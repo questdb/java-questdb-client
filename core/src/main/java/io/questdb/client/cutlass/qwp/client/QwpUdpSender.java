@@ -723,6 +723,22 @@ public class QwpUdpSender implements Sender {
         return col;
     }
 
+    private QwpTableBuffer.ColumnBuffer acquireDesignatedTimestampColumn(byte type) {
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getExistingColumn("", type);
+        if (col == null && currentTableBuffer.getRowCount() > 0) {
+            if (hasInProgressRow()) {
+                flushCommittedPrefixPreservingCurrentRow();
+            } else {
+                flushCommittedRowsOfCurrentTable();
+            }
+            col = currentTableBuffer.getExistingColumn("", type);
+        }
+        if (col == null) {
+            col = currentTableBuffer.getOrCreateDesignatedTimestampColumn(type);
+        }
+        return col;
+    }
+
     private void appendDoubleArrayValue(QwpTableBuffer.ColumnBuffer column, Object value) {
         if (value instanceof double[]) {
             column.addDoubleArray((double[]) value);
@@ -1216,16 +1232,15 @@ public class QwpUdpSender implements Sender {
 
     private void stageDesignatedTimestampValue(long value, boolean nanos) {
         QwpTableBuffer.ColumnBuffer col;
-        if (nanos) {
-            if (cachedTimestampNanosColumn == null) {
-                cachedTimestampNanosColumn = acquireColumn("", TYPE_TIMESTAMP_NANOS, true);
+        byte type = nanos ? TYPE_TIMESTAMP_NANOS : TYPE_TIMESTAMP;
+        col = nanos ? cachedTimestampNanosColumn : cachedTimestampColumn;
+        if (col == null) {
+            col = acquireDesignatedTimestampColumn(type);
+            if (nanos) {
+                cachedTimestampNanosColumn = col;
+            } else {
+                cachedTimestampColumn = col;
             }
-            col = cachedTimestampNanosColumn;
-        } else {
-            if (cachedTimestampColumn == null) {
-                cachedTimestampColumn = acquireColumn("", TYPE_TIMESTAMP, true);
-            }
-            col = cachedTimestampColumn;
         }
         beginColumnWrite(col, "");
         col.addLong(value);

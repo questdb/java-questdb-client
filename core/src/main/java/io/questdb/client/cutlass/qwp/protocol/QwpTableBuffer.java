@@ -206,6 +206,9 @@ public class QwpTableBuffer implements QuietCloseable {
      * no measurable cost.
      */
     public ColumnBuffer getOrCreateColumn(CharSequence name, byte type, boolean nullable) {
+        if (name == null || name.length() == 0) {
+            throw new LineSenderException("column name cannot be empty");
+        }
         ColumnBuffer existing = lookupColumn(name, type);
         if (existing != null) {
             // col.size > rowCount means this column already received a value
@@ -213,7 +216,21 @@ public class QwpTableBuffer implements QuietCloseable {
             // value wins, same as the ILP server behaviour).
             return existing.size <= rowCount ? existing : null;
         }
-        return createColumn(name, type, nullable);
+        if (TableUtils.isValidColumnName(name, MAX_COLUMN_NAME_LENGTH)) {
+            return createColumn(name, type, nullable);
+        }
+        throw new LineSenderException(
+                name.length() > MAX_COLUMN_NAME_LENGTH ? "column name too long [maxLength=" + MAX_COLUMN_NAME_LENGTH + "]"
+                        : "column name contains illegal characters: " + name
+        );
+    }
+
+    public ColumnBuffer getOrCreateDesignatedTimestampColumn(byte type) {
+        ColumnBuffer existing = lookupColumn("", type);
+        if (existing != null) {
+            return existing;
+        }
+        return createColumn("", type, true);
     }
 
     /**
@@ -345,10 +362,6 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     private ColumnBuffer createColumn(CharSequence name, byte type, boolean nullable) {
-        // empty name is the designated timestamp sentinel — skip validation
-        if (name.length() > 0) {
-            validateColumnName(name);
-        }
         ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
         col.sender = sender;
         int index = columns.size();
@@ -419,18 +432,6 @@ public class QwpTableBuffer implements QuietCloseable {
         schemaHashComputed = false;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
-    }
-
-    private static void validateColumnName(CharSequence name) {
-        if (name == null || !TableUtils.isValidColumnName(name, MAX_COLUMN_NAME_LENGTH)) {
-            if (name == null || name.length() == 0) {
-                throw new LineSenderException("column name cannot be empty");
-            }
-            if (name.length() > MAX_COLUMN_NAME_LENGTH) {
-                throw new LineSenderException("column name too long [maxLength=" + MAX_COLUMN_NAME_LENGTH + "]");
-            }
-            throw new LineSenderException("column name contains illegal characters: " + name);
-        }
     }
 
     /**

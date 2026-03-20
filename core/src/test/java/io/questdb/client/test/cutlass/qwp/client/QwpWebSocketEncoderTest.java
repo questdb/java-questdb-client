@@ -135,7 +135,7 @@ public class QwpWebSocketEncoderTest {
                 buffer.getOrCreateColumn("d", TYPE_DOUBLE, false).addDouble(3.14159265);
                 buffer.getOrCreateColumn("s", TYPE_STRING, true).addString("test");
                 buffer.getOrCreateColumn("sym", TYPE_SYMBOL, false).addSymbol("AAPL");
-                buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true).addLong(1000000L);
+                buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP).addLong(1000000L);
 
                 buffer.nextRow();
 
@@ -380,7 +380,7 @@ public class QwpWebSocketEncoderTest {
                 QwpTableBuffer.ColumnBuffer stringCol = buffer.getOrCreateColumn("message", TYPE_STRING, true);
                 stringCol.addString("hello world");
 
-                QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 tsCol.addLong(1000000L);
 
                 buffer.nextRow();
@@ -407,7 +407,7 @@ public class QwpWebSocketEncoderTest {
                     QwpTableBuffer.ColumnBuffer doubleCol = buffer.getOrCreateColumn("value", TYPE_DOUBLE, false);
                     doubleCol.addDouble(i * 1.5);
 
-                    QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                    QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                     tsCol.addLong(1000000L + i);
 
                     buffer.nextRow();
@@ -435,7 +435,7 @@ public class QwpWebSocketEncoderTest {
                 QwpTableBuffer.ColumnBuffer humCol = buffer.getOrCreateColumn("humidity", TYPE_LONG, false);
                 humCol.addLong(65);
 
-                QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 tsCol.addLong(1000000L);
 
                 buffer.nextRow();
@@ -489,7 +489,7 @@ public class QwpWebSocketEncoderTest {
                     QwpTableBuffer.ColumnBuffer valCol = buffer.getOrCreateColumn("value", TYPE_LONG, false);
                     valCol.addLong(i);
 
-                    QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                    QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                     tsCol.addLong(1000000L + i);
 
                     buffer.nextRow();
@@ -731,7 +731,7 @@ public class QwpWebSocketEncoderTest {
                  QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
 
                 // Add a timestamp column (designated timestamp uses empty name)
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 col.addLong(1000000L); // Micros
                 buffer.nextRow();
 
@@ -1141,7 +1141,7 @@ public class QwpWebSocketEncoderTest {
                 encoder.setGorillaEnabled(true);
 
                 // Add multiple timestamps with constant delta (best compression)
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 for (int i = 0; i < 100; i++) {
                     col.addLong(1000000000L + i * 1000L);
                     buffer.nextRow();
@@ -1152,7 +1152,7 @@ public class QwpWebSocketEncoderTest {
                 // Now encode without Gorilla
                 encoder.setGorillaEnabled(false);
                 buffer.reset();
-                col = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 for (int i = 0; i < 100; i++) {
                     col.addLong(1000000000L + i * 1000L);
                     buffer.nextRow();
@@ -1200,7 +1200,7 @@ public class QwpWebSocketEncoderTest {
                 encoder.setGorillaEnabled(true);
 
                 // Single timestamp - should use uncompressed
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 col.addLong(1000000L);
                 buffer.nextRow();
 
@@ -1218,7 +1218,7 @@ public class QwpWebSocketEncoderTest {
                 encoder.setGorillaEnabled(true);
 
                 // Only 2 timestamps - should use uncompressed (Gorilla needs 3+)
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 col.addLong(1000000L);
                 buffer.nextRow();
                 col.addLong(2000000L);

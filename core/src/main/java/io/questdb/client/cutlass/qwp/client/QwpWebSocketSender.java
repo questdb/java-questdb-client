@@ -937,7 +937,7 @@ public class QwpWebSocketSender implements Sender {
         // Add designated timestamp column (empty name for designated timestamp)
         // Use cached reference to avoid hashmap lookup per row
         if (cachedTimestampColumn == null) {
-            cachedTimestampColumn = currentTableBuffer.getOrCreateColumn("", TYPE_TIMESTAMP, true);
+            cachedTimestampColumn = currentTableBuffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
         }
         cachedTimestampColumn.addLong(timestampMicros);
         sendRow();
@@ -947,7 +947,7 @@ public class QwpWebSocketSender implements Sender {
         // Add designated timestamp column (empty name for designated timestamp)
         // Use cached reference to avoid hashmap lookup per row
         if (cachedTimestampNanosColumn == null) {
-            cachedTimestampNanosColumn = currentTableBuffer.getOrCreateColumn("", TYPE_TIMESTAMP_NANOS, true);
+            cachedTimestampNanosColumn = currentTableBuffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP_NANOS);
         }
         cachedTimestampNanosColumn.addLong(timestampNanos);
         sendRow();
