@@ -61,10 +61,7 @@ public class MicrobatchBuffer implements QuietCloseable {
     public static final int STATE_SEALED = 1;
     public static final int STATE_SENDING = 2;
     private static final AtomicLong nextBatchId = new AtomicLong();
-    private final long maxAgeNanos;
-    private final int maxBytes;
     // Flush trigger thresholds
-    private final int maxRows;
     // Batch identification
     private long batchId;
     private int bufferCapacity;
@@ -72,8 +69,6 @@ public class MicrobatchBuffer implements QuietCloseable {
     // Native memory buffer
     private long bufferPtr;
     private long firstRowTimeNanos;
-    // Symbol tracking for delta encoding
-    private int maxSymbolId = -1;
     // For waiting on recycle (user thread waits for I/O thread to finish)
     private volatile Thread recycleWaiter;
     // Row tracking
@@ -98,9 +93,6 @@ public class MicrobatchBuffer implements QuietCloseable {
         this.bufferPos = 0;
         this.rowCount = 0;
         this.firstRowTimeNanos = 0;
-        this.maxRows = maxRows;
-        this.maxBytes = maxBytes;
-        this.maxAgeNanos = maxAgeNanos;
         this.batchId = nextBatchId.getAndIncrement();
     }
 
@@ -289,24 +281,6 @@ public class MicrobatchBuffer implements QuietCloseable {
     }
 
     /**
-     * Checks if the age limit has been exceeded.
-     */
-    public boolean isAgeLimitExceeded() {
-        if (maxAgeNanos <= 0 || rowCount == 0) {
-            return false;
-        }
-        long ageNanos = System.nanoTime() - firstRowTimeNanos;
-        return ageNanos >= maxAgeNanos;
-    }
-
-    /**
-     * Checks if the byte size limit has been exceeded.
-     */
-    public boolean isByteLimitExceeded() {
-        return maxBytes > 0 && bufferPos >= maxBytes;
-    }
-
-    /**
      * Returns true if the buffer is in FILLING state (available for writing).
      */
     public boolean isFilling() {
@@ -326,13 +300,6 @@ public class MicrobatchBuffer implements QuietCloseable {
      */
     public boolean isRecycled() {
         return state == STATE_RECYCLED;
-    }
-
-    /**
-     * Checks if the row count limit has been exceeded.
-     */
-    public boolean isRowLimitExceeded() {
-        return maxRows > 0 && rowCount >= maxRows;
     }
 
     /**
@@ -394,7 +361,6 @@ public class MicrobatchBuffer implements QuietCloseable {
         bufferPos = 0;
         rowCount = 0;
         firstRowTimeNanos = 0;
-        maxSymbolId = -1;
         batchId = nextBatchId.getAndIncrement();
         recycleWaiter = null;
         state = STATE_FILLING;
@@ -443,26 +409,6 @@ public class MicrobatchBuffer implements QuietCloseable {
             throw new IllegalArgumentException("Position out of bounds: " + pos);
         }
         this.bufferPos = pos;
-    }
-
-    /**
-     * Sets the maximum symbol ID used in this batch.
-     * Used for delta symbol dictionary tracking.
-     */
-    public void setMaxSymbolId(int maxSymbolId) {
-        this.maxSymbolId = maxSymbolId;
-    }
-
-    /**
-     * Checks if the buffer should be flushed based on configured thresholds.
-     *
-     * @return true if any flush threshold is exceeded
-     */
-    public boolean shouldFlush() {
-        if (!hasData()) {
-            return false;
-        }
-        return isRowLimitExceeded() || isByteLimitExceeded() || isAgeLimitExceeded();
     }
 
     @Override

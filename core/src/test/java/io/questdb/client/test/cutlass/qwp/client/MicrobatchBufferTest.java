@@ -27,7 +27,9 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -574,77 +576,6 @@ public class MicrobatchBufferTest {
         assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
                 buffer.setBufferPos(2000);
-            }
-        });
-    }
-
-    @Test
-    public void testShouldFlushAgeLimit() throws Exception {
-        assertMemoryLeak(() -> {
-            // 50ms timeout
-            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 0, 0, 50_000_000L)) {
-                buffer.writeByte((byte) 1);
-                buffer.incrementRowCount();
-                Assert.assertFalse(buffer.shouldFlush());
-
-                Thread.sleep(60);
-
-                Assert.assertTrue(buffer.shouldFlush());
-                Assert.assertTrue(buffer.isAgeLimitExceeded());
-            }
-        });
-    }
-
-    @Test
-    public void testShouldFlushByteLimit() throws Exception {
-        assertMemoryLeak(() -> {
-            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 0, 10, 0)) {
-                for (int i = 0; i < 9; i++) {
-                    buffer.writeByte((byte) i);
-                    buffer.incrementRowCount();
-                    Assert.assertFalse(buffer.shouldFlush());
-                }
-                buffer.writeByte((byte) 9);
-                buffer.incrementRowCount();
-                Assert.assertTrue(buffer.shouldFlush());
-                Assert.assertTrue(buffer.isByteLimitExceeded());
-            }
-        });
-    }
-
-    @Test
-    public void testShouldFlushEmptyBuffer() throws Exception {
-        assertMemoryLeak(() -> {
-            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 1, 1, 1)) {
-                Assert.assertFalse(buffer.shouldFlush()); // Empty buffer never flushes
-            }
-        });
-    }
-
-    @Test
-    public void testShouldFlushRowLimit() throws Exception {
-        assertMemoryLeak(() -> {
-            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 5, 0, 0)) {
-                for (int i = 0; i < 4; i++) {
-                    buffer.writeByte((byte) i);
-                    buffer.incrementRowCount();
-                    Assert.assertFalse(buffer.shouldFlush());
-                }
-                buffer.writeByte((byte) 4);
-                buffer.incrementRowCount();
-                Assert.assertTrue(buffer.shouldFlush());
-                Assert.assertTrue(buffer.isRowLimitExceeded());
-            }
-        });
-    }
-
-    @Test
-    public void testShouldFlushWithNoThresholds() throws Exception {
-        assertMemoryLeak(() -> {
-            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
-                buffer.writeByte((byte) 1);
-                buffer.incrementRowCount();
-                Assert.assertFalse(buffer.shouldFlush()); // No thresholds set
             }
         });
     }

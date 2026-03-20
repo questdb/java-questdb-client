@@ -1116,7 +1116,6 @@ public class QwpWebSocketSender implements Sender {
                 activeBuffer.ensureCapacity(messageSize);
                 activeBuffer.write(buffer.getBufferPtr(), messageSize);
                 activeBuffer.incrementRowCount();
-                activeBuffer.setMaxSymbolId(currentBatchMaxSymbolId);
 
                 // Seal and enqueue for sending
                 sealAndSwapBuffer();
