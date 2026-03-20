@@ -583,7 +583,7 @@ public class QwpTableBuffer implements QuietCloseable {
         private byte[] arrayDims;
         private int arrayShapeOffset;
         private int[] arrayShapes;
-        // Off-heap auxiliary buffer for global symbol IDs (SYMBOL type only)
+        // Optional auxiliary buffer used by symbol encoders that need sideband IDs.
         private OffHeapAppendMemory auxBuffer;
         // Off-heap data buffer for fixed-width types
         private OffHeapAppendMemory dataBuffer;
@@ -605,6 +605,7 @@ public class QwpTableBuffer implements QuietCloseable {
         // Off-heap storage for string/varchar column data
         private OffHeapAppendMemory stringOffsets;
         // Symbol specific (dictionary stays on-heap)
+        private boolean storeGlobalSymbolIdsOnly;
         private CharSequenceIntHashMap symbolDict;
         private ObjList<String> symbolList;
         private StringSink symbolLookupSink;
@@ -1101,6 +1102,9 @@ public class QwpTableBuffer implements QuietCloseable {
                 return;
             }
             ensureNullBitmapCapacity();
+            if (storeGlobalSymbolIdsOnly) {
+                throw new LineSenderException("column '" + name + "' cannot mix global symbol IDs with local symbol dictionary values");
+            }
             int idx = getOrAddLocalSymbol(value);
             dataBuffer.putInt(idx);
             valueCount++;
@@ -1129,6 +1133,9 @@ public class QwpTableBuffer implements QuietCloseable {
                 return;
             }
             ensureNullBitmapCapacity();
+            if (storeGlobalSymbolIdsOnly) {
+                throw new LineSenderException("column '" + name + "' cannot mix global symbol IDs with local symbol dictionary values");
+            }
             int idx = getOrAddLocalSymbol(lookupSink);
             dataBuffer.putInt(idx);
             valueCount++;
@@ -1141,13 +1148,24 @@ public class QwpTableBuffer implements QuietCloseable {
                 return;
             }
             ensureNullBitmapCapacity();
-            int localIdx = getOrAddLocalSymbol(value);
-            dataBuffer.putInt(localIdx);
-
-            if (auxBuffer == null) {
-                auxBuffer = new OffHeapAppendMemory(64);
+            if (!storeGlobalSymbolIdsOnly) {
+                if (symbolList != null && symbolList.size() > 0) {
+                    int localIdx = getOrAddLocalSymbol(value);
+                    dataBuffer.putInt(localIdx);
+                    if (auxBuffer == null) {
+                        auxBuffer = new OffHeapAppendMemory(64);
+                    }
+                    auxBuffer.putInt(globalId);
+                    if (globalId > maxGlobalSymbolId) {
+                        maxGlobalSymbolId = globalId;
+                    }
+                    valueCount++;
+                    size++;
+                    return;
+                }
+                storeGlobalSymbolIdsOnly = true;
             }
-            auxBuffer.putInt(globalId);
+            dataBuffer.putInt(globalId);
 
             if (globalId > maxGlobalSymbolId) {
                 maxGlobalSymbolId = globalId;
@@ -1312,6 +1330,9 @@ public class QwpTableBuffer implements QuietCloseable {
         }
 
         public int getSymbolDictionarySize() {
+            if (storeGlobalSymbolIdsOnly) {
+                return 0;
+            }
             return symbolList != null ? symbolList.size() : 0;
         }
 
@@ -1364,6 +1385,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 symbolDict.clear();
                 symbolList.clear();
             }
+            storeGlobalSymbolIdsOnly = false;
             maxGlobalSymbolId = -1;
             arrayShapeOffset = 0;
             arrayDataOffset = 0;
@@ -1480,6 +1502,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 decimalScale = -1;
                 geohashPrecision = -1;
                 maxGlobalSymbolId = -1;
+                storeGlobalSymbolIdsOnly = false;
                 if (symbolDict != null) {
                     symbolDict.clear();
                     symbolList.clear();
@@ -1729,6 +1752,7 @@ public class QwpTableBuffer implements QuietCloseable {
             decimalScale = -1;
             geohashPrecision = -1;
             maxGlobalSymbolId = -1;
+            storeGlobalSymbolIdsOnly = false;
             if (symbolDict != null) {
                 symbolDict.clear();
                 symbolList.clear();
@@ -1797,6 +1821,11 @@ public class QwpTableBuffer implements QuietCloseable {
 
         private void retainSymbolValue(int valueIndex) {
             retainFixedWidthValue(valueIndex);
+
+            if (storeGlobalSymbolIdsOnly) {
+                maxGlobalSymbolId = Unsafe.getUnsafe().getInt(dataBuffer.pageAddress());
+                return;
+            }
 
             int localIndex = Unsafe.getUnsafe().getInt(dataBuffer.pageAddress());
             String symbol = symbolList.get(localIndex);

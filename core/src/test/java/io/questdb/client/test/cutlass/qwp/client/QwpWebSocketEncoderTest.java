@@ -32,6 +32,8 @@ import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.nio.charset.StandardCharsets;
+
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -961,6 +963,43 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
+    @Test
+    public void testEncodeWithDeltaDict_readsGlobalIdsFromDataBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
+                GlobalSymbolDictionary globalDict = new GlobalSymbolDictionary();
+                for (int i = 0; i < 8; i++) {
+                    globalDict.getOrAddSymbol("SYM_" + i);
+                }
+
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("ticker", TYPE_SYMBOL, false);
+                col.addSymbolWithGlobalId("SYM_5", 5);
+                buffer.nextRow();
+                col.addSymbolWithGlobalId("SYM_7", 7);
+                buffer.nextRow();
+
+                Assert.assertEquals(0, col.getAuxDataAddress());
+
+                int size = encoder.encodeWithDeltaDict(buffer, globalDict, 7, 7, false);
+                Assert.assertTrue(size > 12);
+
+                Cursor cursor = new Cursor(encoder.getBuffer().getBufferPtr() + HEADER_SIZE);
+                Assert.assertEquals(8, cursor.readVarint());
+                Assert.assertEquals(0, cursor.readVarint());
+
+                Assert.assertEquals("test_table", cursor.readString());
+                Assert.assertEquals(2, cursor.readVarint());
+                Assert.assertEquals(1, cursor.readVarint());
+                Assert.assertEquals(SCHEMA_MODE_FULL, cursor.readByte());
+                Assert.assertEquals("ticker", cursor.readString());
+                Assert.assertEquals(TYPE_SYMBOL, cursor.readByte());
+                Assert.assertEquals(5, cursor.readVarint());
+                Assert.assertEquals(7, cursor.readVarint());
+            }
+        });
+    }
+
     // ==================== SCHEMA REFERENCE TESTS ====================
 
     @Test
@@ -1358,5 +1397,41 @@ public class QwpWebSocketEncoderTest {
                 Assert.assertEquals(size1, size2);
             }
         });
+    }
+
+    private static final class Cursor {
+        private long address;
+
+        private Cursor(long address) {
+            this.address = address;
+        }
+
+        private byte readByte() {
+            return Unsafe.getUnsafe().getByte(address++);
+        }
+
+        private String readString() {
+            int len = readVarint();
+            byte[] bytes = new byte[len];
+            for (int i = 0; i < len; i++) {
+                bytes[i] = Unsafe.getUnsafe().getByte(address + i);
+            }
+            String value = new String(bytes, StandardCharsets.UTF_8);
+            address += len;
+            return value;
+        }
+
+        private int readVarint() {
+            int value = 0;
+            int shift = 0;
+            while (true) {
+                int b = Unsafe.getUnsafe().getByte(address++) & 0xff;
+                value |= (b & 0x7f) << shift;
+                if ((b & 0x80) == 0) {
+                    return value;
+                }
+                shift += 7;
+            }
+        }
     }
 }
