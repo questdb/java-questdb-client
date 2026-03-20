@@ -93,9 +93,9 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
     public static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
-    private static final int DEFAULT_MAX_NAME_LENGTH = 127;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
+    private static final int MAX_TABLE_NAME_LENGTH = 127;
     private static final String WRITE_PATH = "/write/v4";
     private final AckFrameHandler ackHandler = new AckFrameHandler(this);
     private final WebSocketResponse ackResponse = new WebSocketResponse();
@@ -342,7 +342,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender boolColumn(CharSequence columnName, boolean value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_BOOLEAN, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_BOOLEAN, false);
         if (col != null) {
             col.addBoolean(value);
         }
@@ -364,7 +364,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender byteColumn(CharSequence columnName, byte value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_BYTE, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_BYTE, false);
         if (col != null) {
             col.addByte(value);
         }
@@ -391,7 +391,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender charColumn(CharSequence columnName, char value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_CHAR, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_CHAR, false);
         if (col != null) {
             col.addShort((short) value);
         }
@@ -474,7 +474,7 @@ public class QwpWebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_DECIMAL64, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DECIMAL64, true);
         if (col != null) {
             col.addDecimal64(value);
         }
@@ -486,7 +486,7 @@ public class QwpWebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_DECIMAL128, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DECIMAL128, true);
         if (col != null) {
             col.addDecimal128(value);
         }
@@ -498,7 +498,7 @@ public class QwpWebSocketSender implements Sender {
         if (value == null || value.isNull()) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_DECIMAL256, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DECIMAL256, true);
         if (col != null) {
             col.addDecimal256(value);
         }
@@ -512,7 +512,7 @@ public class QwpWebSocketSender implements Sender {
         checkTableSelected();
         try {
             currentDecimal256.ofString(value);
-            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_DECIMAL256, true);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DECIMAL256, true);
             if (col != null) {
                 col.addDecimal256(currentDecimal256);
             }
@@ -527,7 +527,7 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE_ARRAY, true);
         if (col != null) {
             col.addDoubleArray(values);
         }
@@ -539,7 +539,7 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE_ARRAY, true);
         if (col != null) {
             col.addDoubleArray(values);
         }
@@ -551,7 +551,7 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE_ARRAY, true);
         if (col != null) {
             col.addDoubleArray(values);
         }
@@ -563,7 +563,7 @@ public class QwpWebSocketSender implements Sender {
         if (array == null) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_DOUBLE_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_DOUBLE_ARRAY, true);
         if (col != null) {
             col.addDoubleArray(array);
         }
@@ -574,7 +574,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender doubleColumn(CharSequence columnName, double value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_DOUBLE, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_DOUBLE, true);
         if (col != null) {
             col.addDouble(value);
         }
@@ -591,7 +591,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender floatColumn(CharSequence columnName, float value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_FLOAT, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_FLOAT, true);
         if (col != null) {
             col.addFloat(value);
         }
@@ -703,7 +703,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender intColumn(CharSequence columnName, int value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_INT, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_INT, true);
         if (col != null) {
             col.addInt(value);
         }
@@ -730,7 +730,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender long256Column(CharSequence columnName, long l0, long l1, long l2, long l3) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_LONG256, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_LONG256, true);
         if (col != null) {
             col.addLong256(l0, l1, l2, l3);
         }
@@ -742,7 +742,7 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG_ARRAY, true);
         if (col != null) {
             col.addLongArray(values);
         }
@@ -754,7 +754,7 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG_ARRAY, true);
         if (col != null) {
             col.addLongArray(values);
         }
@@ -766,7 +766,7 @@ public class QwpWebSocketSender implements Sender {
         if (values == null) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG_ARRAY, true);
         if (col != null) {
             col.addLongArray(values);
         }
@@ -778,7 +778,7 @@ public class QwpWebSocketSender implements Sender {
         if (array == null) return this;
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(name), TYPE_LONG_ARRAY, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, TYPE_LONG_ARRAY, true);
         if (col != null) {
             col.addLongArray(array);
         }
@@ -789,7 +789,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender longColumn(CharSequence columnName, long value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_LONG, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_LONG, true);
         if (col != null) {
             col.addLong(value);
         }
@@ -834,7 +834,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender shortColumn(CharSequence columnName, short value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_SHORT, false);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_SHORT, false);
         if (col != null) {
             col.addShort(value);
         }
@@ -845,7 +845,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender stringColumn(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_STRING, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_STRING, true);
         if (col != null) {
             col.addString(value);
         }
@@ -856,7 +856,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender symbol(CharSequence columnName, CharSequence value) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_SYMBOL, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_SYMBOL, true);
         if (col != null) {
             col.addSymbol(value);
         }
@@ -889,13 +889,13 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         if (unit == ChronoUnit.NANOS) {
-            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_TIMESTAMP_NANOS, true);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_TIMESTAMP_NANOS, true);
             if (col != null) {
                 col.addLong(value);
             }
         } else {
             long micros = toMicros(value, unit);
-            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_TIMESTAMP, true);
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_TIMESTAMP, true);
             if (col != null) {
                 col.addLong(micros);
             }
@@ -908,7 +908,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         checkTableSelected();
         long micros = value.getEpochSecond() * 1_000_000L + value.getNano() / 1000L;
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_TIMESTAMP, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_TIMESTAMP, true);
         if (col != null) {
             col.addLong(micros);
         }
@@ -926,7 +926,7 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender uuidColumn(CharSequence columnName, long lo, long hi) {
         checkNotClosed();
         checkTableSelected();
-        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(checkedColumnName(columnName), TYPE_UUID, true);
+        QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, TYPE_UUID, true);
         if (col != null) {
             col.addUuid(hi, lo);
         }
@@ -963,19 +963,6 @@ public class QwpWebSocketSender implements Sender {
         if (currentTableBuffer == null) {
             throw new LineSenderException("table() must be called before adding columns");
         }
-    }
-
-    private CharSequence checkedColumnName(CharSequence name) {
-        if (name == null || !TableUtils.isValidColumnName(name, DEFAULT_MAX_NAME_LENGTH)) {
-            if (name == null || name.length() == 0) {
-                throw new LineSenderException("column name cannot be empty");
-            }
-            if (name.length() > DEFAULT_MAX_NAME_LENGTH) {
-                throw new LineSenderException("column name too long [maxLength=" + DEFAULT_MAX_NAME_LENGTH + "]");
-            }
-            throw new LineSenderException("column name contains illegal characters: " + name);
-        }
-        return name;
     }
 
     /**
@@ -1365,12 +1352,12 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void validateTableName(CharSequence name) {
-        if (name == null || !TableUtils.isValidTableName(name, DEFAULT_MAX_NAME_LENGTH)) {
+        if (name == null || !TableUtils.isValidTableName(name, MAX_TABLE_NAME_LENGTH)) {
             if (name == null || name.length() == 0) {
                 throw new LineSenderException("table name cannot be empty");
             }
-            if (name.length() > DEFAULT_MAX_NAME_LENGTH) {
-                throw new LineSenderException("table name too long [maxLength=" + DEFAULT_MAX_NAME_LENGTH + "]");
+            if (name.length() > MAX_TABLE_NAME_LENGTH) {
+                throw new LineSenderException("table name too long [maxLength=" + MAX_TABLE_NAME_LENGTH + "]");
             }
             throw new LineSenderException("table name contains illegal characters: " + name);
         }

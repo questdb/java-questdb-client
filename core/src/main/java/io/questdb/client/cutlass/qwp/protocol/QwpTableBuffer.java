@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.protocol;
 
 import io.questdb.client.cairo.ColumnType;
+import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
@@ -59,6 +60,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  */
 public class QwpTableBuffer implements QuietCloseable {
 
+    private static final int MAX_COLUMN_NAME_LENGTH = 127;
     private final LowerCaseAsciiCharSequenceIntHashMap columnNameToIndex;
     private final ObjList<ColumnBuffer> columns;
     private final QwpWebSocketSender sender;
@@ -343,6 +345,10 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     private ColumnBuffer createColumn(CharSequence name, byte type, boolean nullable) {
+        // empty name is the designated timestamp sentinel — skip validation
+        if (name.length() > 0) {
+            validateColumnName(name);
+        }
         ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
         col.sender = sender;
         int index = columns.size();
@@ -413,6 +419,18 @@ public class QwpTableBuffer implements QuietCloseable {
         schemaHashComputed = false;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
+    }
+
+    private static void validateColumnName(CharSequence name) {
+        if (name == null || !TableUtils.isValidColumnName(name, MAX_COLUMN_NAME_LENGTH)) {
+            if (name == null || name.length() == 0) {
+                throw new LineSenderException("column name cannot be empty");
+            }
+            if (name.length() > MAX_COLUMN_NAME_LENGTH) {
+                throw new LineSenderException("column name too long [maxLength=" + MAX_COLUMN_NAME_LENGTH + "]");
+            }
+            throw new LineSenderException("column name contains illegal characters: " + name);
+        }
     }
 
     /**
