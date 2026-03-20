@@ -309,7 +309,7 @@ public final class QwpConstants {
      */
     public static String getTypeName(byte typeCode) {
         int code = typeCode & TYPE_MASK;
-        boolean nullable = (typeCode & TYPE_NULLABLE_FLAG) != 0;
+        boolean hasNullBitmap = (typeCode & TYPE_NULLABLE_FLAG) != 0;
         String name;
         switch (code) {
             case TYPE_BOOLEAN:
@@ -382,7 +382,7 @@ public final class QwpConstants {
                 name = "UNKNOWN(" + code + ")";
                 break;
         }
-        return nullable ? name + "?" : name;
+        return hasNullBitmap ? name + "?" : name;
     }
 
     /**

@@ -184,7 +184,7 @@ public class DeltaSymbolDictionaryTest {
             GlobalSymbolDictionary globalDict = new GlobalSymbolDictionary();
 
             try (QwpTableBuffer batch = new QwpTableBuffer("test")) {
-                QwpTableBuffer.ColumnBuffer col = batch.getOrCreateColumn("sym", TYPE_SYMBOL, true);  // nullable
+                QwpTableBuffer.ColumnBuffer col = batch.getOrCreateColumn("sym", TYPE_SYMBOL, true);  // useNullBitmap
 
                 int aaplId = globalDict.getOrAddSymbol("AAPL");
                 col.addSymbolWithGlobalId("AAPL", aaplId);

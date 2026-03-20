@@ -205,7 +205,7 @@ public class QwpTableBuffer implements QuietCloseable {
      * semantics.  The check is a single field comparison on the hot path and has
      * no measurable cost.
      */
-    public ColumnBuffer getOrCreateColumn(CharSequence name, byte type, boolean nullable) {
+    public ColumnBuffer getOrCreateColumn(CharSequence name, byte type, boolean useNullBitmap) {
         if (name == null || name.length() == 0) {
             throw new LineSenderException("column name cannot be empty");
         }
@@ -217,7 +217,7 @@ public class QwpTableBuffer implements QuietCloseable {
             return existing.size <= rowCount ? existing : null;
         }
         if (TableUtils.isValidColumnName(name, MAX_COLUMN_NAME_LENGTH)) {
-            return createColumn(name, type, nullable);
+            return createColumn(name, type, useNullBitmap);
         }
         throw new LineSenderException(
                 name.length() > MAX_COLUMN_NAME_LENGTH ? "column name too long [maxLength=" + MAX_COLUMN_NAME_LENGTH + "]"
@@ -361,8 +361,8 @@ public class QwpTableBuffer implements QuietCloseable {
         }
     }
 
-    private ColumnBuffer createColumn(CharSequence name, byte type, boolean nullable) {
-        ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, nullable);
+    private ColumnBuffer createColumn(CharSequence name, byte type, boolean useNullBitmap) {
+        ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, useNullBitmap);
         col.sender = sender;
         int index = columns.size();
         col.index = index;
