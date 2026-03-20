@@ -28,9 +28,9 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * A buffer for accumulating ILP data into microbatches before sending.
@@ -75,8 +75,7 @@ public class MicrobatchBuffer implements QuietCloseable {
     // Symbol tracking for delta encoding
     private int maxSymbolId = -1;
     // For waiting on recycle (user thread waits for I/O thread to finish)
-    // CountDownLatch is not resettable, so we create a new instance on reset()
-    private volatile CountDownLatch recycleLatch = new CountDownLatch(1);
+    private volatile Thread recycleWaiter;
     // Row tracking
     private int rowCount;
     // State machine
@@ -137,10 +136,20 @@ public class MicrobatchBuffer implements QuietCloseable {
      * Only the user thread should call this.
      */
     public void awaitRecycled() {
+        final Thread current = Thread.currentThread();
+        recycleWaiter = current;
         try {
-            recycleLatch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            while (state != STATE_RECYCLED) {
+                LockSupport.park(this);
+                if (Thread.interrupted()) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        } finally {
+            if (recycleWaiter == current) {
+                recycleWaiter = null;
+            }
         }
     }
 
@@ -152,11 +161,31 @@ public class MicrobatchBuffer implements QuietCloseable {
      * @return true if recycled, false if timeout elapsed
      */
     public boolean awaitRecycled(long timeout, TimeUnit unit) {
+        if (state == STATE_RECYCLED) {
+            // fast-path
+            return true;
+        }
+
+        final Thread current = Thread.currentThread();
+        recycleWaiter = current;
+        final long deadlineNanos = System.nanoTime() + unit.toNanos(timeout);
         try {
-            return recycleLatch.await(timeout, unit);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
+            while (state != STATE_RECYCLED) {
+                final long remaining = deadlineNanos - System.nanoTime();
+                if (remaining <= 0) {
+                    return false;
+                }
+                LockSupport.parkNanos(this, remaining);
+                if (Thread.interrupted()) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            if (recycleWaiter == current) {
+                recycleWaiter = null;
+            }
         }
     }
 
@@ -332,7 +361,10 @@ public class MicrobatchBuffer implements QuietCloseable {
             throw new IllegalStateException("Cannot mark recycled in state " + stateName(state));
         }
         state = STATE_RECYCLED;
-        recycleLatch.countDown();
+        Thread w = recycleWaiter;
+        if (w != null) {
+            LockSupport.unpark(w);
+        }
     }
 
     /**
@@ -364,8 +396,8 @@ public class MicrobatchBuffer implements QuietCloseable {
         firstRowTimeNanos = 0;
         maxSymbolId = -1;
         batchId = nextBatchId.getAndIncrement();
+        recycleWaiter = null;
         state = STATE_FILLING;
-        recycleLatch = new CountDownLatch(1);
     }
 
     /**
