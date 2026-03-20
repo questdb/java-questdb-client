@@ -866,12 +866,12 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public QwpWebSocketSender table(CharSequence tableName) {
         checkNotClosed();
-        validateTableName(tableName);
         // Fast path: if table name matches current, skip hashmap lookup
         if (currentTableName != null && currentTableBuffer != null && Chars.equals(tableName, currentTableName)) {
             return this;
         }
         // Table changed - invalidate cached column references
+        validateTableName(tableName);
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
         currentTableName = tableName.toString();
