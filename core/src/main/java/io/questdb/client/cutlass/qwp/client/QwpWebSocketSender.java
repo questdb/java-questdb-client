@@ -622,7 +622,9 @@ public class QwpWebSocketSender implements Sender {
                 inFlightWindow.awaitEmpty();
             }
 
-            LOG.debug("Flush complete [totalBatches={}, totalBytes={}, totalAcked={}]", sendQueue.getTotalBatchesSent(), sendQueue.getTotalBytesSent(), inFlightWindow.getTotalAcked());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Flush complete [totalBatches={}, totalBytes={}, totalAcked={}]", sendQueue.getTotalBatchesSent(), sendQueue.getTotalBytesSent(), inFlightWindow.getTotalAcked());
+            }
         } else {
             // Sync mode (window=1): flush pending rows and wait for ACKs synchronously
             flushSync();
@@ -983,7 +985,9 @@ public class QwpWebSocketSender implements Sender {
         // Buffer is in use (SEALED or SENDING) - wait for it
         // Use a while loop to handle spurious wakeups and race conditions with the latch
         while (activeBuffer.isInUse()) {
-            LOG.debug("Waiting for active buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Waiting for active buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+            }
             boolean recycled = activeBuffer.awaitRecycled(30, TimeUnit.SECONDS);
             if (!recycled) {
                 throw new LineSenderException("Timeout waiting for active buffer to be recycled");
@@ -1064,7 +1068,9 @@ public class QwpWebSocketSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
-        LOG.debug("Flushing pending rows [count={}, tables={}]", pendingRowCount, tableBuffers.size());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Flushing pending rows [count={}, tables={}]", pendingRowCount, tableBuffers.size());
+        }
 
         // Ensure activeBuffer is ready for writing
         // It might be in RECYCLED state if previous batch was sent but we didn't swap yet
@@ -1090,7 +1096,9 @@ public class QwpWebSocketSender implements Sender {
                 long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
                 boolean useSchemaRef = sentSchemaHashes.contains(schemaKey);
 
-                LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, rowCount, maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, rowCount, maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
+                }
 
                 // Encode this table's rows with delta symbol dictionary
                 int messageSize = encoder.encodeWithDeltaDict(
@@ -1147,7 +1155,9 @@ public class QwpWebSocketSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
-        LOG.debug("Sync flush [pendingRows={}, tables={}]", pendingRowCount, tableBuffers.size());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Sync flush [pendingRows={}, tables={}]", pendingRowCount, tableBuffers.size());
+        }
 
         // Encode all table buffers that have data into a single message
         ObjList<CharSequence> keys = tableBuffers.keys();
@@ -1183,7 +1193,9 @@ public class QwpWebSocketSender implements Sender {
                 long batchSequence = nextBatchSequence++;
                 inFlightWindow.addInFlight(batchSequence);
 
-                LOG.debug("Sending sync batch [seq={}, bytes={}, rows={}, maxSentSymbolId={}, useSchemaRef={}]", batchSequence, messageSize, tableBuffer.getRowCount(), currentBatchMaxSymbolId, useSchemaRef);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Sending sync batch [seq={}, bytes={}, rows={}, maxSentSymbolId={}, useSchemaRef={}]", batchSequence, messageSize, tableBuffer.getRowCount(), currentBatchMaxSymbolId, useSchemaRef);
+                }
 
                 // Send over WebSocket and fail the in-flight entry if send throws,
                 // so close() does not hang waiting for an ACK that will never arrive.
@@ -1223,7 +1235,9 @@ public class QwpWebSocketSender implements Sender {
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
 
-        LOG.debug("Sync flush complete [totalAcked={}]", inFlightWindow.getTotalAcked());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Sync flush complete [totalAcked={}]", inFlightWindow.getTotalAcked());
+        }
     }
 
     private long getPendingBytes() {
@@ -1242,7 +1256,9 @@ public class QwpWebSocketSender implements Sender {
         MicrobatchBuffer toSend = activeBuffer;
         toSend.seal();
 
-        LOG.debug("Sealing buffer [id={}, rows={}, bytes={}]", toSend.getBatchId(), toSend.getRowCount(), toSend.getBufferPos());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Sealing buffer [id={}, rows={}, bytes={}]", toSend.getBatchId(), toSend.getRowCount(), toSend.getBufferPos());
+        }
 
         // Swap to the other buffer
         activeBuffer = (activeBuffer == buffer0) ? buffer1 : buffer0;
@@ -1250,17 +1266,23 @@ public class QwpWebSocketSender implements Sender {
         // If the other buffer is still being sent, wait for it
         // Use a while loop to handle spurious wakeups and race conditions with the latch
         while (activeBuffer.isInUse()) {
-            LOG.debug("Waiting for buffer recycle [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Waiting for buffer recycle [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+            }
             boolean recycled = activeBuffer.awaitRecycled(30, TimeUnit.SECONDS);
             if (!recycled) {
                 throw new LineSenderException("Timeout waiting for buffer to be recycled");
             }
-            LOG.debug("Buffer recycled [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Buffer recycled [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(activeBuffer.getState()));
+            }
         }
 
         // Reset the new active buffer
         int stateBeforeReset = activeBuffer.getState();
-        LOG.debug("Resetting buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(stateBeforeReset));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Resetting buffer [id={}, state={}]", activeBuffer.getBatchId(), MicrobatchBuffer.stateName(stateBeforeReset));
+        }
         activeBuffer.reset();
 
         // Enqueue the sealed buffer for sending.

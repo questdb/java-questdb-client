@@ -265,7 +265,9 @@ public class WebSocketSendQueue implements QuietCloseable {
                 }
             }
         }
-        LOG.debug("Enqueued batch [id={}, bytes={}, rows={}]", buffer.getBatchId(), buffer.getBufferPos(), buffer.getRowCount());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Enqueued batch [id={}, bytes={}, rows={}]", buffer.getBatchId(), buffer.getBufferPos(), buffer.getRowCount());
+        }
         return true;
     }
 
@@ -548,23 +550,33 @@ public class WebSocketSendQueue implements QuietCloseable {
         int bytes = batch.getBufferPos();
         int rows = batch.getRowCount();
 
-        LOG.debug("Sending batch [seq={}, bytes={}, rows={}, bufferId={}]", batchSequence, bytes, rows, batch.getBatchId());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Sending batch [seq={}, bytes={}, rows={}, bufferId={}]", batchSequence, bytes, rows, batch.getBatchId());
+        }
 
         // Add to in-flight window BEFORE sending (so we're ready for ACK)
         // Use non-blocking tryAddInFlight since we already checked window space in ioLoop
         if (inFlightWindow != null) {
-            LOG.debug("Adding to in-flight window [seq={}, inFlight={}, max={}]", batchSequence, inFlightWindow.getInFlightCount(), inFlightWindow.getMaxWindowSize());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Adding to in-flight window [seq={}, inFlight={}, max={}]", batchSequence, inFlightWindow.getInFlightCount(), inFlightWindow.getMaxWindowSize());
+            }
             if (!inFlightWindow.tryAddInFlight(batchSequence)) {
                 // Should not happen since we checked hasWindowSpace before polling
                 throw new LineSenderException("In-flight window unexpectedly full");
             }
-            LOG.debug("Added to in-flight window [seq={}]", batchSequence);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Added to in-flight window [seq={}]", batchSequence);
+            }
         }
 
         // Send over WebSocket
-        LOG.debug("Calling sendBinary [seq={}]", batchSequence);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Calling sendBinary [seq={}]", batchSequence);
+        }
         client.sendBinary(batch.getBufferPtr(), bytes);
-        LOG.debug("sendBinary returned [seq={}]", batchSequence);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("sendBinary returned [seq={}]", batchSequence);
+        }
 
         // Update statistics
         totalBatchesSent.incrementAndGet();
@@ -573,7 +585,9 @@ public class WebSocketSendQueue implements QuietCloseable {
         // Transition state: SENDING -> RECYCLED
         batch.markRecycled();
 
-        LOG.debug("Batch sent and recycled [seq={}, bufferId={}]", batchSequence, batch.getBatchId());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Batch sent and recycled [seq={}, bufferId={}]", batchSequence, batch.getBatchId());
+        }
     }
 
     /**
@@ -639,8 +653,10 @@ public class WebSocketSendQueue implements QuietCloseable {
                     int acked = inFlightWindow.acknowledgeUpTo(sequence);
                     if (acked > 0) {
                         totalAcks.addAndGet(acked);
-                        LOG.debug("Cumulative ACK received [upTo={}, acked={}]", sequence, acked);
-                    } else {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("Cumulative ACK received [upTo={}, acked={}]", sequence, acked);
+                        }
+                    } else if (LOG.isDebugEnabled()) {
                         LOG.debug("ACK for already-acknowledged sequences [upTo={}]", sequence);
                     }
                 }
