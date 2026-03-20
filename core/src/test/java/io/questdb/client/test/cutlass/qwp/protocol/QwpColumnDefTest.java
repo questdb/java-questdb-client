@@ -80,7 +80,7 @@ public class QwpColumnDefTest {
         byte nullableChar = (byte) (QwpConstants.TYPE_CHAR | QwpConstants.TYPE_NULLABLE_FLAG);
         QwpColumnDef col = new QwpColumnDef("ch", nullableChar);
         col.validate();
-        assertTrue(col.isNullable());
+        assertTrue(col.hasNullBitmap());
         assertEquals(QwpConstants.TYPE_CHAR, col.getTypeCode());
     }
 

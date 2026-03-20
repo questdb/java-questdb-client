@@ -58,7 +58,7 @@ class QwpColumnWriter {
     ) {
         long dataAddr = col.getDataAddress();
 
-        if (colDef.isNullable()) {
+        if (colDef.hasNullBitmap()) {
             writeNullBitmap(col, rowCount);
         }
 

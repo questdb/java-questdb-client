@@ -703,7 +703,7 @@ public class QwpUdpSender implements Sender {
         return len;
     }
 
-    private QwpTableBuffer.ColumnBuffer acquireColumn(CharSequence name, byte type, boolean nullable) {
+    private QwpTableBuffer.ColumnBuffer acquireColumn(CharSequence name, byte type, boolean useNullBitmap) {
         QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getExistingColumn(name, type);
         if (col == null && currentTableBuffer.getRowCount() > 0) {
             // schema change while having some rows accumulated -> we flush committed rows of the current table
@@ -718,7 +718,7 @@ public class QwpUdpSender implements Sender {
         }
 
         if (col == null) {
-            col = currentTableBuffer.getOrCreateColumn(name, type, nullable);
+            col = currentTableBuffer.getOrCreateColumn(name, type, useNullBitmap);
         }
         return col;
     }
@@ -1043,7 +1043,7 @@ public class QwpUdpSender implements Sender {
         for (int i = 0; i < inProgressColumnCount; i++) {
             InProgressColumnState state = inProgressColumns[i];
             estimate += state.payloadEstimateDelta;
-            if (state.nullable) {
+            if (state.useNullBitmap) {
                 estimate += bitmapBytes(targetRows) - bitmapBytes(state.sizeBefore);
             }
         }
@@ -1343,7 +1343,7 @@ public class QwpUdpSender implements Sender {
         private int arrayDataOffsetBefore;
         private int arrayShapeOffsetBefore;
         private QwpTableBuffer.ColumnBuffer column;
-        private boolean nullable;
+        private boolean useNullBitmap;
         private long payloadEstimateDelta;
         private int sizeBefore;
         private long stringDataSizeBefore;
@@ -1356,13 +1356,13 @@ public class QwpUdpSender implements Sender {
 
         void clear() {
             column = null;
-            nullable = false;
+            useNullBitmap = false;
             payloadEstimateDelta = 0;
         }
 
         void of(QwpTableBuffer.ColumnBuffer column) {
             this.column = column;
-            this.nullable = column.usesNullBitmap();
+            this.useNullBitmap = column.usesNullBitmap();
             this.payloadEstimateDelta = 0;
             this.sizeBefore = column.getSize();
             this.valueCountBefore = column.getValueCount();
