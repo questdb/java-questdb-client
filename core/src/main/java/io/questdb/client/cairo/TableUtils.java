@@ -24,8 +24,10 @@
 
 package io.questdb.client.cairo;
 
+import org.jetbrains.annotations.NotNull;
+
 public final class TableUtils {
-    public static boolean isValidColumnName(CharSequence columnName, int fsFileNameLimit) {
+    public static boolean isValidColumnName(@NotNull CharSequence columnName, int fsFileNameLimit) {
         final int length = columnName.length();
         if (length > fsFileNameLimit) {
             // Most file systems do not support file names longer than 255 bytes
