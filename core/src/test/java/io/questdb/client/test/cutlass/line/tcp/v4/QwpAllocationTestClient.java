@@ -115,6 +115,7 @@ public class QwpAllocationTestClient {
         int warmupRows = DEFAULT_WARMUP_ROWS;
         int reportInterval = DEFAULT_REPORT_INTERVAL;
         int targetThroughput = DEFAULT_TARGET_THROUGHPUT;
+        boolean isDropTable = true;
 
         for (String arg : args) {
             if (arg.equals("--help") || arg.equals("-h")) {
@@ -146,6 +147,8 @@ public class QwpAllocationTestClient {
                 targetThroughput = Integer.parseInt(arg.substring("--target-throughput=".length()));
             } else if (arg.equals("--no-warmup")) {
                 warmupRows = 0;
+            } else if (arg.equals("--no-drop")) {
+                isDropTable = false;
             } else if (!arg.startsWith("--")) {
                 // Legacy positional args: protocol [host] [port] [rows]
                 protocol = arg.toLowerCase();
@@ -178,7 +181,11 @@ public class QwpAllocationTestClient {
         System.out.println();
 
         try {
-            recreateTable(host);
+            if (isDropTable) {
+                recreateTable(host);
+            } else {
+                System.out.println("Skipping table drop (--no-drop)");
+            }
             runTest(protocol, host, port, totalRows, batchSize, flushBytes, flushIntervalMs,
                     inFlightWindow, maxDatagramSize, warmupRows, reportInterval, targetThroughput);
         } catch (Exception e) {
@@ -277,6 +284,7 @@ public class QwpAllocationTestClient {
         System.out.println("  --report=N               Report progress every N rows (default: 1000000)");
         System.out.println("  --target-throughput=N     Target throughput in rows/sec (0 = unlimited, default: 0)");
         System.out.println("  --no-warmup              Skip warmup phase");
+        System.out.println("  --no-drop                Don't drop/recreate the table (for parallel clients)");
         System.out.println("  --help                   Show this help");
         System.out.println();
         System.out.println("Protocols:");
