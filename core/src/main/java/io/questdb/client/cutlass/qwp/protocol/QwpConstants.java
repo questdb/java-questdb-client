@@ -210,14 +210,6 @@ public final class QwpConstants {
      */
     public static final byte TYPE_LONG_ARRAY = 0x12;
     /**
-     * Mask for type code without nullable flag.
-     */
-    public static final byte TYPE_MASK = 0x7F;
-    /**
-     * High bit indicating nullable column.
-     */
-    public static final byte TYPE_NULLABLE_FLAG = (byte) 0x80;
-    /**
      * Column type: SHORT (int16, little-endian).
      */
     public static final byte TYPE_SHORT = 0x03;
