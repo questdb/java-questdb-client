@@ -189,18 +189,16 @@ public class QwpSchemaHashTest {
     }
 
     @Test
-    public void testNullableFlagAffectsHash() {
+    public void testDifferentTypeCodesProduceDifferentHashes() {
         String[] names = {"value"};
 
-        // Non-nullable
         byte[] types1 = {0x05}; // LONG
-        // Nullable (high bit set)
-        byte[] types2 = {(byte) 0x85}; // LONG | 0x80
+        byte[] types2 = {0x06}; // DOUBLE
 
         long hash1 = QwpSchemaHash.computeSchemaHash(names, types1);
         long hash2 = QwpSchemaHash.computeSchemaHash(names, types2);
 
-        Assert.assertNotEquals("Nullable flag should affect hash", hash1, hash2);
+        Assert.assertNotEquals("Different types should produce different hashes", hash1, hash2);
     }
 
     @Test

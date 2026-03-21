@@ -2164,8 +2164,15 @@ public class QwpUdpSenderTest {
         }
 
         private ColumnValues decodeColumn(QwpColumnDef def, int rowCount) {
-            boolean[] nulls = def.hasNullBitmap() ? reader.readNullBitmap(rowCount) : new boolean[rowCount];
-            int valueCount = rowCount - countNulls(nulls);
+            boolean hasNullBitmap = reader.readByte() != 0;
+            boolean[] nulls = hasNullBitmap ? reader.readNullBitmap(rowCount) : new boolean[rowCount];
+            int nullCount = 0;
+            for (boolean isNull : nulls) {
+                if (isNull) {
+                    nullCount++;
+                }
+            }
+            int valueCount = rowCount - nullCount;
             Object[] values = new Object[rowCount];
 
             switch (def.getTypeCode()) {

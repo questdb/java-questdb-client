@@ -29,7 +29,6 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 
 public class QwpColumnDefTest {
 
@@ -74,14 +73,12 @@ public class QwpColumnDefTest {
         assertEquals(QwpConstants.TYPE_CHAR, col.getTypeCode());
     }
 
-    @Test
-    public void testValidateNullableCharType() {
-        // TYPE_CHAR with nullable flag must also pass
-        byte nullableChar = (byte) (QwpConstants.TYPE_CHAR | QwpConstants.TYPE_NULLABLE_FLAG);
-        QwpColumnDef col = new QwpColumnDef("ch", nullableChar);
+    @Test(expected = IllegalArgumentException.class)
+    public void testValidateRejectsHighBit() {
+        // The high bit is not a valid part of the type code
+        byte badType = (byte) (QwpConstants.TYPE_CHAR | 0x80);
+        QwpColumnDef col = new QwpColumnDef("ch", badType);
         col.validate();
-        assertTrue(col.hasNullBitmap());
-        assertEquals(QwpConstants.TYPE_CHAR, col.getTypeCode());
     }
 
     @Test(expected = IllegalArgumentException.class)

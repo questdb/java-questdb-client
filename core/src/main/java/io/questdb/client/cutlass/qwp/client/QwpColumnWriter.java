@@ -58,9 +58,7 @@ class QwpColumnWriter {
     ) {
         long dataAddr = col.getDataAddress();
 
-        if (colDef.hasNullBitmap()) {
-            writeNullBitmap(col, rowCount);
-        }
+        writeNullHeader(col, rowCount, rowCount - valueCount);
 
         switch (col.getType()) {
             case TYPE_BOOLEAN:
@@ -281,16 +279,15 @@ class QwpColumnWriter {
         }
     }
 
-    private void writeNullBitmap(QwpTableBuffer.ColumnBuffer col, int rowCount) {
-        long nullAddr = col.getNullBitmapAddress();
-        if (nullAddr != 0) {
+    private void writeNullHeader(QwpTableBuffer.ColumnBuffer col, int rowCount, int nullCount) {
+        if (nullCount > 0) {
+            buffer.putByte((byte) 1);
+            col.ensureNullBitmapCapacity(rowCount);
+            long nullAddr = col.getNullBitmapAddress();
             int bitmapSize = (rowCount + 7) / 8;
             buffer.putBlockOfBytes(nullAddr, bitmapSize);
         } else {
-            int bitmapSize = (rowCount + 7) / 8;
-            for (int i = 0; i < bitmapSize; i++) {
-                buffer.putByte((byte) 0);
-            }
+            buffer.putByte((byte) 0);
         }
     }
 

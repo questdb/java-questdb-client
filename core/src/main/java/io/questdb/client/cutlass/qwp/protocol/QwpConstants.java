@@ -269,7 +269,7 @@ public final class QwpConstants {
      * @return size in bytes, 0 for bit-packed (BOOLEAN), or -1 for variable-width types
      */
     public static int getFixedTypeSize(byte typeCode) {
-        int code = typeCode & TYPE_MASK;
+        int code = typeCode;
         switch (code) {
             case TYPE_BOOLEAN:
                 return 0; // Special: bit-packed
@@ -308,8 +308,7 @@ public final class QwpConstants {
      * @return type name
      */
     public static String getTypeName(byte typeCode) {
-        int code = typeCode & TYPE_MASK;
-        boolean hasNullBitmap = (typeCode & TYPE_NULLABLE_FLAG) != 0;
+        int code = typeCode;
         String name;
         switch (code) {
             case TYPE_BOOLEAN:
@@ -382,7 +381,7 @@ public final class QwpConstants {
                 name = "UNKNOWN(" + code + ")";
                 break;
         }
-        return hasNullBitmap ? name + "?" : name;
+        return name;
     }
 
     /**
@@ -392,7 +391,7 @@ public final class QwpConstants {
      * @return true if fixed-width
      */
     public static boolean isFixedWidthType(byte typeCode) {
-        int code = typeCode & TYPE_MASK;
+        int code = typeCode;
         return code == TYPE_BOOLEAN ||
                 code == TYPE_BYTE ||
                 code == TYPE_SHORT ||
