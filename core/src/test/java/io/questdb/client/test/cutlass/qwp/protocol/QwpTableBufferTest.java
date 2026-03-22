@@ -329,6 +329,29 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testAddSymbolWithGlobalIdStoresOnlyGlobalIds() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("sym", QwpConstants.TYPE_SYMBOL, true);
+                col.addSymbolWithGlobalId("alpha", 7);
+                table.nextRow();
+                col.addSymbolWithGlobalId("beta", 11);
+                table.nextRow();
+
+                assertEquals(2, col.getSize());
+                assertEquals(2, col.getValueCount());
+                assertEquals(0, col.getSymbolDictionarySize());
+                assertEquals(0, col.getAuxDataAddress());
+                assertEquals(11, col.getMaxGlobalSymbolId());
+
+                long dataAddress = col.getDataAddress();
+                assertEquals(7, Unsafe.getUnsafe().getInt(dataAddress));
+                assertEquals(11, Unsafe.getUnsafe().getInt(dataAddress + Integer.BYTES));
+            }
+        });
+    }
+
+    @Test
     public void testCancelRowResetsDecimalScaleOnLateAddedColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
@@ -402,6 +425,31 @@ public class QwpTableBufferTest {
                 String[] dict = colS.getSymbolDictionary();
                 assertEquals(1, dict.length);
                 assertEquals("fresh", dict[0]);
+            }
+        });
+    }
+
+    @Test
+    public void testCancelRowRetainsGlobalSymbolIdWithoutLocalDictionary() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(0);
+                table.nextRow();
+
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                QwpTableBuffer.ColumnBuffer colS = table.getOrCreateColumn("s", QwpConstants.TYPE_SYMBOL, true);
+                colS.addSymbolWithGlobalId("stale", 4);
+                table.cancelCurrentRow();
+
+                table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
+                colS.addSymbolWithGlobalId("fresh", 9);
+                table.nextRow();
+
+                assertEquals(2, colS.getSize());
+                assertEquals(1, colS.getValueCount());
+                assertEquals(0, colS.getSymbolDictionarySize());
+                assertEquals(9, colS.getMaxGlobalSymbolId());
+                assertEquals(9, Unsafe.getUnsafe().getInt(colS.getDataAddress()));
             }
         });
     }
