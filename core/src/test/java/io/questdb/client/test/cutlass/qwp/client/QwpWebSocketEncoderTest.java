@@ -994,6 +994,7 @@ public class QwpWebSocketEncoderTest {
                 Assert.assertEquals(SCHEMA_MODE_FULL, cursor.readByte());
                 Assert.assertEquals("ticker", cursor.readString());
                 Assert.assertEquals(TYPE_SYMBOL, cursor.readByte());
+                Assert.assertEquals(0, cursor.readByte()); // no nulls
                 Assert.assertEquals(5, cursor.readVarint());
                 Assert.assertEquals(7, cursor.readVarint());
             }

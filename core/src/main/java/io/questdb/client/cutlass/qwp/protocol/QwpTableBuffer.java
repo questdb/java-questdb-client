@@ -1132,9 +1132,6 @@ public class QwpTableBuffer implements QuietCloseable {
                 addNull();
                 return;
             }
-            if (auxBuffer == null) {
-                auxBuffer = new OffHeapAppendMemory(64);
-            }
             if (!storeGlobalSymbolIdsOnly) {
                 if (symbolList != null && symbolList.size() > 0) {
                     int localIdx = getOrAddLocalSymbol(value);
