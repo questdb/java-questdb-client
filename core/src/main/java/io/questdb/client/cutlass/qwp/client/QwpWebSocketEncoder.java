@@ -40,6 +40,8 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
     private NativeBufferWriter buffer;
     private byte flags;
+    private int payloadStart;
+    private byte savedFlags;
 
     public QwpWebSocketEncoder() {
         this.buffer = new NativeBufferWriter();
@@ -49,6 +51,32 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     public QwpWebSocketEncoder(int bufferSize) {
         this.buffer = new NativeBufferWriter(bufferSize);
         this.flags = 0;
+    }
+
+    public void addTable(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
+        columnWriter.encodeTable(tableBuffer, useSchemaRef, true, isGorillaEnabled());
+    }
+
+    public void beginMessage(
+            int tableCount,
+            GlobalSymbolDictionary globalDict,
+            int confirmedMaxId,
+            int batchMaxId
+    ) {
+        buffer.reset();
+        int deltaStart = confirmedMaxId + 1;
+        int deltaCount = Math.max(0, batchMaxId - confirmedMaxId);
+        savedFlags = flags;
+        flags |= FLAG_DELTA_SYMBOL_DICT;
+        writeHeader(tableCount, 0);
+        payloadStart = buffer.getPosition();
+        buffer.putVarint(deltaStart);
+        buffer.putVarint(deltaCount);
+        for (int id = deltaStart; id < deltaStart + deltaCount; id++) {
+            String symbol = globalDict.getSymbol(id);
+            buffer.putString(symbol);
+        }
+        columnWriter.setBuffer(buffer);
     }
 
     @Override
@@ -77,21 +105,12 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             int batchMaxId,
             boolean useSchemaRef
     ) {
-        buffer.reset();
-        int deltaStart = confirmedMaxId + 1;
-        int deltaCount = Math.max(0, batchMaxId - confirmedMaxId);
-        byte savedFlags = flags;
-        flags |= FLAG_DELTA_SYMBOL_DICT;
-        writeHeader(1, 0);
-        int payloadStart = buffer.getPosition();
-        buffer.putVarint(deltaStart);
-        buffer.putVarint(deltaCount);
-        for (int id = deltaStart; id < deltaStart + deltaCount; id++) {
-            String symbol = globalDict.getSymbol(id);
-            buffer.putString(symbol);
-        }
-        columnWriter.setBuffer(buffer);
-        columnWriter.encodeTable(tableBuffer, useSchemaRef, true, isGorillaEnabled());
+        beginMessage(1, globalDict, confirmedMaxId, batchMaxId);
+        addTable(tableBuffer, useSchemaRef);
+        return finishMessage();
+    }
+
+    public int finishMessage() {
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
         flags = savedFlags;

@@ -1057,7 +1057,7 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Flushes pending rows by encoding and sending them.
-     * Each table's rows are encoded into a separate QWP v1 message and sent as one WebSocket frame.
+     * All non-empty tables are encoded into a single QWP v1 message and sent as one WebSocket frame.
      */
     private void flushPendingRows() {
         if (pendingRowCount <= 0) {
@@ -1068,72 +1068,92 @@ public class QwpWebSocketSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
+        ObjList<CharSequence> keys = tableBuffers.keys();
+
+        // Count non-empty tables for the message header
+        int tableCount = 0;
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
+                tableCount++;
+            }
+        }
+
+        if (tableCount == 0) {
+            pendingBytes = 0;
+            pendingRowCount = 0;
+            firstPendingRowTimeNanos = 0;
+            return;
+        }
+
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Flushing pending rows [count={}, tables={}]", pendingRowCount, tableBuffers.size());
+            LOG.debug("Flushing pending rows [count={}, tables={}]", pendingRowCount, tableCount);
         }
 
         // Ensure activeBuffer is ready for writing
         // It might be in RECYCLED state if previous batch was sent but we didn't swap yet
         ensureActiveBufferReady();
 
-        // Encode all table buffers that have data
-        // Iterate over the keys list directly
-        ObjList<CharSequence> keys = tableBuffers.keys();
+        // Encode all non-empty tables into a single QWP v1 message
+        encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
-                continue; // Skip null entries (shouldn't happen but be safe)
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer == null) {
                 continue;
             }
-            int rowCount = tableBuffer.getRowCount();
-            if (rowCount > 0) {
-                // Check if this schema has been sent before (use schema reference mode if so)
-                // Combined key includes table name since server caches by (tableName, schemaHash)
-                long schemaHash = tableBuffer.getSchemaHash();
-                long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
-                boolean useSchemaRef = sentSchemaHashes.contains(schemaKey);
-
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, rowCount, maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
-                }
-
-                // Encode this table's rows with delta symbol dictionary
-                int messageSize = encoder.encodeWithDeltaDict(
-                        tableBuffer,
-                        globalSymbolDictionary,
-                        maxSentSymbolId,
-                        currentBatchMaxSymbolId,
-                        useSchemaRef
-                );
-
-                QwpBufferWriter buffer = encoder.getBuffer();
-
-                // Copy to microbatch buffer and seal immediately
-                // Each QWP v1 message must be in its own WebSocket frame
-                activeBuffer.ensureCapacity(messageSize);
-                activeBuffer.write(buffer.getBufferPtr(), messageSize);
-                activeBuffer.incrementRowCount();
-
-                // Seal and enqueue for sending
-                sealAndSwapBuffer();
-
-                // Update sent state only after successful enqueue.
-                // If sealAndSwapBuffer() threw, these remain unchanged so the
-                // next batch's delta dictionary will correctly re-include the
-                // symbols and schema that the server never received.
-                maxSentSymbolId = currentBatchMaxSymbolId;
-                if (!useSchemaRef) {
-                    sentSchemaHashes.add(schemaKey);
-                }
-
-                // Reset table buffer and batch-level symbol tracking
-                tableBuffer.reset();
-                currentBatchMaxSymbolId = -1;
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                continue;
             }
+
+            long schemaHash = tableBuffer.getSchemaHash();
+            long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
+            boolean useSchemaRef = sentSchemaHashes.contains(schemaKey);
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, tableBuffer.getRowCount(), maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
+            }
+
+            encoder.addTable(tableBuffer, useSchemaRef);
         }
+        int messageSize = encoder.finishMessage();
+
+        QwpBufferWriter buffer = encoder.getBuffer();
+
+        // Copy the single multi-table message to the microbatch buffer and seal
+        activeBuffer.ensureCapacity(messageSize);
+        activeBuffer.write(buffer.getBufferPtr(), messageSize);
+        activeBuffer.incrementRowCount();
+        sealAndSwapBuffer();
+
+        // Update sent state only after successful enqueue.
+        // If sealAndSwapBuffer() threw, these remain unchanged so the
+        // next batch's delta dictionary will correctly re-include the
+        // symbols and schema that the server never received.
+        maxSentSymbolId = currentBatchMaxSymbolId;
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                continue;
+            }
+
+            long schemaHash = tableBuffer.getSchemaHash();
+            long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
+            if (!sentSchemaHashes.contains(schemaKey)) {
+                sentSchemaHashes.add(schemaKey);
+            }
+
+            tableBuffer.reset();
+        }
+        currentBatchMaxSymbolId = -1;
 
         // Reset pending count
         pendingBytes = 0;
@@ -1154,12 +1174,34 @@ public class QwpWebSocketSender implements Sender {
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Sync flush [pendingRows={}, tables={}]", pendingRowCount, tableBuffers.size());
+        ObjList<CharSequence> keys = tableBuffers.keys();
+
+        // Count non-empty tables for the message header
+        int tableCount = 0;
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
+                tableCount++;
+            }
         }
 
-        // Encode all table buffers that have data into a single message
-        ObjList<CharSequence> keys = tableBuffers.keys();
+        if (tableCount == 0) {
+            pendingBytes = 0;
+            pendingRowCount = 0;
+            firstPendingRowTimeNanos = 0;
+            return;
+        }
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Sync flush [pendingRows={}, tables={}]", pendingRowCount, tableCount);
+        }
+
+        // Encode all non-empty tables into a single QWP v1 message
+        encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -1170,64 +1212,68 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             }
 
-            // Check if this schema has been sent before (use schema reference mode if so)
-            // Combined key includes table name since server caches by (tableName, schemaHash)
             long schemaHash = tableBuffer.getSchemaHash();
             long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
             boolean useSchemaRef = sentSchemaHashes.contains(schemaKey);
 
-            // Encode this table's rows with delta symbol dictionary
-            int messageSize = encoder.encodeWithDeltaDict(
-                    tableBuffer,
-                    globalSymbolDictionary,
-                    maxSentSymbolId,
-                    currentBatchMaxSymbolId,
-                    useSchemaRef
-            );
-
-            if (messageSize > 0) {
-                QwpBufferWriter buffer = encoder.getBuffer();
-
-                // Track batch in InFlightWindow before sending
-                long batchSequence = nextBatchSequence++;
-                inFlightWindow.addInFlight(batchSequence);
-
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("Sending sync batch [seq={}, bytes={}, rows={}, maxSentSymbolId={}, useSchemaRef={}]", batchSequence, messageSize, tableBuffer.getRowCount(), currentBatchMaxSymbolId, useSchemaRef);
-                }
-
-                // Send over WebSocket and fail the in-flight entry if send throws,
-                // so close() does not hang waiting for an ACK that will never arrive.
-                try {
-                    client.sendBinary(buffer.getBufferPtr(), messageSize);
-                } catch (LineSenderException e) {
-                    failExpectedIfNeeded(batchSequence, e);
-                    throw e;
-                } catch (Throwable t) {
-                    LineSenderException error = new LineSenderException("Failed to send batch " + batchSequence, t);
-                    failExpectedIfNeeded(batchSequence, error);
-                    throw error;
-                }
-
-                // Wait for ACK synchronously
-                waitForAck(batchSequence);
-
-                // Update sent state only after successful send + ACK.
-                // If sendBinary() or waitForAck() threw, these remain unchanged
-                // so the next batch's delta dictionary will correctly re-include
-                // the symbols and schema that the server never received.
-                maxSentSymbolId = currentBatchMaxSymbolId;
-                if (!useSchemaRef) {
-                    sentSchemaHashes.add(schemaKey);
-                }
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, tableBuffer.getRowCount(), maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
             }
 
-            // Reset table buffer after sending
-            tableBuffer.reset();
-
-            // Reset batch-level symbol tracking
-            currentBatchMaxSymbolId = -1;
+            encoder.addTable(tableBuffer, useSchemaRef);
         }
+        int messageSize = encoder.finishMessage();
+
+        QwpBufferWriter buffer = encoder.getBuffer();
+
+        // Track batch in InFlightWindow before sending
+        long batchSequence = nextBatchSequence++;
+        inFlightWindow.addInFlight(batchSequence);
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Sending sync batch [seq={}, bytes={}, tables={}, maxSentSymbolId={}]", batchSequence, messageSize, tableCount, currentBatchMaxSymbolId);
+        }
+
+        // Send over WebSocket and fail the in-flight entry if send throws,
+        // so close() does not hang waiting for an ACK that will never arrive.
+        try {
+            client.sendBinary(buffer.getBufferPtr(), messageSize);
+        } catch (LineSenderException e) {
+            failExpectedIfNeeded(batchSequence, e);
+            throw e;
+        } catch (Throwable t) {
+            LineSenderException error = new LineSenderException("Failed to send batch " + batchSequence, t);
+            failExpectedIfNeeded(batchSequence, error);
+            throw error;
+        }
+
+        // Wait for ACK synchronously
+        waitForAck(batchSequence);
+
+        // Update sent state only after successful send + ACK.
+        // If sendBinary() or waitForAck() threw, these remain unchanged
+        // so the next batch's delta dictionary will correctly re-include
+        // the symbols and schema that the server never received.
+        maxSentSymbolId = currentBatchMaxSymbolId;
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                continue;
+            }
+
+            long schemaHash = tableBuffer.getSchemaHash();
+            long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
+            if (!sentSchemaHashes.contains(schemaKey)) {
+                sentSchemaHashes.add(schemaKey);
+            }
+
+            tableBuffer.reset();
+        }
+        currentBatchMaxSymbolId = -1;
 
         // Reset pending row tracking
         pendingBytes = 0;
