@@ -2224,6 +2224,12 @@ public class QwpUdpSenderTest {
                     values[row] = null;
                 } else {
                     byte[] bytes = reader.readBytes(width);
+                    // wire format is little-endian; BigInteger expects big-endian
+                    for (int lo = 0, hi = bytes.length - 1; lo < hi; lo++, hi--) {
+                        byte tmp = bytes[lo];
+                        bytes[lo] = bytes[hi];
+                        bytes[hi] = tmp;
+                    }
                     values[row] = new BigDecimal(new BigInteger(bytes), scale);
                     valueIndex++;
                 }
