@@ -1014,6 +1014,8 @@ public class QwpWebSocketSender implements Sender {
 
             // Connect and upgrade to WebSocket
             try {
+                client.setQwpMaxVersion(MAX_SUPPORTED_VERSION);
+                client.setQwpClientId(CLIENT_ID);
                 client.connect(host, port);
                 client.upgrade(WRITE_PATH, authorizationHeader);
             } catch (Exception e) {
@@ -1041,11 +1043,15 @@ public class QwpWebSocketSender implements Sender {
             }
             // Sync mode (window=1): no send queue - we send and read ACKs synchronously
 
+            // Use the version selected by the server
+            encoder.setVersion((byte) client.getServerQwpVersion());
+
             // Clear sent schema hashes - server starts fresh on each connection
             sentSchemaHashes.clear();
 
             connected = true;
-            LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}]", host, port, inFlightWindowSize);
+            LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
+                    host, port, inFlightWindowSize, client.getServerQwpVersion());
         }
     }
 

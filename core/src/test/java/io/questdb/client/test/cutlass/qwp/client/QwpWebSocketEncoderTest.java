@@ -43,6 +43,34 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class QwpWebSocketEncoderTest {
 
     @Test
+    public void testVersionByteInHeader() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("test")) {
+
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
+                col.addLong(42);
+                buffer.nextRow();
+
+                // Default version
+                int size = encoder.encode(buffer, false);
+                Assert.assertTrue(size > 0);
+                long ptr = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(1, Unsafe.getUnsafe().getByte(ptr + 4));
+
+                // Custom version
+                buffer.reset();
+                col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
+                col.addLong(42);
+                buffer.nextRow();
+                encoder.setVersion((byte) 3);
+                encoder.encode(buffer, false);
+                Assert.assertEquals(3, Unsafe.getUnsafe().getByte(ptr + 4));
+            }
+        });
+    }
+
+    @Test
     public void testBufferResetAndReuse() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();

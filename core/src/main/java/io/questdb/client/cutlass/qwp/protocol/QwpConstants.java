@@ -241,9 +241,17 @@ public final class QwpConstants {
      */
     public static final byte TYPE_VARCHAR = 0x0F;
     /**
+     * Client identifier sent in the X-QWP-Client-Id upgrade header.
+     */
+    public static final String CLIENT_ID = "java/1.0.2";
+    /**
      * Current protocol version.
      */
     public static final byte VERSION_1 = 1;
+    /**
+     * Maximum protocol version supported by this client.
+     */
+    public static final byte MAX_SUPPORTED_VERSION = VERSION_1;
 
     private QwpConstants() {
         // utility class

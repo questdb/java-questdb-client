@@ -42,6 +42,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     private byte flags;
     private int payloadStart;
     private byte savedFlags;
+    private byte version = VERSION_1;
 
     public QwpWebSocketEncoder() {
         this.buffer = new NativeBufferWriter();
@@ -133,12 +134,16 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
+    public void setVersion(byte version) {
+        this.version = version;
+    }
+
     public void writeHeader(int tableCount, int payloadLength) {
         buffer.putByte((byte) 'Q');
         buffer.putByte((byte) 'W');
         buffer.putByte((byte) 'P');
         buffer.putByte((byte) '1');
-        buffer.putByte(VERSION_1);
+        buffer.putByte(version);
         buffer.putByte(flags);
         buffer.putShort((short) tableCount);
         buffer.putInt(payloadLength);

@@ -98,6 +98,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     // Connection state
     private CharSequence host;
     private int port;
+    // QWP version negotiation
+    private String qwpClientId;
+    private int qwpMaxVersion = 1;
+    private int serverQwpVersion = 1;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
@@ -229,6 +233,13 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public int getPort() {
         return port;
+    }
+
+    /**
+     * Returns the QWP version selected by the server during the upgrade handshake.
+     */
+    public int getServerQwpVersion() {
+        return serverQwpVersion;
     }
 
     /**
@@ -381,6 +392,20 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Sets the QWP client identifier sent in the X-QWP-Client-Id upgrade header.
+     */
+    public void setQwpClientId(String clientId) {
+        this.qwpClientId = clientId;
+    }
+
+    /**
+     * Sets the maximum QWP version this client supports, sent in the X-QWP-Max-Version upgrade header.
+     */
+    public void setQwpMaxVersion(int maxVersion) {
+        this.qwpMaxVersion = maxVersion;
+    }
+
+    /**
      * Performs WebSocket upgrade handshake.
      *
      * @param path                the WebSocket endpoint path (e.g., "/ws")
@@ -423,6 +448,14 @@ public abstract class WebSocketClient implements QuietCloseable {
         sendBuffer.putAscii(handshakeKey);
         sendBuffer.putAscii("\r\n");
         sendBuffer.putAscii("Sec-WebSocket-Version: 13\r\n");
+        sendBuffer.putAscii("X-QWP-Max-Version: ");
+        sendBuffer.putAscii(Integer.toString(qwpMaxVersion));
+        sendBuffer.putAscii("\r\n");
+        if (qwpClientId != null) {
+            sendBuffer.putAscii("X-QWP-Client-Id: ");
+            sendBuffer.putAscii(qwpClientId);
+            sendBuffer.putAscii("\r\n");
+        }
         if (authorizationHeader != null) {
             sendBuffer.putAscii("Authorization: ");
             sendBuffer.putAscii(authorizationHeader);
@@ -889,6 +922,30 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (!containsHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept, false)) {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
+
+        // Extract X-QWP-Version (optional — defaults to 1 if absent)
+        serverQwpVersion = extractIntHeader(response, "X-QWP-Version:", 1);
+    }
+
+    private static int extractIntHeader(String response, String headerName, int defaultValue) {
+        int headerLen = headerName.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, headerName, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                try {
+                    return Integer.parseInt(value);
+                } catch (NumberFormatException e) {
+                    return defaultValue;
+                }
+            }
+        }
+        return defaultValue;
     }
 
     protected void dieWaiting(int n) {
