@@ -194,8 +194,8 @@ class QwpColumnWriter {
             long offset = (long) i * 16;
             long hi = Unsafe.getUnsafe().getLong(addr + offset);
             long lo = Unsafe.getUnsafe().getLong(addr + offset + 8);
-            buffer.putLong(hi);
             buffer.putLong(lo);
+            buffer.putLong(hi);
         }
     }
 
@@ -203,10 +203,10 @@ class QwpColumnWriter {
         buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
             long offset = (long) i * 32;
-            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset));
-            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset + 8));
-            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset + 16));
             buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset + 24));
+            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset + 16));
+            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset + 8));
+            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset));
         }
     }
 
