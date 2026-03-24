@@ -311,15 +311,6 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Writes a long value in big-endian format.
-     */
-    public void putLongBE(long value) {
-        ensureCapacity(8);
-        Unsafe.getUnsafe().putLong(bufPtr + writePos, Long.reverseBytes(value));
-        writePos += 8;
-    }
-
-    /**
      * Writes a short value in little-endian format.
      */
     public void putShort(short value) {

@@ -194,8 +194,8 @@ class QwpColumnWriter {
             long offset = (long) i * 16;
             long hi = Unsafe.getUnsafe().getLong(addr + offset);
             long lo = Unsafe.getUnsafe().getLong(addr + offset + 8);
-            buffer.putLongBE(hi);
-            buffer.putLongBE(lo);
+            buffer.putLong(hi);
+            buffer.putLong(lo);
         }
     }
 
@@ -203,17 +203,17 @@ class QwpColumnWriter {
         buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
             long offset = (long) i * 32;
-            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + offset));
-            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + offset + 8));
-            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + offset + 16));
-            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + offset + 24));
+            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset));
+            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset + 8));
+            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset + 16));
+            buffer.putLong(Unsafe.getUnsafe().getLong(addr + offset + 24));
         }
     }
 
     private void writeDecimal64Column(byte scale, long addr, int count) {
         buffer.putByte(scale);
         for (int i = 0; i < count; i++) {
-            buffer.putLongBE(Unsafe.getUnsafe().getLong(addr + (long) i * 8));
+            buffer.putLong(Unsafe.getUnsafe().getLong(addr + (long) i * 8));
         }
     }
 

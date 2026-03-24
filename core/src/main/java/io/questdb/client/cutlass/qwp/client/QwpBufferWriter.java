@@ -39,8 +39,7 @@ import io.questdb.client.cutlass.line.array.ArrayBufferAppender;
  *   <li>{@link io.questdb.client.cutlass.http.client.WebSocketSendBuffer} - WebSocket frame buffer</li>
  * </ul>
  * <p>
- * All multi-byte values are written in little-endian format unless the method
- * name explicitly indicates big-endian (e.g., {@link #putLongBE}).
+ * All multi-byte values are written in little-endian format.
  */
 public interface QwpBufferWriter extends ArrayBufferAppender {
 
@@ -84,11 +83,6 @@ public interface QwpBufferWriter extends ArrayBufferAppender {
      * Writes a float (4 bytes, little-endian).
      */
     void putFloat(float value);
-
-    /**
-     * Writes a long in big-endian byte order.
-     */
-    void putLongBE(long value);
 
     /**
      * Writes a short (2 bytes, little-endian).

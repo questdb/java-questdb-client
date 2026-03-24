@@ -117,11 +117,6 @@ final class SegmentedNativeBufferWriter implements QwpBufferWriter, QuietCloseab
     }
 
     @Override
-    public void putLongBE(long value) {
-        currentChunk.putLongBE(value);
-    }
-
-    @Override
     public void putShort(short value) {
         currentChunk.putShort(value);
     }

@@ -212,16 +212,6 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Writes a long in big-endian order.
-     */
-    @Override
-    public void putLongBE(long value) {
-        ensureCapacity(8);
-        Unsafe.getUnsafe().putLong(bufferPtr + position, Long.reverseBytes(value));
-        position += 8;
-    }
-
-    /**
      * Writes a short (2 bytes, little-endian).
      */
     @Override

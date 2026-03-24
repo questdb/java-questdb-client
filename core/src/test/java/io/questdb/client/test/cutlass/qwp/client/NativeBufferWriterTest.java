@@ -380,26 +380,6 @@ public class NativeBufferWriterTest {
     }
 
     @Test
-    public void testWriteLongBigEndian() throws Exception {
-        assertMemoryLeak(() -> {
-            try (NativeBufferWriter writer = new NativeBufferWriter()) {
-                writer.putLongBE(0x0102030405060708L);
-                Assert.assertEquals(8, writer.getPosition());
-                // Check big-endian byte order
-                long ptr = writer.getBufferPtr();
-                Assert.assertEquals((byte) 0x01, Unsafe.getUnsafe().getByte(ptr));
-                Assert.assertEquals((byte) 0x02, Unsafe.getUnsafe().getByte(ptr + 1));
-                Assert.assertEquals((byte) 0x03, Unsafe.getUnsafe().getByte(ptr + 2));
-                Assert.assertEquals((byte) 0x04, Unsafe.getUnsafe().getByte(ptr + 3));
-                Assert.assertEquals((byte) 0x05, Unsafe.getUnsafe().getByte(ptr + 4));
-                Assert.assertEquals((byte) 0x06, Unsafe.getUnsafe().getByte(ptr + 5));
-                Assert.assertEquals((byte) 0x07, Unsafe.getUnsafe().getByte(ptr + 6));
-                Assert.assertEquals((byte) 0x08, Unsafe.getUnsafe().getByte(ptr + 7));
-            }
-        });
-    }
-
-    @Test
     public void testWriteNullString() throws Exception {
         assertMemoryLeak(() -> {
             try (NativeBufferWriter writer = new NativeBufferWriter()) {
