@@ -205,11 +205,16 @@ public class WebSocketSendQueue implements QuietCloseable {
         }
         ioThread.interrupt();
 
-        // Wait for I/O thread to finish
-        try {
-            shutdownLatch.await(shutdownTimeoutMs, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        // Wait for I/O thread to finish before allowing the caller to free
+        // the socket and client-owned native buffers. If a send/recv call is
+        // still blocked, disconnect the socket to force it to unwind.
+        if (!awaitShutdown(shutdownTimeoutMs)) {
+            LOG.warn("I/O thread did not stop within {}ms, disconnecting socket", shutdownTimeoutMs);
+            client.disconnect();
+            ioThread.interrupt();
+            if (!awaitShutdown(shutdownTimeoutMs)) {
+                throw new LineSenderException("Timed out waiting for WebSocket I/O thread to stop");
+            }
         }
 
         LOG.info("WebSocket send queue closed [totalBatches={}, totalBytes={}]", totalBatchesSent.get(), totalBytesSent.get());
@@ -501,6 +506,15 @@ public class WebSocketSendQueue implements QuietCloseable {
 
     private boolean isPendingEmpty() {
         return pendingBuffer == null;
+    }
+
+    private boolean awaitShutdown(long timeoutMs) {
+        try {
+            return shutdownLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return shutdownLatch.getCount() == 0;
+        }
     }
 
     private boolean offerPending(MicrobatchBuffer buffer) {

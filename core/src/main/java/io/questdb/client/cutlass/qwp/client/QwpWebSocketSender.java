@@ -39,6 +39,7 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.LongHashSet;
+import io.questdb.client.std.Misc;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
@@ -403,6 +404,7 @@ public class QwpWebSocketSender implements Sender {
     public void close() {
         if (!closed) {
             closed = true;
+            boolean ioThreadStopped = true;
 
             // Flush any remaining data
             try {
@@ -436,8 +438,14 @@ public class QwpWebSocketSender implements Sender {
                 try {
                     sendQueue.close();
                 } catch (Exception e) {
+                    ioThreadStopped = false;
                     LOG.error("Error closing send queue: {}", String.valueOf(e));
                 }
+            }
+
+            if (!ioThreadStopped) {
+                LOG.error("Skipping WebSocket client teardown because the I/O thread is still running");
+                return;
             }
 
             // Close buffers (async mode only, window > 1)
@@ -458,10 +466,7 @@ public class QwpWebSocketSender implements Sender {
             for (int i = 0, n = keys.size(); i < n; i++) {
                 CharSequence key = keys.getQuick(i);
                 if (key != null) {
-                    QwpTableBuffer tb = tableBuffers.get(key);
-                    if (tb != null) {
-                        tb.close();
-                    }
+                    Misc.free(tableBuffers.get(key));
                 }
             }
             tableBuffers.clear();
