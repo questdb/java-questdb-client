@@ -376,6 +376,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         if (currentTableBuffer != null) {
             currentTableBuffer.cancelCurrentRow();
+            currentTableBuffer.rollbackUncommittedColumns();
         }
     }
 
