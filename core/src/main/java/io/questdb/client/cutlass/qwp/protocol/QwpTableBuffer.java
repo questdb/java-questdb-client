@@ -71,8 +71,7 @@ public class QwpTableBuffer implements QuietCloseable {
     private int committedColumnCount; // columns that existed at last nextRow()
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int rowCount;
-    private long schemaHash;
-    private boolean schemaHashComputed;
+    private int schemaId = -1;
 
     public QwpTableBuffer(String tableName) {
         this(tableName, null);
@@ -90,8 +89,7 @@ public class QwpTableBuffer implements QuietCloseable {
         this.columns = new ObjList<>();
         this.columnNameToIndex = new LowerCaseAsciiCharSequenceIntHashMap();
         this.rowCount = 0;
-        this.schemaHash = 0;
-        this.schemaHashComputed = false;
+        this.schemaId = -1;
         this.columnDefsCacheValid = false;
     }
 
@@ -131,8 +129,7 @@ public class QwpTableBuffer implements QuietCloseable {
         columnAccessCursor = 0;
         committedColumnCount = 0;
         rowCount = 0;
-        schemaHash = 0;
-        schemaHashComputed = false;
+        schemaId = -1;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
     }
@@ -241,19 +238,18 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
-     * Returns the schema hash for this table.
-     * <p>
-     * The hash is computed to match what QwpSchema.computeSchemaHash() produces:
-     * - Uses wire type codes (with nullable bit)
-     * - Hash is over name bytes + type code for each column
+     * Returns the schema ID assigned by the sender, or -1 if not yet assigned.
      */
-    public long getSchemaHash() {
-        if (!schemaHashComputed) {
-            // Compute hash directly from column buffers without intermediate arrays
-            schemaHash = QwpSchemaHash.computeSchemaHashDirect(columns);
-            schemaHashComputed = true;
-        }
-        return schemaHash;
+    public int getSchemaId() {
+        return schemaId;
+    }
+
+    /**
+     * Assigns a schema ID. Called by the sender when this table's schema
+     * is first sent to the server.
+     */
+    public void setSchemaId(int schemaId) {
+        this.schemaId = schemaId;
     }
 
     /**
@@ -383,7 +379,7 @@ public class QwpTableBuffer implements QuietCloseable {
         for (int r = 0; r < rowCount; r++) {
             col.addNull();
         }
-        schemaHashComputed = false;
+        schemaId = -1;
         columnDefsCacheValid = false;
         return col;
     }
@@ -429,7 +425,7 @@ public class QwpTableBuffer implements QuietCloseable {
             columnNameToIndex.put(col.name, i);
         }
 
-        schemaHashComputed = false;
+        schemaId = -1;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
     }

@@ -36,7 +36,7 @@ import java.lang.reflect.Field;
 import java.time.temporal.ChronoUnit;
 
 /**
- * Verifies that maxSentSymbolId and sentSchemaHashes are not updated
+ * Verifies that maxSentSymbolId and maxSentSchemaId are not updated
  * when the send fails, so the next batch's delta dictionary correctly
  * re-includes symbols the server never received.
  */

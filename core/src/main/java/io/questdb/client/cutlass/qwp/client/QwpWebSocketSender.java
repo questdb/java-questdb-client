@@ -38,7 +38,6 @@ import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
-import io.questdb.client.std.LongHashSet;
 import io.questdb.client.std.Misc;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
@@ -114,10 +113,8 @@ public class QwpWebSocketSender implements Sender {
     // Flow control configuration
     private final int inFlightWindowSize;
     private final int port;
-    // Track schema hashes that have been sent to the server (for schema reference mode)
-    // First time we send a schema: full schema. Subsequent times: 8-byte hash reference.
-    // Combined key = schemaHash XOR (tableNameHash << 32) to include table name in lookup.
-    private final LongHashSet sentSchemaHashes = new LongHashSet();
+    private int maxSentSchemaId = -1;
+    private int nextSchemaId;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     private final boolean tlsEnabled;
     private MicrobatchBuffer activeBuffer;
@@ -1052,8 +1049,9 @@ public class QwpWebSocketSender implements Sender {
             // Use the version selected by the server
             encoder.setVersion((byte) client.getServerQwpVersion());
 
-            // Clear sent schema hashes - server starts fresh on each connection
-            sentSchemaHashes.clear();
+            // Server starts fresh on each connection, so any sender-local schema
+            // IDs retained from a prior connection must be discarded as well.
+            resetSchemaStateForNewConnection();
 
             connected = true;
             LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
@@ -1064,6 +1062,24 @@ public class QwpWebSocketSender implements Sender {
     private void failExpectedIfNeeded(long expectedSequence, LineSenderException error) {
         if (inFlightWindow != null && inFlightWindow.getLastError() == null) {
             inFlightWindow.fail(expectedSequence, error);
+        }
+    }
+
+    private void resetSchemaStateForNewConnection() {
+        maxSentSchemaId = -1;
+        nextSchemaId = 0;
+
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer != null) {
+                tableBuffer.setSchemaId(-1);
+            }
         }
     }
 
@@ -1111,6 +1127,7 @@ public class QwpWebSocketSender implements Sender {
         ensureActiveBufferReady();
 
         // Encode all non-empty tables into a single QWP v1 message
+        int batchMaxSchemaId = maxSentSchemaId;
         encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
@@ -1122,9 +1139,11 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             }
 
-            long schemaHash = tableBuffer.getSchemaHash();
-            long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
-            boolean useSchemaRef = sentSchemaHashes.contains(schemaKey);
+            if (tableBuffer.getSchemaId() < 0) {
+                tableBuffer.setSchemaId(nextSchemaId++);
+            }
+            batchMaxSchemaId = Math.max(batchMaxSchemaId, tableBuffer.getSchemaId());
+            boolean useSchemaRef = tableBuffer.getSchemaId() <= maxSentSchemaId;
 
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, tableBuffer.getRowCount(), maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
@@ -1147,6 +1166,7 @@ public class QwpWebSocketSender implements Sender {
         // next batch's delta dictionary will correctly re-include the
         // symbols and schema that the server never received.
         maxSentSymbolId = currentBatchMaxSymbolId;
+        maxSentSchemaId = batchMaxSchemaId;
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -1156,13 +1176,6 @@ public class QwpWebSocketSender implements Sender {
             if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
                 continue;
             }
-
-            long schemaHash = tableBuffer.getSchemaHash();
-            long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
-            if (!sentSchemaHashes.contains(schemaKey)) {
-                sentSchemaHashes.add(schemaKey);
-            }
-
             tableBuffer.reset();
         }
         currentBatchMaxSymbolId = -1;
@@ -1213,6 +1226,7 @@ public class QwpWebSocketSender implements Sender {
         }
 
         // Encode all non-empty tables into a single QWP v1 message
+        int batchMaxSchemaId = maxSentSchemaId;
         encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
@@ -1224,9 +1238,11 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             }
 
-            long schemaHash = tableBuffer.getSchemaHash();
-            long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
-            boolean useSchemaRef = sentSchemaHashes.contains(schemaKey);
+            if (tableBuffer.getSchemaId() < 0) {
+                tableBuffer.setSchemaId(nextSchemaId++);
+            }
+            batchMaxSchemaId = Math.max(batchMaxSchemaId, tableBuffer.getSchemaId());
+            boolean useSchemaRef = tableBuffer.getSchemaId() <= maxSentSchemaId;
 
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, tableBuffer.getRowCount(), maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
@@ -1267,6 +1283,7 @@ public class QwpWebSocketSender implements Sender {
         // so the next batch's delta dictionary will correctly re-include
         // the symbols and schema that the server never received.
         maxSentSymbolId = currentBatchMaxSymbolId;
+        maxSentSchemaId = batchMaxSchemaId;
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -1276,13 +1293,6 @@ public class QwpWebSocketSender implements Sender {
             if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
                 continue;
             }
-
-            long schemaHash = tableBuffer.getSchemaHash();
-            long schemaKey = schemaHash ^ ((long) tableBuffer.getTableName().hashCode() << 32);
-            if (!sentSchemaHashes.contains(schemaKey)) {
-                sentSchemaHashes.add(schemaKey);
-            }
-
             tableBuffer.reset();
         }
         currentBatchMaxSymbolId = -1;

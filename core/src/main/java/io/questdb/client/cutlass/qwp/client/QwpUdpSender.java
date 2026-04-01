@@ -931,7 +931,8 @@ public class QwpUdpSender implements Sender {
                 prefixSymbolDictionarySizeBefore,
                 false,
                 false,
-                false
+                false,
+                0
         );
         payloadWriter.finish();
         return payloadWriter.getPosition();
@@ -1015,7 +1016,8 @@ public class QwpUdpSender implements Sender {
         estimate += NativeBufferWriter.varintSize(tableNameUtf8) + tableNameUtf8;
         estimate += VARINT_INT_UPPER_BOUND;
         estimate += VARINT_INT_UPPER_BOUND;
-        estimate += 1;
+        estimate += 1; // schema mode byte
+        estimate += VARINT_INT_UPPER_BOUND; // schemaId
 
         QwpColumnDef[] defs = currentTableBuffer.getColumnDefs();
         for (QwpColumnDef def : defs) {

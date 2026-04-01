@@ -1006,6 +1006,7 @@ public class QwpWebSocketEncoderTest {
                 buffer.nextRow();
                 col.addSymbolWithGlobalId("SYM_7", 7);
                 buffer.nextRow();
+                buffer.setSchemaId(0);
 
                 Assert.assertEquals(0, col.getAuxDataAddress());
 
@@ -1020,6 +1021,7 @@ public class QwpWebSocketEncoderTest {
                 Assert.assertEquals(2, cursor.readVarint());
                 Assert.assertEquals(1, cursor.readVarint());
                 Assert.assertEquals(SCHEMA_MODE_FULL, cursor.readByte());
+                Assert.assertEquals(0, cursor.readVarint()); // schemaId
                 Assert.assertEquals("ticker", cursor.readString());
                 Assert.assertEquals(TYPE_SYMBOL, cursor.readByte());
                 Assert.assertEquals(0, cursor.readByte()); // no nulls
@@ -1040,6 +1042,7 @@ public class QwpWebSocketEncoderTest {
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
                 col.addLong(42L);
                 buffer.nextRow();
+                buffer.setSchemaId(0);
 
                 int size = encoder.encode(buffer, true); // Use schema reference
                 Assert.assertTrue(size > 12);

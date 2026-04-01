@@ -127,7 +127,11 @@ class QwpColumnWriter {
     }
 
     void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef, boolean useGlobalSymbols, boolean useGorilla) {
-        encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useSchemaRef, useGlobalSymbols, useGorilla);
+        int schemaId = tableBuffer.getSchemaId();
+        if (schemaId < 0) {
+            schemaId = 0;
+        }
+        encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useSchemaRef, useGlobalSymbols, useGorilla, schemaId);
     }
 
     void encodeTable(
@@ -138,7 +142,8 @@ class QwpColumnWriter {
             int[] limitedSymbolDictionarySizes,
             boolean useSchemaRef,
             boolean useGlobalSymbols,
-            boolean useGorilla
+            boolean useGorilla,
+            int schemaId
     ) {
         QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
 
@@ -146,11 +151,11 @@ class QwpColumnWriter {
             writeTableHeaderWithSchemaRef(
                     tableBuffer.getTableName(),
                     rowCount,
-                    tableBuffer.getSchemaHash(),
+                    schemaId,
                     columnDefs.length
             );
         } else {
-            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, columnDefs);
+            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, schemaId, columnDefs);
         }
 
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
@@ -325,23 +330,24 @@ class QwpColumnWriter {
         }
     }
 
-    private void writeTableHeaderWithSchema(String tableName, int rowCount, QwpColumnDef[] columns) {
+    private void writeTableHeaderWithSchema(String tableName, int rowCount, int schemaId, QwpColumnDef[] columns) {
         buffer.putString(tableName);
         buffer.putVarint(rowCount);
         buffer.putVarint(columns.length);
         buffer.putByte(SCHEMA_MODE_FULL);
+        buffer.putVarint(schemaId);
         for (QwpColumnDef col : columns) {
             buffer.putString(col.getName());
             buffer.putByte(col.getWireTypeCode());
         }
     }
 
-    private void writeTableHeaderWithSchemaRef(String tableName, int rowCount, long schemaHash, int columnCount) {
+    private void writeTableHeaderWithSchemaRef(String tableName, int rowCount, int schemaId, int columnCount) {
         buffer.putString(tableName);
         buffer.putVarint(rowCount);
         buffer.putVarint(columnCount);
         buffer.putByte(SCHEMA_MODE_REFERENCE);
-        buffer.putLong(schemaHash);
+        buffer.putVarint(schemaId);
     }
 
     private void writeTimestampColumn(long addr, int count, boolean useGorilla) {

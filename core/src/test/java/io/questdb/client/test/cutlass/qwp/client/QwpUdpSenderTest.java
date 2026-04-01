@@ -2359,6 +2359,7 @@ public class QwpUdpSenderTest {
             int rowCount = (int) reader.readVarint();
             int columnCount = (int) reader.readVarint();
             Assert.assertEquals(SCHEMA_MODE_FULL, reader.readByte());
+            reader.readVarint(); // schemaId
 
             QwpColumnDef[] defs = new QwpColumnDef[columnCount];
             for (int i = 0; i < columnCount; i++) {
