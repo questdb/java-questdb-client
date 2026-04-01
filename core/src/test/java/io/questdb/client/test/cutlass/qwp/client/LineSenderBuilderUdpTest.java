@@ -125,9 +125,18 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
     @Test
     public void testUdp_httpPathNotSupported() {
         assertThrowsAny(
-                Sender.builder(Sender.Transport.UDP)
+                () -> Sender.builder(Sender.Transport.UDP)
                         .address("localhost")
                         .httpPath("/custom/path"),
+                "not supported for UDP");
+    }
+
+    @Test
+    public void testUdp_httpSettingPathNotSupported() {
+        assertThrowsAny(
+                () -> Sender.builder(Sender.Transport.UDP)
+                        .address("localhost")
+                        .httpSettingPath("/custom/settings"),
                 "not supported for UDP");
     }
 

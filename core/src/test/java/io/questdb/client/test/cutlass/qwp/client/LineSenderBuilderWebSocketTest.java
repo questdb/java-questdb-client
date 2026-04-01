@@ -195,28 +195,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testBufferCapacity() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .bufferCapacity(128 * 1024);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testBufferCapacityDoubleSet_fails() {
-        assertThrows("already configured",
+    public void testBufferCapacityNotSupported_fails() {
+        assertThrows("buffer capacity is not supported for WebSocket transport",
                 () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
-                        .bufferCapacity(1024)
-                        .bufferCapacity(2048));
-    }
-
-    @Test
-    public void testBufferCapacityNegative_fails() {
-        assertThrows("cannot be negative",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .bufferCapacity(-1));
+                        .bufferCapacity(128 * 1024));
     }
 
     @Test
@@ -333,11 +316,18 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testHttpPath_notSupportedForWebSocket() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
+        assertThrows("HTTP path is not supported for WebSocket protocol",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
-                        .httpPath("/custom/path"),
-                "not supported for WebSocket");
+                        .httpPath("/custom/path"));
+    }
+
+    @Test
+    public void testHttpSettingPath_notSupportedForWebSocket() {
+        assertThrows("HTTP settings path is not supported for WebSocket protocol",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .httpSettingPath("/custom/settings"));
     }
 
     @Test
@@ -682,6 +672,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_withInitBufSize_fails() {
+        assertBadConfig("ws::addr=localhost:9000;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
+    }
+
+    @Test
     public void testWsConfigString_withUsernamePassword() throws Exception {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
@@ -711,6 +706,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     @Test
     public void testWssConfigString_withMaxBufSize_fails() {
         assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
+    }
+
+    @Test
+    public void testWssConfigString_withInitBufSize_fails() {
+        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
     }
 
     @Test

@@ -762,12 +762,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * Auto-flushing is only triggered when calling {@link #atNow()}, {@link #at(Instant)} or {@link #at(long, ChronoUnit)}.
          * The Sender will not flush the buffer if no new rows are added even if the auto-flush interval has elapsed.
          * <p>
-         * This is only used when communicating over HTTP transport, and it's illegal to call this method when
-         * communicating over TCP transport.
+         * This is only used when communicating over HTTP and WebSocket transport, and it's illegal to call this method when
+         * communicating over TCP or UDP transport.
          * <br>
          * You cannot set this value when auto-flush is disabled. See {@link #disableAutoFlush()}.
          * <br>
-         * Default value is 1000 milliseconds.
+         * Default value is 1000 milliseconds for HTTP and 100 milliseconds for WebSocket.
          *
          * @param autoFlushIntervalMillis interval at which the Sender automatically flushes it's buffer in milliseconds.
          * @return this instance for method chaining
@@ -791,8 +791,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Set the maximum number of rows that are buffered locally before they are automatically sent to a server.
          * <br>
-         * This is only used when communicating over HTTP transport, and it's illegal to call this method when
-         * communicating over TCP transport.
+         * This is only used when communicating over HTTP and WebSocket transport, and it's illegal to call this method when
+         * communicating over TCP or UDP transport.
          * <br>
          * The Sender automatically flushes it's buffer when the number of accumulated rows reaches the configured value.
          * You must make sure that the buffer has sufficient capacity to accommodate all locally buffered data.
@@ -836,12 +836,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * When communicating over TCP protocol this buffer size is treated as the maximum buffer capacity. The Sender
          * will automatically flush the buffer when it reaches this capacity.
+         * <br>
+         * WebSocket transport does not support configuring buffer capacity explicitly.
          *
          * @param bufferCapacity buffer capacity in bytes.
          * @return this instance for method chaining
          * @see Sender#flush()
          */
         public LineSenderBuilder bufferCapacity(int bufferCapacity) {
+            if (protocol == PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("buffer capacity is not supported for WebSocket transport");
+            }
             if (this.bufferCapacity != PARAMETER_NOT_SET_EXPLICITLY) {
                 throw new LineSenderException("buffer capacity was already configured ")
                         .put("[capacity=").put(this.bufferCapacity).put("]");
@@ -1057,6 +1062,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @return this instance for method chaining
          */
         public LineSenderBuilder httpPath(String path) {
+            if (protocol == PROTOCOL_TCP) {
+                throw new LineSenderException("HTTP path is not supported for TCP protocol");
+            }
+            if (protocol == PROTOCOL_UDP) {
+                throw new LineSenderException("HTTP path is not supported for UDP transport");
+            }
+            if (protocol == PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("HTTP path is not supported for WebSocket protocol");
+            }
             if (this.httpPath != null) {
                 throw new LineSenderException("path was already configured");
             }
@@ -1080,6 +1094,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <b>Example:</b> If the server configures {@code http.context.settings=/custom/settings},
          * call {@code httpSettingPath("/custom/settings")}.
          *
+         * This is only used when communicating over HTTP transport.
+         *
          * @param path The HTTP path to query for server protocol settings. Must:
          *             <ul>
          *               <li>Start with '/'</li>
@@ -1089,6 +1105,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          */
         @SuppressWarnings("unused")
         public LineSenderBuilder httpSettingPath(String path) {
+            if (protocol == PROTOCOL_TCP) {
+                throw new LineSenderException("HTTP settings path is not supported for TCP protocol");
+            }
+            if (protocol == PROTOCOL_UDP) {
+                throw new LineSenderException("HTTP settings path is not supported for UDP transport");
+            }
+            if (protocol == PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("HTTP settings path is not supported for WebSocket protocol");
+            }
             if (this.httpSettingsPath != null) {
                 throw new LineSenderException("the path was already configured");
             }
@@ -1128,8 +1153,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Use HTTP Authentication token.
          * <br>
-         * This is only used when communicating over HTTP transport, and it's illegal to
-         * call this method when communicating over TCP transport.
+         * This is only used when communicating over HTTP and WebSocket transport, and it's illegal to
+         * call this method when communicating over TCP or UDP transport.
          *
          * @param token HTTP authentication token
          * @return this instance for method chaining
@@ -1150,10 +1175,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Use username and password for authentication when communicating over HTTP protocol.
+         * Use username and password for authentication when communicating over HTTP or WebSocket protocol.
          * <br>
-         * This is only used when communicating over HTTP transport, and it's illegal to call this method when
-         * communicating over TCP transport.
+         * This is only used when communicating over HTTP and WebSocket transport, and it's illegal to call this method when
+         * communicating over TCP or UDP transport.
          *
          * @param username username
          * @param password password
@@ -1908,6 +1933,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (username != null || password != null) {
                     throw new LineSenderException("username/password authentication is not supported for TCP protocol");
                 }
+                if (httpPath != null) {
+                    throw new LineSenderException("HTTP path is not supported for TCP protocol");
+                }
+                if (httpSettingsPath != null) {
+                    throw new LineSenderException("HTTP settings path is not supported for TCP protocol");
+                }
                 if (autoFlushRows == AUTO_FLUSH_DISABLED) {
                     throw new LineSenderException("disabling auto-flush is not supported for TCP protocol");
                 } else if (autoFlushRows != PARAMETER_NOT_SET_EXPLICITLY) {
@@ -1965,6 +1996,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (httpPath != null) {
                     throw new LineSenderException("HTTP path is not supported for UDP transport");
                 }
+                if (httpSettingsPath != null) {
+                    throw new LineSenderException("HTTP settings path is not supported for UDP transport");
+                }
                 if (maxBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("max backoff is not supported for UDP transport");
                 }
@@ -1986,6 +2020,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (httpPath != null) {
                     throw new LineSenderException("HTTP path is not supported for WebSocket protocol");
+                }
+                if (httpSettingsPath != null) {
+                    throw new LineSenderException("HTTP settings path is not supported for WebSocket protocol");
                 }
                 if (httpTimeout != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("HTTP timeout is not supported for WebSocket protocol");
