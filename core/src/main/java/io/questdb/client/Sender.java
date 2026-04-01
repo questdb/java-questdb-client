@@ -557,7 +557,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_TCP_PORT = 9009;
         private static final int DEFAULT_UDP_PORT = 9007;
         private static final int DEFAULT_WEBSOCKET_PORT = 9000;
-        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 128 * 1024; // 128KB
+        private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 0;
         private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
         private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 1_000;
         private static final int MIN_BUFFER_SIZE = AuthUtils.CHALLENGE_LEN + 1; // challenge size + 1;
@@ -731,7 +731,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <br>
          * This is only used when communicating over WebSocket transport.
          * <br>
-         * Default value is 128KB.
+         * Default value is 0, which disables byte-based auto-flush.
          *
          * @param bytes maximum bytes per batch
          * @return this instance for method chaining

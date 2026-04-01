@@ -68,7 +68,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  * Configuration options:
  * <ul>
  *   <li>{@code autoFlushRows} - Maximum rows per batch (default: 1000)</li>
- *   <li>{@code autoFlushBytes} - Maximum bytes per batch (default: 128KB)</li>
+ *   <li>{@code autoFlushBytes} - Maximum bytes per batch (default: disabled)</li>
  *   <li>{@code autoFlushIntervalNanos} - Maximum age before auto-flush (default: 100ms)</li>
  * </ul>
  * <p>
@@ -89,7 +89,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  */
 public class QwpWebSocketSender implements Sender {
 
-    public static final int DEFAULT_AUTO_FLUSH_BYTES = 128 * 1024; // 128KB
+    public static final int DEFAULT_AUTO_FLUSH_BYTES = 0;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
     public static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128;
