@@ -737,6 +737,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @return this instance for method chaining
          */
         public LineSenderBuilder autoFlushBytes(int bytes) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("auto flush bytes is only supported for WebSocket transport");
+            }
             if (this.autoFlushBytes != PARAMETER_NOT_SET_EXPLICITLY) {
                 throw new LineSenderException("auto flush bytes was already configured")
                         .put("[bytes=").put(this.autoFlushBytes).put("]");
@@ -1258,6 +1261,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @return this instance for method chaining
          */
         public LineSenderBuilder maxBufferCapacity(int maximumBufferCapacity) {
+            if (protocol == PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("maximum buffer capacity is not supported for WebSocket transport");
+            }
             if (maximumBufferCapacity < DEFAULT_BUFFER_CAPACITY) {
                 throw new LineSenderException("maximum buffer capacity cannot be less than initial buffer capacity ")
                         .put("[maximumBufferCapacity=").put(maximumBufferCapacity)
@@ -1749,13 +1755,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     autoFlushIntervalMillis(autoFlushInterval);
                 } else if (Chars.equals("auto_flush_bytes", sink)) {
-                    if (protocol != PROTOCOL_TCP) {
-                        throw new LineSenderException("auto_flush_bytes is only supported for TCP transport");
+                    if (protocol != PROTOCOL_TCP && protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("auto_flush_bytes is only supported for TCP and WebSocket transport");
                     }
                     pos = getValue(configurationString, pos, sink, "auto_flush_bytes");
-                    if (Chars.equalsIgnoreCase("off", sink)) {
-                        throw new LineSenderException("TCP transport must have auto_flush_bytes enabled");
-                    } else {
+                    if (protocol == PROTOCOL_TCP) {
+                        if (Chars.equalsIgnoreCase("off", sink)) {
+                            throw new LineSenderException("TCP transport must have auto_flush_bytes enabled");
+                        }
                         int autoFlushBytes = parseIntValue(sink, "auto_flush_bytes");
                         if (initBufSizeSet) {
                             if (autoFlushBytes != bufferCapacity) {
@@ -1764,6 +1771,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         } else {
                             bufferCapacity(autoFlushBytes);
                         }
+                    } else {
+                        int autoFlushBytes = parseIntValue(sink, "auto_flush_bytes");
+                        autoFlushBytes(autoFlushBytes);
                     }
                     autoFlushBytesSet = true;
                 } else if (Chars.equals("auto_flush", sink)) {

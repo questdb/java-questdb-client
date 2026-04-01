@@ -121,6 +121,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testAutoFlushBytesNotSupportedForHttp_fails() {
+        assertThrows("only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.HTTP)
+                        .address("localhost")
+                        .autoFlushBytes(1024));
+    }
+
+    @Test
     public void testAutoFlushIntervalMillis() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
@@ -209,6 +217,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
                         .bufferCapacity(-1));
+    }
+
+    @Test
+    public void testMaxBufferCapacityNotSupported_fails() {
+        assertThrows("maximum buffer capacity is not supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .maxBufferCapacity(128 * 1024));
     }
 
     @Test
@@ -645,6 +661,27 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_withAutoFlushBytes() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;auto_flush_bytes=1024;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_withAutoFlushBytesDoubleSet_fails() {
+        assertBadConfig("ws::addr=localhost:9000;auto_flush_bytes=1024;auto_flush_bytes=2048;", "already configured");
+    }
+
+    @Test
+    public void testWsConfigString_withAutoFlushBytesInvalid_fails() {
+        assertBadConfig("ws::addr=localhost:9000;auto_flush_bytes=-1;", "cannot be negative");
+    }
+
+    @Test
+    public void testWsConfigString_withMaxBufSize_fails() {
+        assertBadConfig("ws::addr=localhost:9000;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
+    }
+
+    @Test
     public void testWsConfigString_withUsernamePassword() throws Exception {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
@@ -663,6 +700,17 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     public void testWssConfigString_withToken() {
         Sender.LineSenderBuilder builder = Sender.builder("wss::addr=localhost:9000;tls_verify=unsafe_off;token=mytoken;");
         Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWssConfigString_withAutoFlushBytes() {
+        Sender.LineSenderBuilder builder = Sender.builder("wss::addr=localhost:9000;tls_verify=unsafe_off;auto_flush_bytes=1024;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWssConfigString_withMaxBufSize_fails() {
+        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
     }
 
     @Test

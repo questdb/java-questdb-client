@@ -89,10 +89,10 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
     @Test
     public void testUdp_autoFlushBytesNotSupported() {
         assertThrowsAny(
-                Sender.builder(Sender.Transport.UDP)
+                () -> Sender.builder(Sender.Transport.UDP)
                         .address("localhost")
                         .autoFlushBytes(1000),
-                "not supported for UDP");
+                "auto flush bytes is only supported for WebSocket transport");
     }
 
     @Test
