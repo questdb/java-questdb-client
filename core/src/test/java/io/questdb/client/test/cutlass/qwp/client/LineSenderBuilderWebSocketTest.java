@@ -639,8 +639,8 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     @Test
     public void testWsConfigString_withToken() throws Exception {
         assertMemoryLeak(() -> {
-            int port = findUnusedPort();
-            assertBadConfig("ws::addr=localhost:" + port + ";token=mytoken;", "token is not supported");
+            Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;token=mytoken;");
+            Assert.assertNotNull(builder);
         });
     }
 
@@ -657,6 +657,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertMemoryLeak(() -> {
             assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;", "connect", "Failed", "SSL");
         });
+    }
+
+    @Test
+    public void testWssConfigString_withToken() {
+        Sender.LineSenderBuilder builder = Sender.builder("wss::addr=localhost:9000;tls_verify=unsafe_off;token=mytoken;");
+        Assert.assertNotNull(builder);
     }
 
     @Test
