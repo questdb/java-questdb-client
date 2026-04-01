@@ -253,6 +253,32 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
     }
 
     @Test
+    public void testSchemaLimitExceededFailsBeforeSend() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 0, 3, 0, 0L, 1, 2
+            );
+            try {
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                sender.table("t1").longColumn("x", 1).at(1, ChronoUnit.MICROS);
+                sender.table("t2").longColumn("x", 2).at(2, ChronoUnit.MICROS);
+
+                try {
+                    sender.table("t3").longColumn("x", 3).at(3, ChronoUnit.MICROS);
+                    Assert.fail("Expected schema limit failure");
+                } catch (Exception e) {
+                    Assert.assertTrue(e.getMessage().contains("maximum schemas per connection exceeded"));
+                }
+            } finally {
+                setField(sender, "connected", false);
+                sender.close();
+            }
+        });
+    }
+
+    @Test
     public void testTimestampOnlyRows() throws Exception {
         assertMemoryLeak(() -> {
             // autoFlushRows=10_000 prevents auto-flush; bytes and interval disabled

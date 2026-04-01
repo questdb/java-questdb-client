@@ -32,28 +32,10 @@ package io.questdb.client.cutlass.qwp.protocol;
  * address.
  */
 public final class QwpConstants {
-
     /**
-     * Default initial receive buffer size (64 KB).
+     * Client identifier sent in the X-QWP-Client-Id upgrade header.
      */
-    public static final int DEFAULT_INITIAL_RECV_BUFFER_SIZE = 64 * 1024;
-    /**
-     * Default maximum batch size in bytes (16 MB).
-     */
-    public static final int DEFAULT_MAX_BATCH_SIZE = 16 * 1024 * 1024;
-
-    /**
-     * Maximum in-flight batches for pipelining.
-     */
-    public static final int DEFAULT_MAX_IN_FLIGHT_BATCHES = 4;
-    /**
-     * Default maximum rows per table in a batch.
-     */
-    public static final int DEFAULT_MAX_ROWS_PER_TABLE = 1_000_000;
-    /**
-     * Default maximum tables per batch.
-     */
-    public static final int DEFAULT_MAX_TABLES_PER_BATCH = 256;
+    public static final String CLIENT_ID = "java/1.0.2";
     /**
      * Flag bit: Delta symbol dictionary encoding enabled.
      * When set, symbol columns use global IDs and send only new dictionary entries.
@@ -63,12 +45,10 @@ public final class QwpConstants {
      * Flag bit: Gorilla timestamp encoding enabled.
      */
     public static final byte FLAG_GORILLA = 0x04;
-
     /**
      * Flag bit: LZ4 compression enabled.
      */
     public static final byte FLAG_LZ4 = 0x01;
-
     /**
      * Flag bit: Zstd compression enabled.
      */
@@ -101,10 +81,6 @@ public final class QwpConstants {
      * Magic bytes for QWP v1 message: "QWP1" (ASCII).
      */
     public static final int MAGIC_MESSAGE = 0x31505751; // "QWP1" in little-endian
-    /**
-     * Maximum columns per table (QuestDB limit).
-     */
-    public static final int MAX_COLUMNS_PER_TABLE = 2048;
     /**
      * Schema mode: Full schema included.
      */
@@ -161,7 +137,6 @@ public final class QwpConstants {
      * Column type: DATE (int64 milliseconds since epoch).
      */
     public static final byte TYPE_DATE = 0x0B;
-
     /**
      * Column type: DECIMAL128 (16 bytes, 38 digits precision).
      * Wire format: [scale (1B in schema)] + [little-endian unscaled value (16B)]
@@ -172,7 +147,6 @@ public final class QwpConstants {
      * Wire format: [scale (1B in schema)] + [little-endian unscaled value (32B)]
      */
     public static final byte TYPE_DECIMAL256 = 0x15;
-
     /**
      * Column type: DECIMAL64 (8 bytes, 18 digits precision).
      * Wire format: [scale (1B in schema)] + [little-endian unscaled value (8B)]
@@ -207,7 +181,6 @@ public final class QwpConstants {
      * Column type: LONG256 (32 bytes, little-endian).
      */
     public static final byte TYPE_LONG256 = 0x0D;
-
     /**
      * Column type: LONG_ARRAY (N-dimensional array of int64).
      * Wire format: [nDims (1B)] [dim1_len (4B)]...[dimN_len (4B)] [flattened values (LE)]
@@ -239,15 +212,10 @@ public final class QwpConstants {
      * Column type: UUID (16 bytes, little-endian).
      */
     public static final byte TYPE_UUID = 0x0C;
-
     /**
      * Column type: VARCHAR (length-prefixed UTF-8, aux storage).
      */
     public static final byte TYPE_VARCHAR = 0x0F;
-    /**
-     * Client identifier sent in the X-QWP-Client-Id upgrade header.
-     */
-    public static final String CLIENT_ID = "java/1.0.2";
     /**
      * Current protocol version.
      */
