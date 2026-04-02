@@ -41,12 +41,12 @@ import java.nio.charset.StandardCharsets;
  * <p>
  * Status codes:
  * <ul>
- *   <li>0: Success (ACK)</li>
- *   <li>1: Parse error</li>
- *   <li>2: Schema error</li>
- *   <li>3: Write error</li>
- *   <li>4: Security error</li>
- *   <li>255: Internal error</li>
+ *   <li>0x00: Success (ACK)</li>
+ *   <li>0x05: Parse error</li>
+ *   <li>0x03: Schema mismatch</li>
+ *   <li>0x09: Write error</li>
+ *   <li>0x08: Security error</li>
+ *   <li>0x06: Internal error</li>
  * </ul>
  * <p>
  * The sequence number allows correlation with the original request.
@@ -58,13 +58,13 @@ public class WebSocketResponse {
     public static final int MIN_ERROR_RESPONSE_SIZE = 11; // status + sequence + error length
     // Minimum response size: status (1) + sequence (8)
     public static final int MIN_RESPONSE_SIZE = 9;
-    public static final byte STATUS_INTERNAL_ERROR = (byte) 255;
-    // Status codes
-    public static final byte STATUS_OK = 0;
-    public static final byte STATUS_PARSE_ERROR = 1;
-    public static final byte STATUS_SCHEMA_ERROR = 2;
-    public static final byte STATUS_SECURITY_ERROR = 4;
-    public static final byte STATUS_WRITE_ERROR = 3;
+    public static final byte STATUS_INTERNAL_ERROR = 0x06;
+    // Status codes (must match QWP_SPECIFICATION.md)
+    public static final byte STATUS_OK = 0x00;
+    public static final byte STATUS_PARSE_ERROR = 0x05;
+    public static final byte STATUS_SCHEMA_ERROR = 0x03;
+    public static final byte STATUS_SECURITY_ERROR = 0x08;
+    public static final byte STATUS_WRITE_ERROR = 0x09;
     private String errorMessage;
     private long sequence;
     private byte status;
