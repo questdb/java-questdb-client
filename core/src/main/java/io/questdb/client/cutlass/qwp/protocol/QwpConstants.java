@@ -86,7 +86,7 @@ public final class QwpConstants {
      */
     public static final byte SCHEMA_MODE_FULL = 0x00;
     /**
-     * Schema mode: Schema reference (hash lookup).
+     * Schema mode: Schema reference (ID lookup).
      */
     public static final byte SCHEMA_MODE_REFERENCE = 0x01;
     /**
@@ -114,7 +114,7 @@ public final class QwpConstants {
      */
     public static final byte STATUS_SCHEMA_MISMATCH = 0x03;
     /**
-     * Status: Schema hash not recognized.
+     * Status: Schema ID not recognized.
      */
     public static final byte STATUS_SCHEMA_REQUIRED = 0x02;
     /**
