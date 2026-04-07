@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.std.Os;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.test.AbstractTest;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -247,7 +248,7 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
 
             new Thread(() -> {
                 try {
-                    Thread.sleep(delayMs);
+                    Os.sleep(delayMs);
                     byte[] ackResponse = createAckResponse(sequence);
                     client.sendBinary(ackResponse);
                     LOG.debug("Server sent delayed ACK for seq {}", sequence);
@@ -288,7 +289,7 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
 
             new Thread(() -> {
                 try {
-                    Thread.sleep(delayMs);
+                    Os.sleep(delayMs);
                     client.sendBinary(createAckResponse(sequence));
                 } catch (Exception e) {
                     LOG.error("Failed to send delayed ACK", e);

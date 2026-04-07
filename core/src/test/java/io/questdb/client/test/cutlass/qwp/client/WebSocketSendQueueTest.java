@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
@@ -185,7 +186,7 @@ public class WebSocketSendQueueTest {
                 assertTrue("Expected receive attempt", receiveAttempted.await(2, TimeUnit.SECONDS));
                 long deadline = System.currentTimeMillis() + 2_000;
                 while (queue.getLastError() == null && System.currentTimeMillis() < deadline) {
-                    Thread.sleep(5);
+                    Os.sleep(5);
                 }
                 assertNotNull("Expected queue error after receive failure", queue.getLastError());
 
@@ -347,14 +348,14 @@ public class WebSocketSendQueueTest {
         });
     }
 
-    private static void awaitThreadBlocked(Thread thread) throws InterruptedException {
+    private static void awaitThreadBlocked(Thread thread) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
             Thread.State state = thread.getState();
             if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
                 return;
             }
-            Thread.sleep(1);
+            Os.sleep(1);
         }
         fail("Thread did not reach blocked state within 5s, state: " + thread.getState());
     }

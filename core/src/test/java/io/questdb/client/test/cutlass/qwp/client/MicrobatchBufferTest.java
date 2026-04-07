@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -63,7 +64,7 @@ public class MicrobatchBufferTest {
                 waiter.start();
 
                 started.await();
-                Thread.sleep(50); // Give waiter time to start waiting
+                awaitThreadBlocked(waiter);
                 Assert.assertFalse(recycled.get());
 
                 buffer.markRecycled();
@@ -239,7 +240,7 @@ public class MicrobatchBufferTest {
                         buffer.markSending();
 
                         // Simulate sending
-                        Thread.sleep(10);
+                        Os.sleep(10);
 
                         buffer.markRecycled();
                         ioDone.countDown();
@@ -332,7 +333,7 @@ public class MicrobatchBufferTest {
                 long age1 = buffer.getAgeNanos();
                 Assert.assertTrue(age1 >= 0);
 
-                Thread.sleep(10);
+                Os.sleep(10);
 
                 long age2 = buffer.getAgeNanos();
                 Assert.assertTrue(age2 > age1);
@@ -691,5 +692,17 @@ public class MicrobatchBufferTest {
                 buffer.writeByte((byte) 1); // Should throw
             }
         });
+    }
+
+    private static void awaitThreadBlocked(Thread thread) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            Thread.State state = thread.getState();
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
+                return;
+            }
+            Os.sleep(1);
+        }
+        Assert.fail("Thread did not reach blocked state within 5s, state: " + thread.getState());
     }
 }

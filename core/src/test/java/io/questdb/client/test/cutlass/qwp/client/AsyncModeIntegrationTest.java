@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
@@ -147,7 +148,7 @@ public class AsyncModeIntegrationTest {
                 enqueueThread.start();
 
                 assertTrue(enqueueStarted.await(1, TimeUnit.SECONDS));
-                Thread.sleep(200);
+                awaitThreadBlocked(enqueueThread);
                 assertEquals("Enqueue should still be blocked", 1, enqueueDone.getCount());
 
                 // Deliver ACKs to unblock the pipeline.
@@ -523,6 +524,18 @@ public class AsyncModeIntegrationTest {
                 client.close();
             }
         });
+    }
+
+    private static void awaitThreadBlocked(Thread thread) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            Thread.State state = thread.getState();
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
+                return;
+            }
+            Os.sleep(1);
+        }
+        fail("Thread did not reach blocked state within 5s, state: " + thread.getState());
     }
 
     private static void closeQuietly(WebSocketSendQueue queue) {

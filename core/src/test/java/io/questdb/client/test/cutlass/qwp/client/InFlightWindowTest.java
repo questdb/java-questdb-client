@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.InFlightWindow;
+import io.questdb.client.std.Os;
 import org.junit.Test;
 
 import java.util.concurrent.CountDownLatch;
@@ -300,7 +301,7 @@ public class InFlightWindowTest {
                 for (int i = 0; i < numOperations; i++) {
                     window.addInFlight(i);
                     highestAdded.set(i);
-                    Thread.sleep(1); // Small delay
+                    Os.sleep(1); // Small delay
                 }
             } catch (Throwable t) {
                 error.set(t);
@@ -312,15 +313,19 @@ public class InFlightWindowTest {
         // ACK thread (cumulative ACKs)
         Thread acker = new Thread(() -> {
             try {
-                Thread.sleep(10); // Let sender get ahead
+                // Wait for sender to add at least one item before starting
+                while (highestAdded.get() < 0) {
+                    Os.sleep(1);
+                }
                 int lastAcked = -1;
                 while (lastAcked < numOperations - 1) {
                     int highest = highestAdded.get();
                     if (highest > lastAcked) {
                         window.acknowledgeUpTo(highest);
                         lastAcked = highest;
+                    } else {
+                        Os.sleep(1);
                     }
-                    Thread.sleep(1);
                 }
             } catch (Throwable t) {
                 error.set(t);
@@ -370,7 +375,7 @@ public class InFlightWindowTest {
                         window.acknowledgeUpTo(highest);
                         lastAcked = highest;
                     } else {
-                        Thread.sleep(1);
+                        Os.sleep(1);
                     }
                 }
             } catch (Throwable t) {
@@ -613,7 +618,7 @@ public class InFlightWindowTest {
                         window.acknowledgeUpTo(highest);
                         lastAcked = highest;
                     } else {
-                        Thread.sleep(1);
+                        Os.sleep(1);
                     }
                 }
             } catch (Throwable t) {
@@ -829,14 +834,14 @@ public class InFlightWindowTest {
         assertTrue(window.isEmpty());
     }
 
-    private static void awaitThreadBlocked(Thread thread) throws InterruptedException {
+    private static void awaitThreadBlocked(Thread thread) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
             Thread.State state = thread.getState();
             if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
                 return;
             }
-            Thread.sleep(1);
+            Os.sleep(1);
         }
         fail("Thread did not reach blocked state within 5s, state: " + thread.getState());
     }
