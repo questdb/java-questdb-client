@@ -164,7 +164,7 @@ stages:
                 -type jacoco --cover core/target/site/jacoco/jacoco.xml \
                 --repo "questdb/java-questdb-client" \
                 --pr $(System.PullRequest.PullRequestNumber) \
-                -t $(DIFF_COVER_THRESHOLD_PCT) --github-token "$GH_TOKEN"
+                -t $(DIFF_COVER_THRESHOLD_PCT) --github-token $(GH_TOKEN)
             displayName: "Post coverage report to GitHub"
             env:
               GH_TOKEN: $(GH_TOKEN)
