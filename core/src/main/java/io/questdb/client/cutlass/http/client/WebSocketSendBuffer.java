@@ -266,20 +266,6 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         writePos++;
     }
 
-    /**
-     * Writes raw bytes from a byte array.
-     */
-    public void putBytes(byte[] bytes, int offset, int length) {
-        if (length <= 0) {
-            return;
-        }
-        ensureCapacity(length);
-        for (int i = 0; i < length; i++) {
-            Unsafe.getUnsafe().putByte(bufPtr + writePos + i, bytes[offset + i]);
-        }
-        writePos += length;
-    }
-
     @Override
     public void putDouble(double value) {
         ensureCapacity(8);
