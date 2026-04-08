@@ -62,36 +62,8 @@ public class CharSequenceIntHashMap extends AbstractCharSequenceHashSet {
         return valueAt(keyIndex(key));
     }
 
-    public void inc(@NotNull CharSequence key) {
-        int index = keyIndex(key);
-        if (index < 0) {
-            values[-index - 1]++;
-        } else {
-            String keyString = Chars.toString(key);
-            putAt0(index, keyString, 1);
-            list.add(keyString);
-        }
-    }
-
-    public ObjList<CharSequence> keys() {
-        return list;
-    }
-
     public boolean put(@NotNull CharSequence key, int value) {
-        return putAt(keyIndex(key), key, value);
-    }
-
-    public void putAll(@NotNull CharSequenceIntHashMap other) {
-        CharSequence[] otherKeys = other.keys;
-        int[] otherValues = other.values;
-        for (int i = 0, n = otherKeys.length; i < n; i++) {
-            if (otherKeys[i] != noEntryKey) {
-                put(otherKeys[i], otherValues[i]);
-            }
-        }
-    }
-
-    public boolean putAt(int index, @NotNull CharSequence key, int value) {
+        int index = keyIndex(key);
         if (index < 0) {
             values[-index - 1] = value;
             return false;
@@ -102,84 +74,9 @@ public class CharSequenceIntHashMap extends AbstractCharSequenceHashSet {
         return true;
     }
 
-    public void putIfAbsent(@NotNull CharSequence key, int value) {
-        int index = keyIndex(key);
-        if (index > -1) {
-            String keyString = Chars.toString(key);
-            putAt0(index, keyString, value);
-            list.add(keyString);
-        }
-    }
-
-    public void removeAt(int index) {
-        if (index < 0) {
-            int from = -index - 1;
-            CharSequence key = keys[from];
-            erase(from);
-            free++;
-
-            // after we have freed up a slot
-            // consider non-empty keys directly below
-            // they may have been a direct hit but because
-            // directly hit slot wasn't empty these keys would
-            // have moved.
-            //
-            // After slot is freed these keys require re-hash
-            from = (from + 1) & mask;
-            for (
-                    CharSequence k = keys[from];
-                    k != noEntryKey;
-                    from = (from + 1) & mask, k = keys[from]
-            ) {
-                int idealHit = Hash.spread(Chars.hashCode(k)) & mask;
-                if (idealHit != from) {
-                    int to;
-                    if (keys[idealHit] != noEntryKey) {
-                        to = probe0(k, idealHit);
-                    } else {
-                        to = idealHit;
-                    }
-
-                    if (to > -1) {
-                        move(from, to);
-                    }
-                }
-            }
-
-            list.remove(key);
-        }
-    }
-
     public int valueAt(int index) {
         int index1 = -index - 1;
         return index < 0 ? values[index1] : noEntryValue;
-    }
-
-    public int valueQuick(int index) {
-        return get(list.getQuick(index));
-    }
-
-    private void erase(int index) {
-        keys[index] = noEntryKey;
-        values[index] = noEntryValue;
-    }
-
-    private void move(int from, int to) {
-        keys[to] = keys[from];
-        values[to] = values[from];
-        erase(from);
-    }
-
-    private int probe0(CharSequence key, int index) {
-        do {
-            index = (index + 1) & mask;
-            if (keys[index] == noEntryKey) {
-                return index;
-            }
-            if (Chars.equals(key, keys[index])) {
-                return -index - 1;
-            }
-        } while (true);
     }
 
     private void putAt0(int index, CharSequence key, int value) {
