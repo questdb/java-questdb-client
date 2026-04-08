@@ -7,8 +7,14 @@ pr:
 
 variables:
   ARCHIVED_LOGS: "$(Build.ArtifactStagingDirectory)/questdb-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS).zip"
+  DIFF_COVER_THRESHOLD_PCT: 50
 
 stages:
+  - stage: CheckChanges
+    displayName: "Check Changes"
+    jobs:
+      - template: check-changes.yaml
+
   - stage: Validate
     displayName: "Validation"
     jobs:
@@ -110,3 +116,66 @@ stages:
               options: "-DskipTests -Pbuild-web-console --batch-mode"
           - template: run_client_tests.yaml
           - template: run_oss_tests.yaml
+
+  - stage: Coverage
+    displayName: "Coverage Report"
+    dependsOn:
+      - CheckChanges
+    jobs:
+      - job: CoverageReport
+        displayName: "Coverage Report"
+        pool:
+          name: "Azure Pipelines"
+          vmImage: "ubuntu-latest"
+        variables:
+          JAVA_SOURCE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.JAVA_SOURCE_CHANGED']]
+          jdkArch: "x64"
+          imageName: "ubuntu-latest"
+        condition: and(eq(variables['JAVA_SOURCE_CHANGED'], 'true'), eq(variables['System.PullRequest.IsFork'], 'false'))
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+            persistCredentials: true
+          - template: setup.yaml
+          - task: Cache@2
+            inputs:
+              key: 'maven | "$(Agent.OS)" | **/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+              path: $(HOME)/.m2/repository
+            displayName: "Cache Maven repository"
+          - task: Maven@3
+            displayName: "Run tests with coverage"
+            inputs:
+              mavenPOMFile: "core/pom.xml"
+              jdkVersionOption: "default"
+              goals: "test"
+              options: "-P jacoco --batch-mode"
+          - bash: |
+              set -eux
+              git fetch origin $(System.PullRequest.targetBranchName)
+              git diff origin/$(System.PullRequest.targetBranchName)..HEAD > pr.diff
+
+              $JAVA_HOME/bin/java -jar $(Build.SourcesDirectory)/ci/cover-checker-1.5.0-all.jar \
+                -dt file -d pr.diff \
+                -type jacoco --cover core/target/site/jacoco/jacoco.xml \
+                --repo "questdb/java-questdb-client" \
+                --pr $(System.PullRequest.PullRequestNumber) \
+                -t $(DIFF_COVER_THRESHOLD_PCT) --github-token $(GH_TOKEN)
+            displayName: "Post coverage report to GitHub"
+          - task: ArchiveFiles@2
+            displayName: "Tests failed -- Compress logs"
+            condition: failed()
+            inputs:
+              rootFolderOrFile: "logs"
+              includeRootFolder: false
+              archiveFile: $(ARCHIVED_LOGS)
+          - task: PublishBuildArtifacts@1
+            displayName: "Tests failed -- Upload logs"
+            condition: failed()
+            inputs:
+              pathToPublish: $(ARCHIVED_LOGS)
+              artifactName: CoverageTestsLogs
