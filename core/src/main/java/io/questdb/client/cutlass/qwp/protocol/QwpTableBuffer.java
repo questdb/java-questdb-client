@@ -359,28 +359,33 @@ public class QwpTableBuffer implements QuietCloseable {
 
     private ColumnBuffer createColumn(CharSequence name, byte type, boolean useNullBitmap) {
         ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, useNullBitmap);
-        col.sender = sender;
-        int index = columns.size();
-        col.index = index;
-        columns.add(col);
-        columnNameToIndex.put(name, index);
-        // Update fast access array
-        if (fastColumns == null || index >= fastColumns.length) {
-            int newLen = Math.max(8, index + 4);
-            ColumnBuffer[] newArr = new ColumnBuffer[newLen];
-            if (fastColumns != null) {
-                System.arraycopy(fastColumns, 0, newArr, 0, index);
+        try {
+            col.sender = sender;
+            int index = columns.size();
+            col.index = index;
+            columns.add(col);
+            columnNameToIndex.put(name, index);
+            // Update fast access array
+            if (fastColumns == null || index >= fastColumns.length) {
+                int newLen = Math.max(8, index + 4);
+                ColumnBuffer[] newArr = new ColumnBuffer[newLen];
+                if (fastColumns != null) {
+                    System.arraycopy(fastColumns, 0, newArr, 0, index);
+                }
+                fastColumns = newArr;
             }
-            fastColumns = newArr;
+            fastColumns[index] = col;
+            // Pre-pad with nulls for already-committed rows so the next
+            // value the caller adds lands at the correct row position.
+            for (int r = 0; r < rowCount; r++) {
+                col.addNull();
+            }
+            schemaId = -1;
+            columnDefsCacheValid = false;
+        } catch (Throwable t) {
+            col.close();
+            throw t;
         }
-        fastColumns[index] = col;
-        // Pre-pad with nulls for already-committed rows so the next
-        // value the caller adds lands at the correct row position.
-        for (int r = 0; r < rowCount; r++) {
-            col.addNull();
-        }
-        schemaId = -1;
-        columnDefsCacheValid = false;
         return col;
     }
 
@@ -517,9 +522,10 @@ public class QwpTableBuffer implements QuietCloseable {
 
         @Override
         public void putDouble(double value) {
-            if (doubleData != null && doubleDataOffset < doubleData.length) {
-                doubleData[doubleDataOffset++] = value;
+            if (doubleData == null || doubleDataOffset >= doubleData.length) {
+                throw new LineSenderException("array data overflow: more double values than declared in shape");
             }
+            doubleData[doubleDataOffset++] = value;
         }
 
         @Override
@@ -527,10 +533,14 @@ public class QwpTableBuffer implements QuietCloseable {
             if (shapeIndex < nDims) {
                 shape[shapeIndex++] = value;
                 if (shapeIndex == nDims) {
-                    int totalElements = 1;
+                    long product = 1;
                     for (int i = 0; i < nDims; i++) {
-                        totalElements *= shape[i];
+                        product *= shape[i];
                     }
+                    if (product > Integer.MAX_VALUE) {
+                        throw new LineSenderException("array too large: total element count exceeds int range");
+                    }
+                    int totalElements = (int) product;
                     if (forLong) {
                         if (longData == null || longData.length < totalElements) {
                             longData = new long[Math.max(totalElements, longData == null ? 256 : longData.length * 2)];
@@ -546,9 +556,10 @@ public class QwpTableBuffer implements QuietCloseable {
 
         @Override
         public void putLong(long value) {
-            if (longData != null && longDataOffset < longData.length) {
-                longData[longDataOffset++] = value;
+            if (longData == null || longDataOffset >= longData.length) {
+                throw new LineSenderException("array data overflow: more long values than declared in shape");
             }
+            longData[longDataOffset++] = value;
         }
 
         void reset(boolean forLong) {

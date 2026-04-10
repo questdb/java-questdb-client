@@ -346,6 +346,10 @@ public class InFlightWindow {
         this.failedBatchId = sent;
         TOTAL_FAILED.getAndAdd(this, inFlight);
 
+        // Advance highestAcked so getInFlightCount() returns 0.
+        // All in-flight batches are accounted for as failed.
+        highestAcked = sent;
+
         LOG.error("All in-flight batches failed [inFlight={}, error={}]", inFlight, String.valueOf(error));
 
         wakeWaiters();

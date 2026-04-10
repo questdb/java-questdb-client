@@ -1221,6 +1221,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * @return this instance for method chaining
          */
         public LineSenderBuilder inFlightWindowSize(int size) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("in-flight window size is only supported for WebSocket transport");
+            }
             if (this.inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY) {
                 throw new LineSenderException("in-flight window size was already configured")
                         .put("[size=").put(this.inFlightWindowSize).put("]");
@@ -1819,6 +1822,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             bufferCapacity(autoFlushBytes);
                         }
                     } else {
+                        if (Chars.equalsIgnoreCase("off", sink)) {
+                            throw new LineSenderException("WebSocket transport must have auto_flush_bytes enabled");
+                        }
                         int autoFlushBytes = parseIntValue(sink, "auto_flush_bytes");
                         autoFlushBytes(autoFlushBytes);
                     }

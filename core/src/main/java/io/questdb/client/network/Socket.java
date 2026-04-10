@@ -32,6 +32,7 @@ import org.jetbrains.annotations.Nullable;
  * to accumulate messages, so they require extra calls to convert encrypted data to raw data.
  * <p>
  * {@link #close()} implementations must be idempotent. Also, supports object reuse after
+ * closing via {@link #of(int)}.
  */
 public interface Socket extends QuietCloseable {
     int WRITE_FLAG = 1;
@@ -97,7 +98,7 @@ public interface Socket extends QuietCloseable {
      * the socket. Can be called safely even if the socket doesn't
      * support TLS.
      *
-     * @param readinessFlags socket readiness flags and {@link #WRITE_FLAG}).
+     * @param readinessFlags socket readiness flags (see {@link #WRITE_FLAG}).
      * @return 0 if the call is successful; -1 if there was an error.
      */
     int tlsIO(int readinessFlags);

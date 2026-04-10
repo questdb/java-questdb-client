@@ -817,8 +817,14 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         if (frameParser.getState() == WebSocketFrameParser.STATE_ERROR) {
+            int errorCode = frameParser.getErrorCode();
+            try {
+                sendCloseFrame(errorCode, null, 1000);
+            } catch (Exception e) {
+                // Best-effort close frame before disconnect
+            }
             throw new HttpClientException("WebSocket frame parse error: ")
-                    .put(WebSocketCloseCode.describe(frameParser.getErrorCode()));
+                    .put(WebSocketCloseCode.describe(errorCode));
         }
 
         if (frameParser.getState() == WebSocketFrameParser.STATE_COMPLETE) {

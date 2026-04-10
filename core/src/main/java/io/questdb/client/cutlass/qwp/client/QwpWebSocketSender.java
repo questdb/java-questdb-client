@@ -668,11 +668,7 @@ public class QwpWebSocketSender implements Sender {
             sendQueue.flush();
 
             // Wait for all in-flight batches to be acknowledged by the server
-            if (sendQueue != null) {
-                sendQueue.awaitPendingAcks();
-            } else {
-                inFlightWindow.awaitEmpty();
-            }
+            sendQueue.awaitPendingAcks();
 
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Flush complete [totalBatches={}, totalBytes={}, totalAcked={}]", sendQueue.getTotalBatchesSent(), sendQueue.getTotalBytesSent(), inFlightWindow.getTotalAcked());

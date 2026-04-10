@@ -77,22 +77,22 @@ public class QwpGorillaEncoder {
             return 0;
         }
 
-        int size = 8; // first timestamp
+        long size = 8; // first timestamp
 
         if (count == 1) {
-            return size;
+            return (int) size;
         }
 
         size += 8; // second timestamp
 
         if (count == 2) {
-            return size;
+            return (int) size;
         }
 
         // Calculate bits for delta-of-delta encoding
         long prevTimestamp = Unsafe.getUnsafe().getLong(srcAddress + 8);
         long prevDelta = prevTimestamp - Unsafe.getUnsafe().getLong(srcAddress);
-        int totalBits = 0;
+        long totalBits = 0;
 
         for (int i = 2; i < count; i++) {
             long ts = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8);
@@ -108,7 +108,10 @@ public class QwpGorillaEncoder {
         // Round up to bytes
         size += (totalBits + 7) / 8;
 
-        return size;
+        if (size > Integer.MAX_VALUE) {
+            throw new LineSenderException("Gorilla encoded size exceeds int range");
+        }
+        return (int) size;
     }
 
     /**

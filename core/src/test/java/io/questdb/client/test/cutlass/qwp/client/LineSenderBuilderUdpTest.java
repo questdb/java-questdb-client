@@ -161,10 +161,10 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
     @Test
     public void testUdp_inFlightWindowSizeNotSupported() {
         assertThrowsAny(
-                Sender.builder(Sender.Transport.UDP)
+                () -> Sender.builder(Sender.Transport.UDP)
                         .address("localhost")
                         .inFlightWindowSize(1000),
-                "not supported for UDP");
+                "only supported for WebSocket");
     }
 
     @Test
