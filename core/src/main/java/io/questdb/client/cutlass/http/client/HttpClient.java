@@ -51,7 +51,6 @@ import io.questdb.client.std.str.Utf8StringSink;
 import io.questdb.client.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -109,11 +108,6 @@ public abstract class HttpClient implements QuietCloseable {
 
     public void disconnect() {
         Misc.free(socket);
-    }
-
-    @TestOnly
-    public ResponseHeaders getResponseHeaders() {
-        return responseHeaders;
     }
 
     public Request newRequest(CharSequence host, int port) {

@@ -26,7 +26,6 @@ package io.questdb.client.cairo.vm.api;
 
 import java.io.Closeable;
 
-// appendable
 public interface MemoryA extends Closeable {
 
     @Override
@@ -34,13 +33,7 @@ public interface MemoryA extends Closeable {
 
     long getAppendOffset();
 
-    void putByte(byte value);
-
     void putDouble(double value);
 
-    void putInt(int value);
-
     void putLong(long value);
-
-    void skip(long bytes);
 }

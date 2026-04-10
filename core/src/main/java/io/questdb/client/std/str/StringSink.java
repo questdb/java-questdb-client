@@ -28,7 +28,7 @@ import io.questdb.client.std.Chars;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class StringSink implements MutableUtf16Sink, CharSequence, CloneableMutable, Utf16Sink {
+public class StringSink implements MutableUtf16Sink, CharSequence, Utf16Sink {
 
     private char[] buffer;
     private int pos;
@@ -54,12 +54,6 @@ public class StringSink implements MutableUtf16Sink, CharSequence, CloneableMuta
     @Override
     public void clear() {
         clear(0);
-    }
-
-    @Override
-    @SuppressWarnings("unchecked")
-    public <T> T copy() {
-        return (T) new String(buffer, 0, pos);
     }
 
     @Override

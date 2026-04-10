@@ -25,9 +25,6 @@
 package io.questdb.client.std;
 
 public final class Vect {
-    // Up is decreasing scan direction
-    public static final int BIN_SEARCH_SCAN_UP = -1;
-
     public static void memcpy(long dst, long src, long len) {
         // the split length was determined experimentally
         // using 'MemCopyBenchmark' bench

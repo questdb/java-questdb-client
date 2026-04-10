@@ -57,8 +57,7 @@ public interface Socket extends QuietCloseable {
      * call is not required.
      * <p>
      * If data from the socket doesn't fit into the provided buffer then part of the data stays in the
-     * internal buffer and can be read with a subsequent call to this method. Use {@link #isMorePlaintextBuffered()}
-     * to check if there is more data to read.
+     * internal buffer and can be read with a subsequent call to this method.
      *
      * @param bufferPtr pointer to the buffer
      * @param bufferLen buffer length

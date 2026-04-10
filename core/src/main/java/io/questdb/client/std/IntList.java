@@ -48,11 +48,6 @@ public class IntList implements Mutable, Sinkable {
         this.data = capacity == 0 ? EMPTY_ARRAY : new int[initialCapacity];
     }
 
-    public IntList(IntList source) {
-        this(source.size());
-        addAll(source);
-    }
-
     @SuppressWarnings("ForLoopReplaceableByForEach")
     public static IntList createWithValues(int... values) {
         IntList list = new IntList();
@@ -72,14 +67,6 @@ public class IntList implements Mutable, Sinkable {
         int s = that.size();
         setPos(p + s);
         System.arraycopy(that.data, 0, this.data, p, s);
-    }
-
-    public void allocate(int size) {
-        checkCapacity(size);
-    }
-
-    public void arrayCopy(int srcPos, int dstPos, int length) {
-        System.arraycopy(data, srcPos, data, dstPos, length);
     }
 
     public int binarySearchUniqueList(int v) {
@@ -122,12 +109,6 @@ public class IntList implements Mutable, Sinkable {
         pos = 0;
     }
 
-    public void clear(int capacity) {
-        checkCapacity(capacity);
-        pos = 0;
-        Arrays.fill(data, NO_ENTRY_VALUE);
-    }
-
     public boolean contains(int value) {
         return indexOf(value, 0, pos) > -1;
     }
@@ -140,30 +121,8 @@ public class IntList implements Mutable, Sinkable {
         return this == that || that instanceof IntList && equals((IntList) that);
     }
 
-    /**
-     * Sets the value at index, extending the backing array if needed.
-     * <p>
-     * <strong>WARNING:</strong> does not initialize the newly revealed portion of
-     * the backing array! This may reveal values that were never set, or were set
-     * before calling <code>clear()</code>.
-     */
-    public void extendAndSet(int index, int value) {
-        checkCapacity(index + 1);
-        if (index >= pos) {
-            pos = index + 1;
-        }
-        data[index] = value;
-    }
-
     public int get(int index) {
         return getQuick(index);
-    }
-
-    public int getLast() {
-        if (pos > 0) {
-            return data[pos - 1];
-        }
-        return NO_ENTRY_VALUE;
     }
 
     /**
@@ -194,15 +153,6 @@ public class IntList implements Mutable, Sinkable {
         return hashCode;
     }
 
-    public void increment(int index) {
-        data[index] = data[index] + 1;
-    }
-
-    public void increment(int index, int delta) {
-        assert delta > -1;
-        data[index] = data[index] + delta;
-    }
-
     public int indexOf(int v, int low, int high) {
         assert high <= pos;
 
@@ -213,19 +163,6 @@ public class IntList implements Mutable, Sinkable {
             }
         }
         return -1;
-    }
-
-    public void insert(int index, int element) {
-        setPos(++pos);
-        System.arraycopy(data, index, data, index + 1, pos - index - 1);
-        data[index] = element;
-    }
-
-    // increment at index and return previous value
-    public int postIncrement(int index) {
-        final int prev = data[index];
-        data[index] = prev + 1;
-        return prev;
     }
 
     public void remove(int key) {
@@ -252,15 +189,6 @@ public class IntList implements Mutable, Sinkable {
     public void restoreInitialCapacity() {
         data = new int[initialCapacity];
         pos = 0;
-    }
-
-    public void reverse() {
-        final int len = size();
-        for (int index = 0, mid = len / 2; index < mid; ++index) {
-            final int temp = get(index);
-            set(index, get(len - index - 1));
-            set(len - index - 1, temp);
-        }
     }
 
     /**
@@ -299,20 +227,9 @@ public class IntList implements Mutable, Sinkable {
         throw new ArrayIndexOutOfBoundsException(index);
     }
 
-    public void setAll(int capacity, int value) {
-        checkCapacity(capacity);
-        pos = capacity;
-        Arrays.fill(data, 0, pos, value);
-    }
-
     public void setPos(int position) {
         checkCapacity(position);
         pos = position;
-    }
-
-    public void setQuick(int index, int value) {
-        assert index < pos;
-        data[index] = value;
     }
 
     public int size() {
@@ -358,10 +275,6 @@ public class IntList implements Mutable, Sinkable {
         return b.toString();
     }
 
-    public void zero(int value) {
-        Arrays.fill(data, 0, pos, value);
-    }
-
     private boolean equals(IntList that) {
         if (this.pos != that.pos) {
             return false;
@@ -388,8 +301,4 @@ public class IntList implements Mutable, Sinkable {
         return -(high + 1);
     }
 
-    int[] resetCapacityInternal(int intCapacity) {
-        checkCapacity(intCapacity);
-        return data;
-    }
 }

@@ -24,12 +24,7 @@
 
 package io.questdb.client.std;
 
-import io.questdb.client.std.str.StringSink;
-import io.questdb.client.std.str.Utf16Sink;
-
 public class Rnd {
-    private static final long mask = (1L << 48) - 1;
-    private final StringSink array = new StringSink();
     private long s0;
     private long s1;
 
@@ -43,13 +38,6 @@ public class Rnd {
 
     public boolean nextBoolean() {
         return nextLong() >>> (64 - 1) != 0;
-    }
-
-    // returns random bytes between 'B' and 'Z' for legacy reasons
-    public void nextChars(Utf16Sink array, int len) {
-        for (int i = 0; i < len; i++) {
-            array.put((char) (nextPositiveInt() % 25 + 66));
-        }
     }
 
     /**
@@ -194,11 +182,6 @@ public class Rnd {
     public int nextPositiveInt() {
         int n = (int) nextLong();
         return n > 0 ? n : (n == Integer.MIN_VALUE ? Integer.MAX_VALUE : -n);
-    }
-
-    public long nextPositiveLong() {
-        long l = nextLong();
-        return l > 0 ? l : (l == Long.MIN_VALUE ? Long.MAX_VALUE : -l);
     }
 
     // returns random bytes between 'B' and 'Z' for legacy reasons

@@ -104,9 +104,4 @@ public class LowerCaseAsciiCharSequenceIntHashMap extends AbstractLowerCaseAscii
             }
         }
     }
-
-    protected void erase(int index) {
-        keys[index] = noEntryKey;
-        values[index] = noEntryValue;
-    }
 }

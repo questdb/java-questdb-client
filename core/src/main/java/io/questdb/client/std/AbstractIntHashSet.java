@@ -36,10 +36,6 @@ public abstract class AbstractIntHashSet implements Mutable {
     protected int[] keys;
     protected int mask;
 
-    public AbstractIntHashSet(int initialCapacity, double loadFactor) {
-        this(initialCapacity, loadFactor, noEntryKey);
-    }
-
     public AbstractIntHashSet(int initialCapacity, double loadFactor, int noKeyValue) {
         if (loadFactor <= 0d || loadFactor >= 1d) {
             throw new IllegalArgumentException("0 < loadFactor < 1");

@@ -35,25 +35,6 @@ import org.jetbrains.annotations.Nullable;
 
 public class CairoException extends RuntimeException implements Sinkable, FlyweightMessageContainer {
 
-    public static final int ERRNO_ACCESS_DENIED_WIN = 5;
-    public static final int ERRNO_EACCES_LINUX = 13;
-    public static final int ERRNO_EACCES_MACOS = 13;
-    public static final int ERRNO_EPERM_LINUX = 1;
-    public static final int ERRNO_EPERM_MACOS = 1;
-    public static final int ERRNO_FILE_DOES_NOT_EXIST = 2;
-    public static final int ERRNO_FILE_DOES_NOT_EXIST_WIN = 3;
-    // psync_cvcontinue sets two bits in the error code to indicate whether the wait timed out (0x100) or there were no waiters (0x200).
-    // Error #316 (0x13C) is the timed out bit bitwise OR'd with ETIMEDOUT (60).
-    public static final int ERRNO_FILE_READ_TIMEOUT_MACOS = 316;
-    public static final int METADATA_VALIDATION = -100;
-    public static final int ILLEGAL_OPERATION = METADATA_VALIDATION - 1;
-    private static final int TABLE_DROPPED = ILLEGAL_OPERATION - 1;
-    public static final int METADATA_VALIDATION_RECOVERABLE = TABLE_DROPPED - 1;
-    public static final int PARTITION_MANIPULATION_RECOVERABLE = METADATA_VALIDATION_RECOVERABLE - 1;
-    public static final int TABLE_DOES_NOT_EXIST = PARTITION_MANIPULATION_RECOVERABLE - 1;
-    public static final int VIEW_DOES_NOT_EXIST = TABLE_DOES_NOT_EXIST - 1;
-    public static final int MAT_VIEW_DOES_NOT_EXIST = VIEW_DOES_NOT_EXIST - 1;
-    public static final int TXN_BLOCK_APPLY_FAILED = MAT_VIEW_DOES_NOT_EXIST - 1;
     public static final int NON_CRITICAL = -1;
     private static final StackTraceElement[] EMPTY_STACK_TRACE = {};
     private static final ThreadLocal<CairoException> tlException = new ThreadLocal<>(CairoException::new);

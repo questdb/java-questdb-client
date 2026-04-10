@@ -24,7 +24,6 @@
 
 package io.questdb.client.cutlass.http;
 
-import io.questdb.client.cairo.Reopenable;
 import io.questdb.client.std.LowerCaseUtf8SequenceObjHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Mutable;
@@ -39,15 +38,12 @@ import io.questdb.client.std.str.DirectUtf8Sequence;
 import io.questdb.client.std.str.DirectUtf8Sink;
 import io.questdb.client.std.str.DirectUtf8String;
 import io.questdb.client.std.str.Utf8Sequence;
-import io.questdb.client.std.str.Utf8String;
-import io.questdb.client.std.str.Utf8s;
 import org.jetbrains.annotations.Nullable;
 
 import static io.questdb.client.cutlass.http.HttpConstants.HEADER_CONTENT_LENGTH;
 import static io.questdb.client.cutlass.http.HttpConstants.HEADER_CONTENT_TYPE;
 
 public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHeader {
-    private final BoundaryAugmenter boundaryAugmenter = new BoundaryAugmenter();
     private final ObjectPool<DirectUtf8String> csPool;
     private final LowerCaseUtf8SequenceObjHashMap<DirectUtf8String> headers = new LowerCaseUtf8SequenceObjHashMap<>();
     private final DirectUtf8Sink sink = new DirectUtf8Sink(0);
@@ -114,7 +110,6 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
         clear();
         if (headerPtr != 0) {
             headerPtr = _wptr = hi = Unsafe.free(headerPtr, hi - headerPtr, MemoryTag.NATIVE_HTTP_CONN);
-            boundaryAugmenter.close();
         }
         sink.close();
         csPool.clear();
@@ -407,43 +402,5 @@ public class HttpHeaderParser implements Mutable, QuietCloseable, HttpRequestHea
         }
 
         return offset;
-    }
-
-    public static class BoundaryAugmenter implements Reopenable, QuietCloseable {
-        private static final Utf8String BOUNDARY_PREFIX = new Utf8String("\r\n--");
-        private final DirectUtf8String export = new DirectUtf8String();
-        private long _wptr;
-        private long lim;
-        private long lo;
-
-        @Override
-        public void close() {
-            if (lo > 0) {
-                lo = _wptr = Unsafe.free(lo, lim, MemoryTag.NATIVE_HTTP_CONN);
-            }
-        }
-
-        public DirectUtf8String of(Utf8Sequence value) {
-            int len = value.size() + BOUNDARY_PREFIX.size();
-            if (len > lim) {
-                resize(len);
-            }
-            _wptr = lo + BOUNDARY_PREFIX.size();
-            of0(value);
-            return export.of(lo, _wptr);
-        }
-
-        private void of0(Utf8Sequence value) {
-            int len = value.size();
-            Utf8s.strCpy(value, len, _wptr);
-            _wptr += len;
-        }
-
-        private void resize(int lim) {
-            final long prevLim = this.lim;
-            this.lim = Numbers.ceilPow2(lim);
-            this.lo = this._wptr = Unsafe.realloc(this.lo, prevLim, this.lim, MemoryTag.NATIVE_HTTP_CONN);
-            of0(BOUNDARY_PREFIX);
-        }
     }
 }

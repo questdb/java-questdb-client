@@ -24,12 +24,10 @@
 
 package io.questdb.client.std;
 
-import java.io.File;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 
 public final class Files {
-    public static final char SEPARATOR;
     public static final Charset UTF_8;
 
     private Files() {
@@ -50,6 +48,5 @@ public final class Files {
     static {
         Os.init();
         UTF_8 = StandardCharsets.UTF_8;
-        SEPARATOR = File.separatorChar;
     }
 }

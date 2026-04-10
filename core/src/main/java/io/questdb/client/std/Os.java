@@ -37,8 +37,6 @@ import java.nio.file.Paths;
 import java.security.CodeSource;
 
 public final class Os {
-    public static final int ARCH_AARCH64 = 1;
-    public static final int ARCH_X86_64 = 2;
     public static final int DARWIN = 1;
     public static final int FREEBSD = 4;
     public static final int LINUX = 2;

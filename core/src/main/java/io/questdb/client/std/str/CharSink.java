@@ -93,24 +93,9 @@ public interface CharSink<T extends CharSink<?>> {
     /**
      * Appends a string representation of the supplied number to this sink.
      */
-    default T put(float value) {
-        Numbers.append(this, value);
-        return (T) this;
-    }
-
-    /**
-     * Appends a string representation of the supplied number to this sink.
-     */
     default T put(double value) {
         Numbers.append(this, value);
         return (T) this;
-    }
-
-    /**
-     * Appends a string representation of the supplied boolean to this sink.
-     */
-    default T put(boolean value) {
-        return putAscii(value ? "true" : "false");
     }
 
     /**
@@ -160,11 +145,6 @@ public interface CharSink<T extends CharSink<?>> {
      * Drops the `isAscii` status of this sink.
      */
     T putNonAscii(long lo, long hi);
-
-    default T putQuoted(@NotNull Utf8Sequence cs) {
-        putAscii('\"').put(cs).putAscii('\"');
-        return (T) this;
-    }
 
     default T putSize(long bytes) {
         long b = bytes == Long.MIN_VALUE ? Long.MAX_VALUE : Math.abs(bytes);

@@ -28,14 +28,6 @@ public final class Hash {
 
     private static final int SPREAD_HASH_BITS = 0x7fffffff;
 
-    public static int hashLong32(long k) {
-        return (int) hashLong64(k);
-    }
-
-    public static long hashLong64(long k) {
-        return fmix64(k);
-    }
-
     /**
      * (copied from ConcurrentHashMap)
      * Spreads (XORs) higher bits of hash to lower and also forces top
@@ -58,15 +50,6 @@ public final class Hash {
      */
     public static int spread(int h) {
         return (h ^ (h >>> 16)) & SPREAD_HASH_BITS;
-    }
-
-    /**
-     * Murmur finalizer.
-     */
-    private static long fmix64(long h) {
-        h = (h ^ (h >>> 33)) * 0xff51afd7ed558ccdL;
-        h = (h ^ (h >>> 33)) * 0xc4ceb9fe1a85ec53L;
-        return h ^ (h >>> 33);
     }
 
 }

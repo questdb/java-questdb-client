@@ -54,7 +54,6 @@ import io.questdb.client.std.str.StringSink;
  */
 public final class ColumnType {
     public static final int ARRAY_NDIMS_LIMIT = 32; // inclusive
-    public static final String[] ARRAY_DIM_SUFFIX = new String[ARRAY_NDIMS_LIMIT + 1];
     public static final int GEOLONG_MAX_BITS = 60;
     public static final int MIGRATION_VERSION = 426;
     // our type system is absolutely ordered ranging
