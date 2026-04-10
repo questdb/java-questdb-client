@@ -37,8 +37,6 @@ public final class Unsafe {
 
     public static final long BYTE_OFFSET;
     public static final Module JAVA_BASE_MODULE = System.class.getModule();
-    public static final long LONG_OFFSET;
-    public static final long LONG_SCALE;
     private static final LongAdder[] COUNTERS = new LongAdder[MemoryTag.SIZE];
     private static final long FREE_COUNT_ADDR;
     private static final long MALLOC_COUNT_ADDR;
@@ -80,10 +78,6 @@ public final class Unsafe {
         long ptr = malloc(size, memoryTag);
         Vect.memset(ptr, size, 0);
         return ptr;
-    }
-
-    public static boolean cas(Object o, long offset, long expected, long value) {
-        return UNSAFE.compareAndSwapLong(o, offset, expected, value);
     }
 
     public static long free(long ptr, long size, int memoryTag) {
@@ -275,9 +269,6 @@ public final class Unsafe {
             UNSAFE = (sun.misc.Unsafe) theUnsafe.get(null);
 
             BYTE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(byte[].class);
-
-            LONG_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(long[].class);
-            LONG_SCALE = msb(Unsafe.getUnsafe().arrayIndexScale(long[].class));
 
             OVERRIDE = AccessibleObject_override_fieldOffset();
             implAddExports = Module.class.getDeclaredMethod("implAddExports", String.class, Module.class);

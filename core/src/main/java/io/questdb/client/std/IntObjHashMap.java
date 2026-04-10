@@ -49,14 +49,6 @@ public class IntObjHashMap<V> extends AbstractIntHashSet {
         Arrays.fill(values, null);
     }
 
-    public V get(int key) {
-        return valueAt(keyIndex(key));
-    }
-
-    public V[] getValues() {
-        return values;
-    }
-
     public void put(int key, V value) {
         putAt(keyIndex(key), key, value);
     }
@@ -71,10 +63,6 @@ public class IntObjHashMap<V> extends AbstractIntHashSet {
                 rehash();
             }
         }
-    }
-
-    public V valueAt(int index) {
-        return index < 0 ? valueAtQuick(index) : null;
     }
 
     public V valueAtQuick(int index) {

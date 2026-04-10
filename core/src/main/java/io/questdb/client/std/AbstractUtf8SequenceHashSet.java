@@ -75,15 +75,6 @@ public abstract class AbstractUtf8SequenceHashSet implements Mutable {
         return probe(key, hashCode, index);
     }
 
-    public int remove(@NotNull Utf8Sequence key) {
-        int index = keyIndex(key);
-        if (index < 0) {
-            removeAt(index);
-            return -index - 1;
-        }
-        return -1;
-    }
-
     public void removeAt(int index) {
         if (index < 0) {
             int from = -index - 1;

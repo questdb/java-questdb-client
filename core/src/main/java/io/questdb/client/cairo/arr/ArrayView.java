@@ -150,11 +150,10 @@ public abstract class ArrayView implements QuietCloseable {
     protected int flatViewLength;
 
     // indicates whether the array elements are contiguous in memory.
-    protected boolean isVanilla = true;
     protected int type = ColumnType.UNDEFINED;
 
     /**
-     * Convenience that downcasts {@link #flatView()} into {@link BorrowedFlatArrayView}.
+     * Convenience that downcasts flatView into {@link BorrowedFlatArrayView}.
      * If called on the wrong implementation, this call will fail with a cast exception.
      */
     public final BorrowedFlatArrayView borrowedFlatView() {
@@ -189,9 +188,7 @@ public abstract class ArrayView implements QuietCloseable {
     }
 
     /**
-     * Returns the number of elements in the backing flat view. For a {@linkplain
-     * #isVanilla vanilla} array, it is equal to the total number of elements in
-     * this array.
+     * Returns the number of elements in the backing flat view.
      * <p>
      * <strong>NOTE:</strong> This value is not the same as {@code flatView().length()}.
      * It tells you which part of the underlying flat view this array is using, as

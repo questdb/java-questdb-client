@@ -34,7 +34,6 @@ import java.util.Arrays;
 public class LongList implements Mutable, Sinkable {
     private static final int DEFAULT_ARRAY_SIZE = 16;
     private static final long DEFAULT_NO_ENTRY_VALUE = -1L;
-    private final int initialCapacity;
     private final long noEntryValue;
     private long[] data;
     private int pos = 0;
@@ -48,7 +47,6 @@ public class LongList implements Mutable, Sinkable {
     }
 
     public LongList(int capacity, long noEntryValue) {
-        this.initialCapacity = capacity;
         this.data = new long[capacity];
         this.noEntryValue = noEntryValue;
     }
@@ -119,15 +117,6 @@ public class LongList implements Mutable, Sinkable {
             hashCode = 31 * hashCode + (v == noEntryValue ? 0 : v);
         }
         return (int) hashCode;
-    }
-
-    public final void setPos(int pos) {
-        checkCapacity(pos);
-        this.pos = pos;
-    }
-
-    public int size() {
-        return pos;
     }
 
     @Override

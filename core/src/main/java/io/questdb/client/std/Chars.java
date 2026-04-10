@@ -29,17 +29,9 @@ import io.questdb.client.std.str.Utf16Sink;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.Arrays;
-
 public final class Chars {
     static final String[] CHAR_STRINGS;
     static final char[] base64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toCharArray();
-    // inverted alphabets for base64 decoding could be just byte arrays. this would save 3 * 128 bytes per alphabet
-    // but benchmarks show that int arrays make decoding faster.
-    // it's probably because it does not require any type conversions in the hot decoding loop
-    static final int[] base64Inverted = base64CreateInvertedAlphabet(base64);
-    static final char[] base64Url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toCharArray();
-    static final int[] base64UrlInverted = base64CreateInvertedAlphabet(base64Url);
 
     private Chars() {
     }
@@ -66,42 +58,6 @@ public final class Chars {
 
     public static boolean equals(@NotNull String l, @NotNull String r) {
         return l.equals(r);
-    }
-
-    public static boolean equals(@NotNull CharSequence l, @NotNull CharSequence r, int rLo, int rHi) {
-        if (l == r) {
-            return true;
-        }
-
-        int ll = l.length();
-        if (ll != rHi - rLo) {
-            return false;
-        }
-
-        for (int i = 0; i < ll; i++) {
-            if (l.charAt(i) != r.charAt(i + rLo)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    public static boolean equals(@NotNull CharSequence l, int lLo, int lHi, @NotNull CharSequence r, int rLo, int rHi) {
-        if (l == r) {
-            return true;
-        }
-
-        int ll = lHi - lLo;
-        if (ll != rHi - rLo) {
-            return false;
-        }
-
-        for (int i = 0; i < ll; i++) {
-            if (l.charAt(i + lLo) != r.charAt(i + rLo)) {
-                return false;
-            }
-        }
-        return true;
     }
 
     /**
@@ -212,55 +168,6 @@ public final class Chars {
     }
 
     /**
-     * Searches for the first occurrence of a character sequence within the specified bounds of another character sequence.
-     * This method performs a case-sensitive search using an optimized string matching algorithm.
-     * <p>
-     * The search bounds are defined as {@code [seqLo, seqHi)} where {@code seqLo} is inclusive and
-     * {@code seqHi} is exclusive. The method searches for the complete term within these bounds.
-     * <p>
-     * If the term is empty (length 0), the method returns 0 as an empty string is considered to be
-     * found at the beginning of any sequence.
-     *
-     * @param seq   the character sequence to search within (must not be null)
-     * @param seqLo the lower bound (inclusive) of the search range
-     * @param seqHi the upper bound (exclusive) of the search range
-     * @param term  the character sequence to search for (must not be null)
-     * @return the index of the first occurrence of the term, or -1 if not found within bounds
-     * @throws StringIndexOutOfBoundsException if bounds are invalid for the given sequence
-     */
-    public static int indexOf(@NotNull CharSequence seq, int seqLo, int seqHi, @NotNull CharSequence term) {
-        int termLen = term.length();
-        if (termLen == 0) {
-            return 0;
-        }
-
-        char first = term.charAt(0);
-        int max = seqHi - termLen;
-
-        for (int i = seqLo; i <= max; ++i) {
-            if (seq.charAt(i) != first) {
-                do {
-                    ++i;
-                } while (i <= max && seq.charAt(i) != first);
-            }
-
-            if (i <= max) {
-                int j = i + 1;
-                int end = j + termLen - 1;
-
-                for (int k = 1; j < end && seq.charAt(j) == term.charAt(k); ++k) {
-                    ++j;
-                }
-
-                if (j == end) {
-                    return i;
-                }
-            }
-        }
-        return -1;
-    }
-
-    /**
      * Searches for the nth occurrence of a character within the specified bounds of a character sequence.
      * This method supports both forward and reverse searching based on the occurrence parameter.
      * <p>
@@ -326,19 +233,6 @@ public final class Chars {
         return true;
     }
 
-    public static int lowerCaseAsciiHashCode(CharSequence value) {
-        int len = value.length();
-        if (len == 0) {
-            return 0;
-        }
-
-        int h = 0;
-        for (int p = 0; p < len; p++) {
-            h = 31 * h + toLowerCaseAscii(value.charAt(p));
-        }
-        return h;
-    }
-
     public static int lowerCaseHashCode(CharSequence value) {
         int len = value.length();
         if (len == 0) {
@@ -350,14 +244,6 @@ public final class Chars {
             h = 31 * h + Character.toLowerCase(value.charAt(p));
         }
         return h;
-    }
-
-    public static boolean startsWith(@Nullable CharSequence cs, @Nullable CharSequence starts) {
-        if (cs == null || starts == null) {
-            return false;
-        }
-        int l = starts.length();
-        return l == 0 || cs.length() >= l && equalsChars(cs, starts, l);
     }
 
     public static boolean startsWith(CharSequence _this, char c) {
@@ -380,40 +266,12 @@ public final class Chars {
         return b.toString();
     }
 
-    public static String toLowerCaseAscii(@Nullable CharSequence value) {
-        if (value == null) {
-            return null;
-        }
-        final int len = value.length();
-        if (len == 0) {
-            return "";
-        }
-
-        final Utf16Sink b = Misc.getThreadLocalSink();
-        for (int i = 0; i < len; i++) {
-            b.put(toLowerCaseAscii(value.charAt(i)));
-        }
-        return b.toString();
-    }
-
     public static char toLowerCaseAscii(char character) {
         return character > 64 && character < 91 ? (char) (character + 32) : character;
     }
 
     public static String toString(CharSequence s) {
         return s == null ? null : s.toString();
-    }
-
-    private static int[] base64CreateInvertedAlphabet(char[] alphabet) {
-        int[] inverted = new int[128]; // ASCII only
-        Arrays.fill(inverted, (byte) -1);
-        int length = alphabet.length;
-        for (int i = 0; i < length; i++) {
-            char letter = alphabet[i];
-            assert letter < 128;
-            inverted[letter] = (byte) i;
-        }
-        return inverted;
     }
 
     private static int base64Encode0(@Nullable BinarySequence sequence, int maxLength, @NotNull CharSink<?> buffer) {

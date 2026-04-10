@@ -157,12 +157,6 @@ public final class Utf8s {
         }
     }
 
-    public static void strCpy(long srcLo, long srcHi, @NotNull Utf8Sink dest) {
-        for (long i = srcLo; i < srcHi; i++) {
-            dest.putAny(Unsafe.getUnsafe().getByte(i));
-        }
-    }
-
     public static void strCpyAscii(char @NotNull [] srcChars, int srcLo, int srcLen, long destAddr) {
         for (int i = 0; i < srcLen; i++) {
             Unsafe.getUnsafe().putByte(destAddr + i, (byte) srcChars[i + srcLo]);

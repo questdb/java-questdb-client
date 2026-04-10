@@ -28,7 +28,6 @@ import io.questdb.client.ClientTlsConfiguration;
 import org.slf4j.Logger;
 
 public final class JavaTlsClientSocketFactory implements SocketFactory {
-    public static final SocketFactory DEFAULT = new JavaTlsClientSocketFactory(ClientTlsConfiguration.DEFAULT);
     public static final SocketFactory INSECURE_NO_VALIDATION = new JavaTlsClientSocketFactory(
             ClientTlsConfiguration.INSECURE_NO_VALIDATION);
     private final ClientTlsConfiguration tlsConfig;

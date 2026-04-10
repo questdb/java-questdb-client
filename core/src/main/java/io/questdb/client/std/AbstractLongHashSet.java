@@ -29,17 +29,11 @@ import java.util.Arrays;
 public abstract class AbstractLongHashSet implements Mutable {
     protected static final int MIN_INITIAL_CAPACITY = 16;
     protected static final long noEntryKey = -1;
-    protected final int initialCapacity;
-    protected final double loadFactor;
     protected final long noEntryKeyValue;
     protected int capacity;
     protected int free;
     protected long[] keys;
     protected int mask;
-
-    public AbstractLongHashSet(int initialCapacity, double loadFactor) {
-        this(initialCapacity, loadFactor, noEntryKey);
-    }
 
     public AbstractLongHashSet(int initialCapacity, double loadFactor, long noKeyValue) {
         if (loadFactor <= 0d || loadFactor >= 1d) {
@@ -47,8 +41,6 @@ public abstract class AbstractLongHashSet implements Mutable {
         }
         this.noEntryKeyValue = noKeyValue;
         free = capacity = Math.max(initialCapacity, MIN_INITIAL_CAPACITY);
-        this.initialCapacity = capacity;
-        this.loadFactor = loadFactor;
         keys = new long[Numbers.ceilPow2((int) (this.capacity / loadFactor))];
         mask = keys.length - 1;
     }
@@ -57,59 +49,6 @@ public abstract class AbstractLongHashSet implements Mutable {
     public void clear() {
         Arrays.fill(keys, noEntryKeyValue);
         free = capacity;
-    }
-
-    public int keyIndex(long key) {
-        int hashCode = Hash.hashLong32(key);
-        int index = hashCode & mask;
-        if (keys[index] == noEntryKeyValue) {
-            return index;
-        }
-        if (key == keys[index]) {
-            return -index - 1;
-        }
-        return probe(key, index);
-    }
-
-    public void removeAt(int index) {
-        if (index < 0) {
-            int from = -index - 1;
-            erase(from);
-            free++;
-
-            // after we have freed up a slot
-            // consider non-empty keys directly below
-            // they may have been a direct hit but because
-            // directly hit slot wasn't empty these keys would
-            // have moved.
-            //
-            // After slot if freed these keys require re-hash
-            from = (from + 1) & mask;
-            for (
-                    long key = keys[from];
-                    key != noEntryKeyValue;
-                    from = (from + 1) & mask, key = keys[from]
-            ) {
-                int hashCode = Hash.hashLong32(key);
-                int idealHit = hashCode & mask;
-                if (idealHit != from) {
-                    int to;
-                    if (keys[idealHit] != noEntryKeyValue) {
-                        to = probe(key, idealHit);
-                    } else {
-                        to = idealHit;
-                    }
-
-                    if (to > -1) {
-                        move(from, to);
-                    }
-                }
-            }
-        }
-    }
-
-    public int size() {
-        return capacity - free;
     }
 
     private int probe(long key, int index) {

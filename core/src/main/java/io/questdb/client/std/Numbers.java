@@ -36,7 +36,6 @@ public final class Numbers {
     public static final int IPv4_NULL = 0;
     public static final long LONG_NULL = Long.MIN_VALUE;
     public static final int MAX_DOUBLE_SCALE = 19;
-    public static final int MAX_FLOAT_SCALE = 10;
     public static final int SIGNIFICAND_WIDTH = 53;
     public static final long SIGN_BIT_MASK = 0x8000000000000000L;
     public static final char[] hexDigits = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
@@ -200,10 +199,6 @@ public final class Numbers {
         } else { //  nineteen
             appendLong19(sink, i);
         }
-    }
-
-    public static void append(CharSink<?> sink, float value) {
-        append(sink, value, MAX_FLOAT_SCALE);
     }
 
     public static void append(CharSink<?> sink, double value) {
@@ -427,13 +422,6 @@ public final class Numbers {
         }
 
         return parseInt0(sequence, 0, sequence.length());
-    }
-
-    public static int parseInt(Utf8Sequence sequence, int p, int lim) throws NumericException {
-        if (sequence == null) {
-            throw NumericException.instance().put("null string");
-        }
-        return parseInt0(sequence.asAsciiCharSequence(), p, lim);
     }
 
     public static int parseInt(CharSequence sequence, int p, int lim) throws NumericException {

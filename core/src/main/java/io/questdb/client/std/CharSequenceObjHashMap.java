@@ -27,7 +27,6 @@ package io.questdb.client.std;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
-import java.util.Comparator;
 
 public class CharSequenceObjHashMap<V> extends AbstractCharSequenceHashSet {
     private final ObjList<CharSequence> list;
@@ -69,10 +68,6 @@ public class CharSequenceObjHashMap<V> extends AbstractCharSequenceHashSet {
             return true;
         }
         return false;
-    }
-
-    public void sortKeys(Comparator<CharSequence> comparator) {
-        list.sort(comparator);
     }
 
     public V valueAt(int index) {

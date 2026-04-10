@@ -27,14 +27,12 @@ package io.questdb.client.std.datetime.microtime;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.datetime.CommonUtils;
-import org.jetbrains.annotations.Nullable;
 
 import static io.questdb.client.std.datetime.CommonUtils.DAYS_PER_MONTH;
 
 public final class Micros {
     public static final long DAY_MICROS = 86_400_000_000L; // 24 * 60 * 60 * 1000 * 1000L
     public static final long HOUR_MICROS = 3600000000L;
-    public static final Micros INSTANCE = new Micros();
     public static final long MICRO_NANOS = 1000L;
     public static final long MILLI_MICROS = 1000L;
     public static final long MINUTE_MICROS = 60000000L;
@@ -182,10 +180,6 @@ public final class Micros {
             ts = (yearMicros(year, l) + monthOfYearMicros(1, l));
         }
         return ts;
-    }
-
-    public long parseFloorLiteral(@Nullable CharSequence timestampLiteral) throws NumericException {
-        return timestampLiteral != null ? parseFloor(timestampLiteral, 0, timestampLiteral.length()) : Numbers.LONG_NULL;
     }
 
     private static long checkTimezoneTail(CharSequence seq, int p, int lim) throws NumericException {

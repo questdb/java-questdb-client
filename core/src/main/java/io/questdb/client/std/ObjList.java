@@ -194,10 +194,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
         return pos;
     }
 
-    public void sort(Comparator<T> cmp) {
-        sort(0, pos, cmp);
-    }
-
     public void sort(int from, int to, Comparator<T> cmp) {
         Arrays.sort(buffer, from, to, cmp);
     }

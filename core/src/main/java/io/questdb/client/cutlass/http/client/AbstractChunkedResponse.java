@@ -45,7 +45,6 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
     long available;
     long consumed = 0;
     long dataAddr;
-    boolean endOfChunk;
     long size;
     private long dataHi;
     private long dataLo;
@@ -76,7 +75,6 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
         this.dataHi = hi;
         this.state = STATE_CHUNK_SIZE;
         this.receive = hi == lo;
-        this.endOfChunk = false;
         size = 0;
         available = 0;
         consumed = 0;
@@ -158,7 +156,6 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
                             // chunk data fits in the buffer
                             available = chunkBytesRemaining;
                             consumed += chunkBytesRemaining;
-                            endOfChunk = true;
                             // skip chunk data to begin processing chunk end
                             dataLo += chunkBytesRemaining;
                             state = STATE_CHUNK_DATA_END;
@@ -166,7 +163,6 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
                         } else {
                             available = bufBytesRemaining;
                             consumed += bufBytesRemaining;
-                            endOfChunk = false;
                             // we consumed the entire buffer for chunk data
                             // we must recv more data
                             dataLo = dataHi;

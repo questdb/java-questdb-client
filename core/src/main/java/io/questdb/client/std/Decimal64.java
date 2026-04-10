@@ -307,14 +307,6 @@ public class Decimal64 implements Sinkable, Decimal {
         }
     }
 
-    public static long uncheckedAdd(long value1, long value2) {
-        try {
-            return Math.addExact(value1, value2);
-        } catch (Exception e) {
-            throw NumericException.instance().put("Overflow in addition: result exceeds 64-bit capacity");
-        }
-    }
-
     /**
      * Add another Decimal64 to this one (in-place)
      */
@@ -504,23 +496,6 @@ public class Decimal64 implements Sinkable, Decimal {
         return getDigit(value, p);
     }
 
-    /**
-     * Extracts the digit at a specific power-of-ten from a 64-bit decimal number.
-     * <p>
-     * Uses binary search to efficiently determine which digit (0-9) should appear at the
-     * given power-of-ten when the decimal is represented in base 10.
-     * <p>
-     * Prerequisites:
-     * - The decimal value must be positive
-     * - The decimal value must be less than 10^pow
-     *
-     * @param pow the power of ten
-     * @return the digit (0-9) at the specified power-of-ten
-     */
-    public int getDigitAtPowerOfTen(int pow) {
-        return getDigit(value, TEN_POWERS_TABLE[pow]);
-    }
-
     @Override
     public final int getMaxPrecision() {
         return MAX_PRECISION;
@@ -649,14 +624,6 @@ public class Decimal64 implements Sinkable, Decimal {
     public void ofNull() {
         value = Decimals.DECIMAL64_NULL;
         scale = 0;
-    }
-
-    public void ofRaw(long value) {
-        this.value = value;
-    }
-
-    public void ofRawNull() {
-        this.value = Decimals.DECIMAL64_NULL;
     }
 
     /**
@@ -800,21 +767,6 @@ public class Decimal64 implements Sinkable, Decimal {
         if (hasOverflowed()) {
             throw NumericException.instance().put("Overflow in subtraction: result exceeds max value");
         }
-    }
-
-    /**
-     * Subtract a specific multiplier of a power of ten to the current 64-bit value.
-     * This method modifies the value in-place by adding (multiplier * 10^pow).
-     *
-     * @param pow        the power of ten position
-     * @param multiplier the digit to add (1-9, or 0 for no-op)
-     */
-    public void subtractPowerOfTenMultiple(int pow, int multiplier) {
-        if (multiplier == 0 || multiplier > 9) {
-            return;
-        }
-
-        value -= TEN_POWERS_TABLE[pow] * multiplier;
     }
 
     /**
