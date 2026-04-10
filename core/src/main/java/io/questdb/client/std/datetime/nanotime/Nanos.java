@@ -27,7 +27,6 @@ package io.questdb.client.std.datetime.nanotime;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.datetime.CommonUtils;
-import io.questdb.client.std.str.Utf8Sequence;
 import org.jetbrains.annotations.Nullable;
 
 import static io.questdb.client.std.datetime.microtime.Micros.monthOfYearMicros;
@@ -43,10 +42,6 @@ public final class Nanos {
     private static final int DAYS_0000_TO_1970 = 719527;
 
     private Nanos() {
-    }
-
-    public static long floor(CharSequence value) throws NumericException {
-        return INSTANCE.parseFloorLiteral(value);
     }
 
     public static long monthOfYearNanos(int month, boolean leap) {
@@ -70,103 +65,6 @@ public final class Nanos {
             return Long.MIN_VALUE;
         }
         return nanos;
-    }
-
-    public long parseFloor(Utf8Sequence str, int lo, int hi) throws NumericException {
-        long ts;
-        if (hi - lo < 4) {
-            throw NumericException.instance();
-        }
-        int p = lo;
-        int year = Numbers.parseInt(str, p, p += 4);
-        boolean l = CommonUtils.isLeapYear(year);
-        if (CommonUtils.checkLen3(p, hi)) {
-            CommonUtils.checkChar(str, p++, hi, '-');
-            int month = Numbers.parseInt(str, p, p += 2);
-            CommonUtils.checkRange(month, 1, 12);
-            if (CommonUtils.checkLen3(p, hi)) {
-                CommonUtils.checkChar(str, p++, hi, '-');
-                int day = Numbers.parseInt(str, p, p += 2);
-                CommonUtils.checkRange(day, 1, CommonUtils.getDaysPerMonth(month, l));
-                if (CommonUtils.checkLen3(p, hi)) {
-                    CommonUtils.checkSpecialChar(str, p++, hi);
-                    int hour = Numbers.parseInt(str, p, p += 2);
-                    CommonUtils.checkRange(hour, 0, 23);
-                    if (CommonUtils.checkLen3(p, hi)) {
-                        CommonUtils.checkChar(str, p++, hi, ':');
-                        int min = Numbers.parseInt(str, p, p += 2);
-                        CommonUtils.checkRange(min, 0, 59);
-                        if (CommonUtils.checkLen3(p, hi)) {
-                            CommonUtils.checkChar(str, p++, hi, ':');
-                            int sec = Numbers.parseInt(str, p, p += 2);
-                            CommonUtils.checkRange(sec, 0, 59);
-                            if (p < hi && str.byteAt(p) == '.') {
-                                p++;
-                                // var len milli, micros and seconds
-                                int nanoLim = p + 9;
-                                int nlim = Math.min(hi, nanoLim);
-                                int nano = 0;
-                                for (; p < nlim; p++) {
-                                    char c = (char) str.byteAt(p);
-                                    if (Numbers.notDigit(c)) {
-                                        // Timezone
-                                        break;
-                                    }
-                                    nano *= 10;
-                                    nano += c - '0';
-                                }
-                                nano *= CommonUtils.tenPow(nanoLim - p);
-                                // micros
-                                ts = Nanos.yearNanos(year, l)
-                                        + Nanos.monthOfYearNanos(month, l)
-                                        + (day - 1) * Nanos.DAY_NANOS
-                                        + hour * Nanos.HOUR_NANOS
-                                        + min * Nanos.MINUTE_NANOS
-                                        + sec * Nanos.SECOND_NANOS
-                                        + nano
-                                        + checkTimezoneTail(str, p, hi);
-                            } else {
-                                // seconds
-                                ts = Nanos.yearNanos(year, l)
-                                        + Nanos.monthOfYearNanos(month, l)
-                                        + (day - 1) * Nanos.DAY_NANOS
-                                        + hour * Nanos.HOUR_NANOS
-                                        + min * Nanos.MINUTE_NANOS
-                                        + sec * Nanos.SECOND_NANOS
-                                        + checkTimezoneTail(str, p, hi);
-                            }
-                        } else {
-                            // minute
-                            ts = Nanos.yearNanos(year, l)
-                                    + Nanos.monthOfYearNanos(month, l)
-                                    + (day - 1) * Nanos.DAY_NANOS
-                                    + hour * Nanos.HOUR_NANOS
-                                    + min * Nanos.MINUTE_NANOS;
-
-                        }
-                    } else {
-                        // year + month + day + hour
-                        ts = Nanos.yearNanos(year, l)
-                                + Nanos.monthOfYearNanos(month, l)
-                                + (day - 1) * Nanos.DAY_NANOS
-                                + hour * Nanos.HOUR_NANOS;
-
-                    }
-                } else {
-                    // year + month + day
-                    ts = Nanos.yearNanos(year, l)
-                            + Nanos.monthOfYearNanos(month, l)
-                            + (day - 1) * Nanos.DAY_NANOS;
-                }
-            } else {
-                // year + month
-                ts = (Nanos.yearNanos(year, l) + Nanos.monthOfYearNanos(month, l));
-            }
-        } else {
-            // year
-            ts = (Nanos.yearNanos(year, l) + Nanos.monthOfYearNanos(1, l));
-        }
-        return ts;
     }
 
     public long parseFloor(CharSequence str, int lo, int hi) throws NumericException {
@@ -302,34 +200,4 @@ public final class Nanos {
         throw NumericException.instance();
     }
 
-    private static long checkTimezoneTail(Utf8Sequence seq, int p, int lim) throws NumericException {
-        if (lim == p) {
-            return 0;
-        }
-
-        if (lim - p < 2) {
-            CommonUtils.checkChar(seq, p, lim, 'Z');
-            return 0;
-        }
-
-        if (lim - p > 2) {
-            int tzSign = CommonUtils.parseSign((char) seq.byteAt(p++));
-            int hour = Numbers.parseInt(seq, p, p += 2);
-            CommonUtils.checkRange(hour, 0, 23);
-
-            if (lim - p == 3) {
-                // Optional : separator between hours and mins in timezone
-                CommonUtils.checkChar(seq, p++, lim, ':');
-            }
-
-            if (CommonUtils.checkLenStrict(p, lim)) {
-                int min = Numbers.parseInt(seq, p, p + 2);
-                CommonUtils.checkRange(min, 0, 59);
-                return tzSign * (hour * Nanos.HOUR_NANOS + min * Nanos.MINUTE_NANOS);
-            } else {
-                return tzSign * (hour * Nanos.HOUR_NANOS);
-            }
-        }
-        throw NumericException.instance();
-    }
 }

@@ -28,9 +28,6 @@ import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
-
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
-
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -41,6 +38,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -265,7 +263,7 @@ public class MicrobatchBufferTest {
     @Test
     public void testConstructionWithCustomThresholds() throws Exception {
         assertMemoryLeak(() -> {
-            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 100, 4096, 1_000_000_000L)) {
+            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 1_000_000_000L)) {
                 Assert.assertEquals(1024, buffer.getBufferCapacity());
                 Assert.assertTrue(buffer.isFilling());
             }

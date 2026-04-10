@@ -64,21 +64,6 @@ public final class Misc {
         return null;
     }
 
-    public static <T extends Closeable> void freeObjList(ObjList<T> list) {
-        if (list != null) {
-            freeObjList0(list);
-        }
-    }
-
-    public static <T extends Closeable> void freeObjListAndClear(ObjList<T> list) {
-        if (list != null) {
-            for (int i = 0, n = list.size(); i < n; i++) {
-                free(list.getQuick(i));
-            }
-            list.clear();
-        }
-    }
-
     public static Decimal128 getThreadLocalDecimal128() {
         return tlDecimal128.get();
     }
@@ -99,13 +84,4 @@ public final class Misc {
         return b;
     }
 
-    private static <T> void freeObjList0(ObjList<T> list) {
-        for (int i = 0, n = list.size(); i < n; i++) {
-            list.setQuick(i, freeIfCloseable(list.getQuick(i)));
-        }
-    }
-
-    private static class Utf8SinkPool {
-
-    }
 }

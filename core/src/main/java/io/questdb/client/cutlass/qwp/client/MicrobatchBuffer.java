@@ -77,14 +77,11 @@ public class MicrobatchBuffer implements QuietCloseable {
     private volatile int state = STATE_FILLING;
 
     /**
-     * Creates a new MicrobatchBuffer with specified flush thresholds.
+     * Creates a new MicrobatchBuffer with default thresholds (no auto-flush).
      *
      * @param initialCapacity initial buffer size in bytes
-     * @param maxRows         maximum rows before auto-flush (0 = unlimited)
-     * @param maxBytes        maximum bytes before auto-flush (0 = unlimited)
-     * @param maxAgeNanos     maximum age in nanoseconds before auto-flush (0 = unlimited)
      */
-    public MicrobatchBuffer(int initialCapacity, int maxRows, int maxBytes, long maxAgeNanos) {
+    public MicrobatchBuffer(int initialCapacity) {
         if (initialCapacity <= 0) {
             throw new IllegalArgumentException("initialCapacity must be positive");
         }
@@ -94,15 +91,6 @@ public class MicrobatchBuffer implements QuietCloseable {
         this.rowCount = 0;
         this.firstRowTimeNanos = 0;
         this.batchId = nextBatchId.getAndIncrement();
-    }
-
-    /**
-     * Creates a new MicrobatchBuffer with default thresholds (no auto-flush).
-     *
-     * @param initialCapacity initial buffer size in bytes
-     */
-    public MicrobatchBuffer(int initialCapacity) {
-        this(initialCapacity, 0, 0, 0);
     }
 
     /**
