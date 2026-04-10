@@ -152,7 +152,6 @@ public class QwpWebSocketSender implements Sender {
             String host,
             int port,
             boolean tlsEnabled,
-            int bufferSize,
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
@@ -164,7 +163,7 @@ public class QwpWebSocketSender implements Sender {
         this.host = host;
         this.port = port;
         this.tlsEnabled = tlsEnabled;
-        this.encoder = new QwpWebSocketEncoder(bufferSize);
+        this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
         this.tableBuffers = new CharSequenceObjHashMap<>();
         this.currentTableBuffer = null;
         this.currentTableName = null;
@@ -276,7 +275,7 @@ public class QwpWebSocketSender implements Sender {
             int maxSchemasPerConnection
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
-                host, port, tlsEnabled, DEFAULT_BUFFER_SIZE,
+                host, port, tlsEnabled,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
         );
@@ -302,7 +301,7 @@ public class QwpWebSocketSender implements Sender {
      */
     public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
         return new QwpWebSocketSender(
-                host, port, false, DEFAULT_BUFFER_SIZE,
+                host, port, false,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
                 inFlightWindowSize, null, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
         );
@@ -348,7 +347,7 @@ public class QwpWebSocketSender implements Sender {
             int maxSchemasPerConnection
     ) {
         return new QwpWebSocketSender(
-                host, port, false, DEFAULT_BUFFER_SIZE,
+                host, port, false,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 inFlightWindowSize, null, maxSchemasPerConnection
         );
