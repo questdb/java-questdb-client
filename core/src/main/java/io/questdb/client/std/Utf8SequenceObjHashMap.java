@@ -77,14 +77,6 @@ public class Utf8SequenceObjHashMap<V> extends AbstractUtf8SequenceHashSet {
         return true;
     }
 
-    public void removeAt(int index) {
-        if (index < 0) {
-            Utf8Sequence key = keys[-index - 1];
-            super.removeAt(index);
-            list.remove(key);
-        }
-    }
-
     public V valueAt(int index) {
         return index < 0 ? valueAtQuick(index) : null;
     }

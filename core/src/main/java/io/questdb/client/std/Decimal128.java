@@ -1175,32 +1175,6 @@ public class Decimal128 implements Sinkable, Decimal {
         return Long.compareUnsigned(aLo, bLo);
     }
 
-    /**
-     * Generic function to make a 128-bit addition assuming both values have the same scale.
-     *
-     * @param result Decimal128 that will store the result of the operation
-     * @param aH     High 64-bit part of the first operand.
-     * @param aL     Low 64-bit part of the first operand.
-     * @param bH     High 64-bit part of the second operand.
-     * @param bL     Low 64-bit part of the second operand.
-     */
-    private static void uncheckedAdd(Decimal128 result, long aH, long aL, long bH, long bL) {
-        // Perform 128-bit addition
-        long sumLow = aL + bL;
-
-        // Check for carry
-        long carry = hasCarry(aL, sumLow) ? 1 : 0;
-
-        try {
-            result.high = Math.addExact(aH, Math.addExact(bH, carry));
-            // low is modified after high on purpose in order not to leave the result dirty
-            // should addExact overflow
-            result.low = sumLow;
-        } catch (ArithmeticException e) {
-            throw NumericException.instance().put("Overflow in addition: result exceeds 128-bit capacity");
-        }
-    }
-
     private static void uncheckedAdd(Decimal128 result, long bHi, long bLo) {
         long r = result.low + bLo;
         long carry = hasCarry(result.low, r) ? 1L : 0L;

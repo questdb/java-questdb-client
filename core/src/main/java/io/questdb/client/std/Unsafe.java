@@ -257,11 +257,6 @@ public final class Unsafe {
         return javaVersion.startsWith("11") || javaVersion.startsWith("1.8");
     }
 
-    // most significant bit
-    private static int msb(int value) {
-        return 31 - Integer.numberOfLeadingZeros(value);
-    }
-
     static {
         try {
             Field theUnsafe = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");

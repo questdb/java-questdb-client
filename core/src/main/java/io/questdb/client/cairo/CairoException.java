@@ -35,14 +35,6 @@ import org.jetbrains.annotations.Nullable;
 
 public class CairoException extends RuntimeException implements Sinkable, FlyweightMessageContainer {
 
-    // psync_cvcontinue sets two bits in the error code to indicate whether the wait timed out (0x100) or there were no waiters (0x200).
-    // Error #316 (0x13C) is the timed out bit bitwise OR'd with ETIMEDOUT (60).
-    public static final int METADATA_VALIDATION = -100;
-    public static final int ILLEGAL_OPERATION = METADATA_VALIDATION - 1;
-    private static final int TABLE_DROPPED = ILLEGAL_OPERATION - 1;
-    public static final int METADATA_VALIDATION_RECOVERABLE = TABLE_DROPPED - 1;
-    public static final int PARTITION_MANIPULATION_RECOVERABLE = METADATA_VALIDATION_RECOVERABLE - 1;
-    public static final int TABLE_DOES_NOT_EXIST = PARTITION_MANIPULATION_RECOVERABLE - 1;
     public static final int NON_CRITICAL = -1;
     private static final StackTraceElement[] EMPTY_STACK_TRACE = {};
     private static final ThreadLocal<CairoException> tlException = new ThreadLocal<>(CairoException::new);

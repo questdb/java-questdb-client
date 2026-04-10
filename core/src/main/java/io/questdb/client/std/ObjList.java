@@ -29,7 +29,6 @@ import io.questdb.client.std.str.Sinkable;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
-import java.util.Comparator;
 
 public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     private static final int DEFAULT_ARRAY_SIZE = 16;
@@ -192,10 +191,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     @Override
     public int size() {
         return pos;
-    }
-
-    public void sort(int from, int to, Comparator<T> cmp) {
-        Arrays.sort(buffer, from, to, cmp);
     }
 
     @Override

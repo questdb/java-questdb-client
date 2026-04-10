@@ -34,7 +34,6 @@ import java.util.Arrays;
 public final class Numbers {
     public static final int INT_NULL = Integer.MIN_VALUE;
     public static final int IPv4_NULL = 0;
-    public static final long LONG_NULL = Long.MIN_VALUE;
     public static final int MAX_DOUBLE_SCALE = 19;
     public static final int SIGNIFICAND_WIDTH = 53;
     public static final long SIGN_BIT_MASK = 0x8000000000000000L;
@@ -58,52 +57,6 @@ public final class Numbers {
     private final static ThreadLocal<char[]> tlDoubleDigitsBuffer = new ThreadLocal<>(() -> new char[21]);
 
     private Numbers() {
-    }
-
-    public static void append(CharSink<?> sink, final float value, int scale) {
-        float f = value;
-        if (f == Float.POSITIVE_INFINITY) {
-            sink.putAscii("Infinity");
-            return;
-        }
-
-        if (f == Float.NEGATIVE_INFINITY) {
-            sink.putAscii("-Infinity");
-            return;
-        }
-
-        if (Float.isNaN(f)) {
-            sink.putAscii("NaN");
-            return;
-        }
-
-        // it is very awkward to distinguish between 0.0 and -0.0
-        // -0.0 < 0 is false
-        if (f < 0 || 1 / f == Float.NEGATIVE_INFINITY) {
-            sink.putAscii('-');
-            f = -f;
-        }
-        int factor = (int) pow10[scale];
-        int scaled = (int) (f * factor + 0.5);
-        int targetScale = scale + 1;
-        int z;
-        while (targetScale < 11 && (z = factor * 10) <= scaled) {
-            factor = z;
-            targetScale++;
-        }
-
-        if (targetScale == 11) {
-            sink.putAscii(Float.toString(f));
-            return;
-        }
-
-        while (targetScale > 0) {
-            if (targetScale-- == scale) {
-                sink.putAscii('.');
-            }
-            sink.putAscii((char) ('0' + scaled / factor % 10));
-            factor /= 10;
-        }
     }
 
     public static void append(CharSink<?> sink, final int value) {

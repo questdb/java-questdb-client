@@ -62,11 +62,6 @@ public class HttpException extends RuntimeException implements Sinkable, Flyweig
         return this;
     }
 
-    public HttpException put(char c) {
-        message.put(c);
-        return this;
-    }
-
     @Override
     public void toSink(@NotNull CharSink<?> sink) {
         sink.put(message);
