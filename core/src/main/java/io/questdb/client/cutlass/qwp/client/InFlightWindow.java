@@ -67,16 +67,6 @@ public class InFlightWindow {
     private static final int SPIN_TRIES = 100;
     private static final VarHandle TOTAL_ACKED;
     private static final VarHandle TOTAL_FAILED;
-
-    static {
-        try {
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-            TOTAL_ACKED = lookup.findVarHandle(InFlightWindow.class, "totalAcked", long.class);
-            TOTAL_FAILED = lookup.findVarHandle(InFlightWindow.class, "totalFailed", long.class);
-        } catch (ReflectiveOperationException e) {
-            throw new ExceptionInInitializerError(e);
-        }
-    }
     // Error state
     private final AtomicReference<Throwable> lastError = new AtomicReference<>();
     private final int maxWindowSize;
@@ -162,8 +152,9 @@ public class InFlightWindow {
 
         int acknowledged = (int) (effectiveSequence - prevAcked);
         TOTAL_ACKED.getAndAdd(this, (long) acknowledged);
-
-        LOG.debug("Cumulative ACK [upTo={}, acknowledged={}, remaining={}]", sequence, acknowledged, getInFlightCount());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Cumulative ACK [upTo={}, acknowledged={}, remaining={}]", sequence, acknowledged, getInFlightCount());
+        }
 
         // Wake up waiting threads
         Thread waiter = waitingForSpace;
@@ -259,7 +250,9 @@ public class InFlightWindow {
 
         // Fast path: already empty
         if (getInFlightCount() == 0) {
-            LOG.debug("Window already empty");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Window already empty");
+            }
             return;
         }
 
@@ -294,7 +287,9 @@ public class InFlightWindow {
             // error is pending. Check one final time after the window is empty.
             checkError();
 
-            LOG.debug("Window empty, all batches ACKed");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Window empty, all batches ACKed");
+            }
         } finally {
             waitingForEmpty = null;
         }
@@ -337,11 +332,19 @@ public class InFlightWindow {
     public void failAll(Throwable error) {
         long sent = highestSent;
         long acked = highestAcked;
-        long inFlight = Math.max(0, sent - acked);
 
-        this.failedBatchId = sent;
         this.lastError.set(error);
-        TOTAL_FAILED.getAndAdd(this, Math.max(1L, inFlight));
+
+        if (sent < 0) {
+            // No batches were ever sent; just propagate the error
+            LOG.error("Transport failed before any batches were sent [error={}]", String.valueOf(error));
+            wakeWaiters();
+            return;
+        }
+
+        long inFlight = Math.max(0, sent - acked);
+        this.failedBatchId = sent;
+        TOTAL_FAILED.getAndAdd(this, inFlight);
 
         LOG.error("All in-flight batches failed [inFlight={}, error={}]", inFlight, String.valueOf(error));
 
@@ -446,7 +449,9 @@ public class InFlightWindow {
         // Sequential caller: just publish the new highestSent
         highestSent = batchId;
 
-        LOG.debug("Added to window [batchId={}, windowSize={}]", batchId, getInFlightCount());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Added to window [batchId={}, windowSize={}]", batchId, getInFlightCount());
+        }
         return true;
     }
 
@@ -469,7 +474,9 @@ public class InFlightWindow {
         // The caller guarantees batchId is the next in sequence
         highestSent = batchId;
 
-        LOG.debug("Added to window [batchId={}, windowSize={}]", batchId, getInFlightCount());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Added to window [batchId={}, windowSize={}]", batchId, getInFlightCount());
+        }
         return true;
     }
 
@@ -481,6 +488,16 @@ public class InFlightWindow {
         waiter = waitingForEmpty;
         if (waiter != null) {
             LockSupport.unpark(waiter);
+        }
+    }
+
+    static {
+        try {
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            TOTAL_ACKED = lookup.findVarHandle(InFlightWindow.class, "totalAcked", long.class);
+            TOTAL_FAILED = lookup.findVarHandle(InFlightWindow.class, "totalFailed", long.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
         }
     }
 }

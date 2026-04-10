@@ -157,6 +157,7 @@ public class WebSocketSendQueue implements QuietCloseable {
             return;
         }
         if (!running) {
+            awaitShutdown(shutdownTimeoutMs);
             return;
         }
 
@@ -305,7 +306,9 @@ public class WebSocketSendQueue implements QuietCloseable {
         // If loop exited because running=false we still need to surface the root cause.
         checkError();
 
-        LOG.debug("Flush complete");
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Flush complete");
+        }
     }
 
     /**

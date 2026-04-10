@@ -190,6 +190,7 @@ public class QwpUdpSender implements Sender {
     @Override
     public void close() {
         if (!closed) {
+            closed = true;
             try {
                 if (hasInProgressRow()) {
                     rollbackCurrentRowToCommittedState();
@@ -198,7 +199,6 @@ public class QwpUdpSender implements Sender {
             } catch (Exception e) {
                 LOG.error("Error during close flush: {}", String.valueOf(e));
             }
-            closed = true;
             ObjList<CharSequence> keys = tableBuffers.keys();
             for (int i = 0, n = keys.size(); i < n; i++) {
                 CharSequence key = keys.getQuick(i);

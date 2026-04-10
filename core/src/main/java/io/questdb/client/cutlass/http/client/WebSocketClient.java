@@ -497,7 +497,9 @@ public abstract class WebSocketClient implements QuietCloseable {
 
         upgraded = true;
         sendBuffer.reset();
-        LOG.debug("WebSocket upgraded [path={}]", path);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("WebSocket upgraded [path={}]", path);
+        }
     }
 
     /**
@@ -661,7 +663,9 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         setupIoWait();
-        LOG.debug("Connected to [host={}, port={}]", host, port);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Connected to [host={}, port={}]", host, port);
+        }
     }
 
     private void doSend(long ptr, int len, int timeout) {

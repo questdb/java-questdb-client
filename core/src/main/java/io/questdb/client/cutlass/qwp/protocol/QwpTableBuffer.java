@@ -206,7 +206,7 @@ public class QwpTableBuffer implements QuietCloseable {
         if (name == null || name.length() == 0) {
             throw new LineSenderException("column name cannot be empty");
         }
-        ColumnBuffer existing = lookupColumn(name, type);
+        @SuppressWarnings("resource") ColumnBuffer existing = lookupColumn(name, type);
         if (existing != null) {
             // col.size > rowCount means this column already received a value
             // for the in-progress row.  Silently ignore the duplicate (first
@@ -742,9 +742,8 @@ public class QwpTableBuffer implements QuietCloseable {
             ensureArrayCapacity(1, values.length);
             arrayDims[valueCount] = 1;
             arrayShapes[arrayShapeOffset++] = values.length;
-            for (double v : values) {
-                doubleArrayData[arrayDataOffset++] = v;
-            }
+            System.arraycopy(values, 0, doubleArrayData, arrayDataOffset, values.length);
+            arrayDataOffset += values.length;
             valueCount++;
             size++;
         }
@@ -766,10 +765,10 @@ public class QwpTableBuffer implements QuietCloseable {
             arrayDims[valueCount] = 2;
             arrayShapes[arrayShapeOffset++] = dim0;
             arrayShapes[arrayShapeOffset++] = dim1;
-            for (double[] row : values) {
-                for (double v : row) {
-                    doubleArrayData[arrayDataOffset++] = v;
-                }
+            for (int i = 0, n = values.length; i < n; i++) {
+                double[] row = values[i];
+                System.arraycopy(row, 0, doubleArrayData, arrayDataOffset, row.length);
+                arrayDataOffset += row.length;
             }
             valueCount++;
             size++;
@@ -799,11 +798,12 @@ public class QwpTableBuffer implements QuietCloseable {
             arrayShapes[arrayShapeOffset++] = dim0;
             arrayShapes[arrayShapeOffset++] = dim1;
             arrayShapes[arrayShapeOffset++] = dim2;
-            for (double[][] plane : values) {
-                for (double[] row : plane) {
-                    for (double v : row) {
-                        doubleArrayData[arrayDataOffset++] = v;
-                    }
+            for (int i = 0, ni = values.length; i < ni; i++) {
+                double[][] plane = values[i];
+                for (int j = 0, nj = plane.length; j < nj; j++) {
+                    double[] row = plane[j];
+                    System.arraycopy(row, 0, doubleArrayData, arrayDataOffset, row.length);
+                    arrayDataOffset += row.length;
                 }
             }
             valueCount++;
@@ -891,9 +891,8 @@ public class QwpTableBuffer implements QuietCloseable {
             ensureArrayCapacity(1, values.length);
             arrayDims[valueCount] = 1;
             arrayShapes[arrayShapeOffset++] = values.length;
-            for (long v : values) {
-                longArrayData[arrayDataOffset++] = v;
-            }
+            System.arraycopy(values, 0, longArrayData, arrayDataOffset, values.length);
+            arrayDataOffset += values.length;
             valueCount++;
             size++;
         }
@@ -915,9 +914,10 @@ public class QwpTableBuffer implements QuietCloseable {
             arrayDims[valueCount] = 2;
             arrayShapes[arrayShapeOffset++] = dim0;
             arrayShapes[arrayShapeOffset++] = dim1;
-            for (long[] row : values) {
-                for (long v : row) {
-                    longArrayData[arrayDataOffset++] = v;
+            for (int i = 0; i < dim0; i++) {
+                long[] row = values[i];
+                for (int j = 0, rowLength = row.length; j < rowLength; j++) {
+                    longArrayData[arrayDataOffset++] = row[j];
                 }
             }
             valueCount++;
@@ -948,11 +948,12 @@ public class QwpTableBuffer implements QuietCloseable {
             arrayShapes[arrayShapeOffset++] = dim0;
             arrayShapes[arrayShapeOffset++] = dim1;
             arrayShapes[arrayShapeOffset++] = dim2;
-            for (long[][] plane : values) {
-                for (long[] row : plane) {
-                    for (long v : row) {
-                        longArrayData[arrayDataOffset++] = v;
-                    }
+            for (int i = 0, ni = values.length; i < ni; i++) {
+                long[][] plane = values[i];
+                for (int j = 0, nj = plane.length; j < nj; j++) {
+                    long[] row = plane[j];
+                    System.arraycopy(row, 0, longArrayData, arrayDataOffset, row.length);
+                    arrayDataOffset += row.length;
                 }
             }
             valueCount++;
