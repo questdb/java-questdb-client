@@ -33,7 +33,7 @@ import io.questdb.client.std.Unsafe;
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 /**
- * Transport-agnostic column encoder for ILP v4 table data.
+ * Transport-agnostic column encoder for QWP v1 table data.
  * <p>
  * Reads column data from {@link QwpTableBuffer.ColumnBuffer} and writes encoded
  * bytes to a {@link QwpBufferWriter}. Both {@link QwpWebSocketEncoder} and
@@ -298,9 +298,10 @@ class QwpColumnWriter {
 
     private void writeTimestampColumn(long addr, int count, boolean useGorilla) {
         if (useGorilla && count > 2) {
-            if (QwpGorillaEncoder.canUseGorilla(addr, count)) {
+            // Single pass: check feasibility and compute encoded size together
+            int encodedSize = QwpGorillaEncoder.calculateEncodedSizeIfSupported(addr, count);
+            if (encodedSize >= 0) {
                 buffer.putByte(ENCODING_GORILLA);
-                int encodedSize = QwpGorillaEncoder.calculateEncodedSize(addr, count);
                 buffer.ensureCapacity(encodedSize);
                 int bytesWritten = gorillaEncoder.encodeTimestamps(
                         buffer.getWriteAddress(),

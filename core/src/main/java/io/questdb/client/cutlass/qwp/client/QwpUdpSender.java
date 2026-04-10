@@ -53,7 +53,7 @@ import java.util.Arrays;
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 
 /**
- * Fire-and-forget ILP v4 sender over UDP.
+ * Fire-and-forget QWP v1 sender over UDP.
  * <p>
  * Each {@link #flush()} encodes all buffered table data into self-contained
  * datagrams (one per table) and sends them via UDP. Datagrams use local

@@ -36,7 +36,7 @@ final class NativeSegmentList implements QuietCloseable {
     private long totalLength;
 
     NativeSegmentList() {
-        this.capacity = Math.max(16, 4);
+        this.capacity = 16;
         this.ptr = Unsafe.malloc((long) capacity * ENTRY_SIZE, MemoryTag.NATIVE_DEFAULT);
     }
 

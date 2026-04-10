@@ -348,7 +348,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== SYMBOL COLUMN TESTS ====================
 
     @Test
     public void testEncodeLongString() throws Exception {
@@ -450,7 +449,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== UUID COLUMN TESTS ====================
 
     @Test
     public void testEncodeMultipleColumns() throws Exception {
@@ -507,7 +505,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== DECIMAL COLUMN TESTS ====================
 
     @Test
     public void testEncodeMultipleRows() throws Exception {
@@ -593,7 +590,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== ARRAY COLUMN TESTS ====================
 
     @Test
     public void testEncodeNegativeLong() throws Exception {
@@ -668,7 +664,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== MULTIPLE ROWS TESTS ====================
 
     @Test
     public void testEncodeSingleRowWithBoolean() throws Exception {
@@ -702,7 +697,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== MIXED COLUMN TYPES ====================
 
     @Test
     public void testEncodeSingleRowWithLong() throws Exception {
@@ -752,7 +746,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== EDGE CASES ====================
 
     @Test
     public void testEncodeSingleRowWithTimestamp() throws Exception {
@@ -1031,7 +1024,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== SCHEMA REFERENCE TESTS ====================
 
     @Test
     public void testEncodeWithSchemaRef() throws Exception {
@@ -1050,7 +1042,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== BUFFER REUSE TESTS ====================
 
     @Test
     public void testEncodeZeroLong() throws Exception {
@@ -1093,7 +1084,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== ALL BASIC TYPES IN ONE ROW ====================
 
     @Test
     public void testGlobalSymbolDictionaryBasics() throws Exception {
@@ -1119,7 +1109,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-    // ==================== Delta Symbol Dictionary Tests ====================
 
     @Test
     public void testGorillaEncoding_compressionRatio() throws Exception {

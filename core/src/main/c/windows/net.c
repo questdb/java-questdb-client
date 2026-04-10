@@ -296,11 +296,21 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendToScatter
         return 0;
     }
 
-    WSABUF *buffers = calloc((size_t) segmentCount, sizeof(WSABUF));
-    if (buffers == NULL) {
-        WSASetLastError(WSA_NOT_ENOUGH_MEMORY);
-        SaveLastError();
-        return -1;
+    // Stack-allocate for the common case (small segment count) to avoid
+    // a heap allocation on every UDP send.
+    #define STACK_BUF_COUNT 16
+    WSABUF stack_buffers[STACK_BUF_COUNT];
+    WSABUF *buffers;
+
+    if (segmentCount <= STACK_BUF_COUNT) {
+        buffers = stack_buffers;
+    } else {
+        buffers = calloc((size_t) segmentCount, sizeof(WSABUF));
+        if (buffers == NULL) {
+            WSASetLastError(WSA_NOT_ENOUGH_MEMORY);
+            SaveLastError();
+            return -1;
+        }
     }
 
     const char *segment = (const char *) segmentsPtr;
@@ -322,11 +332,14 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendToScatter
             NULL,
             NULL
     );
-    free(buffers);
+    if (buffers != stack_buffers) {
+        free(buffers);
+    }
 
     if (result == SOCKET_ERROR) {
         SaveLastError();
         return -1;
     }
     return (jint) bytesSent;
+    #undef STACK_BUF_COUNT
 }

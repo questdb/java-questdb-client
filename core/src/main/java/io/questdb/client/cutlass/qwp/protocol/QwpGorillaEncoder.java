@@ -26,6 +26,7 @@ package io.questdb.client.cutlass.qwp.protocol;
 
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.Unsafe;
+import org.jetbrains.annotations.TestOnly;
 
 /**
  * Gorilla delta-of-delta encoder for timestamps in QWP v1 format.
@@ -73,6 +74,23 @@ public class QwpGorillaEncoder {
      * @return encoded size in bytes (excluding encoding flag)
      */
     public static int calculateEncodedSize(long srcAddress, int count) {
+        int size = calculateEncodedSizeIfSupported(srcAddress, count);
+        assert size >= 0 : "caller must verify canUseGorilla() before calling calculateEncodedSize()";
+        return size;
+    }
+
+    /**
+     * Checks whether Gorilla encoding can be used and, if so, calculates the
+     * encoded size in a single pass over the timestamp data. This replaces the
+     * previous two-pass pattern of calling {@link #canUseGorilla} followed by
+     * {@link #calculateEncodedSize}.
+     *
+     * @param srcAddress source address of contiguous int64 timestamps in native memory
+     * @param count      number of timestamps
+     * @return encoded size in bytes (excluding encoding flag), or -1 if Gorilla
+     *         encoding cannot be used (a delta-of-delta exceeds int32 range)
+     */
+    public static int calculateEncodedSizeIfSupported(long srcAddress, int count) {
         if (count == 0) {
             return 0;
         }
@@ -89,7 +107,7 @@ public class QwpGorillaEncoder {
             return (int) size;
         }
 
-        // Calculate bits for delta-of-delta encoding
+        // Single pass: validate int32 range AND calculate bits
         long prevTimestamp = Unsafe.getUnsafe().getLong(srcAddress + 8);
         long prevDelta = prevTimestamp - Unsafe.getUnsafe().getLong(srcAddress);
         long totalBits = 0;
@@ -98,6 +116,10 @@ public class QwpGorillaEncoder {
             long ts = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8);
             long delta = ts - prevTimestamp;
             long deltaOfDelta = delta - prevDelta;
+
+            if (deltaOfDelta < Integer.MIN_VALUE || deltaOfDelta > Integer.MAX_VALUE) {
+                return -1;
+            }
 
             totalBits += getBitsRequired(deltaOfDelta);
 
@@ -108,6 +130,14 @@ public class QwpGorillaEncoder {
         // Round up to bytes
         size += (totalBits + 7) / 8;
 
+        return toIntChecked(size);
+    }
+
+    /**
+     * Converts a long encoded size to int, throwing if it exceeds int range.
+     */
+    @TestOnly
+    public static int toIntChecked(long size) {
         if (size > Integer.MAX_VALUE) {
             throw new LineSenderException("Gorilla encoded size exceeds int range");
         }
@@ -126,21 +156,7 @@ public class QwpGorillaEncoder {
      * @return true if Gorilla encoding can be used, false otherwise
      */
     public static boolean canUseGorilla(long srcAddress, int count) {
-        if (count < 3) {
-            return true; // No DoD encoding needed for 0, 1, or 2 timestamps
-        }
-
-        long prevDelta = Unsafe.getUnsafe().getLong(srcAddress + 8) - Unsafe.getUnsafe().getLong(srcAddress);
-        for (int i = 2; i < count; i++) {
-            long delta = Unsafe.getUnsafe().getLong(srcAddress + (long) i * 8)
-                    - Unsafe.getUnsafe().getLong(srcAddress + (long) (i - 1) * 8);
-            long dod = delta - prevDelta;
-            if (dod < Integer.MIN_VALUE || dod > Integer.MAX_VALUE) {
-                return false;
-            }
-            prevDelta = delta;
-        }
-        return true;
+        return calculateEncodedSizeIfSupported(srcAddress, count) >= 0;
     }
 
     /**

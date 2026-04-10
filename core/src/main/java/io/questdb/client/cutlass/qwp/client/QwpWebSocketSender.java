@@ -138,7 +138,7 @@ public class QwpWebSocketSender implements Sender {
     private int maxSentSchemaId = -1;
     // Track highest symbol ID sent to server (for delta encoding)
     // Once sent over TCP, server is guaranteed to receive it (or connection dies)
-    private volatile int maxSentSymbolId = -1;
+    private int maxSentSymbolId = -1;
     // Batch sequence counter (must match server's messageSequence)
     private long nextBatchSequence = 0;
     private int nextSchemaId;
@@ -653,6 +653,7 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public void flush() {
         checkNotClosed();
+        ensureNoInProgressRow();
         ensureConnected();
 
         if (inFlightWindowSize > 1) {
@@ -1103,6 +1104,15 @@ public class QwpWebSocketSender implements Sender {
             connected = true;
             LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
                     host, port, inFlightWindowSize, client.getServerQwpVersion());
+        }
+    }
+
+    private void ensureNoInProgressRow() {
+        if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
+            throw new LineSenderException(
+                    "Cannot flush while row is in progress. "
+                            + "Use sender.at(), sender.atNow(), or sender.cancelRow() first."
+            );
         }
     }
 

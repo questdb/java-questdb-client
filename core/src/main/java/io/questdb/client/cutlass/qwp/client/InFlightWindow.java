@@ -196,18 +196,20 @@ public class InFlightWindow {
             return;
         }
 
-        // Slow path: need to wait for space
+        // Slow path: need to wait for space.
+        // Register as waiting thread BEFORE re-checking the condition so that
+        // acknowledgeUpTo() is guaranteed to see our thread reference and unpark
+        // us if it frees space between our check and our park.
         long deadline = System.currentTimeMillis() + timeoutMs;
         int spins = 0;
 
-        // Register as waiting thread
         waitingForSpace = Thread.currentThread();
         try {
             while (true) {
                 // Check for errors
                 checkError();
 
-                // Try to add
+                // Re-check after registration to close the race window
                 if (tryAddInFlightInternal(batchId)) {
                     return;
                 }
@@ -256,10 +258,12 @@ public class InFlightWindow {
             return;
         }
 
+        // Register as waiting thread BEFORE re-checking the condition so that
+        // acknowledgeUpTo() is guaranteed to see our thread reference and unpark
+        // us if it drains the window between our check and our park.
         long deadline = System.currentTimeMillis() + timeoutMs;
         int spins = 0;
 
-        // Register as waiting thread
         waitingForEmpty = Thread.currentThread();
         try {
             while (getInFlightCount() > 0) {

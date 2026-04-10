@@ -33,7 +33,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  * Encodes QWP v1 messages for WebSocket transport.
  * <p>
  * This encoder delegates column encoding to {@link QwpColumnWriter} and wraps
- * the encoded payload with a 12-byte ILP4 header.
+ * the encoded payload with a 12-byte QWP v1 header.
  */
 public class QwpWebSocketEncoder implements QuietCloseable {
 

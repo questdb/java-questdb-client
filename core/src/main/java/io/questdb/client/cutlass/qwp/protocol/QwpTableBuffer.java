@@ -252,6 +252,19 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
+     * Returns true if a row is partially built (columns written but not yet committed
+     * via {@link #nextRow()}).
+     */
+    public boolean hasInProgressRow() {
+        for (int i = 0, n = columns.size(); i < n; i++) {
+            if (fastColumns[i].size > rowCount) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Advances to the next row.
      * <p>
      * This should be called after all column values for the current row have been set.

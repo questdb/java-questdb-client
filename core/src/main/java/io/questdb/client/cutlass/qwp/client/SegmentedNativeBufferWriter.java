@@ -28,14 +28,21 @@ import io.questdb.client.std.QuietCloseable;
 
 final class SegmentedNativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     private final ObjList<NativeBufferWriter> chunks = new ObjList<>();
-    private final NativeSegmentList segments = new NativeSegmentList();
+    private final NativeSegmentList segments;
 
     private NativeBufferWriter currentChunk;
     private long flushedBytes;
     private int nextChunkIndex;
 
     SegmentedNativeBufferWriter() {
-        currentChunk = new NativeBufferWriter();
+        NativeSegmentList segs = new NativeSegmentList();
+        try {
+            currentChunk = new NativeBufferWriter();
+        } catch (Throwable t) {
+            segs.close();
+            throw t;
+        }
+        this.segments = segs;
         chunks.add(currentChunk);
     }
 

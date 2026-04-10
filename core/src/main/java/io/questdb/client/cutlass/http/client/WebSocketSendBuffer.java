@@ -97,10 +97,16 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         this.bufCapacity = Math.max(initialCapacity, MAX_HEADER_SIZE * 2);
         this.maxBufferSize = maxBufferSize;
         this.bufPtr = Unsafe.malloc(bufCapacity, MemoryTag.NATIVE_DEFAULT);
+        try {
+            this.rnd = new SecureRnd();
+        } catch (Throwable t) {
+            Unsafe.free(bufPtr, bufCapacity, MemoryTag.NATIVE_DEFAULT);
+            bufPtr = 0;
+            throw t;
+        }
         this.writePos = 0;
         this.frameStartOffset = 0;
         this.payloadStartOffset = 0;
-        this.rnd = new SecureRnd();
     }
 
     /**
