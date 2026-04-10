@@ -316,7 +316,7 @@ public class Decimal64Test {
         // Extract ones digit (5)
         digit = value.getDigit(1);
         Assert.assertEquals(5, digit);
-        value.subtract((long) digit, 0);
+        value.subtract(digit, 0);
         Assert.assertEquals(0, value.getValue());
     }
 

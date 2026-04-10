@@ -1128,13 +1128,11 @@ public class QwpTableBufferTest {
 
                 int[] sizeBefore = {-1, -1};
                 int[] valueCountBefore = {-1, -1};
-                long[] stringDataSizeBefore = new long[2];
                 int[] arrayShapeOffsetBefore = new int[2];
                 int[] arrayDataOffsetBefore = new int[2];
 
                 sizeBefore[keepIndex] = keepSizeBefore;
                 valueCountBefore[keepIndex] = keepValueCountBefore;
-                stringDataSizeBefore[keepIndex] = keepStringDataSizeBefore;
                 arrayShapeOffsetBefore[keepIndex] = keepArrayShapeOffsetBefore;
                 arrayDataOffsetBefore[keepIndex] = keepArrayDataOffsetBefore;
 

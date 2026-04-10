@@ -25,6 +25,7 @@
 package io.questdb.client.test.std.fastdouble;
 
 import io.questdb.client.std.NumericException;
+import io.questdb.client.std.fastdouble.FastFloatParser;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.slf4j.Logger;
@@ -32,9 +33,11 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Random;
 
-abstract class AbstractFloatNumericallyGeneratedTest {
+import static org.junit.Assert.assertEquals;
 
-    private static final Logger LOG = LoggerFactory.getLogger(AbstractFloatNumericallyGeneratedTest.class);
+public class FastFloatParserFromCharSequenceTest {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FastFloatParserFromCharSequenceTest.class);
 
     /**
      * Seed for random number generator.
@@ -66,6 +69,10 @@ abstract class AbstractFloatNumericallyGeneratedTest {
                 .forEach(this::testLegalInput);
     }
 
+    private float parse(String str) throws NumericException {
+        return FastFloatParser.parseFloat(str, false);
+    }
+
     private void testLegalInput(String str, float expected) {
         float actual;
         try {
@@ -73,14 +80,11 @@ abstract class AbstractFloatNumericallyGeneratedTest {
         } catch (NumericException e) {
             throw new NumberFormatException();
         }
-        // TODO: enable these checks after fixing FP parsing
-//        assertEquals("str=" + str, expected, actual, 0.001);
-//        assertEquals("intBits of " + expected, Float.floatToIntBits(expected), Float.floatToIntBits(actual));
+        assertEquals("str=" + str, expected, actual, 0.001);
+        assertEquals("intBits of " + expected, Float.floatToIntBits(expected), Float.floatToIntBits(actual));
     }
 
     private void testLegalInput(float expected) {
         testLegalInput(expected + "", expected);
     }
-
-    protected abstract float parse(String str) throws NumericException;
 }
