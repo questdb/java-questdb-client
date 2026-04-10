@@ -26,7 +26,6 @@ package io.questdb.client.cutlass.line;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
-import io.questdb.client.network.Net;
 import io.questdb.client.network.NetworkFacadeImpl;
 
 /**
@@ -41,7 +40,7 @@ public abstract class AbstractLineTcpSender extends AbstractLineSender {
      * @param bufferCapacity capacity of an internal buffer in bytes
      * @deprecated use {@link LineTcpSenderV2#newSender(int, int, int)} instead.
      * <br>
-     * IP address is encoded as <code>int</code> obtained via {@link Net#parseIPv4(CharSequence)}
+     * IP address is encoded as <code>int</code>
      */
     @Deprecated
     public AbstractLineTcpSender(int ip, int port, int bufferCapacity) {
