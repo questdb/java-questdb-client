@@ -223,20 +223,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Returns the connected host.
-     */
-    public CharSequence getHost() {
-        return host;
-    }
-
-    /**
-     * Returns the connected port.
-     */
-    public int getPort() {
-        return port;
-    }
-
-    /**
      * Gets the send buffer for building WebSocket frames.
      * <p>
      * Usage:
@@ -478,24 +464,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Performs upgrade with default timeout.
-     */
-    public void upgrade(CharSequence path) {
-        upgrade(path, defaultTimeout, null);
-    }
-
-    /**
      * Performs upgrade with default timeout and authorization header.
      */
     public void upgrade(CharSequence path, CharSequence authorizationHeader) {
         upgrade(path, defaultTimeout, authorizationHeader);
-    }
-
-    /**
-     * Performs upgrade without authorization header.
-     */
-    public void upgrade(CharSequence path, int timeout) {
-        upgrade(path, timeout, null);
     }
 
     private static String computeAcceptKey(String key) {

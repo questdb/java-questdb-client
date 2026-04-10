@@ -48,7 +48,6 @@ class QwpColumnWriter {
 
     private void encodeColumn(
             QwpTableBuffer.ColumnBuffer col,
-            QwpColumnDef colDef,
             int rowCount,
             int valueCount,
             long stringDataSize,
@@ -367,7 +366,7 @@ class QwpColumnWriter {
                 symbolDictionarySize = limitedSymbolDictionarySizes[i];
             }
 
-            encodeColumn(col, colDef, rowCount, valueCount, stringDataSize, symbolDictionarySize, useGorilla, useGlobalSymbols);
+            encodeColumn(col, rowCount, valueCount, stringDataSize, symbolDictionarySize, useGorilla, useGlobalSymbols);
         }
     }
 

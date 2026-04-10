@@ -2156,17 +2156,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 LineSenderBuilder.this.shouldDestroyPrivKey = true;
                 return LineSenderBuilder.this;
             }
-
-            /**
-             * Configures a private key for authentication.
-             *
-             * @param privateKey privateKey to use for authentication
-             * @return an instance of LineSenderBuilder for further configuration
-             */
-            public LineSenderBuilder privateKey(PrivateKey privateKey) {
-                LineSenderBuilder.this.privateKey = privateKey;
-                return LineSenderBuilder.this;
-            }
         }
     }
 }

@@ -166,13 +166,6 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     /**
-     * Finishes the current text frame, writing the header and applying masking.
-     */
-    public FrameInfo endTextFrame() {
-        return endFrame(WebSocketOpcode.TEXT);
-    }
-
-    /**
      * Ensures the buffer has capacity for the specified number of additional bytes.
      * May reallocate the buffer if necessary.
      *
@@ -198,13 +191,6 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
      */
     public int getCapacity() {
         return bufCapacity;
-    }
-
-    /**
-     * Gets the payload length of the current frame being built.
-     */
-    public int getCurrentPayloadLength() {
-        return writePos - payloadStartOffset;
     }
 
     /**

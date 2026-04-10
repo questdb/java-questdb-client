@@ -36,7 +36,6 @@ public final class Unsafe {
     // These are off-heap allocated atomic counters for memory usage tracking.
 
     public static final long BYTE_OFFSET;
-    public static final long BYTE_SCALE;
     public static final Module JAVA_BASE_MODULE = System.class.getModule();
     public static final long LONG_OFFSET;
     public static final long LONG_SCALE;
@@ -87,15 +86,6 @@ public final class Unsafe {
         return UNSAFE.compareAndSwapLong(o, offset, expected, value);
     }
 
-    public static boolean cas(Object o, long offset, int expected, int value) {
-        return UNSAFE.compareAndSwapInt(o, offset, expected, value);
-    }
-
-    public static boolean cas(long[] array, int index, long expected, long value) {
-        assert index > -1 && index < array.length;
-        return Unsafe.cas(array, Unsafe.LONG_OFFSET + (((long) index) << Unsafe.LONG_SCALE), expected, value);
-    }
-
     public static long free(long ptr, long size, int memoryTag) {
         if (ptr != 0) {
             Unsafe.getUnsafe().freeMemory(ptr);
@@ -103,10 +93,6 @@ public final class Unsafe {
             recordMemAlloc(-size, memoryTag);
         }
         return 0;
-    }
-
-    public static boolean getBool(long address) {
-        return UNSAFE.getByte(address) == 1;
     }
 
     public static long getFieldOffset(Class<?> clazz, String name) {
@@ -289,7 +275,6 @@ public final class Unsafe {
             UNSAFE = (sun.misc.Unsafe) theUnsafe.get(null);
 
             BYTE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(byte[].class);
-            BYTE_SCALE = msb(Unsafe.getUnsafe().arrayIndexScale(byte[].class));
 
             LONG_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(long[].class);
             LONG_SCALE = msb(Unsafe.getUnsafe().arrayIndexScale(long[].class));

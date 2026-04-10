@@ -44,7 +44,6 @@ public final class Os {
     public static final int LINUX = 2;
     public static final int WINDOWS = 3;
     public static final int _32Bit = -2;
-    public static final int arch;
     public static final String archName;
     public static final String name;
     public static final int type;
@@ -102,10 +101,6 @@ public final class Os {
         return type == LINUX;
     }
 
-    public static boolean isWindows() {
-        return type == Os.WINDOWS;
-    }
-
     public static void loadLib(String lib, @NotNull InputStream libStream) {
         try {
             File tempLib = null;
@@ -131,13 +126,6 @@ public final class Os {
             }
         } finally {
             Misc.free(libStream);
-        }
-    }
-
-    public static void pause() {
-        try {
-            Thread.sleep(0);
-        } catch (InterruptedException ignore) {
         }
     }
 
@@ -194,10 +182,8 @@ public final class Os {
 
     static {
         if ("aarch64".equals(System.getProperty("os.arch"))) {
-            arch = ARCH_AARCH64;
             archName = "aarch64";
         } else {
-            arch = ARCH_X86_64;
             archName = "x86-64";
         }
 

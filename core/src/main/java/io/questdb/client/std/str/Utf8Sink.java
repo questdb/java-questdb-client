@@ -145,22 +145,6 @@ public interface Utf8Sink extends CharSink<Utf8Sink> {
         return put(b);
     }
 
-    /**
-     * For impls that care about the distinction between ASCII and non-ASCII:
-     * Appends a general UTF-8 sequence. If the sequence contains a non-ASCII byte,
-     * this sink's `isAscii` status drops to false.
-     * <br>
-     * For impls that don't care about the ASCII/non-ASCII distinction:
-     * Synonymous with, but likely less performant than
-     * {@link #put(Utf8Sequence, int, int)}.
-     */
-    default Utf8Sink putAny(Utf8Sequence seq, int lo, int hi) {
-        for (int i = lo; i < hi; i++) {
-            putAny(seq.byteAt(i));
-        }
-        return this;
-    }
-
     @Override
     default Utf8Sink putAscii(char c) {
         // This works for impls that don't care about the ASCII/non-ASCII distinction.
@@ -179,19 +163,5 @@ public interface Utf8Sink extends CharSink<Utf8Sink> {
             putAscii(cs.charAt(i));
         }
         return this;
-    }
-
-    private void escapeAscii(char c) {
-        switch (c) {
-            case '"':
-                putAscii("\"\"");
-                break;
-            case '\\':
-                putAscii("\\\\");
-                break;
-            default:
-                putAscii(c);
-                break;
-        }
     }
 }

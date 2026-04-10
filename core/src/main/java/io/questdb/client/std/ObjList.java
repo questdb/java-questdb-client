@@ -41,13 +41,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
         this.buffer = (T[]) new Object[DEFAULT_ARRAY_SIZE];
     }
 
-    @SuppressWarnings("unchecked")
-    public ObjList(ObjList<? extends T> other) {
-        this.buffer = (T[]) new Object[Math.max(other.size(), DEFAULT_ARRAY_SIZE)];
-        setPos(other.size());
-        System.arraycopy(other.buffer, 0, this.buffer, 0, pos);
-    }
-
     @SafeVarargs
     @SuppressWarnings("unchecked")
     public ObjList(T... other) {
@@ -64,14 +57,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     public void add(T value) {
         checkCapacity(pos + 1);
         buffer[pos++] = value;
-    }
-
-    public void addAll(ReadOnlyObjList<? extends T> that) {
-        int n = that.size();
-        checkCapacity(pos + n);
-        for (int i = 0; i < n; i++) {
-            buffer[pos++] = that.getQuick(i);
-        }
     }
 
     @SuppressWarnings("unchecked")
@@ -99,14 +84,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     @Override
     public boolean equals(Object that) {
         return this == that || that instanceof ObjList && equals((ObjList<?>) that);
-    }
-
-    public void extendAndSet(int index, T value) {
-        checkCapacity(index + 1);
-        if (index >= pos) {
-            pos = index + 1;
-        }
-        buffer[index] = value;
     }
 
     public T get(int index) {

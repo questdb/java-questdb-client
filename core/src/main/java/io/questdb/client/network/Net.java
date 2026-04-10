@@ -42,9 +42,13 @@ public final class Net {
     public static final int EPEERDISCONNECT = -1;
     @SuppressWarnings("unused")
     public static final int ERETRY = 0;
+    @SuppressWarnings("unused")
     public static final int EWOULDBLOCK;
+    @SuppressWarnings("unused")
     public static final long MMSGHDR_BUFFER_ADDRESS_OFFSET;
+    @SuppressWarnings("unused")
     public static final long MMSGHDR_BUFFER_LENGTH_OFFSET;
+    @SuppressWarnings("unused")
     public static final long MMSGHDR_SIZE;
     private static final AtomicInteger ADDR_INFO_COUNTER = new AtomicInteger();
     private static final Logger LOG = LoggerFactory.getLogger(Net.class);

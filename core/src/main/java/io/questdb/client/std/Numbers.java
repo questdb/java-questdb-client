@@ -42,7 +42,6 @@ public final class Numbers {
     public static final char[] hexDigits = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
     public final static int[] hexNumbers;
     public static final long[] pow10;
-    public final static int pow10max;
     private static final int EXP_BIAS = 1023;
     private static final long EXP_BIT_MASK = 0x7FF0000000000000L;
     private static final int EXP_SHIFT = SIGNIFICAND_WIDTH - 1;
@@ -262,92 +261,6 @@ public final class Numbers {
         array[bit].append(sink, value);
     }
 
-    public static void appendHexPadded(CharSink<?> sink, final int value) {
-        int i = value;
-        if (i < 0) {
-            if (i == Integer.MIN_VALUE) {
-                sink.putAscii("NaN");
-                return;
-            }
-            sink.putAscii('-');
-            i = -i;
-        }
-        int c;
-        if (i < 0x10) {
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i]);
-        } else if (i < 0x100) {  // two
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x10]);
-            sink.putAscii(hexDigits[i % 0x10]);
-        } else if (i < 0x1000) { // three
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x100]);
-            sink.putAscii(hexDigits[(c = i % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else if (i < 0x10000) { // four
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x1000]);
-            sink.putAscii(hexDigits[(c = i % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else if (i < 0x100000) { // five
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x10000]);
-            sink.putAscii(hexDigits[(c = i % 0x10000) / 0x1000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else if (i < 0x1000000) { // six
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x100000]);
-            sink.putAscii(hexDigits[(c = i % 0x100000) / 0x10000]);
-            sink.putAscii(hexDigits[(c = c % 0x10000) / 0x1000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else if (i < 0x10000000) { // seven
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x1000000]);
-            sink.putAscii(hexDigits[(c = i % 0x1000000) / 0x100000]);
-            sink.putAscii(hexDigits[(c = c % 0x100000) / 0x10000]);
-            sink.putAscii(hexDigits[(c = c % 0x10000) / 0x1000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else { // eight
-            sink.putAscii(hexDigits[i / 0x10000000]);
-            sink.putAscii(hexDigits[(c = i % 0x10000000) / 0x1000000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000000) / 0x100000]);
-            sink.putAscii(hexDigits[(c = c % 0x100000) / 0x10000]);
-            sink.putAscii(hexDigits[(c = c % 0x10000) / 0x1000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        }
-    }
-
     public static int ceilPow2(int value) {
         int i = value;
         if ((i != 0) && (i & (i - 1)) > 0) {
@@ -387,26 +300,6 @@ public final class Numbers {
             throw NumericException.instance().put("invalid hex character: '").put((char) c).put('\'');
         }
         return r;
-    }
-
-    public static long interleaveBits(long x, long y) {
-        return spreadBits(x) | (spreadBits(y) << 1);
-    }
-
-    /**
-     * Checks double value for NULL in database sense. NULL is anything that is
-     * not "finite".
-     *
-     * @param value to check
-     * @return true if value is "infinite", which includes {@link Double#isNaN(double)}, positive and negative
-     * infinities that arise from division by 0.
-     */
-    public static boolean isNull(double value) {
-        return (Double.doubleToRawLongBits(value) & EXP_BIT_MASK) == EXP_BIT_MASK;
-    }
-
-    public static boolean isNull(float value) {
-        return Float.isNaN(value) || Float.isInfinite(value);
     }
 
     public static int msb(int value) {
@@ -536,13 +429,6 @@ public final class Numbers {
         return parseInt0(sequence, 0, sequence.length());
     }
 
-    public static int parseInt(Utf8Sequence sequence) throws NumericException {
-        if (sequence == null) {
-            throw NumericException.instance().put("null string");
-        }
-        return parseInt0(sequence.asAsciiCharSequence(), 0, sequence.size());
-    }
-
     public static int parseInt(Utf8Sequence sequence, int p, int lim) throws NumericException {
         if (sequence == null) {
             throw NumericException.instance().put("null string");
@@ -569,15 +455,6 @@ public final class Numbers {
             throw NumericException.instance().put("null string");
         }
         return parseLong0(sequence.asAsciiCharSequence(), sequence.size());
-    }
-
-    public static long spreadBits(long v) {
-        v = (v | (v << 16)) & 0X0000FFFF0000FFFFL;
-        v = (v | (v << 8)) & 0X00FF00FF00FF00FFL;
-        v = (v | (v << 4)) & 0X0F0F0F0F0F0F0F0FL;
-        v = (v | (v << 2)) & 0x3333333333333333L;
-        v = (v | (v << 1)) & 0x5555555555555555L;
-        return v;
     }
 
     private static void appendDouble0(
@@ -1586,7 +1463,6 @@ public final class Numbers {
 
     static {
         pow10 = new long[20];
-        pow10max = 18;
         pow10[0] = 1;
         for (int i = 1; i < pow10.length; i++) {
             pow10[i] = pow10[i - 1] * 10;

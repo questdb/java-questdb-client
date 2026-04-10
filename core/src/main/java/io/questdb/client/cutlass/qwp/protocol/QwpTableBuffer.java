@@ -1281,10 +1281,6 @@ public class QwpTableBuffer implements QuietCloseable {
             return maxGlobalSymbolId;
         }
 
-        public String getName() {
-            return name;
-        }
-
         /**
          * Returns the off-heap address of the null bitmap.
          * Returns 0 for non-nullable columns.

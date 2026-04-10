@@ -28,7 +28,6 @@ import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf16Sink;
 
 public class Rnd {
-    private static final double DOUBLE_UNIT = 0x1.0p-53; // 1.0 / (1L << 53)
     private static final long mask = (1L << 48) - 1;
     private final StringSink array = new StringSink();
     private long s0;
@@ -44,12 +43,6 @@ public class Rnd {
 
     public boolean nextBoolean() {
         return nextLong() >>> (64 - 1) != 0;
-    }
-
-    public CharSequence nextChars(int len) {
-        array.clear();
-        nextChars(array, len);
-        return array;
     }
 
     // returns random bytes between 'B' and 'Z' for legacy reasons
@@ -182,10 +175,6 @@ public class Rnd {
         return result;
     }
 
-    public double nextDouble() {
-        return (((long) (nextIntForDouble(26)) << 27) + nextIntForDouble(27)) * DOUBLE_UNIT;
-    }
-
     public int nextInt(int boundary) {
         return nextPositiveInt() % boundary;
     }
@@ -200,10 +189,6 @@ public class Rnd {
         s0 = l0;
         l1 ^= l1 << 23;
         return (s1 = l1 ^ l0 ^ (l1 >> 17) ^ (l0 >> 26)) + l0;
-    }
-
-    public long nextLong(long boundary) {
-        return nextPositiveLong() % boundary;
     }
 
     public int nextPositiveInt() {
@@ -232,10 +217,6 @@ public class Rnd {
 
     public final void reset() {
         reset(0xffff_ffff_dead_beefL, 0xffff_ffff_dee4_c0edL);
-    }
-
-    private int nextIntForDouble(int bits) {
-        return (int) ((nextLong() & mask) >>> (48 - bits));
     }
 
 }

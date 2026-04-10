@@ -33,7 +33,6 @@ import java.nio.charset.StandardCharsets;
  * An immutable on-heap sequence of UTF-8 bytes.
  */
 public class Utf8String implements Utf8Sequence {
-    public static final Utf8String EMPTY = new Utf8String("");
     private final boolean ascii;
     private final AsciiCharSequence asciiCharSequence = new AsciiCharSequence();
     private final byte[] bytes;
@@ -48,18 +47,6 @@ public class Utf8String implements Utf8Sequence {
     public Utf8String(@NotNull String str) {
         this.bytes = str.getBytes(StandardCharsets.UTF_8);
         this.ascii = (str.length() == bytes.length);
-        this.zeroPaddedSixPrefix = Utf8s.zeroPaddedSixPrefix(this);
-    }
-
-    public Utf8String(char ch) {
-        this.bytes = String.valueOf(ch).getBytes(StandardCharsets.UTF_8);
-        this.ascii = (bytes.length == 1);
-        this.zeroPaddedSixPrefix = Utf8s.zeroPaddedSixPrefix(this);
-    }
-
-    public Utf8String(@NotNull CharSequence seq) {
-        this.bytes = seq.toString().getBytes(StandardCharsets.UTF_8);
-        this.ascii = (seq.length() == bytes.length);
         this.zeroPaddedSixPrefix = Utf8s.zeroPaddedSixPrefix(this);
     }
 
