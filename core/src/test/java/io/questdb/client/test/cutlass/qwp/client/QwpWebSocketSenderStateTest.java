@@ -28,13 +28,14 @@ import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.test.AbstractTest;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.temporal.ChronoUnit;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * Verifies {@link QwpWebSocketSender} internal state management:
@@ -173,6 +174,39 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
     }
 
     @Test
+    public void testReconnectResetsRetainedSchemaIds() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 0, 10_000, 0, 0L, 1
+            );
+            try {
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                sender.table("t1").longColumn("x", 1).at(1, ChronoUnit.MICROS);
+                sender.table("t2").longColumn("y", 2).at(2, ChronoUnit.MICROS);
+
+                QwpTableBuffer t1 = sender.getTableBuffer("t1");
+                QwpTableBuffer t2 = sender.getTableBuffer("t2");
+                t1.setSchemaId(3);
+                t2.setSchemaId(7);
+                setField(sender, "maxSentSchemaId", 7);
+                setField(sender, "nextSchemaId", 8);
+
+                invokeResetSchemaStateForNewConnection(sender);
+
+                Assert.assertEquals(-1, t1.getSchemaId());
+                Assert.assertEquals(-1, t2.getSchemaId());
+                Assert.assertEquals(-1, getIntField(sender, "maxSentSchemaId"));
+                Assert.assertEquals(0, getIntField(sender, "nextSchemaId"));
+            } finally {
+                setField(sender, "connected", false);
+                sender.close();
+            }
+        });
+    }
+
+    @Test
     public void testResetClearsAllTableBuffersAndPendingRowCount() throws Exception {
         assertMemoryLeak(() -> {
             // Use high autoFlushRows to prevent auto-flush during the test
@@ -212,39 +246,6 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
 
                 // Pending row count should be zeroed
                 Assert.assertEquals("pendingRowCount should be 0 after reset", 0, sender.getPendingRowCount());
-            } finally {
-                setField(sender, "connected", false);
-                sender.close();
-            }
-        });
-    }
-
-    @Test
-    public void testReconnectResetsRetainedSchemaIds() throws Exception {
-        assertMemoryLeak(() -> {
-            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
-                    "localhost", 0, 10_000, 0, 0L, 1
-            );
-            try {
-                setField(sender, "connected", true);
-                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
-
-                sender.table("t1").longColumn("x", 1).at(1, ChronoUnit.MICROS);
-                sender.table("t2").longColumn("y", 2).at(2, ChronoUnit.MICROS);
-
-                QwpTableBuffer t1 = sender.getTableBuffer("t1");
-                QwpTableBuffer t2 = sender.getTableBuffer("t2");
-                t1.setSchemaId(3);
-                t2.setSchemaId(7);
-                setField(sender, "maxSentSchemaId", 7);
-                setField(sender, "nextSchemaId", 8);
-
-                invokeNoArgMethod(sender, "resetSchemaStateForNewConnection");
-
-                Assert.assertEquals(-1, t1.getSchemaId());
-                Assert.assertEquals(-1, t2.getSchemaId());
-                Assert.assertEquals(-1, getIntField(sender, "maxSentSchemaId"));
-                Assert.assertEquals(0, getIntField(sender, "nextSchemaId"));
             } finally {
                 setField(sender, "connected", false);
                 sender.close();
@@ -306,21 +307,21 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
         });
     }
 
-    private static void setField(Object target, String fieldName, Object value) throws Exception {
-        Field f = target.getClass().getDeclaredField(fieldName);
-        f.setAccessible(true);
-        f.set(target, value);
-    }
-
     private static int getIntField(Object target, String fieldName) throws Exception {
         Field f = target.getClass().getDeclaredField(fieldName);
         f.setAccessible(true);
         return f.getInt(target);
     }
 
-    private static void invokeNoArgMethod(Object target, String methodName) throws Exception {
-        Method method = target.getClass().getDeclaredMethod(methodName);
+    private static void invokeResetSchemaStateForNewConnection(Object target) throws Exception {
+        Method method = target.getClass().getDeclaredMethod("resetSchemaStateForNewConnection");
         method.setAccessible(true);
         method.invoke(target);
+    }
+
+    private static void setField(Object target, String fieldName, Object value) throws Exception {
+        Field f = target.getClass().getDeclaredField(fieldName);
+        f.setAccessible(true);
+        f.set(target, value);
     }
 }

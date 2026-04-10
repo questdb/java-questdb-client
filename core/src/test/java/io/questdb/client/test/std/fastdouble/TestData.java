@@ -25,71 +25,22 @@
 package io.questdb.client.test.std.fastdouble;
 
 public final class TestData {
-    private final int byteLength;
-    private final int byteOffset;
-    private final int charLength;
-    private final int charOffset;
-    private final double expectedDoubleValue;
-    private final float expectedFloatValue;
     private final String input;
     private final String title;
     private final boolean valid;
 
-    public TestData(String title,
-                    String input,
-                    int charOffset, int charLength,
-                    int byteOffset, int byteLength,
-                    double expectedDoubleValue,
-                    float expectedFloatValue,
-                    boolean valid) {
-        this.title = title;
-        this.input = input;
-        this.charOffset = charOffset;
-        this.charLength = charLength;
-        this.byteOffset = byteOffset;
-        this.byteLength = byteLength;
-        this.expectedDoubleValue = expectedDoubleValue;
-        this.expectedFloatValue = expectedFloatValue;
-        this.valid = valid;
-    }
-
-    public TestData(String input, double expectedDoubleValue, float expectedFloatValue) {
-        this(input, input, 0, input.length(), 0, input.length(),
-                expectedDoubleValue,
-                expectedFloatValue, true);
-    }
-
-    public TestData(String input, double expectedDoubleValue, float expectedFloatValue, int offset, int length) {
-        this(
-                input,
-                input,
-                offset,
-                length,
-                offset,
-                length,
-                expectedDoubleValue,
-                expectedFloatValue, true);
-    }
-
-    public TestData(String title, String input, double expectedDoubleValue, float expectedFloatValue) {
-        this(title.contains(input) ? title : title + " " + input,
-                input,
-                0,
-                input.length(),
-                0,
-                input.length(),
-                expectedDoubleValue,
-                expectedFloatValue, true);
-    }
-
     public TestData(String input) {
-        this(input, input);
+        this(input, input, true);
     }
 
     public TestData(String title, String input) {
-        this(title.contains(input) ? title : title + " " + input, input, 0, input.length(), 0, input.length(),
-                Double.NaN,
-                Float.NaN, false);
+        this(title.contains(input) ? title : title + " " + input, input, true);
+    }
+
+    public TestData(String title, String input, boolean valid) {
+        this.title = title;
+        this.input = input;
+        this.valid = valid;
     }
 
     public String input() {

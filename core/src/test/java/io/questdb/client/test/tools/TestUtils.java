@@ -25,7 +25,6 @@
 package io.questdb.client.test.tools;
 
 import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Rnd;
 import io.questdb.client.std.ThreadLocal;
@@ -41,8 +40,6 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.Paths;
 import java.util.Arrays;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertNotNull;
 
@@ -125,47 +122,6 @@ public final class TestUtils {
         }
     }
 
-    public static void assertEventually(EventualCode assertion, int timeoutSeconds, Set<Class<?>> exceptionTypesToCatch) throws Exception {
-        long maxSleepingTimeMillis = 1000;
-        long nextSleepingTimeMillis = 10;
-        long startTime = System.nanoTime();
-        long deadline = startTime + TimeUnit.SECONDS.toNanos(timeoutSeconds);
-        for (; ; ) {
-            try {
-                assertion.run();
-                return;
-            } catch (Exception error) {
-                if (!exceptionTypesToCatch.contains(error.getClass())) {
-                    throw error;
-                }
-                if (System.nanoTime() >= deadline) {
-                    throw error;
-                }
-            }
-            Os.sleep(nextSleepingTimeMillis);
-            nextSleepingTimeMillis = Math.min(maxSleepingTimeMillis, nextSleepingTimeMillis << 1);
-        }
-    }
-
-    public static void assertEventually(EventualCode assertion, int timeoutSeconds) throws Exception {
-        long maxSleepingTimeMillis = 1000;
-        long nextSleepingTimeMillis = 10;
-        long startTime = System.nanoTime();
-        long deadline = startTime + TimeUnit.SECONDS.toNanos(timeoutSeconds);
-        for (; ; ) {
-            try {
-                assertion.run();
-                return;
-            } catch (AssertionError error) {
-                if (System.nanoTime() >= deadline) {
-                    throw error;
-                }
-            }
-            Os.sleep(nextSleepingTimeMillis);
-            nextSleepingTimeMillis = Math.min(maxSleepingTimeMillis, nextSleepingTimeMillis << 1);
-        }
-    }
-
     public static void assertMemoryLeak(LeakProneCode runnable) throws Exception {
         try (LeakCheck ignore = new LeakCheck()) {
             try {
@@ -175,38 +131,6 @@ public final class TestUtils {
                 throw e;
             }
         }
-    }
-
-    /**
-     * Asserts that a {@code CharSequence} does NOT contain another {@code CharSequence}.
-     * <p>
-     * Fails if the {@code term} is empty (""), because the convention established by
-     * {@link #assertContains(String, CharSequence, CharSequence)} considers an empty
-     * term to be contained within any sequence.
-     * </p>
-     *
-     * @param message  the identifying message for the {@link AssertionError} (<code>null</code> okay)
-     * @param sequence the {@code CharSequence} to check.
-     * @param term     the {@code CharSequence} to search for (and assert its absence).
-     */
-    public static void assertNotContains(String message, CharSequence sequence, CharSequence term) {
-        if (term.length() == 0) {
-            String formatted = "";
-            if (message != null) {
-                formatted = message + " ";
-            }
-            Assert.fail(formatted + "Cannot assert that sequence does not contain an empty term; an empty term is always considered contained by definition.");
-        }
-
-        if (!sequence.toString().contains(term.toString())) {
-            return;
-        }
-
-        String formatted = "";
-        if (message != null) {
-            formatted = message + " ";
-        }
-        Assert.fail(formatted + "Expected sequence <" + sequence + "> to NOT contain term <" + term + "> but it did.");
     }
 
     // Useful for debugging
@@ -306,10 +230,6 @@ public final class TestUtils {
 
     public interface CheckedSupplier<T> {
         T get() throws Throwable;
-    }
-
-    public interface EventualCode {
-        void run() throws Exception;
     }
 
     @FunctionalInterface

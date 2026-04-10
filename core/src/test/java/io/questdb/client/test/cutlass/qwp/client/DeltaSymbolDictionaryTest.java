@@ -139,15 +139,13 @@ public class DeltaSymbolDictionaryTest {
             int maxSentSymbolId = -1;
             int batchMaxId = 3;  // TSLA
 
-            int deltaStart = maxSentSymbolId + 1;
             int deltaCount = batchMaxId - maxSentSymbolId;
 
             // Must send symbols 0, 1, 2, 3 (even though 1, 2 aren't used in this batch)
-            Assert.assertEquals(0, deltaStart);
             Assert.assertEquals(4, deltaCount);
 
             // This ensures server has contiguous dictionary
-            for (int id = deltaStart; id < deltaStart + deltaCount; id++) {
+            for (int id = 0; id < deltaCount; id++) {
                 String symbol = globalDict.getSymbol(id);
                 Assert.assertNotNull("Symbol " + id + " should exist", symbol);
             }
@@ -622,9 +620,6 @@ public class DeltaSymbolDictionaryTest {
 
     private int readVarint(long address) {
         byte b = Unsafe.getUnsafe().getByte(address);
-        if ((b & 0x80) == 0) {
-            return b & 0x7F;
-        }
         // For simplicity, only handle single-byte varints in tests
         return b & 0x7F;
     }

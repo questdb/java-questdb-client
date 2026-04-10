@@ -31,7 +31,6 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.network.Socket;
-import io.questdb.client.network.TlsSessionInitFailedException;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -45,7 +44,7 @@ public class WebSocketClientTest {
     public void testRecvOrTimeoutPropagatesNonTimeoutError() throws Exception {
         assertMemoryLeak(() -> {
             try (RecvTestWebSocketClient client = new RecvTestWebSocketClient()) {
-                setField(client, "upgraded", true);
+                setUpgradedTrue(client);
 
                 // socket.recv() returns 0, triggering the ioWait path
                 // ioWait throws a non-timeout error (e.g., queue/poll failure)
@@ -81,7 +80,7 @@ public class WebSocketClientTest {
     public void testRecvOrTimeoutReturnsFalseOnTimeout() throws Exception {
         assertMemoryLeak(() -> {
             try (RecvTestWebSocketClient client = new RecvTestWebSocketClient()) {
-                setField(client, "upgraded", true);
+                setUpgradedTrue(client);
 
                 // socket.recv() returns 0, triggering the ioWait path
                 // ioWait throws a timeout error
@@ -139,7 +138,7 @@ public class WebSocketClientTest {
         assertMemoryLeak(() -> {
             try (StubWebSocketClient client = new StubWebSocketClient()) {
                 // Set upgraded=true so checkConnected() passes
-                setField(client, "upgraded", true);
+                setUpgradedTrue(client);
 
                 WebSocketSendBuffer sendBuffer = client.getSendBuffer();
 
@@ -166,19 +165,19 @@ public class WebSocketClientTest {
         });
     }
 
-    private static void setField(Object obj, String fieldName, Object value) throws Exception {
+    private static void setUpgradedTrue(Object obj) throws Exception {
         Class<?> clazz = obj.getClass();
         while (clazz != null) {
             try {
-                Field field = clazz.getDeclaredField(fieldName);
+                Field field = clazz.getDeclaredField("upgraded");
                 field.setAccessible(true);
-                field.set(obj, value);
+                field.set(obj, (Object) true);
                 return;
             } catch (NoSuchFieldException e) {
                 clazz = clazz.getSuperclass();
             }
         }
-        throw new NoSuchFieldException(fieldName);
+        throw new NoSuchFieldException("upgraded");
     }
 
     /**
@@ -216,7 +215,7 @@ public class WebSocketClientTest {
         }
 
         @Override
-        public void startTlsSession(CharSequence peerName) throws TlsSessionInitFailedException {
+        public void startTlsSession(CharSequence peerName) {
             throw new UnsupportedOperationException();
         }
 

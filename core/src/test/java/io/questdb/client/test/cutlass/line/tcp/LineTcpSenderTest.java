@@ -89,7 +89,7 @@ public class LineTcpSenderTest extends AbstractTest {
     }
 
     @Test
-    public void testInsertDecimalTextFormatInvalid() throws Exception {
+    public void testInsertDecimalTextFormatInvalid() {
         try (Sender sender = new LineTcpSenderV3(new DummyLineChannel(), 4096, 127)) {
             sender.table("test");
             // Test invalid characters

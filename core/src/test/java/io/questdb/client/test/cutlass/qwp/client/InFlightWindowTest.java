@@ -632,7 +632,7 @@ public class InFlightWindowTest {
 
         assertTrue(done.await(60, TimeUnit.SECONDS));
         if (error.get() != null) {
-            error.get().printStackTrace();
+            error.get().printStackTrace(System.err);
         }
         assertNull(error.get());
         assertTrue(window.isEmpty());

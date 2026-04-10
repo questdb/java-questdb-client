@@ -49,6 +49,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -1989,7 +1990,7 @@ public class QwpUdpSenderTest {
         return new String(chars);
     }
 
-    private static ScenarioRow row(String table, ThrowingConsumer<QwpUdpSender> writer, Object... kvs) {
+    private static ScenarioRow row(String table, Consumer<QwpUdpSender> writer, Object... kvs) {
         return new ScenarioRow(decodedRow(table, kvs), writer);
     }
 
@@ -2015,11 +2016,6 @@ public class QwpUdpSenderTest {
 
     private static int[] shape(int... dims) {
         return dims;
-    }
-
-    @FunctionalInterface
-    private interface ThrowingConsumer<T> {
-        void accept(T value) throws Exception;
     }
 
     @FunctionalInterface
@@ -2584,9 +2580,9 @@ public class QwpUdpSenderTest {
 
     private static final class ScenarioRow {
         private final DecodedRow expected;
-        private final ThrowingConsumer<QwpUdpSender> writer;
+        private final Consumer<QwpUdpSender> writer;
 
-        private ScenarioRow(DecodedRow expected, ThrowingConsumer<QwpUdpSender> writer) {
+        private ScenarioRow(DecodedRow expected, Consumer<QwpUdpSender> writer) {
             this.expected = expected;
             this.writer = writer;
         }

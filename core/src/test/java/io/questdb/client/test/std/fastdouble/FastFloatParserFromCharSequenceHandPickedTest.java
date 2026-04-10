@@ -35,7 +35,7 @@ public class FastFloatParserFromCharSequenceHandPickedTest extends AbstractFloat
     }
 
     @Override
-    protected float parse(String str, int offset, int length, boolean rejectOverflow) throws NumericException {
-        return FastFloatParser.parseFloat(str, offset, length, rejectOverflow);
+    protected float parse(String str, int offset, int length) throws NumericException {
+        return FastFloatParser.parseFloat(str, offset, length, false);
     }
 }

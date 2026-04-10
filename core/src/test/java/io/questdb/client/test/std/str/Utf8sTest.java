@@ -202,7 +202,7 @@ public class Utf8sTest {
 
     @Test
     public void testEqualsNcAscii() {
-        final Utf8String str = utf8("test1");
+        final Utf8String str = new Utf8String("test1");
 
         Assert.assertTrue(Utf8s.equalsNcAscii("test1", str));
         Assert.assertFalse(Utf8s.equalsNcAscii("test2", str));
@@ -269,22 +269,11 @@ public class Utf8sTest {
         }
     }
 
-    private static byte b(int n) {
-        return (byte) n;
-    }
-
     private static long copyBytes(long buf, byte[] bytes) {
         for (int n = bytes.length, i = 0; i < n; i++) {
             Unsafe.getUnsafe().putByte(buf + i, bytes[i]);
         }
         return buf + bytes.length;
-    }
-
-    /**
-     * Create a Utf8String from a String.
-     */
-    private static Utf8String utf8(String s) {
-        return new Utf8String(s);
     }
 
     private boolean copyToSinkWithTextUtil(StringSink query, String text) {

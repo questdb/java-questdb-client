@@ -1119,7 +1119,6 @@ public class QwpTableBufferTest {
 
                 int keepSizeBefore = keep.getSize();
                 int keepValueCountBefore = keep.getValueCount();
-                long keepStringDataSizeBefore = keep.getStringDataSize();
                 int keepArrayShapeOffsetBefore = keep.getArrayShapeOffset();
                 int keepArrayDataOffsetBefore = keep.getArrayDataOffset();
                 int keepIndex = keep.getIndex();
