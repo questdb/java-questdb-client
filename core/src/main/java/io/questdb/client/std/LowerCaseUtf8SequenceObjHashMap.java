@@ -57,10 +57,6 @@ public class LowerCaseUtf8SequenceObjHashMap<V> extends AbstractLowerCaseUtf8Seq
         return valueAt(keyIndex(key));
     }
 
-    public ObjList<Utf8Sequence> keys() {
-        return list;
-    }
-
     /**
      * Stores a key-value pair in the map without creating a defensive copy of the key.
      * <p>

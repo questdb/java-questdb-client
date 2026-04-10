@@ -31,7 +31,7 @@ import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
 
-public class LongList implements Mutable, LongVec, Sinkable {
+public class LongList implements Mutable, Sinkable {
     private static final int DEFAULT_ARRAY_SIZE = 16;
     private static final long DEFAULT_NO_ENTRY_VALUE = -1L;
     private final int initialCapacity;
@@ -177,21 +177,9 @@ public class LongList implements Mutable, LongVec, Sinkable {
         return (int) hashCode;
     }
 
-    @Override
-    public LongVec newInstance() {
-        LongList newList = new LongList(size());
-        newList.setPos(pos);
-        return newList;
-    }
-
     public final void setPos(int pos) {
         checkCapacity(pos);
         this.pos = pos;
-    }
-
-    public void setQuick(int index, long value) {
-        assert index < pos;
-        data[index] = value;
     }
 
     public int size() {

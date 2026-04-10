@@ -261,16 +261,6 @@ public class MicrobatchBufferTest {
     }
 
     @Test
-    public void testConstructionWithCustomThresholds() throws Exception {
-        assertMemoryLeak(() -> {
-            try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024, 1_000_000_000L)) {
-                Assert.assertEquals(1024, buffer.getBufferCapacity());
-                Assert.assertTrue(buffer.isFilling());
-            }
-        });
-    }
-
-    @Test
     public void testConstructionWithDefaultThresholds() throws Exception {
         assertMemoryLeak(() -> {
             try (MicrobatchBuffer buffer = new MicrobatchBuffer(1024)) {
