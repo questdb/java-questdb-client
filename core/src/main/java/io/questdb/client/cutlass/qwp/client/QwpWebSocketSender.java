@@ -485,8 +485,22 @@ public class QwpWebSocketSender implements Sender {
                 }
             }
 
+            // Always free resources the I/O thread never touches:
+            // encoder and table buffers are user-thread-only.
+            encoder.close();
+            ObjList<CharSequence> keys = tableBuffers.keys();
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                CharSequence key = keys.getQuick(i);
+                if (key != null) {
+                    Misc.free(tableBuffers.get(key));
+                }
+            }
+            tableBuffers.clear();
+
             if (!ioThreadStopped) {
-                LOG.error("Skipping WebSocket client teardown because the I/O thread is still running");
+                // The I/O thread may still be using the socket and microbatch
+                // buffers (buffer0/buffer1). Freeing them would risk SIGSEGV.
+                LOG.error("I/O thread is still running, leaking WebSocket client and microbatch buffers");
                 return;
             }
 
@@ -502,16 +516,6 @@ public class QwpWebSocketSender implements Sender {
                 client.close();
                 client = null;
             }
-            encoder.close();
-            // Close all table buffers to free off-heap column memory
-            ObjList<CharSequence> keys = tableBuffers.keys();
-            for (int i = 0, n = keys.size(); i < n; i++) {
-                CharSequence key = keys.getQuick(i);
-                if (key != null) {
-                    Misc.free(tableBuffers.get(key));
-                }
-            }
-            tableBuffers.clear();
 
             LOG.info("QwpWebSocketSender closed");
         }
@@ -924,9 +928,11 @@ public class QwpWebSocketSender implements Sender {
         validateTableName(tableName);
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
-        currentTableName = tableName.toString();
-        currentTableBuffer = tableBuffers.get(currentTableName);
-        if (currentTableBuffer == null) {
+        currentTableBuffer = tableBuffers.get(tableName);
+        if (currentTableBuffer != null) {
+            currentTableName = currentTableBuffer.getTableName();
+        } else {
+            currentTableName = tableName.toString();
             currentTableBuffer = new QwpTableBuffer(currentTableName, this);
             tableBuffers.put(currentTableName, currentTableBuffer);
         }

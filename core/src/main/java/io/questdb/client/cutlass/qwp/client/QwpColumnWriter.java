@@ -303,8 +303,8 @@ class QwpColumnWriter {
                 int encodedSize = QwpGorillaEncoder.calculateEncodedSize(addr, count);
                 buffer.ensureCapacity(encodedSize);
                 int bytesWritten = gorillaEncoder.encodeTimestamps(
-                        buffer.getBufferPtr() + buffer.getPosition(),
-                        buffer.getCapacity() - buffer.getPosition(),
+                        buffer.getWriteAddress(),
+                        buffer.getWritableBytes(),
                         addr,
                         count
                 );
@@ -355,7 +355,6 @@ class QwpColumnWriter {
 
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
             QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
-            QwpColumnDef colDef = columnDefs[i];
             int valueCount = col.getValueCount();
             long stringDataSize = col.getStringDataSize();
             int symbolDictionarySize = col.getSymbolDictionarySize();

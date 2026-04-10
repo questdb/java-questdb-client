@@ -201,6 +201,16 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         return writePos;
     }
 
+    @Override
+    public long getWriteAddress() {
+        return bufPtr + writePos;
+    }
+
+    @Override
+    public int getWritableBytes() {
+        return bufCapacity - writePos;
+    }
+
     /**
      * Gets the current write position (total bytes written since last reset).
      */

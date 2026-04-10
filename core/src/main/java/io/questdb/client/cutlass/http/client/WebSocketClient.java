@@ -71,6 +71,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int DEFAULT_RECV_BUFFER_SIZE = 65536;
     private static final int DEFAULT_SEND_BUFFER_SIZE = 65536;
     private static final Logger LOG = LoggerFactory.getLogger(WebSocketClient.class);
+    // tryParseFrame() return values
+    private static final int PARSE_INCOMPLETE = 0;
+    private static final int PARSE_NEED_MORE = -1;
+    private static final int PARSE_OK = 1;
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -129,21 +133,26 @@ public abstract class WebSocketClient implements QuietCloseable {
             this.recvBufSize = Math.max(configuration.getResponseBufferSize(), DEFAULT_RECV_BUFFER_SIZE);
             this.maxRecvBufSize = Math.max(configuration.getMaximumResponseBufferSize(), recvBufSize);
             this.recvBufPtr = Unsafe.malloc(recvBufSize, MemoryTag.NATIVE_DEFAULT);
+
+            this.sendBuffer = sendBuf;
+            this.controlFrameBuffer = controlBuf;
+            this.recvPos = 0;
+            this.recvReadPos = 0;
+
+            this.frameParser = new WebSocketFrameParser();
+            this.rnd = new SecureRnd();
+            this.upgraded = false;
+            this.closed = false;
         } catch (Throwable t) {
+            if (recvBufPtr != 0) {
+                Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
+                recvBufPtr = 0;
+            }
             Misc.free(controlBuf);
             Misc.free(sendBuf);
             Misc.free(socket);
             throw t;
         }
-        this.sendBuffer = sendBuf;
-        this.controlFrameBuffer = controlBuf;
-        this.recvPos = 0;
-        this.recvReadPos = 0;
-
-        this.frameParser = new WebSocketFrameParser();
-        this.rnd = new SecureRnd();
-        this.upgraded = false;
-        this.closed = false;
     }
 
     @Override
@@ -211,6 +220,9 @@ public abstract class WebSocketClient implements QuietCloseable {
     /**
      * Disconnects the socket without closing the client.
      * The client can be reconnected by calling connect() again.
+     * <p>
+     * This method is NOT thread-safe. Only call it when no other thread
+     * is using this client (e.g., after the I/O thread has stopped).
      */
     public void disconnect() {
         Misc.free(socket);
@@ -220,6 +232,31 @@ public abstract class WebSocketClient implements QuietCloseable {
         recvPos = 0;
         recvReadPos = 0;
         resetFragmentState();
+    }
+
+    /**
+     * Closes the socket to force-unblock a thread blocked in send/recv.
+     * <p>
+     * Unlike {@link #disconnect()}, this method only closes the socket
+     * and does not reset client state. It is safe to call from a different
+     * thread than the one performing I/O.
+     */
+    public void forceDisconnect() {
+        Misc.free(socket);
+    }
+
+    /**
+     * Returns the connected host.
+     */
+    public CharSequence getHost() {
+        return host;
+    }
+
+    /**
+     * Returns the connected port.
+     */
+    public int getPort() {
+        return port;
     }
 
     /**
@@ -264,9 +301,9 @@ public abstract class WebSocketClient implements QuietCloseable {
         checkConnected();
 
         // First, try to parse any data already in buffer
-        Boolean result = tryParseFrame(handler);
-        if (result != null) {
-            return result;
+        int result = tryParseFrame(handler);
+        if (result != PARSE_NEED_MORE) {
+            return result == PARSE_OK;
         }
 
         // Need more data
@@ -289,8 +326,8 @@ public abstract class WebSocketClient implements QuietCloseable {
             recvPos += bytesRead;
 
             result = tryParseFrame(handler);
-            if (result != null) {
-                return result;
+            if (result != PARSE_NEED_MORE) {
+                return result == PARSE_OK;
             }
         }
     }
@@ -368,9 +405,9 @@ public abstract class WebSocketClient implements QuietCloseable {
         checkConnected();
 
         // First, try to parse any data already in buffer
-        Boolean result = tryParseFrame(handler);
-        if (result != null) {
-            return result;
+        int result = tryParseFrame(handler);
+        if (result != PARSE_NEED_MORE) {
+            return result == PARSE_OK;
         }
 
         // Try one non-blocking recv
@@ -389,7 +426,7 @@ public abstract class WebSocketClient implements QuietCloseable {
 
         // Try to parse again
         result = tryParseFrame(handler);
-        return result != null && result;
+        return result == PARSE_OK;
     }
 
     /**
@@ -772,9 +809,9 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
     }
 
-    private Boolean tryParseFrame(WebSocketFrameHandler handler) {
+    private int tryParseFrame(WebSocketFrameHandler handler) {
         if (recvPos <= recvReadPos) {
-            return null; // No data
+            return PARSE_NEED_MORE;
         }
 
         frameParser.reset();
@@ -782,7 +819,7 @@ public abstract class WebSocketClient implements QuietCloseable {
 
         if (frameParser.getState() == WebSocketFrameParser.STATE_NEED_MORE ||
                 frameParser.getState() == WebSocketFrameParser.STATE_NEED_PAYLOAD) {
-            return null; // Need more data
+            return PARSE_NEED_MORE;
         }
 
         if (frameParser.getState() == WebSocketFrameParser.STATE_ERROR) {
@@ -881,10 +918,10 @@ public abstract class WebSocketClient implements QuietCloseable {
             // Compact buffer if needed
             compactRecvBuffer();
 
-            return true;
+            return PARSE_OK;
         }
 
-        return false;
+        return PARSE_INCOMPLETE;
     }
 
     private void validateUpgradeResponse(int headerEnd) {

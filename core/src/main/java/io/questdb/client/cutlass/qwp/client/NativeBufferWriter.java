@@ -107,10 +107,16 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
      */
     @Override
     public void ensureCapacity(int needed) {
-        if (position + needed > capacity) {
-            int newCapacity = Math.max(capacity * 2, position + needed);
-            bufferPtr = Unsafe.realloc(bufferPtr, capacity, newCapacity, MemoryTag.NATIVE_DEFAULT);
-            capacity = newCapacity;
+        if ((long) position + needed > capacity) {
+            long required = (long) position + needed;
+            long doubled = (long) capacity * 2;
+            long newCapacity = Math.max(doubled, required);
+            if (newCapacity > Integer.MAX_VALUE) {
+                throw new OutOfMemoryError("NativeBufferWriter capacity overflow: " + newCapacity);
+            }
+            int cap = (int) newCapacity;
+            bufferPtr = Unsafe.realloc(bufferPtr, capacity, cap, MemoryTag.NATIVE_DEFAULT);
+            capacity = cap;
         }
     }
 
@@ -136,6 +142,16 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     @Override
     public int getPosition() {
         return position;
+    }
+
+    @Override
+    public long getWriteAddress() {
+        return bufferPtr + position;
+    }
+
+    @Override
+    public int getWritableBytes() {
+        return capacity - position;
     }
 
     /**
@@ -231,10 +247,35 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
             return;
         }
 
-        int utf8Len = utf8Length(value);
-        putVarint(utf8Len);
-        ensureCapacity(utf8Len);
-        encodeUtf8(value);
+        int charLen = value.length();
+        // Optimistic: assume ASCII (utf8Len == charLen).
+        // Reserve varint(charLen) + charLen bytes.
+        int varintLen = varintSize(charLen);
+        ensureCapacity(varintLen + charLen);
+
+        // Single-pass: write ASCII bytes directly after varint space
+        long varintAddr = bufferPtr + position;
+        long addr = varintAddr + varintLen;
+        int i = 0;
+        for (; i < charLen; i++) {
+            char c = value.charAt(i);
+            if (c >= 0x80) {
+                break;
+            }
+            Unsafe.getUnsafe().putByte(addr++, (byte) c);
+        }
+
+        if (i == charLen) {
+            // All ASCII — write varint prefix, done in a single pass
+            writeVarintDirect(varintAddr, charLen);
+            position += varintLen + charLen;
+        } else {
+            // Non-ASCII — fall back to two-pass
+            int utf8Len = utf8Length(value);
+            putVarint(utf8Len);
+            ensureCapacity(utf8Len);
+            encodeUtf8(value);
+        }
     }
 
     /**
@@ -245,9 +286,30 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
         if (value == null || value.isEmpty()) {
             return;
         }
-        int utf8Len = utf8Length(value);
-        ensureCapacity(utf8Len);
-        encodeUtf8(value);
+
+        int charLen = value.length();
+        ensureCapacity(charLen);
+
+        // Single-pass: try ASCII encoding
+        long addr = bufferPtr + position;
+        int i = 0;
+        for (; i < charLen; i++) {
+            char c = value.charAt(i);
+            if (c >= 0x80) {
+                break;
+            }
+            Unsafe.getUnsafe().putByte(addr++, (byte) c);
+        }
+
+        if (i == charLen) {
+            // All ASCII — done in a single pass
+            position += charLen;
+        } else {
+            // Non-ASCII — fall back to two-pass (re-encodes from start)
+            int utf8Len = utf8Length(value);
+            ensureCapacity(utf8Len);
+            encodeUtf8(value);
+        }
     }
 
     /**
@@ -255,11 +317,14 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
      */
     @Override
     public void putVarint(long value) {
+        ensureCapacity(10); // max varint bytes
+        long addr = bufferPtr + position;
         while (value > 0x7F) {
-            putByte((byte) ((value & 0x7F) | 0x80));
+            Unsafe.getUnsafe().putByte(addr++, (byte) ((value & 0x7F) | 0x80));
             value >>>= 7;
         }
-        putByte((byte) value);
+        Unsafe.getUnsafe().putByte(addr++, (byte) value);
+        position = (int) (addr - bufferPtr);
     }
 
     /**
@@ -280,6 +345,14 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
     public void skip(int bytes) {
         ensureCapacity(bytes);
         position += bytes;
+    }
+
+    private static void writeVarintDirect(long addr, long value) {
+        while (value > 0x7F) {
+            Unsafe.getUnsafe().putByte(addr++, (byte) ((value & 0x7F) | 0x80));
+            value >>>= 7;
+        }
+        Unsafe.getUnsafe().putByte(addr, (byte) value);
     }
 
     private void encodeUtf8(String value) {

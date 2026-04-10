@@ -88,7 +88,6 @@ public class QwpUdpSender implements Sender {
     private String currentTableName;
     private int inProgressColumnCount;
     private InProgressColumnState[] inProgressColumns = new InProgressColumnState[8];
-    private int inProgressRowValueCount;
     // prefix* arrays: per-column snapshots captured before the in-progress row,
     // used to encode and flush only the committed prefix when a row is still being built.
     // Indexed by column index. -1 means the column has no in-progress data.
@@ -509,9 +508,11 @@ public class QwpUdpSender implements Sender {
             resetCommittedDatagramEstimate();
         }
 
-        currentTableName = tableName.toString();
-        currentTableBuffer = tableBuffers.get(currentTableName);
-        if (currentTableBuffer == null) {
+        currentTableBuffer = tableBuffers.get(tableName);
+        if (currentTableBuffer != null) {
+            currentTableName = currentTableBuffer.getTableName();
+        } else {
+            currentTableName = tableName.toString();
             currentTableBuffer = new QwpTableBuffer(currentTableName);
             tableBuffers.put(currentTableName, currentTableBuffer);
         }
@@ -855,7 +856,6 @@ public class QwpUdpSender implements Sender {
     }
 
     private void clearInProgressRow() {
-        inProgressRowValueCount = 0;
         for (int i = 0; i < inProgressColumnCount; i++) {
             InProgressColumnState state = inProgressColumns[i];
             if (state != null) {
@@ -1200,7 +1200,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addBoolean(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageDecimal128ColumnValue(CharSequence name, Decimal128 value) {
@@ -1208,7 +1207,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addDecimal128(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageDecimal256ColumnValue(CharSequence name, Decimal256 value) {
@@ -1216,7 +1214,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addDecimal256(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageDecimal64ColumnValue(CharSequence name, Decimal64 value) {
@@ -1224,7 +1221,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addDecimal64(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageDesignatedTimestampValue(long value, boolean nanos) {
@@ -1249,7 +1245,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         appendDoubleArrayValue(col, value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageDoubleColumnValue(CharSequence name, double value) {
@@ -1257,7 +1252,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addDouble(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageLongArrayColumnValue(CharSequence name, Object value) {
@@ -1265,7 +1259,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         appendLongArrayValue(col, value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageLongColumnValue(CharSequence name, long value) {
@@ -1273,7 +1266,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addLong(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageNullArrayColumnValue(CharSequence name, byte type) {
@@ -1283,7 +1275,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addNull();
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageStringColumnValue(CharSequence name, CharSequence value) {
@@ -1291,7 +1282,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addString(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageSymbolColumnValue(CharSequence name, CharSequence value) {
@@ -1299,7 +1289,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addSymbol(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private void stageTimestampColumnValue(CharSequence name, byte type, long value) {
@@ -1307,7 +1296,6 @@ public class QwpUdpSender implements Sender {
         beginColumnWrite(col, name);
         col.addLong(value);
         completeColumnWrite();
-        inProgressRowValueCount++;
     }
 
     private long toMicros(long value, ChronoUnit unit) {

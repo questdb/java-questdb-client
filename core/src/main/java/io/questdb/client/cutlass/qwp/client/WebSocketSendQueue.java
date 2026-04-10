@@ -34,6 +34,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -97,6 +98,8 @@ public class WebSocketSendQueue implements QuietCloseable {
     private final AtomicLong totalBatchesSent = new AtomicLong(0);
     private final AtomicLong totalBytesSent = new AtomicLong(0);
     private final AtomicLong totalErrors = new AtomicLong(0);
+    // Close guard: ensures only one thread executes the shutdown sequence
+    private final AtomicBoolean closeCalled = new AtomicBoolean(false);
     // Error handling
     private volatile Throwable lastError;
     // Batch sequence counter (must match server's messageSequence)
@@ -107,25 +110,6 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Running state
     private volatile boolean running;
     private volatile boolean shuttingDown;
-
-    /**
-     * Creates a new send queue with default configuration.
-     *
-     * @param client the WebSocket client for I/O
-     */
-    public WebSocketSendQueue(WebSocketClient client) {
-        this(client, null, DEFAULT_ENQUEUE_TIMEOUT_MS, DEFAULT_SHUTDOWN_TIMEOUT_MS);
-    }
-
-    /**
-     * Creates a new send queue with InFlightWindow for tracking sent batches.
-     *
-     * @param client         the WebSocket client for I/O
-     * @param inFlightWindow the window to track sent batches awaiting ACK (may be null)
-     */
-    public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow) {
-        this(client, inFlightWindow, DEFAULT_ENQUEUE_TIMEOUT_MS, DEFAULT_SHUTDOWN_TIMEOUT_MS);
-    }
 
     /**
      * Creates a new send queue with custom configuration.
@@ -169,6 +153,9 @@ public class WebSocketSendQueue implements QuietCloseable {
      */
     @Override
     public void close() {
+        if (!closeCalled.compareAndSet(false, true)) {
+            return;
+        }
         if (!running) {
             return;
         }
@@ -210,7 +197,7 @@ public class WebSocketSendQueue implements QuietCloseable {
         // still blocked, disconnect the socket to force it to unwind.
         if (!awaitShutdown(shutdownTimeoutMs)) {
             LOG.warn("I/O thread did not stop within {}ms, disconnecting socket", shutdownTimeoutMs);
-            client.disconnect();
+            client.forceDisconnect();
             ioThread.interrupt();
             if (!awaitShutdown(shutdownTimeoutMs)) {
                 throw new LineSenderException("Timed out waiting for WebSocket I/O thread to stop");
@@ -390,6 +377,7 @@ public class WebSocketSendQueue implements QuietCloseable {
             inFlightWindow.failAll(rootError);
         }
         synchronized (processingLock) {
+            //noinspection resource
             MicrobatchBuffer dropped = pollPending();
             if (dropped != null) {
                 if (dropped.isSealed()) {
