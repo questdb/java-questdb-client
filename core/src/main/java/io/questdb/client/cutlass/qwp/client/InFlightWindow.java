@@ -88,7 +88,9 @@ public class InFlightWindow {
     // highestSent: the sequence number of the last batch added to the window
     private volatile long highestSent = -1;
     // Statistics — updated atomically via VarHandle
+    @SuppressWarnings("FieldMayBeFinal")
     private long totalAcked = 0;
+    @SuppressWarnings("FieldMayBeFinal")
     private long totalFailed = 0;
     // Thread waiting for empty (flush thread)
     private volatile Thread waitingForEmpty;
