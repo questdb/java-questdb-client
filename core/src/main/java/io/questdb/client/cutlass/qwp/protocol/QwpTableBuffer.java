@@ -493,14 +493,14 @@ public class QwpTableBuffer implements QuietCloseable {
             int count = (int) (len / 8);
             if (forLong) {
                 if (longData == null || longData.length < count) {
-                    longData = new long[count];
+                    longData = new long[Math.max(count, longData == null ? 256 : longData.length * 2)];
                 }
                 for (int i = 0; i < count; i++) {
                     longData[longDataOffset++] = Unsafe.getUnsafe().getLong(from + i * 8L);
                 }
             } else {
                 if (doubleData == null || doubleData.length < count) {
-                    doubleData = new double[count];
+                    doubleData = new double[Math.max(count, doubleData == null ? 256 : doubleData.length * 2)];
                 }
                 for (int i = 0; i < count; i++) {
                     doubleData[doubleDataOffset++] = Unsafe.getUnsafe().getDouble(from + i * 8L);
@@ -533,11 +533,11 @@ public class QwpTableBuffer implements QuietCloseable {
                     }
                     if (forLong) {
                         if (longData == null || longData.length < totalElements) {
-                            longData = new long[totalElements];
+                            longData = new long[Math.max(totalElements, longData == null ? 256 : longData.length * 2)];
                         }
                     } else {
                         if (doubleData == null || doubleData.length < totalElements) {
-                            doubleData = new double[totalElements];
+                            doubleData = new double[Math.max(totalElements, doubleData == null ? 256 : doubleData.length * 2)];
                         }
                     }
                 }

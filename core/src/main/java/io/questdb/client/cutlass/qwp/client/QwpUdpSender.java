@@ -1015,7 +1015,8 @@ public class QwpUdpSender implements Sender {
         estimate += VARINT_INT_UPPER_BOUND; // schemaId
 
         QwpColumnDef[] defs = currentTableBuffer.getColumnDefs();
-        for (QwpColumnDef def : defs) {
+        for (int i = 0, n = defs.length; i < n; i++) {
+            QwpColumnDef def = defs[i];
             int nameUtf8 = NativeBufferWriter.utf8Length(def.getName());
             estimate += NativeBufferWriter.varintSize(nameUtf8) + nameUtf8;
             estimate += 1;
@@ -1166,7 +1167,9 @@ public class QwpUdpSender implements Sender {
                     (int) datagramSegments.getTotalLength()
             );
         } catch (LineSenderException e) {
-            LOG.warn("UDP send failed [table={}, errno={}]: {}", tableName, channel.errno(), String.valueOf(e));
+            if (LOG.isWarnEnabled()) {
+                LOG.warn("UDP send failed [table={}, errno={}]: {}", tableName, channel.errno(), String.valueOf(e));
+            }
         }
     }
 

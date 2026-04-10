@@ -188,11 +188,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     /**
      * Connects to a WebSocket server.
      *
-     * @param host    the server hostname
-     * @param port    the server port
-     * @param timeout connection timeout in milliseconds
+     * @param host the server hostname
+     * @param port the server port
      */
-    public void connect(CharSequence host, int port, int timeout) {
+    public void connect(CharSequence host, int port) {
         if (closed) {
             throw new HttpClientException("WebSocket client is closed");
         }
@@ -203,18 +202,11 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         if (socket.isClosed()) {
-            doConnect(host, port, timeout);
+            doConnect(host, port);
         }
 
         this.host = host;
         this.port = port;
-    }
-
-    /**
-     * Connects using default timeout.
-     */
-    public void connect(CharSequence host, int port) {
-        connect(host, port, defaultTimeout);
     }
 
     /**
@@ -519,7 +511,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         return Base64.getEncoder().encodeToString(sha1.digest());
     }
 
-    private static boolean containsHeaderValue(String response, String headerName, String expectedValue, boolean ignoreValueCase) {
+    private static boolean excludesHeaderValue(String response, String headerName, String expectedValue, boolean ignoreValueCase) {
         int headerLen = headerName.length();
         int responseLen = response.length();
         for (int i = 0; i <= responseLen - headerLen; i++) {
@@ -530,12 +522,10 @@ public abstract class WebSocketClient implements QuietCloseable {
                     lineEnd = responseLen;
                 }
                 String actualValue = response.substring(valueStart, lineEnd).trim();
-                return ignoreValueCase
-                        ? actualValue.equalsIgnoreCase(expectedValue)
-                        : actualValue.equals(expectedValue);
+                return ignoreValueCase ? !actualValue.equalsIgnoreCase(expectedValue) : !actualValue.equals(expectedValue);
             }
         }
-        return false;
+        return true;
     }
 
     private static int extractQwpVersion(String response) {
@@ -614,7 +604,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         return byteCount;
     }
 
-    private void doConnect(CharSequence host, int port, int timeout) {
+    private void doConnect(CharSequence host, int port) {
         int fd = nf.socketTcp(true);
         if (fd < 0) {
             throw new HttpClientException("could not allocate a file descriptor [errno=").errno(nf.errno()).put(']');
@@ -943,18 +933,18 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         // Verify Upgrade: websocket (case-insensitive value per RFC 6455 Section 4.1)
-        if (!containsHeaderValue(response, "Upgrade:", "websocket", true)) {
+        if (excludesHeaderValue(response, "Upgrade:", "websocket", true)) {
             throw new HttpClientException("Missing or invalid Upgrade header in WebSocket response");
         }
 
         // Verify Connection: Upgrade (case-insensitive value per RFC 6455 Section 4.1)
-        if (!containsHeaderValue(response, "Connection:", "Upgrade", true)) {
+        if (excludesHeaderValue(response, "Connection:", "Upgrade", true)) {
             throw new HttpClientException("Missing or invalid Connection header in WebSocket response");
         }
 
         // Verify Sec-WebSocket-Accept (exact value match per RFC 6455 Section 4.1)
         String expectedAccept = computeAcceptKey(handshakeKey);
-        if (!containsHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept, false)) {
+        if (excludesHeaderValue(response, "Sec-WebSocket-Accept:", expectedAccept, false)) {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
 
