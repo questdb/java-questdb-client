@@ -126,59 +126,6 @@ class QwpColumnWriter {
         }
     }
 
-    void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef, boolean useGlobalSymbols, boolean useGorilla) {
-        int schemaId = tableBuffer.getSchemaId();
-        if (schemaId < 0) {
-            schemaId = 0;
-        }
-        encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useSchemaRef, useGlobalSymbols, useGorilla, schemaId);
-    }
-
-    void encodeTable(
-            QwpTableBuffer tableBuffer,
-            int rowCount,
-            int[] limitedValueCounts,
-            long[] limitedStringDataSizes,
-            int[] limitedSymbolDictionarySizes,
-            boolean useSchemaRef,
-            boolean useGlobalSymbols,
-            boolean useGorilla,
-            int schemaId
-    ) {
-        QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
-
-        if (useSchemaRef) {
-            writeTableHeaderWithSchemaRef(
-                    tableBuffer.getTableName(),
-                    rowCount,
-                    schemaId,
-                    columnDefs.length
-            );
-        } else {
-            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, schemaId, columnDefs);
-        }
-
-        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
-            QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
-            QwpColumnDef colDef = columnDefs[i];
-            int valueCount = col.getValueCount();
-            long stringDataSize = col.getStringDataSize();
-            int symbolDictionarySize = col.getSymbolDictionarySize();
-
-            if (limitedValueCounts != null && limitedValueCounts[i] > -1) {
-                valueCount = limitedValueCounts[i];
-                stringDataSize = limitedStringDataSizes[i];
-                symbolDictionarySize = limitedSymbolDictionarySizes[i];
-            }
-
-            encodeColumn(col, colDef, rowCount, valueCount, stringDataSize, symbolDictionarySize, useGorilla, useGlobalSymbols);
-        }
-    }
-
-    void setBuffer(QwpBufferWriter buffer) {
-        this.buffer = buffer;
-    }
-
     private void writeBooleanColumn(long addr, int count) {
         int packedSize = (count + 7) / 8;
         for (int i = 0; i < packedSize; i++) {
@@ -186,7 +133,7 @@ class QwpColumnWriter {
             for (int bit = 0; bit < 8; bit++) {
                 int idx = i * 8 + bit;
                 if (idx < count && Unsafe.getUnsafe().getByte(addr + idx) != 0) {
-                    b |= (1 << bit);
+                    b |= (byte) (1 << bit);
                 }
             }
             buffer.putByte(b);
@@ -373,5 +320,58 @@ class QwpColumnWriter {
             }
             buffer.putBlockOfBytes(addr, (long) count * 8);
         }
+    }
+
+    void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef, boolean useGlobalSymbols, boolean useGorilla) {
+        int schemaId = tableBuffer.getSchemaId();
+        if (schemaId < 0) {
+            schemaId = 0;
+        }
+        encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useSchemaRef, useGlobalSymbols, useGorilla, schemaId);
+    }
+
+    void encodeTable(
+            QwpTableBuffer tableBuffer,
+            int rowCount,
+            int[] limitedValueCounts,
+            long[] limitedStringDataSizes,
+            int[] limitedSymbolDictionarySizes,
+            boolean useSchemaRef,
+            boolean useGlobalSymbols,
+            boolean useGorilla,
+            int schemaId
+    ) {
+        QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
+
+        if (useSchemaRef) {
+            writeTableHeaderWithSchemaRef(
+                    tableBuffer.getTableName(),
+                    rowCount,
+                    schemaId,
+                    columnDefs.length
+            );
+        } else {
+            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, schemaId, columnDefs);
+        }
+
+        for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
+            QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);
+            QwpColumnDef colDef = columnDefs[i];
+            int valueCount = col.getValueCount();
+            long stringDataSize = col.getStringDataSize();
+            int symbolDictionarySize = col.getSymbolDictionarySize();
+
+            if (limitedValueCounts != null && limitedValueCounts[i] > -1) {
+                valueCount = limitedValueCounts[i];
+                stringDataSize = limitedStringDataSizes[i];
+                symbolDictionarySize = limitedSymbolDictionarySizes[i];
+            }
+
+            encodeColumn(col, colDef, rowCount, valueCount, stringDataSize, symbolDictionarySize, useGorilla, useGlobalSymbols);
+        }
+    }
+
+    void setBuffer(QwpBufferWriter buffer) {
+        this.buffer = buffer;
     }
 }

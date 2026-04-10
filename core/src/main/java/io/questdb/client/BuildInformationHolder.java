@@ -41,7 +41,8 @@ public class BuildInformationHolder implements BuildInformation {
         String swVersion;
         try {
             final Attributes manifestAttributes = getManifestAttributes(clazz);
-            swVersion = getAttr(manifestAttributes, "[DEVELOPMENT]");
+            final String value = manifestAttributes.getValue("QuestDB-Client-Version");
+            swVersion = value != null ? value : "[DEVELOPMENT]";
         } catch (IOException e) {
             swVersion = UNKNOWN;
         }
@@ -55,11 +56,6 @@ public class BuildInformationHolder implements BuildInformation {
     @Override
     public String getSwVersion() {
         return swVersion;
-    }
-
-    private static String getAttr(final Attributes manifestAttributes, String defaultValue) {
-        final String value = manifestAttributes.getValue("QuestDB-Client-Version");
-        return value != null ? value : defaultValue;
     }
 
     private static Attributes getManifestAttributes(Class<?> clazz) throws IOException {

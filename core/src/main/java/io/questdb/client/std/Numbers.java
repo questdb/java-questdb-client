@@ -561,14 +561,14 @@ public final class Numbers {
         if (sequence == null) {
             throw NumericException.instance().put("null string");
         }
-        return parseLong0(sequence, 0, sequence.length());
+        return parseLong0(sequence, sequence.length());
     }
 
     public static long parseLong(Utf8Sequence sequence) throws NumericException {
         if (sequence == null) {
             throw NumericException.instance().put("null string");
         }
-        return parseLong0(sequence.asAsciiCharSequence(), 0, sequence.size());
+        return parseLong0(sequence.asAsciiCharSequence(), sequence.size());
     }
 
     public static long spreadBits(long v) {
@@ -1499,14 +1499,14 @@ public final class Numbers {
         return negative ? val : -val;
     }
 
-    private static long parseLong0(CharSequence sequence, final int p, int lim) throws NumericException {
-        if (lim == p) {
+    private static long parseLong0(CharSequence sequence, int lim) throws NumericException {
+        if (lim == 0) {
             throw NumericException.instance().put("empty long string");
         }
 
-        boolean negative = sequence.charAt(p) == '-';
+        boolean negative = sequence.charAt(0) == '-';
 
-        int i = p;
+        int i = 0;
         if (negative) {
             i++;
         }
@@ -1522,23 +1522,23 @@ public final class Numbers {
             switch (c | 32) {
                 case 'l':
                     if (i == 0 || i + 1 < lim) {
-                        throw NumericException.instance().put("invalid long format: ").put(sequence, p, lim);
+                        throw NumericException.instance().put("invalid long format: ").put(sequence, 0, lim);
                     }
                     break;
                 case 127: // '_'
                     if (digitCounter == 0) {
-                        throw NumericException.instance().put("invalid long format: ").put(sequence, p, lim);
+                        throw NumericException.instance().put("invalid long format: ").put(sequence, 0, lim);
                     }
                     digitCounter = 0;
                     break;
                 default:
                     if (c < '0' || c > '9') {
-                        throw NumericException.instance().put("invalid character in long: ").put(sequence, p, lim);
+                        throw NumericException.instance().put("invalid character in long: ").put(sequence, 0, lim);
                     }
                     // val * 10 + (c - '0')
                     long r = (val << 3) + (val << 1) - (c - '0');
                     if (r > val) {
-                        throw NumericException.instance().put("long overflow: ").put(sequence, p, lim);
+                        throw NumericException.instance().put("long overflow: ").put(sequence, 0, lim);
                     }
                     val = r;
                     digitCounter++;
@@ -1546,7 +1546,7 @@ public final class Numbers {
         }
 
         if ((val == Long.MIN_VALUE && !negative) || digitCounter == 0) {
-            throw NumericException.instance().put("invalid long format: ").put(sequence, p, lim);
+            throw NumericException.instance().put("invalid long format: ").put(sequence, 0, lim);
         }
         return negative ? val : -val;
     }

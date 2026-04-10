@@ -37,13 +37,9 @@ public class CharSequenceObjHashMap<V> extends AbstractCharSequenceHashSet {
         this(8);
     }
 
-    public CharSequenceObjHashMap(int initialCapacity) {
-        this(initialCapacity, 0.5);
-    }
-
     @SuppressWarnings("unchecked")
-    private CharSequenceObjHashMap(int initialCapacity, double loadFactor) {
-        super(initialCapacity, loadFactor);
+    public CharSequenceObjHashMap(int initialCapacity) {
+        super(initialCapacity, 0.5);
         this.list = new ObjList<>(capacity);
         values = (V[]) new Object[keys.length];
         clear();

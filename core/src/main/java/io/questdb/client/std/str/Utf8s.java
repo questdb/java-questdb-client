@@ -71,7 +71,7 @@ public final class Utf8s {
         final int lSize = l.size();
         return lSize == r.size()
                 && l.zeroPaddedSixPrefix() == r.zeroPaddedSixPrefix()
-                && dataEquals(l, r, VARCHAR_INLINED_PREFIX_BYTES, lSize);
+                && dataEquals(l, r, lSize);
     }
 
     public static boolean equalsAscii(@NotNull CharSequence asciiSeq, @NotNull Utf8Sequence seq) {
@@ -326,8 +326,8 @@ public final class Utf8s {
         return result;
     }
 
-    private static boolean dataEquals(@NotNull Utf8Sequence l, @NotNull Utf8Sequence r, int start, int limit) {
-        int i = start;
+    private static boolean dataEquals(@NotNull Utf8Sequence l, @NotNull Utf8Sequence r, int limit) {
+        int i = VARCHAR_INLINED_PREFIX_BYTES;
         for (; i <= limit - Long.BYTES; i += Long.BYTES) {
             if (l.longAt(i) != r.longAt(i)) {
                 return false;
@@ -407,22 +407,6 @@ public final class Utf8s {
         sink.put(b2);
     }
 
-    private static int put3BytesSafe(byte b1, byte b2, byte b3, @NotNull Utf8Sink sink) {
-        if (!isMalformed3(b1, b2, b3)) {
-            char c = utf8ToChar(b1, b2, b3);
-            if (!Character.isSurrogate(c)) {
-                sink.put(b1);
-                sink.put(b2);
-                sink.put(b3);
-            }
-        } else {
-            putNonAsciiAsHex(sink, b1);
-            putNonAsciiAsHex(sink, b2);
-            putNonAsciiAsHex(sink, b3);
-        }
-        return 3;
-    }
-
     private static void put4ByteSafe(byte b1, byte b2, byte b3, byte b4, @NotNull Utf8Sink sink) {
         if (!isMalformed4(b2, b3, b4)) {
             final int codePoint = getUtf8Codepoint(b1, b2, b3, b4);
@@ -490,7 +474,19 @@ public final class Utf8s {
         if (hi - lo >= 3) {
             byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
             byte b3 = Unsafe.getUnsafe().getByte(lo + 2);
-            return put3BytesSafe(b1, b2, b3, sink);
+            if (!isMalformed3(b1, b2, b3)) {
+                char c = utf8ToChar(b1, b2, b3);
+                if (!Character.isSurrogate(c)) {
+                    sink.put(b1);
+                    sink.put(b2);
+                    sink.put(b3);
+                }
+            } else {
+                putNonAsciiAsHex(sink, b1);
+                putNonAsciiAsHex(sink, b2);
+                putNonAsciiAsHex(sink, b3);
+            }
+            return 3;
         }
         putNonAsciiAsHex(sink, b1);
         if (hi - lo > 1) {

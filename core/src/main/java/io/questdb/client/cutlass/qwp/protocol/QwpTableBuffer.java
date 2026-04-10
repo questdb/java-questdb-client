@@ -71,7 +71,7 @@ public class QwpTableBuffer implements QuietCloseable {
     private int committedColumnCount; // columns that existed at last nextRow()
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int rowCount;
-    private int schemaId = -1;
+    private int schemaId;
 
     public QwpTableBuffer(String tableName) {
         this(tableName, null);
@@ -245,14 +245,6 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
-     * Assigns a schema ID. Called by the sender when this table's schema
-     * is first sent to the server.
-     */
-    public void setSchemaId(int schemaId) {
-        this.schemaId = schemaId;
-    }
-
-    /**
      * Returns the table name.
      */
     public String getTableName() {
@@ -346,6 +338,14 @@ public class QwpTableBuffer implements QuietCloseable {
             columns.remove(i);
         }
         rebuildColumnAccessStructures();
+    }
+
+    /**
+     * Assigns a schema ID. Called by the sender when this table's schema
+     * is first sent to the server.
+     */
+    public void setSchemaId(int schemaId) {
+        this.schemaId = schemaId;
     }
 
     private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {

@@ -45,7 +45,7 @@ public final class Chars {
     }
 
     public static void base64Encode(@Nullable BinarySequence sequence, int maxLength, @NotNull CharSink<?> buffer) {
-        int pad = base64Encode(sequence, maxLength, buffer, base64);
+        int pad = base64Encode0(sequence, maxLength, buffer);
         for (int j = 0; j < pad; j++) {
             buffer.putAscii("=");
         }
@@ -416,7 +416,7 @@ public final class Chars {
         return inverted;
     }
 
-    private static int base64Encode(@Nullable BinarySequence sequence, int maxLength, @NotNull CharSink<?> buffer, char @NotNull [] alphabet) {
+    private static int base64Encode0(@Nullable BinarySequence sequence, int maxLength, @NotNull CharSink<?> buffer) {
         if (sequence == null) {
             return 0;
         }
@@ -437,7 +437,7 @@ public final class Chars {
 
             for (int j = 0; j < 4 - pad; j++) {
                 int c = (b & 0xFC0000) >> 18;
-                buffer.putAscii(alphabet[c]);
+                buffer.putAscii(Chars.base64[c]);
                 b <<= 6;
             }
         }

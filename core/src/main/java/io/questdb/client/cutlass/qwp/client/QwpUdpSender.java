@@ -577,17 +577,16 @@ public class QwpUdpSender implements Sender {
         switch (col.getType()) {
             case TYPE_BOOLEAN:
                 return packedBytes(valueCountAfter) - packedBytes(valueCountBefore);
+            case TYPE_DOUBLE:
+            case TYPE_LONG:
+            case TYPE_TIMESTAMP:
+            case TYPE_TIMESTAMP_NANOS:
             case TYPE_DECIMAL64:
                 return 8;
             case TYPE_DECIMAL128:
                 return 16;
             case TYPE_DECIMAL256:
                 return 32;
-            case TYPE_DOUBLE:
-            case TYPE_LONG:
-            case TYPE_TIMESTAMP:
-            case TYPE_TIMESTAMP_NANOS:
-                return 8;
             case TYPE_DOUBLE_ARRAY:
             case TYPE_LONG_ARRAY:
                 return estimateArrayPayloadBytes(col, state);
@@ -646,29 +645,25 @@ public class QwpUdpSender implements Sender {
                 return (long) missing * 2;
             case TYPE_INT:
             case TYPE_FLOAT:
-                return (long) missing * 4;
-            case TYPE_LONG:
-            case TYPE_DOUBLE:
-            case TYPE_DATE:
-            case TYPE_TIMESTAMP:
-            case TYPE_TIMESTAMP_NANOS:
-                return (long) missing * 8;
-            case TYPE_UUID:
-                return (long) missing * 16;
-            case TYPE_LONG256:
-                return (long) missing * 32;
-            case TYPE_DECIMAL64:
-                return (long) missing * 8;
-            case TYPE_DECIMAL128:
-                return (long) missing * 16;
-            case TYPE_DECIMAL256:
-                return (long) missing * 32;
             case TYPE_STRING:
             case TYPE_VARCHAR:
                 return (long) missing * 4;
             case TYPE_DOUBLE_ARRAY:
             case TYPE_LONG_ARRAY:
                 return (long) missing * 5;
+            case TYPE_LONG:
+            case TYPE_DOUBLE:
+            case TYPE_DATE:
+            case TYPE_TIMESTAMP:
+            case TYPE_TIMESTAMP_NANOS:
+            case TYPE_DECIMAL64:
+                return (long) missing * 8;
+            case TYPE_UUID:
+            case TYPE_DECIMAL128:
+                return (long) missing * 16;
+            case TYPE_LONG256:
+            case TYPE_DECIMAL256:
+                return (long) missing * 32;
             case TYPE_SYMBOL:
                 throw new IllegalStateException("symbol columns must be nullable");
             default:
@@ -1345,11 +1340,11 @@ public class QwpUdpSender implements Sender {
         private int arrayDataOffsetBefore;
         private int arrayShapeOffsetBefore;
         private QwpTableBuffer.ColumnBuffer column;
-        private boolean useNullBitmap;
         private long payloadEstimateDelta;
         private int sizeBefore;
         private long stringDataSizeBefore;
         private int symbolDictionarySizeBefore;
+        private boolean useNullBitmap;
         private int valueCountBefore;
 
         void captureAfterWrite() {

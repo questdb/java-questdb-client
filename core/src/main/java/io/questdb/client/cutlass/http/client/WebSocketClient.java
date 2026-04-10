@@ -71,6 +71,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int DEFAULT_RECV_BUFFER_SIZE = 65536;
     private static final int DEFAULT_SEND_BUFFER_SIZE = 65536;
     private static final Logger LOG = LoggerFactory.getLogger(WebSocketClient.class);
+    private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
             return MessageDigest.getInstance("SHA-1");
@@ -101,12 +102,12 @@ public abstract class WebSocketClient implements QuietCloseable {
     // QWP version negotiation
     private String qwpClientId;
     private int qwpMaxVersion = 1;
-    private int serverQwpVersion = 1;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
     private int recvPos;      // Write position
     private int recvReadPos;  // Read position
+    private int serverQwpVersion = 1;
     private boolean upgraded;
 
     public WebSocketClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
@@ -236,13 +237,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Returns the QWP version selected by the server during the upgrade handshake.
-     */
-    public int getServerQwpVersion() {
-        return serverQwpVersion;
-    }
-
-    /**
      * Gets the send buffer for building WebSocket frames.
      * <p>
      * Usage:
@@ -257,6 +251,13 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public WebSocketSendBuffer getSendBuffer() {
         return sendBuffer;
+    }
+
+    /**
+     * Returns the QWP version selected by the server during the upgrade handshake.
+     */
+    public int getServerQwpVersion() {
+        return serverQwpVersion;
     }
 
     /**
@@ -357,6 +358,20 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Sets the QWP client identifier sent in the X-QWP-Client-Id upgrade header.
+     */
+    public void setQwpClientId(String clientId) {
+        this.qwpClientId = clientId;
+    }
+
+    /**
+     * Sets the maximum QWP version this client supports, sent in the X-QWP-Max-Version upgrade header.
+     */
+    public void setQwpMaxVersion(int maxVersion) {
+        this.qwpMaxVersion = maxVersion;
+    }
+
+    /**
      * Non-blocking attempt to receive a WebSocket frame.
      * Returns immediately if no complete frame is available.
      *
@@ -389,20 +404,6 @@ public abstract class WebSocketClient implements QuietCloseable {
         // Try to parse again
         result = tryParseFrame(handler);
         return result != null && result;
-    }
-
-    /**
-     * Sets the QWP client identifier sent in the X-QWP-Client-Id upgrade header.
-     */
-    public void setQwpClientId(String clientId) {
-        this.qwpClientId = clientId;
-    }
-
-    /**
-     * Sets the maximum QWP version this client supports, sent in the X-QWP-Max-Version upgrade header.
-     */
-    public void setQwpMaxVersion(int maxVersion) {
-        this.qwpMaxVersion = maxVersion;
     }
 
     /**
@@ -524,6 +525,27 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return false;
+    }
+
+    private static int extractQwpVersion(String response) {
+        int headerLen = QWP_VERSION_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QWP_VERSION_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                try {
+                    return Integer.parseInt(value);
+                } catch (NumberFormatException e) {
+                    return 1;
+                }
+            }
+        }
+        return 1;
     }
 
     private static int remainingTime(int timeoutMillis, long startTimeNanos) {
@@ -924,28 +946,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
 
         // Extract X-QWP-Version (optional — defaults to 1 if absent)
-        serverQwpVersion = extractIntHeader(response, "X-QWP-Version:", 1);
-    }
-
-    private static int extractIntHeader(String response, String headerName, int defaultValue) {
-        int headerLen = headerName.length();
-        int responseLen = response.length();
-        for (int i = 0; i <= responseLen - headerLen; i++) {
-            if (response.regionMatches(true, i, headerName, 0, headerLen)) {
-                int valueStart = i + headerLen;
-                int lineEnd = response.indexOf('\r', valueStart);
-                if (lineEnd < 0) {
-                    lineEnd = responseLen;
-                }
-                String value = response.substring(valueStart, lineEnd).trim();
-                try {
-                    return Integer.parseInt(value);
-                } catch (NumberFormatException e) {
-                    return defaultValue;
-                }
-            }
-        }
-        return defaultValue;
+        serverQwpVersion = extractQwpVersion(response);
     }
 
     protected void dieWaiting(int n) {

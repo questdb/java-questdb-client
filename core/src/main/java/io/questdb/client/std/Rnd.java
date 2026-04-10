@@ -231,7 +231,7 @@ public class Rnd {
     }
 
     public final void reset() {
-        reset(0xdeadbeef, 0xdee4c0ed);
+        reset(0xffff_ffff_dead_beefL, 0xffff_ffff_dee4_c0edL);
     }
 
     private int nextIntForDouble(int bits) {

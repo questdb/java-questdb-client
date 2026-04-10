@@ -40,13 +40,9 @@ public class LowerCaseUtf8SequenceObjHashMap<V> extends AbstractLowerCaseUtf8Seq
         this(8);
     }
 
-    public LowerCaseUtf8SequenceObjHashMap(int initialCapacity) {
-        this(initialCapacity, 0.5);
-    }
-
     @SuppressWarnings("unchecked")
-    private LowerCaseUtf8SequenceObjHashMap(int initialCapacity, double loadFactor) {
-        super(initialCapacity, loadFactor);
+    public LowerCaseUtf8SequenceObjHashMap(int initialCapacity) {
+        super(initialCapacity, 0.5);
         this.list = new ObjList<>(capacity);
         values = (V[]) new Object[keys.length];
         clear();
