@@ -32,7 +32,7 @@ import org.junit.Test;
 import java.time.temporal.ChronoUnit;
 
 public class MicroTimestampDriverTest {
-    TimestampDriver driver = MicrosTimestampDriver.INSTANCE;
+    final TimestampDriver driver = MicrosTimestampDriver.INSTANCE;
 
     @Test
     public void testFromChronosUnit() {

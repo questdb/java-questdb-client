@@ -33,11 +33,12 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Mutable;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class JsonLexerTest {
 
@@ -784,12 +785,6 @@ public class JsonLexerTest {
 
         public CharSequence value() {
             return buffer;
-        }
-    }
-
-    private static final class NoOpParser implements JsonParser {
-        @Override
-        public void onEvent(int code, CharSequence tag, int position) {
         }
     }
 }

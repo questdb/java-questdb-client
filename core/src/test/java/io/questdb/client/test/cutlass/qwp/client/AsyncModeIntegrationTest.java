@@ -36,7 +36,6 @@ import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
 import java.util.concurrent.CountDownLatch;
@@ -45,6 +44,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.*;
 
 /**
@@ -480,7 +480,7 @@ public class AsyncModeIntegrationTest {
                     long next = delivered + 1;
                     highestDelivered.set(next);
                     if (next == 1) {
-                        emitError(handler, next, WebSocketResponse.STATUS_WRITE_ERROR, "disk full");
+                        emitDiskFullError(handler, next);
                     } else {
                         emitAck(handler, next);
                     }
@@ -556,8 +556,8 @@ public class AsyncModeIntegrationTest {
         }
     }
 
-    private static void emitError(WebSocketFrameHandler handler, long sequence, byte status, String message) {
-        WebSocketResponse resp = WebSocketResponse.error(sequence, status, message);
+    private static void emitDiskFullError(WebSocketFrameHandler handler, long sequence) {
+        WebSocketResponse resp = WebSocketResponse.error(sequence, WebSocketResponse.STATUS_WRITE_ERROR, "disk full");
         int size = resp.serializedSize();
         long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -578,7 +578,8 @@ public class AsyncModeIntegrationTest {
 
     private static class FakeWebSocketClient extends WebSocketClient {
         private volatile boolean connected = true;
-        private volatile SendBehavior sendBehavior = (dataPtr, length) -> {};
+        private volatile SendBehavior sendBehavior = (dataPtr, length) -> {
+        };
         private volatile TryReceiveBehavior tryReceiveBehavior = handler -> false;
 
         private FakeWebSocketClient() {

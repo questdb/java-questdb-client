@@ -30,11 +30,11 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * Comprehensive tests for delta symbol dictionary encoding and decoding.
@@ -139,15 +139,13 @@ public class DeltaSymbolDictionaryTest {
             int maxSentSymbolId = -1;
             int batchMaxId = 3;  // TSLA
 
-            int deltaStart = maxSentSymbolId + 1;
             int deltaCount = batchMaxId - maxSentSymbolId;
 
             // Must send symbols 0, 1, 2, 3 (even though 1, 2 aren't used in this batch)
-            Assert.assertEquals(0, deltaStart);
             Assert.assertEquals(4, deltaCount);
 
             // This ensures server has contiguous dictionary
-            for (int id = deltaStart; id < deltaStart + deltaCount; id++) {
+            for (int id = 0; id < deltaCount; id++) {
                 String symbol = globalDict.getSymbol(id);
                 Assert.assertNotNull("Symbol " + id + " should exist", symbol);
             }
@@ -232,11 +230,7 @@ public class DeltaSymbolDictionaryTest {
             GlobalSymbolDictionary globalDict = new GlobalSymbolDictionary();
 
             // Create a very long symbol (1000 chars)
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < 1000; i++) {
-                sb.append('X');
-            }
-            String longSymbol = sb.toString();
+            String longSymbol = "X".repeat(1000);
 
             int id = globalDict.getOrAddSymbol(longSymbol);
             Assert.assertEquals(0, id);
@@ -273,7 +267,7 @@ public class DeltaSymbolDictionaryTest {
 
                     // Decode on server side
                     QwpBufferWriter buf1 = encoder.getBuffer();
-                    decodeAndAccumulateDict(buf1.getBufferPtr(), size1, serverDict);
+                    decodeAndAccumulateDict(buf1.getBufferPtr(), serverDict);
 
                     // Verify server dictionary
                     Assert.assertEquals(2, serverDict.size());
@@ -293,11 +287,10 @@ public class DeltaSymbolDictionaryTest {
                     int batch2MaxId = 2;
                     int size2 = encoder.encodeWithDeltaDict(batch2, clientDict, maxSentSymbolId, batch2MaxId, false);
                     Assert.assertTrue(size2 > 0);
-                    maxSentSymbolId = batch2MaxId;
 
                     // Decode batch 2
                     QwpBufferWriter buf2 = encoder.getBuffer();
-                    decodeAndAccumulateDict(buf2.getBufferPtr(), size2, serverDict);
+                    decodeAndAccumulateDict(buf2.getBufferPtr(), serverDict);
 
                     // Server dictionary should now have 3 symbols
                     Assert.assertEquals(3, serverDict.size());
@@ -315,10 +308,9 @@ public class DeltaSymbolDictionaryTest {
             // Batch 1: AAPL, GOOG
             int aaplId = globalDict.getOrAddSymbol("AAPL");
             int googId = globalDict.getOrAddSymbol("GOOG");
-            int batch1MaxId = Math.max(aaplId, googId);
 
             // Simulate sending batch 1 - maxSentSymbolId = 1 after send
-            int maxSentSymbolId = batch1MaxId;  // 1
+            int maxSentSymbolId = Math.max(aaplId, googId);  // 1
 
             // Batch 2: AAPL (existing), MSFT (new), TSLA (new)
             globalDict.getOrAddSymbol("AAPL");  // Returns 0, already exists
@@ -475,10 +467,6 @@ public class DeltaSymbolDictionaryTest {
                 clientDict.getOrAddSymbol("GOOG");
 
                 // Send batch - maxSentSymbolId = 1
-                int maxSentSymbolId = 1;
-
-                // Reconnect - reset maxSentSymbolId
-                maxSentSymbolId = -1;
 
                 // Create new batch using existing symbols
                 try (QwpTableBuffer batch = new QwpTableBuffer("test")) {
@@ -487,7 +475,7 @@ public class DeltaSymbolDictionaryTest {
                     batch.nextRow();
 
                     // Encode - should send full delta (all symbols from 0)
-                    int size = encoder.encodeWithDeltaDict(batch, clientDict, maxSentSymbolId, 1, false);
+                    int size = encoder.encodeWithDeltaDict(batch, clientDict, -1, 1, false);
                     Assert.assertTrue(size > 0);
 
                     // Verify deltaStart is 0
@@ -510,17 +498,11 @@ public class DeltaSymbolDictionaryTest {
             globalDict.getOrAddSymbol("GOOG");
             globalDict.getOrAddSymbol("MSFT");
 
-            int maxSentSymbolId = 2;
-
-            // Simulate reconnection - reset maxSentSymbolId
-            maxSentSymbolId = -1;
-            Assert.assertEquals(-1, maxSentSymbolId);
-
             // Global dictionary is NOT cleared (it's client-side)
             Assert.assertEquals(3, globalDict.size());
 
             // Next batch must send full delta from 0
-            int deltaStart = maxSentSymbolId + 1;
+            int deltaStart = 0;
             Assert.assertEquals(0, deltaStart);
         });
     }
@@ -598,7 +580,7 @@ public class DeltaSymbolDictionaryTest {
         }
     }
 
-    private void decodeAndAccumulateDict(long ptr, int size, ObjList<String> serverDict) {
+    private void decodeAndAccumulateDict(long ptr, ObjList<String> serverDict) {
         // Parse header
         byte flags = Unsafe.getUnsafe().getByte(ptr + HEADER_OFFSET_FLAGS);
         if ((flags & FLAG_DELTA_SYMBOL_DICT) == 0) {
@@ -638,9 +620,6 @@ public class DeltaSymbolDictionaryTest {
 
     private int readVarint(long address) {
         byte b = Unsafe.getUnsafe().getByte(address);
-        if ((b & 0x80) == 0) {
-            return b & 0x7F;
-        }
         // For simplicity, only handle single-byte varints in tests
         return b & 0x7F;
     }

@@ -53,7 +53,7 @@ public class AbstractTest {
     }
 
     @After
-    public void tearDown() throws Exception {
+    public void tearDown() {
         LOG.info("Finished test {}#{}", getClass().getSimpleName(), testName.getMethodName());
     }
 }

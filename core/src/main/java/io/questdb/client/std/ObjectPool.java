@@ -41,7 +41,7 @@ public class ObjectPool<T extends Mutable> implements Mutable {
     private static final Logger LOG = LoggerFactory.getLogger(ObjectPool.class);
     private final ObjectFactory<T> factory;
 
-    private ObjList<T> list;
+    private final ObjList<T> list;
     private int pos = 0;
     private int size;
 

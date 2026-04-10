@@ -32,7 +32,6 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.network.PlainSocketFactory;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -41,6 +40,8 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * Unit tests for QwpWebSocketSender.
@@ -175,8 +176,7 @@ public class QwpWebSocketSenderTest {
     @Test
     public void testConnectToClosedPort() throws Exception {
         assertMemoryLeak(() -> {
-            try {
-                QwpWebSocketSender.connect("127.0.0.1", 1);
+            try (AutoCloseable ignored = QwpWebSocketSender.connect("127.0.0.1", 1)) {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("Failed to connect"));
@@ -469,17 +469,6 @@ public class QwpWebSocketSenderTest {
         return QwpWebSocketSender.createForTesting("localhost", 9000,
                 500, 0, 0L,  // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
                 8);          // inFlightWindowSize
-    }
-
-    /**
-     * Creates an async sender with custom flow control settings without connecting.
-     */
-    private QwpWebSocketSender createUnconnectedAsyncSenderWithFlowControl(
-            int autoFlushRows, int autoFlushBytes, long autoFlushIntervalNanos,
-            int inFlightWindowSize) {
-        return QwpWebSocketSender.createForTesting("localhost", 9000,
-                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize);
     }
 
     /**

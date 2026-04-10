@@ -29,85 +29,22 @@ import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
-import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.network.Socket;
-import io.questdb.client.network.TlsSessionInitFailedException;
-import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 public class WebSocketClientTest {
-
-    @Test
-    public void testSendCloseFrameDoesNotClobberSendBuffer() throws Exception {
-        assertMemoryLeak(() -> {
-            try (StubWebSocketClient client = new StubWebSocketClient()) {
-                WebSocketSendBuffer sendBuffer = client.getSendBuffer();
-
-                // User starts building a data frame
-                sendBuffer.beginFrame();
-                sendBuffer.putLong(0xDEADBEEFL);
-                int posBeforeClose = sendBuffer.getWritePos();
-                Assert.assertTrue("sendBuffer should have data", posBeforeClose > 0);
-
-                // sendCloseFrame() should use controlFrameBuffer, not sendBuffer
-                try {
-                    client.sendCloseFrame(1000, null, 1000);
-                } catch (HttpClientException ignored) {
-                    // Expected: doSend() fails because there's no real socket
-                }
-
-                // Verify sendBuffer was NOT clobbered
-                Assert.assertEquals(
-                        "sendCloseFrame() must not reset the main sendBuffer",
-                        posBeforeClose,
-                        sendBuffer.getWritePos()
-                );
-            }
-        });
-    }
-
-    @Test
-    public void testSendPingDoesNotClobberSendBuffer() throws Exception {
-        assertMemoryLeak(() -> {
-            try (StubWebSocketClient client = new StubWebSocketClient()) {
-                // Set upgraded=true so checkConnected() passes
-                setField(client, "upgraded", true);
-
-                WebSocketSendBuffer sendBuffer = client.getSendBuffer();
-
-                // User starts building a data frame
-                sendBuffer.beginFrame();
-                sendBuffer.putLong(0xCAFEBABEL);
-                int posBeforePing = sendBuffer.getWritePos();
-                Assert.assertTrue("sendBuffer should have data", posBeforePing > 0);
-
-                // sendPing() should use controlFrameBuffer, not sendBuffer
-                try {
-                    client.sendPing(1000);
-                } catch (HttpClientException ignored) {
-                    // Expected: doSend() fails because there's no real socket
-                }
-
-                // Verify sendBuffer was NOT clobbered
-                Assert.assertEquals(
-                        "sendPing() must not reset the main sendBuffer",
-                        posBeforePing,
-                        sendBuffer.getWritePos()
-                );
-            }
-        });
-    }
 
     @Test
     public void testRecvOrTimeoutPropagatesNonTimeoutError() throws Exception {
         assertMemoryLeak(() -> {
             try (RecvTestWebSocketClient client = new RecvTestWebSocketClient()) {
-                setField(client, "upgraded", true);
+                setUpgradedTrue(client);
 
                 // socket.recv() returns 0, triggering the ioWait path
                 // ioWait throws a non-timeout error (e.g., queue/poll failure)
@@ -143,7 +80,7 @@ public class WebSocketClientTest {
     public void testRecvOrTimeoutReturnsFalseOnTimeout() throws Exception {
         assertMemoryLeak(() -> {
             try (RecvTestWebSocketClient client = new RecvTestWebSocketClient()) {
-                setField(client, "upgraded", true);
+                setUpgradedTrue(client);
 
                 // socket.recv() returns 0, triggering the ioWait path
                 // ioWait throws a timeout error
@@ -167,62 +104,80 @@ public class WebSocketClientTest {
         });
     }
 
-    private static void setField(Object obj, String fieldName, Object value) throws Exception {
+    @Test
+    public void testSendCloseFrameDoesNotClobberSendBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            try (StubWebSocketClient client = new StubWebSocketClient()) {
+                WebSocketSendBuffer sendBuffer = client.getSendBuffer();
+
+                // User starts building a data frame
+                sendBuffer.beginFrame();
+                sendBuffer.putLong(0xDEADBEEFL);
+                int posBeforeClose = sendBuffer.getWritePos();
+                Assert.assertTrue("sendBuffer should have data", posBeforeClose > 0);
+
+                // sendCloseFrame() should use controlFrameBuffer, not sendBuffer
+                try {
+                    client.sendCloseFrame(1000, null, 1000);
+                } catch (HttpClientException ignored) {
+                    // Expected: doSend() fails because there's no real socket
+                }
+
+                // Verify sendBuffer was NOT clobbered
+                Assert.assertEquals(
+                        "sendCloseFrame() must not reset the main sendBuffer",
+                        posBeforeClose,
+                        sendBuffer.getWritePos()
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testSendPingDoesNotClobberSendBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            try (StubWebSocketClient client = new StubWebSocketClient()) {
+                // Set upgraded=true so checkConnected() passes
+                setUpgradedTrue(client);
+
+                WebSocketSendBuffer sendBuffer = client.getSendBuffer();
+
+                // User starts building a data frame
+                sendBuffer.beginFrame();
+                sendBuffer.putLong(0xCAFEBABEL);
+                int posBeforePing = sendBuffer.getWritePos();
+                Assert.assertTrue("sendBuffer should have data", posBeforePing > 0);
+
+                // sendPing() should use controlFrameBuffer, not sendBuffer
+                try {
+                    client.sendPing(1000);
+                } catch (HttpClientException ignored) {
+                    // Expected: doSend() fails because there's no real socket
+                }
+
+                // Verify sendBuffer was NOT clobbered
+                Assert.assertEquals(
+                        "sendPing() must not reset the main sendBuffer",
+                        posBeforePing,
+                        sendBuffer.getWritePos()
+                );
+            }
+        });
+    }
+
+    private static void setUpgradedTrue(Object obj) throws Exception {
         Class<?> clazz = obj.getClass();
         while (clazz != null) {
             try {
-                Field field = clazz.getDeclaredField(fieldName);
+                Field field = clazz.getDeclaredField("upgraded");
                 field.setAccessible(true);
-                field.set(obj, value);
+                field.set(obj, (Object) true);
                 return;
             } catch (NoSuchFieldException e) {
                 clazz = clazz.getSuperclass();
             }
         }
-        throw new NoSuchFieldException(fieldName);
-    }
-
-    /**
-     * Minimal concrete WebSocketClient that throws on any I/O,
-     * allowing us to test buffer management without a real socket.
-     */
-    private static class StubWebSocketClient extends WebSocketClient {
-
-        StubWebSocketClient() {
-            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
-        }
-
-        @Override
-        protected void ioWait(int timeout, int op) {
-            throw new HttpClientException("stub: no socket");
-        }
-
-        @Override
-        protected void setupIoWait() {
-            // no-op
-        }
-    }
-
-    /**
-     * WebSocketClient subclass with a fake socket that always returns 0
-     * from recv(), forcing the ioWait path in recvOrTimeout().
-     */
-    private static class RecvTestWebSocketClient extends WebSocketClient {
-        Runnable ioWaitAction;
-
-        RecvTestWebSocketClient() {
-            super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> new FakeSocket());
-        }
-
-        @Override
-        protected void ioWait(int timeout, int op) {
-            ioWaitAction.run();
-        }
-
-        @Override
-        protected void setupIoWait() {
-            // no-op
-        }
+        throw new NoSuchFieldException("upgraded");
     }
 
     /**
@@ -260,7 +215,7 @@ public class WebSocketClientTest {
         }
 
         @Override
-        public void startTlsSession(CharSequence peerName) throws TlsSessionInitFailedException {
+        public void startTlsSession(CharSequence peerName) {
             throw new UnsupportedOperationException();
         }
 
@@ -277,6 +232,49 @@ public class WebSocketClientTest {
         @Override
         public boolean wantsTlsWrite() {
             return false;
+        }
+    }
+
+    /**
+     * WebSocketClient subclass with a fake socket that always returns 0
+     * from recv(), forcing the ioWait path in recvOrTimeout().
+     */
+    private static class RecvTestWebSocketClient extends WebSocketClient {
+        Runnable ioWaitAction;
+
+        RecvTestWebSocketClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> new FakeSocket());
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+            ioWaitAction.run();
+        }
+
+        @Override
+        protected void setupIoWait() {
+            // no-op
+        }
+    }
+
+    /**
+     * Minimal concrete WebSocketClient that throws on any I/O,
+     * allowing us to test buffer management without a real socket.
+     */
+    private static class StubWebSocketClient extends WebSocketClient {
+
+        StubWebSocketClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+            throw new HttpClientException("stub: no socket");
+        }
+
+        @Override
+        protected void setupIoWait() {
+            // no-op
         }
     }
 }

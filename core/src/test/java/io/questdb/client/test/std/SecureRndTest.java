@@ -41,7 +41,6 @@ public class SecureRndTest {
                 foundDifferent = true;
                 break;
             }
-            prev = next;
         }
         Assert.assertTrue("Expected different values from consecutive calls", foundDifferent);
     }
@@ -101,10 +100,10 @@ public class SecureRndTest {
         // Expected output words (ChaCha state after adding original input)
         // from RFC 7539 Section 2.3.2
         int[] expected = {
-                0xe4e7f110, 0x15593bd1, 0x1fdd0f50, (int) 0xc47120a3,
-                (int) 0xc7f4d1c7, 0x0368c033, (int) 0x9aaa2204, 0x4e6cd4c3,
-                0x466482d2, 0x09aa9f07, 0x05d7c214, (int) 0xa2028bd9,
-                (int) 0xd19c12b5, (int) 0xb94e16de, (int) 0xe883d0cb, 0x4e3c50a2,
+                0xe4e7f110, 0x15593bd1, 0x1fdd0f50, 0xc47120a3,
+                0xc7f4d1c7, 0x0368c033, 0x9aaa2204, 0x4e6cd4c3,
+                0x466482d2, 0x09aa9f07, 0x05d7c214, 0xa2028bd9,
+                0xd19c12b5, 0xb94e16de, 0xe883d0cb, 0x4e3c50a2,
         };
 
         for (int i = 0; i < 16; i++) {

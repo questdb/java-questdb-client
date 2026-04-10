@@ -316,7 +316,7 @@ public class Decimal64Test {
         // Extract ones digit (5)
         digit = value.getDigit(1);
         Assert.assertEquals(5, digit);
-        value.subtract((long) digit, 0);
+        value.subtract(digit, 0);
         Assert.assertEquals(0, value.getValue());
     }
 
@@ -423,18 +423,22 @@ public class Decimal64Test {
     }
 
     @Test
+    @SuppressWarnings("SimplifiableAssertion")
     public void testEquals() {
         Decimal64 a = new Decimal64(1230, 2);  // 12.30
         Decimal64 b = new Decimal64(123, 1);   // 12.3
         Decimal64 c = new Decimal64(1230, 2);  // 12.30
         Decimal64 d = new Decimal64(1234, 2);  // 12.34
 
-        Assert.assertEquals(a, a);  // Same objects
-        Assert.assertEquals(a, b);  // Same value, different scale
-        Assert.assertEquals(a, c);  // Same value, same scale
-        Assert.assertNotEquals(a, d); // Different value
-        Assert.assertNotEquals(null, a);
-        Assert.assertNotEquals("string", a);
+        //noinspection EqualsWithItself
+        Assert.assertTrue(a.equals(a)); // Same objects
+        Assert.assertTrue(a.equals(b));  // Same value, different scale
+        Assert.assertTrue(a.equals(c));  // Same value, same scale
+        Assert.assertFalse(a.equals(d)); // Different value
+        //noinspection ConstantValue
+        Assert.assertFalse(a.equals(null));
+        //noinspection EqualsBetweenInconvertibleTypes
+        Assert.assertFalse(a.equals("string"));
     }
 
     @Test

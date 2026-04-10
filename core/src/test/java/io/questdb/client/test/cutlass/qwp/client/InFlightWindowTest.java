@@ -551,7 +551,6 @@ public class InFlightWindowTest {
         int batchId = 0;
         for (int cycle = 0; cycle < 100; cycle++) {
             // Fill
-            int startBatch = batchId;
             for (int i = 0; i < 4; i++) {
                 window.addInFlight(batchId++);
             }
@@ -633,7 +632,7 @@ public class InFlightWindowTest {
 
         assertTrue(done.await(60, TimeUnit.SECONDS));
         if (error.get() != null) {
-            error.get().printStackTrace();
+            error.get().printStackTrace(System.err);
         }
         assertNull(error.get());
         assertTrue(window.isEmpty());

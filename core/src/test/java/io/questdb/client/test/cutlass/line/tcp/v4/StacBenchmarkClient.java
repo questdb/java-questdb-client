@@ -89,9 +89,9 @@ public class StacBenchmarkClient {
     private static final String PROTOCOL_QWP_WEBSOCKET = "qwp-websocket";
     // 8512 unique 4-letter symbols, as per STAC NYSE benchmark
     private static final int SYMBOL_COUNT = 8512;
-    private static final String[] SYMBOLS = generateSymbols(SYMBOL_COUNT);
+    private static final String[] SYMBOLS = generateSymbols();
     // Pre-computed bid base prices per symbol (to generate realistic spreads)
-    private static final float[] BASE_PRICES = generateBasePrices(SYMBOL_COUNT);
+    private static final float[] BASE_PRICES = generateBasePrices();
 
     public static void main(String[] args) {
         String protocol = PROTOCOL_QWP_WEBSOCKET;
@@ -166,7 +166,7 @@ public class StacBenchmarkClient {
                     inFlightWindow, warmupRows, reportInterval);
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
-            e.printStackTrace();
+            e.printStackTrace(System.err);
             System.exit(1);
         }
     }
@@ -205,10 +205,10 @@ public class StacBenchmarkClient {
      * Generates pseudo-random base prices for each symbol.
      * Prices range from $1 to $500 to simulate realistic stock prices.
      */
-    private static float[] generateBasePrices(int count) {
-        float[] prices = new float[count];
+    private static float[] generateBasePrices() {
+        float[] prices = new float[StacBenchmarkClient.SYMBOL_COUNT];
         Random rng = new Random(42); // fixed seed for reproducibility
-        for (int i = 0; i < count; i++) {
+        for (int i = 0; i < StacBenchmarkClient.SYMBOL_COUNT; i++) {
             prices[i] = 1.0f + rng.nextFloat() * 499.0f;
         }
         return prices;
@@ -218,17 +218,17 @@ public class StacBenchmarkClient {
      * Generates N unique 4-letter symbols.
      * Uses combinations of uppercase letters to produce predictable, reproducible symbols.
      */
-    private static String[] generateSymbols(int count) {
-        String[] symbols = new String[count];
+    private static String[] generateSymbols() {
+        String[] symbols = new String[StacBenchmarkClient.SYMBOL_COUNT];
         int idx = 0;
         // 26^4 = 456,976 possible 4-letter combinations, far more than 8512
         outer:
-        for (char a = 'A'; a <= 'Z' && idx < count; a++) {
-            for (char b = 'A'; b <= 'Z' && idx < count; b++) {
-                for (char c = 'A'; c <= 'Z' && idx < count; c++) {
-                    for (char d = 'A'; d <= 'Z' && idx < count; d++) {
+        for (char a = 'A'; a <= 'Z'; a++) {
+            for (char b = 'A'; b <= 'Z'; b++) {
+                for (char c = 'A'; c <= 'Z'; c++) {
+                    for (char d = 'A'; d <= 'Z'; d++) {
                         symbols[idx++] = new String(new char[]{a, b, c, d});
-                        if (idx >= count) break outer;
+                        if (idx >= StacBenchmarkClient.SYMBOL_COUNT) break outer;
                     }
                 }
             }

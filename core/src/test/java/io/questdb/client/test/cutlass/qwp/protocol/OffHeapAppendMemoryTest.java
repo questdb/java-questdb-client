@@ -27,9 +27,9 @@ package io.questdb.client.test.cutlass.qwp.protocol;
 import io.questdb.client.cutlass.qwp.protocol.OffHeapAppendMemory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -292,11 +292,25 @@ public class OffHeapAppendMemoryTest {
     }
 
     @Test
+    public void testPutUtf8InvalidSurrogatePair() throws Exception {
+        assertMemoryLeak(() -> {
+            try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
+                // High surrogate \uD800 followed by non-low-surrogate 'X'.
+                // Should produce '?' for the lone high surrogate, then 'X'.
+                mem.putUtf8("\uD800X");
+                assertEquals(2, mem.getAppendOffset());
+                assertEquals((byte) '?', Unsafe.getUnsafe().getByte(mem.addressOf(0)));
+                assertEquals((byte) 'X', Unsafe.getUnsafe().getByte(mem.addressOf(1)));
+            }
+        });
+    }
+
+    @Test
     public void testPutUtf8Mixed() throws Exception {
         assertMemoryLeak(() -> {
             try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
                 // Mix: ASCII "A" (1 byte) + e-acute (2 bytes) + CJK (3 bytes) + emoji (4 bytes) = 10 bytes
-                mem.putUtf8("A\u00E9\u4E16\uD83D\uDE00");
+                mem.putUtf8("Aé世\uD83D\uDE00");
                 assertEquals(10, mem.getAppendOffset());
             }
         });
@@ -307,7 +321,7 @@ public class OffHeapAppendMemoryTest {
         assertMemoryLeak(() -> {
             try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
                 // 2-byte: U+00E9 (e-acute) = C3 A9
-                mem.putUtf8("\u00E9");
+                mem.putUtf8("é");
                 assertEquals(2, mem.getAppendOffset());
                 assertEquals((byte) 0xC3, Unsafe.getUnsafe().getByte(mem.addressOf(0)));
                 assertEquals((byte) 0xA9, Unsafe.getUnsafe().getByte(mem.addressOf(1)));
@@ -321,20 +335,6 @@ public class OffHeapAppendMemoryTest {
             try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
                 mem.putUtf8(null);
                 assertEquals(0, mem.getAppendOffset());
-            }
-        });
-    }
-
-    @Test
-    public void testPutUtf8InvalidSurrogatePair() throws Exception {
-        assertMemoryLeak(() -> {
-            try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
-                // High surrogate \uD800 followed by non-low-surrogate 'X'.
-                // Should produce '?' for the lone high surrogate, then 'X'.
-                mem.putUtf8("\uD800X");
-                assertEquals(2, mem.getAppendOffset());
-                assertEquals((byte) '?', Unsafe.getUnsafe().getByte(mem.addressOf(0)));
-                assertEquals((byte) 'X', Unsafe.getUnsafe().getByte(mem.addressOf(1)));
             }
         });
     }
@@ -359,7 +359,7 @@ public class OffHeapAppendMemoryTest {
         assertMemoryLeak(() -> {
             try (OffHeapAppendMemory mem = new OffHeapAppendMemory()) {
                 // 3-byte: U+4E16 (CJK character) = E4 B8 96
-                mem.putUtf8("\u4E16");
+                mem.putUtf8("世");
                 assertEquals(3, mem.getAppendOffset());
                 assertEquals((byte) 0xE4, Unsafe.getUnsafe().getByte(mem.addressOf(0)));
                 assertEquals((byte) 0xB8, Unsafe.getUnsafe().getByte(mem.addressOf(1)));

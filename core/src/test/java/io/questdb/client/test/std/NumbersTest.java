@@ -422,7 +422,7 @@ public class NumbersTest {
 
     @Test
     public void testParseIPv42() {
-        assertEquals(0, Numbers.parseIPv4((CharSequence) null));
+        assertEquals(0, Numbers.parseIPv4(null));
         assertEquals(0, Numbers.parseIPv4("null"));
     }
 
