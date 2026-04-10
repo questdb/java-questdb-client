@@ -113,14 +113,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testAutoFlushBytesZero() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .autoFlushBytes(0);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
     public void testAutoFlushBytesNotSupportedForHttp_fails() {
         assertThrows("only supported for WebSocket transport",
                 () -> Sender.builder(Sender.Transport.HTTP)
@@ -129,28 +121,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testMaxSchemasPerConnection() {
+    public void testAutoFlushBytesZero() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
-                .maxSchemasPerConnection(123);
+                .autoFlushBytes(0);
         Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testMaxSchemasPerConnectionDoubleSet_fails() {
-        assertThrows("already configured",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .maxSchemasPerConnection(123)
-                        .maxSchemasPerConnection(456));
-    }
-
-    @Test
-    public void testMaxSchemasPerConnectionZero_fails() {
-        assertThrows("must be positive",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .maxSchemasPerConnection(0));
     }
 
     @Test
@@ -228,14 +203,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testMaxBufferCapacityNotSupported_fails() {
-        assertThrows("maximum buffer capacity is not supported for WebSocket transport",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .maxBufferCapacity(128 * 1024));
-    }
-
-    @Test
     public void testBuilderWithWebSocketTransport() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET);
         Assert.assertNotNull("Builder should be created for WebSocket transport", builder);
@@ -278,6 +245,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testDefaultIsAsync() {
+        // Default in-flight window size is 128 (async)
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST);
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
     public void testDisableAutoFlush_notSupportedForWebSocket() {
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET)
@@ -288,13 +263,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testDnsResolutionFailure() throws Exception {
-        assertMemoryLeak(() -> {
-            assertThrowsAny(
-                    Sender.builder(Sender.Transport.WEBSOCKET)
-                            .address("this-domain-does-not-exist-i-hope-better-to-use-a-silly-tld.silly-tld:9000"),
-                    "resolve", "connect", "Failed"
-            );
-        });
+        assertMemoryLeak(() -> assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("this-domain-does-not-exist-i-hope-better-to-use-a-silly-tld.silly-tld:9000"),
+                "resolve", "connect", "Failed"
+        ));
     }
 
     @Test
@@ -440,6 +413,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testMaxBufferCapacityNotSupported_fails() {
+        assertThrows("maximum buffer capacity is not supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .maxBufferCapacity(128 * 1024));
+    }
+
+    @Test
     public void testMaxNameLength() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
@@ -462,6 +443,31 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
                         .maxNameLength(10));
+    }
+
+    @Test
+    public void testMaxSchemasPerConnection() {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .maxSchemasPerConnection(123);
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testMaxSchemasPerConnectionDoubleSet_fails() {
+        assertThrows("already configured",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .maxSchemasPerConnection(123)
+                        .maxSchemasPerConnection(456));
+    }
+
+    @Test
+    public void testMaxSchemasPerConnectionZero_fails() {
+        assertThrows("must be positive",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .maxSchemasPerConnection(0));
     }
 
     @Test
@@ -522,8 +528,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // createForTesting(host, port, windowSize) mirrors what connect(h,p,tls)
         // creates internally. Verify it uses sensible defaults.
         assertMemoryLeak(() -> {
-            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
-            try {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
                 Assert.assertEquals(
                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
                         sender.getAutoFlushRows()
@@ -536,18 +541,8 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
                         sender.getAutoFlushIntervalNanos()
                 );
-            } finally {
-                sender.close();
             }
         });
-    }
-
-    @Test
-    public void testDefaultIsAsync() {
-        // Default in-flight window size is 128 (async)
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST);
-        Assert.assertNotNull(builder);
     }
 
     @Test
@@ -603,6 +598,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = findUnusedPort();
+            assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
+        });
+    }
+
+    @Test
     public void testWsConfigString_inFlightWindow() throws Exception {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
@@ -634,14 +637,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWsConfigString() throws Exception {
-        assertMemoryLeak(() -> {
-            int port = findUnusedPort();
-            assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
-        });
-    }
-
-    @Test
     public void testWsConfigString_missingAddr_fails() throws Exception {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
@@ -668,22 +663,8 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWsConfigString_withToken() throws Exception {
-        assertMemoryLeak(() -> {
-            Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;token=mytoken;");
-            Assert.assertNotNull(builder);
-        });
-    }
-
-    @Test
     public void testWsConfigString_withAutoFlushBytes() {
         Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;auto_flush_bytes=1024;");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testWsConfigString_withMaxSchemasPerConnection() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;max_schemas_per_connection=1024;");
         Assert.assertNotNull(builder);
     }
 
@@ -698,13 +679,27 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_withInitBufSize_fails() {
+        assertBadConfig("ws::addr=localhost:9000;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
+    }
+
+    @Test
     public void testWsConfigString_withMaxBufSize_fails() {
         assertBadConfig("ws::addr=localhost:9000;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
     }
 
     @Test
-    public void testWsConfigString_withInitBufSize_fails() {
-        assertBadConfig("ws::addr=localhost:9000;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
+    public void testWsConfigString_withMaxSchemasPerConnection() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;max_schemas_per_connection=1024;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_withToken() throws Exception {
+        assertMemoryLeak(() -> {
+            Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;token=mytoken;");
+            Assert.assertNotNull(builder);
+        });
     }
 
     @Test
@@ -717,15 +712,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testWssConfigString() throws Exception {
-        assertMemoryLeak(() -> {
-            assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;", "connect", "Failed", "SSL");
-        });
+        assertMemoryLeak(() -> assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;", "connect", "Failed", "SSL"));
     }
 
     @Test
-    public void testWssConfigString_withToken() {
-        Sender.LineSenderBuilder builder = Sender.builder("wss::addr=localhost:9000;tls_verify=unsafe_off;token=mytoken;");
-        Assert.assertNotNull(builder);
+    public void testWssConfigString_uppercaseNotSupported() {
+        assertBadConfig("WSS::addr=localhost:9000;", "invalid schema");
     }
 
     @Test
@@ -735,18 +727,19 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWssConfigString_withMaxBufSize_fails() {
-        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
-    }
-
-    @Test
     public void testWssConfigString_withInitBufSize_fails() {
         assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
     }
 
     @Test
-    public void testWssConfigString_uppercaseNotSupported() {
-        assertBadConfig("WSS::addr=localhost:9000;", "invalid schema");
+    public void testWssConfigString_withMaxBufSize_fails() {
+        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
+    }
+
+    @Test
+    public void testWssConfigString_withToken() {
+        Sender.LineSenderBuilder builder = Sender.builder("wss::addr=localhost:9000;tls_verify=unsafe_off;token=mytoken;");
+        Assert.assertNotNull(builder);
     }
 
     @SuppressWarnings("resource")

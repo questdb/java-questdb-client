@@ -232,11 +232,7 @@ public class DeltaSymbolDictionaryTest {
             GlobalSymbolDictionary globalDict = new GlobalSymbolDictionary();
 
             // Create a very long symbol (1000 chars)
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < 1000; i++) {
-                sb.append('X');
-            }
-            String longSymbol = sb.toString();
+            String longSymbol = "X".repeat(1000);
 
             int id = globalDict.getOrAddSymbol(longSymbol);
             Assert.assertEquals(0, id);

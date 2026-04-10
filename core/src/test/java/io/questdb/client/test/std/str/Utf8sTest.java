@@ -230,9 +230,6 @@ public class Utf8sTest {
                 sink.clear();
                 Utf8s.putSafe(buf, hi, sink);
                 String actual = sink.toString();
-                for (long ptr = buf; ptr < hi; ptr++) {
-                    int b = Unsafe.getUnsafe().getByte(ptr) & 0xFF;
-                }
                 Assert.assertEquals(testStr, actual);
             }
         } finally {

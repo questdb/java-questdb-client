@@ -234,7 +234,7 @@ public class GlobalSymbolDictionaryTest {
         dict.getOrAddSymbol(" ");          // Space
         dict.getOrAddSymbol("a b c");      // With spaces
         dict.getOrAddSymbol("AAPL\u0000"); // With null char
-        dict.getOrAddSymbol("\u00E9");     // Unicode
+        dict.getOrAddSymbol("é");     // Unicode
         dict.getOrAddSymbol("\uD83D\uDE00"); // Emoji
 
         assertEquals(6, dict.size());
@@ -243,7 +243,7 @@ public class GlobalSymbolDictionaryTest {
         assertEquals(" ", dict.getSymbol(1));
         assertEquals("a b c", dict.getSymbol(2));
         assertEquals("AAPL\u0000", dict.getSymbol(3));
-        assertEquals("\u00E9", dict.getSymbol(4));
+        assertEquals("é", dict.getSymbol(4));
         assertEquals("\uD83D\uDE00", dict.getSymbol(5));
     }
 }

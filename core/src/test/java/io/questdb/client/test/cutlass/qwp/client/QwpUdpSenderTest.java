@@ -217,7 +217,7 @@ public class QwpUdpSenderTest {
             }
 
             assertRowsEqual(
-                    Arrays.asList(decodedRow(
+                    List.of(decodedRow(
                             "arrays",
                             "la", longArrayValue(shape(2), 9, 10),
                             "da", doubleArrayValue(shape(2), 9.5, 10.5)
@@ -231,7 +231,7 @@ public class QwpUdpSenderTest {
     public void testAtMicrosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = Arrays.asList(
+            List<ScenarioRow> oversizedRow = List.of(
                     row("t", sender -> sender.table("t")
                                     .longColumn("a", 2)
                                     .stringColumn("s", large)
@@ -271,7 +271,7 @@ public class QwpUdpSenderTest {
     public void testAtNanosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = Arrays.asList(
+            List<ScenarioRow> oversizedRow = List.of(
                     row("tn", sender -> sender.table("tn")
                                     .longColumn("a", 2)
                                     .stringColumn("s", large)
@@ -311,7 +311,7 @@ public class QwpUdpSenderTest {
     public void testAtNowOversizeFailureRollsBackWithoutExplicitCancel() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = Arrays.asList(
+            List<ScenarioRow> oversizedRow = List.of(
                     row("t", sender -> sender.table("t")
                                     .longColumn("a", 2)
                                     .stringColumn("s", large)
@@ -806,7 +806,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(Arrays.asList(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
+            assertRowsEqual(List.of(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
         });
     }
 
@@ -849,7 +849,7 @@ public class QwpUdpSenderTest {
     @Test
     public void testFirstRowAllowsMultipleNewColumnsAndEncodesRow() throws Exception {
         assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = Arrays.asList(
+            List<ScenarioRow> rows = List.of(
                     row("t", sender -> sender.table("t")
                                     .longColumn("a", 1)
                                     .doubleColumn("b", 2.0)
@@ -904,7 +904,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(Arrays.asList(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
+            assertRowsEqual(List.of(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
         });
     }
 
@@ -924,7 +924,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(Arrays.asList(decodedRow("ok", "x", 1L)), decodeRows(nf.packets));
+            assertRowsEqual(List.of(decodedRow("ok", "x", 1L)), decodeRows(nf.packets));
         });
     }
 
@@ -943,7 +943,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(Arrays.asList(decodedRow("arrays", "x", 1L)), decodeRows(nf.packets));
+            assertRowsEqual(List.of(decodedRow("arrays", "x", 1L)), decodeRows(nf.packets));
         });
     }
 
@@ -965,7 +965,7 @@ public class QwpUdpSenderTest {
             }
 
             assertRowsEqual(
-                    Arrays.asList(decodedRow(
+                    List.of(decodedRow(
                             "arrays",
                             "la", longArrayValue(shape(2, 2), 1, 2, 3, 4)
                     )),
@@ -1089,7 +1089,7 @@ public class QwpUdpSenderTest {
                 doubleValues[i] = i + 0.25;
             }
 
-            List<ScenarioRow> rows = Arrays.asList(
+            List<ScenarioRow> rows = List.of(
                     row("arrays", sender -> sender.table("arrays")
                                     .longColumn("x", 1)
                                     .longArray("la", longValues)
@@ -1120,7 +1120,7 @@ public class QwpUdpSenderTest {
     public void testOversizedRowAfterMidRowSchemaChangeCancelDoesNotLeakSchema() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = Arrays.asList(
+            List<ScenarioRow> oversizedRow = List.of(
                     row("t", sender -> sender.table("t")
                                     .longColumn("a", 2)
                                     .stringColumn("s", large)
@@ -1161,7 +1161,7 @@ public class QwpUdpSenderTest {
         assertMemoryLeak(() -> {
             String small = repeat('s', 32);
             String large = repeat('x', 5000);
-            List<ScenarioRow> largeRow = Arrays.asList(
+            List<ScenarioRow> largeRow = List.of(
                     row("t", sender -> sender.table("t")
                                     .longColumn("x", 2)
                                     .stringColumn("s", large)
@@ -1188,7 +1188,7 @@ public class QwpUdpSenderTest {
             Assert.assertEquals(1, nf.sendCount);
             assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
             assertRowsEqual(
-                    Arrays.asList(decodedRow("t", "x", 1L, "s", small)),
+                    List.of(decodedRow("t", "x", 1L, "s", small)),
                     decodeRows(nf.packets)
             );
         });
@@ -1198,7 +1198,7 @@ public class QwpUdpSenderTest {
     public void testOversizedSingleRowRejectedBeforeReplayUsesActualEncodedSize() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> rows = Arrays.asList(
+            List<ScenarioRow> rows = List.of(
                     row("t", sender -> sender.table("t")
                                     .longColumn("x", 1)
                                     .stringColumn("s", large)
@@ -1465,7 +1465,7 @@ public class QwpUdpSenderTest {
             Assert.assertEquals(1, nf.scatterSendCount);
             Assert.assertEquals(0, nf.rawSendCount);
             Assert.assertTrue("expected multiple segments for header/schema/data", nf.segmentCounts.get(0) > 1);
-            assertRowsEqual(Arrays.asList(decodedRow("t", "x", 42L)), decodeRows(nf.packets));
+            assertRowsEqual(List.of(decodedRow("t", "x", 42L)), decodeRows(nf.packets));
         });
     }
 
