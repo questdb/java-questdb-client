@@ -46,6 +46,35 @@ public class NativeBufferWriterTest {
     }
 
     @Test
+    public void testGetWriteAddressAndWritableBytes() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter(64)) {
+                // Initially at position 0
+                assertEquals(writer.getBufferPtr(), writer.getWriteAddress());
+                assertEquals(64, writer.getWritableBytes());
+
+                // Write some data
+                writer.putInt(42);
+                writer.putLong(123L);
+                assertEquals(12, writer.getPosition());
+                assertEquals(writer.getBufferPtr() + 12, writer.getWriteAddress());
+                assertEquals(writer.getCapacity() - 12, writer.getWritableBytes());
+
+                // After ensureCapacity (may realloc), contract still holds
+                writer.ensureCapacity(100);
+                assertEquals(writer.getBufferPtr() + 12, writer.getWriteAddress());
+                assertEquals(writer.getCapacity() - 12, writer.getWritableBytes());
+
+                // Write directly at getWriteAddress(), then skip
+                Unsafe.getUnsafe().putLong(writer.getWriteAddress(), 999L);
+                writer.skip(8);
+                assertEquals(20, writer.getPosition());
+                assertEquals(writer.getBufferPtr() + 20, writer.getWriteAddress());
+            }
+        });
+    }
+
+    @Test
     public void testGrowBuffer() throws Exception {
         assertMemoryLeak(() -> {
             try (NativeBufferWriter writer = new NativeBufferWriter(16)) {
@@ -313,6 +342,20 @@ public class NativeBufferWriterTest {
     }
 
     @Test
+    public void testVarintSizeMatchesEncodedLength() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter()) {
+                long[] values = {0, 1, 127, 128, 16383, 16384, 2_097_151, 2_097_152, Long.MAX_VALUE};
+                for (long value : values) {
+                    writer.reset();
+                    writer.putVarint(value);
+                    Assert.assertEquals("value=" + value, NativeBufferWriter.varintSize(value), writer.getPosition());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testWriteByte() throws Exception {
         assertMemoryLeak(() -> {
             try (NativeBufferWriter writer = new NativeBufferWriter()) {
@@ -423,6 +466,63 @@ public class NativeBufferWriterTest {
     }
 
     @Test
+    public void testWriteStringMixedAsciiAndNonAscii() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter()) {
+                // "hi€" = 'h'(1) + 'i'(1) + '€'(3) = 5 UTF-8 bytes
+                // Exercises the ASCII fast path breaking out mid-string
+                writer.putString("hi€");
+                int utf8Len = 5;
+                int varintLen = 1;
+                Assert.assertEquals(varintLen + utf8Len, writer.getPosition());
+                Assert.assertEquals((byte) utf8Len, Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
+                Assert.assertEquals((byte) 'h', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 1));
+                Assert.assertEquals((byte) 'i', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 2));
+                Assert.assertEquals((byte) 0xE2, Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 3));
+                Assert.assertEquals((byte) 0x82, Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 4));
+                Assert.assertEquals((byte) 0xAC, Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 5));
+            }
+        });
+    }
+
+    @Test
+    public void testWriteStringNonAscii() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter()) {
+                // "€ñ" = '€'(3) + 'ñ'(2) = 5 UTF-8 bytes
+                // Non-ASCII at position 0, triggers fallback immediately
+                writer.putString("€ñ");
+                int utf8Len = 5;
+                Assert.assertEquals(1 + utf8Len, writer.getPosition());
+                Assert.assertEquals((byte) utf8Len, Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
+            }
+        });
+    }
+
+    @Test
+    public void testWriteUtf8MixedAsciiAndNonAscii() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter()) {
+                // "abc€def" = 3 + 3 + 3 = 9 UTF-8 bytes
+                // ASCII fast path writes 'a','b','c', then hits '€' and falls back
+                writer.putUtf8("abc€def");
+                Assert.assertEquals(9, writer.getPosition());
+                Assert.assertEquals((byte) 'a', Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
+                Assert.assertEquals((byte) 'b', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 1));
+                Assert.assertEquals((byte) 'c', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 2));
+                // € at bytes 3-5
+                Assert.assertEquals((byte) 0xE2, Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 3));
+                Assert.assertEquals((byte) 0x82, Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 4));
+                Assert.assertEquals((byte) 0xAC, Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 5));
+                // 'def' at bytes 6-8
+                Assert.assertEquals((byte) 'd', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 6));
+                Assert.assertEquals((byte) 'e', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 7));
+                Assert.assertEquals((byte) 'f', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 8));
+            }
+        });
+    }
+
+    @Test
     public void testWriteUtf8Ascii() throws Exception {
         assertMemoryLeak(() -> {
             try (NativeBufferWriter writer = new NativeBufferWriter()) {
@@ -473,20 +573,6 @@ public class NativeBufferWriterTest {
                 Assert.assertEquals((byte) 0x80, Unsafe.getUnsafe().getByte(writer.getBufferPtr()));
                 Assert.assertEquals((byte) 0x80, Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 1));
                 Assert.assertEquals((byte) 0x01, Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 2));
-            }
-        });
-    }
-
-    @Test
-    public void testVarintSizeMatchesEncodedLength() throws Exception {
-        assertMemoryLeak(() -> {
-            try (NativeBufferWriter writer = new NativeBufferWriter()) {
-                long[] values = {0, 1, 127, 128, 16383, 16384, 2_097_151, 2_097_152, Long.MAX_VALUE};
-                for (long value : values) {
-                    writer.reset();
-                    writer.putVarint(value);
-                    Assert.assertEquals("value=" + value, NativeBufferWriter.varintSize(value), writer.getPosition());
-                }
             }
         });
     }

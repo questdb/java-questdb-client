@@ -77,6 +77,16 @@ final class SegmentedNativeBufferWriter implements QwpBufferWriter, QuietCloseab
     }
 
     @Override
+    public long getWriteAddress() {
+        return currentChunk.getWriteAddress();
+    }
+
+    @Override
+    public int getWritableBytes() {
+        return currentChunk.getWritableBytes();
+    }
+
+    @Override
     public void patchInt(int offset, int value) {
         if (offset < flushedBytes || offset + Integer.BYTES > flushedBytes + currentChunk.getPosition()) {
             throw new UnsupportedOperationException("cannot patch flushed segment data");

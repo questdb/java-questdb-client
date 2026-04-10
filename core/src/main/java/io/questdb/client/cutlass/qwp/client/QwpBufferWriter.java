@@ -70,6 +70,23 @@ public interface QwpBufferWriter extends ArrayBufferAppender {
     int getPosition();
 
     /**
+     * Returns the native address where the next write will go.
+     * <p>
+     * Unlike {@code getBufferPtr() + getPosition()}, this method returns
+     * the correct write address for all buffer implementations, including
+     * segmented buffers where {@link #getPosition()} is a global offset.
+     * <p>
+     * The returned pointer is valid until the next buffer growth or flush.
+     */
+    long getWriteAddress();
+
+    /**
+     * Returns the number of bytes available for writing at
+     * {@link #getWriteAddress()}.
+     */
+    int getWritableBytes();
+
+    /**
      * Patches an int value at the specified offset in the buffer.
      * <p>
      * Used for updating length fields after writing content.
