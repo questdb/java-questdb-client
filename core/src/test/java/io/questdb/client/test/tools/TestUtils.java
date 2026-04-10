@@ -24,59 +24,32 @@
 
 package io.questdb.client.test.tools;
 
-import io.questdb.client.std.BinarySequence;
-import io.questdb.client.std.Files;
-import io.questdb.client.std.IntList;
-import io.questdb.client.std.LongList;
 import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Rnd;
 import io.questdb.client.std.ThreadLocal;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.std.str.Sinkable;
 import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf8Sequence;
 import io.questdb.client.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
 import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertNotNull;
 
 public final class TestUtils {
-    private static final Logger LOG = LoggerFactory.getLogger(TestUtils.class);
     private static final ThreadLocal<StringSink> tlSink = new ThreadLocal<>(StringSink::new);
 
     private TestUtils() {
-    }
-
-    public static boolean areEqual(BinarySequence a, BinarySequence b) {
-        if (a == b) return true;
-        if (a == null || b == null) return false;
-
-        if (a.length() != b.length()) return false;
-        for (int i = 0; i < a.length(); i++) {
-            if (a.byteAt(i) != b.byteAt(i)) return false;
-        }
-        return true;
     }
 
     public static void assertContains(String message, CharSequence sequence, CharSequence term) {
@@ -92,12 +65,6 @@ public final class TestUtils {
 
     public static void assertContains(CharSequence sequence, CharSequence term) {
         assertContains(null, sequence, term);
-    }
-
-    public static void assertEquals(CharSequence expected, Sinkable actual) {
-        StringSink sink = getTlSink();
-        actual.toSink(sink);
-        assertEquals(null, expected, sink);
     }
 
     public static void assertEquals(CharSequence expected, Utf8Sequence actual) {
@@ -130,31 +97,6 @@ public final class TestUtils {
         }
     }
 
-    public static void assertEquals(Utf8Sequence expected, Utf8Sequence actual) {
-        if (expected == null && actual == null) {
-            return;
-        }
-
-        if (expected != null && actual == null) {
-            Assert.fail("Expected: \n`" + expected + "`\nbut have NULL. ");
-        }
-
-        if (expected == null) {
-            Assert.fail("Expected: NULL but have \n`" + actual + "`\n");
-        }
-
-        if (expected.size() != actual.size()) {
-            Assert.assertEquals(expected, actual);
-        }
-
-        StringSink sink = getTlSink();
-        Utf8s.utf8ToUtf16(expected, sink);
-        String expectedStr = sink.toString();
-        sink.clear();
-        Utf8s.utf8ToUtf16(actual, sink);
-        assertEquals(expectedStr, sink);
-    }
-
     public static void assertEquals(CharSequence expected, CharSequence actual) {
         assertEquals(null, expected, actual);
     }
@@ -181,88 +123,6 @@ public final class TestUtils {
                 Assert.assertEquals(message, expected, actual);
             }
         }
-    }
-
-    public static void assertEquals(BinarySequence bs, BinarySequence actBs, long actualLen) {
-        if (bs == null) {
-            Assert.assertNull(actBs);
-            Assert.assertEquals(-1, actualLen);
-        } else {
-            Assert.assertEquals(bs.length(), actBs.length());
-            Assert.assertEquals(bs.length(), actualLen);
-            for (long l = 0, z = bs.length(); l < z; l++) {
-                byte b1 = bs.byteAt(l);
-                byte b2 = actBs.byteAt(l);
-                if (b1 != b2) {
-                    Assert.fail("Failed comparison at [" + l + "], expected: " + b1 + ", actual: " + b2);
-                }
-                Assert.assertEquals(bs.byteAt(l), actBs.byteAt(l));
-            }
-        }
-    }
-
-    public static void assertEquals(LongList expected, LongList actual) {
-        Assert.assertEquals(expected.size(), actual.size());
-        for (int i = 0, n = expected.size(); i < n; i++) {
-            if (expected.getQuick(i) != actual.getQuick(i)) {
-                Assert.assertEquals("index " + i, expected.getQuick(i), actual.getQuick(i));
-            }
-        }
-    }
-
-    public static void assertEquals(IntList expected, IntList actual) {
-        Assert.assertEquals(expected.size(), actual.size());
-        for (int i = 0, n = expected.size(); i < n; i++) {
-            if (expected.getQuick(i) != actual.getQuick(i)) {
-                Assert.assertEquals("index " + i, expected.getQuick(i), actual.getQuick(i));
-            }
-        }
-    }
-
-    public static <T> void assertEquals(ObjList<T> expected, ObjList<T> actual) {
-        Assert.assertEquals(expected.size(), actual.size());
-        for (int i = 0, n = expected.size(); i < n; i++) {
-            if (expected.getQuick(i) != actual.getQuick(i)) {
-                Assert.assertEquals("index " + i, expected.getQuick(i), actual.getQuick(i));
-            }
-        }
-    }
-
-    public static void assertEqualsIgnoreCase(CharSequence expected, CharSequence actual) {
-        assertEqualsIgnoreCase(null, expected, actual);
-    }
-
-    public static void assertEqualsIgnoreCase(String message, CharSequence expected, CharSequence actual) {
-        if (expected == null && actual == null) {
-            return;
-        }
-
-        if (expected != null && actual == null) {
-            Assert.fail("Expected: \n`" + expected + "`but have NULL");
-        }
-
-        if (expected == null) {
-            Assert.fail("Expected: NULL but have \n`" + actual + "`\n");
-        }
-
-        if (expected.length() != actual.length()) {
-            Assert.assertEquals(message, expected, actual);
-        }
-
-        for (int i = 0; i < expected.length(); i++) {
-            if (Character.toLowerCase(expected.charAt(i)) != Character.toLowerCase(actual.charAt(i))) {
-                Assert.assertEquals(message, expected, actual);
-            }
-        }
-    }
-
-    public static void assertEventually(EventualCode assertion) throws Exception {
-        assertEventually(assertion, 60);
-    }
-
-    public static void assertEventually(EventualCode assertion, Set<Class<?>> exceptionTypesToCatch) throws Exception {
-        exceptionTypesToCatch.add(AssertionError.class);
-        assertEventually(assertion, 30, exceptionTypesToCatch);
     }
 
     public static void assertEventually(EventualCode assertion, int timeoutSeconds, Set<Class<?>> exceptionTypesToCatch) throws Exception {
@@ -319,17 +179,6 @@ public final class TestUtils {
 
     /**
      * Asserts that a {@code CharSequence} does NOT contain another {@code CharSequence}.
-     *
-     * @param sequence the {@code CharSequence} to check.
-     * @param term     the {@code CharSequence} to search for (and assert its absence).
-     * @see #assertNotContains(String, CharSequence, CharSequence)
-     */
-    public static void assertNotContains(CharSequence sequence, CharSequence term) {
-        assertNotContains(null, sequence, term);
-    }
-
-    /**
-     * Asserts that a {@code CharSequence} does NOT contain another {@code CharSequence}.
      * <p>
      * Fails if the {@code term} is empty (""), because the convention established by
      * {@link #assertContains(String, CharSequence, CharSequence)} considers an empty
@@ -360,60 +209,10 @@ public final class TestUtils {
         Assert.fail(formatted + "Expected sequence <" + sequence + "> to NOT contain term <" + term + "> but it did.");
     }
 
-    public static void await(CyclicBarrier barrier) {
-        try {
-            barrier.await();
-        } catch (Throwable ignore) {
-        }
-    }
-
-    public static void await(CountDownLatch latch) {
-        try {
-            latch.await();
-        } catch (Throwable ignore) {
-        }
-    }
-
     // Useful for debugging
     @SuppressWarnings("unused")
     public static long beHexToLong(String hex) {
         return Long.parseLong(reverseBeHex(hex), 16);
-    }
-
-    public static void copyMimeTypes(String targetDir) throws IOException {
-        try (InputStream stream = Files.class.getResourceAsStream("/io/questdb/site/conf/mime.types")) {
-            assertNotNull(stream);
-            final File target = new File(targetDir, "conf/mime.types");
-            Assert.assertTrue(target.getParentFile().mkdirs());
-            try (FileOutputStream fos = new FileOutputStream(target)) {
-                byte[] buffer = new byte[1024 * 1204];
-                int len;
-                while ((len = stream.read(buffer)) > 0) {
-                    fos.write(buffer, 0, len);
-                }
-            }
-        }
-    }
-
-    public static boolean equals(CharSequence expected, CharSequence actual) {
-        if (expected == null && actual == null) {
-            return true;
-        }
-
-        if (expected == null || actual == null) {
-            return false;
-        }
-
-        if (expected.length() != actual.length()) {
-            return false;
-        }
-
-        for (int i = 0; i < expected.length(); i++) {
-            if (expected.charAt(i) != actual.charAt(i)) {
-                return false;
-            }
-        }
-        return true;
     }
 
     @NotNull
@@ -449,22 +248,6 @@ public final class TestUtils {
         return ((ip >> 24) & 0xff) + "." + ((ip >> 16) & 0xff) + "." + ((ip >> 8) & 0xff) + "." + (ip & 0xff);
     }
 
-    public static String readStringFromFile(File file) {
-        try {
-            try (FileInputStream fis = new FileInputStream(file)) {
-                byte[] buffer = new byte[(int) fis.getChannel().size()];
-                int totalRead = 0;
-                int read;
-                while (totalRead < buffer.length && (read = fis.read(buffer, totalRead, buffer.length - totalRead)) > 0) {
-                    totalRead += read;
-                }
-                return new String(buffer, Files.UTF_8);
-            }
-        } catch (IOException e) {
-            throw new RuntimeException("Cannot read from " + file.getAbsolutePath(), e);
-        }
-    }
-
     // Useful for debugging
     @SuppressWarnings("unused")
     public static String reverseBeHex(String hex) {
@@ -490,15 +273,6 @@ public final class TestUtils {
         }
     }
 
-    public static void unchecked(CheckedRunnable runnable, AtomicInteger failureCounter) {
-        try {
-            runnable.run();
-        } catch (Throwable e) {
-            failureCounter.incrementAndGet();
-            throw new RuntimeException(e);
-        }
-    }
-
     public static <T> T unchecked(CheckedSupplier<T> runnable) {
         try {
             return runnable.get();
@@ -512,12 +286,6 @@ public final class TestUtils {
             return runnable.get();
         } catch (Throwable e) {
             throw new RuntimeException(e);
-        }
-    }
-
-    public static void writeStringToFile(File file, String s) throws IOException {
-        try (FileOutputStream fos = new FileOutputStream(file)) {
-            fos.write(s.getBytes(Files.UTF_8));
         }
     }
 

@@ -269,7 +269,7 @@ public class DeltaSymbolDictionaryTest {
 
                     // Decode on server side
                     QwpBufferWriter buf1 = encoder.getBuffer();
-                    decodeAndAccumulateDict(buf1.getBufferPtr(), size1, serverDict);
+                    decodeAndAccumulateDict(buf1.getBufferPtr(), serverDict);
 
                     // Verify server dictionary
                     Assert.assertEquals(2, serverDict.size());
@@ -292,7 +292,7 @@ public class DeltaSymbolDictionaryTest {
 
                     // Decode batch 2
                     QwpBufferWriter buf2 = encoder.getBuffer();
-                    decodeAndAccumulateDict(buf2.getBufferPtr(), size2, serverDict);
+                    decodeAndAccumulateDict(buf2.getBufferPtr(), serverDict);
 
                     // Server dictionary should now have 3 symbols
                     Assert.assertEquals(3, serverDict.size());
@@ -582,7 +582,7 @@ public class DeltaSymbolDictionaryTest {
         }
     }
 
-    private void decodeAndAccumulateDict(long ptr, int size, ObjList<String> serverDict) {
+    private void decodeAndAccumulateDict(long ptr, ObjList<String> serverDict) {
         // Parse header
         byte flags = Unsafe.getUnsafe().getByte(ptr + HEADER_OFFSET_FLAGS);
         if ((flags & FLAG_DELTA_SYMBOL_DICT) == 0) {

@@ -43,18 +43,6 @@ public abstract class AbstractFastXParserTest {
         return list;
     }
 
-    static List<TestData> createAllTestDataForDouble() {
-        List<TestData> list = createAllTestData();
-        list.addAll(createDataForLegalDoubleSuffixes());
-        return list;
-    }
-
-    static List<TestData> createAllTestDataForFloat() {
-        List<TestData> list = createAllTestData();
-        list.addAll(createDataForLegalFloatSuffixes());
-        return list;
-    }
-
     static List<TestData> createDataForBadStrings() {
         return Arrays.asList(
                 new TestData("empty", ""),

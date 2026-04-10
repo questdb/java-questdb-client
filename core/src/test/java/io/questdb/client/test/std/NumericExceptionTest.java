@@ -24,7 +24,6 @@
 
 package io.questdb.client.test.std;
 
-import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.str.DirectUtf8Sink;
 import org.junit.Assert;
@@ -68,7 +67,6 @@ public class NumericExceptionTest {
                 DirectUtf8Sink utf8sink = new DirectUtf8Sink(8);
                 DirectUtf8Sink utf8sink2 = new DirectUtf8Sink(8)
         ) {
-            Decimal128 d = new Decimal128(0, 10, 1);
             utf8sink.put(-1);
             NumericException e1 = NumericException.instance()
                     .put(1L) // 1

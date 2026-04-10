@@ -472,17 +472,6 @@ public class QwpWebSocketSenderTest {
     }
 
     /**
-     * Creates an async sender with custom flow control settings without connecting.
-     */
-    private QwpWebSocketSender createUnconnectedAsyncSenderWithFlowControl(
-            int autoFlushRows, int autoFlushBytes, long autoFlushIntervalNanos,
-            int inFlightWindowSize) {
-        return QwpWebSocketSender.createForTesting("localhost", 9000,
-                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize);
-    }
-
-    /**
      * Creates a sender without connecting.
      * For unit tests that don't need actual connectivity.
      */

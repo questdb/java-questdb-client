@@ -2122,16 +2122,6 @@ public class QwpUdpSenderTest {
             this.reader = new PacketReader(packet);
         }
 
-        private static int countNulls(boolean[] nulls) {
-            int count = 0;
-            for (boolean value : nulls) {
-                if (value) {
-                    count++;
-                }
-            }
-            return count;
-        }
-
         private List<DecodedRow> decode() {
             Assert.assertEquals(MAGIC_MESSAGE, reader.readIntLE());
             Assert.assertEquals(VERSION_1, reader.readByte());

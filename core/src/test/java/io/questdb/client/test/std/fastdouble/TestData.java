@@ -92,30 +92,6 @@ public final class TestData {
                 Float.NaN, false);
     }
 
-    public int byteLength() {
-        return byteLength;
-    }
-
-    public int byteOffset() {
-        return byteOffset;
-    }
-
-    public int charLength() {
-        return charLength;
-    }
-
-    public int charOffset() {
-        return charOffset;
-    }
-
-    public double expectedDoubleValue() {
-        return expectedDoubleValue;
-    }
-
-    public float expectedFloatValue() {
-        return expectedFloatValue;
-    }
-
     public String input() {
         return input;
     }
