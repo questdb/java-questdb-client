@@ -92,7 +92,8 @@ public abstract class WebSocketClient implements QuietCloseable {
     private final int maxRecvBufSize;
     private final SecureRnd rnd;
     private final WebSocketSendBuffer sendBuffer;
-    private boolean closed;
+    // volatile: written by user thread in close(), read by I/O thread in checkConnected()/sendFrame()/receiveFrame()
+    private volatile boolean closed;
     private int fragmentBufPos;
     private long fragmentBufPtr;       // native buffer for accumulating fragment payloads
     private int fragmentBufSize;
@@ -368,8 +369,11 @@ public abstract class WebSocketClient implements QuietCloseable {
         checkConnected();
         controlFrameBuffer.reset();
         WebSocketSendBuffer.FrameInfo frame = controlFrameBuffer.writePingFrame();
-        doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
-        controlFrameBuffer.reset();
+        try {
+            doSend(controlFrameBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+        } finally {
+            controlFrameBuffer.reset();
+        }
     }
 
     /**
@@ -557,7 +561,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (payloadLen == 0) {
             return;
         }
-        int required = fragmentBufPos + payloadLen;
+        long required = (long) fragmentBufPos + payloadLen;
         if (required > maxRecvBufSize) {
             throw new HttpClientException("WebSocket fragment buffer size exceeded maximum [required=")
                     .put(required)
@@ -566,7 +570,7 @@ public abstract class WebSocketClient implements QuietCloseable {
                     .put(']');
         }
         if (fragmentBufPtr == 0) {
-            fragmentBufSize = Math.max(required, DEFAULT_RECV_BUFFER_SIZE);
+            fragmentBufSize = (int) Math.max(required, DEFAULT_RECV_BUFFER_SIZE);
             fragmentBufPtr = Unsafe.malloc(fragmentBufSize, MemoryTag.NATIVE_DEFAULT);
         } else if (required > fragmentBufSize) {
             int newSize = (int) Math.min(Math.max((long) fragmentBufSize * 2, required), maxRecvBufSize);

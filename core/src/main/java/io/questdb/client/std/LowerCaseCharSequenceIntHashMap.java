@@ -26,21 +26,20 @@ package io.questdb.client.std;
 
 import java.util.Arrays;
 
-
-public class LowerCaseAsciiCharSequenceIntHashMap extends AbstractLowerCaseAsciiCharSequenceHashSet {
+public class LowerCaseCharSequenceIntHashMap extends AbstractLowerCaseCharSequenceHashSet {
     private static final int NO_ENTRY_VALUE = -1;
     private final int noEntryValue;
     private int[] values;
 
-    public LowerCaseAsciiCharSequenceIntHashMap() {
+    public LowerCaseCharSequenceIntHashMap() {
         this(8);
     }
 
-    public LowerCaseAsciiCharSequenceIntHashMap(int initialCapacity) {
+    public LowerCaseCharSequenceIntHashMap(int initialCapacity) {
         this(initialCapacity, 0.5, NO_ENTRY_VALUE);
     }
 
-    public LowerCaseAsciiCharSequenceIntHashMap(int initialCapacity, double loadFactor, int noEntryValue) {
+    public LowerCaseCharSequenceIntHashMap(int initialCapacity, double loadFactor, int noEntryValue) {
         super(initialCapacity, loadFactor);
         this.noEntryValue = noEntryValue;
         values = new int[keys.length];
@@ -65,7 +64,7 @@ public class LowerCaseAsciiCharSequenceIntHashMap extends AbstractLowerCaseAscii
             values[-index - 1] = value;
             return false;
         }
-        putAt0(index, Chars.toLowerCaseAscii(key), value);
+        putAt0(index, Chars.toString(key), value);
         return true;
     }
 

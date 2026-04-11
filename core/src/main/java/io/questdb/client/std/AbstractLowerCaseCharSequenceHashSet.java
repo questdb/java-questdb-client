@@ -26,17 +26,16 @@ package io.questdb.client.std;
 
 import java.util.Arrays;
 
-public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutable {
+public abstract class AbstractLowerCaseCharSequenceHashSet implements Mutable {
     protected static final int MIN_INITIAL_CAPACITY = 16;
     protected static final CharSequence noEntryKey = null;
     protected final double loadFactor;
     protected int capacity;
     protected int free;
-    // exposed for testing only
     protected CharSequence[] keys;
     protected int mask;
 
-    public AbstractLowerCaseAsciiCharSequenceHashSet(int initialCapacity, double loadFactor) {
+    public AbstractLowerCaseCharSequenceHashSet(int initialCapacity, double loadFactor) {
         if (loadFactor <= 0d || loadFactor >= 1d) {
             throw new IllegalArgumentException("0 < loadFactor < 1");
         }
@@ -50,17 +49,17 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
     @Override
     public void clear() {
         Arrays.fill(keys, noEntryKey);
-        free = this.capacity;
+        free = capacity;
     }
 
     public int keyIndex(CharSequence key) {
-        int index = Chars.lowerCaseAsciiHashCode(key) & mask;
+        int index = Chars.lowerCaseHashCode(key) & mask;
 
         if (keys[index] == noEntryKey) {
             return index;
         }
 
-        if (Chars.equalsLowerCaseAscii(key, keys[index])) {
+        if (Chars.equalsIgnoreCase(key, keys[index])) {
             return -index - 1;
         }
 
@@ -77,10 +76,9 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
             if (keys[index] == noEntryKey) {
                 return index;
             }
-            if (Chars.equalsLowerCaseAscii(key, keys[index])) {
+            if (Chars.equalsIgnoreCase(key, keys[index])) {
                 return -index - 1;
             }
         } while (true);
     }
-
 }

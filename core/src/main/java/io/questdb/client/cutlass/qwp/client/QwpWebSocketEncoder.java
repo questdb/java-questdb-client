@@ -41,7 +41,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     private NativeBufferWriter buffer;
     private byte flags;
     private int payloadStart;
-    private byte savedFlags;
     private byte version = VERSION_1;
 
     public QwpWebSocketEncoder() {
@@ -67,9 +66,11 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         buffer.reset();
         int deltaStart = confirmedMaxId + 1;
         int deltaCount = Math.max(0, batchMaxId - confirmedMaxId);
-        savedFlags = flags;
-        flags |= FLAG_DELTA_SYMBOL_DICT;
+        byte headerFlags = (byte) (flags | FLAG_DELTA_SYMBOL_DICT);
+        byte origFlags = flags;
+        flags = headerFlags;
         writeHeader(tableCount, 0);
+        flags = origFlags;
         payloadStart = buffer.getPosition();
         buffer.putVarint(deltaStart);
         buffer.putVarint(deltaCount);
@@ -114,7 +115,6 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     public int finishMessage() {
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
-        flags = savedFlags;
         return buffer.getPosition();
     }
 

@@ -233,6 +233,19 @@ public final class Chars {
         return true;
     }
 
+    public static int lowerCaseAsciiHashCode(CharSequence value) {
+        int len = value.length();
+        if (len == 0) {
+            return 0;
+        }
+
+        int h = 0;
+        for (int p = 0; p < len; p++) {
+            h = 31 * h + toLowerCaseAscii(value.charAt(p));
+        }
+        return h;
+    }
+
     public static int lowerCaseHashCode(CharSequence value) {
         int len = value.length();
         if (len == 0) {
@@ -262,6 +275,22 @@ public final class Chars {
         final Utf16Sink b = Misc.getThreadLocalSink();
         for (int i = 0; i < len; i++) {
             b.put(Character.toLowerCase(value.charAt(i)));
+        }
+        return b.toString();
+    }
+
+    public static String toLowerCaseAscii(@Nullable CharSequence value) {
+        if (value == null) {
+            return null;
+        }
+        final int len = value.length();
+        if (len == 0) {
+            return "";
+        }
+
+        final Utf16Sink b = Misc.getThreadLocalSink();
+        for (int i = 0; i < len; i++) {
+            b.put(toLowerCaseAscii(value.charAt(i)));
         }
         return b.toString();
     }

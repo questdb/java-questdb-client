@@ -1823,10 +1823,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         }
                     } else {
                         if (Chars.equalsIgnoreCase("off", sink)) {
-                            throw new LineSenderException("WebSocket transport must have auto_flush_bytes enabled");
+                            autoFlushBytes(0);
+                        } else {
+                            int autoFlushBytes = parseIntValue(sink, "auto_flush_bytes");
+                            autoFlushBytes(autoFlushBytes);
                         }
-                        int autoFlushBytes = parseIntValue(sink, "auto_flush_bytes");
-                        autoFlushBytes(autoFlushBytes);
                     }
                     autoFlushBytesSet = true;
                 } else if (Chars.equals("auto_flush", sink)) {
@@ -2160,6 +2161,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     throw new LineSenderException("could not import token", e);
                 }
                 LineSenderBuilder.this.shouldDestroyPrivKey = true;
+                return LineSenderBuilder.this;
+            }
+
+            /**
+             * Authenticate by using a {@link PrivateKey} directly.
+             *
+             * @param privateKey authentication private key
+             * @return an instance of LineSenderBuilder for further configuration
+             */
+            public LineSenderBuilder privateKey(PrivateKey privateKey) {
+                LineSenderBuilder.this.privateKey = privateKey;
                 return LineSenderBuilder.this;
             }
         }

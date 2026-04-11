@@ -1258,4 +1258,41 @@ public class QwpTableBufferTest {
         }
         return result;
     }
+
+    @Test
+    public void testNonAsciiColumnNameCaseInsensitive() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                // Row 1: create columns with non-ASCII names (Cyrillic)
+                QwpTableBuffer.ColumnBuffer col1 = table.getOrCreateColumn(
+                        "Температура",
+                        QwpConstants.TYPE_DOUBLE, true);
+                col1.addDouble(42.0);
+
+                QwpTableBuffer.ColumnBuffer col2 = table.getOrCreateColumn(
+                        "Straße", QwpConstants.TYPE_LONG, true);
+                col2.addLong(100);
+
+                table.nextRow();
+
+                // Row 2: same column names in different case should resolve
+                // to the same columns via the hash map slow path
+                QwpTableBuffer.ColumnBuffer col3 = table.getOrCreateColumn(
+                        "температура",
+                        QwpConstants.TYPE_DOUBLE, true);
+                assertSame(col1, col3);
+                col3.addDouble(99.0);
+
+                QwpTableBuffer.ColumnBuffer col4 = table.getOrCreateColumn(
+                        "straße", QwpConstants.TYPE_LONG, true);
+                assertSame(col2, col4);
+                col4.addLong(200);
+
+                table.nextRow();
+
+                assertEquals(2, table.getColumnCount());
+                assertEquals(2, table.getRowCount());
+            }
+        });
+    }
 }

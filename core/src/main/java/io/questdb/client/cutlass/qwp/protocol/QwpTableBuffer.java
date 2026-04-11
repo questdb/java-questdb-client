@@ -37,7 +37,7 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Decimals;
-import io.questdb.client.std.LowerCaseAsciiCharSequenceIntHashMap;
+import io.questdb.client.std.LowerCaseCharSequenceIntHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
@@ -61,7 +61,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 public class QwpTableBuffer implements QuietCloseable {
 
     private static final int MAX_COLUMN_NAME_LENGTH = 127;
-    private final LowerCaseAsciiCharSequenceIntHashMap columnNameToIndex;
+    private final LowerCaseCharSequenceIntHashMap columnNameToIndex;
     private final ObjList<ColumnBuffer> columns;
     private final QwpWebSocketSender sender;
     private final String tableName;
@@ -87,7 +87,7 @@ public class QwpTableBuffer implements QuietCloseable {
         this.tableName = tableName;
         this.sender = sender;
         this.columns = new ObjList<>();
-        this.columnNameToIndex = new LowerCaseAsciiCharSequenceIntHashMap();
+        this.columnNameToIndex = new LowerCaseCharSequenceIntHashMap();
         this.rowCount = 0;
         this.schemaId = -1;
         this.columnDefsCacheValid = false;
@@ -1039,7 +1039,7 @@ public class QwpTableBuffer implements QuietCloseable {
                         break;
                     case TYPE_STRING:
                     case TYPE_VARCHAR:
-                        stringOffsets.putInt((int) stringData.getAppendOffset());
+                        stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
                         break;
                     case TYPE_SYMBOL:
                         dataBuffer.putInt(-1);
@@ -1093,7 +1093,7 @@ public class QwpTableBuffer implements QuietCloseable {
                 if (value != null) {
                     stringData.putUtf8(value);
                 }
-                stringOffsets.putInt((int) stringData.getAppendOffset());
+                stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
                 valueCount++;
             }
             size++;
@@ -1735,6 +1735,13 @@ public class QwpTableBuffer implements QuietCloseable {
                 symbolList.add(symbol);
             }
             return idx;
+        }
+
+        private static int checkedStringOffset(long offset) {
+            if (offset > Integer.MAX_VALUE) {
+                throw new LineSenderException("string column data exceeds 2 GiB per batch, flush more frequently");
+            }
+            return (int) offset;
         }
 
         private void markNull(int index) {
