@@ -906,10 +906,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
                 String wsAuthHeader = buildWebSocketAuthHeader();
 
+                ClientTlsConfiguration wsTlsConfig = null;
+                if (tlsEnabled) {
+                    assert (trustStorePath == null) == (trustStorePassword == null);
+                    wsTlsConfig = new ClientTlsConfiguration(
+                            trustStorePath,
+                            trustStorePassword,
+                            tlsValidationMode == TlsValidationMode.DEFAULT
+                                    ? ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL
+                                    : ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE
+                    );
+                }
+
                 return QwpWebSocketSender.connect(
                         hosts.getQuick(0),
                         ports.getQuick(0),
-                        tlsEnabled,
+                        wsTlsConfig,
                         actualAutoFlushRows,
                         actualAutoFlushBytes,
                         actualAutoFlushIntervalNanos,

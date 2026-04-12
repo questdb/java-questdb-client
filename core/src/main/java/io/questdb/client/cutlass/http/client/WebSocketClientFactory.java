@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.http.client;
 
+import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.HttpClientConfiguration;
 import io.questdb.client.network.JavaTlsClientSocketFactory;
@@ -115,5 +116,15 @@ public class WebSocketClientFactory {
      */
     public static WebSocketClient newPlainTextInstance(HttpClientConfiguration configuration) {
         return newInstance(configuration, PlainSocketFactory.INSTANCE);
+    }
+
+    /**
+     * Creates a new WebSocket client with the specified TLS configuration.
+     *
+     * @param tlsConfig the TLS configuration (controls certificate validation and trust store)
+     * @return a new WebSocket client with TLS
+     */
+    public static WebSocketClient newTlsInstance(ClientTlsConfiguration tlsConfig) {
+        return newInstance(DefaultHttpClientConfiguration.INSTANCE, new JavaTlsClientSocketFactory(tlsConfig));
     }
 }

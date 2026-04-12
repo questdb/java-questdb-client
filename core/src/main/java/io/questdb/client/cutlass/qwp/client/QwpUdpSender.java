@@ -70,6 +70,7 @@ public class QwpUdpSender implements Sender {
     private static final int VARINT_INT_UPPER_BOUND = 5;
     private final UdpLineChannel channel;
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
+    private final Decimal256 currentDecimal256 = new Decimal256();
     private final NativeSegmentList datagramSegments;
     private final NativeBufferWriter headerBuffer;
     private final int maxDatagramSize;
@@ -270,6 +271,23 @@ public class QwpUdpSender implements Sender {
         checkTableSelected();
         try {
             stageDecimal256ColumnValue(name, value);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
+        return this;
+    }
+
+    @Override
+    public Sender decimalColumn(CharSequence name, CharSequence value) {
+        if (value == null || value.length() == 0) {
+            return this;
+        }
+        checkNotClosed();
+        checkTableSelected();
+        try {
+            currentDecimal256.ofString(value);
+            stageDecimal256ColumnValue(name, currentDecimal256);
         } catch (RuntimeException | Error e) {
             rollbackCurrentRowToCommittedState();
             throw e;
