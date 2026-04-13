@@ -62,7 +62,7 @@ public class WebSocketResponse {
     // Status codes (must match QWP_SPECIFICATION.md)
     public static final byte STATUS_OK = 0x00;
     public static final byte STATUS_PARSE_ERROR = 0x05;
-    public static final byte STATUS_SCHEMA_ERROR = 0x03;
+    public static final byte STATUS_SCHEMA_MISMATCH = 0x03;
     public static final byte STATUS_SECURITY_ERROR = 0x08;
     public static final byte STATUS_WRITE_ERROR = 0x09;
     private String errorMessage;
@@ -150,8 +150,8 @@ public class WebSocketResponse {
                 return "OK";
             case STATUS_PARSE_ERROR:
                 return "PARSE_ERROR";
-            case STATUS_SCHEMA_ERROR:
-                return "SCHEMA_ERROR";
+            case STATUS_SCHEMA_MISMATCH:
+                return "SCHEMA_MISMATCH";
             case STATUS_WRITE_ERROR:
                 return "WRITE_ERROR";
             case STATUS_SECURITY_ERROR:
