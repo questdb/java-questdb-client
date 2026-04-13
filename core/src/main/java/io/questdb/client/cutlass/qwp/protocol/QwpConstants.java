@@ -46,18 +46,6 @@ public final class QwpConstants {
      */
     public static final byte FLAG_GORILLA = 0x04;
     /**
-     * Flag bit: LZ4 compression enabled.
-     */
-    public static final byte FLAG_LZ4 = 0x01;
-    /**
-     * Flag bit: Zstd compression enabled.
-     */
-    public static final byte FLAG_ZSTD = 0x02;
-    /**
-     * Mask for compression flags (bits 0-1).
-     */
-    public static final byte FLAG_COMPRESSION_MASK = FLAG_LZ4 | FLAG_ZSTD;
-    /**
      * Offset of flags byte in header.
      */
     public static final int HEADER_OFFSET_FLAGS = 5;

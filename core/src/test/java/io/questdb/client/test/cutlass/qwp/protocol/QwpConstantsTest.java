@@ -35,10 +35,7 @@ public class QwpConstantsTest {
     @Test
     public void testFlagBitPositions() {
         // Verify flag bits are at correct positions
-        Assert.assertEquals(0x01, FLAG_LZ4);
-        Assert.assertEquals(0x02, FLAG_ZSTD);
         Assert.assertEquals(0x04, FLAG_GORILLA);
-        Assert.assertEquals(0x03, FLAG_COMPRESSION_MASK);
         Assert.assertEquals(0x08, FLAG_DELTA_SYMBOL_DICT);
     }
 
