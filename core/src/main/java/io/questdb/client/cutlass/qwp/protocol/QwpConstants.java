@@ -90,46 +90,6 @@ public final class QwpConstants {
      */
     public static final byte SCHEMA_MODE_REFERENCE = 0x01;
     /**
-     * Status: Server error.
-     */
-    public static final byte STATUS_INTERNAL_ERROR = 0x06;
-    /**
-     * Status: Batch accepted successfully.
-     */
-    public static final byte STATUS_OK = 0x00;
-    /**
-     * Status: Back-pressure, retry later.
-     */
-    public static final byte STATUS_OVERLOADED = 0x07;
-    /**
-     * Status: Malformed message.
-     */
-    public static final byte STATUS_PARSE_ERROR = 0x05;
-    /**
-     * Status: Some rows failed (partial failure).
-     */
-    public static final byte STATUS_PARTIAL = 0x01;
-    /**
-     * Status: Column type incompatible.
-     */
-    public static final byte STATUS_SCHEMA_MISMATCH = 0x03;
-    /**
-     * Status: Schema ID not recognized.
-     */
-    public static final byte STATUS_SCHEMA_REQUIRED = 0x02;
-    /**
-     * Status: Authorization failure.
-     */
-    public static final byte STATUS_SECURITY_ERROR = 0x08;
-    /**
-     * Status: Table doesn't exist (auto-create disabled).
-     */
-    public static final byte STATUS_TABLE_NOT_FOUND = 0x04;
-    /**
-     * Status: Write failure (e.g., table not accepting writes).
-     */
-    public static final byte STATUS_WRITE_ERROR = 0x09;
-    /**
      * Column type: BOOLEAN (1 bit per value, packed).
      */
     public static final byte TYPE_BOOLEAN = 0x01;
