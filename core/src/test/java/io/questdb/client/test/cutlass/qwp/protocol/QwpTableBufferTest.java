@@ -981,6 +981,29 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testGetOrCreateColumnThrowsWhenExceedingMaxColumnCount() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                for (int i = 0; i < QwpConstants.MAX_COLUMNS_PER_TABLE; i++) {
+                    table.getOrCreateColumn("c" + i, QwpConstants.TYPE_LONG, false);
+                }
+                assertEquals(QwpConstants.MAX_COLUMNS_PER_TABLE, table.getColumnCount());
+                try {
+                    table.getOrCreateColumn("overflow", QwpConstants.TYPE_LONG, false);
+                    fail("Expected LineSenderException for exceeding max column count");
+                } catch (LineSenderException e) {
+                    assertEquals(
+                            "column count exceeds maximum: " + (QwpConstants.MAX_COLUMNS_PER_TABLE + 1)
+                                    + " (max " + QwpConstants.MAX_COLUMNS_PER_TABLE + ")",
+                            e.getMessage()
+                    );
+                }
+                assertEquals(QwpConstants.MAX_COLUMNS_PER_TABLE, table.getColumnCount());
+            }
+        });
+    }
+
+    @Test
     public void testLongArrayMultipleRows() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {

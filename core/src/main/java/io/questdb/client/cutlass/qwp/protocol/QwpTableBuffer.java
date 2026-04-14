@@ -371,6 +371,11 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     private ColumnBuffer createColumn(CharSequence name, byte type, boolean useNullBitmap) {
+        if (columns.size() >= MAX_COLUMNS_PER_TABLE) {
+            throw new LineSenderException("column count exceeds maximum: " + (columns.size() + 1) +
+                    " (max " + MAX_COLUMNS_PER_TABLE + ")"
+            );
+        }
         ColumnBuffer col = new ColumnBuffer(Chars.toString(name), type, useNullBitmap);
         try {
             col.sender = sender;
@@ -1533,6 +1538,13 @@ public class QwpTableBuffer implements QuietCloseable {
             return (int) product;
         }
 
+        private static int checkedStringOffset(long offset) {
+            if (offset > Integer.MAX_VALUE) {
+                throw new LineSenderException("string column data exceeds 2 GiB per batch, flush more frequently");
+            }
+            return (int) offset;
+        }
+
         private void allocateStorage(byte type) {
             switch (type) {
                 case TYPE_BOOLEAN:
@@ -1735,13 +1747,6 @@ public class QwpTableBuffer implements QuietCloseable {
                 symbolList.add(symbol);
             }
             return idx;
-        }
-
-        private static int checkedStringOffset(long offset) {
-            if (offset > Integer.MAX_VALUE) {
-                throw new LineSenderException("string column data exceeds 2 GiB per batch, flush more frequently");
-            }
-            return (int) offset;
         }
 
         private void markNull(int index) {

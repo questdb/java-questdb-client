@@ -158,4 +158,9 @@ public class QwpConstantsTest {
         Assert.assertEquals((byte) ((MAGIC_MESSAGE >> 16) & 0xFF), expected[2]);
         Assert.assertEquals((byte) ((MAGIC_MESSAGE >> 24) & 0xFF), expected[3]);
     }
+
+    @Test
+    public void testMaxColumnsPerTable() {
+        Assert.assertEquals(2048, MAX_COLUMNS_PER_TABLE);
+    }
 }

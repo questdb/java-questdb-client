@@ -70,6 +70,12 @@ public final class QwpConstants {
      */
     public static final int MAGIC_MESSAGE = 0x31505751; // "QWP1" in little-endian
     /**
+     * Maximum columns per table. Must match the server-side constant of
+     * the same name so the client can produce an error before sending to
+     * the server and finding out.
+     */
+    public static final int MAX_COLUMNS_PER_TABLE = 2048;
+    /**
      * Schema mode: Full schema included.
      */
     public static final byte SCHEMA_MODE_FULL = 0x00;
