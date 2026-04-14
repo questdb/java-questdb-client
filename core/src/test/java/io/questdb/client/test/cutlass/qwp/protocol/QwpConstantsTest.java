@@ -116,36 +116,6 @@ public class QwpConstantsTest {
     }
 
     @Test
-    public void testMagicBytesCapabilityRequest() {
-        // "ILP?" in ASCII
-        byte[] expected = new byte[]{'I', 'L', 'P', '?'};
-        Assert.assertEquals((byte) (MAGIC_CAPABILITY_REQUEST & 0xFF), expected[0]);
-        Assert.assertEquals((byte) ((MAGIC_CAPABILITY_REQUEST >> 8) & 0xFF), expected[1]);
-        Assert.assertEquals((byte) ((MAGIC_CAPABILITY_REQUEST >> 16) & 0xFF), expected[2]);
-        Assert.assertEquals((byte) ((MAGIC_CAPABILITY_REQUEST >> 24) & 0xFF), expected[3]);
-    }
-
-    @Test
-    public void testMagicBytesCapabilityResponse() {
-        // "ILP!" in ASCII
-        byte[] expected = new byte[]{'I', 'L', 'P', '!'};
-        Assert.assertEquals((byte) (MAGIC_CAPABILITY_RESPONSE & 0xFF), expected[0]);
-        Assert.assertEquals((byte) ((MAGIC_CAPABILITY_RESPONSE >> 8) & 0xFF), expected[1]);
-        Assert.assertEquals((byte) ((MAGIC_CAPABILITY_RESPONSE >> 16) & 0xFF), expected[2]);
-        Assert.assertEquals((byte) ((MAGIC_CAPABILITY_RESPONSE >> 24) & 0xFF), expected[3]);
-    }
-
-    @Test
-    public void testMagicBytesFallback() {
-        // "ILP0" in ASCII
-        byte[] expected = new byte[]{'I', 'L', 'P', '0'};
-        Assert.assertEquals((byte) (MAGIC_FALLBACK & 0xFF), expected[0]);
-        Assert.assertEquals((byte) ((MAGIC_FALLBACK >> 8) & 0xFF), expected[1]);
-        Assert.assertEquals((byte) ((MAGIC_FALLBACK >> 16) & 0xFF), expected[2]);
-        Assert.assertEquals((byte) ((MAGIC_FALLBACK >> 24) & 0xFF), expected[3]);
-    }
-
-    @Test
     public void testMagicBytesValue() {
         // "QWP1" in ASCII: Q=0x51, W=0x57, P=0x50, 1=0x31
         // Little-endian: 0x31505751

@@ -54,18 +54,6 @@ public final class QwpConstants {
      */
     public static final int HEADER_SIZE = 12;
     /**
-     * Magic bytes for capability request: "ILP?" (ASCII).
-     */
-    public static final int MAGIC_CAPABILITY_REQUEST = 0x3F504C49; // "ILP?" in little-endian
-    /**
-     * Magic bytes for capability response: "ILP!" (ASCII).
-     */
-    public static final int MAGIC_CAPABILITY_RESPONSE = 0x21504C49; // "ILP!" in little-endian
-    /**
-     * Magic bytes for fallback response (old server): "ILP0" (ASCII).
-     */
-    public static final int MAGIC_FALLBACK = 0x30504C49; // "ILP0" in little-endian
-    /**
      * Magic bytes for QWP v1 message: "QWP1" (ASCII).
      */
     public static final int MAGIC_MESSAGE = 0x31505751; // "QWP1" in little-endian
