@@ -309,6 +309,29 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testAtNowAllowsTimestampOnlyRowWhenTableHasColumns() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                // First row establishes a column schema
+                sender.table("t")
+                        .longColumn("x", 1)
+                        .atNow();
+
+                // Second row with atNow() and no user columns is valid:
+                // the pre-existing column "x" gets null-padded.
+                sender.table("t").atNow();
+                sender.flush();
+            }
+
+            assertRowsEqual(Arrays.asList(
+                    decodedRow("t", "x", 1L),
+                    decodedRow("t", "x", Long.MIN_VALUE)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
     public void testAtNowOversizeFailureRollsBackWithoutExplicitCancel() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
@@ -343,6 +366,31 @@ public class QwpUdpSenderTest {
             assertRowsEqual(Arrays.asList(
                     decodedRow("t", "a", 1L),
                     decodedRow("t", "a", 3L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testAtNowRejectsEmptyRowOnFirstRow() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                // Calling atNow() with no columns on a fresh table (no
+                // pre-existing columns) should be rejected -- it would
+                // produce a degenerate datagram with no column data.
+                assertThrowsContains("no columns were provided", () ->
+                        sender.table("t").atNow()
+                );
+
+                // Sender must remain usable after the rejected empty row
+                sender.table("t")
+                        .longColumn("x", 1)
+                        .atNow();
+                sender.flush();
+            }
+
+            assertRowsEqual(List.of(
+                    decodedRow("t", "x", 1L)
             ), decodeRows(nf.packets));
         });
     }
@@ -1582,6 +1630,78 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testTableRejectsEmptyName() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                assertThrowsContains("table name cannot be empty", () ->
+                        sender.table("")
+                );
+
+                // Sender must remain usable after the rejected table name
+                sender.table("valid")
+                        .longColumn("x", 1)
+                        .atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertRowsEqual(List.of(
+                    decodedRow("valid", "x", 1L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testTableRejectsInvalidCharacters() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                assertThrowsContains("table name contains illegal characters", () ->
+                        sender.table("has?question")
+                );
+                assertThrowsContains("table name contains illegal characters", () ->
+                        sender.table("has/slash")
+                );
+                assertThrowsContains("table name contains illegal characters", () ->
+                        sender.table(".leading_dot")
+                );
+
+                // Sender must remain usable after rejected names
+                sender.table("valid")
+                        .longColumn("x", 1)
+                        .atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+        });
+    }
+
+    @Test
+    public void testTableRejectsNullName() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                assertThrowsContains("table name cannot be empty", () ->
+                        sender.table(null)
+                );
+
+                // Sender must remain usable after the rejected null table name
+                sender.table("valid")
+                        .longColumn("x", 1)
+                        .atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.sendCount);
+            assertRowsEqual(List.of(
+                    decodedRow("valid", "x", 1L)
+            ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
     public void testTimestampOnlyRows() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -1734,7 +1854,7 @@ public class QwpUdpSenderTest {
         });
     }
 
-    private static void assertEstimateAtLeastActual(List<ScenarioRow> rows) throws Exception {
+    private static void assertEstimateAtLeastActual(List<ScenarioRow> rows) {
         CapturingNetworkFacade nf = new CapturingNetworkFacade();
         try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
             for (int i = 0; i < rows.size(); i++) {
@@ -1821,7 +1941,7 @@ public class QwpUdpSenderTest {
         }
     }
 
-    private static void auditEstimateAcrossSymbolDictionaryVarintBoundary() throws Exception {
+    private static void auditEstimateAcrossSymbolDictionaryVarintBoundary() {
         ArrayList<ScenarioRow> rows = new ArrayList<>();
         for (int i = 0; i < 160; i++) {
             final int rowId = i;
@@ -1838,7 +1958,7 @@ public class QwpUdpSenderTest {
         assertEstimateAtLeastActual(rows);
     }
 
-    private static void auditEstimateWithStableSchemaAndNullableValues() throws Exception {
+    private static void auditEstimateWithStableSchemaAndNullableValues() {
         ArrayList<ScenarioRow> rows = new ArrayList<>();
         for (int i = 0; i < 96; i++) {
             final int rowId = i;
@@ -1966,7 +2086,7 @@ public class QwpUdpSenderTest {
         return flat;
     }
 
-    private static int fullPacketSize(List<ScenarioRow> rows) throws Exception {
+    private static int fullPacketSize(List<ScenarioRow> rows) {
         RunResult result = runScenario(rows, 0);
         Assert.assertEquals("expected a single unbounded packet", 1, result.packets.size());
         return result.lengths.get(0);
@@ -1994,7 +2114,7 @@ public class QwpUdpSenderTest {
         return new ScenarioRow(decodedRow(table, kvs), writer);
     }
 
-    private static RunResult runScenario(List<ScenarioRow> rows, int maxDatagramSize) throws Exception {
+    private static RunResult runScenario(List<ScenarioRow> rows, int maxDatagramSize) {
         CapturingNetworkFacade nf = new CapturingNetworkFacade();
         if (maxDatagramSize > 0) {
             try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {

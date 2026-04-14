@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -67,6 +68,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 public class QwpUdpSender implements Sender {
     private static final int ADAPTIVE_HEADROOM_EWMA_SHIFT = 2;
     private static final Logger LOG = LoggerFactory.getLogger(QwpUdpSender.class);
+    private static final int MAX_TABLE_NAME_LENGTH = 127;
     private static final int VARINT_INT_UPPER_BOUND = 5;
     private final UdpLineChannel channel;
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
@@ -156,6 +158,9 @@ public class QwpUdpSender implements Sender {
     public void atNow() {
         checkNotClosed();
         checkTableSelected();
+        if (inProgressColumnCount == 0 && currentTableBuffer.getColumnCount() == 0) {
+            throw new LineSenderException("no columns were provided");
+        }
         try {
             commitCurrentRow();
         } catch (RuntimeException | Error e) {
@@ -515,6 +520,7 @@ public class QwpUdpSender implements Sender {
     @Override
     public Sender table(CharSequence tableName) {
         checkNotClosed();
+        validateTableName(tableName);
         if (currentTableName != null && currentTableBuffer != null && Chars.equals(tableName, currentTableName)) {
             return this;
         }
@@ -1337,6 +1343,18 @@ public class QwpUdpSender implements Sender {
                 return value * 86_400_000_000L;
             default:
                 throw new LineSenderException("Unsupported time unit: " + unit);
+        }
+    }
+
+    private void validateTableName(CharSequence name) {
+        if (name == null || !TableUtils.isValidTableName(name, MAX_TABLE_NAME_LENGTH)) {
+            if (name == null || name.length() == 0) {
+                throw new LineSenderException("table name cannot be empty");
+            }
+            if (name.length() > MAX_TABLE_NAME_LENGTH) {
+                throw new LineSenderException("table name too long [maxLength=" + MAX_TABLE_NAME_LENGTH + "]");
+            }
+            throw new LineSenderException("table name contains illegal characters: " + name);
         }
     }
 

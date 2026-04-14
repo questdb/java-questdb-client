@@ -193,7 +193,7 @@ public class WebSocketResponse {
         offset += 8;
 
         // Error message (if status != OK and more data available)
-        if (status != STATUS_OK && length > offset + 2) {
+        if (status != STATUS_OK && length >= offset + 2) {
             int msgLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
             offset += 2;
 

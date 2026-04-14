@@ -564,7 +564,7 @@ public class NumbersTest {
 
     @Test(expected = NumericException.class)
     public void testParseIntNull() {
-        Numbers.parseInt((CharSequence) null);
+        Numbers.parseInt(null);
     }
 
     @Test(expected = NumericException.class)

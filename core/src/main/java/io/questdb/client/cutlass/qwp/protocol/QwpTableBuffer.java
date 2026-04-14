@@ -70,6 +70,7 @@ public class QwpTableBuffer implements QuietCloseable {
     private boolean columnDefsCacheValid;
     private int committedColumnCount; // columns that existed at last nextRow()
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
+    private int inProgressColumnCount;
     private int rowCount;
     private int schemaId;
 
@@ -101,6 +102,7 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public void cancelCurrentRow() {
         columnAccessCursor = 0;
+        inProgressColumnCount = 0;
         for (int i = 0, n = columns.size(); i < n; i++) {
             ColumnBuffer col = fastColumns[i];
             if (i >= committedColumnCount) {
@@ -128,6 +130,7 @@ public class QwpTableBuffer implements QuietCloseable {
         fastColumns = null;
         columnAccessCursor = 0;
         committedColumnCount = 0;
+        inProgressColumnCount = 0;
         rowCount = 0;
         schemaId = -1;
         columnDefsCacheValid = false;
@@ -206,15 +209,21 @@ public class QwpTableBuffer implements QuietCloseable {
         if (name == null || name.length() == 0) {
             throw new LineSenderException("column name cannot be empty");
         }
-        @SuppressWarnings("resource") ColumnBuffer existing = lookupColumn(name, type);
+        ColumnBuffer existing = lookupColumn(name, type);
         if (existing != null) {
             // col.size > rowCount means this column already received a value
             // for the in-progress row.  Silently ignore the duplicate (first
             // value wins, same as the ILP server behaviour).
-            return existing.size <= rowCount ? existing : null;
+            if (existing.size > rowCount) {
+                return null;
+            }
+            inProgressColumnCount++;
+            return existing;
         }
         if (TableUtils.isValidColumnName(name, MAX_COLUMN_NAME_LENGTH)) {
-            return createColumn(name, type, useNullBitmap);
+            ColumnBuffer col = createColumn(name, type, useNullBitmap);
+            inProgressColumnCount++;
+            return col;
         }
         throw new LineSenderException(
                 name.length() > MAX_COLUMN_NAME_LENGTH ? "column name too long [maxLength=" + MAX_COLUMN_NAME_LENGTH + "]"
@@ -225,9 +234,12 @@ public class QwpTableBuffer implements QuietCloseable {
     public ColumnBuffer getOrCreateDesignatedTimestampColumn(byte type) {
         ColumnBuffer existing = lookupColumn("", type);
         if (existing != null) {
+            inProgressColumnCount++;
             return existing;
         }
-        return createColumn("", type, true);
+        ColumnBuffer col = createColumn("", type, true);
+        inProgressColumnCount++;
+        return col;
     }
 
     /**
@@ -256,12 +268,7 @@ public class QwpTableBuffer implements QuietCloseable {
      * via {@link #nextRow()}).
      */
     public boolean hasInProgressRow() {
-        for (int i = 0, n = columns.size(); i < n; i++) {
-            if (fastColumns[i].size > rowCount) {
-                return true;
-            }
-        }
-        return false;
+        return inProgressColumnCount > 0;
     }
 
     /**
@@ -272,6 +279,7 @@ public class QwpTableBuffer implements QuietCloseable {
     public void nextRow() {
         // Reset sequential access cursor for the next row
         columnAccessCursor = 0;
+        inProgressColumnCount = 0;
         // Ensure all columns have the same row count
         for (int i = 0, n = columns.size(); i < n; i++) {
             ColumnBuffer col = fastColumns[i];
@@ -292,6 +300,7 @@ public class QwpTableBuffer implements QuietCloseable {
      */
     public void nextRow(ColumnBuffer[] missingColumns, int missingColumnCount) {
         columnAccessCursor = 0;
+        inProgressColumnCount = 0;
         for (int i = 0; i < missingColumnCount; i++) {
             ColumnBuffer col = missingColumns[i];
             while (col.size < rowCount + 1) {
@@ -311,6 +320,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
         columnAccessCursor = 0;
         committedColumnCount = columns.size();
+        inProgressColumnCount = 0;
         rowCount = 0;
     }
 
