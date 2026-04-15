@@ -86,8 +86,7 @@ stages:
                 maven | "$(Agent.OS)"
               path: $(HOME)/.m2/repository
             displayName: "Cache Maven repository"
-          # TODO: remove branch once jh_experiment_new_ilp is merged
-          - script: git clone --depth 1 -b jh_experiment_new_ilp https://github.com/questdb/questdb.git ./questdb
+          - script: git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Update client version"
