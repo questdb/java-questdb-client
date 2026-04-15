@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <sys/errno.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include "net.h"
 #include <netdb.h>
@@ -356,4 +357,49 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendTo
         (JNIEnv *e, jclass cl, jint fd, jlong ptr, jint len, jlong sockaddr) {
     return (jint) sendto((int) fd, (const void *) ptr, (size_t) len, 0, (const struct sockaddr *) sockaddr,
                          sizeof(struct sockaddr_in));
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendToScatter
+        (JNIEnv *e, jclass cl, jint fd, jlong segmentsPtr, jint segmentCount, jlong sockaddr) {
+    if (segmentCount <= 0) {
+        return 0;
+    }
+
+    // Stack-allocate for the common case (small segment count) to avoid
+    // a heap allocation on every UDP send.
+    #define STACK_IOV_COUNT 16
+    struct iovec stack_iov[STACK_IOV_COUNT];
+    struct iovec *iov;
+
+    if (segmentCount <= STACK_IOV_COUNT) {
+        iov = stack_iov;
+    } else {
+        iov = calloc((size_t) segmentCount, sizeof(struct iovec));
+        if (iov == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+
+    const char *segment = (const char *) segmentsPtr;
+    for (int i = 0; i < segmentCount; i++) {
+        iov[i].iov_base = (void *) (uintptr_t) (*(const jlong *) segment);
+        iov[i].iov_len = (size_t) (*(const jlong *) (segment + 8));
+        segment += 16;
+    }
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = (void *) sockaddr;
+    msg.msg_namelen = sizeof(struct sockaddr_in);
+    msg.msg_iov = iov;
+    msg.msg_iovlen = (size_t) segmentCount;
+
+    ssize_t sent;
+    RESTARTABLE(sendmsg((int) fd, &msg, 0), sent);
+    if (iov != stack_iov) {
+        free(iov);
+    }
+    return sent < 0 ? -1 : (jint) sent;
+    #undef STACK_IOV_COUNT
 }

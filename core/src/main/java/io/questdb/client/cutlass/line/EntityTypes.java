@@ -29,11 +29,6 @@ import io.questdb.client.cairo.ColumnType;
 public class EntityTypes {
 
     public static final byte ARRAY = 14;
-    public static final byte BOOLEAN = 6;
-    public static final byte BYTE = 18;
-    public static final byte CACHED_TAG = 8;
-    public static final byte CHAR = 20;
-    public static final byte DATE = 19;
     /**
      * Representation of the {@link ColumnType#DECIMAL} type in ILP.
      * <p>
@@ -56,22 +51,4 @@ public class EntityTypes {
      */
     public static final byte DECIMAL = 23;
     public static final byte DOUBLE = 16;
-    public static final byte FLOAT = 2;
-    public static final byte GEOBYTE = 9;
-    public static final byte GEOINT = 11;
-    public static final byte GEOLONG = 12;
-    public static final byte GEOSHORT = 10;
-    public static final byte INTEGER = 3;
-    public static final byte LONG = 15;
-    public static final byte LONG256 = 7;
-    public static final byte NONE = (byte) 0xff; // visible for testing
-    public static final byte NULL = 0;
-    public static final int N_ENTITY_TYPES = DECIMAL + 1;
-    public static final byte SHORT = 17;
-    public static final byte STRING = 4;
-    public static final byte SYMBOL = 5;
-    public static final byte TAG = 1;
-    public static final byte TIMESTAMP = 13;
-    public static final byte UUID = 21;
-    public static final byte VARCHAR = 22;
 }

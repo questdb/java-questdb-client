@@ -7,10 +7,14 @@ pr:
 
 variables:
   ARCHIVED_LOGS: "$(Build.ArtifactStagingDirectory)/questdb-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS).zip"
-  QUESTDB_RUNNING: true
-  QUESTDB_ILP_TCP_AUTH_ENABLE: false
+  DIFF_COVER_THRESHOLD_PCT: 50
 
 stages:
+  - stage: CheckChanges
+    displayName: "Check Changes"
+    jobs:
+      - template: check-changes.yaml
+
   - stage: Validate
     displayName: "Validation"
     jobs:
@@ -30,9 +34,9 @@ stages:
             displayName: "Checkout PR source branch"
             condition: eq(variables['Build.Reason'], 'PullRequest')
           - task: JavaToolInstaller@0
-            displayName: "Install Java 11"
+            displayName: "Install Java 17"
             inputs:
-              versionSpec: "11"
+              versionSpec: "17"
               jdkArchitectureOption: "x64"
               jdkSourceOption: "PreInstalled"
           - bash: mvn -f core/pom.xml javadoc:javadoc -Pjavadoc --batch-mode
@@ -72,7 +76,18 @@ stages:
             lfs: false
             submodules: false
           - template: setup.yaml
-          - script: git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
+          - bash: echo "##vso[task.setvariable variable=HOME]$USERPROFILE"
+            displayName: "Set HOME on Windows"
+            condition: eq(variables['Agent.OS'], 'Windows_NT')
+          - task: Cache@2
+            inputs:
+              key: 'maven | "$(Agent.OS)" | **/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+              path: $(HOME)/.m2/repository
+            displayName: "Cache Maven repository"
+          # TODO: remove branch once jh_experiment_new_ilp is merged
+          - script: git clone --depth 1 -b jh_experiment_new_ilp https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Update client version"
@@ -88,27 +103,11 @@ stages:
               jdkVersionOption: "default"
               goals: "install"
               options: "-DskipTests --batch-mode"
-          - task: Maven@3
-            displayName: "Update QuestDB client version: core"
-            inputs:
-              mavenPOMFile: "questdb/core/pom.xml"
-              jdkVersionOption: "default"
-              goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
-          - task: Maven@3
-            displayName: "Update QuestDB client version: benchmarks"
-            inputs:
-              mavenPOMFile: "questdb/benchmarks/pom.xml"
-              jdkVersionOption: "default"
-              goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
-          - task: Maven@3
-            displayName: "Update QuestDB client version: utils"
-            inputs:
-              mavenPOMFile: "questdb/utils/pom.xml"
-              jdkVersionOption: "default"
-              goals: "versions:use-dep-version"
-              options: "-Dincludes=org.questdb:client -DdepVersion=9.9.9 -DforceVersion=true --batch-mode"
+          - bash: |
+              sed -i.bak 's|<questdb.client.version>.*</questdb.client.version>|<questdb.client.version>9.9.9</questdb.client.version>|' \
+                questdb/core/pom.xml questdb/benchmarks/pom.xml questdb/utils/pom.xml
+              rm -f questdb/core/pom.xml.bak questdb/benchmarks/pom.xml.bak questdb/utils/pom.xml.bak
+            displayName: "Update QuestDB client version to 9.9.9"
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
@@ -116,12 +115,69 @@ stages:
               jdkVersionOption: "default"
               options: "-DskipTests -Pbuild-web-console --batch-mode"
           - template: run_client_tests.yaml
-            parameters:
-              configPath: "ci/confs/default"
-          - bash: |
-              echo "##vso[task.setvariable variable=QUESTDB_ILP_TCP_AUTH_ENABLE]true"
-            displayName: "Enable ILP TCP Auth"
-          - template: run_client_tests.yaml
-            parameters:
-              configPath: "ci/confs/authenticated"
           - template: run_oss_tests.yaml
+
+  - stage: Coverage
+    displayName: "Coverage Report"
+    dependsOn:
+      - CheckChanges
+    jobs:
+      - job: CoverageReport
+        displayName: "Coverage Report"
+        pool:
+          name: "Azure Pipelines"
+          vmImage: "ubuntu-latest"
+        variables:
+          JAVA_SOURCE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.JAVA_SOURCE_CHANGED']]
+          jdkArch: "x64"
+          imageName: "ubuntu-latest"
+        condition: and(eq(variables['JAVA_SOURCE_CHANGED'], 'true'), eq(variables['System.PullRequest.IsFork'], 'false'))
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+            persistCredentials: true
+          - template: setup.yaml
+          - task: Cache@2
+            inputs:
+              key: 'maven | "$(Agent.OS)" | **/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+              path: $(HOME)/.m2/repository
+            displayName: "Cache Maven repository"
+          - task: Maven@3
+            displayName: "Run tests with coverage"
+            inputs:
+              mavenPOMFile: "core/pom.xml"
+              jdkVersionOption: "default"
+              goals: "test"
+              options: "-P jacoco --batch-mode"
+          - bash: |
+              set -eux
+              git fetch origin $(System.PullRequest.targetBranchName)
+              git diff origin/$(System.PullRequest.targetBranchName)..HEAD > pr.diff
+
+              $JAVA_HOME/bin/java -jar $(Build.SourcesDirectory)/ci/cover-checker-1.5.0-all.jar \
+                -dt file -d pr.diff \
+                -type jacoco --cover core/target/site/jacoco/jacoco.xml \
+                --repo "questdb/java-questdb-client" \
+                --pr $(System.PullRequest.PullRequestNumber) \
+                -t $(DIFF_COVER_THRESHOLD_PCT) --github-token $(GH_TOKEN)
+            displayName: "Post coverage report to GitHub"
+            env:
+              GH_TOKEN: $(GH_TOKEN)
+          - task: ArchiveFiles@2
+            displayName: "Tests failed -- Compress logs"
+            condition: failed()
+            inputs:
+              rootFolderOrFile: "logs"
+              includeRootFolder: false
+              archiveFile: $(ARCHIVED_LOGS)
+          - task: PublishBuildArtifacts@1
+            displayName: "Tests failed -- Upload logs"
+            condition: failed()
+            inputs:
+              pathToPublish: $(ARCHIVED_LOGS)
+              artifactName: CoverageTestsLogs

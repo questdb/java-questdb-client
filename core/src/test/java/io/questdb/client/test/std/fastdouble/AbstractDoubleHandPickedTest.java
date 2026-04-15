@@ -36,6 +36,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
+import java.util.stream.Stream;
 
 import static org.junit.Assert.*;
 
@@ -79,15 +80,17 @@ abstract class AbstractDoubleHandPickedTest {
     public void testErrorCases() throws IOException {
         String file = TestUtils.getTestResourcePath("/fastdouble/FastDoubleParser_testcases.txt");
         Path p = Paths.get(file);
-        Files.lines(p)
-                .flatMap(line -> Arrays.stream(line.split(",")))
-                .forEach(str -> {
-                    try {
-                        testLegalInput(str, Double.parseDouble(str));
-                    } catch (NumericException e) {
-                        throw new NumberFormatException();
-                    }
-                });
+        try (Stream<String> lines = Files.lines(p)) {
+            lines
+                    .flatMap(line -> Arrays.stream(line.split(",")))
+                    .forEach(str -> {
+                        try {
+                            testLegalInput(str, Double.parseDouble(str));
+                        } catch (NumericException e) {
+                            throw new NumberFormatException();
+                        }
+                    });
+        }
     }
 
     /**

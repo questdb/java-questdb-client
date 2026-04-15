@@ -24,14 +24,7 @@
 
 package io.questdb.client.std;
 
-import io.questdb.client.cairo.GeoHashes;
-import io.questdb.client.std.str.StringSink;
-import io.questdb.client.std.str.Utf16Sink;
-
 public class Rnd {
-    private static final double DOUBLE_UNIT = 0x1.0p-53; // 1.0 / (1L << 53)
-    private static final long mask = (1L << 48) - 1;
-    private final StringSink array = new StringSink();
     private long s0;
     private long s1;
 
@@ -45,19 +38,6 @@ public class Rnd {
 
     public boolean nextBoolean() {
         return nextLong() >>> (64 - 1) != 0;
-    }
-
-    public CharSequence nextChars(int len) {
-        array.clear();
-        nextChars(array, len);
-        return array;
-    }
-
-    // returns random bytes between 'B' and 'Z' for legacy reasons
-    public void nextChars(Utf16Sink array, int len) {
-        for (int i = 0; i < len; i++) {
-            array.put((char) (nextPositiveInt() % 25 + 66));
-        }
     }
 
     /**
@@ -183,21 +163,6 @@ public class Rnd {
         return result;
     }
 
-    public double nextDouble() {
-        return (((long) (nextIntForDouble(26)) << 27) + nextIntForDouble(27)) * DOUBLE_UNIT;
-    }
-
-    public long nextGeoHash(int bits) {
-        double x = nextDouble() * 180.0 - 90.0;
-        double y = nextDouble() * 360.0 - 180.0;
-        try {
-            return GeoHashes.fromCoordinatesDeg(x, y, bits);
-        } catch (NumericException e) {
-            // Should never happen
-            return GeoHashes.NULL;
-        }
-    }
-
     public int nextInt(int boundary) {
         return nextPositiveInt() % boundary;
     }
@@ -214,18 +179,9 @@ public class Rnd {
         return (s1 = l1 ^ l0 ^ (l1 >> 17) ^ (l0 >> 26)) + l0;
     }
 
-    public long nextLong(long boundary) {
-        return nextPositiveLong() % boundary;
-    }
-
     public int nextPositiveInt() {
         int n = (int) nextLong();
         return n > 0 ? n : (n == Integer.MIN_VALUE ? Integer.MAX_VALUE : -n);
-    }
-
-    public long nextPositiveLong() {
-        long l = nextLong();
-        return l > 0 ? l : (l == Long.MIN_VALUE ? Long.MAX_VALUE : -l);
     }
 
     // returns random bytes between 'B' and 'Z' for legacy reasons
@@ -243,11 +199,7 @@ public class Rnd {
     }
 
     public final void reset() {
-        reset(0xdeadbeef, 0xdee4c0ed);
-    }
-
-    private int nextIntForDouble(int bits) {
-        return (int) ((nextLong() & mask) >>> (48 - bits));
+        reset(0xffff_ffff_dead_beefL, 0xffff_ffff_dee4_c0edL);
     }
 
 }

@@ -69,20 +69,6 @@ public class HttpSemantics {
     }
 
     /**
-     * Swallow the next character if it's a delimiter.
-     *
-     * @param lo the ptr to start swallowing from.
-     * @param hi the last ptr to check.
-     * @return the address of the next character if c is a delimiter.
-     */
-    public static long swallowNextDelimiter(long lo, long hi) {
-        if (lo < hi && isDelimiter((char) Unsafe.getUnsafe().getByte(lo))) {
-            return lo + 1;
-        }
-        return lo;
-    }
-
-    /**
      * Swallow optional whitespaces.
      *
      * @param lo the ptr to start swallowing from.

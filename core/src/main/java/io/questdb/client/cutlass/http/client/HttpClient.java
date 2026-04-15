@@ -51,7 +51,6 @@ import io.questdb.client.std.str.Utf8StringSink;
 import io.questdb.client.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -109,11 +108,6 @@ public abstract class HttpClient implements QuietCloseable {
 
     public void disconnect() {
         Misc.free(socket);
-    }
-
-    @TestOnly
-    public ResponseHeaders getResponseHeaders() {
-        return responseHeaders;
     }
 
     public Request newRequest(CharSequence host, int port) {
@@ -529,7 +523,7 @@ public abstract class HttpClient implements QuietCloseable {
 
             if (contentStart > -1) {
                 assert state == STATE_CONTENT;
-                sendHeaderAndContent(Integer.MAX_VALUE, timeout);
+                sendHeaderAndContent(timeout);
             } else {
                 eol();
                 doSend(bufLo, ptr, timeout);
@@ -612,9 +606,7 @@ public abstract class HttpClient implements QuietCloseable {
                 throw new HttpClientException("could not allocate a file descriptor").errno(nf.errno());
             }
             if (nf.setTcpNoDelay(fd, true) < 0) {
-                // TODO: LOG
-//                LOG.info().$("could not turn off Nagle's algorithm [fd=").$(fd)
-//                        .$(", errno=").$(nf.errno()).I$();
+                LOG.info("could not turn off Nagle's algorithm [fd={}, errno={}]", fd, nf.errno());
             }
             socket.of(fd);
 
@@ -803,7 +795,7 @@ public abstract class HttpClient implements QuietCloseable {
             }
         }
 
-        private void sendHeaderAndContent(int maxContentLen, int timeout) {
+        private void sendHeaderAndContent(int timeout) {
             final int contentLength = (int) (ptr - contentStart);
 
             // Add content bytes into the header.
@@ -825,7 +817,7 @@ public abstract class HttpClient implements QuietCloseable {
             doSend(bufLo, headerHi, timeout);
 
             // Send content.
-            doSend(contentStart, contentStart + Math.min(hi - contentStart, maxContentLen), timeout);
+            doSend(contentStart, contentStart + Math.min(hi - contentStart, Integer.MAX_VALUE), timeout);
         }
     }
 

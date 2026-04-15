@@ -54,7 +54,6 @@ import io.questdb.client.std.str.StringSink;
  */
 public final class ColumnType {
     public static final int ARRAY_NDIMS_LIMIT = 32; // inclusive
-    public static final String[] ARRAY_DIM_SUFFIX = new String[ARRAY_NDIMS_LIMIT + 1];
     public static final int GEOLONG_MAX_BITS = 60;
     public static final int MIGRATION_VERSION = 426;
     // our type system is absolutely ordered ranging
@@ -215,19 +214,6 @@ public final class ColumnType {
     }
 
     /**
-     * Encodes an array type with weak dimensionality. The dimensionality is still
-     * encoded but marked as tentative and can be updated based on actual data.
-     * This is useful for PostgreSQL wire protocol where type information doesn't
-     * include array dimensions.
-     * <p>
-     * The number of dimensions of this type is undefined, so the decoded number on
-     * dimensions for the returned column type will be -1.
-     */
-    public static int encodeArrayTypeWithWeakDims(short elemType, boolean checkSupportedElementTypes) {
-        return encodeArrayType(elemType, 1, checkSupportedElementTypes) | TYPE_FLAG_ARRAY_WEAK_DIMS;
-    }
-
-    /**
      * Generate a decimal type from a given precision and scale.
      * It will choose the proper subtype (DECIMAL8, DECIMAL16, etc.) from the precision, depending on the amount
      * of storage needed to store a number with the given precision.
@@ -365,6 +351,7 @@ public final class ColumnType {
         typeNameMap.put(NULL, "NULL");
 
         arrayTypeSet.add(DOUBLE);
+        arrayTypeSet.add(LONG);
 
         TYPE_SIZE_POW2[UNDEFINED] = -1;
         TYPE_SIZE_POW2[BOOLEAN] = 0;

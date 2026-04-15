@@ -56,7 +56,7 @@ docker run -p 9000:9000 questdb/questdb
 import io.questdb.client.Sender;
 
 public class Main {
-    public static void main(String[] args) {
+    static void main(String[] args) {
         try (Sender sender = Sender.fromConfig("http::addr=localhost:9000;")) {
             sender.table("trades")
                     .symbol("symbol", "ETH-USD")

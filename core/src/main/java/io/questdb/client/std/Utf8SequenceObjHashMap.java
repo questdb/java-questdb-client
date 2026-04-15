@@ -39,13 +39,9 @@ public class Utf8SequenceObjHashMap<V> extends AbstractUtf8SequenceHashSet {
         this(8);
     }
 
-    public Utf8SequenceObjHashMap(int initialCapacity) {
-        this(initialCapacity, 0.5);
-    }
-
     @SuppressWarnings("unchecked")
-    private Utf8SequenceObjHashMap(int initialCapacity, double loadFactor) {
-        super(initialCapacity, loadFactor);
+    public Utf8SequenceObjHashMap(int initialCapacity) {
+        super(initialCapacity, 0.5);
         this.list = new ObjList<>(capacity);
         values = (V[]) new Object[keys.length];
         clear();
@@ -79,14 +75,6 @@ public class Utf8SequenceObjHashMap<V> extends AbstractUtf8SequenceHashSet {
         }
         list.add(onHeapKey);
         return true;
-    }
-
-    public void removeAt(int index) {
-        if (index < 0) {
-            Utf8Sequence key = keys[-index - 1];
-            super.removeAt(index);
-            list.remove(key);
-        }
     }
 
     public V valueAt(int index) {

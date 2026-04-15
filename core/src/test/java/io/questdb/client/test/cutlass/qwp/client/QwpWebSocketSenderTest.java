@@ -1,0 +1,524 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.qwp.client;
+
+import io.questdb.client.DefaultHttpClientConfiguration;
+import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
+import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.network.PlainSocketFactory;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
+/**
+ * Unit tests for QwpWebSocketSender.
+ * These tests focus on state management and API validation without requiring a live server.
+ */
+public class QwpWebSocketSenderTest {
+
+    @Test
+    public void testAtAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.at(1000L, ChronoUnit.MICROS);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testAtInstantAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.at(Instant.now());
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testAtNowAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.atNow();
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testBoolColumnAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.boolColumn("x", true);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testBufferViewNotSupported() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.bufferView();
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("not supported"));
+            }
+        });
+    }
+
+    @Test
+    public void testCancelRowAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.cancelRow();
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testCancelRowDiscardsPartialRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("test");
+                sender.longColumn("x", 1);
+                sender.boolColumn("y", true);
+
+                // Row is not yet committed (no at/atNow call), cancel it
+                sender.cancelRow();
+
+                // Buffer should have no committed rows
+                QwpTableBuffer buf = sender.getTableBuffer("test");
+                Assert.assertEquals(0, buf.getRowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testCancelRowNoOpWithoutTable() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                // cancelRow without table() should be a no-op (no NPE)
+                sender.cancelRow();
+            }
+        });
+    }
+
+    @Test
+    public void testCloseIdemponent() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+            sender.close(); // Should not throw
+        });
+    }
+
+    @Test
+    public void testConnectToClosedPort() throws Exception {
+        assertMemoryLeak(() -> {
+            try (AutoCloseable ignored = QwpWebSocketSender.connect("127.0.0.1", 1)) {
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("Failed to connect"));
+            }
+        });
+    }
+
+    @Test
+    public void testDoubleArrayAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.doubleArray("x", new double[]{1.0, 2.0});
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testDoubleColumnAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.doubleColumn("x", 1.0);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testGorillaEnabledByDefault() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                Assert.assertTrue(sender.isGorillaEnabled());
+            }
+        });
+    }
+
+    @Test
+    public void testLongArrayAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.longArray("x", new long[]{1L, 2L});
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testLongColumnAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.longColumn("x", 1);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testNullArrayReturnsThis() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                // Null arrays should be no-ops and return sender
+                Assert.assertSame(sender, sender.doubleArray("x", (double[]) null));
+                Assert.assertSame(sender, sender.longArray("x", (long[]) null));
+            }
+        });
+    }
+
+    @Test
+    public void testOperationsAfterCloseThrow() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.table("test");
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testResetAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.reset();
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testSealAndSwapRollsBackOnEnqueueFailure() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedAsyncSender(); ThrowingOnceWebSocketSendQueue queue = new ThrowingOnceWebSocketSendQueue()) {
+                setSendQueue(sender, queue);
+
+                MicrobatchBuffer originalActive = getActiveBuffer(sender);
+                originalActive.writeByte((byte) 7);
+                originalActive.incrementRowCount();
+
+                try {
+                    invokeSealAndSwapBuffer(sender);
+                    Assert.fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("Synthetic enqueue failure"));
+                }
+
+                // Failed enqueue must not strand the sealed buffer.
+                Assert.assertSame(originalActive, getActiveBuffer(sender));
+                Assert.assertTrue(originalActive.isFilling());
+                Assert.assertTrue(originalActive.hasData());
+                Assert.assertEquals(1, originalActive.getRowCount());
+
+                // Retry should be possible on the same sender instance.
+                invokeSealAndSwapBuffer(sender);
+                Assert.assertNotSame(originalActive, getActiveBuffer(sender));
+            }
+        });
+    }
+
+    @Test
+    public void testSetGorillaEnabled() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.setGorillaEnabled(false);
+                Assert.assertFalse(sender.isGorillaEnabled());
+                sender.setGorillaEnabled(true);
+                Assert.assertTrue(sender.isGorillaEnabled());
+            }
+        });
+    }
+
+    @Test
+    public void testStringColumnAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.stringColumn("x", "test");
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testSymbolAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.symbol("x", "test");
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testTableBeforeAtNowRequired() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.atNow();
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("table()"));
+            }
+        });
+    }
+
+    @Test
+    public void testTableBeforeAtRequired() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.at(1000L, ChronoUnit.MICROS);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("table()"));
+            }
+        });
+    }
+
+    @Test
+    public void testTableBeforeColumnsRequired() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create sender without connecting (we'll catch the error earlier)
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.longColumn("x", 1);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("table()"));
+            }
+        });
+    }
+
+    @Test
+    public void testTimestampColumnAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.timestampColumn("x", 1000L, ChronoUnit.MICROS);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testTimestampColumnInstantAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.timestampColumn("x", Instant.now());
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    private static MicrobatchBuffer getActiveBuffer(QwpWebSocketSender sender) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField("activeBuffer");
+        field.setAccessible(true);
+        return (MicrobatchBuffer) field.get(sender);
+    }
+
+    private static void invokeSealAndSwapBuffer(QwpWebSocketSender sender) throws Exception {
+        Method method = QwpWebSocketSender.class.getDeclaredMethod("sealAndSwapBuffer");
+        method.setAccessible(true);
+        try {
+            method.invoke(sender);
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw new RuntimeException(cause);
+        }
+    }
+
+    private static void setSendQueue(QwpWebSocketSender sender, WebSocketSendQueue queue) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField("sendQueue");
+        field.setAccessible(true);
+        field.set(sender, queue);
+    }
+
+    /**
+     * Creates an async sender without connecting.
+     */
+    private QwpWebSocketSender createUnconnectedAsyncSender() {
+        return QwpWebSocketSender.createForTesting("localhost", 9000,
+                500, 0, 0L,  // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
+                8);          // inFlightWindowSize
+    }
+
+    /**
+     * Creates a sender without connecting.
+     * For unit tests that don't need actual connectivity.
+     */
+    private QwpWebSocketSender createUnconnectedSender() {
+        return QwpWebSocketSender.createForTesting("localhost", 9000, 1);  // window=1 for sync
+    }
+
+    private static class NoOpWebSocketClient extends WebSocketClient {
+        private NoOpWebSocketClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public boolean isConnected() {
+            return false;
+        }
+
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+            // no-op
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+            // no-op
+        }
+
+        @Override
+        protected void setupIoWait() {
+            // no-op
+        }
+    }
+
+    private static class ThrowingOnceWebSocketSendQueue extends WebSocketSendQueue {
+        private boolean failOnce = true;
+
+        private ThrowingOnceWebSocketSendQueue() {
+            super(new NoOpWebSocketClient(), null, 50, 50);
+        }
+
+        @Override
+        public boolean enqueue(MicrobatchBuffer buffer) {
+            if (failOnce) {
+                failOnce = false;
+                throw new LineSenderException("Synthetic enqueue failure");
+            }
+            return true;
+        }
+    }
+}

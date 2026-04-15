@@ -30,14 +30,8 @@ import org.junit.Test;
 
 public class ColumnTypeTest {
     @Test
-    public void testArrayWithWeakDims() {
-        int arrayType = ColumnType.encodeArrayTypeWithWeakDims(ColumnType.DOUBLE, true);
-        Assert.assertTrue(ColumnType.isArray(arrayType));
-        // arrays with weak dimensions are considered undefined
-        Assert.assertEquals(ColumnType.DOUBLE, ColumnType.decodeArrayElementType(arrayType));
-        Assert.assertEquals(-1, ColumnType.decodeWeakArrayDimensionality(arrayType));
-
-        arrayType = ColumnType.encodeArrayType(ColumnType.DOUBLE, 5);
+    public void testArrayEncoding() {
+        int arrayType = ColumnType.encodeArrayType(ColumnType.DOUBLE, 5);
         Assert.assertTrue(ColumnType.isArray(arrayType));
         Assert.assertEquals(ColumnType.DOUBLE, ColumnType.decodeArrayElementType(arrayType));
         Assert.assertEquals(5, ColumnType.decodeWeakArrayDimensionality(arrayType));

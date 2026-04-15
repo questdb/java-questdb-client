@@ -266,22 +266,6 @@ public class Decimal128 implements Sinkable, Decimal {
         return Long.compareUnsigned(aLo, bLo);
     }
 
-    public static int compare(Decimal128 a, Decimal128 b) {
-        int s = Long.compare(a.getHigh(), b.getHigh());
-        if (s != 0) {
-            return s;
-        }
-        return Long.compareUnsigned(a.getLow(), b.getLow());
-    }
-
-    public static int compare(Decimal128 a, long bHi, long bLo) {
-        return compare(a.getHigh(), a.getLow(), bHi, bLo);
-    }
-
-    public static int compare(long aHi, long aLo, Decimal128 b) {
-        return compare(aHi, aLo, b.getHigh(), b.getLow());
-    }
-
     public static int compareTo(long aHigh, long aLow, int aScale, long bHigh, long bLow, int bScale) {
         if (isNull(aHigh, aLow)) {
             if (isNull(bHigh, bLow)) {
@@ -511,20 +495,6 @@ public class Decimal128 implements Sinkable, Decimal {
         sink.negate();
     }
 
-    public static void put(Decimal128 d, long addr) {
-        put(d.high, d.low, addr);
-    }
-
-    public static void put(long high, long low, long addr) {
-        Unsafe.getUnsafe().putLong(addr, high);
-        Unsafe.getUnsafe().putLong(addr + Long.BYTES, low);
-    }
-
-    public static void putNull(long addr) {
-        Unsafe.getUnsafe().putLong(addr, Decimals.DECIMAL128_HI_NULL);
-        Unsafe.getUnsafe().putLong(addr + 8L, Decimals.DECIMAL128_LO_NULL);
-    }
-
     /**
      * Subtract two Decimal128 numbers and store the result in sink (a - b {@code ->} sink)
      *
@@ -620,10 +590,6 @@ public class Decimal128 implements Sinkable, Decimal {
         result.high += carry + (b < 0 ? -1L : 0L);
     }
 
-    public static void uncheckedAdd(Decimal128 result, Decimal128 other) {
-        uncheckedAdd(result, other.high, other.low);
-    }
-
     /**
      * Add another Decimal128 to this one (in-place)
      *
@@ -673,16 +639,6 @@ public class Decimal128 implements Sinkable, Decimal {
         this.high = source.high;
         this.low = source.low;
         this.scale = source.scale;
-    }
-
-    /**
-     * Copy values from another Decimal128 instance without the scale.
-     *
-     * @param other the Decimal128 instance to copy from
-     */
-    public void copyRaw(Decimal128 other) {
-        this.high = other.high;
-        this.low = other.low;
     }
 
     /**
@@ -970,35 +926,6 @@ public class Decimal128 implements Sinkable, Decimal {
     }
 
     /**
-     * Sets this Decimal128 to the specified 128-bit value. Keeps the existing scale.
-     *
-     * @param high the high 64 bits (bits 64-127)
-     * @param low  the low 64 bits (bits 0-63)
-     */
-    public void ofRaw(long high, long low) {
-        this.high = high;
-        this.low = low;
-    }
-
-    /**
-     * Sets this Decimal128 to the specified 64-bit value. Keeps the existing scale.
-     *
-     * @param value the value to sign-extend
-     */
-    public void ofRaw(long value) {
-        this.high = value < 0 ? -1L : 0L;
-        this.low = value;
-    }
-
-    /**
-     * Set this Decimal128 to the null value. Zeroes out the scale.
-     */
-    public void ofRawNull() {
-        high = Decimals.DECIMAL128_HI_NULL;
-        low = Decimals.DECIMAL128_LO_NULL;
-    }
-
-    /**
      * Parses a CharSequence decimal and store the result into the given Decimal256.
      *
      * @param cs is the CharSequence to be parsed
@@ -1131,39 +1058,6 @@ public class Decimal128 implements Sinkable, Decimal {
     }
 
     /**
-     * Subtracts a specific multiplier of a power of ten from the current 128-bit value.
-     * This method modifies the value in-place by subtracting (multiplier * 10^pow).
-     * <p>
-     * Used in conjunction with getDigitAtPowerOfTen to extract individual digits:
-     * 1. Call getDigitAtPowerOfTen to get the digit at a specific power
-     * 2. Call this method to subtract that digit's contribution
-     * 3. Repeat for the next lower power
-     *
-     * @param pow        the power of ten position
-     * @param multiplier the digit to subtract (1-9, or 0 for no-op)
-     */
-    public void subtractPowerOfTenMultiple(int pow, int multiplier) {
-        if (multiplier == 0 || multiplier > 9) {
-            return;
-        }
-
-        // Get the value to subtract from POWERS_TEN_TABLE
-        // Each power has 9 entries (for multipliers 1-9), each entry has 2 longs
-        int offset = (multiplier - 1) * 2;
-
-        // Perform 256-bit subtraction using two's complement
-        // First, negate the value to subtract (two's complement)
-        long bLow = ~POWERS_TEN_TABLE[pow][offset + 1] + 1;
-        long c = bLow == 0L ? 1L : 0L;
-        long r = low + bLow;
-        long carry = hasCarry(low, r) ? 1L : 0L;
-        low = r;
-
-        long bHigh = ~POWERS_TEN_TABLE[pow][offset] + c;
-        high = high + carry + bHigh;
-    }
-
-    /**
      * Convert to BigDecimal with full precision
      *
      * @return BigDecimal representation of this Decimal128
@@ -1224,14 +1118,6 @@ public class Decimal128 implements Sinkable, Decimal {
         return sink.toString();
     }
 
-    public void uncheckedAdd(Decimal128 other) {
-        uncheckedAdd(other.high, other.low);
-    }
-
-    public void uncheckedAdd(long otherHigh, long otherLow) {
-        uncheckedAdd(this, this.high, this.low, otherHigh, otherLow);
-    }
-
     /**
      * Generic function to make a 128-bit addition.
      *
@@ -1287,32 +1173,6 @@ public class Decimal128 implements Sinkable, Decimal {
         }
         long bLo = POWERS_TEN_TABLE[pow][offset + 1];
         return Long.compareUnsigned(aLo, bLo);
-    }
-
-    /**
-     * Generic function to make a 128-bit addition assuming both values have the same scale.
-     *
-     * @param result Decimal128 that will store the result of the operation
-     * @param aH     High 64-bit part of the first operand.
-     * @param aL     Low 64-bit part of the first operand.
-     * @param bH     High 64-bit part of the second operand.
-     * @param bL     Low 64-bit part of the second operand.
-     */
-    private static void uncheckedAdd(Decimal128 result, long aH, long aL, long bH, long bL) {
-        // Perform 128-bit addition
-        long sumLow = aL + bL;
-
-        // Check for carry
-        long carry = hasCarry(aL, sumLow) ? 1 : 0;
-
-        try {
-            result.high = Math.addExact(aH, Math.addExact(bH, carry));
-            // low is modified after high on purpose in order not to leave the result dirty
-            // should addExact overflow
-            result.low = sumLow;
-        } catch (ArithmeticException e) {
-            throw NumericException.instance().put("Overflow in addition: result exceeds 128-bit capacity");
-        }
     }
 
     private static void uncheckedAdd(Decimal128 result, long bHi, long bLo) {

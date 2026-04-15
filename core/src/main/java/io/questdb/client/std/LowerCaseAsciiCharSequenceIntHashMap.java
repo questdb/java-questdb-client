@@ -69,13 +69,6 @@ public class LowerCaseAsciiCharSequenceIntHashMap extends AbstractLowerCaseAscii
         return true;
     }
 
-    public void putIfAbsent(CharSequence key, int value) {
-        int index = keyIndex(key);
-        if (index > -1) {
-            putAt0(index, Chars.toLowerCaseAscii(key), value);
-        }
-    }
-
     public int valueAt(int index) {
         return index < 0 ? values[-index - 1] : noEntryValue;
     }
@@ -110,16 +103,5 @@ public class LowerCaseAsciiCharSequenceIntHashMap extends AbstractLowerCaseAscii
                 values[index] = oldValues[i];
             }
         }
-    }
-
-    protected void erase(int index) {
-        keys[index] = noEntryKey;
-        values[index] = noEntryValue;
-    }
-
-    protected void move(int from, int to) {
-        keys[to] = keys[from];
-        values[to] = values[from];
-        erase(from);
     }
 }

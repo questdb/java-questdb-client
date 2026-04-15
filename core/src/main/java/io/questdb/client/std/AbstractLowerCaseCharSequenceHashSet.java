@@ -52,10 +52,6 @@ public abstract class AbstractLowerCaseCharSequenceHashSet implements Mutable {
         free = capacity;
     }
 
-    public boolean contains(CharSequence key) {
-        return keyIndex(key) < 0;
-    }
-
     public int keyIndex(CharSequence key) {
         int index = Chars.lowerCaseHashCode(key) & mask;
 
@@ -85,5 +81,4 @@ public abstract class AbstractLowerCaseCharSequenceHashSet implements Mutable {
             }
         } while (true);
     }
-
 }

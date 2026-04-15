@@ -29,14 +29,14 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
-import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
 public class VectFuzzTest {
     @Test
     public void testMemmove() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             int maxSize = 1024 * 1024;
             int[] sizes = {1024, 4096, maxSize};
             int buffSize = 1024 + 4096 + maxSize;

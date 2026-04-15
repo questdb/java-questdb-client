@@ -33,7 +33,7 @@ import io.questdb.client.std.NumericException;
 public final class FastDoubleParser {
 
     /**
-     * Convenience method for calling {@link #parseDouble(CharSequence, int, int)}.
+     * Convenience method for calling {@link #parseDouble(CharSequence, int, int, boolean)}.
      *
      * @param str            the string to be parsed
      * @param rejectOverflow numbers that overflow double type will be considered illegal

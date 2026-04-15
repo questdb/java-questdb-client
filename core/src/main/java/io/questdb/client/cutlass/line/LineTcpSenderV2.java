@@ -35,7 +35,6 @@ import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.FlattenArrayUtils;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
-import io.questdb.client.network.Net;
 import io.questdb.client.network.NetworkFacadeImpl;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
@@ -54,7 +53,7 @@ public class LineTcpSenderV2 extends AbstractLineTcpSender implements ArrayBuffe
     /**
      * Create a new LineTcpSender.
      * <br>
-     * IP address is encoded as <code>int</code> obtained via {@link Net#parseIPv4(CharSequence)}
+     * IP address is encoded as <code>int</code>
      * <br>
      * This is meant to be used for testing only, it's not something most users want to use.
      * See {@link Sender} instead

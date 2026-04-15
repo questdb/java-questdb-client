@@ -25,7 +25,6 @@
 package io.questdb.client.std;
 
 import io.questdb.client.std.fastdouble.FastDoubleParser;
-import io.questdb.client.std.fastdouble.FastFloatParser;
 import io.questdb.client.std.str.CharSink;
 import io.questdb.client.std.str.Utf8Sequence;
 import jdk.internal.math.FDBigInteger;
@@ -35,15 +34,12 @@ import java.util.Arrays;
 public final class Numbers {
     public static final int INT_NULL = Integer.MIN_VALUE;
     public static final int IPv4_NULL = 0;
-    public static final long LONG_NULL = Long.MIN_VALUE;
     public static final int MAX_DOUBLE_SCALE = 19;
-    public static final int MAX_FLOAT_SCALE = 10;
     public static final int SIGNIFICAND_WIDTH = 53;
     public static final long SIGN_BIT_MASK = 0x8000000000000000L;
     public static final char[] hexDigits = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
     public final static int[] hexNumbers;
     public static final long[] pow10;
-    public final static int pow10max;
     private static final int EXP_BIAS = 1023;
     private static final long EXP_BIT_MASK = 0x7FF0000000000000L;
     private static final int EXP_SHIFT = SIGNIFICAND_WIDTH - 1;
@@ -61,52 +57,6 @@ public final class Numbers {
     private final static ThreadLocal<char[]> tlDoubleDigitsBuffer = new ThreadLocal<>(() -> new char[21]);
 
     private Numbers() {
-    }
-
-    public static void append(CharSink<?> sink, final float value, int scale) {
-        float f = value;
-        if (f == Float.POSITIVE_INFINITY) {
-            sink.putAscii("Infinity");
-            return;
-        }
-
-        if (f == Float.NEGATIVE_INFINITY) {
-            sink.putAscii("-Infinity");
-            return;
-        }
-
-        if (Float.isNaN(f)) {
-            sink.putAscii("NaN");
-            return;
-        }
-
-        // it is very awkward to distinguish between 0.0 and -0.0
-        // -0.0 < 0 is false
-        if (f < 0 || 1 / f == Float.NEGATIVE_INFINITY) {
-            sink.putAscii('-');
-            f = -f;
-        }
-        int factor = (int) pow10[scale];
-        int scaled = (int) (f * factor + 0.5);
-        int targetScale = scale + 1;
-        int z;
-        while (targetScale < 11 && (z = factor * 10) <= scaled) {
-            factor = z;
-            targetScale++;
-        }
-
-        if (targetScale == 11) {
-            sink.putAscii(Float.toString(f));
-            return;
-        }
-
-        while (targetScale > 0) {
-            if (targetScale-- == scale) {
-                sink.putAscii('.');
-            }
-            sink.putAscii((char) ('0' + scaled / factor % 10));
-            factor /= 10;
-        }
     }
 
     public static void append(CharSink<?> sink, final int value) {
@@ -204,10 +154,6 @@ public final class Numbers {
         }
     }
 
-    public static void append(CharSink<?> sink, float value) {
-        append(sink, value, MAX_FLOAT_SCALE);
-    }
-
     public static void append(CharSink<?> sink, double value) {
         append(sink, value, MAX_DOUBLE_SCALE);
     }
@@ -263,161 +209,6 @@ public final class Numbers {
         array[bit].append(sink, value);
     }
 
-    /**
-     * Append a long value to a CharSink in hex format.
-     *
-     * @param sink       the CharSink to append to
-     * @param value      the value to append
-     * @param padToBytes if non-zero, pad the output to the specified number of bytes
-     */
-    public static void appendHexPadded(CharSink<?> sink, long value, int padToBytes) {
-        assert padToBytes >= 0 && padToBytes <= 8;
-        // This code might be unclear, so here are some hints:
-        // This method uses longHexAppender() and longHexAppender() is always padding to a whole byte. It never prints
-        // just a nibble. It means the longHexAppender() will print value 0xf as "0f". Value 0xff will be printed as "ff".
-        // Value 0xfff will be printed as "0fff". Value 0xffff will be printed as "ffff" and so on.
-        // So this method needs to pad only from the next whole byte up.
-        // In other words: This method always pads with full bytes (=even number of zeros), never with just a nibble.
-
-        // Example 1: Value is 0xF and padToBytes is 2. This means the desired output is 000f.
-        // longHexAppender() pads to a full byte. This means it will output is 0f. So this method needs to pad with 2 zeros.
-
-        // Example 2: The value is 0xFF and padToBytes is 2. This means the desired output is 00ff.
-        // longHexAppender() will output "ff". This is a full byte so longHexAppender() will not do any padding on its own.
-        // So this method needs to pad with 2 zeros.
-        int leadingZeroBits = Long.numberOfLeadingZeros(value);
-        int padToBits = padToBytes << 3;
-        int bitsToPad = padToBits - (Long.SIZE - leadingZeroBits);
-        int bytesToPad = (bitsToPad >> 3);
-        for (int i = 0; i < bytesToPad; i++) {
-            sink.putAscii('0');
-            sink.putAscii('0');
-        }
-        if (value == 0) {
-            return;
-        }
-        int bit = 64 - leadingZeroBits;
-        longHexAppender[bit].append(sink, value);
-    }
-
-    public static void appendHexPadded(CharSink<?> sink, final int value) {
-        int i = value;
-        if (i < 0) {
-            if (i == Integer.MIN_VALUE) {
-                sink.putAscii("NaN");
-                return;
-            }
-            sink.putAscii('-');
-            i = -i;
-        }
-        int c;
-        if (i < 0x10) {
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i]);
-        } else if (i < 0x100) {  // two
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x10]);
-            sink.putAscii(hexDigits[i % 0x10]);
-        } else if (i < 0x1000) { // three
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x100]);
-            sink.putAscii(hexDigits[(c = i % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else if (i < 0x10000) { // four
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x1000]);
-            sink.putAscii(hexDigits[(c = i % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else if (i < 0x100000) { // five
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x10000]);
-            sink.putAscii(hexDigits[(c = i % 0x10000) / 0x1000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else if (i < 0x1000000) { // six
-            sink.putAscii('0');
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x100000]);
-            sink.putAscii(hexDigits[(c = i % 0x100000) / 0x10000]);
-            sink.putAscii(hexDigits[(c = c % 0x10000) / 0x1000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else if (i < 0x10000000) { // seven
-            sink.putAscii('0');
-            sink.putAscii(hexDigits[i / 0x1000000]);
-            sink.putAscii(hexDigits[(c = i % 0x1000000) / 0x100000]);
-            sink.putAscii(hexDigits[(c = c % 0x100000) / 0x10000]);
-            sink.putAscii(hexDigits[(c = c % 0x10000) / 0x1000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        } else { // eight
-            sink.putAscii(hexDigits[i / 0x10000000]);
-            sink.putAscii(hexDigits[(c = i % 0x10000000) / 0x1000000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000000) / 0x100000]);
-            sink.putAscii(hexDigits[(c = c % 0x100000) / 0x10000]);
-            sink.putAscii(hexDigits[(c = c % 0x10000) / 0x1000]);
-            sink.putAscii(hexDigits[(c = c % 0x1000) / 0x100]);
-            sink.putAscii(hexDigits[(c = c % 0x100) / 0x10]);
-            sink.putAscii(hexDigits[c % 0x10]);
-        }
-    }
-
-    public static void appendLong256(long a, long b, long c, long d, CharSink<?> sink) {
-        if (a == Numbers.LONG_NULL && b == Numbers.LONG_NULL && c == Numbers.LONG_NULL && d == Numbers.LONG_NULL) {
-            return;
-        }
-        sink.putAscii("0x");
-        if (d != 0) {
-            appendLong256Four(a, b, c, d, sink);
-            return;
-        }
-        if (c != 0) {
-            appendLong256Three(a, b, c, sink);
-            return;
-        }
-        if (b != 0) {
-            appendLong256Two(a, b, sink);
-            return;
-        }
-        appendHex(sink, a, false);
-    }
-
-    public static void appendUuid(long lo, long hi, CharSink<?> sink) {
-        appendHexPadded(sink, (hi >> 32) & 0xFFFFFFFFL, 4);
-        sink.putAscii('-');
-        appendHexPadded(sink, (hi >> 16) & 0xFFFF, 2);
-        sink.putAscii('-');
-        appendHexPadded(sink, hi & 0xFFFF, 2);
-        sink.putAscii('-');
-        appendHexPadded(sink, lo >> 48 & 0xFFFF, 2);
-        sink.putAscii('-');
-        appendHexPadded(sink, lo & 0xFFFFFFFFFFFFL, 6);
-    }
-
     public static int ceilPow2(int value) {
         int i = value;
         if ((i != 0) && (i & (i - 1)) > 0) {
@@ -459,41 +250,6 @@ public final class Numbers {
         return r;
     }
 
-    public static void intToIPv4Sink(CharSink<?> sink, int value) {
-        // NULL handling should be done outside, null here will be printed as 0.0.0.0
-        append(sink, (value >> 24) & 0xff);
-        sink.putAscii('.');
-        append(sink, (value >> 16) & 0xff);
-        sink.putAscii('.');
-        append(sink, (value >> 8) & 0xff);
-        sink.putAscii('.');
-        append(sink, value & 0xff);
-    }
-
-    public static long interleaveBits(long x, long y) {
-        return spreadBits(x) | (spreadBits(y) << 1);
-    }
-
-    /**
-     * Checks double value for NULL in database sense. NULL is anything that is
-     * not "finite".
-     *
-     * @param value to check
-     * @return true if value is "infinite", which includes {@link Double#isNaN(double)}, positive and negative
-     * infinities that arise from division by 0.
-     */
-    public static boolean isNull(double value) {
-        return (Double.doubleToRawLongBits(value) & EXP_BIT_MASK) == EXP_BIT_MASK;
-    }
-
-    public static boolean isNull(float value) {
-        return Float.isNaN(value) || Float.isInfinite(value);
-    }
-
-    public static boolean isPow2(int value) {
-        return value > 0 && (value & (value - 1)) == 0;
-    }
-
     public static int msb(int value) {
         return 31 - Integer.numberOfLeadingZeros(value);
     }
@@ -504,10 +260,6 @@ public final class Numbers {
 
     public static double parseDouble(CharSequence sequence) throws NumericException {
         return FastDoubleParser.parseDouble(sequence, true);
-    }
-
-    public static float parseFloat(CharSequence sequence) throws NumericException {
-        return FastFloatParser.parseFloat(sequence, true);
     }
 
     public static int parseHexInt(CharSequence sequence) throws NumericException {
@@ -555,17 +307,6 @@ public final class Numbers {
             return IPv4_NULL;
         }
         return parseIPv4_0(sequence, 0, sequence.length());
-    }
-
-    public static int parseIPv4Quiet(CharSequence sequence) {
-        try {
-            if (sequence == null || Chars.equals("null", sequence)) {
-                return IPv4_NULL;
-            }
-            return parseIPv4(sequence);
-        } catch (NumericException e) {
-            return IPv4_NULL;
-        }
     }
 
     public static int parseIPv4_0(CharSequence sequence, final int p, int lim) throws NumericException {
@@ -636,20 +377,6 @@ public final class Numbers {
         return parseInt0(sequence, 0, sequence.length());
     }
 
-    public static int parseInt(Utf8Sequence sequence) throws NumericException {
-        if (sequence == null) {
-            throw NumericException.instance().put("null string");
-        }
-        return parseInt0(sequence.asAsciiCharSequence(), 0, sequence.size());
-    }
-
-    public static int parseInt(Utf8Sequence sequence, int p, int lim) throws NumericException {
-        if (sequence == null) {
-            throw NumericException.instance().put("null string");
-        }
-        return parseInt0(sequence.asAsciiCharSequence(), p, lim);
-    }
-
     public static int parseInt(CharSequence sequence, int p, int lim) throws NumericException {
         if (sequence == null) {
             throw NumericException.instance().put("null string");
@@ -657,167 +384,18 @@ public final class Numbers {
         return parseInt0(sequence, p, lim);
     }
 
-    public static long parseInt000Greedy(CharSequence sequence, final int p, int lim) throws NumericException {
-        if (lim == p) {
-            throw NumericException.instance().put("empty number string");
-        }
-
-        boolean negative = sequence.charAt(p) == '-';
-        int i = p;
-        if (negative) {
-            i++;
-        }
-
-        if (i >= lim || notDigit(sequence.charAt(i))) {
-            throw NumericException.instance().put("not a number: ").put(sequence);
-        }
-
-        int val = 0;
-        for (; i < lim; i++) {
-            char c = sequence.charAt(i);
-
-            if (notDigit(c)) {
-                break;
-            }
-
-            // val * 10 + (c - '0')
-            int r = (val << 3) + (val << 1) - (c - '0');
-            if (r > val) {
-                throw NumericException.instance().put("number overflow");
-            }
-            val = r;
-        }
-
-        final int len = i - p;
-
-        if (len > 3 || val == Integer.MIN_VALUE && !negative) {
-            throw NumericException.instance().put("number overflow");
-        }
-
-        while (i - p < 3) {
-            val *= 10;
-            i++;
-        }
-
-        return encodeLowHighInts(negative ? val : -val, len);
-    }
-
-    public static int parseIntQuiet(CharSequence sequence) {
-        try {
-            if (sequence == null || Chars.equals("NaN", sequence)) {
-                return Numbers.INT_NULL;
-            }
-            return parseInt0(sequence, 0, sequence.length());
-        } catch (NumericException e) {
-            return Numbers.INT_NULL;
-        }
-
-    }
-
-    public static long parseIntSafely(CharSequence sequence, final int p, int lim) throws NumericException {
-        if (lim == p) {
-            throw NumericException.instance().put("empty number string");
-        }
-
-        boolean negative = sequence.charAt(p) == '-';
-        int i = p;
-        if (negative) {
-            i++;
-        }
-
-        if (i >= lim || notDigit(sequence.charAt(i))) {
-            throw NumericException.instance().put("not a number: ").put(sequence);
-        }
-
-        int val = 0;
-        for (; i < lim; i++) {
-            char c = sequence.charAt(i);
-
-            if (notDigit(c)) {
-                break;
-            }
-
-            // val * 10 + (c - '0')
-            int r = (val << 3) + (val << 1) - (c - '0');
-            if (r > val) {
-                throw NumericException.instance().put("number overflow");
-            }
-            val = r;
-        }
-
-        if (val == Integer.MIN_VALUE && !negative) {
-            throw NumericException.instance().put("number overflow");
-        }
-
-        return encodeLowHighInts(negative ? val : -val, i - p);
-    }
-
     public static long parseLong(CharSequence sequence) throws NumericException {
         if (sequence == null) {
             throw NumericException.instance().put("null string");
         }
-        return parseLong0(sequence, 0, sequence.length());
+        return parseLong0(sequence, sequence.length());
     }
 
     public static long parseLong(Utf8Sequence sequence) throws NumericException {
         if (sequence == null) {
             throw NumericException.instance().put("null string");
         }
-        return parseLong0(sequence.asAsciiCharSequence(), 0, sequence.size());
-    }
-
-    public static long parseLong000000Greedy(CharSequence sequence, final int p, int lim) throws NumericException {
-        if (lim == p) {
-            throw NumericException.instance().put("empty number string");
-        }
-
-        boolean negative = sequence.charAt(p) == '-';
-        int i = p;
-        if (negative) {
-            i++;
-        }
-
-        if (i >= lim || notDigit(sequence.charAt(i))) {
-            throw NumericException.instance().put("not a number: ").put(sequence);
-        }
-
-        int val = 0;
-        for (; i < lim; i++) {
-            char c = sequence.charAt(i);
-
-            if (notDigit(c)) {
-                break;
-            }
-
-            // val * 10 + (c - '0')
-            int r = (val << 3) + (val << 1) - (c - '0');
-            if (r > val) {
-                throw NumericException.instance().put("number overflow");
-            }
-            val = r;
-        }
-
-        final int len = i - p;
-
-        if (len > 6 || val == Integer.MIN_VALUE && !negative) {
-            throw NumericException.instance().put("number overflow");
-        }
-
-        while (i - p < 6) {
-            val *= 10;
-            i++;
-        }
-
-        return encodeLowHighInts(negative ? val : -val, len);
-    }
-
-    public static long spreadBits(long v) {
-        v = (v | (v << 16)) & 0X0000FFFF0000FFFFL;
-        v = (v | (v << 8)) & 0X00FF00FF00FF00FFL;
-        v = (v | (v << 4)) & 0X0F0F0F0F0F0F0F0FL;
-        v = (v | (v << 2)) & 0x3333333333333333L;
-        v = (v | (v << 1)) & 0x5555555555555555L;
-        return v;
+        return parseLong0(sequence.asAsciiCharSequence(), sequence.size());
     }
 
     private static void appendDouble0(
@@ -1440,21 +1018,6 @@ public final class Numbers {
         sink.putAscii((char) ('0' + i % 10));
     }
 
-    private static void appendLong256Four(long a, long b, long c, long d, CharSink<?> sink) {
-        appendLong256Three(b, c, d, sink);
-        appendHex(sink, a, true);
-    }
-
-    private static void appendLong256Three(long a, long b, long c, CharSink<?> sink) {
-        appendLong256Two(b, c, sink);
-        appendHex(sink, a, true);
-    }
-
-    private static void appendLong256Two(long a, long b, CharSink<?> sink) {
-        appendHex(sink, b, false);
-        appendHex(sink, a, true);
-    }
-
     private static void appendLong3(CharSink<?> sink, long i) {
         long c;
         sink.putAscii((char) ('0' + i / 100));
@@ -1754,14 +1317,14 @@ public final class Numbers {
         return negative ? val : -val;
     }
 
-    private static long parseLong0(CharSequence sequence, final int p, int lim) throws NumericException {
-        if (lim == p) {
+    private static long parseLong0(CharSequence sequence, int lim) throws NumericException {
+        if (lim == 0) {
             throw NumericException.instance().put("empty long string");
         }
 
-        boolean negative = sequence.charAt(p) == '-';
+        boolean negative = sequence.charAt(0) == '-';
 
-        int i = p;
+        int i = 0;
         if (negative) {
             i++;
         }
@@ -1777,23 +1340,23 @@ public final class Numbers {
             switch (c | 32) {
                 case 'l':
                     if (i == 0 || i + 1 < lim) {
-                        throw NumericException.instance().put("invalid long format: ").put(sequence, p, lim);
+                        throw NumericException.instance().put("invalid long format: ").put(sequence, 0, lim);
                     }
                     break;
                 case 127: // '_'
                     if (digitCounter == 0) {
-                        throw NumericException.instance().put("invalid long format: ").put(sequence, p, lim);
+                        throw NumericException.instance().put("invalid long format: ").put(sequence, 0, lim);
                     }
                     digitCounter = 0;
                     break;
                 default:
                     if (c < '0' || c > '9') {
-                        throw NumericException.instance().put("invalid character in long: ").put(sequence, p, lim);
+                        throw NumericException.instance().put("invalid character in long: ").put(sequence, 0, lim);
                     }
                     // val * 10 + (c - '0')
                     long r = (val << 3) + (val << 1) - (c - '0');
                     if (r > val) {
-                        throw NumericException.instance().put("long overflow: ").put(sequence, p, lim);
+                        throw NumericException.instance().put("long overflow: ").put(sequence, 0, lim);
                     }
                     val = r;
                     digitCounter++;
@@ -1801,7 +1364,7 @@ public final class Numbers {
         }
 
         if ((val == Long.MIN_VALUE && !negative) || digitCounter == 0) {
-            throw NumericException.instance().put("invalid long format: ").put(sequence, p, lim);
+            throw NumericException.instance().put("invalid long format: ").put(sequence, 0, lim);
         }
         return negative ? val : -val;
     }
@@ -1841,7 +1404,6 @@ public final class Numbers {
 
     static {
         pow10 = new long[20];
-        pow10max = 18;
         pow10[0] = 1;
         for (int i = 1; i < pow10.length; i++) {
             pow10[i] = pow10[i - 1] * 10;

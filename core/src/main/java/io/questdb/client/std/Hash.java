@@ -26,26 +26,7 @@ package io.questdb.client.std;
 
 public final class Hash {
 
-    // Constant from Rust compiler's FxHasher.
-    private static final long M2 = 0x517cc1b727220a95L;
-
     private static final int SPREAD_HASH_BITS = 0x7fffffff;
-
-    public static int hashLong128_32(long key1, long key2) {
-        return (int) hashLong128_64(key1, key2);
-    }
-
-    public static long hashLong128_64(long key1, long key2) {
-        return fmix64(key1 * M2 + key2);
-    }
-
-    public static int hashLong32(long k) {
-        return (int) hashLong64(k);
-    }
-
-    public static long hashLong64(long k) {
-        return fmix64(k);
-    }
 
     /**
      * (copied from ConcurrentHashMap)
@@ -69,15 +50,6 @@ public final class Hash {
      */
     public static int spread(int h) {
         return (h ^ (h >>> 16)) & SPREAD_HASH_BITS;
-    }
-
-    /**
-     * Murmur finalizer.
-     */
-    private static long fmix64(long h) {
-        h = (h ^ (h >>> 33)) * 0xff51afd7ed558ccdL;
-        h = (h ^ (h >>> 33)) * 0xc4ceb9fe1a85ec53L;
-        return h ^ (h >>> 33);
     }
 
 }

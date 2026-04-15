@@ -38,6 +38,8 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 public class JsonLexerTest {
 
     private static final JsonLexer LEXER = new JsonLexer(4, 1024);
@@ -78,7 +80,7 @@ public class JsonLexerTest {
 
     @Test
     public void testCacheDisabled() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             String json = "{\"a\":1, \"b\": \"123456789012345678901234567890\"}";
             int len = json.length();
             long address = TestUtils.toMemory(json);
@@ -251,7 +253,7 @@ public class JsonLexerTest {
 
     @Test
     public void testStringTooLong() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             String json = "{\"a\":1, \"b\": \"123456789012345678901234567890\"]}";
             int len = json.length() - 6;
             long address = TestUtils.toMemory(json);
@@ -783,12 +785,6 @@ public class JsonLexerTest {
 
         public CharSequence value() {
             return buffer;
-        }
-    }
-
-    private static final class NoOpParser implements JsonParser {
-        @Override
-        public void onEvent(int code, CharSequence tag, int position) {
         }
     }
 }

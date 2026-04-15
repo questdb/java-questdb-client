@@ -32,11 +32,9 @@ import org.jetbrains.annotations.Nullable;
  * to accumulate messages, so they require extra calls to convert encrypted data to raw data.
  * <p>
  * {@link #close()} implementations must be idempotent. Also, supports object reuse after
- * {@link #close()}: see {@link #of(long)}.
+ * closing via {@link #of(int)}.
  */
 public interface Socket extends QuietCloseable {
-    int HAS_MORE_PLAINTEXT_FLAG = 1 << 2;
-    int READ_FLAG = 1 << 1;
     int WRITE_FLAG = 1;
 
     /**
@@ -60,8 +58,7 @@ public interface Socket extends QuietCloseable {
      * call is not required.
      * <p>
      * If data from the socket doesn't fit into the provided buffer then part of the data stays in the
-     * internal buffer and can be read with a subsequent call to this method. Use {@link #isMorePlaintextBuffered()}
-     * to check if there is more data to read.
+     * internal buffer and can be read with a subsequent call to this method.
      *
      * @param bufferPtr pointer to the buffer
      * @param bufferLen buffer length
@@ -101,8 +98,7 @@ public interface Socket extends QuietCloseable {
      * the socket. Can be called safely even if the socket doesn't
      * support TLS.
      *
-     * @param readinessFlags socket readiness flags (see {@link #READ_FLAG}
-     *                       and {@link #WRITE_FLAG}).
+     * @param readinessFlags socket readiness flags (see {@link #WRITE_FLAG}).
      * @return 0 if the call is successful; -1 if there was an error.
      */
     int tlsIO(int readinessFlags);

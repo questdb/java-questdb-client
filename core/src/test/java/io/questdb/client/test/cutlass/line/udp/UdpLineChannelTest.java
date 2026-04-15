@@ -28,9 +28,9 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.udp.UdpLineChannel;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
-import io.questdb.client.test.tools.TestUtils;
 import org.junit.Test;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.fail;
 
 public class UdpLineChannelTest {
@@ -55,9 +55,8 @@ public class UdpLineChannelTest {
 
     @Test
     public void testConstructorLeak_DescriptorsExhausted() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            try {
-                new UdpLineChannel(FD_EXHAUSTED_NET_FACADE, 1, 1, 9000, 10);
+        assertMemoryLeak(() -> {
+            try (UdpLineChannel ignored = new UdpLineChannel(FD_EXHAUSTED_NET_FACADE, 1, 1, 9000, 10)) {
                 fail("the channel should fail to instantiate when NetworkFacade fails to create a new socket");
             } catch (LineSenderException ignored) {
                 // expected
@@ -67,9 +66,8 @@ public class UdpLineChannelTest {
 
     @Test
     public void testConstructorLeak_FailsToSendInterface() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            try {
-                new UdpLineChannel(FAILS_TO_SET_MULTICAST_IFACE_NET_FACADE, 1, 1, 9000, 10);
+        assertMemoryLeak(() -> {
+            try (UdpLineChannel ignored = new UdpLineChannel(FAILS_TO_SET_MULTICAST_IFACE_NET_FACADE, 1, 1, 9000, 10)) {
                 fail("the channel should fail to instantiate when NF fails to set multicast interface");
             } catch (LineSenderException ignored) {
                 // expected
@@ -79,9 +77,8 @@ public class UdpLineChannelTest {
 
     @Test
     public void testConstructorLeak_FailsToSetTTL() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            try {
-                new UdpLineChannel(FAILS_SET_SET_TTL_NET_FACADE, 1, 1, 9000, 10);
+        assertMemoryLeak(() -> {
+            try (UdpLineChannel ignored = new UdpLineChannel(FAILS_SET_SET_TTL_NET_FACADE, 1, 1, 9000, 10)) {
                 fail("the channel should fail to instantiate when NF fails to set multicast interface");
             } catch (LineSenderException ignored) {
                 // expected

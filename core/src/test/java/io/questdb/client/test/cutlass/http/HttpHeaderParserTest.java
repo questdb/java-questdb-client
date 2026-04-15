@@ -33,6 +33,7 @@ import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.DirectUtf8String;
 import io.questdb.client.std.str.Utf8String;
 import io.questdb.client.test.tools.TestUtils;
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -53,7 +54,7 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testContentLengthLarge() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             String v = "Content-Length: 81136060058\r\n" +
                     "\r\n";
             long p = TestUtils.toMemory(v);
@@ -135,7 +136,7 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testQueryDanglingEncoding() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             String v = "GET /status?x=1&a=% HTTP/1.1\r\n" +
                     "\r\n";
             long p = TestUtils.toMemory(v);
@@ -152,7 +153,7 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testQueryInvalidEncoding() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             String v = "GET /status?x=1&a=%i6b&c&d=x HTTP/1.1\r\n" +
                     "\r\n";
             long p = TestUtils.toMemory(v);

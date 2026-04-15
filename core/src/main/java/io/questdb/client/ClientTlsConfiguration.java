@@ -26,7 +26,6 @@ package io.questdb.client;
 
 public class ClientTlsConfiguration {
     public static final int TLS_VALIDATION_MODE_FULL = 0;
-    public static final ClientTlsConfiguration DEFAULT = new ClientTlsConfiguration(null, null, TLS_VALIDATION_MODE_FULL);
     public static final int TLS_VALIDATION_MODE_NONE = 1;
     public static final ClientTlsConfiguration INSECURE_NO_VALIDATION = new ClientTlsConfiguration(null, null, TLS_VALIDATION_MODE_NONE);
     private final int tlsValidationMode;

@@ -25,6 +25,16 @@
 package io.questdb.client.std;
 
 public final class Decimals {
+    public static final long DECIMAL128_HI_NULL = Long.MIN_VALUE;
+    public static final long DECIMAL128_LO_NULL = 0L;
+    public static final short DECIMAL16_NULL = Short.MIN_VALUE;
+    public static final long DECIMAL256_HH_NULL = Long.MIN_VALUE;
+    public static final long DECIMAL256_HL_NULL = 0L;
+    public static final long DECIMAL256_LH_NULL = 0L;
+    public static final long DECIMAL256_LL_NULL = 0L;
+    public static final int DECIMAL32_NULL = Integer.MIN_VALUE;
+    public static final long DECIMAL64_NULL = Long.MIN_VALUE;
+    public static final byte DECIMAL8_NULL = Byte.MIN_VALUE;
     public static final int MAX_PRECISION = 76;
     // Maximum scale of a decimal value, must be kept below Byte.MAX_VALUE for ILP.
     public static final int MAX_SCALE = MAX_PRECISION;
@@ -40,17 +50,6 @@ public final class Decimals {
             5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
             5, 5, // precision 39-76 -> 32 bytes
     };
-
-    public static long DECIMAL128_HI_NULL = Long.MIN_VALUE;
-    public static long DECIMAL128_LO_NULL = 0L;
-    public static short DECIMAL16_NULL = Short.MIN_VALUE;
-    public static long DECIMAL256_HH_NULL = Long.MIN_VALUE;
-    public static long DECIMAL256_HL_NULL = 0L;
-    public static long DECIMAL256_LH_NULL = 0L;
-    public static long DECIMAL256_LL_NULL = 0L;
-    public static int DECIMAL32_NULL = Integer.MIN_VALUE;
-    public static long DECIMAL64_NULL = Long.MIN_VALUE;
-    public static byte DECIMAL8_NULL = Byte.MIN_VALUE;
 
     /**
      * Returns the required storage size in bytes (pow 2) for a decimal with given precision.

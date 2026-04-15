@@ -216,7 +216,7 @@ abstract class AbstractFloatHandPickedTest {
     }
 
     private void testIllegalInputWithPrefixAndSuffix(String str, int length) {
-        assertThrows(NumericException.class, () -> parse(str, 6, length, false));
+        assertThrows(NumericException.class, () -> parse(str, 6, length));
     }
 
     private void testLegalDecInput(float expected) {
@@ -259,7 +259,7 @@ abstract class AbstractFloatHandPickedTest {
     }
 
     private void testLegalInputWithPrefixAndSuffix(String testName, String str, int length, float expected) throws NumericException {
-        float actual = parse(str, 6, length, false);
+        float actual = parse(str, 6, length);
         Assert.assertEquals(testName, expected, actual, 0.001);
     }
 
@@ -273,5 +273,5 @@ abstract class AbstractFloatHandPickedTest {
 
     abstract float parse(CharSequence str, boolean rejectOverflow) throws NumericException;
 
-    protected abstract float parse(String str, int offset, int length, boolean rejectOverflow) throws NumericException;
+    protected abstract float parse(String str, int offset, int length) throws NumericException;
 }

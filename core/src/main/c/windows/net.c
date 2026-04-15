@@ -25,6 +25,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
+#include <stdint.h>
 #include "../share/net.h"
 #include "errno.h"
 
@@ -287,4 +288,58 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendTo
         SaveLastError();
     }
     return result;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendToScatter
+        (JNIEnv *e, jclass cl, jint fd, jlong segmentsPtr, jint segmentCount, jlong sockaddr) {
+    if (segmentCount <= 0) {
+        return 0;
+    }
+
+    // Stack-allocate for the common case (small segment count) to avoid
+    // a heap allocation on every UDP send.
+    #define STACK_BUF_COUNT 16
+    WSABUF stack_buffers[STACK_BUF_COUNT];
+    WSABUF *buffers;
+
+    if (segmentCount <= STACK_BUF_COUNT) {
+        buffers = stack_buffers;
+    } else {
+        buffers = calloc((size_t) segmentCount, sizeof(WSABUF));
+        if (buffers == NULL) {
+            WSASetLastError(WSA_NOT_ENOUGH_MEMORY);
+            SaveLastError();
+            return -1;
+        }
+    }
+
+    const char *segment = (const char *) segmentsPtr;
+    for (int i = 0; i < segmentCount; i++) {
+        buffers[i].buf = (CHAR *) (uintptr_t) (*(const jlong *) segment);
+        buffers[i].len = (ULONG) (*(const jlong *) (segment + 8));
+        segment += 16;
+    }
+
+    DWORD bytesSent = 0;
+    int result = WSASendTo(
+            (SOCKET) fd,
+            buffers,
+            (DWORD) segmentCount,
+            &bytesSent,
+            0,
+            (const struct sockaddr *) sockaddr,
+            sizeof(struct sockaddr_in),
+            NULL,
+            NULL
+    );
+    if (buffers != stack_buffers) {
+        free(buffers);
+    }
+
+    if (result == SOCKET_ERROR) {
+        SaveLastError();
+        return -1;
+    }
+    return (jint) bytesSent;
+    #undef STACK_BUF_COUNT
 }

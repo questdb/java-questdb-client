@@ -155,11 +155,6 @@ public final class DirectArray extends MutableArray implements Mutable {
         }
 
         @Override
-        public void putByte(byte value) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
         public void putDouble(double value) {
             assert ptr != 0 : "ptr == 0";
             assert appendOffset <= size - Double.BYTES : "appending beyond limit";
@@ -168,21 +163,11 @@ public final class DirectArray extends MutableArray implements Mutable {
         }
 
         @Override
-        public void putInt(int value) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
         public void putLong(long value) {
             assert ptr != 0 : "ptr == 0";
             assert appendOffset <= size - Long.BYTES : "appending beyond limit";
             Unsafe.getUnsafe().putLong(ptr + appendOffset, value);
             appendOffset += Long.BYTES;
-        }
-
-        @Override
-        public void skip(long bytes) {
-            throw new UnsupportedOperationException();
         }
     }
 }

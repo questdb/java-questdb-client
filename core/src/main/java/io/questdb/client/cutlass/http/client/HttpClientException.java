@@ -31,6 +31,7 @@ public class HttpClientException extends RuntimeException {
 
     private final StringSink message = new StringSink();
     private int errno = Integer.MIN_VALUE;
+    private boolean isTimeout;
 
     public HttpClientException(String message) {
         this.message.put(message);
@@ -51,6 +52,10 @@ public class HttpClientException extends RuntimeException {
             return errNoRender;
         }
         return errNoRender + " " + message;
+    }
+
+    public boolean isTimeout() {
+        return isTimeout;
     }
 
     public HttpClientException put(char value) {
@@ -75,6 +80,11 @@ public class HttpClientException extends RuntimeException {
 
     public HttpClientException putSize(long value) {
         message.putSize(value);
+        return this;
+    }
+
+    public HttpClientException flagAsTimeout() {
+        this.isTimeout = true;
         return this;
     }
 }

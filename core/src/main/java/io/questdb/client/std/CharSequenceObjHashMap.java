@@ -27,7 +27,6 @@ package io.questdb.client.std;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
-import java.util.Comparator;
 
 public class CharSequenceObjHashMap<V> extends AbstractCharSequenceHashSet {
     private final ObjList<CharSequence> list;
@@ -37,13 +36,9 @@ public class CharSequenceObjHashMap<V> extends AbstractCharSequenceHashSet {
         this(8);
     }
 
-    public CharSequenceObjHashMap(int initialCapacity) {
-        this(initialCapacity, 0.5);
-    }
-
     @SuppressWarnings("unchecked")
-    private CharSequenceObjHashMap(int initialCapacity, double loadFactor) {
-        super(initialCapacity, loadFactor);
+    public CharSequenceObjHashMap(int initialCapacity) {
+        super(initialCapacity, 0.5);
         this.list = new ObjList<>(capacity);
         values = (V[]) new Object[keys.length];
         clear();
@@ -73,10 +68,6 @@ public class CharSequenceObjHashMap<V> extends AbstractCharSequenceHashSet {
             return true;
         }
         return false;
-    }
-
-    public void sortKeys(Comparator<CharSequence> comparator) {
-        list.sort(comparator);
     }
 
     public V valueAt(int index) {

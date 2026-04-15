@@ -29,7 +29,6 @@ import io.questdb.client.std.str.Sinkable;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
-import java.util.Comparator;
 
 public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     private static final int DEFAULT_ARRAY_SIZE = 16;
@@ -39,13 +38,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     @SuppressWarnings("unchecked")
     public ObjList() {
         this.buffer = (T[]) new Object[DEFAULT_ARRAY_SIZE];
-    }
-
-    @SuppressWarnings("unchecked")
-    public ObjList(ObjList<? extends T> other) {
-        this.buffer = (T[]) new Object[Math.max(other.size(), DEFAULT_ARRAY_SIZE)];
-        setPos(other.size());
-        System.arraycopy(other.buffer, 0, this.buffer, 0, pos);
     }
 
     @SafeVarargs
@@ -64,14 +56,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     public void add(T value) {
         checkCapacity(pos + 1);
         buffer[pos++] = value;
-    }
-
-    public void addAll(ReadOnlyObjList<? extends T> that) {
-        int n = that.size();
-        checkCapacity(pos + n);
-        for (int i = 0; i < n; i++) {
-            buffer[pos++] = that.getQuick(i);
-        }
     }
 
     @SuppressWarnings("unchecked")
@@ -99,14 +83,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     @Override
     public boolean equals(Object that) {
         return this == that || that instanceof ObjList && equals((ObjList<?>) that);
-    }
-
-    public void extendAndSet(int index, T value) {
-        checkCapacity(index + 1);
-        if (index >= pos) {
-            pos = index + 1;
-        }
-        buffer[index] = value;
     }
 
     public T get(int index) {
@@ -215,14 +191,6 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
     @Override
     public int size() {
         return pos;
-    }
-
-    public void sort(Comparator<T> cmp) {
-        sort(0, pos, cmp);
-    }
-
-    public void sort(int from, int to, Comparator<T> cmp) {
-        Arrays.sort(buffer, from, to, cmp);
     }
 
     @Override

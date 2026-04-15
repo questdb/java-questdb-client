@@ -182,6 +182,14 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_setMulticastTtl
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendTo
         (JNIEnv *, jclass, jint, jlong, jint, jlong);
 
+/*
+ * Class:     io_questdb_client_network_Net
+ * Method:    sendToScatter
+ * Signature: (IJIJ)I
+ */
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_sendToScatter
+        (JNIEnv *, jclass, jint, jlong, jint, jlong);
+
 #ifdef __cplusplus
 }
 #endif

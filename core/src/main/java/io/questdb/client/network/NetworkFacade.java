@@ -55,6 +55,8 @@ public interface NetworkFacade {
 
     int sendToRaw(int fd, long lo, int len, long socketAddress);
 
+    int sendToRawScatter(int fd, long segmentsPtr, int segmentCount, long socketAddress);
+
     int setMulticastInterface(int fd, int ipv4Address);
 
     int setMulticastTtl(int fd, int ttl);

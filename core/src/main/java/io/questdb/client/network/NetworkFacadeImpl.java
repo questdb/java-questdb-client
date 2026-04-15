@@ -103,6 +103,11 @@ public class NetworkFacadeImpl implements NetworkFacade {
     }
 
     @Override
+    public int sendToRawScatter(int fd, long segmentsPtr, int segmentCount, long socketAddress) {
+        return Net.sendToScatter(fd, segmentsPtr, segmentCount, socketAddress);
+    }
+
+    @Override
     public int setMulticastInterface(int fd, int ipv4Address) {
         return Net.setMulticastInterface(fd, ipv4Address);
     }

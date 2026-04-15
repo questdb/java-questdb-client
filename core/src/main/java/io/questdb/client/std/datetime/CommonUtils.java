@@ -25,7 +25,6 @@
 package io.questdb.client.std.datetime;
 
 import io.questdb.client.std.NumericException;
-import io.questdb.client.std.str.Utf8Sequence;
 
 public class CommonUtils {
     public static final int[] DAYS_PER_MONTH = {
@@ -34,12 +33,6 @@ public class CommonUtils {
 
     public static void checkChar(CharSequence s, int p, int lim, char c) throws NumericException {
         if (p >= lim || s.charAt(p) != c) {
-            throw NumericException.instance();
-        }
-    }
-
-    public static void checkChar(Utf8Sequence s, int p, int lim, char c) throws NumericException {
-        if (p >= lim || s.byteAt(p) != c) {
             throw NumericException.instance();
         }
     }
@@ -74,12 +67,6 @@ public class CommonUtils {
 
     public static void checkSpecialChar(CharSequence s, int p, int lim) throws NumericException {
         if (p >= lim || (s.charAt(p) != 'T' && s.charAt(p) != ' ')) {
-            throw NumericException.instance();
-        }
-    }
-
-    public static void checkSpecialChar(Utf8Sequence s, int p, int lim) throws NumericException {
-        if (p >= lim || (s.byteAt(p) != 'T' && s.byteAt(p) != ' ')) {
             throw NumericException.instance();
         }
     }
@@ -145,10 +132,5 @@ public class CommonUtils {
             default:
                 throw NumericException.instance();
         }
-    }
-
-    @FunctionalInterface
-    public interface TimestampUnitConverter {
-        long convert(long timestamp);
     }
 }

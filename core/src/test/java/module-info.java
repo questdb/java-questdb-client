@@ -35,4 +35,6 @@ open module io.questdb.test {
 
     exports io.questdb.client.test;
     exports io.questdb.client.test.cairo;
+    exports io.questdb.client.test.cutlass.line;
+    exports io.questdb.client.test.cutlass.qwp.client;
 }

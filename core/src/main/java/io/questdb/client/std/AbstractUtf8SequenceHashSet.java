@@ -75,52 +75,6 @@ public abstract class AbstractUtf8SequenceHashSet implements Mutable {
         return probe(key, hashCode, index);
     }
 
-    public int remove(@NotNull Utf8Sequence key) {
-        int index = keyIndex(key);
-        if (index < 0) {
-            removeAt(index);
-            return -index - 1;
-        }
-        return -1;
-    }
-
-    public void removeAt(int index) {
-        if (index < 0) {
-            int from = -index - 1;
-            erase(from);
-            free++;
-
-            // after we have freed up a slot
-            // consider non-empty keys directly below
-            // they may have been a direct hit but because
-            // directly hit slot wasn't empty these keys would
-            // have moved.
-            //
-            // After slot if freed these keys require re-hash
-            from = (from + 1) & mask;
-            for (
-                    Utf8Sequence key = keys[from];
-                    key != noEntryKey;
-                    from = (from + 1) & mask, key = keys[from]
-            ) {
-                int hashCode = Utf8s.hashCode(key);
-                int idealHit = Hash.spread(hashCode) & mask;
-                if (idealHit != from) {
-                    int to;
-                    if (keys[idealHit] != noEntryKey) {
-                        to = probe(key, hashCode, idealHit);
-                    } else {
-                        to = idealHit;
-                    }
-
-                    if (to > -1) {
-                        move(from, to);
-                    }
-                }
-            }
-        }
-    }
-
     public int size() {
         return capacity - free;
     }

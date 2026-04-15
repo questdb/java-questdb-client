@@ -71,7 +71,7 @@ public final class Utf8s {
         final int lSize = l.size();
         return lSize == r.size()
                 && l.zeroPaddedSixPrefix() == r.zeroPaddedSixPrefix()
-                && dataEquals(l, r, VARCHAR_INLINED_PREFIX_BYTES, lSize);
+                && dataEquals(l, r, lSize);
     }
 
     public static boolean equalsAscii(@NotNull CharSequence asciiSeq, @NotNull Utf8Sequence seq) {
@@ -81,19 +81,6 @@ public final class Utf8s {
         }
         for (int index = 0; index < len; index++) {
             if (asciiSeq.charAt(index) != seq.byteAt(index)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    public static boolean equalsAscii(@NotNull CharSequence asciiSeq, long rLo, long rHi) {
-        int rLen = (int) (rHi - rLo);
-        if (rLen != asciiSeq.length()) {
-            return false;
-        }
-        for (int i = 0; i < rLen; i++) {
-            if (asciiSeq.charAt(i) != (char) Unsafe.getUnsafe().getByte(rLo + i)) {
                 return false;
             }
         }
@@ -170,12 +157,6 @@ public final class Utf8s {
         }
     }
 
-    public static void strCpy(long srcLo, long srcHi, @NotNull Utf8Sink dest) {
-        for (long i = srcLo; i < srcHi; i++) {
-            dest.putAny(Unsafe.getUnsafe().getByte(i));
-        }
-    }
-
     public static void strCpyAscii(char @NotNull [] srcChars, int srcLo, int srcLen, long destAddr) {
         for (int i = 0; i < srcLen; i++) {
             Unsafe.getUnsafe().putByte(destAddr + i, (byte) srcChars[i + srcLo]);
@@ -223,32 +204,6 @@ public final class Utf8s {
             throw CairoException.nonCritical().put("cannot convert invalid UTF-8 sequence to UTF-16 [seq=").put(seq).put(']');
         }
         return b.toString();
-    }
-
-    public static String stringFromUtf8BytesSafe(@NotNull Utf8Sequence seq) {
-        if (seq.size() == 0) {
-            return "";
-        }
-        Utf16Sink b = getThreadLocalSink();
-        utf8ToUtf16(seq, b);
-        return b.toString();
-    }
-
-    public static String toString(@Nullable Utf8Sequence s) {
-        return s == null ? null : s.toString();
-    }
-
-    public static String toString(@NotNull Utf8Sequence us, int start, int end, byte unescapeAscii) {
-        final Utf8Sink sink = getThreadLocalUtf8Sink();
-        final int lastChar = end - 1;
-        for (int i = start; i < end; i++) {
-            byte b = us.byteAt(i);
-            sink.putAny(b);
-            if (b == unescapeAscii && i < lastChar && us.byteAt(i + 1) == unescapeAscii) {
-                i++;
-            }
-        }
-        return sink.toString();
     }
 
     public static int utf8DecodeMultiByte(long lo, long hi, byte b, Utf16Sink sink) {
@@ -329,28 +284,6 @@ public final class Utf8s {
         return utf8ToUtf16(seq, 0, seq.size(), sink);
     }
 
-    public static int validateUtf8(@NotNull Utf8Sequence seq) {
-        if (seq.isAscii()) {
-            return seq.size();
-        }
-        int len = 0;
-        for (int i = 0, hi = seq.size(); i < hi; ) {
-            byte b = seq.byteAt(i);
-            if (b < 0) {
-                int n = validateUtf8MultiByte(seq, i, b);
-                if (n == -1) {
-                    // UTF-8 error
-                    return -1;
-                }
-                i += n;
-            } else {
-                ++i;
-            }
-            ++len;
-        }
-        return len;
-    }
-
     /**
      * Returns up to 6 initial bytes of the given UTF-8 sequence (less if it's shorter)
      * packed into a zero-padded long value, in little-endian order. This prefix is
@@ -374,8 +307,8 @@ public final class Utf8s {
         return result;
     }
 
-    private static boolean dataEquals(@NotNull Utf8Sequence l, @NotNull Utf8Sequence r, int start, int limit) {
-        int i = start;
+    private static boolean dataEquals(@NotNull Utf8Sequence l, @NotNull Utf8Sequence r, int limit) {
+        int i = VARCHAR_INLINED_PREFIX_BYTES;
         for (; i <= limit - Long.BYTES; i += Long.BYTES) {
             if (l.longAt(i) != r.longAt(i)) {
                 return false;
@@ -455,22 +388,6 @@ public final class Utf8s {
         sink.put(b2);
     }
 
-    private static int put3BytesSafe(byte b1, byte b2, byte b3, @NotNull Utf8Sink sink) {
-        if (!isMalformed3(b1, b2, b3)) {
-            char c = utf8ToChar(b1, b2, b3);
-            if (!Character.isSurrogate(c)) {
-                sink.put(b1);
-                sink.put(b2);
-                sink.put(b3);
-            }
-        } else {
-            putNonAsciiAsHex(sink, b1);
-            putNonAsciiAsHex(sink, b2);
-            putNonAsciiAsHex(sink, b3);
-        }
-        return 3;
-    }
-
     private static void put4ByteSafe(byte b1, byte b2, byte b3, byte b4, @NotNull Utf8Sink sink) {
         if (!isMalformed4(b2, b3, b4)) {
             final int codePoint = getUtf8Codepoint(b1, b2, b3, b4);
@@ -538,7 +455,19 @@ public final class Utf8s {
         if (hi - lo >= 3) {
             byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
             byte b3 = Unsafe.getUnsafe().getByte(lo + 2);
-            return put3BytesSafe(b1, b2, b3, sink);
+            if (!isMalformed3(b1, b2, b3)) {
+                char c = utf8ToChar(b1, b2, b3);
+                if (!Character.isSurrogate(c)) {
+                    sink.put(b1);
+                    sink.put(b2);
+                    sink.put(b3);
+                }
+            } else {
+                putNonAsciiAsHex(sink, b1);
+                putNonAsciiAsHex(sink, b2);
+                putNonAsciiAsHex(sink, b3);
+            }
+            return 3;
         }
         putNonAsciiAsHex(sink, b1);
         if (hi - lo > 1) {
@@ -674,61 +603,4 @@ public final class Utf8s {
         return utf8Decode4Bytes(seq, index, b, sink);
     }
 
-    private static int validateUtf8Decode2Bytes(@NotNull Utf8Sequence seq, int index) {
-        if (seq.size() - index < 2) {
-            return -1;
-        }
-        byte b2 = seq.byteAt(index + 1);
-        if (isNotContinuation(b2)) {
-            return -1;
-        }
-        return 2;
-    }
-
-    private static int validateUtf8Decode3Bytes(@NotNull Utf8Sequence seq, int index, byte b1) {
-        if (seq.size() - index < 3) {
-            return -1;
-        }
-        byte b2 = seq.byteAt(index + 1);
-        byte b3 = seq.byteAt(index + 2);
-
-        if (isMalformed3(b1, b2, b3)) {
-            return -1;
-        }
-
-        char c = utf8ToChar(b1, b2, b3);
-        if (Character.isSurrogate(c)) {
-            return -1;
-        }
-        return 3;
-    }
-
-    private static int validateUtf8Decode4Bytes(@NotNull Utf8Sequence seq, int index, int b) {
-        if (b >> 3 != -2 || seq.size() - index < 4) {
-            return -1;
-        }
-        byte b2 = seq.byteAt(index + 1);
-        byte b3 = seq.byteAt(index + 2);
-        byte b4 = seq.byteAt(index + 3);
-
-        if (isMalformed4(b2, b3, b4)) {
-            return -1;
-        }
-        final int codePoint = getUtf8Codepoint(b, b2, b3, b4);
-        if (!Character.isSupplementaryCodePoint(codePoint)) {
-            return -1;
-        }
-        return 4;
-    }
-
-    private static int validateUtf8MultiByte(Utf8Sequence seq, int index, byte b) {
-        if (b >> 5 == -2 && (b & 30) != 0) {
-            // we should allow 11000001, as it is a valid UTF8 byte?
-            return validateUtf8Decode2Bytes(seq, index);
-        }
-        if (b >> 4 == -2) {
-            return validateUtf8Decode3Bytes(seq, index, b);
-        }
-        return validateUtf8Decode4Bytes(seq, index, b);
-    }
 }
