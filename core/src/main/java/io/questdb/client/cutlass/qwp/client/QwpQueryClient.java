@@ -26,7 +26,10 @@ package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.impl.ConfStringParser;
+import io.questdb.client.std.Chars;
 import io.questdb.client.std.QuietCloseable;
+import io.questdb.client.std.str.StringSink;
 
 /**
  * QWP egress (query results) client.
@@ -44,12 +47,14 @@ import io.questdb.client.std.QuietCloseable;
 public class QwpQueryClient implements QuietCloseable {
 
     public static final String DEFAULT_ENDPOINT_PATH = "/read/v1";
+    public static final int DEFAULT_WS_PORT = 9000;
     public static final int QWP_MAX_VERSION = 1;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
     private final CharSequence host;
     private final int port;
     private String authorizationHeader;
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
+    private String clientId;
     private boolean connected;
     private String endpointPath = DEFAULT_ENDPOINT_PATH;
     private QwpEgressIoThread ioThread;
@@ -61,6 +66,112 @@ public class QwpQueryClient implements QuietCloseable {
     private QwpQueryClient(CharSequence host, int port) {
         this.host = host;
         this.port = port;
+    }
+
+    /**
+     * Builds a query client from a connection-string of the same shape used by
+     * {@link io.questdb.client.Sender#fromConfig(CharSequence)}: {@code <schema>::key=value;key=value;...}.
+     * <p>
+     * Supported schemas:
+     * <ul>
+     *   <li>{@code ws::} — plain WebSocket (matches QWP egress today; TLS not yet supported).</li>
+     * </ul>
+     * Supported keys:
+     * <ul>
+     *   <li>{@code addr=host[:port]} — required. Default port is {@value #DEFAULT_WS_PORT}.</li>
+     *   <li>{@code path=/read/v1} — egress endpoint. Default {@value #DEFAULT_ENDPOINT_PATH}.</li>
+     *   <li>{@code auth=<value>} — sent as the HTTP {@code Authorization} header during the upgrade handshake.</li>
+     *   <li>{@code client_id=<id>} — sent as the {@code X-QWP-Client-Id} header.</li>
+     *   <li>{@code buffer_pool_size=N} — depth of the I/O thread's batch buffer pool. Default 4.</li>
+     * </ul>
+     * Examples:
+     * <pre>
+     *   ws::addr=localhost:9000;
+     *   ws::addr=db.internal:9000;path=/read/v1;auth=Bearer abc123;client_id=dashboard/2.0;
+     * </pre>
+     */
+    public static QwpQueryClient fromConfig(CharSequence configurationString) {
+        if (configurationString == null || configurationString.length() == 0) {
+            throw new IllegalArgumentException("configuration string cannot be empty");
+        }
+        StringSink sink = new StringSink();
+        int pos = ConfStringParser.of(configurationString, sink);
+        if (pos < 0) {
+            throw new IllegalArgumentException("invalid configuration string: " + sink);
+        }
+        if (Chars.equals("wss", sink)) {
+            throw new IllegalArgumentException("wss:: (TLS) is not supported by QwpQueryClient yet");
+        }
+        if (!Chars.equals("ws", sink)) {
+            throw new IllegalArgumentException(
+                    "unsupported schema [schema=" + sink + ", supported-schemas=[ws]]");
+        }
+
+        String addrHost = null;
+        int addrPort = DEFAULT_WS_PORT;
+        String path = DEFAULT_ENDPOINT_PATH;
+        String auth = null;
+        String cid = null;
+        int poolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
+
+        while (ConfStringParser.hasNext(configurationString, pos)) {
+            pos = ConfStringParser.nextKey(configurationString, pos, sink);
+            if (pos < 0) {
+                throw new IllegalArgumentException("invalid configuration string [error=" + sink + "]");
+            }
+            String key = sink.toString();
+            pos = ConfStringParser.value(configurationString, pos, sink);
+            if (pos < 0) {
+                throw new IllegalArgumentException("invalid configuration string [error=" + sink + "]");
+            }
+            String value = sink.toString();
+            switch (key) {
+                case "addr": {
+                    int colon = value.indexOf(':');
+                    if (colon < 0) {
+                        addrHost = value;
+                    } else {
+                        addrHost = value.substring(0, colon);
+                        try {
+                            addrPort = Integer.parseInt(value.substring(colon + 1));
+                        } catch (NumberFormatException e) {
+                            throw new IllegalArgumentException("invalid port in addr: " + value);
+                        }
+                    }
+                    break;
+                }
+                case "path":
+                    path = value;
+                    break;
+                case "auth":
+                    auth = value;
+                    break;
+                case "client_id":
+                    cid = value;
+                    break;
+                case "buffer_pool_size":
+                    try {
+                        poolSize = Integer.parseInt(value);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("invalid buffer_pool_size: " + value);
+                    }
+                    if (poolSize < 1) {
+                        throw new IllegalArgumentException("buffer_pool_size must be >= 1");
+                    }
+                    break;
+                default:
+                    throw new IllegalArgumentException("unknown configuration key: " + key);
+            }
+        }
+        if (addrHost == null) {
+            throw new IllegalArgumentException("missing required key: addr");
+        }
+        QwpQueryClient client = new QwpQueryClient(addrHost, addrPort)
+                .withEndpointPath(path)
+                .withBufferPoolSize(poolSize);
+        if (auth != null) client.withAuthorization(auth);
+        if (cid != null) client.withClientId(cid);
+        return client;
     }
 
     /**
@@ -102,7 +213,7 @@ public class QwpQueryClient implements QuietCloseable {
         }
         webSocketClient = WebSocketClientFactory.newPlainTextInstance();
         webSocketClient.setQwpMaxVersion(QWP_MAX_VERSION);
-        webSocketClient.setQwpClientId(defaultClientId());
+        webSocketClient.setQwpClientId(clientId != null ? clientId : defaultClientId());
         webSocketClient.connect(host, port);
         webSocketClient.upgrade(endpointPath, authorizationHeader);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
@@ -177,6 +288,15 @@ public class QwpQueryClient implements QuietCloseable {
 
     public QwpQueryClient withAuthorization(String authorizationHeader) {
         this.authorizationHeader = authorizationHeader;
+        return this;
+    }
+
+    /**
+     * Overrides the {@code X-QWP-Client-Id} header sent during the upgrade handshake.
+     * Must be called before {@link #connect()}.
+     */
+    public QwpQueryClient withClientId(String clientId) {
+        this.clientId = clientId;
         return this;
     }
 
