@@ -27,28 +27,35 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.DirectUtf8String;
 
 import java.nio.charset.StandardCharsets;
 
 /**
- * Stateful decoder for inbound QWP egress frames (server → client).
+ * Zero-alloc (after warmup) decoder for inbound QWP egress {@code RESULT_BATCH} frames.
  * <p>
- * Reusable across batches on a single connection. Holds the connection-scoped
- * schema registry so schema-reference batches (mode 0x01) can be resolved back
- * to the full column list. Decoded values are materialised onto the heap for
- * Phase-1 simplicity; see the public getters on {@link QwpColumnBatch}.
+ * The decoder parses the payload in-place — no values are copied out of the
+ * WebSocket receive buffer. It maintains pooled {@link QwpColumnLayout} slots,
+ * per-column {@code int[]} index arrays, and per-column {@link DirectUtf8String}
+ * dict entries that are reused across batches. After the connection has seen
+ * its peak schema width and row count, decoding a batch allocates nothing on
+ * the JVM heap.
+ * <p>
+ * The produced {@link QwpColumnBatch} is valid only during the surrounding
+ * {@code onBatch} callback because its pointers refer into the caller's native
+ * payload buffer.
  */
 public class QwpResultBatchDecoder {
 
-    /**
-     * Sentinel used as the per-row "NULL" marker in the decoded value arrays.
-     */
-    public static final Object NULL = new Object();
-
-    private final QwpColumnBatch batch = new QwpColumnBatch();
-    // Registry indexed by schemaId. null = not registered. Non-null ObjList is the column list
-    // for that schema. Schema ids are server-assigned and small (monotonic from 0).
+    // Connection-scoped state (safe to share across buffers — reused across batches
+    // of the same query and across queries on the same connection).
+    // Registry indexed by schemaId. null = not registered. Schema ids are server-assigned
+    // and small (monotonic from 0).
     private final ObjList<ObjList<QwpEgressColumnInfo>> schemaRegistry = new ObjList<>();
+    // Reusable varint decode state: value in varintValue, new position in varintPos.
+    // Instance-level so no {@code long[2]} scratch is allocated per call.
+    private long varintPos;
+    private long varintValue;
 
     /**
      * Clears the per-connection schema registry. Call when reconnecting.
@@ -58,12 +65,16 @@ public class QwpResultBatchDecoder {
     }
 
     /**
-     * Decodes a RESULT_BATCH frame payload (starting with msg_kind=0x11 at {@code payload}).
-     * After success, {@link #getBatch()} returns a view over the decoded data valid until
-     * the next {@code decode()} call.
+     * Decodes the RESULT_BATCH frame whose payload has been copied into {@code buffer}.
+     * Populates {@code buffer.batch} and {@code buffer.layoutPool}. The resulting
+     * batch view stays valid as long as the buffer is not reused.
      */
-    public void decode(long payload, int payloadLen) throws QwpDecodeException {
-        if (payloadLen < QwpConstants.HEADER_SIZE + 10 /* msg_kind + reqId + min varint */) {
+    public void decode(QwpBatchBuffer buffer) throws QwpDecodeException {
+        decodePayload(buffer, buffer.getScratchAddr(), buffer.getPayloadLen());
+    }
+
+    private void decodePayload(QwpBatchBuffer buffer, long payload, int payloadLen) throws QwpDecodeException {
+        if (payloadLen < QwpConstants.HEADER_SIZE + 10) {
             throw new QwpDecodeException("RESULT_BATCH payload too short: " + payloadLen);
         }
         // Message header
@@ -75,7 +86,6 @@ public class QwpResultBatchDecoder {
         if (version != QwpConstants.VERSION_1) {
             throw new QwpDecodeException("unsupported version " + (version & 0xFF));
         }
-        // flags and table_count informational for Phase 1
         long p = payload + QwpConstants.HEADER_SIZE;
         long limit = payload + payloadLen;
 
@@ -86,46 +96,42 @@ public class QwpResultBatchDecoder {
         if (p + 8 > limit) throw new QwpDecodeException("truncated request_id");
         long requestId = Unsafe.getUnsafe().getLong(p);
         p += 8;
-        long[] varint = new long[2]; // [value, nextPos]
-        decodeVarint(p, limit, varint);
-        long batchSeq = varint[0];
-        p = varint[1];
+        decodeVarint(p, limit);
+        long batchSeq = varintValue;
+        p = varintPos;
 
         // Table block: name_length, name, row_count, column_count, schema, columns
-        decodeVarint(p, limit, varint);
-        long nameLen = varint[0];
-        p = varint[1];
+        decodeVarint(p, limit);
+        long nameLen = varintValue;
+        p = varintPos;
         if (p + nameLen > limit) throw new QwpDecodeException("truncated table name");
-        // Skip name — result sets carry empty names.
         p += nameLen;
 
-        decodeVarint(p, limit, varint);
-        int rowCount = (int) varint[0];
-        p = varint[1];
-        decodeVarint(p, limit, varint);
-        int columnCount = (int) varint[0];
-        p = varint[1];
+        decodeVarint(p, limit);
+        int rowCount = (int) varintValue;
+        p = varintPos;
+        decodeVarint(p, limit);
+        int columnCount = (int) varintValue;
+        p = varintPos;
 
         // Schema section
         if (p >= limit) throw new QwpDecodeException("truncated schema mode");
         byte schemaMode = Unsafe.getUnsafe().getByte(p++);
-        decodeVarint(p, limit, varint);
-        int schemaId = (int) varint[0];
-        p = varint[1];
+        decodeVarint(p, limit);
+        int schemaId = (int) varintValue;
+        p = varintPos;
 
         ObjList<QwpEgressColumnInfo> columns;
         if (schemaMode == QwpConstants.SCHEMA_MODE_FULL) {
             columns = ensureSchemaSlot(schemaId, columnCount);
             for (int i = 0; i < columnCount; i++) {
-                decodeVarint(p, limit, varint);
-                int colNameLen = (int) varint[0];
-                p = varint[1];
+                decodeVarint(p, limit);
+                int colNameLen = (int) varintValue;
+                p = varintPos;
                 if (p + colNameLen + 1 > limit) throw new QwpDecodeException("truncated column def");
                 String colName = readUtf8(p, colNameLen);
                 p += colNameLen;
                 byte wireType = Unsafe.getUnsafe().getByte(p++);
-                // Scale/precision are NOT in the schema — they're wire-level prefixes
-                // inside each column's data block. Placeholders here.
                 columns.getQuick(i).of(colName, wireType, 0, 0);
             }
         } else if (schemaMode == QwpConstants.SCHEMA_MODE_REFERENCE) {
@@ -140,332 +146,35 @@ public class QwpResultBatchDecoder {
             throw new QwpDecodeException("unknown schema mode 0x" + Integer.toHexString(schemaMode & 0xFF));
         }
 
-        // Column data
-        batch.reset(requestId, batchSeq, rowCount, columnCount, columns);
+        // Reset batch view and parse columns into per-column layouts owned by the buffer.
+        resetBatch(buffer, requestId, batchSeq, rowCount, columnCount, columns, payload, limit);
         for (int ci = 0; ci < columnCount; ci++) {
-            QwpEgressColumnInfo info = columns.getQuick(ci);
-            p = decodeColumn(p, limit, info, rowCount, batch.columnValues(ci));
+            QwpColumnLayout layout = borrowLayout(buffer.layoutPool, ci);
+            layout.clear();
+            layout.info = columns.getQuick(ci);
+            p = parseColumn(layout, rowCount, p, limit);
         }
-    }
-
-    /**
-     * Returns the view over the most recently decoded batch. Valid until the next
-     * {@link #decode(long, int)} call.
-     */
-    public QwpColumnBatch getBatch() {
-        return batch;
     }
 
     // -----------------------------------------------------------------------------
-    // Varint / bitmap helpers
+    // Pool helpers
     // -----------------------------------------------------------------------------
 
-    private static void decodeVarint(long p, long limit, long[] out) throws QwpDecodeException {
-        long value = 0;
-        int shift = 0;
-        long cur = p;
-        while (true) {
-            if (cur >= limit) throw new QwpDecodeException("truncated varint");
-            byte b = Unsafe.getUnsafe().getByte(cur++);
-            value |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) break;
-            shift += 7;
-            if (shift > 63) throw new QwpDecodeException("varint overflow");
+    private static QwpColumnLayout borrowLayout(ObjList<QwpColumnLayout> layoutPool, int colIdx) {
+        while (layoutPool.size() <= colIdx) {
+            layoutPool.add(new QwpColumnLayout());
         }
-        out[0] = value;
-        out[1] = cur;
+        return layoutPool.getQuick(colIdx);
     }
 
-    private static String readUtf8(long p, long len) {
-        byte[] bytes = new byte[(int) len];
-        for (int i = 0; i < len; i++) {
-            bytes[i] = Unsafe.getUnsafe().getByte(p + i);
-        }
-        return new String(bytes, StandardCharsets.UTF_8);
+    private static int[] ensureIntArray(int[] current, int size) {
+        if (current != null && current.length >= size) return current;
+        return new int[Math.max(size, current == null ? 16 : current.length * 2)];
     }
 
-    /**
-     * Reads the null flag byte and (if present) the bitmap. Populates the given boolean
-     * array (length = rowCount) with row-is-null flags. Returns the new position.
-     */
-    private static long readNullBitmap(long p, long limit, int rowCount, boolean[] nullFlags) throws QwpDecodeException {
-        if (p >= limit) throw new QwpDecodeException("truncated null flag");
-        byte flag = Unsafe.getUnsafe().getByte(p++);
-        java.util.Arrays.fill(nullFlags, 0, rowCount, false);
-        if (flag == 0) return p;
-        int bytes = (rowCount + 7) >>> 3;
-        if (p + bytes > limit) throw new QwpDecodeException("truncated null bitmap");
-        for (int i = 0; i < rowCount; i++) {
-            int bi = i >>> 3;
-            int bit = i & 7;
-            byte bm = Unsafe.getUnsafe().getByte(p + bi);
-            if ((bm & (1 << bit)) != 0) {
-                nullFlags[i] = true;
-            }
-        }
-        return p + bytes;
-    }
-
-    // -----------------------------------------------------------------------------
-    // Per-column decoders
-    // -----------------------------------------------------------------------------
-
-    private long decodeColumn(long p, long limit, QwpEgressColumnInfo info, int rowCount, Object[] values)
-            throws QwpDecodeException {
-        boolean[] nullFlags = new boolean[rowCount];
-        p = readNullBitmap(p, limit, rowCount, nullFlags);
-        byte wt = info.wireType;
-        if (wt == QwpConstants.TYPE_BOOLEAN) {
-            int nonNull = 0;
-            for (int i = 0; i < rowCount; i++) if (!nullFlags[i]) nonNull++;
-            int bytes = (nonNull + 7) >>> 3;
-            if (p + bytes > limit) throw new QwpDecodeException("truncated BOOLEAN");
-            int bitIdx = 0;
-            for (int i = 0; i < rowCount; i++) {
-                if (nullFlags[i]) {
-                    values[i] = null;
-                    continue;
-                }
-                byte bm = Unsafe.getUnsafe().getByte(p + (bitIdx >>> 3));
-                values[i] = ((bm & (1 << (bitIdx & 7))) != 0) ? Boolean.TRUE : Boolean.FALSE;
-                bitIdx++;
-            }
-            return p + bytes;
-        }
-        if (wt == QwpConstants.TYPE_BYTE) return decodeFixed(p, limit, rowCount, 1, nullFlags, values);
-        if (wt == QwpConstants.TYPE_SHORT || wt == QwpConstants.TYPE_CHAR) {
-            return decodeFixed(p, limit, rowCount, 2, nullFlags, values);
-        }
-        if (wt == QwpConstants.TYPE_INT) return decodeFixed(p, limit, rowCount, 4, nullFlags, values);
-        if (wt == QwpConstants.TYPE_FLOAT) return decodeFloat(p, limit, rowCount, nullFlags, values);
-        if (wt == QwpConstants.TYPE_LONG || wt == QwpConstants.TYPE_DATE
-                || wt == QwpConstants.TYPE_TIMESTAMP || wt == QwpConstants.TYPE_TIMESTAMP_NANOS) {
-            return decodeFixed(p, limit, rowCount, 8, nullFlags, values);
-        }
-        if (wt == QwpConstants.TYPE_DOUBLE) return decodeDouble(p, limit, rowCount, nullFlags, values);
-        if (wt == QwpConstants.TYPE_STRING || wt == QwpConstants.TYPE_VARCHAR) {
-            return decodeString(p, limit, rowCount, nullFlags, values, wt == QwpConstants.TYPE_STRING);
-        }
-        if (wt == QwpConstants.TYPE_SYMBOL) return decodeSymbol(p, limit, rowCount, nullFlags, values);
-        if (wt == QwpConstants.TYPE_UUID) return decodeFixedPair(p, limit, rowCount, nullFlags, values);
-        if (wt == QwpConstants.TYPE_LONG256) return decodeFixedQuad(p, limit, rowCount, nullFlags, values);
-        if (wt == QwpConstants.TYPE_GEOHASH) {
-            long[] varint = new long[2];
-            decodeVarint(p, limit, varint);
-            info.precisionBits = (int) varint[0];
-            p = varint[1];
-            int bytesPerValue = (info.precisionBits + 7) >>> 3;
-            for (int i = 0; i < rowCount; i++) {
-                if (nullFlags[i]) {
-                    values[i] = null;
-                    continue;
-                }
-                if (p + bytesPerValue > limit) throw new QwpDecodeException("truncated GEOHASH");
-                long bits = 0;
-                for (int b = 0; b < bytesPerValue; b++) {
-                    bits |= ((long) (Unsafe.getUnsafe().getByte(p + b) & 0xFF)) << (b * 8);
-                }
-                values[i] = bits;
-                p += bytesPerValue;
-            }
-            return p;
-        }
-        if (wt == QwpConstants.TYPE_DECIMAL64) {
-            if (p >= limit) throw new QwpDecodeException("truncated DECIMAL64 scale");
-            info.scale = Unsafe.getUnsafe().getByte(p++) & 0xFF;
-            return decodeFixed(p, limit, rowCount, 8, nullFlags, values);
-        }
-        if (wt == QwpConstants.TYPE_DECIMAL128) {
-            if (p >= limit) throw new QwpDecodeException("truncated DECIMAL128 scale");
-            info.scale = Unsafe.getUnsafe().getByte(p++) & 0xFF;
-            return decodeFixedPair(p, limit, rowCount, nullFlags, values);
-        }
-        if (wt == QwpConstants.TYPE_DECIMAL256) {
-            if (p >= limit) throw new QwpDecodeException("truncated DECIMAL256 scale");
-            info.scale = Unsafe.getUnsafe().getByte(p++) & 0xFF;
-            return decodeFixedQuad(p, limit, rowCount, nullFlags, values);
-        }
-        if (wt == QwpConstants.TYPE_DOUBLE_ARRAY || wt == QwpConstants.TYPE_LONG_ARRAY) {
-            return decodeArray(p, limit, rowCount, nullFlags, values);
-        }
-        throw new QwpDecodeException("unsupported wire type 0x" + Integer.toHexString(wt & 0xFF));
-    }
-
-    private long decodeFixed(long p, long limit, int rowCount, int sizeBytes, boolean[] nullFlags, Object[] values)
-            throws QwpDecodeException {
-        for (int i = 0; i < rowCount; i++) {
-            if (nullFlags[i]) {
-                values[i] = null;
-                continue;
-            }
-            if (p + sizeBytes > limit) throw new QwpDecodeException("truncated fixed column");
-            long v;
-            switch (sizeBytes) {
-                case 1: v = Unsafe.getUnsafe().getByte(p); break;
-                case 2: v = Unsafe.getUnsafe().getShort(p); break;
-                case 4: v = Unsafe.getUnsafe().getInt(p); break;
-                case 8: v = Unsafe.getUnsafe().getLong(p); break;
-                default: throw new IllegalStateException();
-            }
-            values[i] = v;
-            p += sizeBytes;
-        }
-        return p;
-    }
-
-    private long decodeFloat(long p, long limit, int rowCount, boolean[] nullFlags, Object[] values)
-            throws QwpDecodeException {
-        for (int i = 0; i < rowCount; i++) {
-            if (nullFlags[i]) {
-                values[i] = null;
-                continue;
-            }
-            if (p + 4 > limit) throw new QwpDecodeException("truncated FLOAT");
-            values[i] = Float.intBitsToFloat(Unsafe.getUnsafe().getInt(p));
-            p += 4;
-        }
-        return p;
-    }
-
-    private long decodeDouble(long p, long limit, int rowCount, boolean[] nullFlags, Object[] values)
-            throws QwpDecodeException {
-        for (int i = 0; i < rowCount; i++) {
-            if (nullFlags[i]) {
-                values[i] = null;
-                continue;
-            }
-            if (p + 8 > limit) throw new QwpDecodeException("truncated DOUBLE");
-            values[i] = Double.longBitsToDouble(Unsafe.getUnsafe().getLong(p));
-            p += 8;
-        }
-        return p;
-    }
-
-    private long decodeFixedPair(long p, long limit, int rowCount, boolean[] nullFlags, Object[] values)
-            throws QwpDecodeException {
-        for (int i = 0; i < rowCount; i++) {
-            if (nullFlags[i]) {
-                values[i] = null;
-                continue;
-            }
-            if (p + 16 > limit) throw new QwpDecodeException("truncated 16-byte value");
-            long lo = Unsafe.getUnsafe().getLong(p);
-            long hi = Unsafe.getUnsafe().getLong(p + 8);
-            values[i] = new long[]{lo, hi};
-            p += 16;
-        }
-        return p;
-    }
-
-    private long decodeFixedQuad(long p, long limit, int rowCount, boolean[] nullFlags, Object[] values)
-            throws QwpDecodeException {
-        for (int i = 0; i < rowCount; i++) {
-            if (nullFlags[i]) {
-                values[i] = null;
-                continue;
-            }
-            if (p + 32 > limit) throw new QwpDecodeException("truncated 32-byte value");
-            values[i] = new long[]{
-                    Unsafe.getUnsafe().getLong(p),
-                    Unsafe.getUnsafe().getLong(p + 8),
-                    Unsafe.getUnsafe().getLong(p + 16),
-                    Unsafe.getUnsafe().getLong(p + 24)
-            };
-            p += 32;
-        }
-        return p;
-    }
-
-    private long decodeString(long p, long limit, int rowCount, boolean[] nullFlags, Object[] values, boolean utf16)
-            throws QwpDecodeException {
-        int nonNull = 0;
-        for (int i = 0; i < rowCount; i++) if (!nullFlags[i]) nonNull++;
-        int offsetBytes = 4 * (nonNull + 1);
-        if (p + offsetBytes > limit) throw new QwpDecodeException("truncated string offsets");
-        long offsetsAddr = p;
-        long bytesStart = p + offsetBytes;
-
-        int nonNullIdx = 0;
-        for (int i = 0; i < rowCount; i++) {
-            if (nullFlags[i]) {
-                values[i] = null;
-                continue;
-            }
-            int startOff = Unsafe.getUnsafe().getInt(offsetsAddr + 4L * nonNullIdx);
-            int endOff = Unsafe.getUnsafe().getInt(offsetsAddr + 4L * (nonNullIdx + 1));
-            int len = endOff - startOff;
-            if (bytesStart + endOff > limit || len < 0) throw new QwpDecodeException("truncated string bytes");
-            if (utf16) {
-                values[i] = readUtf8(bytesStart + startOff, len);
-            } else {
-                byte[] raw = new byte[len];
-                for (int b = 0; b < len; b++) {
-                    raw[b] = Unsafe.getUnsafe().getByte(bytesStart + startOff + b);
-                }
-                values[i] = raw;
-            }
-            nonNullIdx++;
-        }
-        int totalStringBytes = nonNull == 0 ? 0 : Unsafe.getUnsafe().getInt(offsetsAddr + 4L * nonNull);
-        return bytesStart + totalStringBytes;
-    }
-
-    private long decodeSymbol(long p, long limit, int rowCount, boolean[] nullFlags, Object[] values)
-            throws QwpDecodeException {
-        long[] varint = new long[2];
-        decodeVarint(p, limit, varint);
-        int dictSize = (int) varint[0];
-        p = varint[1];
-        String[] dict = new String[dictSize];
-        for (int e = 0; e < dictSize; e++) {
-            decodeVarint(p, limit, varint);
-            int entryLen = (int) varint[0];
-            p = varint[1];
-            if (p + entryLen > limit) throw new QwpDecodeException("truncated symbol entry");
-            dict[e] = readUtf8(p, entryLen);
-            p += entryLen;
-        }
-        for (int i = 0; i < rowCount; i++) {
-            if (nullFlags[i]) {
-                values[i] = null;
-                continue;
-            }
-            decodeVarint(p, limit, varint);
-            int idx = (int) varint[0];
-            p = varint[1];
-            if (idx < 0 || idx >= dictSize) throw new QwpDecodeException("symbol index out of range: " + idx);
-            values[i] = dict[idx];
-        }
-        return p;
-    }
-
-    private long decodeArray(long p, long limit, int rowCount, boolean[] nullFlags, Object[] values)
-            throws QwpDecodeException {
-        for (int i = 0; i < rowCount; i++) {
-            if (nullFlags[i]) {
-                values[i] = null;
-                continue;
-            }
-            if (p + 1 > limit) throw new QwpDecodeException("truncated ARRAY");
-            int nDims = Unsafe.getUnsafe().getByte(p) & 0xFF;
-            long headerEnd = p + 1 + 4L * nDims;
-            if (headerEnd > limit) throw new QwpDecodeException("truncated ARRAY dims");
-            int elements = 1;
-            for (int d = 0; d < nDims; d++) {
-                int dl = Unsafe.getUnsafe().getInt(p + 1 + 4L * d);
-                elements *= dl;
-            }
-            long payloadEnd = headerEnd + 8L * elements;
-            if (payloadEnd > limit) throw new QwpDecodeException("truncated ARRAY payload");
-            int totalLen = (int) (payloadEnd - p);
-            byte[] raw = new byte[totalLen];
-            for (int b = 0; b < totalLen; b++) {
-                raw[b] = Unsafe.getUnsafe().getByte(p + b);
-            }
-            values[i] = raw;
-            p = payloadEnd;
-        }
-        return p;
+    private static long[] ensureLongArray(long[] current, int size) {
+        if (current != null && current.length >= size) return current;
+        return new long[Math.max(size, current == null ? 16 : current.length * 2)];
     }
 
     private ObjList<QwpEgressColumnInfo> ensureSchemaSlot(int schemaId, int columnCount) {
@@ -489,5 +198,258 @@ public class QwpResultBatchDecoder {
             slot.setPos(columnCount);
         }
         return slot;
+    }
+
+    // -----------------------------------------------------------------------------
+    // Varint / string helpers
+    // -----------------------------------------------------------------------------
+
+    /**
+     * Decodes a varint starting at {@code p}. Stores the decoded value in
+     * {@link #varintValue} and the position just past the varint in
+     * {@link #varintPos}. Caller reads both before issuing the next varint call.
+     */
+    private void decodeVarint(long p, long limit) throws QwpDecodeException {
+        long value = 0;
+        int shift = 0;
+        long cur = p;
+        while (true) {
+            if (cur >= limit) throw new QwpDecodeException("truncated varint");
+            byte b = Unsafe.getUnsafe().getByte(cur++);
+            value |= (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) break;
+            shift += 7;
+            if (shift > 63) throw new QwpDecodeException("varint overflow");
+        }
+        varintValue = value;
+        varintPos = cur;
+    }
+
+    private static String readUtf8(long p, long len) {
+        byte[] bytes = new byte[(int) len];
+        for (int i = 0; i < len; i++) {
+            bytes[i] = Unsafe.getUnsafe().getByte(p + i);
+        }
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    // -----------------------------------------------------------------------------
+    // Per-column parse: advances through wire bytes, populates layout pointers,
+    // precomputes nonNullIdx for O(1) per-row access.
+    // -----------------------------------------------------------------------------
+
+    /**
+     * Reads the null flag and bitmap, populates {@code layout.nullBitmapAddr} and
+     * {@code layout.nonNullCount}, and fills {@code layout.nonNullIdx[0..rowCount)}
+     * with dense indices (or -1 for NULL rows). Returns the position just past
+     * the null section.
+     */
+    private long parseNullSection(QwpColumnLayout layout, int rowCount, long p, long limit) throws QwpDecodeException {
+        if (p >= limit) throw new QwpDecodeException("truncated null flag");
+        byte flag = Unsafe.getUnsafe().getByte(p++);
+        layout.nonNullIdx = ensureIntArray(layout.nonNullIdx, rowCount);
+        if (flag == 0) {
+            layout.nullBitmapAddr = 0;
+            layout.nonNullCount = rowCount;
+            for (int i = 0; i < rowCount; i++) layout.nonNullIdx[i] = i;
+            return p;
+        }
+        int bitmapBytes = (rowCount + 7) >>> 3;
+        if (p + bitmapBytes > limit) throw new QwpDecodeException("truncated null bitmap");
+        layout.nullBitmapAddr = p;
+        int denseIdx = 0;
+        for (int i = 0; i < rowCount; i++) {
+            int bi = i >>> 3;
+            int bit = i & 7;
+            byte bm = Unsafe.getUnsafe().getByte(p + bi);
+            if ((bm & (1 << bit)) != 0) {
+                layout.nonNullIdx[i] = -1;
+            } else {
+                layout.nonNullIdx[i] = denseIdx++;
+            }
+        }
+        layout.nonNullCount = denseIdx;
+        return p + bitmapBytes;
+    }
+
+    private long parseColumn(QwpColumnLayout layout, int rowCount, long p, long limit) throws QwpDecodeException {
+        p = parseNullSection(layout, rowCount, p, limit);
+        byte wt = layout.info.wireType;
+        if (wt == QwpConstants.TYPE_BOOLEAN) {
+            layout.valuesAddr = p;
+            int bytes = (layout.nonNullCount + 7) >>> 3;
+            if (p + bytes > limit) throw new QwpDecodeException("truncated BOOLEAN");
+            return p + bytes;
+        }
+        if (wt == QwpConstants.TYPE_BYTE) return advanceFixed(layout, p, limit, 1);
+        if (wt == QwpConstants.TYPE_SHORT || wt == QwpConstants.TYPE_CHAR) return advanceFixed(layout, p, limit, 2);
+        if (wt == QwpConstants.TYPE_INT || wt == QwpConstants.TYPE_FLOAT) return advanceFixed(layout, p, limit, 4);
+        if (wt == QwpConstants.TYPE_LONG || wt == QwpConstants.TYPE_DOUBLE
+                || wt == QwpConstants.TYPE_DATE
+                || wt == QwpConstants.TYPE_TIMESTAMP || wt == QwpConstants.TYPE_TIMESTAMP_NANOS) {
+            return advanceFixed(layout, p, limit, 8);
+        }
+        if (wt == QwpConstants.TYPE_DECIMAL64) {
+            if (p >= limit) throw new QwpDecodeException("truncated DECIMAL64 scale");
+            layout.info.scale = Unsafe.getUnsafe().getByte(p++) & 0xFF;
+            return advanceFixed(layout, p, limit, 8);
+        }
+        if (wt == QwpConstants.TYPE_UUID) return advanceFixed(layout, p, limit, 16);
+        if (wt == QwpConstants.TYPE_DECIMAL128) {
+            if (p >= limit) throw new QwpDecodeException("truncated DECIMAL128 scale");
+            layout.info.scale = Unsafe.getUnsafe().getByte(p++) & 0xFF;
+            return advanceFixed(layout, p, limit, 16);
+        }
+        if (wt == QwpConstants.TYPE_LONG256) return advanceFixed(layout, p, limit, 32);
+        if (wt == QwpConstants.TYPE_DECIMAL256) {
+            if (p >= limit) throw new QwpDecodeException("truncated DECIMAL256 scale");
+            layout.info.scale = Unsafe.getUnsafe().getByte(p++) & 0xFF;
+            return advanceFixed(layout, p, limit, 32);
+        }
+        if (wt == QwpConstants.TYPE_STRING || wt == QwpConstants.TYPE_VARCHAR) {
+            return parseStringColumn(layout, p, limit);
+        }
+        if (wt == QwpConstants.TYPE_SYMBOL) {
+            return parseSymbolColumn(layout, rowCount, p, limit);
+        }
+        if (wt == QwpConstants.TYPE_GEOHASH) {
+            decodeVarint(p, limit);
+            layout.info.precisionBits = (int) varintValue;
+            p = varintPos;
+            int bytesPerValue = (layout.info.precisionBits + 7) >>> 3;
+            layout.valuesAddr = p;
+            long total = (long) bytesPerValue * layout.nonNullCount;
+            if (p + total > limit) throw new QwpDecodeException("truncated GEOHASH");
+            return p + total;
+        }
+        if (wt == QwpConstants.TYPE_DOUBLE_ARRAY || wt == QwpConstants.TYPE_LONG_ARRAY) {
+            return parseArrayColumn(layout, rowCount, p, limit);
+        }
+        throw new QwpDecodeException("unsupported wire type 0x" + Integer.toHexString(wt & 0xFF));
+    }
+
+    private static long advanceFixed(QwpColumnLayout layout, long p, long limit, int sizeBytes) throws QwpDecodeException {
+        layout.valuesAddr = p;
+        long total = (long) sizeBytes * layout.nonNullCount;
+        if (p + total > limit) throw new QwpDecodeException("truncated fixed-width column");
+        return p + total;
+    }
+
+    /**
+     * STRING / VARCHAR: the offsets array is (nonNullCount+1) × uint32 starting at {@code p},
+     * followed by the concatenated UTF-8 bytes.
+     */
+    private static long parseStringColumn(QwpColumnLayout layout, long p, long limit) throws QwpDecodeException {
+        int nonNull = layout.nonNullCount;
+        long offsetsSize = 4L * (nonNull + 1);
+        if (p + offsetsSize > limit) throw new QwpDecodeException("truncated string offsets");
+        layout.valuesAddr = p;
+        layout.stringBytesAddr = p + offsetsSize;
+        int totalBytes = nonNull == 0 ? 0 : Unsafe.getUnsafe().getInt(p + 4L * nonNull);
+        if (layout.stringBytesAddr + totalBytes > limit) {
+            throw new QwpDecodeException("truncated string bytes");
+        }
+        return layout.stringBytesAddr + totalBytes;
+    }
+
+    /**
+     * SYMBOL: per-table dictionary (dict_size varint, then len+bytes per entry),
+     * then per-non-null-row varint indices into the dict.
+     */
+    private long parseSymbolColumn(QwpColumnLayout layout, int rowCount, long p, long limit) throws QwpDecodeException {
+        decodeVarint(p, limit);
+        int dictSize = (int) varintValue;
+        p = varintPos;
+        // Ensure pool size
+        while (layout.symbolDict.size() < dictSize) {
+            layout.symbolDict.add(new DirectUtf8String());
+        }
+        for (int e = 0; e < dictSize; e++) {
+            decodeVarint(p, limit);
+            int entryLen = (int) varintValue;
+            p = varintPos;
+            if (p + entryLen > limit) throw new QwpDecodeException("truncated symbol entry");
+            layout.symbolDict.getQuick(e).of(p, p + entryLen);
+            p += entryLen;
+        }
+        layout.symbolDictSize = dictSize;
+        // Materialise per-row IDs into int[rowCount] so random access is O(1).
+        layout.symbolRowIds = ensureIntArray(layout.symbolRowIds, rowCount);
+        for (int i = 0; i < rowCount; i++) {
+            int denseIdx = layout.nonNullIdx[i];
+            if (denseIdx < 0) continue; // NULL row; leave slot stale
+            decodeVarint(p, limit);
+            p = varintPos;
+            int id = (int) varintValue;
+            if (id < 0 || id >= dictSize) {
+                throw new QwpDecodeException("symbol index out of range: " + id);
+            }
+            layout.symbolRowIds[i] = id;
+        }
+        layout.valuesAddr = 0; // Not applicable; accessors use symbolRowIds + symbolDict.
+        return p;
+    }
+
+    /**
+     * DOUBLE_ARRAY / LONG_ARRAY: each non-null row stores nDims (u8) + dimLens (nDims × i32)
+     * + flattened values (8 bytes each). We precompute per-row (addr, len) for O(1) access.
+     */
+    private long parseArrayColumn(QwpColumnLayout layout, int rowCount, long p, long limit) throws QwpDecodeException {
+        layout.arrayRowAddr = ensureLongArray(layout.arrayRowAddr, rowCount);
+        layout.arrayRowLen = ensureIntArray(layout.arrayRowLen, rowCount);
+        layout.valuesAddr = p;
+        for (int i = 0; i < rowCount; i++) {
+            if (layout.nonNullIdx[i] < 0) {
+                layout.arrayRowAddr[i] = 0;
+                layout.arrayRowLen[i] = 0;
+                continue;
+            }
+            if (p + 1 > limit) throw new QwpDecodeException("truncated ARRAY header");
+            int nDims = Unsafe.getUnsafe().getByte(p) & 0xFF;
+            long headerEnd = p + 1 + 4L * nDims;
+            if (headerEnd > limit) throw new QwpDecodeException("truncated ARRAY dims");
+            int elements = 1;
+            for (int d = 0; d < nDims; d++) {
+                int dl = Unsafe.getUnsafe().getInt(p + 1 + 4L * d);
+                elements *= dl;
+            }
+            long rowEnd = headerEnd + 8L * elements;
+            if (rowEnd > limit) throw new QwpDecodeException("truncated ARRAY payload");
+            layout.arrayRowAddr[i] = p;
+            layout.arrayRowLen[i] = (int) (rowEnd - p);
+            p = rowEnd;
+        }
+        return p;
+    }
+
+    // -----------------------------------------------------------------------------
+    // Batch reset
+    // -----------------------------------------------------------------------------
+
+    private void resetBatch(
+            QwpBatchBuffer buffer,
+            long requestId,
+            long batchSeq,
+            int rowCount,
+            int columnCount,
+            ObjList<QwpEgressColumnInfo> columns,
+            long payloadAddr,
+            long payloadLimit
+    ) {
+        QwpColumnBatch batch = buffer.batch;
+        batch.requestId = requestId;
+        batch.batchSeq = batchSeq;
+        batch.rowCount = rowCount;
+        batch.columnCount = columnCount;
+        batch.columns = columns;
+        batch.payloadAddr = payloadAddr;
+        batch.payloadLimit = payloadLimit;
+        // Surface the buffer-owned layouts to the batch view
+        while (batch.columnLayouts.size() < columnCount) {
+            batch.columnLayouts.add(null);
+        }
+        for (int i = 0; i < columnCount; i++) {
+            batch.columnLayouts.setQuick(i, borrowLayout(buffer.layoutPool, i));
+        }
     }
 }

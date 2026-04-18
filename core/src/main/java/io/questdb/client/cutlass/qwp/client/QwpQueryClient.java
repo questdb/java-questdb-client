@@ -26,45 +26,34 @@ package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
-import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
-import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
-import io.questdb.client.std.Misc;
 import io.questdb.client.std.QuietCloseable;
-import io.questdb.client.std.Unsafe;
-
-import java.nio.charset.StandardCharsets;
 
 /**
- * QWP egress (query results) client. Phase-1 skeleton: connects to /read/v1,
- * negotiates the QWP protocol version, and closes cleanly.
+ * QWP egress (query results) client.
  * <p>
- * Thread safety: not thread-safe. A single instance should be used from one thread.
+ * Connection shape: one WebSocket to {@code /read/v1}, one dedicated I/O thread
+ * that owns the socket and the decoder. The user thread submits a query and
+ * drains result batches via the supplied {@link QwpColumnBatchHandler}; the
+ * I/O thread reads and decodes ahead so that decoding of batch {@code N+1}
+ * overlaps with the user's processing of batch {@code N}.
  * <p>
- * Query execution wiring (QUERY_REQUEST encoding, RESULT_BATCH decoding, column-batch
- * handler dispatch) is added in subsequent commits; this skeleton exists so the
- * WebSocket upgrade to /read/v1 can be exercised end-to-end against the server.
+ * Thread safety: not thread-safe for concurrent queries on the same client.
+ * One {@link #execute} at a time. Opening one client per query-issuing thread
+ * is the recommended pattern.
  */
 public class QwpQueryClient implements QuietCloseable {
 
-    /**
-     * Default endpoint path for QWP egress on the QuestDB HTTP server.
-     */
     public static final String DEFAULT_ENDPOINT_PATH = "/read/v1";
-
-    /**
-     * Default QWP protocol version requested by this client.
-     */
     public static final int QWP_MAX_VERSION = 1;
-
-    private final QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-    private final QwpFrameRouter frameRouter = new QwpFrameRouter();
+    private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
     private final CharSequence host;
     private final int port;
-    private final NativeBufferWriter sendScratch = new NativeBufferWriter();
     private String authorizationHeader;
+    private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private boolean connected;
-    private int defaultTimeoutMillis = 30_000;
     private String endpointPath = DEFAULT_ENDPOINT_PATH;
+    private QwpEgressIoThread ioThread;
+    private Thread ioThreadHandle;
     private int negotiatedQwpVersion;
     private long nextRequestId = 1;
     private WebSocketClient webSocketClient;
@@ -84,7 +73,19 @@ public class QwpQueryClient implements QuietCloseable {
     @Override
     public void close() {
         connected = false;
-        Misc.free(sendScratch);
+        if (ioThread != null) {
+            ioThread.shutdown();
+            if (ioThreadHandle != null) {
+                try {
+                    ioThreadHandle.join(5_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            ioThread.closePool();
+            ioThread = null;
+            ioThreadHandle = null;
+        }
         if (webSocketClient != null) {
             webSocketClient.close();
             webSocketClient = null;
@@ -92,35 +93,7 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Executes {@code sql} against the server and delivers result batches to the handler.
-     * <p>
-     * Blocks until the server sends either {@code RESULT_END} or {@code QUERY_ERROR}.
-     * The handler's {@code onBatch}, {@code onEnd}, {@code onError} callbacks run on
-     * the calling thread during {@code receiveFrame} processing.
-     * <p>
-     * Phase 1: no bind parameters, no CREDIT (server streams unbounded).
-     */
-    public void execute(String sql, QwpColumnBatchHandler handler) {
-        if (!connected) {
-            throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
-        }
-        long requestId = nextRequestId++;
-        writeQueryRequest(sql, requestId);
-        webSocketClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
-        sendScratch.reset();
-
-        frameRouter.of(handler, decoder, requestId);
-        while (!frameRouter.isDone()) {
-            boolean got = webSocketClient.receiveFrame(frameRouter, defaultTimeoutMillis);
-            if (!got) {
-                handler.onError((byte) 0, "timeout waiting for server response");
-                break;
-            }
-        }
-    }
-
-    /**
-     * Opens the TCP connection and performs the WebSocket upgrade handshake.
+     * Opens the TCP connection, performs the WebSocket upgrade, and spawns the I/O thread.
      * Must be called before any query is submitted.
      */
     public void connect() {
@@ -133,7 +106,53 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.connect(host, port);
         webSocketClient.upgrade(endpointPath, authorizationHeader);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
+
+        ioThread = new QwpEgressIoThread(webSocketClient, bufferPoolSize);
+        ioThreadHandle = new Thread(ioThread, "qwp-egress-io");
+        ioThreadHandle.setDaemon(true);
+        ioThreadHandle.start();
         connected = true;
+    }
+
+    /**
+     * Executes {@code sql} and drives the supplied handler through the result stream.
+     * <p>
+     * Blocks the calling thread until the server sends {@code RESULT_END} or
+     * {@code QUERY_ERROR}. While the user thread is inside {@code handler.onBatch},
+     * the I/O thread keeps reading and decoding ahead up to the configured buffer-pool depth.
+     */
+    public void execute(String sql, QwpColumnBatchHandler handler) {
+        if (!connected) {
+            throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
+        }
+        long requestId = nextRequestId++;
+        try {
+            ioThread.submitQuery(sql, requestId);
+            while (true) {
+                QueryEvent ev = ioThread.takeEvent();
+                switch (ev.kind) {
+                    case QueryEvent.KIND_BATCH:
+                        try {
+                            handler.onBatch(ev.buffer.batch);
+                        } finally {
+                            ioThread.releaseBuffer(ev.buffer);
+                        }
+                        break;
+                    case QueryEvent.KIND_END:
+                        handler.onEnd(ev.totalRows);
+                        return;
+                    case QueryEvent.KIND_ERROR:
+                        handler.onError(ev.errorStatus, ev.errorMessage);
+                        return;
+                    default:
+                        handler.onError((byte) 0, "unknown event kind " + ev.kind);
+                        return;
+                }
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            handler.onError((byte) 0, "interrupted while waiting for server response");
+        }
     }
 
     public int getNegotiatedQwpVersion() {
@@ -145,18 +164,22 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Sets the HTTP Authorization header used during the upgrade handshake.
+     * Overrides the default I/O buffer pool depth (4). Larger pools let the
+     * I/O thread decode further ahead of the consumer at the cost of memory;
+     * smaller pools reduce memory but may stall the I/O thread on slow consumers.
      * Must be called before {@link #connect()}.
      */
+    public QwpQueryClient withBufferPoolSize(int size) {
+        if (size < 1) throw new IllegalArgumentException("bufferPoolSize must be >= 1");
+        this.bufferPoolSize = size;
+        return this;
+    }
+
     public QwpQueryClient withAuthorization(String authorizationHeader) {
         this.authorizationHeader = authorizationHeader;
         return this;
     }
 
-    /**
-     * Overrides the default egress endpoint path ({@value #DEFAULT_ENDPOINT_PATH}).
-     * Must be called before {@link #connect()}.
-     */
     public QwpQueryClient withEndpointPath(String endpointPath) {
         this.endpointPath = endpointPath;
         return this;
@@ -164,119 +187,5 @@ public class QwpQueryClient implements QuietCloseable {
 
     private static String defaultClientId() {
         return "questdb-java-egress/1.0.0";
-    }
-
-    /**
-     * Encodes a {@code QUERY_REQUEST} into {@link #sendScratch} at position 0.
-     * Layout: msg_kind + request_id + sql_len (varint) + sql (UTF-8) +
-     * initial_credit (varint) + bind_count (varint).
-     */
-    private void writeQueryRequest(String sql, long requestId) {
-        byte[] sqlBytes = sql.getBytes(StandardCharsets.UTF_8);
-        sendScratch.reset();
-        sendScratch.putByte(QwpEgressMsgKind.QUERY_REQUEST);
-        sendScratch.putLong(requestId);
-        sendScratch.putVarint(sqlBytes.length);
-        for (byte b : sqlBytes) {
-            sendScratch.putByte(b);
-        }
-        sendScratch.putVarint(0); // initial_credit = 0 (unbounded)
-        sendScratch.putVarint(0); // bind_count = 0
-    }
-
-    /**
-     * WebSocket frame handler that decodes QWP egress responses and dispatches to the
-     * user-supplied {@link QwpColumnBatchHandler}. Reused across {@code execute()} calls.
-     */
-    private static final class QwpFrameRouter implements WebSocketFrameHandler {
-        private QwpResultBatchDecoder decoder;
-        private boolean done;
-        private QwpColumnBatchHandler handler;
-        private long requestId;
-
-        public boolean isDone() {
-            return done;
-        }
-
-        @Override
-        public void onBinaryMessage(long payloadPtr, int payloadLen) {
-            if (payloadLen < QwpConstants.HEADER_SIZE + 1) {
-                handler.onError((byte) 0, "server sent short frame (" + payloadLen + " bytes)");
-                done = true;
-                return;
-            }
-            byte msgKind = Unsafe.getUnsafe().getByte(payloadPtr + QwpConstants.HEADER_SIZE);
-            if (msgKind == QwpEgressMsgKind.RESULT_BATCH) {
-                try {
-                    decoder.decode(payloadPtr, payloadLen);
-                    handler.onBatch(decoder.getBatch());
-                } catch (QwpDecodeException e) {
-                    handler.onError((byte) 0, e.getMessage());
-                    done = true;
-                }
-            } else if (msgKind == QwpEgressMsgKind.RESULT_END) {
-                long totalRows = decodeResultEnd(payloadPtr, payloadLen);
-                handler.onEnd(totalRows);
-                done = true;
-            } else if (msgKind == QwpEgressMsgKind.QUERY_ERROR) {
-                decodeQueryError(payloadPtr, payloadLen);
-                done = true;
-            } else {
-                handler.onError((byte) 0, "unknown msg_kind 0x" + Integer.toHexString(msgKind & 0xFF));
-                done = true;
-            }
-        }
-
-        @Override
-        public void onClose(int code, String reason) {
-            if (!done) {
-                handler.onError((byte) 0, "server closed connection: code=" + code + " reason=" + reason);
-                done = true;
-            }
-        }
-
-        public void of(QwpColumnBatchHandler handler, QwpResultBatchDecoder decoder, long requestId) {
-            this.handler = handler;
-            this.decoder = decoder;
-            this.requestId = requestId;
-            this.done = false;
-        }
-
-        private void decodeQueryError(long payload, int payloadLen) {
-            // Body: msg_kind(1) + requestId(8) + status(1) + msgLen(u16) + msgBytes
-            long p = payload + QwpConstants.HEADER_SIZE + 1 /* kind */ + 8 /* reqId */;
-            byte status = Unsafe.getUnsafe().getByte(p);
-            p += 1;
-            int msgLen = Unsafe.getUnsafe().getShort(p) & 0xFFFF;
-            p += 2;
-            byte[] bytes = new byte[msgLen];
-            for (int i = 0; i < msgLen; i++) {
-                bytes[i] = Unsafe.getUnsafe().getByte(p + i);
-            }
-            handler.onError(status, new String(bytes, StandardCharsets.UTF_8));
-        }
-
-        /**
-         * RESULT_END body: msg_kind(1) + requestId(8) + final_seq(varint) + total_rows(varint).
-         * We only need total_rows, so walk past the first two varints.
-         */
-        private long decodeResultEnd(long payload, int payloadLen) {
-            long p = payload + QwpConstants.HEADER_SIZE + 1 /* kind */ + 8 /* reqId */;
-            long limit = payload + payloadLen;
-            // Skip final_seq varint.
-            while (p < limit && (Unsafe.getUnsafe().getByte(p++) & 0x80) != 0) {
-                // continuation
-            }
-            // Decode total_rows varint.
-            long total = 0;
-            int shift = 0;
-            while (p < limit) {
-                byte b = Unsafe.getUnsafe().getByte(p++);
-                total |= (long) (b & 0x7F) << shift;
-                if ((b & 0x80) == 0) break;
-                shift += 7;
-            }
-            return total;
-        }
     }
 }
