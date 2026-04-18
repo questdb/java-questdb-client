@@ -88,6 +88,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     public void onBinaryMessage(long payloadPtr, int payloadLen) {
         if (payloadLen < QwpConstants.HEADER_SIZE + 1) {
             emitError((byte) 0, "server sent truncated frame");
+            // Stop the receive loop; the framing is broken and any further bytes
+            // would be misinterpreted relative to the expected message boundary.
+            currentQueryDone = true;
             return;
         }
         byte msgKind = Unsafe.getUnsafe().getByte(payloadPtr + QwpConstants.HEADER_SIZE);

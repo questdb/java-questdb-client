@@ -253,7 +253,6 @@ public class QwpColumnBatch {
         return Unsafe.getUnsafe().getLong(l.valuesAddr + 32L * l.nonNullIdx[row] + 8L * wordIndex);
     }
 
-    // =============================================================================
     // Raw column-address API — for zero-branch hot inner loops.
     //
     // Typical usage:
@@ -266,7 +265,6 @@ public class QwpColumnBatch {
     //   }
     //
     // All four accessors return constant-time views; no allocation.
-    // =============================================================================
 
     /**
      * Number of non-null rows in this column, i.e. the count of entries in the

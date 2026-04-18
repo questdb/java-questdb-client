@@ -156,9 +156,7 @@ public class QwpResultBatchDecoder {
         }
     }
 
-    // -----------------------------------------------------------------------------
     // Pool helpers
-    // -----------------------------------------------------------------------------
 
     private static QwpColumnLayout borrowLayout(ObjList<QwpColumnLayout> layoutPool, int colIdx) {
         while (layoutPool.size() <= colIdx) {
@@ -200,9 +198,7 @@ public class QwpResultBatchDecoder {
         return slot;
     }
 
-    // -----------------------------------------------------------------------------
     // Varint / string helpers
-    // -----------------------------------------------------------------------------
 
     /**
      * Decodes a varint starting at {@code p}. Stores the decoded value in
@@ -233,10 +229,8 @@ public class QwpResultBatchDecoder {
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
-    // -----------------------------------------------------------------------------
     // Per-column parse: advances through wire bytes, populates layout pointers,
     // precomputes nonNullIdx for O(1) per-row access.
-    // -----------------------------------------------------------------------------
 
     /**
      * Reads the null flag and bitmap, populates {@code layout.nullBitmapAddr} and
@@ -394,6 +388,13 @@ public class QwpResultBatchDecoder {
      * DOUBLE_ARRAY / LONG_ARRAY: each non-null row stores nDims (u8) + dimLens (nDims × i32)
      * + flattened values (8 bytes each). We precompute per-row (addr, len) for O(1) access.
      */
+    /**
+     * Cap on per-row ARRAY element count. 8 bytes per element × this ≈ 256 MB max payload,
+     * which fits in {@code int} once {@code rowEnd - p} is computed. A malicious or buggy
+     * server cannot push a negative or wrap-around length past this guard.
+     */
+    private static final long MAX_ARRAY_ELEMENTS = (Integer.MAX_VALUE - 1024) / 8L;
+
     private long parseArrayColumn(QwpColumnLayout layout, int rowCount, long p, long limit) throws QwpDecodeException {
         layout.arrayRowAddr = ensureLongArray(layout.arrayRowAddr, rowCount);
         layout.arrayRowLen = ensureIntArray(layout.arrayRowLen, rowCount);
@@ -408,10 +409,15 @@ public class QwpResultBatchDecoder {
             int nDims = Unsafe.getUnsafe().getByte(p) & 0xFF;
             long headerEnd = p + 1 + 4L * nDims;
             if (headerEnd > limit) throw new QwpDecodeException("truncated ARRAY dims");
-            int elements = 1;
+            long elements = 1;
             for (int d = 0; d < nDims; d++) {
                 int dl = Unsafe.getUnsafe().getInt(p + 1 + 4L * d);
+                if (dl < 0) throw new QwpDecodeException("ARRAY dim " + d + " is negative: " + dl);
                 elements *= dl;
+                if (elements > MAX_ARRAY_ELEMENTS) {
+                    throw new QwpDecodeException("ARRAY element count exceeds limit ("
+                            + elements + " > " + MAX_ARRAY_ELEMENTS + ")");
+                }
             }
             long rowEnd = headerEnd + 8L * elements;
             if (rowEnd > limit) throw new QwpDecodeException("truncated ARRAY payload");
@@ -422,9 +428,7 @@ public class QwpResultBatchDecoder {
         return p;
     }
 
-    // -----------------------------------------------------------------------------
     // Batch reset
-    // -----------------------------------------------------------------------------
 
     private void resetBatch(
             QwpBatchBuffer buffer,
