@@ -50,6 +50,13 @@ public class QwpQueryClient implements QuietCloseable {
     public static final int DEFAULT_WS_PORT = 9000;
     public static final int QWP_MAX_VERSION = 1;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
+    /**
+     * Maximum time {@link #close()} will wait for the I/O thread to exit before giving up
+     * and leaking the (daemon) thread + its native buffer pool + WebSocket socket. 5 seconds
+     * is generous given the I/O thread polls on a 100 ms cadence; if it overshoots this,
+     * something is seriously wrong (e.g., user handler stuck in onBatch).
+     */
+    private static final long SHUTDOWN_JOIN_MS = 5_000;
     private final CharSequence host;
     private final int port;
     private String authorizationHeader;
@@ -59,6 +66,7 @@ public class QwpQueryClient implements QuietCloseable {
     private String endpointPath = DEFAULT_ENDPOINT_PATH;
     private QwpEgressIoThread ioThread;
     private Thread ioThreadHandle;
+    private boolean lastCloseTimedOut;
     private int negotiatedQwpVersion;
     private long nextRequestId = 1;
     private WebSocketClient webSocketClient;
@@ -181,16 +189,45 @@ public class QwpQueryClient implements QuietCloseable {
         return new QwpQueryClient(host, port);
     }
 
+    /**
+     * Shutdown order: signal the I/O thread, interrupt it to wake it from any blocking
+     * {@code wsClient.receiveFrame(...)} or queue poll, wait for it to exit, then free
+     * the buffer pool and close the underlying socket.
+     * <p>
+     * If the I/O thread fails to exit within {@link #SHUTDOWN_JOIN_MS} (default 5 s), this
+     * method does <em>not</em> free the buffer pool or close the WebSocket — both are
+     * still in use by the thread, and freeing them would race into a JVM-killing
+     * use-after-free. The thread is a daemon, so the JVM still exits normally; the
+     * resources leak for the lifetime of the process. A warning is recorded by setting
+     * {@link #lastCloseTimedOut} (queryable via {@link #wasLastCloseTimedOut}) so callers
+     * can detect and report the condition.
+     */
     @Override
     public void close() {
         connected = false;
+        lastCloseTimedOut = false;
         if (ioThread != null) {
             ioThread.shutdown();
+            // Wake the thread from any blocking poll / recv so it sees the shutdown flag promptly.
             if (ioThreadHandle != null) {
+                ioThreadHandle.interrupt();
+                boolean joined = false;
                 try {
-                    ioThreadHandle.join(5_000);
+                    ioThreadHandle.join(SHUTDOWN_JOIN_MS);
+                    joined = !ioThreadHandle.isAlive();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    // Don't free anything — preserve clean shutdown semantics on the next attempt.
+                    return;
+                }
+                if (!joined) {
+                    // Daemon thread is still running — buffer pool and WebSocketClient may
+                    // be in use. Leak them rather than risk a SIGSEGV by freeing under it.
+                    lastCloseTimedOut = true;
+                    ioThread = null;
+                    ioThreadHandle = null;
+                    webSocketClient = null;
+                    return;
                 }
             }
             ioThread.closePool();
@@ -201,6 +238,16 @@ public class QwpQueryClient implements QuietCloseable {
             webSocketClient.close();
             webSocketClient = null;
         }
+    }
+
+    /**
+     * Returns true if the most recent {@link #close()} call abandoned the I/O thread
+     * because it failed to exit within the join timeout. The native buffer pool and
+     * WebSocket socket are leaked for the lifetime of the JVM; the daemon I/O thread
+     * keeps running until process exit.
+     */
+    public boolean wasLastCloseTimedOut() {
+        return lastCloseTimedOut;
     }
 
     /**

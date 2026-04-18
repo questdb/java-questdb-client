@@ -423,6 +423,17 @@ public class QwpColumnBatch {
         return lookupStringBytes(col, row, varcharB);
     }
 
+    /**
+     * True if the cell is NULL on the wire.
+     * <p>
+     * Note on type-specific sentinels (see {@code docs/QWP_EGRESS_EXTENSION.md} §11.5):
+     * QuestDB stores NULL as a sentinel value for several types — {@code Long.MIN_VALUE}
+     * for LONG/INT/etc., {@code 0.0.0.0} for IPv4, {@code -1} for GEOHASH, and crucially
+     * {@code NaN} for FLOAT and DOUBLE. Egress preserves these conventions: a row carrying
+     * NaN in a DOUBLE column will return {@code true} from this method. Callers who need
+     * to distinguish "real NaN" from "explicit NULL" cannot do so over the wire — both
+     * map to the same null bitmap bit.
+     */
     public boolean isNull(int col, int row) {
         return isLayoutNull(columnLayouts.getQuick(col), row);
     }
