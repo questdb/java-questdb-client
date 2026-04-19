@@ -71,9 +71,15 @@ public class QwpColumnLayout {
     long stringBytesAddr;
 
     /**
-     * SYMBOL: decoded dictionary entries as reusable native views into the payload.
+     * SYMBOL: decoded dictionary entries as reusable native views.
+     * <p>
+     * Without {@code FLAG_DELTA_SYMBOL_DICT}, this is a per-batch list of
+     * {@link DirectUtf8String}s pointing INTO the current payload buffer (valid
+     * only for the lifetime of that buffer). With the flag set, the decoder
+     * replaces this reference with its connection-scoped list, whose entries
+     * point into a heap owned by the decoder that survives across batches.
      */
-    final ObjList<DirectUtf8String> symbolDict = new ObjList<>();
+    ObjList<DirectUtf8String> symbolDict = new ObjList<>();
 
     /**
      * SYMBOL: number of valid entries in {@link #symbolDict} for this batch.

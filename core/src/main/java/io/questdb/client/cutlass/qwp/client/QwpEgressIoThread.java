@@ -316,6 +316,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      */
     void closePool() {
         Misc.free(sendScratch);
+        Misc.free(decoder);
         QueryEvent ev;
         while ((ev = events.poll()) != null) {
             if (ev.kind == QueryEvent.KIND_BATCH && ev.buffer != null) {

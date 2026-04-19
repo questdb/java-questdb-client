@@ -25,7 +25,9 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.DirectUtf8String;
 
@@ -45,7 +47,7 @@ import java.nio.charset.StandardCharsets;
  * {@code onBatch} callback because its pointers refer into the caller's native
  * payload buffer.
  */
-public class QwpResultBatchDecoder {
+public class QwpResultBatchDecoder implements QuietCloseable {
 
     /**
      * Cap on per-row ARRAY element count. 8 bytes per element x this ~ 256 MB max payload,
@@ -70,15 +72,39 @@ public class QwpResultBatchDecoder {
      * a negative varint that long-to-int casts negative).
      */
     private static final int MAX_SCHEMAS_PER_CONNECTION = 65_535;
+    private static final int CONN_DICT_INITIAL_BYTES = 4096;
     // Connection-scoped state (safe to share across buffers -- reused across batches
     // of the same query and across queries on the same connection).
+    // Connection-scoped SYMBOL dictionary. Populated by {@link #parseDeltaSymbolDict}
+    // from the per-message delta section; the bytes live in a native heap owned by
+    // the decoder ({@link #connDictHeapAddr}) so DirectUtf8String views stay valid
+    // across batches (unlike per-batch flyweights which expire when the WS recv
+    // buffer recycles). Grows but never shrinks; freed on {@link #close}.
+    private final ObjList<DirectUtf8String> connSymDict = new ObjList<>();
     // Registry indexed by schemaId. null = not registered. Schema ids are server-assigned
     // and small (monotonic from 0).
     private final ObjList<ObjList<QwpEgressColumnInfo>> schemaRegistry = new ObjList<>();
+    private long connDictHeapAddr;
+    private int connDictHeapCapacity;
+    private int connDictHeapPos;
+    // True when the current message carries {@code FLAG_DELTA_SYMBOL_DICT}. Read by
+    // {@link #parseSymbolColumn} to decide whether to consume a per-column dict.
+    private boolean deltaMode;
     // Reusable varint decode state: value in varintValue, new position in varintPos.
     // Instance-level so no {@code long[2]} scratch is allocated per call.
     private long varintPos;
     private long varintValue;
+
+    @Override
+    public void close() {
+        if (connDictHeapAddr != 0) {
+            Unsafe.free(connDictHeapAddr, connDictHeapCapacity, MemoryTag.NATIVE_DEFAULT);
+            connDictHeapAddr = 0;
+            connDictHeapCapacity = 0;
+            connDictHeapPos = 0;
+        }
+        connSymDict.clear();
+    }
 
     /**
      * Decodes the RESULT_BATCH frame whose payload has been copied into {@code buffer}.
@@ -124,6 +150,26 @@ public class QwpResultBatchDecoder {
     private static long[] ensureLongArray(long[] current, int size) {
         if (current != null && current.length >= size) return current;
         return new long[Math.max(size, current == null ? 16 : current.length * 2)];
+    }
+
+    private void ensureConnDictHeapCapacity(int required) {
+        if (connDictHeapCapacity >= required) return;
+        int newCap = Math.max(connDictHeapCapacity * 2, Math.max(CONN_DICT_INITIAL_BYTES, required));
+        connDictHeapAddr = Unsafe.realloc(connDictHeapAddr, connDictHeapCapacity, newCap, MemoryTag.NATIVE_DEFAULT);
+        // Any existing DirectUtf8String views that point into the old memory are
+        // invalidated by realloc (the OS may move the mapping). Repoint every
+        // entry at its original offset in the fresh heap.
+        if (connDictHeapCapacity != newCap) {
+            long base = connDictHeapAddr;
+            int prevEnd = 0;
+            for (int i = 0, n = connSymDict.size(); i < n; i++) {
+                DirectUtf8String entry = connSymDict.getQuick(i);
+                int entryLen = entry.size();
+                entry.of(base + prevEnd, base + prevEnd + entryLen);
+                prevEnd += entryLen;
+            }
+        }
+        connDictHeapCapacity = newCap;
     }
 
     // Varint / string helpers
@@ -173,6 +219,8 @@ public class QwpResultBatchDecoder {
         if (version != QwpConstants.VERSION_1) {
             throw new QwpDecodeException("unsupported version " + (version & 0xFF));
         }
+        byte flags = Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS);
+        deltaMode = (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0;
         long p = payload + QwpConstants.HEADER_SIZE;
         long limit = payload + payloadLen;
 
@@ -186,6 +234,13 @@ public class QwpResultBatchDecoder {
         decodeVarint(p, limit);
         long batchSeq = varintValue;
         p = varintPos;
+
+        // Delta section (if enabled) sits right after the prelude and before the
+        // table block. We consume it first so that SYMBOL columns inside the
+        // table block resolve indices against the freshly-updated connection dict.
+        if (deltaMode) {
+            p = parseDeltaSymbolDict(p, limit);
+        }
 
         // Table block: name_length, name, row_count, column_count, schema, columns
         decodeVarint(p, limit);
@@ -397,6 +452,56 @@ public class QwpResultBatchDecoder {
     }
 
     /**
+     * Parses the message-level delta symbol dictionary section present when
+     * {@code FLAG_DELTA_SYMBOL_DICT} is set. Copies newly-seen symbol bytes into
+     * the decoder's connection-scoped native heap and appends {@code DirectUtf8String}
+     * views over them to {@link #connSymDict}.
+     * <pre>
+     *   [deltaStartId: varint]
+     *   [deltaCount:   varint]
+     *   for each new entry: [length: varint][UTF-8 bytes]
+     * </pre>
+     * The server is required to emit {@code deltaStartId == connSymDict.size()}
+     * (otherwise the two ends are out of sync and we bail rather than silently
+     * corrupt the dict). Returns the wire position just past the section.
+     */
+    private long parseDeltaSymbolDict(long p, long limit) throws QwpDecodeException {
+        decodeVarint(p, limit);
+        long deltaStart = varintValue;
+        p = varintPos;
+        decodeVarint(p, limit);
+        long deltaCount = varintValue;
+        p = varintPos;
+        if (deltaStart < 0 || deltaCount < 0
+                || deltaStart + deltaCount > Integer.MAX_VALUE) {
+            throw new QwpDecodeException("delta symbol section out of range: start="
+                    + deltaStart + ", count=" + deltaCount);
+        }
+        if (deltaStart != connSymDict.size()) {
+            throw new QwpDecodeException("delta symbol dict out of sync: expected start="
+                    + connSymDict.size() + ", got=" + deltaStart);
+        }
+        for (long i = 0; i < deltaCount; i++) {
+            decodeVarint(p, limit);
+            long entryLen = varintValue;
+            p = varintPos;
+            if (entryLen < 0 || p + entryLen > limit) {
+                throw new QwpDecodeException("truncated delta symbol entry");
+            }
+            int len = (int) entryLen;
+            ensureConnDictHeapCapacity(connDictHeapPos + len);
+            long dst = connDictHeapAddr + connDictHeapPos;
+            Unsafe.getUnsafe().copyMemory(p, dst, len);
+            DirectUtf8String entry = new DirectUtf8String();
+            entry.of(dst, dst + len);
+            connSymDict.add(entry);
+            connDictHeapPos += len;
+            p += len;
+        }
+        return p;
+    }
+
+    /**
      * Reads the null flag and bitmap, populates {@code layout.nullBitmapAddr} and
      * {@code layout.nonNullCount}, and fills {@code layout.nonNullIdx[0..rowCount)}
      * with dense indices (or -1 for NULL rows). Returns the position just past
@@ -431,24 +536,35 @@ public class QwpResultBatchDecoder {
     }
 
     /**
-     * SYMBOL: per-table dictionary (dict_size varint, then len+bytes per entry),
-     * then per-non-null-row varint indices into the dict.
+     * SYMBOL: in delta mode (always, with the current server) there's no per-column
+     * dictionary -- indices reference the connection-scoped {@link #connSymDict}
+     * populated by {@link #parseDeltaSymbolDict}. In non-delta mode the column
+     * carries its own dict: (dict_size varint, then len+bytes per entry), followed
+     * by per-non-null-row varint indices.
      */
     private long parseSymbolColumn(QwpColumnLayout layout, int rowCount, long p, long limit) throws QwpDecodeException {
-        decodeVarint(p, limit);
-        int dictSize = (int) varintValue;
-        p = varintPos;
-        // Ensure pool size
-        while (layout.symbolDict.size() < dictSize) {
-            layout.symbolDict.add(new DirectUtf8String());
-        }
-        for (int e = 0; e < dictSize; e++) {
+        final int dictSize;
+        if (deltaMode) {
+            // Point the column's dict at the connection-scoped list; size is
+            // whatever the dict has grown to across all batches on this connection.
+            layout.symbolDict = connSymDict;
+            dictSize = connSymDict.size();
+        } else {
             decodeVarint(p, limit);
-            int entryLen = (int) varintValue;
+            dictSize = (int) varintValue;
             p = varintPos;
-            if (p + entryLen > limit) throw new QwpDecodeException("truncated symbol entry");
-            layout.symbolDict.getQuick(e).of(p, p + entryLen);
-            p += entryLen;
+            // Ensure pool size
+            while (layout.symbolDict.size() < dictSize) {
+                layout.symbolDict.add(new DirectUtf8String());
+            }
+            for (int e = 0; e < dictSize; e++) {
+                decodeVarint(p, limit);
+                int entryLen = (int) varintValue;
+                p = varintPos;
+                if (p + entryLen > limit) throw new QwpDecodeException("truncated symbol entry");
+                layout.symbolDict.getQuick(e).of(p, p + entryLen);
+                p += entryLen;
+            }
         }
         layout.symbolDictSize = dictSize;
         // Materialise per-row IDs into int[rowCount] so random access is O(1).
