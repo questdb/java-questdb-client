@@ -122,6 +122,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             long total = decodeResultEnd(payloadPtr, payloadLen);
             events.offer(new QueryEvent().asEnd(total));
             currentQueryDone = true;
+        } else if (msgKind == QwpEgressMsgKind.EXEC_DONE) {
+            decodeAndEmitExecDone(payloadPtr, payloadLen);
+            currentQueryDone = true;
         } else if (msgKind == QwpEgressMsgKind.QUERY_ERROR) {
             decodeAndEmitError(payloadPtr, payloadLen);
             currentQueryDone = true;
@@ -213,6 +216,33 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private void decodeAndEmitError(long payload, int payloadLen) {
         QueryEvent ev = decodeError(payload, payloadLen);
         events.offer(ev);
+    }
+
+    /**
+     * EXEC_DONE body: msg_kind(1) + requestId(8) + op_type(1) + rows_affected(varint).
+     * Parses all fields, surfaces as a {@link QueryEvent#KIND_EXEC_DONE} event.
+     */
+    private void decodeAndEmitExecDone(long payload, int payloadLen) {
+        long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
+        long limit = payload + payloadLen;
+        if (p + 1 > limit) {
+            emitError((byte) 0, "EXEC_DONE frame truncated before op_type");
+            return;
+        }
+        byte opType = Unsafe.getUnsafe().getByte(p++);
+        long rowsAffected = 0;
+        int shift = 0;
+        while (p < limit) {
+            byte b = Unsafe.getUnsafe().getByte(p++);
+            rowsAffected |= (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) break;
+            shift += 7;
+            if (shift > 63) {
+                emitError((byte) 0, "EXEC_DONE rows_affected varint overflow");
+                return;
+            }
+        }
+        events.offer(new QueryEvent().asExecDone(opType, rowsAffected));
     }
 
     /**

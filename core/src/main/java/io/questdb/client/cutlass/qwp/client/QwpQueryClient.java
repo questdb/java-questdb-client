@@ -309,6 +309,9 @@ public class QwpQueryClient implements QuietCloseable {
                     case QueryEvent.KIND_END:
                         handler.onEnd(ev.totalRows);
                         return;
+                    case QueryEvent.KIND_EXEC_DONE:
+                        handler.onExecDone(ev.opType, ev.rowsAffected);
+                        return;
                     case QueryEvent.KIND_ERROR:
                         handler.onError(ev.errorStatus, ev.errorMessage);
                         return;

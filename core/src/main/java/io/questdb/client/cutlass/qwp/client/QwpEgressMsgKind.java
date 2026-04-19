@@ -32,6 +32,11 @@ package io.questdb.client.cutlass.qwp.client;
 public final class QwpEgressMsgKind {
     public static final byte CANCEL = 0x14;
     public static final byte CREDIT = 0x15;
+    /**
+     * Server -> client. Ack for a successful non-SELECT query. Body:
+     * {@code request_id:u64, op_type:u8, rows_affected:varint}.
+     */
+    public static final byte EXEC_DONE = 0x16;
     public static final byte QUERY_ERROR = 0x13;
     public static final byte QUERY_REQUEST = 0x10;
     public static final byte RESULT_BATCH = 0x11;

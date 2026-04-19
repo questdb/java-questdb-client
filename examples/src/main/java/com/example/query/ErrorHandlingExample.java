@@ -15,7 +15,7 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  * Status codes mirror the ingress namespace. For egress the common ones are:
  * <ul>
  *   <li>{@code 0x03 SCHEMA_MISMATCH}  — bind parameter type doesn't match the placeholder</li>
- *   <li>{@code 0x05 PARSE_ERROR}      — SQL syntax error OR non-SELECT statement</li>
+ *   <li>{@code 0x05 PARSE_ERROR}      — SQL syntax error OR unsupported statement on the endpoint</li>
  *   <li>{@code 0x06 INTERNAL_ERROR}   — unexpected server-side failure</li>
  *   <li>{@code 0x08 SECURITY_ERROR}   — authorization failure</li>
  *   <li>{@code 0x0A CANCELLED}        — query terminated in response to CANCEL</li>
@@ -24,6 +24,10 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  * SQL-level errors carry the position embedded in the message, using QuestDB's
  * standard "{@code [pos] text}" format, so you can point the user directly at
  * the offending token.
+ * <p>
+ * Note: DDL / INSERT / UPDATE are <em>not</em> errors over {@code /read/v1} --
+ * the server executes them and replies with {@code EXEC_DONE}, surfaced via
+ * {@link QwpColumnBatchHandler#onExecDone}. See {@link ExecStatementExample}.
  */
 public class ErrorHandlingExample {
 
@@ -37,8 +41,9 @@ public class ErrorHandlingExample {
             // Nonexistent table — also reported as PARSE_ERROR with a "does not exist" message.
             runAndReport(client, "SELECT * FROM nowhere");
 
-            // DDL sent over the read endpoint — Phase 1 restricts /read/v1 to SELECT.
-            runAndReport(client, "DROP TABLE trades");
+            // COPY ... FROM is the one non-SELECT still rejected on egress:
+            // bulk load belongs on the /write/v4 ingress endpoint.
+            runAndReport(client, "COPY trades FROM '/tmp/missing.csv'");
         }
     }
 
@@ -58,6 +63,11 @@ public class ErrorHandlingExample {
             @Override
             public void onError(byte status, String message) {
                 System.out.printf("query failed: status=0x%02X, message=%s%n", status & 0xFF, message);
+            }
+
+            @Override
+            public void onExecDone(short opType, long rowsAffected) {
+                System.out.printf("(unexpected) exec ok: opType=%d, rows=%d%n", opType, rowsAffected);
             }
         });
     }

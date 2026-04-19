@@ -35,11 +35,14 @@ public class QueryEvent {
     public static final int KIND_BATCH = 0;
     public static final int KIND_END = 1;
     public static final int KIND_ERROR = 2;
+    public static final int KIND_EXEC_DONE = 3;
 
     public QwpBatchBuffer buffer;     // valid for KIND_BATCH (must be released to pool by consumer)
     public byte errorStatus;          // valid for KIND_ERROR
     public String errorMessage;       // valid for KIND_ERROR
     public int kind;
+    public short opType;              // valid for KIND_EXEC_DONE (matches CompiledQuery.SELECT/INSERT/etc.)
+    public long rowsAffected;         // valid for KIND_EXEC_DONE
     public long totalRows;            // valid for KIND_END
 
     public QueryEvent asBatch(QwpBatchBuffer buffer) {
@@ -60,6 +63,14 @@ public class QueryEvent {
         this.buffer = null;
         this.errorStatus = status;
         this.errorMessage = message;
+        return this;
+    }
+
+    public QueryEvent asExecDone(short opType, long rowsAffected) {
+        this.kind = KIND_EXEC_DONE;
+        this.buffer = null;
+        this.opType = opType;
+        this.rowsAffected = rowsAffected;
         return this;
     }
 }

@@ -58,4 +58,20 @@ public interface QwpColumnBatchHandler {
      * @param message server-supplied error message (may be empty)
      */
     void onError(byte status, String message);
+
+    /**
+     * Invoked in place of {@link #onBatch} + {@link #onEnd} when the query was
+     * a non-SELECT (DDL, INSERT, UPDATE, etc.). No batches are delivered for
+     * such queries -- the server executes the statement and replies with a
+     * single {@code EXEC_DONE}.
+     *
+     * @param opType       matches one of {@code CompiledQuery.SELECT} / {@code INSERT} /
+     *                     {@code UPDATE} / {@code CREATE_TABLE} / etc. (server-side constants)
+     * @param rowsAffected rows inserted / updated / deleted; 0 for pure DDL
+     */
+    default void onExecDone(short opType, long rowsAffected) {
+        // Default no-op lets existing SELECT-only implementations stay source-
+        // compatible. A handler that ever sees a non-SELECT query should
+        // override this method.
+    }
 }
