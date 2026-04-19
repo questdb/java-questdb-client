@@ -473,6 +473,23 @@ public class QwpColumnBatch {
         return columnLayouts.getQuick(col).nonNullIdx;
     }
 
+    /**
+     * Starting address of the RESULT_BATCH payload this view was decoded from.
+     * Equal to the WebSocket payload pointer when in-place decode is in use.
+     * Intended for accounting (byte counters) rather than data access.
+     */
+    public long payloadAddr() {
+        return payloadAddr;
+    }
+
+    /**
+     * Exclusive upper bound of the RESULT_BATCH payload bytes. See
+     * {@link #payloadAddr()}.
+     */
+    public long payloadLimit() {
+        return payloadLimit;
+    }
+
     public long requestId() {
         return requestId;
     }

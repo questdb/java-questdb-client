@@ -51,11 +51,17 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
 
     private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
     private static final long POLL_TIMEOUT_MS = 100;
+    private static final Object RELEASE_TOKEN = new Object();
     private final QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
     // Events delivered from I/O thread to user thread (RESULT_BATCH / RESULT_END / QUERY_ERROR).
     private final BlockingQueue<QueryEvent> events;
     // Pool of pre-allocated buffers. I/O thread takes, user thread releases.
     private final BlockingQueue<QwpBatchBuffer> freeBuffers;
+    // One-slot release latch: user thread offers a token from releaseBuffer, I/O
+    // thread drains it before returning from onBinaryMessage. Holds the payload
+    // bytes in the WebSocket recv buffer steady for the duration of the user
+    // handler, since in-place decode makes batch pointers alias those bytes.
+    private final BlockingQueue<Object> pendingRelease = new ArrayBlockingQueue<>(1);
     // Single-slot request queue (Phase-1 allows one in-flight query).
     private final BlockingQueue<QueryRequest> requests = new ArrayBlockingQueue<>(1);
     private final NativeBufferWriter sendScratch = new NativeBufferWriter();
@@ -136,9 +142,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     /**
      * Releases a buffer back to the I/O thread pool. Call after the user
      * handler finishes processing a {@code KIND_BATCH} event.
+     * <p>
+     * Also signals the release latch so the I/O thread, parked at the end of
+     * {@code handleResultBatch}, can resume and let the WebSocket recv buffer
+     * compact past the consumed frame.
      */
     public void releaseBuffer(QwpBatchBuffer buffer) {
         freeBuffers.offer(buffer);
+        pendingRelease.offer(RELEASE_TOKEN);
     }
 
     @Override
@@ -249,9 +260,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         } catch (InterruptedException ie) {
             return;
         }
-        buf.copyFromPayload(payloadPtr, payloadLen);
+        // Decode in place: column layouts reference payloadPtr (the WebSocket recv
+        // buffer) directly, skipping the previous per-batch memcpy into buf.scratchAddr.
         try {
-            decoder.decode(buf);
+            decoder.decode(buf, payloadPtr, payloadLen);
         } catch (QwpDecodeException e) {
             freeBuffers.offer(buf);
             emitError((byte) 0, "decode failure: " + e.getMessage());
@@ -259,6 +271,16 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             return;
         }
         events.offer(new QueryEvent().asBatch(buf));
+        // Park on the release latch. Returning sooner would let receiveFrame
+        // compact the WebSocket recv buffer, overwriting the bytes that the
+        // user-visible column pointers still reference. User thread's
+        // releaseBuffer offers the token that unblocks this take.
+        try {
+            pendingRelease.take();
+        } catch (InterruptedException ie) {
+            // Shutdown path: leave the batch to the user thread; they'll see
+            // either the in-progress batch or a subsequent close event.
+        }
     }
 
     /**

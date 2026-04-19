@@ -89,6 +89,17 @@ public class QwpResultBatchDecoder {
         decodePayload(buffer, buffer.getScratchAddr(), buffer.getPayloadLen());
     }
 
+    /**
+     * In-place decode: parses the frame whose bytes live at {@code payloadPtr} (e.g. the
+     * WebSocket recv buffer) without copying into {@code buffer}'s native scratch.
+     * {@code buffer} contributes only its reusable layout pool and batch view; all
+     * column pointers produced reference {@code payloadPtr}, so the caller must keep
+     * those bytes stable until it's done reading the {@link QwpColumnBatch}.
+     */
+    public void decode(QwpBatchBuffer buffer, long payloadPtr, int payloadLen) throws QwpDecodeException {
+        decodePayload(buffer, payloadPtr, payloadLen);
+    }
+
     // Pool helpers
 
     private static long advanceFixed(QwpColumnLayout layout, long p, long limit, int sizeBytes) throws QwpDecodeException {
