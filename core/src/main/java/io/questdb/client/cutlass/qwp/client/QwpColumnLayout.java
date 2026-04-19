@@ -24,8 +24,9 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
-import io.questdb.client.std.ObjList;
-import io.questdb.client.std.str.DirectUtf8String;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.QuietCloseable;
+import io.questdb.client.std.Unsafe;
 
 /**
  * Per-column parsed layout for one batch. Holds native pointers INTO the
@@ -33,13 +34,64 @@ import io.questdb.client.std.str.DirectUtf8String;
  * O(1) access. Reused across batches to eliminate allocations on the hot path
  * (pooled arrays grow to max observed size and never shrink).
  */
-public class QwpColumnLayout {
+public class QwpColumnLayout implements QuietCloseable {
 
+    /**
+     * ARRAY: per-row starting offset (absolute address) of the array bytes. -1 for NULL rows.
+     */
+    long[] arrayRowAddr;
+    /**
+     * ARRAY: per-row length in bytes of the array payload.
+     */
+    int[] arrayRowLen;
     /**
      * Schema column metadata (name, wire type, scale, precisionBits).
      */
     QwpEgressColumnInfo info;
-
+    /**
+     * Absolute address of the first byte after this column's data -- used to walk to the next column.
+     */
+    long nextAddr;
+    /**
+     * Count of non-null rows in this column.
+     */
+    int nonNullCount;
+    /**
+     * Per-row lookup: {@code nonNullIdx[row]} is the dense index of row {@code row} within
+     * the non-null values, or -1 if the row is NULL. Sized to {@code rowCount}.
+     * Pool-owned; re-used across batches.
+     */
+    int[] nonNullIdx;
+    /**
+     * Absolute payload address of the null bitmap, or 0 if the column has no NULL rows.
+     */
+    long nullBitmapAddr;
+    /**
+     * STRING / VARCHAR: absolute address of the concatenated UTF-8 bytes (right after the offsets array).
+     */
+    long stringBytesAddr;
+    /**
+     * SYMBOL: absolute address of the native entries array. Each entry is a packed
+     * 8-byte pair {@code (offset:i32 | length:i32<<32)} relative to
+     * {@link #symbolDictHeapAddr}. Access in the hot path is a single 64-bit
+     * load + two int extractions, no object dereferences.
+     */
+    long symbolDictEntriesAddr;
+    /**
+     * SYMBOL: absolute address of the UTF-8 bytes heap holding all dict entries. In
+     * delta mode this points into the decoder's connection-scoped native heap; in
+     * non-delta mode it points into the payload buffer (wire bytes directly).
+     */
+    long symbolDictHeapAddr;
+    /**
+     * SYMBOL: number of valid entries referenced by {@link #symbolDictEntriesAddr}.
+     */
+    int symbolDictSize;
+    /**
+     * SYMBOL: per-row dictionary ID. Sized to {@code rowCount}; NULL rows are
+     * left with stale values -- use {@link #nonNullIdx}/null-check first.
+     */
+    int[] symbolRowIds;
     /**
      * Absolute payload address where this column's non-null values start. For
      * fixed-width types this is the dense values array. For strings/varchars
@@ -47,65 +99,14 @@ public class QwpColumnLayout {
      * per-row IDs are materialised into {@link #symbolRowIds} during parse.
      */
     long valuesAddr;
-
     /**
-     * Absolute payload address of the null bitmap, or 0 if the column has no NULL rows.
+     * SYMBOL non-delta only: native buffer owned by this layout that holds the
+     * per-batch packed entries when the column carries its own dict. In delta
+     * mode this is 0 and {@link #symbolDictEntriesAddr} points at the decoder's
+     * shared array instead.
      */
-    long nullBitmapAddr;
-
-    /**
-     * Count of non-null rows in this column.
-     */
-    int nonNullCount;
-
-    /**
-     * Per-row lookup: {@code nonNullIdx[row]} is the dense index of row {@code row} within
-     * the non-null values, or -1 if the row is NULL. Sized to {@code rowCount}.
-     * Pool-owned; re-used across batches.
-     */
-    int[] nonNullIdx;
-
-    /**
-     * STRING / VARCHAR: absolute address of the concatenated UTF-8 bytes (right after the offsets array).
-     */
-    long stringBytesAddr;
-
-    /**
-     * SYMBOL: decoded dictionary entries as reusable native views.
-     * <p>
-     * Without {@code FLAG_DELTA_SYMBOL_DICT}, this is a per-batch list of
-     * {@link DirectUtf8String}s pointing INTO the current payload buffer (valid
-     * only for the lifetime of that buffer). With the flag set, the decoder
-     * replaces this reference with its connection-scoped list, whose entries
-     * point into a heap owned by the decoder that survives across batches.
-     */
-    ObjList<DirectUtf8String> symbolDict = new ObjList<>();
-
-    /**
-     * SYMBOL: number of valid entries in {@link #symbolDict} for this batch.
-     */
-    int symbolDictSize;
-
-    /**
-     * SYMBOL: per-row dictionary ID. Sized to {@code rowCount}; NULL rows are
-     * left with stale values -- use {@link #nonNullIdx}/null-check first.
-     */
-    int[] symbolRowIds;
-
-    /**
-     * ARRAY: per-row starting offset (absolute address) of the array bytes. -1 for NULL rows.
-     */
-    long[] arrayRowAddr;
-
-    /**
-     * ARRAY: per-row length in bytes of the array payload.
-     */
-    int[] arrayRowLen;
-
-    /**
-     * Absolute address of the first byte after this column's data -- used to walk to the next column.
-     */
-    long nextAddr;
+    private long ownedEntriesAddr;
+    private int ownedEntriesCapacity;
 
     public void clear() {
         info = null;
@@ -113,7 +114,32 @@ public class QwpColumnLayout {
         nullBitmapAddr = 0;
         nonNullCount = 0;
         stringBytesAddr = 0;
+        symbolDictHeapAddr = 0;
+        symbolDictEntriesAddr = 0;
         symbolDictSize = 0;
         nextAddr = 0;
+    }
+
+    @Override
+    public void close() {
+        if (ownedEntriesAddr != 0) {
+            Unsafe.free(ownedEntriesAddr, ownedEntriesCapacity, MemoryTag.NATIVE_DEFAULT);
+            ownedEntriesAddr = 0;
+            ownedEntriesCapacity = 0;
+        }
+    }
+
+    /**
+     * Ensures the per-layout owned entries buffer is at least {@code requiredBytes}
+     * and returns its address. Used by non-delta mode where the column carries its
+     * own dictionary inline and we need a dedicated buffer for the packed entries.
+     */
+    long ensureOwnedEntriesAddr(int requiredBytes) {
+        if (ownedEntriesCapacity < requiredBytes) {
+            int newCap = Math.max(ownedEntriesCapacity * 2, Math.max(64, requiredBytes));
+            ownedEntriesAddr = Unsafe.realloc(ownedEntriesAddr, ownedEntriesCapacity, newCap, MemoryTag.NATIVE_DEFAULT);
+            ownedEntriesCapacity = newCap;
+        }
+        return ownedEntriesAddr;
     }
 }

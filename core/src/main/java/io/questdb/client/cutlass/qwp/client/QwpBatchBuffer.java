@@ -43,12 +43,12 @@ import io.questdb.client.std.Unsafe;
  */
 public class QwpBatchBuffer implements QuietCloseable {
 
+    final QwpColumnBatch batch = new QwpColumnBatch();
     /**
      * Per-column layout pool scoped to this buffer. Sized to the max column
      * count observed on this buffer across batches; layouts are reused.
      */
     final ObjList<QwpColumnLayout> layoutPool = new ObjList<>();
-    final QwpColumnBatch batch = new QwpColumnBatch();
     private int payloadLen;
     private long scratchAddr;
     private int scratchCapacity;
@@ -65,6 +65,12 @@ public class QwpBatchBuffer implements QuietCloseable {
             scratchAddr = 0;
             scratchCapacity = 0;
         }
+        // Layouts own native entries buffers in non-delta SYMBOL mode. Free them
+        // before the buffer itself is discarded so the allocations don't leak.
+        for (int i = 0, n = layoutPool.size(); i < n; i++) {
+            layoutPool.getQuick(i).close();
+        }
+        layoutPool.clear();
     }
 
     /**

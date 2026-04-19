@@ -555,8 +555,12 @@ public class QwpColumnBatch {
         }
         if (wt == QwpConstants.TYPE_SYMBOL) {
             int dictIdx = l.symbolRowIds[row];
-            DirectUtf8String entry = l.symbolDict.getQuick(dictIdx);
-            return view.of(entry.ptr(), entry.ptr() + entry.size());
+            // Single 64-bit load: low 32 bits = offset into dict heap, high 32 = length.
+            // No ObjList.getQuick, no DirectUtf8String deref -- pure pointer arithmetic.
+            long packed = Unsafe.getUnsafe().getLong(l.symbolDictEntriesAddr + ((long) dictIdx << 3));
+            long start = l.symbolDictHeapAddr + (packed & 0xFFFFFFFFL);
+            long end = start + (packed >>> 32);
+            return view.of(start, end);
         }
         return null;
     }
