@@ -63,6 +63,11 @@ public class QwpQueryClient implements QuietCloseable {
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private String clientId;
     private boolean connected;
+    // Written on the user thread at entry to {@link #execute} and cleared on exit.
+    // Read by {@link #cancel} from any thread. {@code volatile} to guarantee the
+    // user thread's write is visible to a concurrent cancel caller; 64-bit writes
+    // are atomic under {@code volatile long}.
+    private volatile long currentRequestId = -1L;
     private String endpointPath = DEFAULT_ENDPOINT_PATH;
     private QwpEgressIoThread ioThread;
     private Thread ioThreadHandle;
@@ -190,6 +195,21 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Asks the server to cancel the currently executing query. No-op if no query
+     * is in flight. Safe to call from a thread other than the one blocked inside
+     * {@link #execute}. The server replies to the active query with a
+     * {@code QUERY_ERROR} whose status byte is {@code STATUS_CANCELLED}; the
+     * handler's {@code onError} (on the execute-ing thread) will see it.
+     */
+    public void cancel() {
+        QwpEgressIoThread io = ioThread;
+        long id = currentRequestId;
+        if (io != null && id >= 0L) {
+            io.requestCancel(id);
+        }
+    }
+
+    /**
      * Shutdown order: signal the I/O thread, interrupt it to wake it from any blocking
      * {@code wsClient.receiveFrame(...)} or queue poll, wait for it to exit, then free
      * the buffer pool and close the underlying socket.
@@ -241,16 +261,6 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Returns true if the most recent {@link #close()} call abandoned the I/O thread
-     * because it failed to exit within the join timeout. The native buffer pool and
-     * WebSocket socket are leaked for the lifetime of the JVM; the daemon I/O thread
-     * keeps running until process exit.
-     */
-    public boolean wasLastCloseTimedOut() {
-        return lastCloseTimedOut;
-    }
-
-    /**
      * Opens the TCP connection, performs the WebSocket upgrade, and spawns the I/O thread.
      * Must be called before any query is submitted.
      */
@@ -294,6 +304,7 @@ public class QwpQueryClient implements QuietCloseable {
             return;
         }
         long requestId = nextRequestId++;
+        currentRequestId = requestId;
         try {
             io.submitQuery(sql, requestId);
             while (true) {
@@ -323,6 +334,8 @@ public class QwpQueryClient implements QuietCloseable {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             handler.onError((byte) 0, "interrupted while waiting for server response");
+        } finally {
+            currentRequestId = -1L;
         }
     }
 
@@ -335,6 +348,21 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Returns true if the most recent {@link #close()} call abandoned the I/O thread
+     * because it failed to exit within the join timeout. The native buffer pool and
+     * WebSocket socket are leaked for the lifetime of the JVM; the daemon I/O thread
+     * keeps running until process exit.
+     */
+    public boolean wasLastCloseTimedOut() {
+        return lastCloseTimedOut;
+    }
+
+    public QwpQueryClient withAuthorization(String authorizationHeader) {
+        this.authorizationHeader = authorizationHeader;
+        return this;
+    }
+
+    /**
      * Overrides the default I/O buffer pool depth (4). Larger pools let the
      * I/O thread decode further ahead of the consumer at the cost of memory;
      * smaller pools reduce memory but may stall the I/O thread on slow consumers.
@@ -343,11 +371,6 @@ public class QwpQueryClient implements QuietCloseable {
     public QwpQueryClient withBufferPoolSize(int size) {
         if (size < 1) throw new IllegalArgumentException("bufferPoolSize must be >= 1");
         this.bufferPoolSize = size;
-        return this;
-    }
-
-    public QwpQueryClient withAuthorization(String authorizationHeader) {
-        this.authorizationHeader = authorizationHeader;
         return this;
     }
 

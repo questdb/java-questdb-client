@@ -34,6 +34,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Dedicated I/O thread that owns the client's {@link WebSocketClient} and drives
@@ -57,6 +58,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private final BlockingQueue<QueryEvent> events;
     // Pool of pre-allocated buffers. I/O thread takes, user thread releases.
     private final BlockingQueue<QwpBatchBuffer> freeBuffers;
+    // Pending CANCEL requestId set by the user thread via {@link #requestCancel}.
+    // The I/O thread polls this between {@code receiveFrame} iterations; when
+    // non-negative, it emits a CANCEL frame for that requestId and resets to -1.
+    // Using AtomicLong (not volatile long) to guarantee 64-bit atomicity on all
+    // supported JVMs.
+    private final AtomicLong pendingCancelRequestId = new AtomicLong(-1L);
     // One-slot release latch: user thread offers a token from releaseBuffer, I/O
     // thread drains it before returning from onBinaryMessage. Holds the payload
     // bytes in the WebSocket recv buffer steady for the duration of the user
@@ -155,6 +162,17 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         pendingRelease.offer(RELEASE_TOKEN);
     }
 
+    /**
+     * Queues a CANCEL frame for {@code requestId} to be sent by the I/O thread
+     * between the next two {@code receiveFrame} iterations (typically within
+     * {@link #POLL_TIMEOUT_MS}). Safe to call from any thread. If a CANCEL for
+     * the same (or another) requestId is already pending, the newer id wins --
+     * multiple concurrent cancels coalesce into one send.
+     */
+    public void requestCancel(long requestId) {
+        pendingCancelRequestId.set(requestId);
+    }
+
     @Override
     public void run() {
         try {
@@ -174,6 +192,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                 while (!currentQueryDone && !shutdown) {
                     // onBinaryMessage (on this same thread) sets currentQueryDone.
                     wsClient.receiveFrame(this, (int) POLL_TIMEOUT_MS);
+                    drainPendingCancel();
                 }
             }
         } catch (Throwable t) {
@@ -266,6 +285,19 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         return total;
     }
 
+    /**
+     * Flushes the pending cancel (if any) to the wire. Called from the I/O
+     * thread at every loop boundary so a cancel set by a user thread reaches
+     * the server regardless of whether the I/O thread was waiting on a frame
+     * or on a free buffer.
+     */
+    private void drainPendingCancel() {
+        long id = pendingCancelRequestId.getAndSet(-1L);
+        if (id >= 0L) {
+            sendCancel(id);
+        }
+    }
+
     private void emitError(byte status, String message) {
         events.offer(new QueryEvent().asError(status, message));
     }
@@ -286,7 +318,17 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private void handleResultBatch(long payloadPtr, int payloadLen) {
         QwpBatchBuffer buf;
         try {
-            buf = freeBuffers.take();
+            // Poll rather than take so a pending cancel set by the user thread
+            // still gets flushed while the I/O thread is waiting for the user
+            // to release a buffer. Without this, an app that never releases
+            // (or sleeps in its handler) would wedge the cancel path -- the
+            // server never sees the CANCEL and keeps on streaming.
+            buf = freeBuffers.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            while (buf == null && !shutdown) {
+                drainPendingCancel();
+                buf = freeBuffers.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            }
+            if (buf == null) return;
         } catch (InterruptedException ie) {
             return;
         }
@@ -311,6 +353,18 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             // Shutdown path: leave the batch to the user thread; they'll see
             // either the in-progress batch or a subsequent close event.
         }
+    }
+
+    /**
+     * Builds and transmits a CANCEL frame on the WebSocket. Wire format:
+     * {@code msg_kind(0x14) + request_id(u64)}.
+     */
+    private void sendCancel(long requestId) {
+        sendScratch.reset();
+        sendScratch.putByte(QwpEgressMsgKind.CANCEL);
+        sendScratch.putLong(requestId);
+        wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
+        sendScratch.reset();
     }
 
     /**

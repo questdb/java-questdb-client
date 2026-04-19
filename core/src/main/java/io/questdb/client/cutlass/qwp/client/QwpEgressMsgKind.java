@@ -42,6 +42,19 @@ public final class QwpEgressMsgKind {
     public static final byte RESULT_BATCH = 0x11;
     public static final byte RESULT_END = 0x12;
 
+    // Egress-specific QUERY_ERROR status codes. Extend the ingress
+    // QwpConstants.STATUS_* namespace (0x00-0x09).
+    /**
+     * Status byte on a {@code QUERY_ERROR} frame: the query was cancelled,
+     * either by a client {@code CANCEL} frame or by explicit server-side cancel.
+     */
+    public static final byte STATUS_CANCELLED = 0x0A;
+    /**
+     * Status byte on a {@code QUERY_ERROR} frame: a server-side limit was hit
+     * (query timeout, memory cap, circuit breaker).
+     */
+    public static final byte STATUS_LIMIT_EXCEEDED = 0x0B;
+
     private QwpEgressMsgKind() {
     }
 }
