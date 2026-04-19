@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.bytes.DirectByteSequence;
 import io.questdb.client.std.str.DirectUtf8Sequence;
 import io.questdb.client.std.str.DirectUtf8String;
 
@@ -49,13 +50,9 @@ import java.nio.charset.StandardCharsets;
 public class QwpColumnBatch {
 
     final ObjList<QwpColumnLayout> columnLayouts = new ObjList<>();
-    long batchSeq;
-    int columnCount;
-    ObjList<QwpEgressColumnInfo> columns;
-    long payloadAddr;
-    long payloadLimit;
-    long requestId;
-    int rowCount;
+    // BINARY views -- re-pointed per call, never re-allocated.
+    private final io.questdb.client.std.bytes.DirectByteSlice binaryA = new io.questdb.client.std.bytes.DirectByteSlice();
+    private final io.questdb.client.std.bytes.DirectByteSlice binaryB = new io.questdb.client.std.bytes.DirectByteSlice();
     // Reusable views for zero-alloc UTF-8 access. strA and strB are dual views
     // (same pattern as QuestDB Record.getStrA/getStrB) so callers can compare
     // two cells without one overwriting the other.
@@ -63,9 +60,59 @@ public class QwpColumnBatch {
     private final DirectUtf8String strB = new DirectUtf8String();
     private final DirectUtf8String varcharA = new DirectUtf8String();
     private final DirectUtf8String varcharB = new DirectUtf8String();
+    long batchSeq;
+    int columnCount;
+    ObjList<QwpEgressColumnInfo> columns;
+    long payloadAddr;
+    long payloadLimit;
+    long requestId;
+    int rowCount;
 
     public long batchSeq() {
         return batchSeq;
+    }
+
+    /**
+     * Returns the dimensionality of the ARRAY value at {@code (col, row)}, or 0 if
+     * the row is null. Caller must know the column is an ARRAY type.
+     */
+    public int getArrayNDims(int col, int row) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return 0;
+        return Unsafe.getUnsafe().getByte(l.arrayRowAddr[row]) & 0xFF;
+    }
+
+    /**
+     * Heap-allocating convenience. Returns the raw bytes of a BINARY value, or {@code null}
+     * for NULL rows. Allocates a new {@code byte[]} per call; on the hot path prefer
+     * {@link #getBinaryA} which returns a reusable native view.
+     */
+    public byte[] getBinary(int col, int row) {
+        io.questdb.client.std.bytes.DirectByteSequence v = lookupBinaryBytes(col, row, binaryA);
+        if (v == null) return null;
+        int size = v.size();
+        byte[] bytes = new byte[size];
+        for (int i = 0; i < size; i++) {
+            bytes[i] = v.byteAt(i);
+        }
+        return bytes;
+    }
+
+    /**
+     * Zero-allocation BINARY view. Returns a {@link DirectByteSequence}
+     * pointing into the WebSocket payload buffer. The view is invalidated by the next call to
+     * {@link #getBinaryB} on this batch or once the enclosing
+     * {@code onBatch} callback returns.
+     */
+    public DirectByteSequence getBinaryA(int col, int row) {
+        return lookupBinaryBytes(col, row, binaryA);
+    }
+
+    /**
+     * Dual of {@link #getBinaryA}; use when you need to hold two binary views concurrently.
+     */
+    public io.questdb.client.std.bytes.DirectByteSequence getBinaryB(int col, int row) {
+        return lookupBinaryBytes(col, row, binaryB);
     }
 
     public boolean getBool(int col, int row) {
@@ -108,10 +155,6 @@ public class QwpColumnBatch {
         return columns.getQuick(col).wireType;
     }
 
-    public int getDecimalScale(int col) {
-        return columns.getQuick(col).scale;
-    }
-
     /**
      * Returns the high 64 bits of a DECIMAL128 value. Combine with {@link #getDecimal128Low}.
      */
@@ -130,16 +173,47 @@ public class QwpColumnBatch {
         return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.nonNullIdx[row]);
     }
 
+    public int getDecimalScale(int col) {
+        return columns.getQuick(col).scale;
+    }
+
     public double getDouble(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return Double.NaN;
         return Unsafe.getUnsafe().getDouble(l.valuesAddr + 8L * l.nonNullIdx[row]);
     }
 
+    /**
+     * Returns the flattened elements of a DOUBLE_ARRAY value in row-major order, or
+     * {@code null} for NULL rows. Heap-allocating convenience -- on the hot path, use
+     * {@link #getArrayNDims}/ and read directly from the
+     * wire via {@code arrayRowAddr}.
+     */
+    public double[] getDoubleArrayElements(int col, int row) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return null;
+        long rowAddr = l.arrayRowAddr[row];
+        int nDims = Unsafe.getUnsafe().getByte(rowAddr) & 0xFF;
+        int elements = 1;
+        for (int d = 0; d < nDims; d++) {
+            elements *= Unsafe.getUnsafe().getInt(rowAddr + 1 + 4L * d);
+        }
+        double[] out = new double[elements];
+        long base = rowAddr + 1 + 4L * nDims;
+        for (int i = 0; i < elements; i++) {
+            out[i] = Unsafe.getUnsafe().getDouble(base + 8L * i);
+        }
+        return out;
+    }
+
     public float getFloat(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return Float.NaN;
         return Unsafe.getUnsafe().getFloat(l.valuesAddr + 4L * l.nonNullIdx[row]);
+    }
+
+    public int getGeohashPrecisionBits(int col) {
+        return columns.getQuick(col).precisionBits;
     }
 
     /**
@@ -150,10 +224,6 @@ public class QwpColumnBatch {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0;
         return Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * l.nonNullIdx[row]);
-    }
-
-    public int getGeohashPrecisionBits(int col) {
-        return columns.getQuick(col).precisionBits;
     }
 
     /**
@@ -174,7 +244,7 @@ public class QwpColumnBatch {
                 || wt == QwpConstants.TYPE_DECIMAL64) {
             return Unsafe.getUnsafe().getLong(l.valuesAddr + 8L * denseIdx);
         }
-        if (wt == QwpConstants.TYPE_INT) {
+        if (wt == QwpConstants.TYPE_INT || wt == QwpConstants.TYPE_IPv4) {
             return Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * denseIdx);
         }
         if (wt == QwpConstants.TYPE_SHORT || wt == QwpConstants.TYPE_CHAR) {
@@ -198,27 +268,31 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Returns an 8-byte LONG / TIMESTAMP / DATE / DECIMAL64 value without type dispatch.
-     * Caller must know the column is a LONG-family type. Returns 0 for NULL rows.
+     * Returns one of the four 64-bit words of a LONG256 or DECIMAL256 value.
+     * {@code wordIndex} 0 is least significant, 3 is most significant.
      */
-    public long getLongValue(int col, int row) {
+    public long getLong256Word(int col, int row, int wordIndex) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
-        return Unsafe.getUnsafe().getLong(l.valuesAddr + 8L * l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getLong(l.valuesAddr + 32L * l.nonNullIdx[row] + 8L * wordIndex);
     }
 
-    /**
-     * Returns a SHORT value without type dispatch. Caller must know the column is SHORT.
-     */
-    public short getShortValue(int col, int row) {
-        QwpColumnLayout l = columnLayouts.getQuick(col);
-        if (isLayoutNull(l, row)) return 0;
-        return Unsafe.getUnsafe().getShort(l.valuesAddr + 2L * l.nonNullIdx[row]);
-    }
+    // Raw column-address API -- for zero-branch hot inner loops.
+    //
+    // Typical usage:
+    //   long base = batch.valuesAddr(col);
+    //   int[] idx = batch.nonNullIndex(col);
+    //   for (int r = 0; r < rowCount; r++) {
+    //       if (idx[r] < 0) continue;              // NULL
+    //       long v = Unsafe.getLong(base + 8L * idx[r]);
+    //       ...
+    //   }
+    //
+    // All four accessors return constant-time views; no allocation.
 
     /**
      * Convenience: returns a length-{@code N} long array with the components of a UUID,
-     * LONG256, DECIMAL128, or DECIMAL256 value. Allocates — avoid on the hot path;
+     * LONG256, DECIMAL128, or DECIMAL256 value. Allocates -- avoid on the hot path;
      * use {@link #getUuidLo}/{@link #getUuidHi} or {@link #getLong256Word} instead.
      */
     public long[] getLongArray(int col, int row) {
@@ -244,83 +318,26 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Returns one of the four 64-bit words of a LONG256 or DECIMAL256 value.
-     * {@code wordIndex} 0 is least significant, 3 is most significant.
+     * Returns an 8-byte LONG / TIMESTAMP / DATE / DECIMAL64 value without type dispatch.
+     * Caller must know the column is a LONG-family type. Returns 0 for NULL rows.
      */
-    public long getLong256Word(int col, int row, int wordIndex) {
+    public long getLongValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
-        return Unsafe.getUnsafe().getLong(l.valuesAddr + 32L * l.nonNullIdx[row] + 8L * wordIndex);
-    }
-
-    // Raw column-address API — for zero-branch hot inner loops.
-    //
-    // Typical usage:
-    //   long base = batch.valuesAddr(col);
-    //   int[] idx = batch.nonNullIndex(col);
-    //   for (int r = 0; r < rowCount; r++) {
-    //       if (idx[r] < 0) continue;              // NULL
-    //       long v = Unsafe.getLong(base + 8L * idx[r]);
-    //       ...
-    //   }
-    //
-    // All four accessors return constant-time views; no allocation.
-
-    /**
-     * Number of non-null rows in this column, i.e. the count of entries in the
-     * dense values array pointed to by {@link #valuesAddr(int)}.
-     */
-    public int nonNullCount(int col) {
-        return columnLayouts.getQuick(col).nonNullCount;
-    }
-
-    /**
-     * Per-row lookup table. {@code result[row]} is the dense index within the
-     * column's non-null values, or -1 if the row is NULL. Array length equals
-     * {@link #getRowCount()}. Valid only during the current {@code onBatch}
-     * callback; do not retain.
-     */
-    public int[] nonNullIndex(int col) {
-        return columnLayouts.getQuick(col).nonNullIdx;
-    }
-
-    /**
-     * Address of the column's null bitmap, or {@code 0} if the column has no NULL rows.
-     * Bitmap is {@code ceil(rowCount / 8)} bytes, LSB-first; bit = 1 means NULL.
-     */
-    public long nullBitmapAddr(int col) {
-        return columnLayouts.getQuick(col).nullBitmapAddr;
-    }
-
-    /**
-     * Address of the column's packed non-null values in the payload buffer.
-     * Layout depends on the wire type:
-     * <ul>
-     *   <li>Fixed-width (LONG, INT, DOUBLE, UUID, LONG256, etc.): contiguous values, index by {@code nonNullIndex(col)[row] * sizeBytes}.</li>
-     *   <li>BOOLEAN: bit-packed, 8 values per byte, LSB-first; index by {@code nonNullIndex(col)[row]}.</li>
-     *   <li>STRING / VARCHAR: points to the (N+1) × uint32 offsets array; use {@link #stringBytesAddr(int)} for the bytes region.</li>
-     *   <li>GEOHASH: {@code ceil(precisionBits / 8)} bytes per value; index by {@code nonNullIndex(col)[row] * bytesPerValue}.</li>
-     *   <li>DECIMAL64/128/256: the scale byte has already been consumed; this is the first unscaled value.</li>
-     *   <li>SYMBOL: not meaningful — use {@link #getStrA} / {@link #getStrB} instead.</li>
-     *   <li>ARRAY: not meaningful — use the per-row {@code arrayRowAddr} accessors (forthcoming).</li>
-     * </ul>
-     */
-    public long valuesAddr(int col) {
-        return columnLayouts.getQuick(col).valuesAddr;
-    }
-
-    /**
-     * For STRING / VARCHAR columns, the address of the concatenated UTF-8 bytes
-     * (immediately after the offsets array pointed to by {@link #valuesAddr}).
-     * Combined with the offsets array, lets you read every string without
-     * going through {@link #getStrA}.
-     */
-    public long stringBytesAddr(int col) {
-        return columnLayouts.getQuick(col).stringBytesAddr;
+        return Unsafe.getUnsafe().getLong(l.valuesAddr + 8L * l.nonNullIdx[row]);
     }
 
     public int getRowCount() {
         return rowCount;
+    }
+
+    /**
+     * Returns a SHORT value without type dispatch. Caller must know the column is SHORT.
+     */
+    public short getShortValue(int col, int row) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return 0;
+        return Unsafe.getUnsafe().getShort(l.valuesAddr + 2L * l.nonNullIdx[row]);
     }
 
     /**
@@ -426,16 +443,55 @@ public class QwpColumnBatch {
     /**
      * True if the cell is NULL on the wire.
      * <p>
-     * Note on type-specific sentinels (see {@code docs/QWP_EGRESS_EXTENSION.md} §11.5):
-     * QuestDB stores NULL as a sentinel value for several types — {@code Long.MIN_VALUE}
+     * Note on type-specific sentinels (see {@code docs/QWP_EGRESS_EXTENSION.md} sec 11.5):
+     * QuestDB stores NULL as a sentinel value for several types -- {@code Long.MIN_VALUE}
      * for LONG/INT/etc., {@code 0.0.0.0} for IPv4, {@code -1} for GEOHASH, and crucially
      * {@code NaN} for FLOAT and DOUBLE. Egress preserves these conventions: a row carrying
      * NaN in a DOUBLE column will return {@code true} from this method. Callers who need
-     * to distinguish "real NaN" from "explicit NULL" cannot do so over the wire — both
+     * to distinguish "real NaN" from "explicit NULL" cannot do so over the wire -- both
      * map to the same null bitmap bit.
      */
     public boolean isNull(int col, int row) {
         return isLayoutNull(columnLayouts.getQuick(col), row);
+    }
+
+    /**
+     * Number of non-null rows in this column, i.e. the count of entries in the
+     * dense values array pointed to by {@link #valuesAddr(int)}.
+     */
+    public int nonNullCount(int col) {
+        return columnLayouts.getQuick(col).nonNullCount;
+    }
+
+    /**
+     * Per-row lookup table. {@code result[row]} is the dense index within the
+     * column's non-null values, or -1 if the row is NULL. Array length equals
+     * {@link #getRowCount()}. Valid only during the current {@code onBatch}
+     * callback; do not retain.
+     */
+    public int[] nonNullIndex(int col) {
+        return columnLayouts.getQuick(col).nonNullIdx;
+    }
+
+    public long requestId() {
+        return requestId;
+    }
+
+    /**
+     * Address of the column's packed non-null values in the payload buffer.
+     * Layout depends on the wire type:
+     * <ul>
+     *   <li>Fixed-width (LONG, INT, DOUBLE, UUID, LONG256, etc.): contiguous values, index by {@code nonNullIndex(col)[row] * sizeBytes}.</li>
+     *   <li>BOOLEAN: bit-packed, 8 values per byte, LSB-first; index by {@code nonNullIndex(col)[row]}.</li>
+     *   <li>STRING / VARCHAR: points to the (N+1) x uint32 offsets array; use  for the bytes region.</li>
+     *   <li>GEOHASH: {@code ceil(precisionBits / 8)} bytes per value; index by {@code nonNullIndex(col)[row] * bytesPerValue}.</li>
+     *   <li>DECIMAL64/128/256: the scale byte has already been consumed; this is the first unscaled value.</li>
+     *   <li>SYMBOL: not meaningful -- use {@link #getStrA} / {@link #getStrB} instead.</li>
+     *   <li>ARRAY: not meaningful -- use the per-row {@code arrayRowAddr} accessors (forthcoming).</li>
+     * </ul>
+     */
+    public long valuesAddr(int col) {
+        return columnLayouts.getQuick(col).valuesAddr;
     }
 
     /**
@@ -449,8 +505,20 @@ public class QwpColumnBatch {
         return (bm & (1 << (row & 7))) != 0;
     }
 
-    public long requestId() {
-        return requestId;
+    /**
+     * Resolves the {@code (col, row)} cell for a BINARY column and points the supplied
+     * slice at the underlying bytes in the payload buffer. Returns {@code null} for NULL
+     * rows or if the column is not BINARY.
+     */
+    private io.questdb.client.std.bytes.DirectByteSequence lookupBinaryBytes(
+            int col, int row, io.questdb.client.std.bytes.DirectByteSlice view) {
+        if (isNull(col, row)) return null;
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (l.info.wireType != QwpConstants.TYPE_BINARY) return null;
+        int denseIdx = l.nonNullIdx[row];
+        int startOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * denseIdx);
+        int endOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * (denseIdx + 1));
+        return view.of(l.stringBytesAddr + startOff, endOff - startOff);
     }
 
     /**

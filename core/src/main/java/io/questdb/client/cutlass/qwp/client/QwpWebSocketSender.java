@@ -1279,7 +1279,7 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
-        // Invalidate cached column references — table buffers will be reset below
+        // Invalidate cached column references -- table buffers will be reset below
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
@@ -1386,7 +1386,7 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
-        // Invalidate cached column references — table buffers will be reset below
+        // Invalidate cached column references -- table buffers will be reset below
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 

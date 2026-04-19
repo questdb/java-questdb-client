@@ -82,15 +82,15 @@ public class QwpQueryClient implements QuietCloseable {
      * <p>
      * Supported schemas:
      * <ul>
-     *   <li>{@code ws::} — plain WebSocket (matches QWP egress today; TLS not yet supported).</li>
+     *   <li>{@code ws::} -- plain WebSocket (matches QWP egress today; TLS not yet supported).</li>
      * </ul>
      * Supported keys:
      * <ul>
-     *   <li>{@code addr=host[:port]} — required. Default port is {@value #DEFAULT_WS_PORT}.</li>
-     *   <li>{@code path=/read/v1} — egress endpoint. Default {@value #DEFAULT_ENDPOINT_PATH}.</li>
-     *   <li>{@code auth=<value>} — sent as the HTTP {@code Authorization} header during the upgrade handshake.</li>
-     *   <li>{@code client_id=<id>} — sent as the {@code X-QWP-Client-Id} header.</li>
-     *   <li>{@code buffer_pool_size=N} — depth of the I/O thread's batch buffer pool. Default 4.</li>
+     *   <li>{@code addr=host[:port]} -- required. Default port is {@value #DEFAULT_WS_PORT}.</li>
+     *   <li>{@code path=/read/v1} -- egress endpoint. Default {@value #DEFAULT_ENDPOINT_PATH}.</li>
+     *   <li>{@code auth=<value>} -- sent as the HTTP {@code Authorization} header during the upgrade handshake.</li>
+     *   <li>{@code client_id=<id>} -- sent as the {@code X-QWP-Client-Id} header.</li>
+     *   <li>{@code buffer_pool_size=N} -- depth of the I/O thread's batch buffer pool. Default 4.</li>
      * </ul>
      * Examples:
      * <pre>
@@ -195,7 +195,7 @@ public class QwpQueryClient implements QuietCloseable {
      * the buffer pool and close the underlying socket.
      * <p>
      * If the I/O thread fails to exit within {@link #SHUTDOWN_JOIN_MS} (default 5 s), this
-     * method does <em>not</em> free the buffer pool or close the WebSocket — both are
+     * method does <em>not</em> free the buffer pool or close the WebSocket -- both are
      * still in use by the thread, and freeing them would race into a JVM-killing
      * use-after-free. The thread is a daemon, so the JVM still exits normally; the
      * resources leak for the lifetime of the process. A warning is recorded by setting
@@ -211,17 +211,17 @@ public class QwpQueryClient implements QuietCloseable {
             // Wake the thread from any blocking poll / recv so it sees the shutdown flag promptly.
             if (ioThreadHandle != null) {
                 ioThreadHandle.interrupt();
-                boolean joined = false;
+                boolean joined;
                 try {
                     ioThreadHandle.join(SHUTDOWN_JOIN_MS);
                     joined = !ioThreadHandle.isAlive();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    // Don't free anything — preserve clean shutdown semantics on the next attempt.
+                    // Don't free anything -- preserve clean shutdown semantics on the next attempt.
                     return;
                 }
                 if (!joined) {
-                    // Daemon thread is still running — buffer pool and WebSocketClient may
+                    // Daemon thread is still running -- buffer pool and WebSocketClient may
                     // be in use. Leak them rather than risk a SIGSEGV by freeing under it.
                     lastCloseTimedOut = true;
                     ioThread = null;
@@ -283,17 +283,27 @@ public class QwpQueryClient implements QuietCloseable {
         if (!connected) {
             throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
         }
+        // Cache the I/O thread reference at entry: close() may null the field while
+        // we are inside this loop, so reading the field per-iteration would NPE
+        // exactly when the user is mid-execute() and close() races. The queue and
+        // pool the cached reference owns are still drained safely by closePool()
+        // before close() returns.
+        QwpEgressIoThread io = ioThread;
+        if (io == null) {
+            handler.onError((byte) 0, "QwpQueryClient is closed");
+            return;
+        }
         long requestId = nextRequestId++;
         try {
-            ioThread.submitQuery(sql, requestId);
+            io.submitQuery(sql, requestId);
             while (true) {
-                QueryEvent ev = ioThread.takeEvent();
+                QueryEvent ev = io.takeEvent();
                 switch (ev.kind) {
                     case QueryEvent.KIND_BATCH:
                         try {
                             handler.onBatch(ev.buffer.batch);
                         } finally {
-                            ioThread.releaseBuffer(ev.buffer);
+                            io.releaseBuffer(ev.buffer);
                         }
                         break;
                     case QueryEvent.KIND_END:

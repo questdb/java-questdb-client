@@ -35,8 +35,8 @@ import io.questdb.client.std.Unsafe;
  * into, plus the per-column {@link QwpColumnLayout} pool used while decoding and
  * the {@link QwpColumnBatch} view that the user's handler sees.
  * <p>
- * Lifecycle: I/O thread takes a buffer from the free pool → copies the frame
- * payload in → hands the decoder the buffer → pushes the resulting batch onto
+ * Lifecycle: I/O thread takes a buffer from the free pool -> copies the frame
+ * payload in -> hands the decoder the buffer -> pushes the resulting batch onto
  * the event queue. User thread pops, invokes the handler, releases the buffer
  * back to the pool. While the user thread owns the buffer the I/O thread is
  * free to take a different buffer and decode the next frame.
@@ -90,8 +90,7 @@ public class QwpBatchBuffer implements QuietCloseable {
         if (required <= scratchCapacity) return;
         int newCap = scratchCapacity;
         while (newCap < required) newCap *= 2;
-        long newAddr = Unsafe.realloc(scratchAddr, scratchCapacity, newCap, MemoryTag.NATIVE_DEFAULT);
-        scratchAddr = newAddr;
+        scratchAddr = Unsafe.realloc(scratchAddr, scratchCapacity, newCap, MemoryTag.NATIVE_DEFAULT);
         scratchCapacity = newCap;
     }
 }

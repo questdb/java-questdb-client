@@ -82,7 +82,7 @@ public class QwpColumnLayout {
 
     /**
      * SYMBOL: per-row dictionary ID. Sized to {@code rowCount}; NULL rows are
-     * left with stale values — use {@link #nonNullIdx}/null-check first.
+     * left with stale values -- use {@link #nonNullIdx}/null-check first.
      */
     int[] symbolRowIds;
 
@@ -97,7 +97,7 @@ public class QwpColumnLayout {
     int[] arrayRowLen;
 
     /**
-     * Absolute address of the first byte after this column's data — used to walk to the next column.
+     * Absolute address of the first byte after this column's data -- used to walk to the next column.
      */
     long nextAddr;
 

@@ -72,6 +72,11 @@ public final class QwpConstants {
      */
     public static final byte SCHEMA_MODE_REFERENCE = 0x01;
     /**
+     * Column type: BINARY (length-prefixed opaque bytes).
+     * Wire format: identical to VARCHAR — (N+1) x uint32 offsets + concatenated bytes.
+     */
+    public static final byte TYPE_BINARY = 0x17;
+    /**
      * Column type: BOOLEAN (1 bit per value, packed).
      */
     public static final byte TYPE_BOOLEAN = 0x01;
@@ -123,6 +128,11 @@ public final class QwpConstants {
      * Column type: INT (int32, little-endian).
      */
     public static final byte TYPE_INT = 0x04;
+    /**
+     * Column type: IPv4 (32-bit address). Wire format: 4 bytes LE, identical to INT.
+     * NULL is signalled via the standard null bitmap.
+     */
+    public static final byte TYPE_IPv4 = 0x18;
     /**
      * Column type: LONG (int64, little-endian).
      */
@@ -191,8 +201,7 @@ public final class QwpConstants {
      * @return size in bytes, 0 for bit-packed (BOOLEAN), or -1 for variable-width types
      */
     public static int getFixedTypeSize(byte typeCode) {
-        int code = typeCode;
-        switch (code) {
+        switch ((int) typeCode) {
             case TYPE_BOOLEAN:
                 return 0; // Special: bit-packed
             case TYPE_BYTE:
@@ -230,9 +239,8 @@ public final class QwpConstants {
      * @return type name
      */
     public static String getTypeName(byte typeCode) {
-        int code = typeCode;
         String name;
-        switch (code) {
+        switch ((int) typeCode) {
             case TYPE_BOOLEAN:
                 name = "BOOLEAN";
                 break;
@@ -300,7 +308,7 @@ public final class QwpConstants {
                 name = "DECIMAL256";
                 break;
             default:
-                name = "UNKNOWN(" + code + ")";
+                name = "UNKNOWN(" + (int) typeCode + ")";
                 break;
         }
         return name;
@@ -313,22 +321,21 @@ public final class QwpConstants {
      * @return true if fixed-width
      */
     public static boolean isFixedWidthType(byte typeCode) {
-        int code = typeCode;
-        return code == TYPE_BOOLEAN ||
-                code == TYPE_BYTE ||
-                code == TYPE_SHORT ||
-                code == TYPE_CHAR ||
-                code == TYPE_INT ||
-                code == TYPE_LONG ||
-                code == TYPE_FLOAT ||
-                code == TYPE_DOUBLE ||
-                code == TYPE_TIMESTAMP ||
-                code == TYPE_TIMESTAMP_NANOS ||
-                code == TYPE_DATE ||
-                code == TYPE_UUID ||
-                code == TYPE_LONG256 ||
-                code == TYPE_DECIMAL64 ||
-                code == TYPE_DECIMAL128 ||
-                code == TYPE_DECIMAL256;
+        return (int) typeCode == TYPE_BOOLEAN ||
+                (int) typeCode == TYPE_BYTE ||
+                (int) typeCode == TYPE_SHORT ||
+                (int) typeCode == TYPE_CHAR ||
+                (int) typeCode == TYPE_INT ||
+                (int) typeCode == TYPE_LONG ||
+                (int) typeCode == TYPE_FLOAT ||
+                (int) typeCode == TYPE_DOUBLE ||
+                (int) typeCode == TYPE_TIMESTAMP ||
+                (int) typeCode == TYPE_TIMESTAMP_NANOS ||
+                (int) typeCode == TYPE_DATE ||
+                (int) typeCode == TYPE_UUID ||
+                (int) typeCode == TYPE_LONG256 ||
+                (int) typeCode == TYPE_DECIMAL64 ||
+                (int) typeCode == TYPE_DECIMAL128 ||
+                (int) typeCode == TYPE_DECIMAL256;
     }
 }

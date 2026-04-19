@@ -28,7 +28,6 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Misc;
-import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 
 import java.nio.charset.StandardCharsets;
@@ -45,26 +44,23 @@ import java.util.concurrent.TimeUnit;
  * A small pool of {@link QwpBatchBuffer} instances (default: 4) holds decoded
  * batches in flight. When the pool is exhausted the I/O thread blocks on
  * {@link #freeBuffers} until the user releases a buffer. This gives natural
- * back-pressure — if the consumer is slow, the I/O thread stops reading and
+ * back-pressure -- if the consumer is slow, the I/O thread stops reading and
  * the kernel's TCP window closes on the server side.
  */
 public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
 
     private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
     private static final long POLL_TIMEOUT_MS = 100;
-    // Pool of pre-allocated buffers. I/O thread takes, user thread releases.
-    private final BlockingQueue<QwpBatchBuffer> freeBuffers;
     private final QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
     // Events delivered from I/O thread to user thread (RESULT_BATCH / RESULT_END / QUERY_ERROR).
     private final BlockingQueue<QueryEvent> events;
+    // Pool of pre-allocated buffers. I/O thread takes, user thread releases.
+    private final BlockingQueue<QwpBatchBuffer> freeBuffers;
     // Single-slot request queue (Phase-1 allows one in-flight query).
     private final BlockingQueue<QueryRequest> requests = new ArrayBlockingQueue<>(1);
     private final NativeBufferWriter sendScratch = new NativeBufferWriter();
     private final WebSocketClient wsClient;
-    // Per-query state; accessed only from the I/O thread.
-    private long currentRequestId;
     private boolean currentQueryDone;
-    private volatile Throwable fatalError;
     private volatile boolean shutdown;
 
     public QwpEgressIoThread(WebSocketClient wsClient, int bufferPoolSize) {
@@ -77,11 +73,31 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
-     * Releases a buffer back to the I/O thread pool. Call after the user
-     * handler finishes processing a {@code KIND_BATCH} event.
+     * Decodes a QUERY_ERROR payload into a {@link QueryEvent}. Visible for testing.
+     * Bound-checks msgLen against the actual payload: a hostile or buggy server
+     * can encode msgLen=0xFFFF with a tiny payload, which would otherwise read
+     * up to 65 KiB of native memory beyond the frame and surface it to the user
+     * callback as a String.
      */
-    public void releaseBuffer(QwpBatchBuffer buffer) {
-        freeBuffers.offer(buffer);
+    public static QueryEvent decodeError(long payload, int payloadLen) {
+        long payloadEnd = payload + payloadLen;
+        long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
+        if (p + 1 + 2 > payloadEnd) {
+            return new QueryEvent().asError((byte) 0, "QUERY_ERROR frame truncated before msg_len");
+        }
+        byte status = Unsafe.getUnsafe().getByte(p);
+        p += 1;
+        int msgLen = Unsafe.getUnsafe().getShort(p) & 0xFFFF;
+        p += 2;
+        if (p + msgLen > payloadEnd) {
+            return new QueryEvent().asError((byte) 0,
+                    "QUERY_ERROR msg_len " + msgLen + " exceeds frame remainder " + (payloadEnd - p));
+        }
+        byte[] bytes = new byte[msgLen];
+        for (int i = 0; i < msgLen; i++) {
+            bytes[i] = Unsafe.getUnsafe().getByte(p + i);
+        }
+        return new QueryEvent().asError(status, new String(bytes, StandardCharsets.UTF_8));
     }
 
     @Override
@@ -117,6 +133,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         }
     }
 
+    /**
+     * Releases a buffer back to the I/O thread pool. Call after the user
+     * handler finishes processing a {@code KIND_BATCH} event.
+     */
+    public void releaseBuffer(QwpBatchBuffer buffer) {
+        freeBuffers.offer(buffer);
+    }
+
     @Override
     public void run() {
         try {
@@ -125,11 +149,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                 try {
                     req = requests.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException ie) {
-                    return;
+                    break;
                 }
                 if (req == null) continue;
 
-                currentRequestId = req.requestId;
+                // Per-query state; accessed only from the I/O thread.
                 currentQueryDone = false;
                 sendQueryRequest(req);
 
@@ -139,20 +163,23 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                 }
             }
         } catch (Throwable t) {
-            fatalError = t;
-            emitError((byte) 0, "I/O thread failure: " + t.getMessage());
+            emitErrorBlocking((byte) 0, "I/O thread failure: " + t.getMessage());
+        } finally {
+            // Wake any user thread blocked on events.take(). Without this, a close()
+            // (or any abnormal exit) while a user thread is mid-execute() would let
+            // takeEvent() block forever -- once the I/O thread is gone, no further
+            // events arrive on the queue.
+            if (!currentQueryDone) {
+                emitErrorBlocking((byte) 0, shutdown
+                        ? "I/O thread shut down with query in flight"
+                        : "I/O thread terminated with query in flight");
+                currentQueryDone = true;
+            }
         }
     }
 
     /**
-     * Blocking pop of the next event. Called by the user thread during {@code execute()}.
-     */
-    public QueryEvent takeEvent() throws InterruptedException {
-        return events.take();
-    }
-
-    /**
-     * Signals shutdown. Does not join the thread — caller handles that.
+     * Signals shutdown. Does not join the thread -- caller handles that.
      */
     public void shutdown() {
         shutdown = true;
@@ -166,28 +193,15 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
-     * Frees native scratch owned by the pool. Call after the thread has terminated.
+     * Blocking pop of the next event. Called by the user thread during {@code execute()}.
      */
-    void closePool() {
-        Misc.free(sendScratch);
-        for (QwpBatchBuffer b : freeBuffers) {
-            b.close();
-        }
-        freeBuffers.clear();
+    public QueryEvent takeEvent() throws InterruptedException {
+        return events.take();
     }
 
     private void decodeAndEmitError(long payload, int payloadLen) {
-        // Body: msg_kind(1) + requestId(8) + status(1) + msgLen(u16) + msgBytes
-        long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
-        byte status = Unsafe.getUnsafe().getByte(p);
-        p += 1;
-        int msgLen = Unsafe.getUnsafe().getShort(p) & 0xFFFF;
-        p += 2;
-        byte[] bytes = new byte[msgLen];
-        for (int i = 0; i < msgLen; i++) {
-            bytes[i] = Unsafe.getUnsafe().getByte(p + i);
-        }
-        events.offer(new QueryEvent().asError(status, new String(bytes, StandardCharsets.UTF_8)));
+        QueryEvent ev = decodeError(payload, payloadLen);
+        events.offer(ev);
     }
 
     /**
@@ -213,6 +227,19 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
 
     private void emitError(byte status, String message) {
         events.offer(new QueryEvent().asError(status, message));
+    }
+
+    /**
+     * Like {@link #emitError} but blocks until the event is enqueued. Used on shutdown
+     * and fatal-error paths where dropping the event would leave the user thread
+     * blocked on {@link #takeEvent} indefinitely.
+     */
+    private void emitErrorBlocking(byte status, String message) {
+        try {
+            events.put(new QueryEvent().asError(status, message));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void handleResultBatch(long payloadPtr, int payloadLen) {
@@ -250,6 +277,36 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         sendScratch.putVarint(0); // bind_count = 0
         wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
         sendScratch.reset();
+    }
+
+    /**
+     * Frees native scratch owned by the pool. Call after the thread has terminated.
+     * <p>
+     * Drains any unconsumed batch events still in the events queue and closes
+     * their buffers. Without this, a close() that races with an in-flight query
+     * would leak the {@link QwpBatchBuffer} native scratches that were enqueued
+     * but never consumed.
+     * <p>
+     * Pushes a final sentinel error onto the events queue so any user thread
+     * blocked on {@link #takeEvent} (or that returns from a handler after the
+     * pool has been drained) wakes up with a clear error rather than blocking
+     * forever on an empty queue.
+     */
+    void closePool() {
+        Misc.free(sendScratch);
+        QueryEvent ev;
+        while ((ev = events.poll()) != null) {
+            if (ev.kind == QueryEvent.KIND_BATCH && ev.buffer != null) {
+                ev.buffer.close();
+            }
+        }
+        for (QwpBatchBuffer b : freeBuffers) {
+            b.close();
+        }
+        freeBuffers.clear();
+        // The events queue capacity is bufferPoolSize + 2 with no consumer competing
+        // for slots after the I/O thread has joined, so offer is guaranteed to succeed.
+        events.offer(new QueryEvent().asError((byte) 0, "QwpQueryClient closed"));
     }
 
     private static final class QueryRequest {
