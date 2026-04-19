@@ -73,6 +73,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private final BlockingQueue<QueryRequest> requests = new ArrayBlockingQueue<>(1);
     private final NativeBufferWriter sendScratch = new NativeBufferWriter();
     private final WebSocketClient wsClient;
+    // Per-query credit state (accessed only from the I/O thread).
+    // creditEnabled == (initialCredit > 0); controls whether we emit CREDIT
+    // replenish frames after each batch release.
+    private boolean creditEnabled;
+    private long currentRequestId = -1L;
     private boolean currentQueryDone;
     private volatile boolean shutdown;
 
@@ -187,6 +192,8 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
 
                 // Per-query state; accessed only from the I/O thread.
                 currentQueryDone = false;
+                currentRequestId = req.requestId;
+                creditEnabled = req.initialCredit > 0L;
                 sendQueryRequest(req);
 
                 while (!currentQueryDone && !shutdown) {
@@ -219,10 +226,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
-     * Blocking submission of a query. Called by the user thread.
+     * Blocking submission of a query. Called by the user thread. {@code initialCredit}
+     * is the client-advertised send-ahead budget in bytes -- 0 means "unbounded"
+     * (server streams without flow control, Phase-1 default); any positive value
+     * asks the server to suspend once it has emitted that many bytes and wait
+     * for a CREDIT frame.
      */
-    public void submitQuery(String sql, long requestId) throws InterruptedException {
-        requests.put(new QueryRequest(sql, requestId));
+    public void submitQuery(String sql, long requestId, long initialCredit) throws InterruptedException {
+        requests.put(new QueryRequest(sql, requestId, initialCredit));
     }
 
     /**
@@ -352,7 +363,27 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         } catch (InterruptedException ie) {
             // Shutdown path: leave the batch to the user thread; they'll see
             // either the in-progress batch or a subsequent close event.
+            return;
         }
+        // Credit replenish: the user is done with the batch, so the recv-buffer
+        // bytes are free. Tell the server it can stream {@code payloadLen} more
+        // bytes. No-op when the query wasn't started under flow control.
+        if (creditEnabled) {
+            sendCredit(currentRequestId, payloadLen);
+        }
+    }
+
+    /**
+     * Builds and transmits a CREDIT frame on the WebSocket. Wire format:
+     * {@code msg_kind(0x15) + request_id(u64) + additional_bytes(varint)}.
+     */
+    private void sendCredit(long requestId, long additionalBytes) {
+        sendScratch.reset();
+        sendScratch.putByte(QwpEgressMsgKind.CREDIT);
+        sendScratch.putLong(requestId);
+        sendScratch.putVarint(additionalBytes);
+        wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
+        sendScratch.reset();
     }
 
     /**
@@ -379,7 +410,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         for (byte b : sqlBytes) {
             sendScratch.putByte(b);
         }
-        sendScratch.putVarint(0); // initial_credit = 0 (unbounded)
+        sendScratch.putVarint(req.initialCredit); // 0 = unbounded (Phase-1 default)
         sendScratch.putVarint(0); // bind_count = 0
         wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
         sendScratch.reset();
@@ -417,12 +448,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     private static final class QueryRequest {
+        final long initialCredit;
         final long requestId;
         final String sql;
 
-        QueryRequest(String sql, long requestId) {
+        QueryRequest(String sql, long requestId, long initialCredit) {
             this.sql = sql;
             this.requestId = requestId;
+            this.initialCredit = initialCredit;
         }
     }
 }

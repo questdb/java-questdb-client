@@ -69,6 +69,12 @@ public class QwpQueryClient implements QuietCloseable {
     // are atomic under {@code volatile long}.
     private volatile long currentRequestId = -1L;
     private String endpointPath = DEFAULT_ENDPOINT_PATH;
+    // Credit-flow send-ahead budget. 0 = unbounded (Phase-1 default, no CREDIT
+    // bookkeeping on either side). A positive value puts the stream under byte-
+    // based flow control: the server emits at most this many bytes of result
+    // payload before it parks, and the client auto-replenishes by the size of
+    // each batch as the user releases it.
+    private long initialCreditBytes;
     private QwpEgressIoThread ioThread;
     private Thread ioThreadHandle;
     private boolean lastCloseTimedOut;
@@ -306,7 +312,7 @@ public class QwpQueryClient implements QuietCloseable {
         long requestId = nextRequestId++;
         currentRequestId = requestId;
         try {
-            io.submitQuery(sql, requestId);
+            io.submitQuery(sql, requestId, initialCreditBytes);
             while (true) {
                 QueryEvent ev = io.takeEvent();
                 switch (ev.kind) {
@@ -385,6 +391,22 @@ public class QwpQueryClient implements QuietCloseable {
 
     public QwpQueryClient withEndpointPath(String endpointPath) {
         this.endpointPath = endpointPath;
+        return this;
+    }
+
+    /**
+     * Opts the next {@link #execute} into credit-based flow control with
+     * {@code bytes} of initial send-ahead budget. The server streams at most
+     * {@code bytes} of result payload before pausing; the client auto-
+     * replenishes by the size of each batch after the user's handler releases
+     * it. Passing {@code 0} (the default) disables flow control entirely
+     * (unbounded -- Phase-1 behaviour).
+     * <p>
+     * Must be called before {@link #connect}.
+     */
+    public QwpQueryClient withInitialCredit(long bytes) {
+        if (bytes < 0) throw new IllegalArgumentException("initial credit must be >= 0");
+        this.initialCreditBytes = bytes;
         return this;
     }
 

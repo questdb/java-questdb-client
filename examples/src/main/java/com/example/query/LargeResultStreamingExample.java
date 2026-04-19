@@ -14,8 +14,10 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  * <p>
  * The server streams continuously until the cursor is exhausted; batches arrive
  * on the calling thread inside {@code client.execute(...)} as the WebSocket
- * yields frames. Nothing you write on the client influences pacing in Phase 1
- * (credit-based flow control is a follow-up).
+ * yields frames. Pacing naturally follows TCP back-pressure -- if the consumer
+ * is slower than the network, the kernel send buffer fills and the server
+ * parks between batches. For explicit byte-level flow control on top of that,
+ * see {@link CreditFlowControlExample}.
  */
 public class LargeResultStreamingExample {
 
