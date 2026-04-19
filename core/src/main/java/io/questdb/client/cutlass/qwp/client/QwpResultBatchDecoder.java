@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.protocol.QwpGorillaDecoder;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
@@ -73,6 +74,11 @@ public class QwpResultBatchDecoder implements QuietCloseable {
      * a negative varint that long-to-int casts negative).
      */
     private static final int MAX_SCHEMAS_PER_CONNECTION = 65_535;
+    // Reused for Gorilla-encoded TIMESTAMP / TIMESTAMP_NANOS / DATE columns.
+    // Stateful per-column -- {@link #parseTimestampColumn} calls {@code reset}
+    // before decoding each column so residue from a previous column never bleeds
+    // in.
+    private final QwpGorillaDecoder gorillaDecoder = new QwpGorillaDecoder();
     // Connection-scoped state (safe to share across buffers -- reused across batches
     // of the same query and across queries on the same connection).
     // Connection-scoped SYMBOL dictionary. Populated by {@link #parseDeltaSymbolDict}
@@ -95,6 +101,10 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     // True when the current message carries {@code FLAG_DELTA_SYMBOL_DICT}. Read by
     // {@link #parseSymbolColumn} to decide whether to consume a per-column dict.
     private boolean deltaMode;
+    // True when the current message carries {@code FLAG_GORILLA}. When set,
+    // TIMESTAMP / TIMESTAMP_NANOS / DATE columns are prefixed by a 1-byte
+    // encoding discriminator (0x00 raw, 0x01 Gorilla).
+    private boolean gorillaMode;
     // Reusable varint decode state: value in varintValue, new position in varintPos.
     // Instance-level so no {@code long[2]} scratch is allocated per call.
     private long varintPos;
@@ -208,6 +218,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         }
         byte flags = Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS);
         deltaMode = (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0;
+        gorillaMode = (flags & QwpConstants.FLAG_GORILLA) != 0;
         long p = payload + QwpConstants.HEADER_SIZE;
         long limit = payload + payloadLen;
 
@@ -411,10 +422,13 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         if (wt == QwpConstants.TYPE_SHORT || wt == QwpConstants.TYPE_CHAR) return advanceFixed(layout, p, limit, 2);
         if (wt == QwpConstants.TYPE_INT || wt == QwpConstants.TYPE_FLOAT
                 || wt == QwpConstants.TYPE_IPv4) return advanceFixed(layout, p, limit, 4);
-        if (wt == QwpConstants.TYPE_LONG || wt == QwpConstants.TYPE_DOUBLE
-                || wt == QwpConstants.TYPE_DATE
-                || wt == QwpConstants.TYPE_TIMESTAMP || wt == QwpConstants.TYPE_TIMESTAMP_NANOS) {
+        if (wt == QwpConstants.TYPE_LONG || wt == QwpConstants.TYPE_DOUBLE) {
             return advanceFixed(layout, p, limit, 8);
+        }
+        if (wt == QwpConstants.TYPE_DATE
+                || wt == QwpConstants.TYPE_TIMESTAMP
+                || wt == QwpConstants.TYPE_TIMESTAMP_NANOS) {
+            return parseTimestampColumn(layout, p, limit);
         }
         if (wt == QwpConstants.TYPE_DECIMAL64) {
             if (p >= limit) throw new QwpDecodeException("truncated DECIMAL64 scale");
@@ -599,6 +613,57 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         }
         layout.valuesAddr = 0; // Not applicable; accessors use symbolRowIds + symbolDictEntriesAddr.
         return p;
+    }
+
+    /**
+     * TIMESTAMP / TIMESTAMP_NANOS / DATE: with {@code FLAG_GORILLA} set on the
+     * message, the column is prefixed with a 1-byte encoding discriminator
+     * ({@code 0x00} uncompressed, {@code 0x01} Gorilla bitstream). Without the
+     * flag the column is plain 8-byte fixed-width -- the pre-Gorilla format.
+     * <p>
+     * Uncompressed: {@link QwpColumnLayout#valuesAddr} points directly at the
+     * wire bytes. Gorilla: we decode into a per-layout native i64 buffer and
+     * point {@code valuesAddr} at it, so the caller's {@code getLong(col, row)}
+     * path is identical in both cases.
+     */
+    private long parseTimestampColumn(QwpColumnLayout layout, long p, long limit) throws QwpDecodeException {
+        int nonNull = layout.nonNullCount;
+        if (!gorillaMode) {
+            return advanceFixed(layout, p, limit, 8);
+        }
+        if (p >= limit) throw new QwpDecodeException("truncated TIMESTAMP encoding byte");
+        byte encoding = Unsafe.getUnsafe().getByte(p++);
+        if (encoding == 0x00) {
+            // Uncompressed: bytes sit inline just like advanceFixed.
+            long total = (long) nonNull * 8L;
+            if (p + total > limit) throw new QwpDecodeException("truncated TIMESTAMP raw values");
+            layout.valuesAddr = p;
+            return p + total;
+        }
+        if (encoding != 0x01) {
+            throw new QwpDecodeException("unknown TIMESTAMP encoding 0x" + Integer.toHexString(encoding & 0xFF));
+        }
+        // Gorilla: first two timestamps are uncompressed (16 bytes), the rest is
+        // a bitstream. Server shortcuts nonNull<3 to the uncompressed branch, so
+        // we always have at least 3 values here.
+        if (nonNull < 3) throw new QwpDecodeException("Gorilla-encoded column with nonNull<3: " + nonNull);
+        if (p + 16L > limit) throw new QwpDecodeException("truncated Gorilla prefix");
+        long firstTs = Unsafe.getUnsafe().getLong(p);
+        long secondTs = Unsafe.getUnsafe().getLong(p + 8L);
+        long bitstreamStart = p + 16L;
+        long decodeAddr = layout.ensureTimestampDecodeAddr(nonNull * 8);
+        Unsafe.getUnsafe().putLong(decodeAddr, firstTs);
+        Unsafe.getUnsafe().putLong(decodeAddr + 8L, secondTs);
+        gorillaDecoder.reset(firstTs, secondTs, bitstreamStart, limit - bitstreamStart);
+        for (int i = 2; i < nonNull; i++) {
+            Unsafe.getUnsafe().putLong(decodeAddr + (long) i * 8L, gorillaDecoder.decodeNext());
+        }
+        layout.valuesAddr = decodeAddr;
+        long bitPos = gorillaDecoder.getBitPosition();
+        long bitstreamBytes = (bitPos + 7L) >>> 3;
+        long end = bitstreamStart + bitstreamBytes;
+        if (end > limit) throw new QwpDecodeException("truncated Gorilla bitstream");
+        return end;
     }
 
     // Batch reset

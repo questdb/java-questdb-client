@@ -107,6 +107,15 @@ public class QwpColumnLayout implements QuietCloseable {
      */
     private long ownedEntriesAddr;
     private int ownedEntriesCapacity;
+    /**
+     * TIMESTAMP / TIMESTAMP_NANOS / DATE Gorilla decode buffer owned by this
+     * layout. Populated when the per-column encoding discriminator is
+     * {@code 0x01}; {@link #valuesAddr} is then pointed at this buffer so the
+     * user-facing {@code getLong(col, row)} path sees decoded int64s. Unused
+     * (0) when the column was shipped uncompressed.
+     */
+    private long timestampDecodeAddr;
+    private int timestampDecodeCapacity;
 
     public void clear() {
         info = null;
@@ -127,6 +136,11 @@ public class QwpColumnLayout implements QuietCloseable {
             ownedEntriesAddr = 0;
             ownedEntriesCapacity = 0;
         }
+        if (timestampDecodeAddr != 0) {
+            Unsafe.free(timestampDecodeAddr, timestampDecodeCapacity, MemoryTag.NATIVE_DEFAULT);
+            timestampDecodeAddr = 0;
+            timestampDecodeCapacity = 0;
+        }
     }
 
     /**
@@ -141,5 +155,18 @@ public class QwpColumnLayout implements QuietCloseable {
             ownedEntriesCapacity = newCap;
         }
         return ownedEntriesAddr;
+    }
+
+    /**
+     * Ensures the per-layout Gorilla decode buffer is at least {@code requiredBytes}
+     * and returns its address.
+     */
+    long ensureTimestampDecodeAddr(int requiredBytes) {
+        if (timestampDecodeCapacity < requiredBytes) {
+            int newCap = Math.max(timestampDecodeCapacity * 2, Math.max(64, requiredBytes));
+            timestampDecodeAddr = Unsafe.realloc(timestampDecodeAddr, timestampDecodeCapacity, newCap, MemoryTag.NATIVE_DEFAULT);
+            timestampDecodeCapacity = newCap;
+        }
+        return timestampDecodeAddr;
     }
 }
