@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.5)
 project(questdb)
 
+# Required for zstd's huf_decompress_amd64.S to be assembled. Without this,
+# CMake silently drops the .S file from the build and the link fails at
+# _HUF_decompress4X1_usingDTable_internal_fast_asm_loop etc. (The asmlib
+# subdirectory enables ASM_NASM separately for Agner Fog's .asm files.)
+enable_language(ASM)
+
 include(ExternalProject)
 
 set(CMAKE_CXX_STANDARD 17)
