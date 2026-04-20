@@ -49,6 +49,42 @@ set(
         src/main/c/share/byte_sink.h
 )
 
+# libzstd is included via a git submodule at src/main/c/share/zstd (pinned to
+# upstream tag v1.5.7). Covers the client side of the QWP egress compression
+# feature; the server-side compressor lives in the Rust qdbr crate and isn't
+# linked into this library. Only the decompress-only subset of upstream is
+# compiled -- the compress/ directory is left out entirely. zstd_jni.c is our
+# JNI glue and lives alongside the submodule (not inside) so upstream resets
+# don't disturb it.
+if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/zstd/lib/zstd.h)
+    message(FATAL_ERROR
+        "libzstd submodule not initialised. Run:\n"
+        "  git submodule update --init --recursive\n"
+        "from java-questdb-client/.")
+endif ()
+set(
+        ZSTD_FILES
+        src/main/c/share/zstd_jni.c
+        src/main/c/share/zstd/lib/common/debug.c
+        src/main/c/share/zstd/lib/common/entropy_common.c
+        src/main/c/share/zstd/lib/common/error_private.c
+        src/main/c/share/zstd/lib/common/fse_decompress.c
+        src/main/c/share/zstd/lib/common/pool.c
+        src/main/c/share/zstd/lib/common/threading.c
+        src/main/c/share/zstd/lib/common/xxhash.c
+        src/main/c/share/zstd/lib/common/zstd_common.c
+        src/main/c/share/zstd/lib/decompress/huf_decompress.c
+        src/main/c/share/zstd/lib/decompress/zstd_ddict.c
+        src/main/c/share/zstd/lib/decompress/zstd_decompress_block.c
+        src/main/c/share/zstd/lib/decompress/zstd_decompress.c
+)
+# x86_64-only hand-tuned Huffman decoder; C fallback kicks in when
+# ZSTD_DISABLE_ASM is set.
+if (ARCH_AMD64 AND NOT WIN32)
+    list(APPEND ZSTD_FILES src/main/c/share/zstd/lib/decompress/huf_decompress_amd64.S)
+endif ()
+list(APPEND SOURCE_FILES ${ZSTD_FILES})
+
 # JNI includes
 include_directories($ENV{JAVA_HOME}/include/)
 
@@ -110,6 +146,20 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${OUTPUT})
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${OUTPUT})
 
 add_library(questdb SHARED ${SOURCE_FILES})
+
+# libzstd public header is at zstd/lib/zstd.h; internal headers live under
+# zstd/lib/common/. Both directories go on the include path so zstd_jni.c can
+# use the short include "zstd.h" and the upstream .c files can find their own
+# siblings without patching.
+target_include_directories(questdb PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/zstd/lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/zstd/lib/common)
+
+# Drop the zstd-internal hand-written amd64 assembly on platforms that can't
+# assemble it; libzstd falls back to a C implementation when this is set.
+if (NOT ARCH_AMD64 OR WIN32)
+    target_compile_definitions(questdb PRIVATE ZSTD_DISABLE_ASM=1)
+endif ()
 
 set(COMMON_OPTIONS "-Wno-gnu-anonymous-struct;-Wno-nested-anon-types;-Wno-unused-parameter;-fPIC;-fno-rtti;-fno-exceptions")
 

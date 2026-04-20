@@ -105,6 +105,12 @@ public abstract class WebSocketClient implements QuietCloseable {
     private CharSequence host;
     private int port;
     // QWP version negotiation
+    // Verbatim header value sent as X-QWP-Accept-Encoding during upgrade, e.g.
+    // "zstd;level=3,raw". When null, the header is omitted and the server ships
+    // batches uncompressed. The echoed X-QWP-Content-Encoding response header
+    // is intentionally not parsed: the RESULT_BATCH decoder branches on
+    // FLAG_ZSTD in every frame, which is the authoritative signal.
+    private String qwpAcceptEncoding;
     private String qwpClientId;
     private int qwpMaxVersion = 1;
     // Receive buffer (native memory)
@@ -377,6 +383,16 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Sets the value sent as the {@code X-QWP-Accept-Encoding} upgrade header,
+     * e.g. {@code "zstd;level=3,raw"}. Pass {@code null} to omit the header
+     * entirely (server ships uncompressed batches). Must be called before
+     * {@link #upgrade}.
+     */
+    public void setQwpAcceptEncoding(String acceptEncoding) {
+        this.qwpAcceptEncoding = acceptEncoding;
+    }
+
+    /**
      * Sets the QWP client identifier sent in the X-QWP-Client-Id upgrade header.
      */
     public void setQwpClientId(String clientId) {
@@ -474,6 +490,11 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (qwpClientId != null) {
             sendBuffer.putAscii("X-QWP-Client-Id: ");
             sendBuffer.putAscii(qwpClientId);
+            sendBuffer.putAscii("\r\n");
+        }
+        if (qwpAcceptEncoding != null) {
+            sendBuffer.putAscii("X-QWP-Accept-Encoding: ");
+            sendBuffer.putAscii(qwpAcceptEncoding);
             sendBuffer.putAscii("\r\n");
         }
         if (authorizationHeader != null) {
@@ -958,7 +979,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
 
-        // Extract X-QWP-Version (optional — defaults to 1 if absent)
+        // Extract X-QWP-Version (optional, defaults to 1 if absent)
         serverQwpVersion = extractQwpVersion(response);
     }
 

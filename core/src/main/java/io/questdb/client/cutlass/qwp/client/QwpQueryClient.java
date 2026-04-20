@@ -24,12 +24,16 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.QuietCloseable;
+import io.questdb.client.std.Zstd;
 import io.questdb.client.std.str.StringSink;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * QWP egress (query results) client.
@@ -50,18 +54,18 @@ public class QwpQueryClient implements QuietCloseable {
     public static final int DEFAULT_WS_PORT = 9000;
     public static final int QWP_MAX_VERSION = 1;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
-    /**
-     * Maximum time {@link #close()} will wait for the I/O thread to exit before giving up
-     * and leaking the (daemon) thread + its native buffer pool + WebSocket socket. 5 seconds
-     * is generous given the I/O thread polls on a 100 ms cadence; if it overshoots this,
-     * something is seriously wrong (e.g., user handler stuck in onBatch).
-     */
-    private static final long SHUTDOWN_JOIN_MS = 5_000;
+    private static final Logger LOG = LoggerFactory.getLogger(QwpQueryClient.class);
     private final CharSequence host;
     private final int port;
     private String authorizationHeader;
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private String clientId;
+    private int compressionLevel = 3;
+    // User-facing compression preference from the connection string. "auto" is
+    // the default and advertises "zstd,raw" to the server. The actual codec
+    // used on the wire is whatever the server echoes back in the 101 response;
+    // if the server ignores the header or picks raw, decompression stays off.
+    private String compressionPreference = "auto";
     private boolean connected;
     // Written on the user thread at entry to {@link #execute} and cleared on exit.
     // Read by {@link #cancel} from any thread. {@code volatile} to guarantee the
@@ -80,6 +84,14 @@ public class QwpQueryClient implements QuietCloseable {
     private boolean lastCloseTimedOut;
     private int negotiatedQwpVersion;
     private long nextRequestId = 1;
+    // Maximum time close() will wait for the I/O thread to exit before giving up
+    // and leaking the (daemon) thread + its native buffer pool + WebSocket socket.
+    // 5 seconds is generous given the I/O thread polls on a 100 ms cadence; if
+    // it overshoots this, something is seriously wrong (e.g., user handler stuck
+    // in onBatch). Volatile (not final) so tests can reflectively shorten it to
+    // hit the timeout branch in under a second instead of spending five.
+    @SuppressWarnings("FieldMayBeFinal")
+    private volatile long shutdownJoinMs = 5_000;
     private WebSocketClient webSocketClient;
 
     private QwpQueryClient(CharSequence host, int port) {
@@ -102,6 +114,12 @@ public class QwpQueryClient implements QuietCloseable {
      *   <li>{@code auth=<value>} -- sent as the HTTP {@code Authorization} header during the upgrade handshake.</li>
      *   <li>{@code client_id=<id>} -- sent as the {@code X-QWP-Client-Id} header.</li>
      *   <li>{@code buffer_pool_size=N} -- depth of the I/O thread's batch buffer pool. Default 4.</li>
+     *   <li>{@code compression=zstd|raw|auto} -- compression codec the client
+     *       asks the server to use for RESULT_BATCH bodies. {@code auto}
+     *       (default) advertises {@code zstd,raw} so the server picks zstd
+     *       when it supports it and falls back to raw otherwise.</li>
+     *   <li>{@code compression_level=N} -- zstd level hint, clamped server-side
+     *       to [1, 9]. Default 3. Ignored when {@code compression=raw}.</li>
      * </ul>
      * Examples:
      * <pre>
@@ -132,6 +150,8 @@ public class QwpQueryClient implements QuietCloseable {
         String auth = null;
         String cid = null;
         int poolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
+        String compression = "auto";
+        int compressionLevel = 3;
 
         while (ConfStringParser.hasNext(configurationString, pos)) {
             pos = ConfStringParser.nextKey(configurationString, pos, sink);
@@ -178,6 +198,23 @@ public class QwpQueryClient implements QuietCloseable {
                         throw new IllegalArgumentException("buffer_pool_size must be >= 1");
                     }
                     break;
+                case "compression":
+                    if (!"zstd".equals(value) && !"raw".equals(value) && !"auto".equals(value)) {
+                        throw new IllegalArgumentException(
+                                "unsupported compression: " + value + " (expected zstd, raw, or auto)");
+                    }
+                    compression = value;
+                    break;
+                case "compression_level":
+                    try {
+                        compressionLevel = Integer.parseInt(value);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("invalid compression_level: " + value);
+                    }
+                    if (compressionLevel < 1 || compressionLevel > 22) {
+                        throw new IllegalArgumentException("compression_level must be in [1, 22]");
+                    }
+                    break;
                 default:
                     throw new IllegalArgumentException("unknown configuration key: " + key);
             }
@@ -187,7 +224,8 @@ public class QwpQueryClient implements QuietCloseable {
         }
         QwpQueryClient client = new QwpQueryClient(addrHost, addrPort)
                 .withEndpointPath(path)
-                .withBufferPoolSize(poolSize);
+                .withBufferPoolSize(poolSize)
+                .withCompression(compression, compressionLevel);
         if (auth != null) client.withAuthorization(auth);
         if (cid != null) client.withClientId(cid);
         return client;
@@ -220,7 +258,7 @@ public class QwpQueryClient implements QuietCloseable {
      * {@code wsClient.receiveFrame(...)} or queue poll, wait for it to exit, then free
      * the buffer pool and close the underlying socket.
      * <p>
-     * If the I/O thread fails to exit within {@link #SHUTDOWN_JOIN_MS} (default 5 s), this
+     * If the I/O thread fails to exit within {@link #shutdownJoinMs} (default 5 s), this
      * method does <em>not</em> free the buffer pool or close the WebSocket -- both are
      * still in use by the thread, and freeing them would race into a JVM-killing
      * use-after-free. The thread is a daemon, so the JVM still exits normally; the
@@ -239,7 +277,7 @@ public class QwpQueryClient implements QuietCloseable {
                 ioThreadHandle.interrupt();
                 boolean joined;
                 try {
-                    ioThreadHandle.join(SHUTDOWN_JOIN_MS);
+                    ioThreadHandle.join(shutdownJoinMs);
                     joined = !ioThreadHandle.isAlive();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -249,6 +287,13 @@ public class QwpQueryClient implements QuietCloseable {
                 if (!joined) {
                     // Daemon thread is still running -- buffer pool and WebSocketClient may
                     // be in use. Leak them rather than risk a SIGSEGV by freeing under it.
+                    // Log at ERROR so operators notice; wasLastCloseTimedOut() is the
+                    // programmatic hook for monitoring or tests that want to assert on it.
+                    LOG.error("QwpQueryClient close timed out after {} ms; leaking I/O thread, "
+                                    + "buffer pool, and WebSocket to avoid freeing them from under "
+                                    + "a running daemon. Common cause: a batch handler that never "
+                                    + "returns (e.g. blocking I/O or deadlock).",
+                            shutdownJoinMs);
                     lastCloseTimedOut = true;
                     ioThread = null;
                     ioThreadHandle = null;
@@ -277,9 +322,21 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient = WebSocketClientFactory.newPlainTextInstance();
         webSocketClient.setQwpMaxVersion(QWP_MAX_VERSION);
         webSocketClient.setQwpClientId(clientId != null ? clientId : defaultClientId());
+        webSocketClient.setQwpAcceptEncoding(buildAcceptEncodingHeader());
         webSocketClient.connect(host, port);
         webSocketClient.upgrade(endpointPath, authorizationHeader);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
+
+        // Early probe: if we told the server we can accept zstd, make sure the
+        // bundled native library actually provides the decompression symbols
+        // before we start accepting batches. Without this, a client jar built
+        // without the zstd submodule would only discover the missing symbols
+        // mid-stream when it hits the first FLAG_ZSTD frame, and the error
+        // would surface as an opaque "I/O thread failure: ..." callback on the
+        // user handler. Fail loud here instead so the cause is obvious.
+        if (!"raw".equals(compressionPreference)) {
+            probeZstdAvailable();
+        }
 
         ioThread = new QwpEgressIoThread(webSocketClient, bufferPoolSize);
         ioThreadHandle = new Thread(ioThread, "qwp-egress-io");
@@ -389,6 +446,26 @@ public class QwpQueryClient implements QuietCloseable {
         return this;
     }
 
+    /**
+     * Programmatic equivalent of the {@code compression=} / {@code compression_level=}
+     * connection-string keys. {@code preference} is one of {@code zstd},
+     * {@code raw}, or {@code auto} (default). {@code level} is the zstd
+     * compression level hint passed to the server; clamped server-side to
+     * [1, 9]. Must be called before {@link #connect}.
+     */
+    public QwpQueryClient withCompression(String preference, int level) {
+        if (!"zstd".equals(preference) && !"raw".equals(preference) && !"auto".equals(preference)) {
+            throw new IllegalArgumentException(
+                    "unsupported compression: " + preference + " (expected zstd, raw, or auto)");
+        }
+        if (level < 1 || level > 22) {
+            throw new IllegalArgumentException("compression level must be in [1, 22]");
+        }
+        this.compressionPreference = preference;
+        this.compressionLevel = level;
+        return this;
+    }
+
     public QwpQueryClient withEndpointPath(String endpointPath) {
         this.endpointPath = endpointPath;
         return this;
@@ -412,5 +489,46 @@ public class QwpQueryClient implements QuietCloseable {
 
     private static String defaultClientId() {
         return "questdb-java-egress/1.0.0";
+    }
+
+    /**
+     * Builds the {@code X-QWP-Accept-Encoding} header value from the user's
+     * preference. {@code raw} omits the header entirely so servers that don't
+     * know about compression see an unchanged handshake. {@code zstd} asks for
+     * zstd first and falls back to raw. {@code auto} is the default and
+     * behaves like {@code zstd}.
+     */
+    private String buildAcceptEncodingHeader() {
+        if ("raw".equals(compressionPreference)) {
+            return null;
+        }
+        return "zstd;level=" + compressionLevel + ",raw";
+    }
+
+    /**
+     * Allocates and immediately frees a {@code ZSTD_DCtx} so that any
+     * {@link UnsatisfiedLinkError} from a client build that doesn't include
+     * the bundled libzstd surfaces synchronously on the user thread at
+     * {@code connect()} time. Closes the just-opened WebSocket on failure so
+     * the caller doesn't inherit a half-open socket.
+     */
+    private void probeZstdAvailable() {
+        try {
+            long dctx = Zstd.createDCtx();
+            if (dctx != 0) {
+                Zstd.freeDCtx(dctx);
+            }
+        } catch (UnsatisfiedLinkError e) {
+            LOG.error("zstd JNI symbols missing from libquestdb; aborting connect", e);
+            if (webSocketClient != null) {
+                webSocketClient.close();
+                webSocketClient = null;
+            }
+            throw new HttpClientException("this client build does not support zstd compression -- "
+                    + "libquestdb was built without the zstd submodule. Rebuild the native library "
+                    + "with 'git submodule update --init --recursive' and 'cmake --build', or set "
+                    + "compression=raw on the connection string to skip the probe. "
+                    + "[cause=" + e.getMessage() + "]");
+        }
     }
 }

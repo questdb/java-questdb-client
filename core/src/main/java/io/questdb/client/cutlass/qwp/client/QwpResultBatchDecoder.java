@@ -30,6 +30,7 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.Zstd;
 
 import java.nio.charset.StandardCharsets;
 
@@ -98,6 +99,15 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     private int connDictHeapCapacity;
     private int connDictHeapPos;
     private int connDictSize;
+    // Native ZSTD_DCtx pointer, lazy-allocated on the first {@code FLAG_ZSTD}
+    // batch. One per decoder instance (which in turn is one per IoThread), reused
+    // for every subsequent compressed batch on the same connection.
+    private long dctx;
+    // Growable scratch holding the decompressed body between the zstd call and
+    // the downstream parse. Starts small and doubles on demand when the decoder
+    // reports a destination-too-small error.
+    private long decompressScratchAddr;
+    private int decompressScratchCapacity;
     // True when the current message carries {@code FLAG_DELTA_SYMBOL_DICT}. Read by
     // {@link #parseSymbolColumn} to decide whether to consume a per-column dict.
     private boolean deltaMode;
@@ -122,6 +132,15 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             Unsafe.free(connDictEntriesAddr, connDictEntriesCapacity, MemoryTag.NATIVE_DEFAULT);
             connDictEntriesAddr = 0;
             connDictEntriesCapacity = 0;
+        }
+        if (decompressScratchAddr != 0) {
+            Unsafe.free(decompressScratchAddr, decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
+            decompressScratchAddr = 0;
+            decompressScratchCapacity = 0;
+        }
+        if (dctx != 0) {
+            Zstd.freeDCtx(dctx);
+            dctx = 0;
         }
         connDictSize = 0;
     }
@@ -233,6 +252,62 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         long batchSeq = varintValue;
         p = varintPos;
 
+        // Zstd-compressed body: the region from here to {@code limit} is a
+        // single zstd frame covering the delta section + table block. Decode
+        // into the decoder-owned scratch buffer and rebind {@code p} /
+        // {@code limit} so downstream parsers see the plain bytes without any
+        // structural awareness of compression. {@code payloadAddr} exposed
+        // on the batch view also follows {@code p} here so size-measuring
+        // callers ({@code batch.payloadLimit() - batch.payloadAddr()}) report
+        // the uncompressed-equivalent body size rather than an arbitrary
+        // pointer delta between two native allocations.
+        long batchViewAddr = payload;
+        if ((flags & QwpConstants.FLAG_ZSTD) != 0) {
+            long srcLen = limit - p;
+            if (dctx == 0) {
+                try {
+                    dctx = Zstd.createDCtx();
+                } catch (UnsatisfiedLinkError e) {
+                    // The early probe in QwpQueryClient.connect() should have
+                    // caught this already. If we end up here, something went
+                    // around that probe (custom client wiring, direct use of
+                    // QwpResultBatchDecoder, etc.) -- surface a message that
+                    // names the actual cause instead of letting the JNI symbol
+                    // name leak into the user callback.
+                    throw new QwpDecodeException("server sent a zstd-compressed batch but this "
+                            + "client build does not include zstd -- libquestdb was built without "
+                            + "the zstd submodule. Rebuild the native library with the submodule "
+                            + "initialised, or set compression=raw on the connection string "
+                            + "[cause=" + e.getMessage() + "]");
+                }
+                if (dctx == 0) {
+                    throw new QwpDecodeException("failed to allocate zstd decompression context");
+                }
+            }
+            // Try the current scratch; on dst-too-small, grow once up to a hard
+            // cap. The cap exists so that a corrupted or hostile frame advertising
+            // a huge content size cannot be used to trigger unbounded allocation.
+            final int MAX_SCRATCH = 64 * 1024 * 1024;
+            if (decompressScratchCapacity == 0) {
+                decompressScratchCapacity = 1024 * 1024;
+                decompressScratchAddr = Unsafe.malloc(decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
+            }
+            long decLen = Zstd.decompress(dctx, p, srcLen, decompressScratchAddr, decompressScratchCapacity);
+            while (decLen < 0 && decompressScratchCapacity < MAX_SCRATCH) {
+                int newCap = Math.min(decompressScratchCapacity * 2, MAX_SCRATCH);
+                Unsafe.free(decompressScratchAddr, decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
+                decompressScratchCapacity = newCap;
+                decompressScratchAddr = Unsafe.malloc(decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
+                decLen = Zstd.decompress(dctx, p, srcLen, decompressScratchAddr, decompressScratchCapacity);
+            }
+            if (decLen < 0) {
+                throw new QwpDecodeException("zstd decompression failed [code=" + (-decLen) + "]");
+            }
+            p = decompressScratchAddr;
+            limit = decompressScratchAddr + decLen;
+            batchViewAddr = decompressScratchAddr;
+        }
+
         // Delta section (if enabled) sits right after the prelude and before the
         // table block. We consume it first so that SYMBOL columns inside the
         // table block resolve indices against the freshly-updated connection dict.
@@ -303,7 +378,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         }
 
         // Reset batch view and parse columns into per-column layouts owned by the buffer.
-        resetBatch(buffer, requestId, batchSeq, rowCount, columnCount, columns, payload, limit);
+        resetBatch(buffer, requestId, batchSeq, rowCount, columnCount, columns, batchViewAddr, limit);
         for (int ci = 0; ci < columnCount; ci++) {
             QwpColumnLayout layout = borrowLayout(buffer.layoutPool, ci);
             layout.clear();

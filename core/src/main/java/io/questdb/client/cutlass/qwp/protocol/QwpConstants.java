@@ -46,6 +46,12 @@ public final class QwpConstants {
      */
     public static final byte FLAG_GORILLA = 0x04;
     /**
+     * Flag bit: payload region after the prelude is zstd-compressed. Set only
+     * when the handshake negotiated zstd compression. Mirror of the server-side
+     * constant; see the server QwpConstants for the full description.
+     */
+    public static final byte FLAG_ZSTD = 0x10;
+    /**
      * Offset of flags byte in header.
      */
     public static final int HEADER_OFFSET_FLAGS = 5;
