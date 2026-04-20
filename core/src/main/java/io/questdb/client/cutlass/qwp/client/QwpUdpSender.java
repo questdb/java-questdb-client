@@ -615,7 +615,6 @@ public class QwpUdpSender implements Sender {
             case TYPE_DOUBLE_ARRAY:
             case TYPE_LONG_ARRAY:
                 return estimateArrayPayloadBytes(col, state);
-            case TYPE_STRING:
             case TYPE_VARCHAR:
                 return 4L + (col.getStringDataSize() - state.stringDataSizeBefore);
             case TYPE_SYMBOL:
@@ -670,7 +669,6 @@ public class QwpUdpSender implements Sender {
                 return (long) missing * 2;
             case TYPE_INT:
             case TYPE_FLOAT:
-            case TYPE_STRING:
             case TYPE_VARCHAR:
                 return (long) missing * 4;
             case TYPE_DOUBLE_ARRAY:
@@ -1046,7 +1044,7 @@ public class QwpUdpSender implements Sender {
             estimate += 1;
 
             byte type = def.getTypeCode();
-            if (type == TYPE_STRING || type == TYPE_VARCHAR) {
+            if (type == TYPE_VARCHAR) {
                 estimate += 4;
             } else if (type == TYPE_SYMBOL) {
                 estimate += 1;

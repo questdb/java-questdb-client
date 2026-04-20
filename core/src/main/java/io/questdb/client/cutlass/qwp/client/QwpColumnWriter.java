@@ -86,7 +86,6 @@ class QwpColumnWriter {
             case TYPE_GEOHASH:
                 writeGeoHashColumn(dataAddr, valueCount, col.getGeoHashPrecision());
                 break;
-            case TYPE_STRING:
             case TYPE_VARCHAR:
                 writeStringColumn(col, valueCount, stringDataSize);
                 break;

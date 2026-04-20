@@ -571,14 +571,14 @@ public class QwpTableBufferTest {
                 // Commit 3 rows with columns "a" (LONG, non-nullable) and "b" (STRING, nullable)
                 for (int i = 0; i < 3; i++) {
                     table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(i);
-                    table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true).addString("v" + i);
+                    table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true).addString("v" + i);
                     table.nextRow();
                 }
 
                 // Start row 4: set "a" and "b", then create a NEW column "c"
                 table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(3);
-                table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true).addString("v3");
-                QwpTableBuffer.ColumnBuffer colC = table.getOrCreateColumn("c", QwpConstants.TYPE_STRING, true);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true).addString("v3");
+                QwpTableBuffer.ColumnBuffer colC = table.getOrCreateColumn("c", QwpConstants.TYPE_VARCHAR, true);
                 colC.addString("stale");
 
                 // Cancel the in-progress row
@@ -590,7 +590,7 @@ public class QwpTableBufferTest {
 
                 // Start row 4 again: set "a" and "b" only (not "c")
                 table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(3);
-                table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true).addString("v3");
+                table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true).addString("v3");
                 table.nextRow();
 
                 // Column "c" should now have size == 4 (padded with nulls) and valueCount == 0
@@ -616,7 +616,7 @@ public class QwpTableBufferTest {
                 // Start row 2: set "a", then create NEW column "c" with one value
                 // col_c.size will be 1, which equals rowCount — the edge case
                 table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1);
-                QwpTableBuffer.ColumnBuffer colC = table.getOrCreateColumn("c", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer colC = table.getOrCreateColumn("c", QwpConstants.TYPE_VARCHAR, true);
                 colC.addString("stale");
 
                 // Cancel the in-progress row
@@ -763,10 +763,10 @@ public class QwpTableBufferTest {
                 colA.addLong(1);
                 table.nextRow();
 
-                assertNull(table.getExistingColumn("missing", QwpConstants.TYPE_STRING));
+                assertNull(table.getExistingColumn("missing", QwpConstants.TYPE_VARCHAR));
                 assertEquals(1, table.getColumnCount());
 
-                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true);
                 assertNotNull(colB);
                 assertEquals(2, table.getColumnCount());
             }
@@ -778,13 +778,13 @@ public class QwpTableBufferTest {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
-                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true);
                 colA.addLong(1);
                 colB.addString("x");
                 table.nextRow();
 
                 QwpTableBuffer.ColumnBuffer existingA = table.getExistingColumn("a", QwpConstants.TYPE_LONG);
-                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_STRING);
+                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_VARCHAR);
 
                 assertSame(colA, existingA);
                 assertSame(colB, existingB);
@@ -807,12 +807,12 @@ public class QwpTableBufferTest {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
-                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true);
                 colA.addLong(1);
                 colB.addString("x");
                 table.nextRow();
 
-                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_STRING);
+                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_VARCHAR);
                 QwpTableBuffer.ColumnBuffer existingA = table.getExistingColumn("a", QwpConstants.TYPE_LONG);
 
                 assertSame(colB, existingB);
@@ -836,7 +836,7 @@ public class QwpTableBufferTest {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
-                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true);
                 colA.addLong(1);
                 colB.addString("x");
                 table.nextRow();
@@ -857,12 +857,12 @@ public class QwpTableBufferTest {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
-                table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true);
                 colA.addLong(1);
                 table.nextRow();
 
                 try {
-                    table.getExistingColumn("a", QwpConstants.TYPE_STRING);
+                    table.getExistingColumn("a", QwpConstants.TYPE_VARCHAR);
                     fail("Expected LineSenderException for ordered-path type mismatch");
                 } catch (LineSenderException e) {
                     assertTrue(e.getMessage().contains("Column type mismatch"));
@@ -877,7 +877,7 @@ public class QwpTableBufferTest {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
-                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true);
                 colA.addLong(1);
                 colB.addString("x");
                 table.nextRow();
@@ -885,7 +885,7 @@ public class QwpTableBufferTest {
                 table.reset();
 
                 QwpTableBuffer.ColumnBuffer existingA = table.getExistingColumn("a", QwpConstants.TYPE_LONG);
-                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_STRING);
+                QwpTableBuffer.ColumnBuffer existingB = table.getExistingColumn("b", QwpConstants.TYPE_VARCHAR);
 
                 assertSame(colA, existingA);
                 assertSame(colB, existingB);
@@ -911,11 +911,11 @@ public class QwpTableBufferTest {
                 table.nextRow();
 
                 table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(2);
-                QwpTableBuffer.ColumnBuffer late = table.getOrCreateColumn("late", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer late = table.getOrCreateColumn("late", QwpConstants.TYPE_VARCHAR, true);
                 late.addString("stale");
                 table.cancelCurrentRow();
 
-                QwpTableBuffer.ColumnBuffer existingLate = table.getExistingColumn("late", QwpConstants.TYPE_STRING);
+                QwpTableBuffer.ColumnBuffer existingLate = table.getExistingColumn("late", QwpConstants.TYPE_VARCHAR);
                 assertSame(late, existingLate);
                 assertEquals(0, existingLate.getSize());
                 assertEquals(0, existingLate.getValueCount());
@@ -961,7 +961,7 @@ public class QwpTableBufferTest {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 // Create two columns so the fast-path cursor can be defeated
                 table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false).addLong(1L);
-                table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true).addString("v");
+                table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true).addString("v");
                 table.nextRow();
 
                 // Access column "b" first — cursor now expects "a" at index 0,
@@ -972,7 +972,7 @@ public class QwpTableBufferTest {
                     fail("Expected LineSenderException for column type mismatch");
                 } catch (LineSenderException e) {
                     assertEquals(
-                            "Column type mismatch for column 'b': columnType=" + QwpConstants.TYPE_STRING + ", sentType=" + QwpConstants.TYPE_LONG,
+                            "Column type mismatch for column 'b': columnType=" + QwpConstants.TYPE_VARCHAR + ", sentType=" + QwpConstants.TYPE_LONG,
                             e.getMessage()
                     );
                 }
@@ -1098,7 +1098,7 @@ public class QwpTableBufferTest {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 QwpTableBuffer.ColumnBuffer colA = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, false);
-                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer colB = table.getOrCreateColumn("b", QwpConstants.TYPE_VARCHAR, true);
                 QwpTableBuffer.ColumnBuffer colC = table.getOrCreateColumn("c", QwpConstants.TYPE_LONG, false);
 
                 colA.addLong(10);
@@ -1124,11 +1124,48 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testNonAsciiColumnNameCaseInsensitive() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                // Row 1: create columns with non-ASCII names (Cyrillic)
+                QwpTableBuffer.ColumnBuffer col1 = table.getOrCreateColumn(
+                        "Температура",
+                        QwpConstants.TYPE_DOUBLE, true);
+                col1.addDouble(42.0);
+
+                QwpTableBuffer.ColumnBuffer col2 = table.getOrCreateColumn(
+                        "Straße", QwpConstants.TYPE_LONG, true);
+                col2.addLong(100);
+
+                table.nextRow();
+
+                // Row 2: same column names in different case should resolve
+                // to the same columns via the hash map slow path
+                QwpTableBuffer.ColumnBuffer col3 = table.getOrCreateColumn(
+                        "температура",
+                        QwpConstants.TYPE_DOUBLE, true);
+                assertSame(col1, col3);
+                col3.addDouble(99.0);
+
+                QwpTableBuffer.ColumnBuffer col4 = table.getOrCreateColumn(
+                        "straße", QwpConstants.TYPE_LONG, true);
+                assertSame(col2, col4);
+                col4.addLong(200);
+
+                table.nextRow();
+
+                assertEquals(2, table.getColumnCount());
+                assertEquals(2, table.getRowCount());
+            }
+        });
+    }
+
+    @Test
     public void testRetainInProgressRowFastClearsUnstagedNullableColumn() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
                 QwpTableBuffer.ColumnBuffer keep = table.getOrCreateColumn("keep", QwpConstants.TYPE_LONG, false);
-                QwpTableBuffer.ColumnBuffer drop = table.getOrCreateColumn("drop", QwpConstants.TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer drop = table.getOrCreateColumn("drop", QwpConstants.TYPE_VARCHAR, true);
 
                 for (int i = 0; i < 130; i++) {
                     keep.addLong(i);
@@ -1280,42 +1317,5 @@ public class QwpTableBufferTest {
             }
         }
         return result;
-    }
-
-    @Test
-    public void testNonAsciiColumnNameCaseInsensitive() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
-                // Row 1: create columns with non-ASCII names (Cyrillic)
-                QwpTableBuffer.ColumnBuffer col1 = table.getOrCreateColumn(
-                        "Температура",
-                        QwpConstants.TYPE_DOUBLE, true);
-                col1.addDouble(42.0);
-
-                QwpTableBuffer.ColumnBuffer col2 = table.getOrCreateColumn(
-                        "Straße", QwpConstants.TYPE_LONG, true);
-                col2.addLong(100);
-
-                table.nextRow();
-
-                // Row 2: same column names in different case should resolve
-                // to the same columns via the hash map slow path
-                QwpTableBuffer.ColumnBuffer col3 = table.getOrCreateColumn(
-                        "температура",
-                        QwpConstants.TYPE_DOUBLE, true);
-                assertSame(col1, col3);
-                col3.addDouble(99.0);
-
-                QwpTableBuffer.ColumnBuffer col4 = table.getOrCreateColumn(
-                        "straße", QwpConstants.TYPE_LONG, true);
-                assertSame(col2, col4);
-                col4.addLong(200);
-
-                table.nextRow();
-
-                assertEquals(2, table.getColumnCount());
-                assertEquals(2, table.getRowCount());
-            }
-        });
     }
 }

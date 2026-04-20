@@ -2308,7 +2308,6 @@ public class QwpUdpSenderTest {
                 case TYPE_LONG_ARRAY:
                     decodeLongArrays(values, nulls, valueCount);
                     break;
-                case TYPE_STRING:
                 case TYPE_VARCHAR:
                     decodeStrings(values, nulls, valueCount);
                     break;
