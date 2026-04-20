@@ -61,11 +61,13 @@ public class QwpQueryClient implements QuietCloseable {
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private String clientId;
     private int compressionLevel = 3;
-    // User-facing compression preference from the connection string. "auto" is
-    // the default and advertises "zstd,raw" to the server. The actual codec
-    // used on the wire is whatever the server echoes back in the 101 response;
-    // if the server ignores the header or picks raw, decompression stays off.
-    private String compressionPreference = "auto";
+    // User-facing compression preference from the connection string. "raw" is
+    // the library default -- no compression, no handshake header, no server-
+    // side CPU burn on payloads where the network isn't the bottleneck
+    // (colocated clients, loopback). Clients wanting zstd must opt in via
+    // {@code compression=zstd} (demands zstd) or {@code compression=auto}
+    // (advertises zstd,raw and lets the server pick).
+    private String compressionPreference = "raw";
     private boolean connected;
     // Written on the user thread at entry to {@link #execute} and cleared on exit.
     // Read by {@link #cancel} from any thread. {@code volatile} to guarantee the
@@ -154,7 +156,9 @@ public class QwpQueryClient implements QuietCloseable {
         String auth = null;
         String cid = null;
         int poolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
-        String compression = "auto";
+        // Default matches the field initializer in QwpQueryClient: raw wire,
+        // zstd opt-in.
+        String compression = "raw";
         int compressionLevel = 3;
 
         while (ConfStringParser.hasNext(configurationString, pos)) {
@@ -406,6 +410,16 @@ public class QwpQueryClient implements QuietCloseable {
         }
     }
 
+    /**
+     * Returns the current compression preference: one of {@code raw} (the
+     * library default, no compression), {@code zstd} (demand zstd), or
+     * {@code auto} (advertise zstd and raw, let the server pick). Useful for
+     * introspection and for tests that pin the default.
+     */
+    public String getCompressionPreference() {
+        return compressionPreference;
+    }
+
     public int getNegotiatedQwpVersion() {
         return negotiatedQwpVersion;
     }
@@ -453,7 +467,7 @@ public class QwpQueryClient implements QuietCloseable {
     /**
      * Programmatic equivalent of the {@code compression=} / {@code compression_level=}
      * connection-string keys. {@code preference} is one of {@code zstd},
-     * {@code raw}, or {@code auto} (default). {@code level} is the zstd
+     * {@code raw} (default), or {@code auto}. {@code level} is the zstd
      * compression level hint passed to the server; clamped server-side to
      * [1, 9]. Must be called before {@link #connect}.
      */
@@ -497,10 +511,11 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * Builds the {@code X-QWP-Accept-Encoding} header value from the user's
-     * preference. {@code raw} omits the header entirely so servers that don't
-     * know about compression see an unchanged handshake. {@code zstd} asks for
-     * zstd first and falls back to raw. {@code auto} is the default and
-     * behaves like {@code zstd}.
+     * preference. {@code raw} (the library default) omits the header entirely
+     * so servers that don't know about compression see an unchanged handshake.
+     * {@code zstd} asks for zstd first and falls back to raw. {@code auto}
+     * advertises both and lets the server pick -- useful for cross-DC clients
+     * where the bandwidth/CPU trade-off is worthwhile; an explicit opt-in.
      */
     private String buildAcceptEncodingHeader() {
         if ("raw".equals(compressionPreference)) {
