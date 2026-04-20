@@ -1101,7 +1101,7 @@ public class QwpUdpSenderTest {
                 Assert.assertNotNull(tableBuffer);
                 Assert.assertEquals(0, tableBuffer.getRowCount());
 
-                QwpTableBuffer.ColumnBuffer stringColumn = tableBuffer.getExistingColumn("s", TYPE_STRING);
+                QwpTableBuffer.ColumnBuffer stringColumn = tableBuffer.getExistingColumn("s", TYPE_VARCHAR);
                 assertNullableStringNullState(stringColumn);
 
                 QwpTableBuffer.ColumnBuffer longColumn = tableBuffer.getExistingColumn("x", TYPE_LONG);

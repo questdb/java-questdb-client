@@ -1305,7 +1305,7 @@ public class QwpUdpSender implements Sender {
     }
 
     private void stageStringColumnValue(CharSequence name, CharSequence value) {
-        QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_STRING, true);
+        QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_VARCHAR, true);
         beginColumnWrite(col, name);
         col.addString(value);
         completeColumnWrite();
