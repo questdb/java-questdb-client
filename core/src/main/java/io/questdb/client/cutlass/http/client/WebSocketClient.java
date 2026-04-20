@@ -112,6 +112,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     // FLAG_ZSTD in every frame, which is the authoritative signal.
     private String qwpAcceptEncoding;
     private String qwpClientId;
+    // Client-requested per-batch row cap advertised via X-QWP-Max-Batch-Rows.
+    // 0 means "omit the header" (server uses its default cap). Server may clamp
+    // down to its own hard limit.
+    private int qwpMaxBatchRows;
     private int qwpMaxVersion = 1;
     // Receive buffer (native memory)
     private long recvBufPtr;
@@ -400,6 +404,18 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Sets the client's preferred per-batch row cap, sent in the
+     * {@code X-QWP-Max-Batch-Rows} upgrade header. {@code 0} (the default)
+     * omits the header entirely and the server uses its own cap. Positive
+     * values ask the server to flush batches sooner (lower time-to-first-row
+     * for streaming consumers, at the cost of more per-batch overhead); the
+     * server clamps down to its own maximum.
+     */
+    public void setQwpMaxBatchRows(int maxBatchRows) {
+        this.qwpMaxBatchRows = maxBatchRows;
+    }
+
+    /**
      * Sets the maximum QWP version this client supports, sent in the X-QWP-Max-Version upgrade header.
      */
     public void setQwpMaxVersion(int maxVersion) {
@@ -495,6 +511,11 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (qwpAcceptEncoding != null) {
             sendBuffer.putAscii("X-QWP-Accept-Encoding: ");
             sendBuffer.putAscii(qwpAcceptEncoding);
+            sendBuffer.putAscii("\r\n");
+        }
+        if (qwpMaxBatchRows > 0) {
+            sendBuffer.putAscii("X-QWP-Max-Batch-Rows: ");
+            sendBuffer.putAscii(Integer.toString(qwpMaxBatchRows));
             sendBuffer.putAscii("\r\n");
         }
         if (authorizationHeader != null) {

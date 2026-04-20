@@ -52,6 +52,14 @@ public class QwpQueryClient implements QuietCloseable {
 
     public static final String DEFAULT_ENDPOINT_PATH = "/read/v1";
     public static final int DEFAULT_WS_PORT = 9000;
+    /**
+     * Hard ceiling on {@link #withMaxBatchRows}. Matches the client decoder's
+     * own {@code MAX_ROWS_PER_BATCH} safety cap so a user cannot ask for a
+     * per-batch row count the decoder would itself refuse. The server enforces
+     * its own (typically smaller) cap independently; this is just the client's
+     * sanity bound.
+     */
+    public static final int MAX_BATCH_ROWS_UPPER_BOUND = 1_048_576;
     public static final int QWP_MAX_VERSION = 1;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
     private static final Logger LOG = LoggerFactory.getLogger(QwpQueryClient.class);
@@ -81,6 +89,13 @@ public class QwpQueryClient implements QuietCloseable {
     // payload before it parks, and the client auto-replenishes by the size of
     // each batch as the user releases it.
     private long initialCreditBytes;
+    // Client preference for server-side per-batch row cap. 0 means "unset",
+    // server uses its default. Set via {@code max_batch_rows=N} in the
+    // connection string or {@link #withMaxBatchRows}. Smaller values give
+    // streaming consumers earlier access to the first rows at the cost of
+    // more per-batch overhead; larger values amortise fixed costs over more
+    // rows. Server may clamp down to its own hard cap.
+    private int maxBatchRows;
     // Volatile so a cancel() call from a thread other than the one that ran
     // connect() sees the published reference (and a concurrent null-out from
     // close() is observed without a stale-reference race). The thread-safety
@@ -160,6 +175,7 @@ public class QwpQueryClient implements QuietCloseable {
         // zstd opt-in.
         String compression = "raw";
         int compressionLevel = 3;
+        int maxBatchRows = 0;  // 0 = omit header, server uses its default
 
         while (ConfStringParser.hasNext(configurationString, pos)) {
             pos = ConfStringParser.nextKey(configurationString, pos, sink);
@@ -223,6 +239,17 @@ public class QwpQueryClient implements QuietCloseable {
                         throw new IllegalArgumentException("compression_level must be in [1, 22]");
                     }
                     break;
+                case "max_batch_rows":
+                    try {
+                        maxBatchRows = Integer.parseInt(value);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("invalid max_batch_rows: " + value);
+                    }
+                    if (maxBatchRows < 1 || maxBatchRows > MAX_BATCH_ROWS_UPPER_BOUND) {
+                        throw new IllegalArgumentException(
+                                "max_batch_rows must be in [1, " + MAX_BATCH_ROWS_UPPER_BOUND + "]");
+                    }
+                    break;
                 default:
                     throw new IllegalArgumentException("unknown configuration key: " + key);
             }
@@ -236,6 +263,7 @@ public class QwpQueryClient implements QuietCloseable {
                 .withCompression(compression, compressionLevel);
         if (auth != null) client.withAuthorization(auth);
         if (cid != null) client.withClientId(cid);
+        if (maxBatchRows > 0) client.withMaxBatchRows(maxBatchRows);
         return client;
     }
 
@@ -331,6 +359,7 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.setQwpMaxVersion(QWP_MAX_VERSION);
         webSocketClient.setQwpClientId(clientId != null ? clientId : defaultClientId());
         webSocketClient.setQwpAcceptEncoding(buildAcceptEncodingHeader());
+        webSocketClient.setQwpMaxBatchRows(maxBatchRows);
         webSocketClient.connect(host, port);
         webSocketClient.upgrade(endpointPath, authorizationHeader);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
@@ -502,6 +531,26 @@ public class QwpQueryClient implements QuietCloseable {
     public QwpQueryClient withInitialCredit(long bytes) {
         if (bytes < 0) throw new IllegalArgumentException("initial credit must be >= 0");
         this.initialCreditBytes = bytes;
+        return this;
+    }
+
+    /**
+     * Asks the server to cap each {@code RESULT_BATCH} at {@code rows} rows.
+     * Useful for latency-sensitive streaming consumers that want to start
+     * processing the first row as soon as possible -- a smaller cap flushes
+     * the first batch sooner, at the cost of more per-batch overhead (WS
+     * header, send syscall, schema-reference decode). The server clamps down
+     * to its own hard limit; a value of {@code 0} (default) omits the header
+     * and the server uses its own cap.
+     * <p>
+     * Must be called before {@link #connect}.
+     */
+    public QwpQueryClient withMaxBatchRows(int rows) {
+        if (rows < 1 || rows > MAX_BATCH_ROWS_UPPER_BOUND) {
+            throw new IllegalArgumentException(
+                    "max_batch_rows must be in [1, " + MAX_BATCH_ROWS_UPPER_BOUND + "]");
+        }
+        this.maxBatchRows = rows;
         return this;
     }
 
