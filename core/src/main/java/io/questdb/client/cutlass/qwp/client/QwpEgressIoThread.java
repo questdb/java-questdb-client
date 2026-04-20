@@ -54,9 +54,15 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private static final long POLL_TIMEOUT_MS = 100;
     private static final Object RELEASE_TOKEN = new Object();
     private final QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-    // Events delivered from I/O thread to user thread (RESULT_BATCH / RESULT_END / QUERY_ERROR).
-    private final BlockingQueue<QueryEvent> events;
+    // Events delivered from I/O thread (producer) to user thread (consumer):
+    // RESULT_BATCH / RESULT_END / EXEC_DONE / QUERY_ERROR. Hot path of every
+    // query. Purpose-built SPSC with spin-then-park avoids the ~2 microseconds
+    // per offer/take that j.u.c.ArrayBlockingQueue burns on its ReentrantLock +
+    // Condition pair for an empty queue hand-off.
+    private final QwpSpscQueue<QueryEvent> events;
     // Pool of pre-allocated buffers. I/O thread takes, user thread releases.
+    // Kept on ArrayBlockingQueue: the take uses a timeout to poll pending
+    // cancels while waiting, a pattern the SPSC queue doesn't offer.
     private final BlockingQueue<QwpBatchBuffer> freeBuffers;
     // Pending CANCEL requestId set by the user thread via {@link #requestCancel}.
     // The I/O thread polls this between {@code receiveFrame} iterations; when
@@ -64,11 +70,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     // Using AtomicLong (not volatile long) to guarantee 64-bit atomicity on all
     // supported JVMs.
     private final AtomicLong pendingCancelRequestId = new AtomicLong(-1L);
-    // One-slot release latch: user thread offers a token from releaseBuffer, I/O
-    // thread drains it before returning from onBinaryMessage. Holds the payload
-    // bytes in the WebSocket recv buffer steady for the duration of the user
-    // handler, since in-place decode makes batch pointers alias those bytes.
-    private final BlockingQueue<Object> pendingRelease = new ArrayBlockingQueue<>(1);
+    // One-slot release latch: user thread offers a token from releaseBuffer
+    // (producer), I/O thread drains it before returning from onBinaryMessage
+    // (consumer). Holds the payload bytes in the WebSocket recv buffer steady
+    // for the duration of the user handler, since in-place decode makes batch
+    // pointers alias those bytes. Same SPSC reasoning as {@link #events} --
+    // the I/O thread typically parks on this for the duration of the user's
+    // onBatch callback, which is microseconds for a no-op consumer.
+    private final QwpSpscQueue<Object> pendingRelease = new QwpSpscQueue<>(1);
     // Single-slot request queue (Phase-1 allows one in-flight query).
     private final BlockingQueue<QueryRequest> requests = new ArrayBlockingQueue<>(1);
     private final NativeBufferWriter sendScratch = new NativeBufferWriter();
@@ -84,7 +93,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     public QwpEgressIoThread(WebSocketClient wsClient, int bufferPoolSize) {
         this.wsClient = wsClient;
         this.freeBuffers = new ArrayBlockingQueue<>(bufferPoolSize);
-        this.events = new ArrayBlockingQueue<>(bufferPoolSize + 2);
+        // +2 reserves slots for a trailing RESULT_END and a synthetic error
+        // frame the I/O thread may emit on shutdown, so a full buffer pool
+        // never stalls the producer.
+        this.events = new QwpSpscQueue<>(bufferPoolSize + 2);
         for (int i = 0; i < bufferPoolSize; i++) {
             freeBuffers.offer(new QwpBatchBuffer(DEFAULT_BUFFER_CAPACITY));
         }
@@ -314,15 +326,23 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
-     * Like {@link #emitError} but blocks until the event is enqueued. Used on shutdown
-     * and fatal-error paths where dropping the event would leave the user thread
-     * blocked on {@link #takeEvent} indefinitely.
+     * Like {@link #emitError} but retries until the event is enqueued. Used on
+     * shutdown and fatal-error paths where dropping the event would leave the
+     * user thread blocked on {@link #takeEvent} indefinitely.
      */
     private void emitErrorBlocking(byte status, String message) {
-        try {
-            events.put(new QueryEvent().asError(status, message));
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
+        QueryEvent ev = new QueryEvent().asError(status, message);
+        while (!events.offer(ev)) {
+            // Events queue is bounded; the consumer side (user thread) drains
+            // steadily under a cooperative shutdown. Yield between retries so
+            // we don't busy-spin while the consumer is scheduled.
+            Thread.yield();
+            if (Thread.currentThread().isInterrupted()) {
+                // Restore the interrupt and abandon the error publish. Caller
+                // paths that rely on the error reaching the user may see a
+                // silent drop -- acceptable under explicit interrupt.
+                return;
+            }
         }
     }
 
