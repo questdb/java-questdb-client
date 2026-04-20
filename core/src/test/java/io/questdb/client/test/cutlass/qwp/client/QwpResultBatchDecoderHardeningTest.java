@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.qwp.client.QwpResultBatchDecoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -51,25 +52,28 @@ public class QwpResultBatchDecoderHardeningTest {
      * append nulls until OOM (or AIOOBE for negative ids cast from a high varint).
      */
     @Test
-    public void testHugeSchemaIdIsRejected() {
-        QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-        QwpBatchBuffer buffer = new QwpBatchBuffer(256);
-        long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
-        try {
-            // schema_id = 1_000_000_000, well above the 65_535 cap.
-            int len = writeMinimalResultBatch(staging, /*schemaId=*/ 1_000_000_000L);
-            buffer.copyFromPayload(staging, len);
+    public void testHugeSchemaIdIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
             try {
-                decoder.decode(buffer);
-                Assert.fail("decoder must reject huge schema_id");
-            } catch (QwpDecodeException expected) {
-                Assert.assertTrue("error message should mention schema_id: " + expected.getMessage(),
-                        expected.getMessage().contains("schema_id"));
+                // schema_id = 1_000_000_000, well above the 65_535 cap.
+                int len = writeMinimalResultBatch(staging, /*schemaId=*/ 1_000_000_000L);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject huge schema_id");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error message should mention schema_id: " + expected.getMessage(),
+                            expected.getMessage().contains("schema_id"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
             }
-        } finally {
-            Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
-            buffer.close();
-        }
+        });
     }
 
     /**
@@ -78,32 +82,35 @@ public class QwpResultBatchDecoderHardeningTest {
      * rejected, not silently passed to {@code getQuick(negativeIndex)}.
      */
     @Test
-    public void testNegativeSchemaIdIsRejected() {
-        QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-        QwpBatchBuffer buffer = new QwpBatchBuffer(256);
-        long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
-        try {
-            // 5-byte varint encoding 0x80000000 (which casts to Integer.MIN_VALUE).
-            // varint bytes for 0x80000000:
-            //   value bits 7..0:  0x00 -> byte: 0x80 (continuation)
-            //   value bits 14..8: 0x00 -> byte: 0x80
-            //   value bits 21..15:0x00 -> byte: 0x80
-            //   value bits 28..22:0x00 -> byte: 0x80
-            //   value bits 35..29:0x08 -> byte: 0x08 (no continuation)
-            int len = writeMinimalResultBatchWithRawSchemaIdVarint(
-                    staging, new byte[]{(byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x08});
-            buffer.copyFromPayload(staging, len);
+    public void testNegativeSchemaIdIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
             try {
-                decoder.decode(buffer);
-                Assert.fail("decoder must reject huge/negative schema_id");
-            } catch (QwpDecodeException expected) {
-                Assert.assertTrue("error message should mention schema_id: " + expected.getMessage(),
-                        expected.getMessage().contains("schema_id"));
+                // 5-byte varint encoding 0x80000000 (which casts to Integer.MIN_VALUE).
+                // varint bytes for 0x80000000:
+                //   value bits 7..0:  0x00 -> byte: 0x80 (continuation)
+                //   value bits 14..8: 0x00 -> byte: 0x80
+                //   value bits 21..15:0x00 -> byte: 0x80
+                //   value bits 28..22:0x00 -> byte: 0x80
+                //   value bits 35..29:0x08 -> byte: 0x08 (no continuation)
+                int len = writeMinimalResultBatchWithRawSchemaIdVarint(
+                        staging, new byte[]{(byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x08});
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject huge/negative schema_id");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error message should mention schema_id: " + expected.getMessage(),
+                            expected.getMessage().contains("schema_id"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
             }
-        } finally {
-            Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
-            buffer.close();
-        }
+        });
     }
 
     /**
@@ -114,32 +121,34 @@ public class QwpResultBatchDecoderHardeningTest {
      * detects the overrun and reports a bounded error.
      */
     @Test
-    public void testQueryErrorMsgLenOverrunIsRejected() {
-        // Frame contents:
-        //   12 bytes header (uninspected by decodeError)
-        //   1 byte msg_kind
-        //   8 bytes request_id
-        //   1 byte status
-        //   2 bytes msgLen (we set 0xFFFF)
-        //   0 bytes of actual message body
-        // Total payload: 24 bytes; msgLen would otherwise force reading 65535 bytes.
-        int payloadLen = 12 + 1 + 8 + 1 + 2;
-        long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
-        try {
-            // Zero out
-            for (int i = 0; i < payloadLen; i++) Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
-            // Write an obviously bogus msgLen at the right offset (header + msg_kind + reqId + status).
-            long msgLenOffset = buf + 12 + 1 + 8 + 1;
-            Unsafe.getUnsafe().putShort(msgLenOffset, (short) 0xFFFF);
+    public void testQueryErrorMsgLenOverrunIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Frame contents:
+            //   12 bytes header (uninspected by decodeError)
+            //   1 byte msg_kind
+            //   8 bytes request_id
+            //   1 byte status
+            //   2 bytes msgLen (we set 0xFFFF)
+            //   0 bytes of actual message body
+            // Total payload: 24 bytes; msgLen would otherwise force reading 65535 bytes.
+            int payloadLen = 12 + 1 + 8 + 1 + 2;
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Zero out
+                for (int i = 0; i < payloadLen; i++) Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+                // Write an obviously bogus msgLen at the right offset (header + msg_kind + reqId + status).
+                long msgLenOffset = buf + 12 + 1 + 8 + 1;
+                Unsafe.getUnsafe().putShort(msgLenOffset, (short) 0xFFFF);
 
-            QueryEvent ev = QwpEgressIoThread.decodeError(buf, payloadLen);
-            Assert.assertEquals(QueryEvent.KIND_ERROR, ev.kind);
-            Assert.assertNotNull(ev.errorMessage);
-            Assert.assertTrue("error must mention msg_len overrun: " + ev.errorMessage,
-                    ev.errorMessage.contains("msg_len") && ev.errorMessage.contains("exceeds"));
-        } finally {
-            Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
-        }
+                QueryEvent ev = QwpEgressIoThread.decodeError(buf, payloadLen);
+                Assert.assertEquals(QueryEvent.KIND_ERROR, ev.kind);
+                Assert.assertNotNull(ev.errorMessage);
+                Assert.assertTrue("error must mention msg_len overrun: " + ev.errorMessage,
+                        ev.errorMessage.contains("msg_len") && ev.errorMessage.contains("exceeds"));
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
     }
 
     /**
@@ -148,28 +157,30 @@ public class QwpResultBatchDecoderHardeningTest {
      * confirming a real defensive guard, not a broken decoder.
      */
     @Test
-    public void testQueryErrorValidMessageDecodes() {
-        byte[] msgBytes = "boom".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        int payloadLen = 12 + 1 + 8 + 1 + 2 + msgBytes.length;
-        long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
-        try {
-            for (int i = 0; i < payloadLen; i++) Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
-            long statusOffset = buf + 12 + 1 + 8;
-            Unsafe.getUnsafe().putByte(statusOffset, (byte) 0x05);
-            long msgLenOffset = statusOffset + 1;
-            Unsafe.getUnsafe().putShort(msgLenOffset, (short) msgBytes.length);
-            long bytesOffset = msgLenOffset + 2;
-            for (int i = 0; i < msgBytes.length; i++) {
-                Unsafe.getUnsafe().putByte(bytesOffset + i, msgBytes[i]);
-            }
+    public void testQueryErrorValidMessageDecodes() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            byte[] msgBytes = "boom".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            int payloadLen = 12 + 1 + 8 + 1 + 2 + msgBytes.length;
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payloadLen; i++) Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+                long statusOffset = buf + 12 + 1 + 8;
+                Unsafe.getUnsafe().putByte(statusOffset, (byte) 0x05);
+                long msgLenOffset = statusOffset + 1;
+                Unsafe.getUnsafe().putShort(msgLenOffset, (short) msgBytes.length);
+                long bytesOffset = msgLenOffset + 2;
+                for (int i = 0; i < msgBytes.length; i++) {
+                    Unsafe.getUnsafe().putByte(bytesOffset + i, msgBytes[i]);
+                }
 
-            QueryEvent ev = QwpEgressIoThread.decodeError(buf, payloadLen);
-            Assert.assertEquals(QueryEvent.KIND_ERROR, ev.kind);
-            Assert.assertEquals((byte) 0x05, ev.errorStatus);
-            Assert.assertEquals("boom", ev.errorMessage);
-        } finally {
-            Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
-        }
+                QueryEvent ev = QwpEgressIoThread.decodeError(buf, payloadLen);
+                Assert.assertEquals(QueryEvent.KIND_ERROR, ev.kind);
+                Assert.assertEquals((byte) 0x05, ev.errorStatus);
+                Assert.assertEquals("boom", ev.errorMessage);
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
     }
 
     /**
@@ -180,24 +191,27 @@ public class QwpResultBatchDecoderHardeningTest {
      * memory backwards.
      */
     @Test
-    public void testStringColumnNegativeTotalBytesIsRejected() {
-        QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-        QwpBatchBuffer buffer = new QwpBatchBuffer(512);
-        long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
-        try {
-            int len = writeStringResultBatch(staging, /*nonNull=*/ 1, /*totalBytes=*/ -1);
-            buffer.copyFromPayload(staging, len);
+    public void testStringColumnNegativeTotalBytesIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(512);
+            long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
             try {
-                decoder.decode(buffer);
-                Assert.fail("decoder must reject negative totalBytes");
-            } catch (QwpDecodeException expected) {
-                Assert.assertTrue("error message should describe invalid total bytes: " + expected.getMessage(),
-                        expected.getMessage().contains("total bytes"));
+                int len = writeStringResultBatch(staging, /*nonNull=*/ 1, /*totalBytes=*/ -1);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject negative totalBytes");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error message should describe invalid total bytes: " + expected.getMessage(),
+                            expected.getMessage().contains("total bytes"));
+                }
+            } finally {
+                Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
             }
-        } finally {
-            Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
-            buffer.close();
-        }
+        });
     }
 
     /**
@@ -206,19 +220,22 @@ public class QwpResultBatchDecoderHardeningTest {
      * the negative-value rejection above is testing the right code path.
      */
     @Test
-    public void testStringColumnValidTotalBytesIsAccepted() throws QwpDecodeException {
-        QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-        QwpBatchBuffer buffer = new QwpBatchBuffer(512);
-        long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
-        try {
-            int len = writeStringResultBatch(staging, /*nonNull=*/ 1, /*totalBytes=*/ 5);
-            buffer.copyFromPayload(staging, len);
-            decoder.decode(buffer);
-            // no exception => the decoder accepts the valid wire bytes
-        } finally {
-            Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
-            buffer.close();
-        }
+    public void testStringColumnValidTotalBytesIsAccepted() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(512);
+            long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int len = writeStringResultBatch(staging, /*nonNull=*/ 1, /*totalBytes=*/ 5);
+                buffer.copyFromPayload(staging, len);
+                decoder.decode(buffer);
+                // no exception => the decoder accepts the valid wire bytes
+            } finally {
+                Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
     }
 
     // -----------------------------------------------------------------------

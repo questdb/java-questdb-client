@@ -79,7 +79,11 @@ public class QwpQueryClient implements QuietCloseable {
     // payload before it parks, and the client auto-replenishes by the size of
     // each batch as the user releases it.
     private long initialCreditBytes;
-    private QwpEgressIoThread ioThread;
+    // Volatile so a cancel() call from a thread other than the one that ran
+    // connect() sees the published reference (and a concurrent null-out from
+    // close() is observed without a stale-reference race). The thread-safety
+    // contract documented on cancel() relies on this.
+    private volatile QwpEgressIoThread ioThread;
     private Thread ioThreadHandle;
     private boolean lastCloseTimedOut;
     private int negotiatedQwpVersion;

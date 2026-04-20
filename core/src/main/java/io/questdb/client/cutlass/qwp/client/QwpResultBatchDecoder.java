@@ -295,9 +295,14 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             long decLen = Zstd.decompress(dctx, p, srcLen, decompressScratchAddr, decompressScratchCapacity);
             while (decLen < 0 && decompressScratchCapacity < MAX_SCRATCH) {
                 int newCap = Math.min(decompressScratchCapacity * 2, MAX_SCRATCH);
+                // Reset to 0 before free + malloc so a throwing malloc cannot leave
+                // a dangling address + non-zero capacity behind; the next decode
+                // would otherwise skip the first-alloc branch and use-after-free.
                 Unsafe.free(decompressScratchAddr, decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
+                decompressScratchAddr = 0;
+                decompressScratchCapacity = 0;
+                decompressScratchAddr = Unsafe.malloc(newCap, MemoryTag.NATIVE_DEFAULT);
                 decompressScratchCapacity = newCap;
-                decompressScratchAddr = Unsafe.malloc(decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
                 decLen = Zstd.decompress(dctx, p, srcLen, decompressScratchAddr, decompressScratchCapacity);
             }
             if (decLen < 0) {
