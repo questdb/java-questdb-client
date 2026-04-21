@@ -43,34 +43,6 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class QwpWebSocketEncoderTest {
 
     @Test
-    public void testVersionByteInHeader() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
-                 QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
-                col.addLong(42);
-                buffer.nextRow();
-
-                // Default version
-                int size = encoder.encode(buffer, false);
-                Assert.assertTrue(size > 0);
-                long ptr = encoder.getBuffer().getBufferPtr();
-                Assert.assertEquals(1, Unsafe.getUnsafe().getByte(ptr + 4));
-
-                // Custom version
-                buffer.reset();
-                col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
-                col.addLong(42);
-                buffer.nextRow();
-                encoder.setVersion((byte) 3);
-                encoder.encode(buffer, false);
-                Assert.assertEquals(3, Unsafe.getUnsafe().getByte(ptr + 4));
-            }
-        });
-    }
-
-    @Test
     public void testBufferResetAndReuse() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -163,7 +135,7 @@ public class QwpWebSocketEncoderTest {
                 buffer.getOrCreateColumn("l", TYPE_LONG, false).addLong(1000000000L);
                 buffer.getOrCreateColumn("f", TYPE_FLOAT, false).addFloat(3.14f);
                 buffer.getOrCreateColumn("d", TYPE_DOUBLE, false).addDouble(3.14159265);
-                buffer.getOrCreateColumn("s", TYPE_STRING, true).addString("test");
+                buffer.getOrCreateColumn("s", TYPE_VARCHAR, true).addString("test");
                 buffer.getOrCreateColumn("sym", TYPE_SYMBOL, false).addSymbol("AAPL");
                 buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP).addLong(1000000L);
 
@@ -265,7 +237,7 @@ public class QwpWebSocketEncoderTest {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
 
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_VARCHAR, true);
                 col.addString("");
                 buffer.nextRow();
 
@@ -348,7 +320,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-
     @Test
     public void testEncodeLongString() throws Exception {
         assertMemoryLeak(() -> {
@@ -357,7 +328,7 @@ public class QwpWebSocketEncoderTest {
 
                 String sb = "a".repeat(10_000);
 
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("data", TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("data", TYPE_VARCHAR, true);
                 col.addString(sb);
                 buffer.nextRow();
 
@@ -406,7 +377,7 @@ public class QwpWebSocketEncoderTest {
                 QwpTableBuffer.ColumnBuffer boolCol = buffer.getOrCreateColumn("active", TYPE_BOOLEAN, false);
                 boolCol.addBoolean(true);
 
-                QwpTableBuffer.ColumnBuffer stringCol = buffer.getOrCreateColumn("message", TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer stringCol = buffer.getOrCreateColumn("message", TYPE_VARCHAR, true);
                 stringCol.addString("hello world");
 
                 QwpTableBuffer.ColumnBuffer tsCol = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
@@ -448,7 +419,6 @@ public class QwpWebSocketEncoderTest {
             }
         });
     }
-
 
     @Test
     public void testEncodeMultipleColumns() throws Exception {
@@ -504,7 +474,6 @@ public class QwpWebSocketEncoderTest {
             }
         });
     }
-
 
     @Test
     public void testEncodeMultipleRows() throws Exception {
@@ -590,7 +559,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-
     @Test
     public void testEncodeNegativeLong() throws Exception {
         assertMemoryLeak(() -> {
@@ -614,7 +582,7 @@ public class QwpWebSocketEncoderTest {
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
 
                 // Nullable column with null
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_VARCHAR, true);
                 col.addString(null);
                 buffer.nextRow();
 
@@ -631,7 +599,7 @@ public class QwpWebSocketEncoderTest {
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
 
                 // Nullable column with a value
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_VARCHAR, true);
                 col.addString("hello");
                 buffer.nextRow();
 
@@ -664,7 +632,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-
     @Test
     public void testEncodeSingleRowWithBoolean() throws Exception {
         assertMemoryLeak(() -> {
@@ -696,7 +663,6 @@ public class QwpWebSocketEncoderTest {
             }
         });
     }
-
 
     @Test
     public void testEncodeSingleRowWithLong() throws Exception {
@@ -736,7 +702,7 @@ public class QwpWebSocketEncoderTest {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
 
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_VARCHAR, true);
                 col.addString("hello");
                 buffer.nextRow();
 
@@ -745,7 +711,6 @@ public class QwpWebSocketEncoderTest {
             }
         });
     }
-
 
     @Test
     public void testEncodeSingleRowWithTimestamp() throws Exception {
@@ -831,7 +796,7 @@ public class QwpWebSocketEncoderTest {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
 
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_STRING, true);
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("name", TYPE_VARCHAR, true);
                 col.addString("Hello 世界 🌍");
                 buffer.nextRow();
 
@@ -940,6 +905,46 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
+    public void testEncodeWithDeltaDict_readsGlobalIdsFromDataBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
+                GlobalSymbolDictionary globalDict = new GlobalSymbolDictionary();
+                for (int i = 0; i < 8; i++) {
+                    globalDict.getOrAddSymbol("SYM_" + i);
+                }
+
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("ticker", TYPE_SYMBOL, false);
+                col.addSymbolWithGlobalId("SYM_5", 5);
+                buffer.nextRow();
+                col.addSymbolWithGlobalId("SYM_7", 7);
+                buffer.nextRow();
+                buffer.setSchemaId(0);
+
+                Assert.assertEquals(0, col.getAuxDataAddress());
+
+                int size = encoder.encodeWithDeltaDict(buffer, globalDict, 7, 7, false);
+                Assert.assertTrue(size > 12);
+
+                Cursor cursor = new Cursor(encoder.getBuffer().getBufferPtr() + HEADER_SIZE);
+                Assert.assertEquals(8, cursor.readVarint());
+                Assert.assertEquals(0, cursor.readVarint());
+
+                Assert.assertEquals("test_table", cursor.readString());
+                Assert.assertEquals(2, cursor.readVarint());
+                Assert.assertEquals(1, cursor.readVarint());
+                Assert.assertEquals(SCHEMA_MODE_FULL, cursor.readByte());
+                Assert.assertEquals(0, cursor.readVarint()); // schemaId
+                Assert.assertEquals("ticker", cursor.readString());
+                Assert.assertEquals(TYPE_SYMBOL, cursor.readByte());
+                Assert.assertEquals(0, cursor.readByte()); // no nulls
+                Assert.assertEquals(5, cursor.readVarint());
+                Assert.assertEquals(7, cursor.readVarint());
+            }
+        });
+    }
+
+    @Test
     public void testEncodeWithDeltaDict_withConfirmed_sendsOnlyNew() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -985,47 +990,6 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
-    public void testEncodeWithDeltaDict_readsGlobalIdsFromDataBuffer() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
-                 QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
-                GlobalSymbolDictionary globalDict = new GlobalSymbolDictionary();
-                for (int i = 0; i < 8; i++) {
-                    globalDict.getOrAddSymbol("SYM_" + i);
-                }
-
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("ticker", TYPE_SYMBOL, false);
-                col.addSymbolWithGlobalId("SYM_5", 5);
-                buffer.nextRow();
-                col.addSymbolWithGlobalId("SYM_7", 7);
-                buffer.nextRow();
-                buffer.setSchemaId(0);
-
-                Assert.assertEquals(0, col.getAuxDataAddress());
-
-                int size = encoder.encodeWithDeltaDict(buffer, globalDict, 7, 7, false);
-                Assert.assertTrue(size > 12);
-
-                Cursor cursor = new Cursor(encoder.getBuffer().getBufferPtr() + HEADER_SIZE);
-                Assert.assertEquals(8, cursor.readVarint());
-                Assert.assertEquals(0, cursor.readVarint());
-
-                Assert.assertEquals("test_table", cursor.readString());
-                Assert.assertEquals(2, cursor.readVarint());
-                Assert.assertEquals(1, cursor.readVarint());
-                Assert.assertEquals(SCHEMA_MODE_FULL, cursor.readByte());
-                Assert.assertEquals(0, cursor.readVarint()); // schemaId
-                Assert.assertEquals("ticker", cursor.readString());
-                Assert.assertEquals(TYPE_SYMBOL, cursor.readByte());
-                Assert.assertEquals(0, cursor.readByte()); // no nulls
-                Assert.assertEquals(5, cursor.readVarint());
-                Assert.assertEquals(7, cursor.readVarint());
-            }
-        });
-    }
-
-
-    @Test
     public void testEncodeWithSchemaRef() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -1041,7 +1005,6 @@ public class QwpWebSocketEncoderTest {
             }
         });
     }
-
 
     @Test
     public void testEncodeZeroLong() throws Exception {
@@ -1084,7 +1047,6 @@ public class QwpWebSocketEncoderTest {
         });
     }
 
-
     @Test
     public void testGlobalSymbolDictionaryBasics() throws Exception {
         assertMemoryLeak(() -> {
@@ -1108,7 +1070,6 @@ public class QwpWebSocketEncoderTest {
             Assert.assertEquals(3, dict.size());
         });
     }
-
 
     @Test
     public void testGorillaEncoding_compressionRatio() throws Exception {
@@ -1416,6 +1377,34 @@ public class QwpWebSocketEncoderTest {
 
                 // Sizes should be similar (same schema)
                 Assert.assertEquals(size1, size2);
+            }
+        });
+    }
+
+    @Test
+    public void testVersionByteInHeader() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("test")) {
+
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
+                col.addLong(42);
+                buffer.nextRow();
+
+                // Default version
+                int size = encoder.encode(buffer, false);
+                Assert.assertTrue(size > 0);
+                long ptr = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(1, Unsafe.getUnsafe().getByte(ptr + 4));
+
+                // Custom version
+                buffer.reset();
+                col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
+                col.addLong(42);
+                buffer.nextRow();
+                encoder.setVersion((byte) 3);
+                encoder.encode(buffer, false);
+                Assert.assertEquals(3, Unsafe.getUnsafe().getByte(ptr + 4));
             }
         });
     }
