@@ -1052,7 +1052,6 @@ public class QwpTableBuffer implements QuietCloseable {
                     case TYPE_DOUBLE:
                         dataBuffer.putDouble(Double.NaN);
                         break;
-                    case TYPE_STRING:
                     case TYPE_VARCHAR:
                         stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
                         break;
@@ -1438,7 +1437,6 @@ public class QwpTableBuffer implements QuietCloseable {
             }
 
             switch (type) {
-                case TYPE_STRING:
                 case TYPE_VARCHAR:
                     retainStringValue(valueCountBefore);
                     break;
@@ -1586,7 +1584,6 @@ public class QwpTableBuffer implements QuietCloseable {
                 case TYPE_DECIMAL256:
                     dataBuffer = new OffHeapAppendMemory(512);
                     break;
-                case TYPE_STRING:
                 case TYPE_VARCHAR:
                     stringOffsets = new OffHeapAppendMemory(64);
                     try {
