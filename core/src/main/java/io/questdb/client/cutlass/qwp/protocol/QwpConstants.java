@@ -141,10 +141,6 @@ public final class QwpConstants {
      */
     public static final byte TYPE_SHORT = 0x03;
     /**
-     * Column type: STRING (length-prefixed UTF-8).
-     */
-    public static final byte TYPE_STRING = 0x08;
-    /**
      * Column type: SYMBOL (dictionary-encoded string).
      */
     public static final byte TYPE_SYMBOL = 0x09;
@@ -256,9 +252,6 @@ public final class QwpConstants {
                 break;
             case TYPE_DOUBLE:
                 name = "DOUBLE";
-                break;
-            case TYPE_STRING:
-                name = "STRING";
                 break;
             case TYPE_SYMBOL:
                 name = "SYMBOL";
