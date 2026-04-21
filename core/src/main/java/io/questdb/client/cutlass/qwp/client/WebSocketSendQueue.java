@@ -92,6 +92,9 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Synchronization for flush/close
     private final CountDownLatch shutdownLatch;
     private final long shutdownTimeoutMs;
+    // Highest durable-ack watermark reported by the server, or -1 if none seen.
+    // Only meaningful when the connection opted in via X-QWP-Request-Durable-Ack.
+    private final AtomicLong highestDurableSequence = new AtomicLong(-1L);
     // Statistics - receiving
     private final AtomicLong totalAcks = new AtomicLong(0);
     // Statistics - sending
@@ -107,6 +110,8 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Single pending buffer slot (double-buffering means at most 1 item in queue)
     // Zero allocation - just a volatile reference handoff
     private volatile MicrobatchBuffer pendingBuffer;
+    private volatile boolean pingRequested;
+    private volatile boolean pingComplete;
     // Running state
     private volatile boolean running;
     private volatile boolean shuttingDown;
@@ -332,6 +337,40 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
+     * Returns the highest client batch sequence that the server has reported
+     * as durably uploaded, or -1 if no durable ACK has been observed on this
+     * connection.
+     */
+    public long getHighestDurableSequence() {
+        return highestDurableSequence.get();
+    }
+
+    /**
+     * Requests the I/O thread to send a PING and drain any pending frames
+     * (including STATUS_DURABLE_ACK). Blocks until the I/O thread completes.
+     */
+    public void pingAndDrain() {
+        synchronized (processingLock) {
+            pingComplete = false;
+            pingRequested = true;
+            processingLock.notifyAll();
+            long deadline = System.nanoTime() + InFlightWindow.DEFAULT_TIMEOUT_MS * 1_000_000L;
+            while (!pingComplete && running) {
+                long remaining = (deadline - System.nanoTime()) / 1_000_000L;
+                if (remaining <= 0) {
+                    throw new LineSenderException("Ping timed out");
+                }
+                try {
+                    processingLock.wait(remaining);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new LineSenderException("Ping interrupted");
+                }
+            }
+        }
+    }
+
+    /**
      * Returns the total number of batches sent.
      */
     public long getTotalBatchesSent() {
@@ -423,6 +462,21 @@ public class WebSocketSendQueue implements QuietCloseable {
         try {
             int drainIdleCycles = 0;
             while (running || !isPendingEmpty()) {
+                if (pingRequested) {
+                    pingRequested = false;
+                    try {
+                        client.sendPing(1000);
+                        tryReceiveAcks();
+                    } catch (Exception e) {
+                        LOG.error("Ping failed: {}", e.getMessage());
+                    } finally {
+                        synchronized (processingLock) {
+                            pingComplete = true;
+                            processingLock.notifyAll();
+                        }
+                    }
+                }
+
                 MicrobatchBuffer batch = null;
                 boolean hasInFlight = (inFlightWindow != null && inFlightWindow.getInFlightCount() > 0);
                 IoState state = computeState(hasInFlight);
@@ -664,6 +718,18 @@ public class WebSocketSendQueue implements QuietCloseable {
                     } else if (LOG.isDebugEnabled()) {
                         LOG.debug("ACK for already-acknowledged sequences [upTo={}]", sequence);
                     }
+                }
+            } else if (response.isDurableAck()) {
+                // Durable-upload watermark. Track monotonically; no action on the in-flight window.
+                long curr;
+                do {
+                    curr = highestDurableSequence.get();
+                    if (curr >= sequence) {
+                        break;
+                    }
+                } while (!highestDurableSequence.compareAndSet(curr, sequence));
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Cumulative durable ACK received [upTo={}]", sequence);
                 }
             } else {
                 // Error - fail the batch

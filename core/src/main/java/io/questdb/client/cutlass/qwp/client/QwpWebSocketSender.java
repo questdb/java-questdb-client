@@ -138,7 +138,7 @@ public class QwpWebSocketSender implements Sender {
     // Flow control
     private InFlightWindow inFlightWindow;
     private int maxSentSchemaId = -1;
-    // Track highest symbol ID sent to server (for delta encoding)
+    // Track the highest symbol ID sent to server (for delta encoding)
     // Once sent over TCP, server is guaranteed to receive it (or connection dies)
     private int maxSentSymbolId = -1;
     // Batch sequence counter (must match server's messageSequence)
@@ -147,7 +147,14 @@ public class QwpWebSocketSender implements Sender {
     // Async mode: pending row tracking
     private long pendingBytes;
     private int pendingRowCount;
+    // Highest client sequence durably uploaded, tracked when durable-ack opt-in is enabled
+    // and the server emits STATUS_DURABLE_ACK frames.
+    private long highestDurableSequence = -1;
+    // Opt-in: request server-side STATUS_DURABLE_ACK frames after WAL reaches object store.
+    // Must be set before the first send; has no effect once the WebSocket upgrade has completed.
+    private boolean requestDurableAck;
     private boolean sawBinaryAck;
+    private boolean sawPong;
     private WebSocketSendQueue sendQueue;
 
     private QwpWebSocketSender(
@@ -290,6 +297,33 @@ public class QwpWebSocketSender implements Sender {
         return sender;
     }
 
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck
+    ) {
+        QwpWebSocketSender sender = new QwpWebSocketSender(
+                host, port, tlsConfig,
+                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
+        );
+        try {
+            sender.setRequestDurableAck(requestDurableAck);
+            sender.ensureConnected();
+        } catch (Throwable t) {
+            sender.close();
+            throw t;
+        }
+        return sender;
+    }
+
     /**
      * Creates a sender without connecting. For testing only.
      * <p>
@@ -302,10 +336,14 @@ public class QwpWebSocketSender implements Sender {
      * @return unconnected sender
      */
     public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
+        return createForTesting(host, port, inFlightWindowSize, null);
+    }
+
+    public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize, String authorizationHeader) {
         return new QwpWebSocketSender(
                 host, port, null,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                inFlightWindowSize, null, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
+                inFlightWindowSize, authorizationHeader, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
         );
     }
 
@@ -780,6 +818,27 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Returns the highest client batch sequence acknowledged by the server
+     * (committed to WAL), or -1 if no ACK has been received yet.
+     */
+    public long getHighestAckedSequence() {
+        return inFlightWindow != null ? inFlightWindow.getHighestAckedSequence() : -1;
+    }
+
+    /**
+     * Returns the highest client batch sequence that the server has reported
+     * as durably persisted to the object store via a STATUS_DURABLE_ACK frame,
+     * or -1 if no durable ACK has been observed yet on this connection.
+     * <p>
+     * Only meaningful when the connection was opened with
+     * {@link #setRequestDurableAck(boolean)} = true on a server where primary
+     * replication is enabled; otherwise remains -1.
+     */
+    public long getHighestDurableSequence() {
+        return sendQueue != null ? sendQueue.getHighestDurableSequence() : highestDurableSequence;
+    }
+
+    /**
      * Returns the max symbol ID sent to the server.
      * Once sent over TCP, server is guaranteed to receive it (or connection dies).
      */
@@ -960,6 +1019,27 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    /**
+     * Sends a WebSocket PING and reads frames until the PONG comes back,
+     * processing any STATUS_DURABLE_ACK or STATUS_OK frames along the way.
+     * After this method returns, {@link #getHighestDurableSequence()} reflects
+     * the latest durable watermark reported by the server.
+     * <p>
+     * In async mode the PING is queued for the I/O thread; this method
+     * returns once the I/O thread has sent it and processed the response.
+     *
+     * @throws LineSenderException if the connection is closed or the ping times out
+     */
+    public void ping() {
+        checkNotClosed();
+        ensureConnected();
+        if (inFlightWindowSize > 1) {
+            sendQueue.pingAndDrain();
+        } else {
+            syncPing();
+        }
+    }
+
     @Override
     public void reset() {
         checkNotClosed();
@@ -986,6 +1066,27 @@ public class QwpWebSocketSender implements Sender {
     public void setGorillaEnabled(boolean enabled) {
         this.gorillaEnabled = enabled;
         this.encoder.setGorillaEnabled(enabled);
+    }
+
+    /**
+     * Opts the connection in for STATUS_DURABLE_ACK frames. Must be called
+     * before any send operation — the flag is consulted once, during WebSocket
+     * upgrade. Setting this true on a server without primary replication
+     * enabled is a no-op: the server silently ignores the header.
+     * <p>
+     * Observe durable progress via {@link #getHighestDurableSequence()}.
+     *
+     * @throws LineSenderException if the connection is already established or closed
+     */
+    public void setRequestDurableAck(boolean enabled) {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        if (connected) {
+            throw new LineSenderException(
+                    "setRequestDurableAck must be called before the first send");
+        }
+        this.requestDurableAck = enabled;
     }
 
     /**
@@ -1215,6 +1316,7 @@ public class QwpWebSocketSender implements Sender {
             try {
                 client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_VERSION);
                 client.setQwpClientId(QwpConstants.CLIENT_ID);
+                client.setQwpRequestDurableAck(requestDurableAck);
                 client.connect(host, port);
                 client.upgrade(WRITE_PATH, authorizationHeader);
             } catch (Exception e) {
@@ -1639,6 +1741,32 @@ public class QwpWebSocketSender implements Sender {
         return false;
     }
 
+    private void syncPing() {
+        client.sendPing(1000);
+        long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            sawPong = false;
+            sawBinaryAck = false;
+            boolean received = client.receiveFrame(ackHandler, 1000);
+            if (received) {
+                if (sawBinaryAck) {
+                    long sequence = ackResponse.getSequence();
+                    if (ackResponse.isDurableAck()) {
+                        if (sequence > highestDurableSequence) {
+                            highestDurableSequence = sequence;
+                        }
+                    } else if (ackResponse.isSuccess()) {
+                        inFlightWindow.acknowledgeUpTo(sequence);
+                    }
+                }
+                if (sawPong) {
+                    return;
+                }
+            }
+        }
+        throw new LineSenderException("Ping timed out");
+    }
+
     private long toMicros(long value, ChronoUnit unit) {
         switch (unit) {
             case NANOS:
@@ -1696,6 +1824,13 @@ public class QwpWebSocketSender implements Sender {
                             return; // Our batch was acknowledged (cumulative)
                         }
                         // Got ACK for lower sequence - continue waiting
+                    } else if (ackResponse.isDurableAck()) {
+                        // Durable-upload watermark for opted-in connections. Record the highest
+                        // value seen; this method does not block for durable acks — callers who
+                        // need to wait on durability can poll getHighestDurableSequence().
+                        if (sequence > highestDurableSequence) {
+                            highestDurableSequence = sequence;
+                        }
                     } else {
                         String errorMessage = ackResponse.getErrorMessage();
                         LineSenderException error = new LineSenderException(
@@ -1745,6 +1880,11 @@ public class QwpWebSocketSender implements Sender {
         @Override
         public void onClose(int code, String reason) {
             throw new LineSenderException("WebSocket closed while waiting for ACK: " + reason);
+        }
+
+        @Override
+        public void onPong(long payloadPtr, int payloadLen) {
+            sender.sawPong = true;
         }
     }
 }

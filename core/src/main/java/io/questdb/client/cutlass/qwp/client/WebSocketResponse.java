@@ -58,11 +58,17 @@ public class WebSocketResponse {
     public static final int MIN_ERROR_RESPONSE_SIZE = 11; // status + sequence + error length
     // Minimum response size: status (1) + sequence (8)
     public static final int MIN_RESPONSE_SIZE = 9;
-    public static final byte STATUS_INTERNAL_ERROR = 0x06;
     // Status codes (must match QWP_SPECIFICATION.md)
     public static final byte STATUS_OK = 0x00;
-    public static final byte STATUS_PARSE_ERROR = 0x05;
+    /**
+     * Cumulative durable-upload acknowledgment. Emitted by servers where
+     * primary replication is enabled and the connection opted in via
+     * X-QWP-Request-Durable-Ack. Payload layout matches STATUS_OK.
+     */
+    public static final byte STATUS_DURABLE_ACK = 0x02;
     public static final byte STATUS_SCHEMA_MISMATCH = 0x03;
+    public static final byte STATUS_PARSE_ERROR = 0x05;
+    public static final byte STATUS_INTERNAL_ERROR = 0x06;
     public static final byte STATUS_SECURITY_ERROR = 0x08;
     public static final byte STATUS_WRITE_ERROR = 0x09;
     private String errorMessage;
@@ -73,6 +79,16 @@ public class WebSocketResponse {
         this.status = STATUS_OK;
         this.sequence = 0;
         this.errorMessage = null;
+    }
+
+    /**
+     * Creates a durable-upload ACK response.
+     */
+    public static WebSocketResponse durableAck(long sequence) {
+        WebSocketResponse response = new WebSocketResponse();
+        response.status = STATUS_DURABLE_ACK;
+        response.sequence = sequence;
+        return response;
     }
 
     /**
@@ -105,7 +121,7 @@ public class WebSocketResponse {
         }
 
         byte status = Unsafe.getUnsafe().getByte(ptr);
-        if (status == STATUS_OK) {
+        if (status == STATUS_OK || status == STATUS_DURABLE_ACK) {
             return length == MIN_RESPONSE_SIZE;
         }
 
@@ -142,12 +158,21 @@ public class WebSocketResponse {
     }
 
     /**
+     * Returns the raw status byte.
+     */
+    public byte getStatus() {
+        return status;
+    }
+
+    /**
      * Returns a human-readable status name.
      */
     public String getStatusName() {
         switch (status) {
             case STATUS_OK:
                 return "OK";
+            case STATUS_DURABLE_ACK:
+                return "DURABLE_ACK";
             case STATUS_PARSE_ERROR:
                 return "PARSE_ERROR";
             case STATUS_SCHEMA_MISMATCH:
@@ -164,7 +189,14 @@ public class WebSocketResponse {
     }
 
     /**
-     * Returns true if this is a success response.
+     * Returns true when this is a cumulative durable-upload ACK (STATUS_DURABLE_ACK).
+     */
+    public boolean isDurableAck() {
+        return status == STATUS_DURABLE_ACK;
+    }
+
+    /**
+     * Returns true if this is a success response (STATUS_OK).
      */
     public boolean isSuccess() {
         return status == STATUS_OK;
@@ -192,8 +224,8 @@ public class WebSocketResponse {
         sequence = Unsafe.getUnsafe().getLong(ptr + offset);
         offset += 8;
 
-        // Error message (if status != OK and more data available)
-        if (status != STATUS_OK && length >= offset + 2) {
+        // Error message (present only for error frames; STATUS_OK and STATUS_DURABLE_ACK carry no message)
+        if (status != STATUS_OK && status != STATUS_DURABLE_ACK && length >= offset + 2) {
             int msgLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
             offset += 2;
 

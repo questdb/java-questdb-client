@@ -107,6 +107,8 @@ public abstract class WebSocketClient implements QuietCloseable {
     // QWP version negotiation
     private String qwpClientId;
     private int qwpMaxVersion = 1;
+    // Opt-in for STATUS_DURABLE_ACK frames; sent as X-QWP-Request-Durable-Ack: true
+    private boolean qwpRequestDurableAck;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
@@ -391,6 +393,16 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Enables the opt-in X-QWP-Request-Durable-Ack upgrade header. When set,
+     * servers with primary replication configured will additionally emit
+     * STATUS_DURABLE_ACK frames as the WAL containing committed client
+     * messages reaches the object store.
+     */
+    public void setQwpRequestDurableAck(boolean enabled) {
+        this.qwpRequestDurableAck = enabled;
+    }
+
+    /**
      * Non-blocking attempt to receive a WebSocket frame.
      * Returns immediately if no complete frame is available.
      *
@@ -475,6 +487,9 @@ public abstract class WebSocketClient implements QuietCloseable {
             sendBuffer.putAscii("X-QWP-Client-Id: ");
             sendBuffer.putAscii(qwpClientId);
             sendBuffer.putAscii("\r\n");
+        }
+        if (qwpRequestDurableAck) {
+            sendBuffer.putAscii("X-QWP-Request-Durable-Ack: true\r\n");
         }
         if (authorizationHeader != null) {
             sendBuffer.putAscii("Authorization: ");

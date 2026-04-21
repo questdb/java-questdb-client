@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
@@ -48,6 +49,68 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * </ul>
  */
 public class QwpWebSocketSenderStateTest extends AbstractTest {
+
+    @Test
+    public void testGetHighestDurableSequenceDefaultsToMinusOne() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
+                Assert.assertEquals(-1L, sender.getHighestDurableSequence());
+            }
+        });
+    }
+
+    @Test
+    public void testGetHighestAckedSequenceDefaultsToMinusOne() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
+                Assert.assertEquals(-1L, sender.getHighestAckedSequence());
+            }
+        });
+    }
+
+    @Test
+    public void testSetRequestDurableAckBeforeConnect() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
+                // Must not throw before connection is established
+                sender.setRequestDurableAck(true);
+                sender.setRequestDurableAck(false);
+            }
+        });
+    }
+
+    @Test
+    public void testSetRequestDurableAckAfterConnectThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            try {
+                setField(sender, "connected", true);
+                try {
+                    sender.setRequestDurableAck(true);
+                    Assert.fail("Expected exception for setRequestDurableAck after connect");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("before the first send"));
+                }
+            } finally {
+                setField(sender, "connected", false);
+                sender.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSetRequestDurableAckOnClosedSenderThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            sender.close();
+            try {
+                sender.setRequestDurableAck(true);
+                Assert.fail("Expected exception for setRequestDurableAck on closed sender");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
 
     @Test
     public void testAutoFlushAccumulatesRowsAcrossAllTables() throws Exception {

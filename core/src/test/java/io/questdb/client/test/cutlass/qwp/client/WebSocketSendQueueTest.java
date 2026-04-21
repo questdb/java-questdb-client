@@ -36,7 +36,6 @@ import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
 import java.util.concurrent.CountDownLatch;
@@ -46,6 +45,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.*;
 
 public class WebSocketSendQueueTest {
@@ -54,12 +54,8 @@ public class WebSocketSendQueueTest {
     public void testEnqueueTimeoutWhenPendingSlotOccupied() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(1, 1_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
-            MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
-            MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
             WebSocketSendQueue queue = null;
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient(); MicrobatchBuffer batch0 = sealedBuffer((byte) 1); MicrobatchBuffer batch1 = sealedBuffer((byte) 2)) {
                 // Keep window full so I/O thread cannot drain pending slot.
                 window.addInFlight(0);
                 queue = new WebSocketSendQueue(client, window, 100, 500);
@@ -74,9 +70,6 @@ public class WebSocketSendQueueTest {
             } finally {
                 window.acknowledgeUpTo(Long.MAX_VALUE);
                 closeQuietly(queue);
-                batch0.close();
-                batch1.close();
-                client.close();
             }
         });
     }
@@ -85,12 +78,8 @@ public class WebSocketSendQueueTest {
     public void testEnqueueWaitsUntilSlotAvailable() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(1, 1_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
-            MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
-            MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
             WebSocketSendQueue queue = null;
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient(); MicrobatchBuffer batch0 = sealedBuffer((byte) 1); MicrobatchBuffer batch1 = sealedBuffer((byte) 2)) {
                 window.addInFlight(0);
                 queue = new WebSocketSendQueue(client, window, 2_000, 500);
                 final WebSocketSendQueue finalQueue = queue;
@@ -124,9 +113,6 @@ public class WebSocketSendQueueTest {
             } finally {
                 window.acknowledgeUpTo(Long.MAX_VALUE);
                 closeQuietly(queue);
-                batch0.close();
-                batch1.close();
-                client.close();
             }
         });
     }
@@ -135,12 +121,10 @@ public class WebSocketSendQueueTest {
     public void testFlushFailsOnInvalidAckPayload() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
             WebSocketSendQueue queue = null;
-            CountDownLatch payloadDelivered = new CountDownLatch(1);
-            AtomicBoolean fired = new AtomicBoolean(false);
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch payloadDelivered = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean(false);
                 window.addInFlight(0);
                 client.setTryReceiveBehavior(handler -> {
                     if (fired.compareAndSet(false, true)) {
@@ -162,7 +146,6 @@ public class WebSocketSendQueueTest {
                 }
             } finally {
                 closeQuietly(queue);
-                client.close();
             }
         });
     }
@@ -171,11 +154,9 @@ public class WebSocketSendQueueTest {
     public void testFlushFailsOnReceiveIoError() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
             WebSocketSendQueue queue = null;
-            CountDownLatch receiveAttempted = new CountDownLatch(1);
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch receiveAttempted = new CountDownLatch(1);
                 window.addInFlight(0);
                 client.setTryReceiveBehavior(handler -> {
                     receiveAttempted.countDown();
@@ -198,7 +179,6 @@ public class WebSocketSendQueueTest {
                 }
             } finally {
                 closeQuietly(queue);
-                client.close();
             }
         });
     }
@@ -206,11 +186,8 @@ public class WebSocketSendQueueTest {
     @Test
     public void testFlushFailsOnSendIoError() throws Exception {
         assertMemoryLeak(() -> {
-            FakeWebSocketClient client = new FakeWebSocketClient();
-            MicrobatchBuffer batch = sealedBuffer((byte) 42);
             WebSocketSendQueue queue = null;
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient(); MicrobatchBuffer batch = sealedBuffer((byte) 42)) {
                 client.setSendBehavior((dataPtr, length) -> {
                     throw new RuntimeException("send-fail");
                 });
@@ -228,8 +205,6 @@ public class WebSocketSendQueueTest {
                 }
             } finally {
                 closeQuietly(queue);
-                batch.close();
-                client.close();
             }
         });
     }
@@ -238,12 +213,10 @@ public class WebSocketSendQueueTest {
     public void testFlushFailsWhenServerClosesConnection() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
             WebSocketSendQueue queue = null;
-            CountDownLatch closeDelivered = new CountDownLatch(1);
-            AtomicBoolean fired = new AtomicBoolean(false);
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch closeDelivered = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean(false);
                 window.addInFlight(0);
                 client.setTryReceiveBehavior(handler -> {
                     if (fired.compareAndSet(false, true)) {
@@ -265,7 +238,6 @@ public class WebSocketSendQueueTest {
                 }
             } finally {
                 closeQuietly(queue);
-                client.close();
             }
         });
     }
@@ -348,6 +320,158 @@ public class WebSocketSendQueueTest {
         });
     }
 
+    @Test
+    public void testDurableAckUpdatesHighestDurableSequence() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch durableDelivered = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean(false);
+                window.addInFlight(0);
+                client.setTryReceiveBehavior(handler -> {
+                    if (fired.compareAndSet(false, true)) {
+                        emitDurableAck(handler, 0);
+                        durableDelivered.countDown();
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue("Expected durable ACK callback",
+                        durableDelivered.await(2, TimeUnit.SECONDS));
+
+                // Wait for the I/O thread to process the frame
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (queue.getHighestDurableSequence() < 0 && System.currentTimeMillis() < deadline) {
+                    Os.sleep(5);
+                }
+
+                assertEquals(0, queue.getHighestDurableSequence());
+                // Durable ACK should NOT remove in-flight batches — only STATUS_OK does that.
+                assertEquals(1, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testDurableAckIsMonotonic() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                AtomicInteger callCount = new AtomicInteger();
+                CountDownLatch allDelivered = new CountDownLatch(1);
+                window.addInFlight(0);
+                window.addInFlight(1);
+                window.addInFlight(2);
+
+                client.setTryReceiveBehavior(handler -> {
+                    int n = callCount.getAndIncrement();
+                    switch (n) {
+                        case 0:
+                            emitDurableAck(handler, 2);
+                            return true;
+                        case 1:
+                            // Lower value — should be ignored
+                            emitDurableAck(handler, 1);
+                            allDelivered.countDown();
+                            return true;
+                        default:
+                            return false;
+                    }
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue(allDelivered.await(2, TimeUnit.SECONDS));
+
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (queue.getHighestDurableSequence() < 2 && System.currentTimeMillis() < deadline) {
+                    Os.sleep(5);
+                }
+
+                // The higher value (2) must win; the lower (1) must not regress it.
+                assertEquals(2, queue.getHighestDurableSequence());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testDurableAckInterleavedWithStatusOk() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                AtomicInteger callCount = new AtomicInteger();
+                CountDownLatch allDelivered = new CountDownLatch(1);
+                window.addInFlight(0);
+                window.addInFlight(1);
+
+                client.setTryReceiveBehavior(handler -> {
+                    int n = callCount.getAndIncrement();
+                    switch (n) {
+                        case 0:
+                            // STATUS_OK ack for batch 0
+                            emitAck(handler, 0);
+                            return true;
+                        case 1:
+                            // Durable ACK for sequence 0
+                            emitDurableAck(handler, 0);
+                            return true;
+                        case 2:
+                            // STATUS_OK ack for batch 1
+                            emitAck(handler, 1);
+                            return true;
+                        case 3:
+                            // Durable ACK for sequence 1
+                            emitDurableAck(handler, 1);
+                            allDelivered.countDown();
+                            return true;
+                        default:
+                            return false;
+                    }
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue(allDelivered.await(2, TimeUnit.SECONDS));
+
+                long deadline = System.currentTimeMillis() + 2_000;
+                while ((queue.getHighestDurableSequence() < 1 || window.getInFlightCount() > 0)
+                        && System.currentTimeMillis() < deadline) {
+                    Os.sleep(5);
+                }
+
+                // Both STATUS_OK and DURABLE_ACK processed correctly
+                assertEquals(1, queue.getHighestDurableSequence());
+                assertEquals(0, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testHighestDurableSequenceInitiallyMinusOne() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertEquals(-1, queue.getHighestDurableSequence());
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
     private static void awaitThreadBlocked(Thread thread) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
@@ -375,6 +499,18 @@ public class WebSocketSendQueueTest {
             handler.onBinaryMessage(ptr, payload.length);
         } finally {
             Unsafe.free(ptr, payload.length, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void emitDurableAck(WebSocketFrameHandler handler, long sequence) {
+        WebSocketResponse response = WebSocketResponse.durableAck(sequence);
+        int size = response.serializedSize();
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            response.writeTo(ptr);
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
         }
     }
 
