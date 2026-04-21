@@ -403,7 +403,7 @@ public class QwpColumnBatch {
         if (wt == QwpConstants.TYPE_BOOLEAN) return getBool(col, row);
         if (wt == QwpConstants.TYPE_FLOAT) return getFloat(col, row);
         if (wt == QwpConstants.TYPE_DOUBLE) return getDouble(col, row);
-        if (wt == QwpConstants.TYPE_STRING || wt == QwpConstants.TYPE_SYMBOL) return getString(col, row);
+        if (wt == QwpConstants.TYPE_SYMBOL) return getString(col, row);
         if (wt == QwpConstants.TYPE_VARCHAR) return getVarchar(col, row);
         if (wt == QwpConstants.TYPE_UUID || wt == QwpConstants.TYPE_DECIMAL128
                 || wt == QwpConstants.TYPE_LONG256 || wt == QwpConstants.TYPE_DECIMAL256) {
@@ -562,7 +562,7 @@ public class QwpColumnBatch {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         byte wt = l.info.wireType;
         int denseIdx = l.denseIndex(row);
-        if (wt == QwpConstants.TYPE_STRING || wt == QwpConstants.TYPE_VARCHAR) {
+        if (wt == QwpConstants.TYPE_VARCHAR) {
             int startOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * denseIdx);
             int endOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * (denseIdx + 1));
             return view.of(l.stringBytesAddr + startOff, l.stringBytesAddr + endOff);

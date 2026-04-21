@@ -584,9 +584,8 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             layout.info.scale = Unsafe.getUnsafe().getByte(p++) & 0xFF;
             return advanceFixed(layout, p, limit, 32);
         }
-        if (wt == QwpConstants.TYPE_STRING || wt == QwpConstants.TYPE_VARCHAR
-                || wt == QwpConstants.TYPE_BINARY) {
-            // STRING/VARCHAR/BINARY all share the (N+1) x uint32 offsets + concatenated bytes layout.
+        if (wt == QwpConstants.TYPE_VARCHAR || wt == QwpConstants.TYPE_BINARY) {
+            // VARCHAR/BINARY share the (N+1) x uint32 offsets + concatenated bytes layout.
             // BINARY differs only in that the bytes are opaque (no UTF-8 contract).
             return parseStringColumn(layout, p, limit);
         }

@@ -461,10 +461,10 @@ public class QwpResultBatchDecoderHardeningTest {
         p = putVarint(p, 1L);                         // column_count
         p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
         p = putVarint(p, 0L);                         // schema_id
-        // Schema entries (full): one column "s" of TYPE_STRING
+        // Schema entries (full): one column "s" of TYPE_VARCHAR
         p = putVarint(p, 1L);                         // column name length
         p = putByte(p, (byte) 's');
-        p = putByte(p, QwpConstants.TYPE_STRING);
+        p = putByte(p, QwpConstants.TYPE_VARCHAR);
         // Column body: null_flag = 0 (no nulls), offsets[nonNull+1] u32, then bytes.
         p = putByte(p, (byte) 0);                     // null_flag
         for (int i = 0; i < nonNull; i++) {

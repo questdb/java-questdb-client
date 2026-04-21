@@ -84,7 +84,7 @@ public class TypedResultExample {
             out.append(batch.getFloat(col, row));
         } else if (type == QwpConstants.TYPE_DOUBLE) {
             out.append(batch.getDouble(col, row));
-        } else if (type == QwpConstants.TYPE_STRING || type == QwpConstants.TYPE_SYMBOL) {
+        } else if (type == QwpConstants.TYPE_SYMBOL) {
             out.append(batch.getString(col, row));
         } else if (type == QwpConstants.TYPE_VARCHAR) {
             out.append(new String(batch.getVarchar(col, row)));
