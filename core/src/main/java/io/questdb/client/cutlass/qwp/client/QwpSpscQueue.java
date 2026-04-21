@@ -70,25 +70,6 @@ public final class QwpSpscQueue<T> {
     }
 
     /**
-     * Drops any queued items and wakes the consumer if it is currently parked.
-     * Safe to call concurrently with poll/take only if the caller is the
-     * producer; otherwise external synchronisation is required.
-     */
-    public void clearAndWakeConsumer() {
-        long h = head;
-        long t = tail;
-        while (t < h) {
-            slots[(int) (t & mask)] = null;
-            t++;
-        }
-        tail = t;
-        Thread consumer = consumerThread;
-        if (consumer != null) {
-            LockSupport.unpark(consumer);
-        }
-    }
-
-    /**
      * Publishes {@code value} to the consumer. Returns {@code false} when the
      * ring is full (caller may retry or spin externally). Never blocks.
      */

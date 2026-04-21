@@ -512,8 +512,13 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         layout.arrayRowAddr = ensureLongArray(layout.arrayRowAddr, rowCount);
         layout.arrayRowLen = ensureIntArray(layout.arrayRowLen, rowCount);
         layout.valuesAddr = p;
+        // Hoist the no-nulls discriminator out of the per-row loop -- when the
+        // column has no nulls in this batch, every row is non-null and the
+        // null-skip branch is dead.
+        boolean noNulls = layout.nullBitmapAddr == 0;
+        int[] nonNullIdx = layout.nonNullIdx;
         for (int i = 0; i < rowCount; i++) {
-            if (layout.nonNullIdx[i] < 0) {
+            if (!noNulls && nonNullIdx[i] < 0) {
                 layout.arrayRowAddr[i] = 0;
                 layout.arrayRowLen[i] = 0;
                 continue;
@@ -668,16 +673,25 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     private long parseNullSection(QwpColumnLayout layout, int rowCount, long p, long limit) throws QwpDecodeException {
         if (p >= limit) throw new QwpDecodeException("truncated null flag");
         byte flag = Unsafe.getUnsafe().getByte(p++);
-        layout.nonNullIdx = ensureIntArray(layout.nonNullIdx, rowCount);
         if (flag == 0) {
+            // No nulls in this column -- skip the per-row "nonNullIdx[i] = i"
+            // array fill entirely. Accessors detect the no-nulls case via
+            // {@code nullBitmapAddr == 0} and treat dense-index == row directly
+            // (see {@link QwpColumnLayout#denseIndex}), so the array is unread
+            // on this path. For a 16K-row x 100-column wide result this saves
+            // 1.6M trivial assignments per batch. nonNullIdx is nulled so a
+            // raw-API caller of {@code QwpColumnBatch.nonNullIndex(col)} can
+            // distinguish "needs identity-fill" from "fully populated by a
+            // prior with-nulls batch"; that path lazy-materialises on demand.
             layout.nullBitmapAddr = 0;
+            layout.nonNullIdx = null;
             layout.nonNullCount = rowCount;
-            for (int i = 0; i < rowCount; i++) layout.nonNullIdx[i] = i;
             return p;
         }
         int bitmapBytes = (rowCount + 7) >>> 3;
         if (p + bitmapBytes > limit) throw new QwpDecodeException("truncated null bitmap");
         layout.nullBitmapAddr = p;
+        layout.nonNullIdx = ensureIntArray(layout.nonNullIdx, rowCount);
         int denseIdx = 0;
         for (int i = 0; i < rowCount; i++) {
             int bi = i >>> 3;
@@ -732,9 +746,13 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         layout.symbolDictSize = dictSize;
         // Materialise per-row IDs into int[rowCount] so random access is O(1).
         layout.symbolRowIds = ensureIntArray(layout.symbolRowIds, rowCount);
+        // Hoist the no-nulls discriminator out of the per-row loop -- when the
+        // column has no nulls in this batch, every row carries an id and the
+        // null-skip branch is dead.
+        boolean noNulls = layout.nullBitmapAddr == 0;
+        int[] nonNullIdx = layout.nonNullIdx;
         for (int i = 0; i < rowCount; i++) {
-            int denseIdx = layout.nonNullIdx[i];
-            if (denseIdx < 0) continue; // NULL row; leave slot stale
+            if (!noNulls && nonNullIdx[i] < 0) continue; // NULL row; leave slot stale
             decodeVarint(p, limit);
             p = varintPos;
             int id = (int) varintValue;

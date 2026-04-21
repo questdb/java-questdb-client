@@ -118,7 +118,7 @@ public class QwpColumnBatch {
     public boolean getBool(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return false;
-        int denseIdx = l.nonNullIdx[row];
+        int denseIdx = l.denseIndex(row);
         // Bit-packed: 8 values per byte, LSB-first
         byte b = Unsafe.getUnsafe().getByte(l.valuesAddr + (denseIdx >>> 3));
         return (b & (1 << (denseIdx & 7))) != 0;
@@ -131,7 +131,7 @@ public class QwpColumnBatch {
     public byte getByteValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0;
-        return Unsafe.getUnsafe().getByte(l.valuesAddr + l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getByte(l.valuesAddr + l.denseIndex(row));
     }
 
     /**
@@ -140,7 +140,7 @@ public class QwpColumnBatch {
     public char getCharValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0;
-        return (char) Unsafe.getUnsafe().getShort(l.valuesAddr + 2L * l.nonNullIdx[row]);
+        return (char) Unsafe.getUnsafe().getShort(l.valuesAddr + 2L * l.denseIndex(row));
     }
 
     public int getColumnCount() {
@@ -161,7 +161,7 @@ public class QwpColumnBatch {
     public long getDecimal128High(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
-        return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.nonNullIdx[row] + 8L);
+        return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.denseIndex(row) + 8L);
     }
 
     /**
@@ -170,7 +170,7 @@ public class QwpColumnBatch {
     public long getDecimal128Low(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
-        return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.denseIndex(row));
     }
 
     public int getDecimalScale(int col) {
@@ -180,7 +180,7 @@ public class QwpColumnBatch {
     public double getDouble(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return Double.NaN;
-        return Unsafe.getUnsafe().getDouble(l.valuesAddr + 8L * l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getDouble(l.valuesAddr + 8L * l.denseIndex(row));
     }
 
     /**
@@ -209,7 +209,7 @@ public class QwpColumnBatch {
     public float getFloat(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return Float.NaN;
-        return Unsafe.getUnsafe().getFloat(l.valuesAddr + 4L * l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getFloat(l.valuesAddr + 4L * l.denseIndex(row));
     }
 
     public int getGeohashPrecisionBits(int col) {
@@ -223,7 +223,7 @@ public class QwpColumnBatch {
     public int getIntValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0;
-        return Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * l.denseIndex(row));
     }
 
     /**
@@ -238,7 +238,7 @@ public class QwpColumnBatch {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
         byte wt = l.info.wireType;
-        int denseIdx = l.nonNullIdx[row];
+        int denseIdx = l.denseIndex(row);
         if (wt == QwpConstants.TYPE_LONG || wt == QwpConstants.TYPE_DATE
                 || wt == QwpConstants.TYPE_TIMESTAMP || wt == QwpConstants.TYPE_TIMESTAMP_NANOS
                 || wt == QwpConstants.TYPE_DECIMAL64) {
@@ -274,7 +274,7 @@ public class QwpColumnBatch {
     public long getLong256Word(int col, int row, int wordIndex) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
-        return Unsafe.getUnsafe().getLong(l.valuesAddr + 32L * l.nonNullIdx[row] + 8L * wordIndex);
+        return Unsafe.getUnsafe().getLong(l.valuesAddr + 32L * l.denseIndex(row) + 8L * wordIndex);
     }
 
     // Raw column-address API -- for zero-branch hot inner loops.
@@ -299,7 +299,7 @@ public class QwpColumnBatch {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return null;
         byte wt = l.info.wireType;
-        int denseIdx = l.nonNullIdx[row];
+        int denseIdx = l.denseIndex(row);
         if (wt == QwpConstants.TYPE_UUID || wt == QwpConstants.TYPE_DECIMAL128) {
             long base = l.valuesAddr + 16L * denseIdx;
             return new long[]{Unsafe.getUnsafe().getLong(base), Unsafe.getUnsafe().getLong(base + 8)};
@@ -324,7 +324,7 @@ public class QwpColumnBatch {
     public long getLongValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
-        return Unsafe.getUnsafe().getLong(l.valuesAddr + 8L * l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getLong(l.valuesAddr + 8L * l.denseIndex(row));
     }
 
     public int getRowCount() {
@@ -337,7 +337,7 @@ public class QwpColumnBatch {
     public short getShortValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0;
-        return Unsafe.getUnsafe().getShort(l.valuesAddr + 2L * l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getShort(l.valuesAddr + 2L * l.denseIndex(row));
     }
 
     /**
@@ -379,7 +379,7 @@ public class QwpColumnBatch {
     public long getUuidHi(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
-        return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.nonNullIdx[row] + 8L);
+        return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.denseIndex(row) + 8L);
     }
 
     /**
@@ -388,7 +388,7 @@ public class QwpColumnBatch {
     public long getUuidLo(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
-        return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.nonNullIdx[row]);
+        return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.denseIndex(row));
     }
 
     /**
@@ -468,9 +468,23 @@ public class QwpColumnBatch {
      * column's non-null values, or -1 if the row is NULL. Array length equals
      * {@link #getRowCount()}. Valid only during the current {@code onBatch}
      * callback; do not retain.
+     * <p>
+     * For columns with no nulls in this batch the decoder skips populating
+     * this array (saves O(rowCount * columnCount) per batch on the typical
+     * no-nulls hot path). This accessor lazy-materialises an identity mapping
+     * on demand for raw-API callers; the result is cached on the layout so
+     * repeated calls within the same batch reuse the allocation. The typed
+     * accessors ({@link #getLong}, {@link #getDouble}, etc.) avoid this
+     * allocation entirely via {@link QwpColumnLayout#denseIndex}.
      */
     public int[] nonNullIndex(int col) {
-        return columnLayouts.getQuick(col).nonNullIdx;
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (l.nullBitmapAddr == 0 && l.nonNullIdx == null) {
+            int[] arr = new int[rowCount];
+            for (int i = 0; i < rowCount; i++) arr[i] = i;
+            l.nonNullIdx = arr;
+        }
+        return l.nonNullIdx;
     }
 
     /**
@@ -532,7 +546,7 @@ public class QwpColumnBatch {
         if (isNull(col, row)) return null;
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (l.info.wireType != QwpConstants.TYPE_BINARY) return null;
-        int denseIdx = l.nonNullIdx[row];
+        int denseIdx = l.denseIndex(row);
         int startOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * denseIdx);
         int endOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * (denseIdx + 1));
         return view.of(l.stringBytesAddr + startOff, endOff - startOff);
@@ -547,7 +561,7 @@ public class QwpColumnBatch {
         if (isNull(col, row)) return null;
         QwpColumnLayout l = columnLayouts.getQuick(col);
         byte wt = l.info.wireType;
-        int denseIdx = l.nonNullIdx[row];
+        int denseIdx = l.denseIndex(row);
         if (wt == QwpConstants.TYPE_STRING || wt == QwpConstants.TYPE_VARCHAR) {
             int startOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * denseIdx);
             int endOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * (denseIdx + 1));

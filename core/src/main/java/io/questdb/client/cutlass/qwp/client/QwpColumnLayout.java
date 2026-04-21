@@ -117,6 +117,21 @@ public class QwpColumnLayout implements QuietCloseable {
     private long timestampDecodeAddr;
     private int timestampDecodeCapacity;
 
+    /**
+     * Returns the dense index of {@code row} into the non-null values array.
+     * For columns with no nulls in this batch ({@code nullBitmapAddr == 0}),
+     * dense index equals row and {@link #nonNullIdx} is left unread (the
+     * decoder skips the per-row array fill on this path). Otherwise the
+     * pre-computed slot is returned.
+     * <p>
+     * Caller MUST have null-checked the cell first via the surrounding
+     * {@code isNull} / {@code isLayoutNull} guard -- this method does not
+     * detect null rows on its own.
+     */
+    public int denseIndex(int row) {
+        return nullBitmapAddr == 0 ? row : nonNullIdx[row];
+    }
+
     public void clear() {
         info = null;
         valuesAddr = 0;
