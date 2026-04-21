@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
@@ -34,6 +35,9 @@ import io.questdb.client.std.Zstd;
 import io.questdb.client.std.str.StringSink;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 
 /**
  * QWP egress (query results) client.
@@ -113,6 +117,11 @@ public class QwpQueryClient implements QuietCloseable {
     // hit the timeout branch in under a second instead of spending five.
     @SuppressWarnings("FieldMayBeFinal")
     private volatile long shutdownJoinMs = 5_000;
+    private boolean tlsEnabled;
+    // Only meaningful when tlsEnabled. Default is full validation against the JVM's trust store.
+    private int tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
+    private char[] trustStorePassword;
+    private String trustStorePath;
     private WebSocketClient webSocketClient;
 
     private QwpQueryClient(CharSequence host, int port) {
@@ -126,13 +135,23 @@ public class QwpQueryClient implements QuietCloseable {
      * <p>
      * Supported schemas:
      * <ul>
-     *   <li>{@code ws::} -- plain WebSocket (matches QWP egress today; TLS not yet supported).</li>
+     *   <li>{@code ws::} -- plain WebSocket.</li>
+     *   <li>{@code wss::} -- WebSocket over TLS. See {@code tls_verify} / {@code tls_roots} /
+     *       {@code tls_roots_password} for trust configuration.</li>
      * </ul>
      * Supported keys:
      * <ul>
      *   <li>{@code addr=host[:port]} -- required. Default port is {@value #DEFAULT_WS_PORT}.</li>
      *   <li>{@code path=/read/v1} -- egress endpoint. Default {@value #DEFAULT_ENDPOINT_PATH}.</li>
-     *   <li>{@code auth=<value>} -- sent as the HTTP {@code Authorization} header during the upgrade handshake.</li>
+     *   <li>{@code auth=<value>} -- sent verbatim as the HTTP {@code Authorization} header during the upgrade handshake.
+     *       Mutually exclusive with {@code username}/{@code password} and {@code token}.</li>
+     *   <li>{@code username=<name>;password=<secret>} -- HTTP Basic authentication. Server verifies the credentials
+     *       against the same user store the Postgres wire protocol uses, so a user created via
+     *       {@code CREATE USER ... WITH PASSWORD ...} can log in unchanged.
+     *       Both keys must be present together; mutually exclusive with {@code auth} and {@code token}.</li>
+     *   <li>{@code token=<access_token>} -- HTTP Bearer authentication with an OIDC access token (sent as
+     *       {@code Authorization: Bearer <token>}). Mutually exclusive with {@code auth} and
+     *       {@code username}/{@code password}.</li>
      *   <li>{@code client_id=<id>} -- sent as the {@code X-QWP-Client-Id} header.</li>
      *   <li>{@code buffer_pool_size=N} -- depth of the I/O thread's batch buffer pool. Default 4.</li>
      *   <li>{@code compression=zstd|raw|auto} -- compression codec the client
@@ -141,6 +160,12 @@ public class QwpQueryClient implements QuietCloseable {
      *       when it supports it and falls back to raw otherwise.</li>
      *   <li>{@code compression_level=N} -- zstd level hint, clamped server-side
      *       to [1, 9]. Default 3. Ignored when {@code compression=raw}.</li>
+     *   <li>{@code tls_verify=on|unsafe_off} -- TLS certificate validation. Default is {@code on}.
+     *       Only allowed with the {@code wss::} schema. {@code unsafe_off} disables hostname and
+     *       certificate chain validation; use only for testing.</li>
+     *   <li>{@code tls_roots=<path>} -- path to a custom trust store (PKCS12 or JKS). Must be
+     *       paired with {@code tls_roots_password}. Only allowed with {@code wss::}.</li>
+     *   <li>{@code tls_roots_password=<secret>} -- password for the custom trust store.</li>
      * </ul>
      * Examples:
      * <pre>
@@ -157,18 +182,23 @@ public class QwpQueryClient implements QuietCloseable {
         if (pos < 0) {
             throw new IllegalArgumentException("invalid configuration string: " + sink);
         }
-        if (Chars.equals("wss", sink)) {
-            throw new IllegalArgumentException("wss:: (TLS) is not supported by QwpQueryClient yet");
-        }
-        if (!Chars.equals("ws", sink)) {
+        boolean tls;
+        if (Chars.equals("ws", sink)) {
+            tls = false;
+        } else if (Chars.equals("wss", sink)) {
+            tls = true;
+        } else {
             throw new IllegalArgumentException(
-                    "unsupported schema [schema=" + sink + ", supported-schemas=[ws]]");
+                    "unsupported schema [schema=" + sink + ", supported-schemas=[ws, wss]]");
         }
 
         String addrHost = null;
         int addrPort = DEFAULT_WS_PORT;
         String path = DEFAULT_ENDPOINT_PATH;
         String auth = null;
+        String username = null;
+        String password = null;
+        String token = null;
         String cid = null;
         int poolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
         // Default matches the field initializer in QwpQueryClient: raw wire,
@@ -176,6 +206,10 @@ public class QwpQueryClient implements QuietCloseable {
         String compression = "raw";
         int compressionLevel = 3;
         int maxBatchRows = 0;  // 0 = omit header, server uses its default
+        // TLS validation mode: null means "unset in config". Explicit values kick in only when tls is true.
+        Integer tlsValidation = null;
+        String tlsRoots = null;
+        String tlsRootsPassword = null;
 
         while (ConfStringParser.hasNext(configurationString, pos)) {
             pos = ConfStringParser.nextKey(configurationString, pos, sink);
@@ -208,6 +242,15 @@ public class QwpQueryClient implements QuietCloseable {
                     break;
                 case "auth":
                     auth = value;
+                    break;
+                case "username":
+                    username = value;
+                    break;
+                case "password":
+                    password = value;
+                    break;
+                case "token":
+                    token = value;
                     break;
                 case "client_id":
                     cid = value;
@@ -250,6 +293,22 @@ public class QwpQueryClient implements QuietCloseable {
                                 "max_batch_rows must be in [1, " + MAX_BATCH_ROWS_UPPER_BOUND + "]");
                     }
                     break;
+                case "tls_verify":
+                    if ("on".equals(value)) {
+                        tlsValidation = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
+                    } else if ("unsafe_off".equals(value)) {
+                        tlsValidation = ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE;
+                    } else {
+                        throw new IllegalArgumentException(
+                                "invalid tls_verify: " + value + " (expected on or unsafe_off)");
+                    }
+                    break;
+                case "tls_roots":
+                    tlsRoots = value;
+                    break;
+                case "tls_roots_password":
+                    tlsRootsPassword = value;
+                    break;
                 default:
                     throw new IllegalArgumentException("unknown configuration key: " + key);
             }
@@ -257,11 +316,39 @@ public class QwpQueryClient implements QuietCloseable {
         if (addrHost == null) {
             throw new IllegalArgumentException("missing required key: addr");
         }
+        boolean hasBasic = username != null || password != null;
+        if (hasBasic && (username == null || password == null)) {
+            throw new IllegalArgumentException("both username and password must be provided together");
+        }
+        int authModesSet = (auth != null ? 1 : 0) + (hasBasic ? 1 : 0) + (token != null ? 1 : 0);
+        if (authModesSet > 1) {
+            throw new IllegalArgumentException(
+                    "auth, username/password, and token are mutually exclusive");
+        }
+        if (!tls && (tlsValidation != null || tlsRoots != null || tlsRootsPassword != null)) {
+            throw new IllegalArgumentException(
+                    "tls_verify/tls_roots/tls_roots_password require the wss:: schema");
+        }
+        if ((tlsRoots == null) != (tlsRootsPassword == null)) {
+            throw new IllegalArgumentException(
+                    "tls_roots and tls_roots_password must be provided together");
+        }
         QwpQueryClient client = new QwpQueryClient(addrHost, addrPort)
                 .withEndpointPath(path)
                 .withBufferPoolSize(poolSize)
                 .withCompression(compression, compressionLevel);
+        if (tls) {
+            if (tlsRoots != null) {
+                client.withTrustStore(tlsRoots, tlsRootsPassword.toCharArray());
+            } else if (tlsValidation != null && tlsValidation == ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE) {
+                client.withInsecureTls();
+            } else {
+                client.withTls();
+            }
+        }
         if (auth != null) client.withAuthorization(auth);
+        if (hasBasic) client.withBasicAuth(username, password);
+        if (token != null) client.withBearerToken(token);
         if (cid != null) client.withClientId(cid);
         if (maxBatchRows > 0) client.withMaxBatchRows(maxBatchRows);
         return client;
@@ -355,7 +442,12 @@ public class QwpQueryClient implements QuietCloseable {
         if (connected) {
             return;
         }
-        webSocketClient = WebSocketClientFactory.newPlainTextInstance();
+        if (tlsEnabled) {
+            webSocketClient = WebSocketClientFactory.newTlsInstance(
+                    new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode));
+        } else {
+            webSocketClient = WebSocketClientFactory.newPlainTextInstance();
+        }
         webSocketClient.setQwpMaxVersion(QWP_MAX_VERSION);
         webSocketClient.setQwpClientId(clientId != null ? clientId : defaultClientId());
         webSocketClient.setQwpAcceptEncoding(buildAcceptEncodingHeader());
@@ -473,6 +565,37 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Configures HTTP Basic authentication for the WebSocket upgrade request.
+     * The server verifies the credentials against the same user store the
+     * Postgres wire protocol uses, so a user created via
+     * {@code CREATE USER ... WITH PASSWORD ...} can authenticate here unchanged.
+     * Must be called before {@link #connect}.
+     */
+    public QwpQueryClient withBasicAuth(String username, String password) {
+        if (username == null || password == null) {
+            throw new IllegalArgumentException("username and password must not be null");
+        }
+        String credentials = username + ":" + password;
+        this.authorizationHeader = "Basic " + Base64.getEncoder()
+                .encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+        return this;
+    }
+
+    /**
+     * Configures HTTP Bearer authentication with an OIDC access token for the
+     * WebSocket upgrade request. The server verifies the token via the
+     * configured OIDC provider and resolves the principal (and any groups)
+     * from the token's claims. Must be called before {@link #connect}.
+     */
+    public QwpQueryClient withBearerToken(String token) {
+        if (token == null) {
+            throw new IllegalArgumentException("token must not be null");
+        }
+        this.authorizationHeader = "Bearer " + token;
+        return this;
+    }
+
+    /**
      * Overrides the default I/O buffer pool depth (4). Larger pools let the
      * I/O thread decode further ahead of the consumer at the cost of memory;
      * smaller pools reduce memory but may stall the I/O thread on slow consumers.
@@ -535,6 +658,19 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Enables TLS with certificate validation disabled. Intended for testing only --
+     * production code should use {@link #withTls} or {@link #withTrustStore}.
+     * Must be called before {@link #connect}.
+     */
+    public QwpQueryClient withInsecureTls() {
+        this.tlsEnabled = true;
+        this.tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE;
+        this.trustStorePath = null;
+        this.trustStorePassword = null;
+        return this;
+    }
+
+    /**
      * Asks the server to cap each {@code RESULT_BATCH} at {@code rows} rows.
      * Useful for latency-sensitive streaming consumers that want to start
      * processing the first row as soon as possible -- a smaller cap flushes
@@ -551,6 +687,36 @@ public class QwpQueryClient implements QuietCloseable {
                     "max_batch_rows must be in [1, " + MAX_BATCH_ROWS_UPPER_BOUND + "]");
         }
         this.maxBatchRows = rows;
+        return this;
+    }
+
+    /**
+     * Enables TLS with full certificate validation against the JVM's default trust store.
+     * Must be called before {@link #connect}.
+     */
+    public QwpQueryClient withTls() {
+        this.tlsEnabled = true;
+        this.tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
+        this.trustStorePath = null;
+        this.trustStorePassword = null;
+        return this;
+    }
+
+    /**
+     * Enables TLS with full certificate validation against the given custom trust store.
+     * Must be called before {@link #connect}.
+     *
+     * @param trustStorePath     filesystem path to a PKCS12 or JKS trust store
+     * @param trustStorePassword password for the trust store
+     */
+    public QwpQueryClient withTrustStore(String trustStorePath, char[] trustStorePassword) {
+        if (trustStorePath == null || trustStorePassword == null) {
+            throw new IllegalArgumentException("trustStorePath and trustStorePassword must not be null");
+        }
+        this.tlsEnabled = true;
+        this.tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
+        this.trustStorePath = trustStorePath;
+        this.trustStorePassword = trustStorePassword;
         return this;
     }
 
