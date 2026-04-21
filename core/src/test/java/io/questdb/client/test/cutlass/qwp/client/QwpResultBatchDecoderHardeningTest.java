@@ -238,22 +238,25 @@ public class QwpResultBatchDecoderHardeningTest {
         });
     }
 
-    // -----------------------------------------------------------------------
-    // Wire-format helpers: write a minimal RESULT_BATCH frame to native memory.
-    // Layout (matches QwpResultBatchDecoder.decodePayload + parseStringColumn):
-    //   header (12 bytes)
-    //   msg_kind (0x11)
-    //   request_id (8 bytes)
-    //   batch_seq (varint)
-    //   table-block:
-    //     name_len (varint), name bytes (none)
-    //     row_count (varint)
-    //     column_count (varint)
-    //     schema_mode (1 byte) + schema_id (varint)
-    //     [if FULL] per column: name_len varint, name bytes, wire_type byte
-    //     per column: null_flag byte (+optional bitmap), then column body
-    // -----------------------------------------------------------------------
-
+    /**
+     * Writes a single byte and returns the advanced position. Part of the
+     * wire-format helper set used to hand-craft a minimal RESULT_BATCH frame
+     * in native memory, matching {@code QwpResultBatchDecoder.decodePayload +
+     * parseStringColumn}:
+     * <pre>
+     *   header (12 bytes)
+     *   msg_kind (0x11)
+     *   request_id (8 bytes)
+     *   batch_seq (varint)
+     *   table-block:
+     *     name_len (varint), name bytes (none)
+     *     row_count (varint)
+     *     column_count (varint)
+     *     schema_mode (1 byte) + schema_id (varint)
+     *     [if FULL] per column: name_len varint, name bytes, wire_type byte
+     *     per column: null_flag byte (+optional bitmap), then column body
+     * </pre>
+     */
     private static long putByte(long p, byte v) {
         Unsafe.getUnsafe().putByte(p, v);
         return p + 1;
