@@ -70,6 +70,17 @@ public final class QwpConstants {
      */
     public static final int MAX_COLUMNS_PER_TABLE = 2048;
     /**
+     * Maximum column name length in bytes. Mirrors the server's same-named
+     * constant so the decoder can reject hostile or malformed wire bytes that
+     * advertise an oversized name length.
+     */
+    public static final int MAX_COLUMN_NAME_LENGTH = 127;
+    /**
+     * Maximum table name length in bytes. Mirrors the server's same-named
+     * constant; used by the decoder to reject malformed wire bytes.
+     */
+    public static final int MAX_TABLE_NAME_LENGTH = 127;
+    /**
      * Schema mode: Full schema included.
      */
     public static final byte SCHEMA_MODE_FULL = 0x00;

@@ -46,4 +46,19 @@ public final class Zstd {
     public static native long decompress(long ctx, long srcAddr, long srcLen, long dstAddr, long dstCap);
 
     public static native void freeDCtx(long ptr);
+
+    /**
+     * Returns the decompressed size declared in the zstd frame header at
+     * {@code srcAddr} (length {@code srcLen}). Allows the caller to size the
+     * destination buffer in a single allocation instead of retrying on
+     * dst-too-small.
+     * <ul>
+     *   <li>positive: declared content size in bytes</li>
+     *   <li>{@code -1}: frame valid but content size not stored
+     *       (ZSTD_CONTENTSIZE_UNKNOWN; the encoder disabled the size flag)</li>
+     *   <li>{@code -2}: invalid frame, truncated header, or size exceeds
+     *       {@link Long#MAX_VALUE}</li>
+     * </ul>
+     */
+    public static native long getFrameContentSize(long srcAddr, long srcLen);
 }

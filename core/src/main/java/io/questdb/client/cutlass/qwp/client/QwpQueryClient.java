@@ -93,13 +93,6 @@ public class QwpQueryClient implements QuietCloseable {
     // payload before it parks, and the client auto-replenishes by the size of
     // each batch as the user releases it.
     private long initialCreditBytes;
-    // Client preference for server-side per-batch row cap. 0 means "unset",
-    // server uses its default. Set via {@code max_batch_rows=N} in the
-    // connection string or {@link #withMaxBatchRows}. Smaller values give
-    // streaming consumers earlier access to the first rows at the cost of
-    // more per-batch overhead; larger values amortise fixed costs over more
-    // rows. Server may clamp down to its own hard cap.
-    private int maxBatchRows;
     // Volatile so a cancel() call from a thread other than the one that ran
     // connect() sees the published reference (and a concurrent null-out from
     // close() is observed without a stale-reference race). The thread-safety
@@ -107,6 +100,13 @@ public class QwpQueryClient implements QuietCloseable {
     private volatile QwpEgressIoThread ioThread;
     private Thread ioThreadHandle;
     private boolean lastCloseTimedOut;
+    // Client preference for server-side per-batch row cap. 0 means "unset",
+    // server uses its default. Set via {@code max_batch_rows=N} in the
+    // connection string or {@link #withMaxBatchRows}. Smaller values give
+    // streaming consumers earlier access to the first rows at the cost of
+    // more per-batch overhead; larger values amortise fixed costs over more
+    // rows. Server may clamp down to its own hard cap.
+    private int maxBatchRows;
     private int negotiatedQwpVersion;
     private long nextRequestId = 1;
     // Maximum time close() will wait for the I/O thread to exit before giving up
@@ -388,6 +388,17 @@ public class QwpQueryClient implements QuietCloseable {
      * resources leak for the lifetime of the process. A warning is recorded by setting
      * {@link #lastCloseTimedOut} (queryable via {@link #wasLastCloseTimedOut}) so callers
      * can detect and report the condition.
+     * <p>
+     * <strong>Threading contract:</strong> {@code close()} must be called from a thread
+     * other than the one currently inside a batch handler, AND the user must finish
+     * any in-flight {@code execute()} before calling {@code close()}. Calling
+     * {@code close()} concurrently with a {@code handler.onBatch(...)} that is still
+     * dereferencing batch column pointers can free the WebSocket recv buffer under
+     * those pointers and SIGSEGV the JVM. The interrupt-driven I/O thread shutdown
+     * does NOT detect or wait for a still-running user handler -- the timeout-based
+     * leak fallback only protects against an unresponsive I/O thread, not an
+     * unresponsive user thread. {@link #cancel()} is the right way to ask an
+     * in-flight {@code execute()} to return; close after it does.
      */
     @Override
     public void close() {
@@ -747,11 +758,9 @@ public class QwpQueryClient implements QuietCloseable {
      * the caller doesn't inherit a half-open socket.
      */
     private void probeZstdAvailable() {
+        long dctx;
         try {
-            long dctx = Zstd.createDCtx();
-            if (dctx != 0) {
-                Zstd.freeDCtx(dctx);
-            }
+            dctx = Zstd.createDCtx();
         } catch (UnsatisfiedLinkError e) {
             LOG.error("zstd JNI symbols missing from libquestdb; aborting connect", e);
             if (webSocketClient != null) {
@@ -764,5 +773,20 @@ public class QwpQueryClient implements QuietCloseable {
                     + "compression=raw on the connection string to skip the probe. "
                     + "[cause=" + e.getMessage() + "]");
         }
+        if (dctx == 0) {
+            // Native createDCtx returned 0 -- the underlying ZSTD_createDCtx failed
+            // (typically allocator pressure). Don't proceed: a connection that
+            // negotiated zstd but cannot decode it would surface as a confusing
+            // mid-stream decode error on the first compressed batch instead.
+            LOG.error("zstd createDCtx returned 0 (native allocation failure); aborting connect");
+            if (webSocketClient != null) {
+                webSocketClient.close();
+                webSocketClient = null;
+            }
+            throw new HttpClientException("zstd decompression context allocation failed; "
+                    + "cannot accept compressed batches. Set compression=raw on the connection "
+                    + "string to disable compression, or retry once memory pressure subsides.");
+        }
+        Zstd.freeDCtx(dctx);
     }
 }

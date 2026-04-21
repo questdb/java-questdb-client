@@ -43,6 +43,41 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Zstd_createDCtx(
     return (jlong) (uintptr_t) ZSTD_createDCtx();
 }
 
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Zstd_getFrameContentSize(
+        JNIEnv *env, jclass cls,
+        jlong src_addr, jlong src_len) {
+    /*
+     * Peeks the zstd frame header at src_addr to recover the declared
+     * uncompressed size. Returns:
+     *   positive  -- declared content size in bytes
+     *        -1   -- frame valid, content size not stored (ZSTD_CONTENTSIZE_UNKNOWN)
+     *        -2   -- invalid frame, truncated header, or size > INT64_MAX
+     *
+     * Lets the Java caller size the destination buffer in a single allocation
+     * instead of retrying decompress on dst-too-small. Crucially, it also lets
+     * a corrupt frame fail BEFORE any output buffer growth, eliminating a
+     * memory-amplification vector where one bad frame would have driven
+     * scratch growth all the way to the 64 MiB cap.
+     */
+    if (src_len < 0 || (src_len > 0 && src_addr == 0)) {
+        return -2;
+    }
+    unsigned long long size = ZSTD_getFrameContentSize(
+            (const void *) (uintptr_t) src_addr, (size_t) src_len);
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        return -1;
+    }
+    if (size == ZSTD_CONTENTSIZE_ERROR) {
+        return -2;
+    }
+    if (size > (unsigned long long) INT64_MAX) {
+        /* Cast to jlong would wrap to negative and look like an error code;
+         * reject upfront so the caller doesn't double-interpret. */
+        return -2;
+    }
+    return (jlong) size;
+}
+
 JNIEXPORT void JNICALL Java_io_questdb_client_std_Zstd_freeDCtx(
         JNIEnv *env, jclass cls, jlong ptr) {
     if (ptr != 0) {

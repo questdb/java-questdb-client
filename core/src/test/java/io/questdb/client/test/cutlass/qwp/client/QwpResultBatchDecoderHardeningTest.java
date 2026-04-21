@@ -239,6 +239,82 @@ public class QwpResultBatchDecoderHardeningTest {
     }
 
     /**
+     * Regression for CR-3: the table {@code name_len} varint must reject
+     * negative-when-cast values (10-byte varint with bit 63 set on the final
+     * data byte). Without the fix, the bound check {@code p + nameLen > limit}
+     * passes (negative addend wraps {@code p} below {@code limit}), the
+     * decoder advances {@code p} backwards, and the next decode reads garbage
+     * from already-consumed bytes -- silent corruption rather than a clean
+     * rejection.
+     */
+    @Test
+    public void testTableNameLengthOverflowVarintIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int len = writeMinimalResultBatchWithRawNameLenVarint(staging,
+                        // 10-byte varint encoding 0x8000_0000_0000_0000 (Long.MIN_VALUE).
+                        // Each 0x80 byte sets the continuation bit and contributes
+                        // 7 zero data bits; the final 0x01 byte sets bit 63.
+                        new byte[]{
+                                (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80,
+                                (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x01
+                        });
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject negative-when-cast nameLen");
+                } catch (QwpDecodeException expected) {
+                    String msg = expected.getMessage();
+                    Assert.assertTrue("error must blame varint overflow or table name length: " + msg,
+                            msg.contains("varint overflow") || msg.contains("table name length"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
+     * Regression for CR-2: a RESULT_BATCH frame with FLAG_ZSTD set and a body
+     * that is not a valid zstd frame must be rejected via the up-front
+     * frame-header check, NOT by the old grow-the-scratch-and-retry loop. The
+     * old code would double the scratch up to the 64 MiB cap on any negative
+     * decompress return -- a single corrupt frame caused ~127 MiB of native
+     * malloc/free churn and pinned 64 MiB resident for the rest of the
+     * connection. The fix reads ZSTD_getFrameContentSize before allocating
+     * anything; an invalid frame returns -2 and the decoder throws.
+     */
+    @Test
+    public void testZstdCorruptBodyIsRejectedBeforeScratchGrowth() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int len = writeResultBatchWithCorruptZstdBody(staging);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject corrupt zstd frame");
+                } catch (QwpDecodeException expected) {
+                    String msg = expected.getMessage();
+                    Assert.assertTrue("error must blame the frame header (rejected before decompress): " + msg,
+                            msg.contains("frame header") || msg.contains("frame missing"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
      * Writes a single byte and returns the advanced position. Part of the
      * wire-format helper set used to hand-craft a minimal RESULT_BATCH frame
      * in native memory, matching {@code QwpResultBatchDecoder.decodePayload +
@@ -301,6 +377,26 @@ public class QwpResultBatchDecoderHardeningTest {
     }
 
     /**
+     * Variant of {@link #writeMinimalResultBatch} that injects a raw varint
+     * sequence for the table {@code name_len} field. Used by the CR-3
+     * regression test to drive the negative-nameLen bound-check bypass.
+     */
+    private static int writeMinimalResultBatchWithRawNameLenVarint(long buf, byte[] nameLenVarint) {
+        long p = buf;
+        p = putInt(p, QwpConstants.MAGIC_MESSAGE);
+        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, (byte) 0);
+        p = putByte(p, (byte) 0);
+        p = putByte(p, (byte) 1);
+        p = putInt(p, 0);
+        p = putByte(p, (byte) 0x11);
+        p = putLong(p, 1L);
+        p = putVarint(p, 0L);                         // batch_seq
+        for (byte b : nameLenVarint) p = putByte(p, b);
+        return (int) (p - buf);
+    }
+
+    /**
      * Variant that writes a custom raw varint sequence for schema_id. Lets us
      * inject a multi-byte varint that decodes to a value with the int sign bit
      * set after long-to-int truncation.
@@ -321,6 +417,28 @@ public class QwpResultBatchDecoderHardeningTest {
         p = putVarint(p, 0L);
         p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
         for (byte b : schemaIdVarint) p = putByte(p, b);
+        return (int) (p - buf);
+    }
+
+    /**
+     * Crafts a RESULT_BATCH frame whose flags byte advertises FLAG_ZSTD but
+     * whose body is junk (not a valid zstd frame). Used by
+     * {@link #testZstdCorruptBodyIsRejectedBeforeScratchGrowth}.
+     */
+    private static int writeResultBatchWithCorruptZstdBody(long buf) {
+        long p = buf;
+        p = putInt(p, QwpConstants.MAGIC_MESSAGE);
+        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.FLAG_ZSTD);       // flags byte (offset 5) -- FLAG_ZSTD set
+        p = putByte(p, (byte) 0);
+        p = putByte(p, (byte) 1);
+        p = putInt(p, 0);
+        p = putByte(p, (byte) 0x11);                  // msg_kind = RESULT_BATCH
+        p = putLong(p, 1L);                           // request_id
+        p = putVarint(p, 0L);                         // batch_seq
+        // Following bytes claim to be a zstd frame but aren't -- not the magic
+        // (0x28 0xB5 0x2F 0xFD), no header, just a few junk bytes.
+        for (int i = 0; i < 16; i++) p = putByte(p, (byte) (0xAA ^ i));
         return (int) (p - buf);
     }
 

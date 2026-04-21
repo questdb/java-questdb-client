@@ -284,29 +284,55 @@ public class QwpResultBatchDecoder implements QuietCloseable {
                     throw new QwpDecodeException("failed to allocate zstd decompression context");
                 }
             }
-            // Try the current scratch; on dst-too-small, grow once up to a hard
-            // cap. The cap exists so that a corrupted or hostile frame advertising
-            // a huge content size cannot be used to trigger unbounded allocation.
+            // Read the declared content size from the frame header BEFORE any
+            // allocation. This both lets us size the scratch in a single malloc
+            // (no decompress-fail-grow-retry loop) and -- crucially -- rejects
+            // corrupt or truncated frames upfront. Without the up-front check,
+            // a single hostile or malformed frame would have driven scratch
+            // doubling all the way to MAX_SCRATCH (~127 MiB of malloc/free
+            // churn per bad frame, plus 64 MiB pinned for the connection's
+            // lifetime).
             final int MAX_SCRATCH = 64 * 1024 * 1024;
-            if (decompressScratchCapacity == 0) {
-                decompressScratchCapacity = 1024 * 1024;
-                decompressScratchAddr = Unsafe.malloc(decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
+            final int MIN_SCRATCH = 1024 * 1024;
+            long expectedSize = Zstd.getFrameContentSize(p, srcLen);
+            if (expectedSize == -2) {
+                throw new QwpDecodeException("invalid zstd frame header (truncated, bad magic, or content size > Long.MAX_VALUE)");
+            }
+            if (expectedSize == -1) {
+                // The server's encoder leaves ZSTD_c_contentSizeFlag at its
+                // default (on), so every frame it produces declares content
+                // size. An "unknown" reading is therefore a protocol violation
+                // -- refuse rather than guess a buffer size and reopen the
+                // amplification window.
+                throw new QwpDecodeException("zstd frame missing content size (protocol violation)");
+            }
+            if (expectedSize > MAX_SCRATCH) {
+                throw new QwpDecodeException("zstd frame content size " + expectedSize
+                        + " exceeds client cap " + MAX_SCRATCH);
+            }
+            if (decompressScratchCapacity < expectedSize) {
+                long newCap = Math.max((long) decompressScratchCapacity * 2L, expectedSize);
+                if (newCap < MIN_SCRATCH) newCap = MIN_SCRATCH;
+                if (newCap > MAX_SCRATCH) newCap = MAX_SCRATCH;
+                // Reset to 0 before free + malloc so a throwing malloc cannot
+                // leave a dangling address + non-zero capacity behind; the next
+                // decode would otherwise skip the first-alloc branch and
+                // use-after-free.
+                if (decompressScratchAddr != 0) {
+                    Unsafe.free(decompressScratchAddr, decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
+                    decompressScratchAddr = 0;
+                    decompressScratchCapacity = 0;
+                }
+                decompressScratchAddr = Unsafe.malloc(newCap, MemoryTag.NATIVE_DEFAULT);
+                decompressScratchCapacity = (int) newCap;
             }
             long decLen = Zstd.decompress(dctx, p, srcLen, decompressScratchAddr, decompressScratchCapacity);
-            while (decLen < 0 && decompressScratchCapacity < MAX_SCRATCH) {
-                int newCap = Math.min(decompressScratchCapacity * 2, MAX_SCRATCH);
-                // Reset to 0 before free + malloc so a throwing malloc cannot leave
-                // a dangling address + non-zero capacity behind; the next decode
-                // would otherwise skip the first-alloc branch and use-after-free.
-                Unsafe.free(decompressScratchAddr, decompressScratchCapacity, MemoryTag.NATIVE_DEFAULT);
-                decompressScratchAddr = 0;
-                decompressScratchCapacity = 0;
-                decompressScratchAddr = Unsafe.malloc(newCap, MemoryTag.NATIVE_DEFAULT);
-                decompressScratchCapacity = newCap;
-                decLen = Zstd.decompress(dctx, p, srcLen, decompressScratchAddr, decompressScratchCapacity);
-            }
             if (decLen < 0) {
                 throw new QwpDecodeException("zstd decompression failed [code=" + (-decLen) + "]");
+            }
+            if (decLen != expectedSize) {
+                throw new QwpDecodeException("zstd decompressed size " + decLen
+                        + " does not match frame content size " + expectedSize);
             }
             p = decompressScratchAddr;
             limit = decompressScratchAddr + decLen;
@@ -324,6 +350,11 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         decodeVarint(p, limit);
         long nameLen = varintValue;
         p = varintPos;
+        // Negative nameLen would make p + nameLen wrap below the bound check
+        // and let the next decode rewind into already-consumed bytes.
+        if (nameLen < 0 || nameLen > QwpConstants.MAX_TABLE_NAME_LENGTH) {
+            throw new QwpDecodeException("table name length out of range: " + nameLen);
+        }
         if (p + nameLen > limit) throw new QwpDecodeException("truncated table name");
         p += nameLen;
 
@@ -362,6 +393,12 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             columns = ensureSchemaSlot(schemaId, columnCount);
             for (int i = 0; i < columnCount; i++) {
                 decodeVarint(p, limit);
+                // Same negative / out-of-range guard as nameLen above; without
+                // it, a hostile colNameLen wraps p + colNameLen below limit
+                // and lets the decoder rewind into already-consumed bytes.
+                if (varintValue < 0 || varintValue > QwpConstants.MAX_COLUMN_NAME_LENGTH) {
+                    throw new QwpDecodeException("column name length out of range: " + varintValue);
+                }
                 int colNameLen = (int) varintValue;
                 p = varintPos;
                 if (p + colNameLen + 1 > limit) throw new QwpDecodeException("truncated column def");
@@ -396,6 +433,13 @@ public class QwpResultBatchDecoder implements QuietCloseable {
      * Decodes a varint starting at {@code p}. Stores the decoded value in
      * {@link #varintValue} and the position just past the varint in
      * {@link #varintPos}. Caller reads both before issuing the next varint call.
+     * <p>
+     * The encoding is the standard 7-bit varint: each byte contributes 7 data
+     * bits and signals continuation via the MSB. With ten data-carrying bytes
+     * the last byte's high data bits would spill past bit 63 of the result --
+     * in Java the {@code <<} operator silently masks the shift count to 6 bits,
+     * which would wrap the high bits back into the low end and produce a value
+     * the caller couldn't tell from a legitimate small one. Reject those.
      */
     private void decodeVarint(long p, long limit) throws QwpDecodeException {
         long value = 0;
@@ -404,6 +448,14 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         while (true) {
             if (cur >= limit) throw new QwpDecodeException("truncated varint");
             byte b = Unsafe.getUnsafe().getByte(cur++);
+            // On byte 10 (shift == 63) only bit 0 of the data nibble can fit
+            // in the result without overflowing bit 63 (the sign bit of long).
+            // Any other data bit on byte 10 means the encoded value would not
+            // round-trip; refuse to claim it decoded successfully. The server
+            // has the same guard in QwpVarint.decodeMultiByte.
+            if (shift == 63 && (b & 0x7E) != 0) {
+                throw new QwpDecodeException("varint overflow");
+            }
             value |= (long) (b & 0x7F) << shift;
             if ((b & 0x80) == 0) break;
             shift += 7;

@@ -85,9 +85,16 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     // Per-query credit state (accessed only from the I/O thread).
     // creditEnabled == (initialCredit > 0); controls whether we emit CREDIT
     // replenish frames after each batch release.
+    // Set true by closePool() before it drains freeBuffers / events, so any
+    // user thread still inside releaseBuffer (or one that returns from onBatch
+    // after close has run) sees closed == true and frees the buffer in place
+    // instead of stranding it in a queue nobody will iterate again.
+    // Volatile because the writer (close-caller thread) and reader (user
+    // thread inside releaseBuffer) are different threads.
+    private volatile boolean closed;
     private boolean creditEnabled;
-    private long currentRequestId = -1L;
     private boolean currentQueryDone;
+    private long currentRequestId = -1L;
     private volatile boolean shutdown;
 
     public QwpEgressIoThread(WebSocketClient wsClient, int bufferPoolSize) {
@@ -97,8 +104,21 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // frame the I/O thread may emit on shutdown, so a full buffer pool
         // never stalls the producer.
         this.events = new QwpSpscQueue<>(bufferPoolSize + 2);
-        for (int i = 0; i < bufferPoolSize; i++) {
-            freeBuffers.offer(new QwpBatchBuffer(DEFAULT_BUFFER_CAPACITY));
+        // Track allocations as we go so a partial-pool failure (e.g. native
+        // OOM at iteration K) frees the K-1 buffers already in freeBuffers.
+        // Without this, the half-built QwpEgressIoThread instance escapes the
+        // failed constructor and is unreachable from QwpQueryClient.close(),
+        // leaking those buffers' native scratches for the JVM's lifetime.
+        try {
+            for (int i = 0; i < bufferPoolSize; i++) {
+                freeBuffers.offer(new QwpBatchBuffer(DEFAULT_BUFFER_CAPACITY));
+            }
+        } catch (Throwable t) {
+            for (QwpBatchBuffer b : freeBuffers) {
+                b.close();
+            }
+            freeBuffers.clear();
+            throw t;
         }
     }
 
@@ -175,6 +195,15 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * compact past the consumed frame.
      */
     public void releaseBuffer(QwpBatchBuffer buffer) {
+        if (closed) {
+            // closePool already drained and cleared freeBuffers; offering this
+            // buffer back into the pool would strand it (no consumer left to
+            // close it). Free its native scratch in place. The pendingRelease
+            // queue is also abandoned -- the I/O thread that would have read
+            // the token is gone.
+            buffer.close();
+            return;
+        }
         freeBuffers.offer(buffer);
         pendingRelease.offer(RELEASE_TOKEN);
     }
@@ -289,13 +318,22 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
 
     /**
      * RESULT_END body: msg_kind(1) + requestId(8) + final_seq(varint) + total_rows(varint).
-     * We only need total_rows.
+     * We only need total_rows. Both varint loops cap at 10 bytes so a hostile
+     * server cannot drive {@code shift} past 63 (where Java's {@code <<} masks
+     * the count to 6 bits and silently wraps high bytes back into the low bits,
+     * producing a wildly wrong total).
      */
     private long decodeResultEnd(long payload, int payloadLen) {
         long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
         long limit = payload + payloadLen;
+        int seqBytes = 0;
         while (p < limit && (Unsafe.getUnsafe().getByte(p++) & 0x80) != 0) {
-            // skip final_seq continuation bytes
+            if (++seqBytes > 9) {
+                // Continuation bit set on byte 10 of the final_seq varint --
+                // malformed. Surface a 0 total rather than read into the
+                // total_rows section with a desynced cursor.
+                return 0L;
+            }
         }
         long total = 0;
         int shift = 0;
@@ -304,6 +342,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             total |= (long) (b & 0x7F) << shift;
             if ((b & 0x80) == 0) break;
             shift += 7;
+            if (shift > 63) {
+                // Same overflow guard decodeAndEmitExecDone uses; without it,
+                // byte 10 of total_rows could land in the sign bit and bytes
+                // 11+ would silently wrap.
+                return 0L;
+            }
         }
         return total;
     }
@@ -394,6 +438,18 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
+     * Builds and transmits a CANCEL frame on the WebSocket. Wire format:
+     * {@code msg_kind(0x14) + request_id(u64)}.
+     */
+    private void sendCancel(long requestId) {
+        sendScratch.reset();
+        sendScratch.putByte(QwpEgressMsgKind.CANCEL);
+        sendScratch.putLong(requestId);
+        wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
+        sendScratch.reset();
+    }
+
+    /**
      * Builds and transmits a CREDIT frame on the WebSocket. Wire format:
      * {@code msg_kind(0x15) + request_id(u64) + additional_bytes(varint)}.
      */
@@ -402,18 +458,6 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         sendScratch.putByte(QwpEgressMsgKind.CREDIT);
         sendScratch.putLong(requestId);
         sendScratch.putVarint(additionalBytes);
-        wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
-        sendScratch.reset();
-    }
-
-    /**
-     * Builds and transmits a CANCEL frame on the WebSocket. Wire format:
-     * {@code msg_kind(0x14) + request_id(u64)}.
-     */
-    private void sendCancel(long requestId) {
-        sendScratch.reset();
-        sendScratch.putByte(QwpEgressMsgKind.CANCEL);
-        sendScratch.putLong(requestId);
         wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
         sendScratch.reset();
     }
@@ -450,6 +494,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * forever on an empty queue.
      */
     void closePool() {
+        // Set closed BEFORE draining so a user thread that returns from
+        // onBatch concurrently and calls releaseBuffer sees closed=true and
+        // frees the buffer in place rather than offering it into a queue
+        // we're about to clear. Volatile write pairs with the volatile read
+        // in releaseBuffer.
+        closed = true;
         Misc.free(sendScratch);
         Misc.free(decoder);
         QueryEvent ev;
