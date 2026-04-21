@@ -248,6 +248,99 @@ public class Utf8sTest {
     }
 
     @Test
+    public void testStrCpyUtf8() {
+        final int bufSize = 64;
+        long mem = Unsafe.malloc(bufSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            fill(mem, bufSize, (byte) 0x7F);
+
+            Assert.assertEquals(0, Utf8s.strCpyUtf8("", mem, bufSize));
+            assertUntouched(mem, bufSize, (byte) 0x7F);
+
+            Assert.assertEquals(0, Utf8s.strCpyUtf8("hello", mem, 0));
+            assertUntouched(mem, bufSize, (byte) 0x7F);
+
+            assertStrCpyUtf8(mem, bufSize, "hello", bufSize, 5, "hello");
+            assertStrCpyUtf8(mem, bufSize, "éü", bufSize, 4, "éü");
+            assertStrCpyUtf8(mem, bufSize, "世界", bufSize, 6, "世界");
+            assertStrCpyUtf8(mem, bufSize, "\uD83D\uDE00", bufSize, 4, "\uD83D\uDE00");
+            assertStrCpyUtf8(mem, bufSize, "Aé世\uD83D\uDE00", bufSize, 10, "Aé世\uD83D\uDE00");
+        } finally {
+            Unsafe.free(mem, bufSize, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testStrCpyUtf8DoesNotSplitCharactersAtLimit() {
+        final int bufSize = 16;
+        long mem = Unsafe.malloc(bufSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            assertStrCpyUtf8(mem, bufSize, "abcdef", 3, 3, "abc");
+            assertStrCpyUtf8(mem, bufSize, "aéb", 2, 1, "a");
+            assertStrCpyUtf8(mem, bufSize, "a世b", 3, 1, "a");
+            assertStrCpyUtf8(mem, bufSize, "a\uD83D\uDE00b", 4, 1, "a");
+
+            assertStrCpyUtf8(mem, bufSize, "aé", 3, 3, "aé");
+            assertStrCpyUtf8(mem, bufSize, "a世", 4, 4, "a世");
+            assertStrCpyUtf8(mem, bufSize, "a\uD83D\uDE00", 5, 5, "a\uD83D\uDE00");
+        } finally {
+            Unsafe.free(mem, bufSize, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testStrCpyUtf8ReplacesInvalidSurrogates() {
+        final int bufSize = 16;
+        long mem = Unsafe.malloc(bufSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            assertStrCpyUtf8(mem, bufSize, "\uD83Da", bufSize, 2, "?a");
+            assertStrCpyUtf8(mem, bufSize, "\uDE00b", bufSize, 2, "?b");
+            assertStrCpyUtf8(mem, bufSize, "\uD83D", bufSize, 1, "?");
+            assertStrCpyUtf8(mem, bufSize, "\uDE00", bufSize, 1, "?");
+            assertStrCpyUtf8(mem, bufSize, "\uD83Da", 1, 1, "?");
+            assertStrCpyUtf8(mem, bufSize, "a\uD83D", 1, 1, "a");
+            assertStrCpyUtf8(mem, bufSize, "a\uDE00", 1, 1, "a");
+        } finally {
+            Unsafe.free(mem, bufSize, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testUtf8Bytes() {
+        Assert.assertEquals(0, Utf8s.utf8Bytes(""));
+        Assert.assertEquals(5, Utf8s.utf8Bytes("hello"));
+        Assert.assertEquals(4, Utf8s.utf8Bytes("éü"));
+        Assert.assertEquals(6, Utf8s.utf8Bytes("世界"));
+        Assert.assertEquals(4, Utf8s.utf8Bytes("\uD83D\uDE00"));
+        Assert.assertEquals(10, Utf8s.utf8Bytes("Aé世\uD83D\uDE00"));
+        Assert.assertEquals(2, Utf8s.utf8Bytes("\uD83Da"));
+        Assert.assertEquals(2, Utf8s.utf8Bytes("\uDE00b"));
+        Assert.assertEquals(1, Utf8s.utf8Bytes("\uD83D"));
+        Assert.assertEquals(1, Utf8s.utf8Bytes("\uDE00"));
+    }
+
+    @Test
+    public void testUtf8BytesWithLimit() {
+        Assert.assertEquals(0, Utf8s.utf8Bytes("hello", 0));
+        Assert.assertEquals(5, Utf8s.utf8Bytes("hello", 10));
+        Assert.assertEquals(3, Utf8s.utf8Bytes("hello", 3));
+
+        Assert.assertEquals(1, Utf8s.utf8Bytes("aéb", 2));
+        Assert.assertEquals(3, Utf8s.utf8Bytes("aé", 3));
+
+        Assert.assertEquals(1, Utf8s.utf8Bytes("a世b", 3));
+        Assert.assertEquals(4, Utf8s.utf8Bytes("a世", 4));
+
+        Assert.assertEquals(1, Utf8s.utf8Bytes("a\uD83D\uDE00b", 4));
+        Assert.assertEquals(5, Utf8s.utf8Bytes("a\uD83D\uDE00", 5));
+
+        Assert.assertEquals(1, Utf8s.utf8Bytes("\uD83Da", 1));
+        Assert.assertEquals(1, Utf8s.utf8Bytes("\uDE00b", 1));
+        Assert.assertEquals(1, Utf8s.utf8Bytes("a\uD83D", 1));
+        Assert.assertEquals(1, Utf8s.utf8Bytes("a\uDE00", 1));
+    }
+
+    @Test
     public void testUtf8Support() {
         StringBuilder expected = new StringBuilder();
         for (int i = 0; i < 0xD800; i++) {
@@ -269,11 +362,43 @@ public class Utf8sTest {
         }
     }
 
+    private static void assertStrCpyUtf8(long mem, int bufSize, String value, int maxBytes, int expectedBytes, String expected) {
+        final byte sentinel = 0x5A;
+        fill(mem, bufSize, sentinel);
+
+        int n = Utf8s.strCpyUtf8(value, mem, maxBytes);
+        Assert.assertEquals(expectedBytes, n);
+        Assert.assertEquals(expected, readUtf8(mem, n));
+        for (int i = n; i < bufSize; i++) {
+            Assert.assertEquals("write past copied bytes at offset " + i, sentinel, Unsafe.getUnsafe().getByte(mem + i));
+        }
+    }
+
     private static long copyBytes(long buf, byte[] bytes) {
         for (int n = bytes.length, i = 0; i < n; i++) {
             Unsafe.getUnsafe().putByte(buf + i, bytes[i]);
         }
         return buf + bytes.length;
+    }
+
+    private static void assertUntouched(long mem, int bufSize, byte expected) {
+        for (int i = 0; i < bufSize; i++) {
+            Assert.assertEquals("unexpected write at offset " + i, expected, Unsafe.getUnsafe().getByte(mem + i));
+        }
+    }
+
+    private static void fill(long mem, int len, byte value) {
+        for (int i = 0; i < len; i++) {
+            Unsafe.getUnsafe().putByte(mem + i, value);
+        }
+    }
+
+    private static String readUtf8(long mem, int len) {
+        byte[] bytes = new byte[len];
+        for (int i = 0; i < len; i++) {
+            bytes[i] = Unsafe.getUnsafe().getByte(mem + i);
+        }
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     private boolean copyToSinkWithTextUtil(StringSink query, String text) {

@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.Utf8s;
 
 import java.nio.charset.StandardCharsets;
 
@@ -219,8 +220,7 @@ public class WebSocketResponse {
     public int serializedSize() {
         int size = MIN_RESPONSE_SIZE;
         if (errorMessage != null && !errorMessage.isEmpty()) {
-            byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
-            int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
+            int msgLen = Utf8s.utf8Bytes(errorMessage, MAX_ERROR_MESSAGE_LENGTH);
             size += 2 + msgLen; // 2 bytes for length prefix
         }
         return size;
@@ -255,18 +255,14 @@ public class WebSocketResponse {
 
         // Error message (if any)
         if (status != STATUS_OK && errorMessage != null && !errorMessage.isEmpty()) {
-            byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
-            int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
+            int msgLen = Utf8s.utf8Bytes(errorMessage, MAX_ERROR_MESSAGE_LENGTH);
 
             // Length prefix (2 bytes, little-endian)
             Unsafe.getUnsafe().putShort(ptr + offset, (short) msgLen);
             offset += 2;
 
             // Message bytes
-            for (int i = 0; i < msgLen; i++) {
-                Unsafe.getUnsafe().putByte(ptr + offset + i, msgBytes[i]);
-            }
-            offset += msgLen;
+            offset += Utf8s.strCpyUtf8(errorMessage, ptr + offset, msgLen);
         }
 
         return offset;
