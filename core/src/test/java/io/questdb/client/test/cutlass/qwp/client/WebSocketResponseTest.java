@@ -37,10 +37,12 @@ public class WebSocketResponseTest {
     @Test
     public void testDurableAckFactory() throws Exception {
         assertMemoryLeak(() -> {
-            WebSocketResponse response = WebSocketResponse.durableAck(42L);
+            WebSocketResponse response = WebSocketResponse.durableAck("trades", 42L);
             Assert.assertTrue(response.isDurableAck());
             Assert.assertFalse(response.isSuccess());
-            Assert.assertEquals(42L, response.getSequence());
+            Assert.assertEquals(1, response.getTableEntryCount());
+            Assert.assertEquals("trades", response.getTableName(0));
+            Assert.assertEquals(42L, response.getTableSeqTxn(0));
             Assert.assertEquals(WebSocketResponse.STATUS_DURABLE_ACK, response.getStatus());
             Assert.assertEquals("DURABLE_ACK", response.getStatusName());
             Assert.assertNull(response.getErrorMessage());
@@ -48,22 +50,19 @@ public class WebSocketResponseTest {
     }
 
     @Test
-    public void testDurableAckIsStructurallyValidExact9Bytes() throws Exception {
+    public void testDurableAckIsStructurallyValid() throws Exception {
         assertMemoryLeak(() -> {
-            WebSocketResponse response = WebSocketResponse.durableAck(7L);
+            WebSocketResponse response = WebSocketResponse.durableAck("t", 7L);
             int size = response.serializedSize();
-            Assert.assertEquals(WebSocketResponse.MIN_RESPONSE_SIZE, size);
 
-            long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+            long ptr = Unsafe.malloc(size + 1, MemoryTag.NATIVE_DEFAULT);
             try {
                 response.writeTo(ptr);
                 Assert.assertTrue(WebSocketResponse.isStructurallyValid(ptr, size));
-                // Extra bytes make it invalid
                 Assert.assertFalse(WebSocketResponse.isStructurallyValid(ptr, size + 1));
-                // Too few bytes also invalid
                 Assert.assertFalse(WebSocketResponse.isStructurallyValid(ptr, size - 1));
             } finally {
-                Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(ptr, size + 1, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -71,7 +70,7 @@ public class WebSocketResponseTest {
     @Test
     public void testDurableAckRoundTripThroughNativeMemory() throws Exception {
         assertMemoryLeak(() -> {
-            WebSocketResponse original = WebSocketResponse.durableAck(12345L);
+            WebSocketResponse original = WebSocketResponse.durableAck("orders", 12345L);
             int size = original.serializedSize();
             long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
             try {
@@ -81,7 +80,9 @@ public class WebSocketResponseTest {
                 Assert.assertTrue(parsed.readFrom(ptr, size));
                 Assert.assertTrue(parsed.isDurableAck());
                 Assert.assertFalse(parsed.isSuccess());
-                Assert.assertEquals(12345L, parsed.getSequence());
+                Assert.assertEquals(1, parsed.getTableEntryCount());
+                Assert.assertEquals("orders", parsed.getTableName(0));
+                Assert.assertEquals(12345L, parsed.getTableSeqTxn(0));
                 Assert.assertNull(parsed.getErrorMessage());
             } finally {
                 Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
@@ -92,7 +93,7 @@ public class WebSocketResponseTest {
     @Test
     public void testDurableAckDoesNotCarryErrorMessage() throws Exception {
         assertMemoryLeak(() -> {
-            WebSocketResponse response = WebSocketResponse.durableAck(99L);
+            WebSocketResponse response = WebSocketResponse.durableAck("t", 99L);
             int size = response.serializedSize();
             long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
             try {

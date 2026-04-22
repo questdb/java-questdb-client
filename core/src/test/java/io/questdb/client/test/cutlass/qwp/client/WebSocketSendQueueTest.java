@@ -321,7 +321,7 @@ public class WebSocketSendQueueTest {
     }
 
     @Test
-    public void testDurableAckUpdatesHighestDurableSequence() throws Exception {
+    public void testDurableAckUpdatesPerTableSeqTxn() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
             WebSocketSendQueue queue = null;
@@ -331,7 +331,7 @@ public class WebSocketSendQueueTest {
                 window.addInFlight(0);
                 client.setTryReceiveBehavior(handler -> {
                     if (fired.compareAndSet(false, true)) {
-                        emitDurableAck(handler, 0);
+                        emitDurableAck(handler, "trades", 10);
                         durableDelivered.countDown();
                         return true;
                     }
@@ -342,14 +342,13 @@ public class WebSocketSendQueueTest {
                 assertTrue("Expected durable ACK callback",
                         durableDelivered.await(2, TimeUnit.SECONDS));
 
-                // Wait for the I/O thread to process the frame
                 long deadline = System.currentTimeMillis() + 2_000;
-                while (queue.getHighestDurableSequence() < 0 && System.currentTimeMillis() < deadline) {
+                while (queue.getDurableSeqTxn("trades") < 0 && System.currentTimeMillis() < deadline) {
                     Os.sleep(5);
                 }
 
-                assertEquals(0, queue.getHighestDurableSequence());
-                // Durable ACK should NOT remove in-flight batches — only STATUS_OK does that.
+                assertEquals(10, queue.getDurableSeqTxn("trades"));
+                assertEquals(-1, queue.getDurableSeqTxn("other"));
                 assertEquals(1, window.getInFlightCount());
             } finally {
                 window.acknowledgeUpTo(Long.MAX_VALUE);
@@ -374,11 +373,10 @@ public class WebSocketSendQueueTest {
                     int n = callCount.getAndIncrement();
                     switch (n) {
                         case 0:
-                            emitDurableAck(handler, 2);
+                            emitDurableAck(handler, "t", 20);
                             return true;
                         case 1:
-                            // Lower value — should be ignored
-                            emitDurableAck(handler, 1);
+                            emitDurableAck(handler, "t", 10);
                             allDelivered.countDown();
                             return true;
                         default:
@@ -390,12 +388,11 @@ public class WebSocketSendQueueTest {
                 assertTrue(allDelivered.await(2, TimeUnit.SECONDS));
 
                 long deadline = System.currentTimeMillis() + 2_000;
-                while (queue.getHighestDurableSequence() < 2 && System.currentTimeMillis() < deadline) {
+                while (queue.getDurableSeqTxn("t") < 20 && System.currentTimeMillis() < deadline) {
                     Os.sleep(5);
                 }
 
-                // The higher value (2) must win; the lower (1) must not regress it.
-                assertEquals(2, queue.getHighestDurableSequence());
+                assertEquals(20, queue.getDurableSeqTxn("t"));
             } finally {
                 window.acknowledgeUpTo(Long.MAX_VALUE);
                 closeQuietly(queue);
@@ -418,20 +415,16 @@ public class WebSocketSendQueueTest {
                     int n = callCount.getAndIncrement();
                     switch (n) {
                         case 0:
-                            // STATUS_OK ack for batch 0
                             emitAck(handler, 0);
                             return true;
                         case 1:
-                            // Durable ACK for sequence 0
-                            emitDurableAck(handler, 0);
+                            emitDurableAck(handler, "t", 10);
                             return true;
                         case 2:
-                            // STATUS_OK ack for batch 1
                             emitAck(handler, 1);
                             return true;
                         case 3:
-                            // Durable ACK for sequence 1
-                            emitDurableAck(handler, 1);
+                            emitDurableAck(handler, "t", 20);
                             allDelivered.countDown();
                             return true;
                         default:
@@ -443,13 +436,12 @@ public class WebSocketSendQueueTest {
                 assertTrue(allDelivered.await(2, TimeUnit.SECONDS));
 
                 long deadline = System.currentTimeMillis() + 2_000;
-                while ((queue.getHighestDurableSequence() < 1 || window.getInFlightCount() > 0)
+                while ((queue.getDurableSeqTxn("t") < 20 || window.getInFlightCount() > 0)
                         && System.currentTimeMillis() < deadline) {
                     Os.sleep(5);
                 }
 
-                // Both STATUS_OK and DURABLE_ACK processed correctly
-                assertEquals(1, queue.getHighestDurableSequence());
+                assertEquals(20, queue.getDurableSeqTxn("t"));
                 assertEquals(0, window.getInFlightCount());
             } finally {
                 window.acknowledgeUpTo(Long.MAX_VALUE);
@@ -467,7 +459,7 @@ public class WebSocketSendQueueTest {
                 AtomicBoolean ackDelivered = new AtomicBoolean(false);
                 client.setTryReceiveBehavior(handler -> {
                     if (ackDelivered.compareAndSet(false, true)) {
-                        emitDurableAck(handler, 7);
+                        emitDurableAck(handler, "t", 7);
                         return true;
                     }
                     return false;
@@ -477,7 +469,7 @@ public class WebSocketSendQueueTest {
 
                 queue.pingAndDrain();
 
-                assertEquals(7, queue.getHighestDurableSequence());
+                assertEquals(7, queue.getDurableSeqTxn("t"));
             } finally {
                 closeQuietly(queue);
             }
@@ -501,7 +493,7 @@ public class WebSocketSendQueueTest {
                             emitAck(handler, 1);
                             return true;
                         case 1:
-                            emitDurableAck(handler, 0);
+                            emitDurableAck(handler, "t", 5);
                             return true;
                         default:
                             return false;
@@ -513,7 +505,7 @@ public class WebSocketSendQueueTest {
                 queue.pingAndDrain();
 
                 assertEquals(0, window.getInFlightCount());
-                assertEquals(0, queue.getHighestDurableSequence());
+                assertEquals(5, queue.getDurableSeqTxn("t"));
             } finally {
                 closeQuietly(queue);
             }
@@ -521,13 +513,13 @@ public class WebSocketSendQueueTest {
     }
 
     @Test
-    public void testHighestDurableSequenceInitiallyMinusOne() throws Exception {
+    public void testDurableSeqTxnInitiallyMinusOne() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
             WebSocketSendQueue queue = null;
             try (FakeWebSocketClient client = new FakeWebSocketClient()) {
                 queue = new WebSocketSendQueue(client, window, 1_000, 500);
-                assertEquals(-1, queue.getHighestDurableSequence());
+                assertEquals(-1, queue.getDurableSeqTxn("any_table"));
             } finally {
                 closeQuietly(queue);
             }
@@ -564,8 +556,8 @@ public class WebSocketSendQueueTest {
         }
     }
 
-    private static void emitDurableAck(WebSocketFrameHandler handler, long sequence) {
-        WebSocketResponse response = WebSocketResponse.durableAck(sequence);
+    private static void emitDurableAck(WebSocketFrameHandler handler, String tableName, long seqTxn) {
+        WebSocketResponse response = WebSocketResponse.durableAck(tableName, seqTxn);
         int size = response.serializedSize();
         long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         try {

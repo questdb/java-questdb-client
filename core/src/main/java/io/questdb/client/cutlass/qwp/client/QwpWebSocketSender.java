@@ -35,6 +35,7 @@ import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.CharSequenceObjHashMap;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
@@ -147,11 +148,8 @@ public class QwpWebSocketSender implements Sender {
     // Async mode: pending row tracking
     private long pendingBytes;
     private int pendingRowCount;
-    // Highest client sequence durably uploaded, tracked when durable-ack opt-in is enabled
-    // and the server emits STATUS_DURABLE_ACK frames.
-    private long highestDurableSequence = -1;
-    // Opt-in: request server-side STATUS_DURABLE_ACK frames after WAL reaches object store.
-    // Must be set before the first send; has no effect once the WebSocket upgrade has completed.
+    private final CharSequenceLongHashMap syncCommittedSeqTxns = new CharSequenceLongHashMap();
+    private final CharSequenceLongHashMap syncDurableSeqTxns = new CharSequenceLongHashMap();
     private boolean requestDurableAck;
     private boolean sawBinaryAck;
     private boolean sawPong;
@@ -818,24 +816,28 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns the highest client batch sequence acknowledged by the server
-     * (committed to WAL), or -1 if no ACK has been received yet.
+     * Returns the highest seqTxn committed (written to WAL) for the given
+     * table, or -1 if no commit has been acknowledged for that table yet.
      */
-    public long getHighestAckedSequence() {
-        return inFlightWindow != null ? inFlightWindow.getHighestAckedSequence() : -1;
+    public long getHighestAckedSeqTxn(CharSequence tableName) {
+        if (sendQueue != null) {
+            return sendQueue.getCommittedSeqTxn(tableName.toString());
+        }
+        return syncCommittedSeqTxns.get(tableName);
     }
 
     /**
-     * Returns the highest client batch sequence that the server has reported
-     * as durably persisted to the object store via a STATUS_DURABLE_ACK frame,
-     * or -1 if no durable ACK has been observed yet on this connection.
-     * <p>
+     * Returns the highest seqTxn durably uploaded to object store for the
+     * given table, or -1 if no durable ACK has been observed for that table.
      * Only meaningful when the connection was opened with
      * {@link #setRequestDurableAck(boolean)} = true on a server where primary
-     * replication is enabled; otherwise remains -1.
+     * replication is enabled.
      */
-    public long getHighestDurableSequence() {
-        return sendQueue != null ? sendQueue.getHighestDurableSequence() : highestDurableSequence;
+    public long getHighestDurableSeqTxn(CharSequence tableName) {
+        if (sendQueue != null) {
+            return sendQueue.getDurableSeqTxn(tableName.toString());
+        }
+        return syncDurableSeqTxns.get(tableName);
     }
 
     /**
@@ -1022,7 +1024,7 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Sends a WebSocket PING and reads frames until the PONG comes back,
      * processing any STATUS_DURABLE_ACK or STATUS_OK frames along the way.
-     * After this method returns, {@link #getHighestDurableSequence()} reflects
+     * After this method returns, {@link #getHighestDurableSeqTxn(CharSequence)} reflects
      * the latest durable watermark reported by the server.
      * <p>
      * In async mode the PING is queued for the I/O thread; this method
@@ -1074,7 +1076,7 @@ public class QwpWebSocketSender implements Sender {
      * upgrade. Setting this true on a server without primary replication
      * enabled is a no-op: the server silently ignores the header.
      * <p>
-     * Observe durable progress via {@link #getHighestDurableSequence()}.
+     * Observe durable progress via {@link #getHighestDurableSeqTxn(CharSequence)}.
      *
      * @throws LineSenderException if the connection is already established or closed
      */
@@ -1750,13 +1752,11 @@ public class QwpWebSocketSender implements Sender {
             boolean received = client.receiveFrame(ackHandler, 1000);
             if (received) {
                 if (sawBinaryAck) {
-                    long sequence = ackResponse.getSequence();
                     if (ackResponse.isDurableAck()) {
-                        if (sequence > highestDurableSequence) {
-                            highestDurableSequence = sequence;
-                        }
+                        updateSyncDurableSeqTxns();
                     } else if (ackResponse.isSuccess()) {
-                        inFlightWindow.acknowledgeUpTo(sequence);
+                        inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
+                        updateSyncCommittedSeqTxns();
                     }
                 }
                 if (sawPong) {
@@ -1765,6 +1765,26 @@ public class QwpWebSocketSender implements Sender {
             }
         }
         throw new LineSenderException("Ping timed out");
+    }
+
+    private void updateSyncCommittedSeqTxns() {
+        for (int i = 0, n = ackResponse.getTableEntryCount(); i < n; i++) {
+            String name = ackResponse.getTableName(i);
+            long seqTxn = ackResponse.getTableSeqTxn(i);
+            if (seqTxn > syncCommittedSeqTxns.get(name)) {
+                syncCommittedSeqTxns.put(name, seqTxn);
+            }
+        }
+    }
+
+    private void updateSyncDurableSeqTxns() {
+        for (int i = 0, n = ackResponse.getTableEntryCount(); i < n; i++) {
+            String name = ackResponse.getTableName(i);
+            long seqTxn = ackResponse.getTableSeqTxn(i);
+            if (seqTxn > syncDurableSeqTxns.get(name)) {
+                syncDurableSeqTxns.put(name, seqTxn);
+            }
+        }
     }
 
     private long toMicros(long value, ChronoUnit unit) {
@@ -1812,26 +1832,20 @@ public class QwpWebSocketSender implements Sender {
                 boolean received = client.receiveFrame(ackHandler, 1000); // 1 second timeout per read attempt
 
                 if (received) {
-                    // Non-binary frames (e.g. ping/pong/text) are not ACKs.
                     if (!sawBinaryAck) {
                         continue;
                     }
-                    long sequence = ackResponse.getSequence();
                     if (ackResponse.isSuccess()) {
-                        // Cumulative ACK - acknowledge all batches up to this sequence
+                        long sequence = ackResponse.getSequence();
                         inFlightWindow.acknowledgeUpTo(sequence);
+                        updateSyncCommittedSeqTxns();
                         if (sequence >= expectedSequence) {
-                            return; // Our batch was acknowledged (cumulative)
+                            return;
                         }
-                        // Got ACK for lower sequence - continue waiting
                     } else if (ackResponse.isDurableAck()) {
-                        // Durable-upload watermark for opted-in connections. Record the highest
-                        // value seen; this method does not block for durable acks — callers who
-                        // need to wait on durability can poll getHighestDurableSequence().
-                        if (sequence > highestDurableSequence) {
-                            highestDurableSequence = sequence;
-                        }
+                        updateSyncDurableSeqTxns();
                     } else {
+                        long sequence = ackResponse.getSequence();
                         String errorMessage = ackResponse.getErrorMessage();
                         LineSenderException error = new LineSenderException(
                                 "Server error for batch " + sequence + ": " +

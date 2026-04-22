@@ -81,19 +81,19 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
     }
 
     @Test
-    public void testGetHighestDurableSequenceDefaultsToMinusOne() throws Exception {
+    public void testGetHighestDurableSeqTxnDefaultsToMinusOne() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
-                Assert.assertEquals(-1L, sender.getHighestDurableSequence());
+                Assert.assertEquals(-1L, sender.getHighestDurableSeqTxn("any_table"));
             }
         });
     }
 
     @Test
-    public void testGetHighestAckedSequenceDefaultsToMinusOne() throws Exception {
+    public void testGetHighestAckedSeqTxnDefaultsToMinusOne() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
-                Assert.assertEquals(-1L, sender.getHighestAckedSequence());
+                Assert.assertEquals(-1L, sender.getHighestAckedSeqTxn("any_table"));
             }
         });
     }
@@ -162,7 +162,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
             PingTestClient client = new PingTestClient();
             try {
-                client.frameSequence.add(handler -> emitBinaryResponse(handler, WebSocketResponse.durableAck(5)));
+                client.frameSequence.add(handler -> emitBinaryResponse(handler, WebSocketResponse.durableAck("trades", 5)));
                 client.frameSequence.add(handler -> handler.onPong(0, 0));
 
                 setField(sender, "client", client);
@@ -172,7 +172,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
                 sender.ping();
 
                 Assert.assertTrue(client.pingSent);
-                Assert.assertEquals(5L, sender.getHighestDurableSequence());
+                Assert.assertEquals(5L, sender.getHighestDurableSeqTxn("trades"));
             } finally {
                 setField(sender, "client", null);
                 setField(sender, "connected", false);
@@ -203,7 +203,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
                 sender.ping();
 
                 Assert.assertTrue(client.pingSent);
-                Assert.assertEquals(3L, sender.getHighestAckedSequence());
+                Assert.assertEquals(0, window.getInFlightCount());
             } finally {
                 setField(sender, "client", null);
                 setField(sender, "connected", false);

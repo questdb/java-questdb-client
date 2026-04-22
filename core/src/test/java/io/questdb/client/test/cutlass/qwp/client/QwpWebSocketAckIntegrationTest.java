@@ -197,15 +197,13 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
 
     /**
      * Creates a binary ACK response using WebSocketResponse format.
-     * Format: status (1 byte) + sequence (8 bytes little-endian)
+     * Format: status (1) + sequence (8) + tableCount (2, zero entries)
      */
     private static byte[] createAckResponse(long sequence) {
-        byte[] response = new byte[WebSocketResponse.MIN_RESPONSE_SIZE];
+        byte[] response = new byte[WebSocketResponse.MIN_OK_RESPONSE_SIZE];
 
-        // Status OK (0)
         response[0] = WebSocketResponse.STATUS_OK;
 
-        // Sequence (little-endian)
         response[1] = (byte) (sequence & 0xFF);
         response[2] = (byte) ((sequence >> 8) & 0xFF);
         response[3] = (byte) ((sequence >> 16) & 0xFF);
@@ -214,6 +212,10 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
         response[6] = (byte) ((sequence >> 40) & 0xFF);
         response[7] = (byte) ((sequence >> 48) & 0xFF);
         response[8] = (byte) ((sequence >> 56) & 0xFF);
+
+        // tableCount = 0
+        response[9] = 0;
+        response[10] = 0;
 
         return response;
     }

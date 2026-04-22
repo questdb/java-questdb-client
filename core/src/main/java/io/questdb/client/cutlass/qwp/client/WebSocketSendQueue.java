@@ -32,6 +32,7 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -92,9 +93,8 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Synchronization for flush/close
     private final CountDownLatch shutdownLatch;
     private final long shutdownTimeoutMs;
-    // Highest durable-ack watermark reported by the server, or -1 if none seen.
-    // Only meaningful when the connection opted in via X-QWP-Request-Durable-Ack.
-    private final AtomicLong highestDurableSequence = new AtomicLong(-1L);
+    private final ConcurrentHashMap<String, SeqTxn> committedSeqTxns = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, SeqTxn> durableSeqTxns = new ConcurrentHashMap<>();
     // Statistics - receiving
     private final AtomicLong totalAcks = new AtomicLong(0);
     // Statistics - sending
@@ -336,13 +336,14 @@ public class WebSocketSendQueue implements QuietCloseable {
         return lastError;
     }
 
-    /**
-     * Returns the highest client batch sequence that the server has reported
-     * as durably uploaded, or -1 if no durable ACK has been observed on this
-     * connection.
-     */
-    public long getHighestDurableSequence() {
-        return highestDurableSequence.get();
+    public long getCommittedSeqTxn(String tableName) {
+        SeqTxn s = committedSeqTxns.get(tableName);
+        return s != null ? s.get() : -1L;
+    }
+
+    public long getDurableSeqTxn(String tableName) {
+        SeqTxn s = durableSeqTxns.get(tableName);
+        return s != null ? s.get() : -1L;
     }
 
     /**
@@ -707,7 +708,6 @@ public class WebSocketSendQueue implements QuietCloseable {
             long sequence = response.getSequence();
 
             if (response.isSuccess()) {
-                // Cumulative ACK - acknowledge all batches up to this sequence
                 if (inFlightWindow != null) {
                     int acked = inFlightWindow.acknowledgeUpTo(sequence);
                     if (acked > 0) {
@@ -719,17 +719,15 @@ public class WebSocketSendQueue implements QuietCloseable {
                         LOG.debug("ACK for already-acknowledged sequences [upTo={}]", sequence);
                     }
                 }
+                for (int i = 0, n = response.getTableEntryCount(); i < n; i++) {
+                    advanceSeqTxn(committedSeqTxns, response.getTableName(i), response.getTableSeqTxn(i));
+                }
             } else if (response.isDurableAck()) {
-                // Durable-upload watermark. Track monotonically; no action on the in-flight window.
-                long curr;
-                do {
-                    curr = highestDurableSequence.get();
-                    if (curr >= sequence) {
-                        break;
-                    }
-                } while (!highestDurableSequence.compareAndSet(curr, sequence));
+                for (int i = 0, n = response.getTableEntryCount(); i < n; i++) {
+                    advanceSeqTxn(durableSeqTxns, response.getTableName(i), response.getTableSeqTxn(i));
+                }
                 if (LOG.isDebugEnabled()) {
-                    LOG.debug("Cumulative durable ACK received [upTo={}]", sequence);
+                    LOG.debug("Durable ACK received [tables={}]", response.getTableEntryCount());
                 }
             } else {
                 // Error - fail the batch
@@ -750,6 +748,35 @@ public class WebSocketSendQueue implements QuietCloseable {
         public void onClose(int code, String reason) {
             LOG.info("WebSocket closed by server [code={}, reason={}]", code, reason);
             failTransport(new LineSenderException("WebSocket closed by server [code=" + code + ", reason=" + reason + ']'));
+        }
+    }
+
+    static final class SeqTxn {
+        private final AtomicLong value;
+
+        SeqTxn(long value) {
+            this.value = new AtomicLong(value);
+        }
+
+        long get() {
+            return value.get();
+        }
+
+        void advance(long newValue) {
+            long curr;
+            do {
+                curr = value.get();
+                if (curr >= newValue) {
+                    return;
+                }
+            } while (!value.compareAndSet(curr, newValue));
+        }
+    }
+
+    private static void advanceSeqTxn(ConcurrentHashMap<String, SeqTxn> map, String tableName, long seqTxn) {
+        SeqTxn existing = map.putIfAbsent(tableName, new SeqTxn(seqTxn));
+        if (existing != null) {
+            existing.advance(seqTxn);
         }
     }
 }
