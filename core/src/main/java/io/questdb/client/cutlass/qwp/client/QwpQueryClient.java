@@ -38,6 +38,7 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * QWP egress (query results) client.
@@ -51,6 +52,15 @@ import java.util.Base64;
  * Thread safety: not thread-safe for concurrent queries on the same client.
  * One {@link #execute} at a time. Opening one client per query-issuing thread
  * is the recommended pattern.
+ * <p>
+ * Terminal-failure model: transport- or protocol-level faults detected by the
+ * I/O thread (server close, truncated/unknown frames, send/recv exceptions)
+ * latch a sticky terminal failure on the client. Subsequent {@link #execute}
+ * calls short-circuit via {@link QwpColumnBatchHandler#onError} with the
+ * stored status/message rather than dispatching to the now-broken connection.
+ * Per-query {@code QUERY_ERROR} responses are NOT terminal -- the connection
+ * remains usable for the next query. To retry after a terminal failure the
+ * caller must {@link #close} this client and open a fresh one.
  */
 public class QwpQueryClient implements QuietCloseable {
 
@@ -117,6 +127,11 @@ public class QwpQueryClient implements QuietCloseable {
     // hit the timeout branch in under a second instead of spending five.
     @SuppressWarnings("FieldMayBeFinal")
     private volatile long shutdownJoinMs = 5_000;
+    // Latched when the I/O thread reports a transport- or protocol-level
+    // failure (see QwpEgressIoThread notifyTerminalFailure callers). Checked
+    // on every user-facing method so a broken connection short-circuits
+    // instead of submitting work that will only collect an error event.
+    private final AtomicReference<TerminalFailure> terminalFailure = new AtomicReference<>();
     private boolean tlsEnabled;
     // Only meaningful when tlsEnabled. Default is full validation against the JVM's trust store.
     private int tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
@@ -478,7 +493,8 @@ public class QwpQueryClient implements QuietCloseable {
             probeZstdAvailable();
         }
 
-        ioThread = new QwpEgressIoThread(webSocketClient, bufferPoolSize);
+        terminalFailure.set(null);
+        ioThread = new QwpEgressIoThread(webSocketClient, bufferPoolSize, this::recordTerminalFailure);
         ioThreadHandle = new Thread(ioThread, "qwp-egress-io");
         ioThreadHandle.setDaemon(true);
         ioThreadHandle.start();
@@ -491,6 +507,11 @@ public class QwpQueryClient implements QuietCloseable {
      * Blocks the calling thread until the server sends {@code RESULT_END} or
      * {@code QUERY_ERROR}. While the user thread is inside {@code handler.onBatch},
      * the I/O thread keeps reading and decoding ahead up to the configured buffer-pool depth.
+     * <p>
+     * Short-circuits when a terminal failure has already been latched by the I/O
+     * thread (see class Javadoc): {@code handler.onError} fires immediately with
+     * the stored status and message, and no query is dispatched. The caller must
+     * {@link #close} the client and open a new one to retry.
      */
     public void execute(String sql, QwpColumnBatchHandler handler) {
         if (!connected) {
@@ -504,6 +525,16 @@ public class QwpQueryClient implements QuietCloseable {
         QwpEgressIoThread io = ioThread;
         if (io == null) {
             handler.onError((byte) 0, "QwpQueryClient is closed");
+            return;
+        }
+        TerminalFailure tf = terminalFailure.get();
+        if (tf != null) {
+            // I/O thread has reported a transport- or protocol-level failure.
+            // Submitting another query would only accumulate work the I/O thread
+            // cannot process. Surface the stored failure via the handler
+            // immediately -- users who want to retry must close() and create a
+            // fresh client.
+            handler.onError(tf.status, tf.message);
             return;
         }
         long requestId = nextRequestId++;
@@ -731,6 +762,10 @@ public class QwpQueryClient implements QuietCloseable {
         return this;
     }
 
+    void recordTerminalFailure(byte status, String message) {
+        terminalFailure.compareAndSet(null, new TerminalFailure(status, message));
+    }
+
     private static String defaultClientId() {
         return "questdb-java-egress/1.0.0";
     }
@@ -788,5 +823,15 @@ public class QwpQueryClient implements QuietCloseable {
                     + "string to disable compression, or retry once memory pressure subsides.");
         }
         Zstd.freeDCtx(dctx);
+    }
+
+    private static final class TerminalFailure {
+        final String message;
+        final byte status;
+
+        TerminalFailure(byte status, String message) {
+            this.status = status;
+            this.message = message;
+        }
     }
 }

@@ -81,6 +81,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     // Single-slot request queue (Phase-1 allows one in-flight query).
     private final BlockingQueue<QueryRequest> requests = new ArrayBlockingQueue<>(1);
     private final NativeBufferWriter sendScratch = new NativeBufferWriter();
+    // Notified once when the I/O thread detects a transport- or protocol-level
+    // terminal failure (onClose, truncated/unknown frames, send/receive
+    // throwing). Distinct from per-query QUERY_ERROR, which leaves the
+    // connection healthy and is delivered only through the events queue.
+    private final TerminalFailureListener terminalFailureListener;
     private final WebSocketClient wsClient;
     // Per-query credit state (accessed only from the I/O thread).
     // creditEnabled == (initialCredit > 0); controls whether we emit CREDIT
@@ -98,7 +103,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private volatile boolean shutdown;
 
     public QwpEgressIoThread(WebSocketClient wsClient, int bufferPoolSize) {
+        this(wsClient, bufferPoolSize, null);
+    }
+
+    public QwpEgressIoThread(WebSocketClient wsClient, int bufferPoolSize, TerminalFailureListener terminalFailureListener) {
         this.wsClient = wsClient;
+        this.terminalFailureListener = terminalFailureListener;
         this.freeBuffers = new ArrayBlockingQueue<>(bufferPoolSize);
         // +2 reserves slots for a trailing RESULT_END and a synthetic error
         // frame the I/O thread may emit on shutdown, so a full buffer pool
@@ -153,7 +163,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     @Override
     public void onBinaryMessage(long payloadPtr, int payloadLen) {
         if (payloadLen < QwpConstants.HEADER_SIZE + 1) {
-            emitError((byte) 0, "server sent truncated frame");
+            emitTerminalError((byte) 0, "server sent truncated frame");
             // Stop the receive loop; the framing is broken and any further bytes
             // would be misinterpreted relative to the expected message boundary.
             currentQueryDone = true;
@@ -173,13 +183,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             decodeAndEmitError(payloadPtr, payloadLen);
             currentQueryDone = true;
         } else {
-            emitError((byte) 0, "unknown msg_kind 0x" + Integer.toHexString(msgKind & 0xFF));
+            emitTerminalError((byte) 0, "unknown msg_kind 0x" + Integer.toHexString(msgKind & 0xFF));
             currentQueryDone = true;
         }
     }
 
     @Override
     public void onClose(int code, String reason) {
+        notifyTerminalFailure((byte) 0, "server closed connection: code=" + code + " reason=" + reason);
         if (!currentQueryDone) {
             emitError((byte) 0, "server closed connection: code=" + code + " reason=" + reason);
             currentQueryDone = true;
@@ -244,6 +255,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                 }
             }
         } catch (Throwable t) {
+            notifyTerminalFailure((byte) 0, "I/O thread failure: " + t.getMessage());
             emitErrorBlocking((byte) 0, "I/O thread failure: " + t.getMessage());
         } finally {
             // Wake any user thread blocked on events.take(). Without this, a close()
@@ -251,9 +263,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             // takeEvent() block forever -- once the I/O thread is gone, no further
             // events arrive on the queue.
             if (!currentQueryDone) {
-                emitErrorBlocking((byte) 0, shutdown
+                String msg = shutdown
                         ? "I/O thread shut down with query in flight"
-                        : "I/O thread terminated with query in flight");
+                        : "I/O thread terminated with query in flight";
+                if (!shutdown) {
+                    // Shutdown is a user-driven close; don't mark the client terminal for it.
+                    notifyTerminalFailure((byte) 0, msg);
+                }
+                emitErrorBlocking((byte) 0, msg);
                 currentQueryDone = true;
             }
         }
@@ -297,7 +314,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
         long limit = payload + payloadLen;
         if (p + 1 > limit) {
-            emitError((byte) 0, "EXEC_DONE frame truncated before op_type");
+            emitTerminalError((byte) 0, "EXEC_DONE frame truncated before op_type");
             return;
         }
         byte opType = Unsafe.getUnsafe().getByte(p++);
@@ -309,7 +326,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             if ((b & 0x80) == 0) break;
             shift += 7;
             if (shift > 63) {
-                emitError((byte) 0, "EXEC_DONE rows_affected varint overflow");
+                emitTerminalError((byte) 0, "EXEC_DONE rows_affected varint overflow");
                 return;
             }
         }
@@ -390,6 +407,15 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         }
     }
 
+    // Emits a per-query error event AND latches the client terminal-failure
+    // state. Use for transport- or protocol-level faults where the WebSocket
+    // is no longer usable; per-query QUERY_ERROR must still go through
+    // plain emitError, since the connection remains healthy after it.
+    private void emitTerminalError(byte status, String message) {
+        notifyTerminalFailure(status, message);
+        emitError(status, message);
+    }
+
     private void handleResultBatch(long payloadPtr, int payloadLen) {
         QwpBatchBuffer buf;
         try {
@@ -413,7 +439,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             decoder.decode(buf, payloadPtr, payloadLen);
         } catch (QwpDecodeException e) {
             freeBuffers.offer(buf);
-            emitError((byte) 0, "decode failure: " + e.getMessage());
+            // A decode failure leaves the client-side decoder out of step with
+            // the server's byte stream: the next frame cannot be trusted.
+            emitTerminalError((byte) 0, "decode failure: " + e.getMessage());
             currentQueryDone = true;
             return;
         }
@@ -434,6 +462,17 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // bytes. No-op when the query wasn't started under flow control.
         if (creditEnabled) {
             sendCredit(currentRequestId, payloadLen);
+        }
+    }
+
+    private void notifyTerminalFailure(byte status, String message) {
+        if (terminalFailureListener != null) {
+            try {
+                terminalFailureListener.onTerminalFailure(status, message);
+            } catch (Throwable ignored) {
+                // Listener must not bring down the I/O thread. A first-failure-wins
+                // CAS in the listener cannot throw in practice; defensive anyway.
+            }
         }
     }
 
@@ -515,6 +554,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // The events queue capacity is bufferPoolSize + 2 with no consumer competing
         // for slots after the I/O thread has joined, so offer is guaranteed to succeed.
         events.offer(new QueryEvent().asError((byte) 0, "QwpQueryClient closed"));
+    }
+
+    @FunctionalInterface
+    public interface TerminalFailureListener {
+        void onTerminalFailure(byte status, String message);
     }
 
     private static final class QueryRequest {
