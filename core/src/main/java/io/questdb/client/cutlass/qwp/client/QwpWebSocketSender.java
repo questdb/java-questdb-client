@@ -1202,6 +1202,10 @@ public class QwpWebSocketSender implements Sender {
     private void checkConnectionError() {
         LineSenderException error = connectionError.get();
         if (error != null) {
+            // Refresh the stack so subsequent public API calls point at the
+            // call that observed the terminal sender state, not the I/O thread
+            // that originally recorded the failure.
+            error.fillInStackTrace();
             throw error;
         }
     }

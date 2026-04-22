@@ -67,6 +67,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
                     Assert.fail("Expected sender-level connection failure");
                 } catch (LineSenderException e) {
                     Assert.assertSame(failure, e);
+                    assertStackContains(e, "table");
                 }
 
                 LineSenderException secondFailure = new LineSenderException("second failure");
@@ -77,6 +78,7 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
                     Assert.fail("Expected original sender-level connection failure");
                 } catch (LineSenderException e) {
                     Assert.assertSame(failure, e);
+                    assertStackContains(e, "flush");
                 }
             } finally {
                 sender.close();
@@ -352,6 +354,16 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
         Method method = target.getClass().getDeclaredMethod("resetSchemaStateForNewConnection");
         method.setAccessible(true);
         method.invoke(target);
+    }
+
+    private static void assertStackContains(Throwable throwable, String methodName) {
+        for (StackTraceElement element : throwable.getStackTrace()) {
+            if (QwpWebSocketSender.class.getName().equals(element.getClassName())
+                    && methodName.equals(element.getMethodName())) {
+                return;
+            }
+        }
+        Assert.fail("Expected stack trace to contain QwpWebSocketSender." + methodName);
     }
 
     private static boolean invokeRecordConnectionFailure(Object target, LineSenderException error) throws Exception {
