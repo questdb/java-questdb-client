@@ -298,8 +298,8 @@ public class WebSocketResponse {
         if (status == STATUS_DURABLE_ACK) {
             return MIN_DURABLE_ACK_SIZE + tableEntriesSize();
         }
-        // Error
-        int size = MIN_OK_RESPONSE_SIZE;
+        // Error: status(1) + sequence(8) + optional [errorLen(2) + errorBytes]
+        int size = 1 + 8;
         if (errorMessage != null && !errorMessage.isEmpty()) {
             byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
             int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
