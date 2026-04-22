@@ -24,10 +24,17 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.DefaultHttpClientConfiguration;
+import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.network.PlainSocketFactory;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.AbstractTest;
 import org.junit.Assert;
 import org.junit.Test;
@@ -35,6 +42,9 @@ import org.junit.Test;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -49,6 +59,26 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * </ul>
  */
 public class QwpWebSocketSenderStateTest extends AbstractTest {
+
+    @Test
+    public void testConnectWithDurableAckToClosedPort() throws Exception {
+        assertMemoryLeak(() -> {
+            try {
+                QwpWebSocketSender.connect(
+                        "127.0.0.1", 1, null,
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                        1, null,
+                        QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                        true
+                ).close();
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("Failed to connect"));
+            }
+        });
+    }
 
     @Test
     public void testGetHighestDurableSequenceDefaultsToMinusOne() throws Exception {
@@ -108,6 +138,101 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
                 Assert.fail("Expected exception for setRequestDurableAck on closed sender");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testPingAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            sender.close();
+            try {
+                sender.ping();
+                Assert.fail("Expected exception");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testSyncPingProcessesDurableAck() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            PingTestClient client = new PingTestClient();
+            try {
+                client.frameSequence.add(handler -> emitBinaryResponse(handler, WebSocketResponse.durableAck(5)));
+                client.frameSequence.add(handler -> handler.onPong(0, 0));
+
+                setField(sender, "client", client);
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                sender.ping();
+
+                Assert.assertTrue(client.pingSent);
+                Assert.assertEquals(5L, sender.getHighestDurableSequence());
+            } finally {
+                setField(sender, "client", null);
+                setField(sender, "connected", false);
+                sender.close();
+                client.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSyncPingProcessesStatusOk() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            PingTestClient client = new PingTestClient();
+            try {
+                client.frameSequence.add(handler -> emitBinaryResponse(handler, WebSocketResponse.success(3)));
+                client.frameSequence.add(handler -> handler.onPong(0, 0));
+
+                setField(sender, "client", client);
+                setField(sender, "connected", true);
+                InFlightWindow window = new InFlightWindow(8, InFlightWindow.DEFAULT_TIMEOUT_MS);
+                window.addInFlight(0);
+                window.addInFlight(1);
+                window.addInFlight(2);
+                window.addInFlight(3);
+                setField(sender, "inFlightWindow", window);
+
+                sender.ping();
+
+                Assert.assertTrue(client.pingSent);
+                Assert.assertEquals(3L, sender.getHighestAckedSequence());
+            } finally {
+                setField(sender, "client", null);
+                setField(sender, "connected", false);
+                sender.close();
+                client.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSyncPingReturnsOnPong() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            PingTestClient client = new PingTestClient();
+            try {
+                client.frameSequence.add(handler -> handler.onPong(0, 0));
+
+                setField(sender, "client", client);
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                sender.ping();
+
+                Assert.assertTrue(client.pingSent);
+            } finally {
+                setField(sender, "client", null);
+                setField(sender, "connected", false);
+                sender.close();
+                client.close();
             }
         });
     }
@@ -386,5 +511,57 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
         Field f = target.getClass().getDeclaredField(fieldName);
         f.setAccessible(true);
         f.set(target, value);
+    }
+
+    private static void emitBinaryResponse(WebSocketFrameHandler handler, WebSocketResponse response) {
+        int size = response.serializedSize();
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            response.writeTo(ptr);
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static class PingTestClient extends WebSocketClient {
+        final List<Consumer<WebSocketFrameHandler>> frameSequence = new ArrayList<>();
+        boolean pingSent = false;
+        private int nextFrame = 0;
+
+        PingTestClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public boolean isConnected() {
+            return true;
+        }
+
+        @Override
+        public boolean receiveFrame(WebSocketFrameHandler handler, int timeout) {
+            if (nextFrame < frameSequence.size()) {
+                frameSequence.get(nextFrame++).accept(handler);
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+        }
+
+        @Override
+        public void sendPing(int timeout) {
+            pingSent = true;
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
+        }
     }
 }

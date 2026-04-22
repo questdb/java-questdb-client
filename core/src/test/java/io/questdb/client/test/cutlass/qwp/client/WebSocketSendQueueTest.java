@@ -459,6 +459,68 @@ public class WebSocketSendQueueTest {
     }
 
     @Test
+    public void testPingAndDrainCompletesSuccessfully() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                AtomicBoolean ackDelivered = new AtomicBoolean(false);
+                client.setTryReceiveBehavior(handler -> {
+                    if (ackDelivered.compareAndSet(false, true)) {
+                        emitDurableAck(handler, 7);
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+
+                queue.pingAndDrain();
+
+                assertEquals(7, queue.getHighestDurableSequence());
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testPingAndDrainWithInFlightBatches() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                window.addInFlight(0);
+                window.addInFlight(1);
+
+                AtomicInteger callCount = new AtomicInteger();
+                client.setTryReceiveBehavior(handler -> {
+                    int n = callCount.getAndIncrement();
+                    switch (n) {
+                        case 0:
+                            emitAck(handler, 1);
+                            return true;
+                        case 1:
+                            emitDurableAck(handler, 0);
+                            return true;
+                        default:
+                            return false;
+                    }
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+
+                queue.pingAndDrain();
+
+                assertEquals(0, window.getInFlightCount());
+                assertEquals(0, queue.getHighestDurableSequence());
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
     public void testHighestDurableSequenceInitiallyMinusOne() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
@@ -571,6 +633,10 @@ public class WebSocketSendQueueTest {
         @Override
         public void sendBinary(long dataPtr, int length) {
             sendBehavior.send(dataPtr, length);
+        }
+
+        @Override
+        public void sendPing(int timeout) {
         }
 
         public void setSendBehavior(SendBehavior sendBehavior) {
