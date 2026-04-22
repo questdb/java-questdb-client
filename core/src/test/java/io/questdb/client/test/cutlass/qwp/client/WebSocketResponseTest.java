@@ -150,6 +150,60 @@ public class WebSocketResponseTest {
     }
 
     @Test
+    public void testSuccessWithTableEntriesRoundTrip() throws Exception {
+        assertMemoryLeak(() -> {
+            // Build a STATUS_OK frame with 2 table entries directly in native memory
+            // Format: status(1) + sequence(8) + tableCount(2) + entries
+            byte[] name1 = "trades".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] name2 = "orders".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            int size = 1 + 8 + 2 + (2 + name1.length + 8) + (2 + name2.length + 8);
+            long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int offset = 0;
+                Unsafe.getUnsafe().putByte(ptr + offset, WebSocketResponse.STATUS_OK);
+                offset += 1;
+                Unsafe.getUnsafe().putLong(ptr + offset, 42L);
+                offset += 8;
+                Unsafe.getUnsafe().putShort(ptr + offset, (short) 2);
+                offset += 2;
+                // entry 1: trades, seqTxn=10
+                Unsafe.getUnsafe().putShort(ptr + offset, (short) name1.length);
+                offset += 2;
+                for (int i = 0; i < name1.length; i++) {
+                    Unsafe.getUnsafe().putByte(ptr + offset + i, name1[i]);
+                }
+                offset += name1.length;
+                Unsafe.getUnsafe().putLong(ptr + offset, 10L);
+                offset += 8;
+                // entry 2: orders, seqTxn=20
+                Unsafe.getUnsafe().putShort(ptr + offset, (short) name2.length);
+                offset += 2;
+                for (int i = 0; i < name2.length; i++) {
+                    Unsafe.getUnsafe().putByte(ptr + offset + i, name2[i]);
+                }
+                offset += name2.length;
+                Unsafe.getUnsafe().putLong(ptr + offset, 20L);
+
+                Assert.assertTrue(WebSocketResponse.isStructurallyValid(ptr, size));
+
+                WebSocketResponse parsed = new WebSocketResponse();
+                Assert.assertTrue(parsed.readFrom(ptr, size));
+                Assert.assertTrue(parsed.isSuccess());
+                Assert.assertFalse(parsed.isDurableAck());
+                Assert.assertEquals(42L, parsed.getSequence());
+                Assert.assertEquals(2, parsed.getTableEntryCount());
+                Assert.assertEquals("trades", parsed.getTableName(0));
+                Assert.assertEquals(10L, parsed.getTableSeqTxn(0));
+                Assert.assertEquals("orders", parsed.getTableName(1));
+                Assert.assertEquals(20L, parsed.getTableSeqTxn(1));
+                Assert.assertNull(parsed.getErrorMessage());
+            } finally {
+                Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testErrorRoundTrip() throws Exception {
         assertMemoryLeak(() -> {
             WebSocketResponse original = WebSocketResponse.error(

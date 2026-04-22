@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.std.LongList;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
+import org.jetbrains.annotations.TestOnly;
 
 import java.nio.charset.StandardCharsets;
 
@@ -37,7 +38,7 @@ import java.nio.charset.StandardCharsets;
  * <pre>
  * +--------+----------+------------+--------------------------------------+
  * | status | sequence | tableCount | table entries                         |
- * | 1 byte | 8 bytes  | 2 bytes    | [nameLen(1)+name(N)+seqTxn(8)] * cnt |
+ * | 1 byte | 8 bytes  | 2 bytes    | [nameLen(2)+name(N)+seqTxn(8)] * cnt |
  * +--------+----------+------------+--------------------------------------+
  * </pre>
  * <p>
@@ -45,7 +46,7 @@ import java.nio.charset.StandardCharsets;
  * <pre>
  * +--------+------------+--------------------------------------+
  * | status | tableCount | table entries                         |
- * | 1 byte | 2 bytes    | [nameLen(1)+name(N)+seqTxn(8)] * cnt |
+ * | 1 byte | 2 bytes    | [nameLen(2)+name(N)+seqTxn(8)] * cnt |
  * +--------+------------+--------------------------------------+
  * </pre>
  * <p>
@@ -92,6 +93,7 @@ public class WebSocketResponse {
     /**
      * Creates a durable-upload ACK response with a single table entry.
      */
+    @TestOnly
     public static WebSocketResponse durableAck(String tableName, long seqTxn) {
         WebSocketResponse response = new WebSocketResponse();
         response.status = STATUS_DURABLE_ACK;
@@ -104,6 +106,7 @@ public class WebSocketResponse {
     /**
      * Creates an error response.
      */
+    @TestOnly
     public static WebSocketResponse error(long sequence, byte status, String errorMessage) {
         WebSocketResponse response = new WebSocketResponse();
         response.status = status;
@@ -150,6 +153,7 @@ public class WebSocketResponse {
     /**
      * Creates a success response.
      */
+    @TestOnly
     public static WebSocketResponse success(long sequence) {
         WebSocketResponse response = new WebSocketResponse();
         response.status = STATUS_OK;
@@ -265,23 +269,22 @@ public class WebSocketResponse {
         }
 
         // Error response
-        if (length < MIN_OK_RESPONSE_SIZE) {
+        if (length < MIN_ERROR_RESPONSE_SIZE) {
             return false;
         }
         sequence = Unsafe.getUnsafe().getLong(ptr + 1);
         int offset = 9;
-        if (length >= offset + 2) {
-            int msgLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
-            offset += 2;
-            if (length >= offset + msgLen && msgLen > 0) {
-                byte[] msgBytes = new byte[msgLen];
-                for (int i = 0; i < msgLen; i++) {
-                    msgBytes[i] = Unsafe.getUnsafe().getByte(ptr + offset + i);
-                }
-                errorMessage = new String(msgBytes, StandardCharsets.UTF_8);
-            } else {
-                errorMessage = null;
+        int msgLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+        offset += 2;
+        if (length < offset + msgLen) {
+            return false;
+        }
+        if (msgLen > 0) {
+            byte[] msgBytes = new byte[msgLen];
+            for (int i = 0; i < msgLen; i++) {
+                msgBytes[i] = Unsafe.getUnsafe().getByte(ptr + offset + i);
             }
+            errorMessage = new String(msgBytes, StandardCharsets.UTF_8);
         } else {
             errorMessage = null;
         }
@@ -291,6 +294,7 @@ public class WebSocketResponse {
     /**
      * Calculates the serialized size of this response.
      */
+    @TestOnly
     public int serializedSize() {
         if (status == STATUS_OK) {
             return MIN_OK_RESPONSE_SIZE + tableEntriesSize();
@@ -326,6 +330,7 @@ public class WebSocketResponse {
      * @param ptr destination address
      * @return number of bytes written
      */
+    @TestOnly
     public int writeTo(long ptr) {
         int offset = 0;
 
@@ -362,11 +367,11 @@ public class WebSocketResponse {
         int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
         int offset = 2;
         for (int i = 0; i < tableCount; i++) {
-            if (remaining < offset + 1) {
+            if (remaining < offset + 2) {
                 return false;
             }
-            int nameLen = Unsafe.getUnsafe().getByte(ptr + offset) & 0xFF;
-            offset += 1;
+            int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+            offset += 2;
             if (remaining < offset + nameLen + 8) {
                 return false;
             }
@@ -380,13 +385,13 @@ public class WebSocketResponse {
             tableNames.add(new String(nameBytes, StandardCharsets.UTF_8));
             tableSeqTxns.add(seqTxn);
         }
-        return true;
+        return remaining == offset;
     }
 
     private int tableEntriesSize() {
         int size = 0;
         for (int i = 0, n = tableNames.size(); i < n; i++) {
-            size += 1 + tableNames.getQuick(i).getBytes(StandardCharsets.UTF_8).length + 8;
+            size += 2 + tableNames.getQuick(i).getBytes(StandardCharsets.UTF_8).length + 8;
         }
         return size;
     }
@@ -398,11 +403,11 @@ public class WebSocketResponse {
         int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
         int offset = 2;
         for (int i = 0; i < tableCount; i++) {
-            if (remaining < offset + 1) {
+            if (remaining < offset + 2) {
                 return false;
             }
-            int nameLen = Unsafe.getUnsafe().getByte(ptr + offset) & 0xFF;
-            offset += 1;
+            int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+            offset += 2;
             if (remaining < offset + nameLen + 8) {
                 return false;
             }
@@ -418,8 +423,8 @@ public class WebSocketResponse {
         offset += 2;
         for (int i = 0; i < count; i++) {
             byte[] nameBytes = tableNames.getQuick(i).getBytes(StandardCharsets.UTF_8);
-            Unsafe.getUnsafe().putByte(ptr + offset, (byte) nameBytes.length);
-            offset += 1;
+            Unsafe.getUnsafe().putShort(ptr + offset, (short) nameBytes.length);
+            offset += 2;
             for (int j = 0; j < nameBytes.length; j++) {
                 Unsafe.getUnsafe().putByte(ptr + offset + j, nameBytes[j]);
             }

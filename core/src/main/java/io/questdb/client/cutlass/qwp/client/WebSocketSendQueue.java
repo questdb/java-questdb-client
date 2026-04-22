@@ -469,7 +469,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         client.sendPing(1000);
                         tryReceiveAcks();
                     } catch (Exception e) {
-                        LOG.error("Ping failed: {}", e.getMessage());
+                        failTransport(new LineSenderException("Ping failed", e));
                     } finally {
                         synchronized (processingLock) {
                             pingComplete = true;
@@ -774,9 +774,14 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     private static void advanceSeqTxn(ConcurrentHashMap<String, SeqTxn> map, String tableName, long seqTxn) {
-        SeqTxn existing = map.putIfAbsent(tableName, new SeqTxn(seqTxn));
+        SeqTxn existing = map.get(tableName);
         if (existing != null) {
             existing.advance(seqTxn);
+        } else {
+            existing = map.putIfAbsent(tableName, new SeqTxn(seqTxn));
+            if (existing != null) {
+                existing.advance(seqTxn);
+            }
         }
     }
 }
