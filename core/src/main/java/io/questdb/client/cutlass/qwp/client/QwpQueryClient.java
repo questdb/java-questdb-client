@@ -61,6 +61,15 @@ import java.util.concurrent.atomic.AtomicReference;
  * Per-query {@code QUERY_ERROR} responses are NOT terminal -- the connection
  * remains usable for the next query. To retry after a terminal failure the
  * caller must {@link #close} this client and open a fresh one.
+ * <p>
+ * Status byte convention on {@link QwpColumnBatchHandler#onError}: server-
+ * emitted {@code QUERY_ERROR} frames surface with the server's status code
+ * ({@link WebSocketResponse#STATUS_PARSE_ERROR}, {@code STATUS_INTERNAL_ERROR},
+ * {@link QwpEgressMsgKind#STATUS_CANCELLED}, {@code STATUS_LIMIT_EXCEEDED},
+ * etc.). Failures detected client-side (closed client, bind encoding error,
+ * truncated / unknown frame, decoder out of sync, I/O thread interrupt) all
+ * surface with {@link WebSocketResponse#STATUS_INTERNAL_ERROR} and the
+ * specific cause in the message.
  */
 public class QwpQueryClient implements QuietCloseable {
 
@@ -77,8 +86,19 @@ public class QwpQueryClient implements QuietCloseable {
     public static final int QWP_MAX_VERSION = 1;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
     private static final Logger LOG = LoggerFactory.getLogger(QwpQueryClient.class);
+    // Reusable typed bind-value sink. Populated on the user thread by the
+    // {@link QwpBindSetter} passed to execute(); the pre-encoded bytes are
+    // handed to the I/O thread via QueryRequest. Allocated once per client to
+    // keep the per-query path zero-alloc after warmup. Freed in close() on the
+    // clean-join path; leaked together with the buffer pool on the timeout path.
+    private final QwpBindValues bindValues = new QwpBindValues();
     private final CharSequence host;
     private final int port;
+    // Latched when the I/O thread reports a transport- or protocol-level
+    // failure (see QwpEgressIoThread notifyTerminalFailure callers). Checked
+    // on every user-facing method so a broken connection short-circuits
+    // instead of submitting work that will only collect an error event.
+    private final AtomicReference<TerminalFailure> terminalFailure = new AtomicReference<>();
     private String authorizationHeader;
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private String clientId;
@@ -127,11 +147,6 @@ public class QwpQueryClient implements QuietCloseable {
     // hit the timeout branch in under a second instead of spending five.
     @SuppressWarnings("FieldMayBeFinal")
     private volatile long shutdownJoinMs = 5_000;
-    // Latched when the I/O thread reports a transport- or protocol-level
-    // failure (see QwpEgressIoThread notifyTerminalFailure callers). Checked
-    // on every user-facing method so a broken connection short-circuits
-    // instead of submitting work that will only collect an error event.
-    private final AtomicReference<TerminalFailure> terminalFailure = new AtomicReference<>();
     private boolean tlsEnabled;
     // Only meaningful when tlsEnabled. Default is full validation against the JVM's trust store.
     private int tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
@@ -463,6 +478,7 @@ public class QwpQueryClient implements QuietCloseable {
             webSocketClient.close();
             webSocketClient = null;
         }
+        bindValues.close();
     }
 
     /**
@@ -519,6 +535,21 @@ public class QwpQueryClient implements QuietCloseable {
      * {@link #close} the client and open a new one to retry.
      */
     public void execute(String sql, QwpColumnBatchHandler handler) {
+        execute(sql, null, handler);
+    }
+
+    /**
+     * Executes {@code sql} with typed bind parameters supplied by the given
+     * {@link QwpBindSetter}. The setter runs on the calling thread before the
+     * query is dispatched; bind values must be assigned in strictly ascending
+     * index order starting at 0, matching the SQL placeholders ({@code $1, $2, ...}).
+     * <p>
+     * Passing the same SQL text on subsequent calls hits the server's
+     * SQL-text-keyed factory cache -- the factory compiles once and binds
+     * supply the per-call values. Interpolating values into the SQL string
+     * defeats this reuse.
+     */
+    public void execute(String sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
         if (!connected) {
             throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
         }
@@ -529,7 +560,7 @@ public class QwpQueryClient implements QuietCloseable {
         // before close() returns.
         QwpEgressIoThread io = ioThread;
         if (io == null) {
-            handler.onError((byte) 0, "QwpQueryClient is closed");
+            handler.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "QwpQueryClient is closed");
             return;
         }
         TerminalFailure tf = terminalFailure.get();
@@ -542,10 +573,24 @@ public class QwpQueryClient implements QuietCloseable {
             handler.onError(tf.status, tf.message);
             return;
         }
+        bindValues.reset();
+        if (binds != null) {
+            try {
+                binds.apply(bindValues);
+            } catch (RuntimeException e) {
+                // Surface user-side bind errors through the handler contract rather
+                // than propagating out of execute. Keeps error handling consistent
+                // with the rest of the API and avoids leaving the client in a half-
+                // prepared state for the next call.
+                bindValues.reset();
+                handler.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "bind encoding failed: " + e.getMessage());
+                return;
+            }
+        }
         long requestId = nextRequestId++;
         currentRequestId = requestId;
         try {
-            io.submitQuery(sql, requestId, initialCreditBytes);
+            io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen());
             while (true) {
                 QueryEvent ev = io.takeEvent();
                 switch (ev.kind) {
@@ -566,13 +611,13 @@ public class QwpQueryClient implements QuietCloseable {
                         handler.onError(ev.errorStatus, ev.errorMessage);
                         return;
                     default:
-                        handler.onError((byte) 0, "unknown event kind " + ev.kind);
+                        handler.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind);
                         return;
                 }
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            handler.onError((byte) 0, "interrupted while waiting for server response");
+            handler.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "interrupted while waiting for server response");
         } finally {
             currentRequestId = -1L;
         }
@@ -606,9 +651,8 @@ public class QwpQueryClient implements QuietCloseable {
         return lastCloseTimedOut;
     }
 
-    public QwpQueryClient withAuthorization(String authorizationHeader) {
+    public void withAuthorization(String authorizationHeader) {
         this.authorizationHeader = authorizationHeader;
-        return this;
     }
 
     /**
@@ -618,14 +662,13 @@ public class QwpQueryClient implements QuietCloseable {
      * {@code CREATE USER ... WITH PASSWORD ...} can authenticate here unchanged.
      * Must be called before {@link #connect}.
      */
-    public QwpQueryClient withBasicAuth(String username, String password) {
+    public void withBasicAuth(String username, String password) {
         if (username == null || password == null) {
             throw new IllegalArgumentException("username and password must not be null");
         }
         String credentials = username + ":" + password;
         this.authorizationHeader = "Basic " + Base64.getEncoder()
                 .encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
-        return this;
     }
 
     /**
@@ -634,12 +677,11 @@ public class QwpQueryClient implements QuietCloseable {
      * configured OIDC provider and resolves the principal (and any groups)
      * from the token's claims. Must be called before {@link #connect}.
      */
-    public QwpQueryClient withBearerToken(String token) {
+    public void withBearerToken(String token) {
         if (token == null) {
             throw new IllegalArgumentException("token must not be null");
         }
         this.authorizationHeader = "Bearer " + token;
-        return this;
     }
 
     /**
@@ -658,9 +700,8 @@ public class QwpQueryClient implements QuietCloseable {
      * Overrides the {@code X-QWP-Client-Id} header sent during the upgrade handshake.
      * Must be called before {@link #connect()}.
      */
-    public QwpQueryClient withClientId(String clientId) {
+    public void withClientId(String clientId) {
         this.clientId = clientId;
-        return this;
     }
 
     /**
@@ -709,12 +750,11 @@ public class QwpQueryClient implements QuietCloseable {
      * production code should use {@link #withTls} or {@link #withTrustStore}.
      * Must be called before {@link #connect}.
      */
-    public QwpQueryClient withInsecureTls() {
+    public void withInsecureTls() {
         this.tlsEnabled = true;
         this.tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE;
         this.trustStorePath = null;
         this.trustStorePassword = null;
-        return this;
     }
 
     /**
@@ -765,10 +805,6 @@ public class QwpQueryClient implements QuietCloseable {
         this.trustStorePath = trustStorePath;
         this.trustStorePassword = trustStorePassword;
         return this;
-    }
-
-    void recordTerminalFailure(byte status, String message) {
-        terminalFailure.compareAndSet(null, new TerminalFailure(status, message));
     }
 
     private static String defaultClientId() {
@@ -828,6 +864,10 @@ public class QwpQueryClient implements QuietCloseable {
                     + "string to disable compression, or retry once memory pressure subsides.");
         }
         Zstd.freeDCtx(dctx);
+    }
+
+    void recordTerminalFailure(byte status, String message) {
+        terminalFailure.compareAndSet(null, new TerminalFailure(status, message));
     }
 
     private static final class TerminalFailure {

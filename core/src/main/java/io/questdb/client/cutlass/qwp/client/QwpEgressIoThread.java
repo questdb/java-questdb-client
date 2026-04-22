@@ -102,10 +102,6 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private long currentRequestId = -1L;
     private volatile boolean shutdown;
 
-    public QwpEgressIoThread(WebSocketClient wsClient, int bufferPoolSize) {
-        this(wsClient, bufferPoolSize, null);
-    }
-
     public QwpEgressIoThread(WebSocketClient wsClient, int bufferPoolSize, TerminalFailureListener terminalFailureListener) {
         this.wsClient = wsClient;
         this.terminalFailureListener = terminalFailureListener;
@@ -121,7 +117,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // leaking those buffers' native scratches for the JVM's lifetime.
         try {
             for (int i = 0; i < bufferPoolSize; i++) {
-                freeBuffers.offer(new QwpBatchBuffer(DEFAULT_BUFFER_CAPACITY));
+                // add() throws on capacity violation, which is what we want here:
+                // the queue was just allocated with capacity == bufferPoolSize so
+                // every insertion must succeed. A silent drop via offer() would
+                // leave the pool smaller than advertised.
+                freeBuffers.add(new QwpBatchBuffer(DEFAULT_BUFFER_CAPACITY));
             }
         } catch (Throwable t) {
             for (QwpBatchBuffer b : freeBuffers) {
@@ -143,14 +143,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         long payloadEnd = payload + payloadLen;
         long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
         if (p + 1 + 2 > payloadEnd) {
-            return new QueryEvent().asError((byte) 0, "QUERY_ERROR frame truncated before msg_len");
+            return new QueryEvent().asError(WebSocketResponse.STATUS_INTERNAL_ERROR, "QUERY_ERROR frame truncated before msg_len");
         }
         byte status = Unsafe.getUnsafe().getByte(p);
         p += 1;
         int msgLen = Unsafe.getUnsafe().getShort(p) & 0xFFFF;
         p += 2;
         if (p + msgLen > payloadEnd) {
-            return new QueryEvent().asError((byte) 0,
+            return new QueryEvent().asError(WebSocketResponse.STATUS_INTERNAL_ERROR,
                     "QUERY_ERROR msg_len " + msgLen + " exceeds frame remainder " + (payloadEnd - p));
         }
         byte[] bytes = new byte[msgLen];
@@ -163,7 +163,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     @Override
     public void onBinaryMessage(long payloadPtr, int payloadLen) {
         if (payloadLen < QwpConstants.HEADER_SIZE + 1) {
-            emitTerminalError((byte) 0, "server sent truncated frame");
+            emitTerminalError("server sent truncated frame");
             // Stop the receive loop; the framing is broken and any further bytes
             // would be misinterpreted relative to the expected message boundary.
             currentQueryDone = true;
@@ -183,16 +183,16 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             decodeAndEmitError(payloadPtr, payloadLen);
             currentQueryDone = true;
         } else {
-            emitTerminalError((byte) 0, "unknown msg_kind 0x" + Integer.toHexString(msgKind & 0xFF));
+            emitTerminalError("unknown msg_kind 0x" + Integer.toHexString(msgKind & 0xFF));
             currentQueryDone = true;
         }
     }
 
     @Override
     public void onClose(int code, String reason) {
-        notifyTerminalFailure((byte) 0, "server closed connection: code=" + code + " reason=" + reason);
+        notifyTerminalFailure("server closed connection: code=" + code + " reason=" + reason);
         if (!currentQueryDone) {
-            emitError((byte) 0, "server closed connection: code=" + code + " reason=" + reason);
+            emitError(WebSocketResponse.STATUS_INTERNAL_ERROR, "server closed connection: code=" + code + " reason=" + reason);
             currentQueryDone = true;
         }
     }
@@ -215,7 +215,13 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             buffer.close();
             return;
         }
-        freeBuffers.offer(buffer);
+        // Invariant: at most bufferPoolSize buffers exist, so a slot is always
+        // free when the user releases one. If offer ever fails we'd leak the
+        // buffer's native scratch; close in place so an invariant violation
+        // surfaces as a broken buffer rather than a slow native-memory leak.
+        if (!freeBuffers.offer(buffer)) {
+            buffer.close();
+        }
         pendingRelease.offer(RELEASE_TOKEN);
     }
 
@@ -255,8 +261,8 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                 }
             }
         } catch (Throwable t) {
-            notifyTerminalFailure((byte) 0, "I/O thread failure: " + t.getMessage());
-            emitErrorBlocking((byte) 0, "I/O thread failure: " + t.getMessage());
+            notifyTerminalFailure("I/O thread failure: " + t.getMessage());
+            emitErrorBlocking("I/O thread failure: " + t.getMessage());
         } finally {
             // Wake any user thread blocked on events.take(). Without this, a close()
             // (or any abnormal exit) while a user thread is mid-execute() would let
@@ -268,9 +274,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                         : "I/O thread terminated with query in flight";
                 if (!shutdown) {
                     // Shutdown is a user-driven close; don't mark the client terminal for it.
-                    notifyTerminalFailure((byte) 0, msg);
+                    notifyTerminalFailure(msg);
                 }
-                emitErrorBlocking((byte) 0, msg);
+                emitErrorBlocking(msg);
                 currentQueryDone = true;
             }
         }
@@ -289,9 +295,24 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * (server streams without flow control, Phase-1 default); any positive value
      * asks the server to suspend once it has emitted that many bytes and wait
      * for a CREDIT frame.
+     * <p>
+     * The {@code bindPayloadPtr} / {@code bindPayloadLen} range holds the
+     * pre-encoded per-bind wire bytes (type code + null flag + value, one
+     * sequence per bind) produced on the user thread by
+     * {@link QwpBindValues}. The I/O thread reads this range synchronously
+     * during {@link #sendQueryRequest} and does not retain a reference after
+     * the send completes. {@code bindCount} is the number of binds the
+     * payload contains; zero when the user supplied no binds.
      */
-    public void submitQuery(String sql, long requestId, long initialCredit) throws InterruptedException {
-        requests.put(new QueryRequest(sql, requestId, initialCredit));
+    public void submitQuery(
+            String sql,
+            long requestId,
+            long initialCredit,
+            int bindCount,
+            long bindPayloadPtr,
+            long bindPayloadLen
+    ) throws InterruptedException {
+        requests.put(new QueryRequest(sql, requestId, initialCredit, bindCount, bindPayloadPtr, bindPayloadLen));
     }
 
     /**
@@ -314,7 +335,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
         long limit = payload + payloadLen;
         if (p + 1 > limit) {
-            emitTerminalError((byte) 0, "EXEC_DONE frame truncated before op_type");
+            emitTerminalError("EXEC_DONE frame truncated before op_type");
             return;
         }
         byte opType = Unsafe.getUnsafe().getByte(p++);
@@ -326,7 +347,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             if ((b & 0x80) == 0) break;
             shift += 7;
             if (shift > 63) {
-                emitTerminalError((byte) 0, "EXEC_DONE rows_affected varint overflow");
+                emitTerminalError("EXEC_DONE rows_affected varint overflow");
                 return;
             }
         }
@@ -391,8 +412,8 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * shutdown and fatal-error paths where dropping the event would leave the
      * user thread blocked on {@link #takeEvent} indefinitely.
      */
-    private void emitErrorBlocking(byte status, String message) {
-        QueryEvent ev = new QueryEvent().asError(status, message);
+    private void emitErrorBlocking(String message) {
+        QueryEvent ev = new QueryEvent().asError(WebSocketResponse.STATUS_INTERNAL_ERROR, message);
         while (!events.offer(ev)) {
             // Events queue is bounded; the consumer side (user thread) drains
             // steadily under a cooperative shutdown. Yield between retries so
@@ -411,9 +432,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     // state. Use for transport- or protocol-level faults where the WebSocket
     // is no longer usable; per-query QUERY_ERROR must still go through
     // plain emitError, since the connection remains healthy after it.
-    private void emitTerminalError(byte status, String message) {
-        notifyTerminalFailure(status, message);
-        emitError(status, message);
+    private void emitTerminalError(String message) {
+        notifyTerminalFailure(message);
+        emitError(WebSocketResponse.STATUS_INTERNAL_ERROR, message);
     }
 
     private void handleResultBatch(long payloadPtr, int payloadLen) {
@@ -438,10 +459,15 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         try {
             decoder.decode(buf, payloadPtr, payloadLen);
         } catch (QwpDecodeException e) {
-            freeBuffers.offer(buf);
+            // Same invariant as releaseBuffer: a slot is always free for a buf
+            // we took out of the pool moments ago. Close-on-failure is a
+            // defensive guard against future refactors breaking that invariant.
+            if (!freeBuffers.offer(buf)) {
+                buf.close();
+            }
             // A decode failure leaves the client-side decoder out of step with
             // the server's byte stream: the next frame cannot be trusted.
-            emitTerminalError((byte) 0, "decode failure: " + e.getMessage());
+            emitTerminalError("decode failure: " + e.getMessage());
             currentQueryDone = true;
             return;
         }
@@ -465,10 +491,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         }
     }
 
-    private void notifyTerminalFailure(byte status, String message) {
+    private void notifyTerminalFailure(String message) {
         if (terminalFailureListener != null) {
             try {
-                terminalFailureListener.onTerminalFailure(status, message);
+                terminalFailureListener.onTerminalFailure(WebSocketResponse.STATUS_INTERNAL_ERROR, message);
             } catch (Throwable ignored) {
                 // Listener must not bring down the I/O thread. A first-failure-wins
                 // CAS in the listener cannot throw in practice; defensive anyway.
@@ -503,6 +529,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
 
     /**
      * Builds and transmits a QUERY_REQUEST frame on the WebSocket.
+     * The bind payload, if any, is copied straight from the user thread's
+     * {@link QwpBindValues} scratch into the send buffer; no per-bind encoding
+     * happens on this thread.
      */
     private void sendQueryRequest(QueryRequest req) {
         byte[] sqlBytes = req.sql.getBytes(StandardCharsets.UTF_8);
@@ -514,7 +543,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             sendScratch.putByte(b);
         }
         sendScratch.putVarint(req.initialCredit); // 0 = unbounded (Phase-1 default)
-        sendScratch.putVarint(0); // bind_count = 0
+        sendScratch.putVarint(req.bindCount);
+        if (req.bindCount > 0 && req.bindPayloadLen > 0) {
+            sendScratch.putBlockOfBytes(req.bindPayloadPtr, req.bindPayloadLen);
+        }
         wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
         sendScratch.reset();
     }
@@ -553,7 +585,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         freeBuffers.clear();
         // The events queue capacity is bufferPoolSize + 2 with no consumer competing
         // for slots after the I/O thread has joined, so offer is guaranteed to succeed.
-        events.offer(new QueryEvent().asError((byte) 0, "QwpQueryClient closed"));
+        events.offer(new QueryEvent().asError(WebSocketResponse.STATUS_INTERNAL_ERROR, "QwpQueryClient closed"));
     }
 
     @FunctionalInterface
@@ -562,14 +594,20 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     private static final class QueryRequest {
+        final int bindCount;
+        final long bindPayloadLen;
+        final long bindPayloadPtr;
         final long initialCredit;
         final long requestId;
         final String sql;
 
-        QueryRequest(String sql, long requestId, long initialCredit) {
+        QueryRequest(String sql, long requestId, long initialCredit, int bindCount, long bindPayloadPtr, long bindPayloadLen) {
             this.sql = sql;
             this.requestId = requestId;
             this.initialCredit = initialCredit;
+            this.bindCount = bindCount;
+            this.bindPayloadPtr = bindPayloadPtr;
+            this.bindPayloadLen = bindPayloadLen;
         }
     }
 }
