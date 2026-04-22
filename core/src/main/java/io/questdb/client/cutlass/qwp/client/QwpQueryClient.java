@@ -370,7 +370,12 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Creates a plain-text (non-TLS) QWP query client.
+     * Creates a plain-text (non-TLS) QWP query client against {@code host:port}
+     * with all other settings at their defaults. For TLS, authentication,
+     * custom paths, compression, or buffer pool sizing use
+     * {@link #fromConfig(CharSequence)} with a connection string instead.
+     *
+     * @see #fromConfig(CharSequence)
      */
     public static QwpQueryClient newPlainText(CharSequence host, int port) {
         return new QwpQueryClient(host, port);

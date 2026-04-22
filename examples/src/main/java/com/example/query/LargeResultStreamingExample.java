@@ -39,7 +39,7 @@ public class LargeResultStreamingExample {
                             batchCount[0]++;
                             int rows = batch.getRowCount();
                             for (int r = 0; r < rows; r++) {
-                                priceSum[0] += batch.getDouble(1, r);
+                                priceSum[0] += batch.getDoubleValue(1, r);
                             }
                             rowsSeen[0] += rows;
 

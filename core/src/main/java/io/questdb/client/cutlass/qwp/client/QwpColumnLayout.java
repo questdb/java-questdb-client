@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 
@@ -93,6 +94,14 @@ public class QwpColumnLayout implements QuietCloseable {
      */
     int[] symbolRowIds;
     /**
+     * SYMBOL: lazy String cache indexed by dict ID. Populated on first
+     * {@code getSymbol}/{@code getSymbolForId}/{@code getString}(SYMBOL) call
+     * so a query over 10M rows with N distinct symbols materialises only N
+     * Strings per batch instead of one per row. Cleared (size reset to 0) in
+     * {@link #clear()} because a reused layout may be rebound to a different dict.
+     */
+    final ObjList<String> symbolStringCache = new ObjList<>();
+    /**
      * Absolute payload address where this column's non-null values start. For
      * fixed-width types this is the dense values array. For strings/varchars
      * it's the offsets array. For symbols it's where the dict starts; the
@@ -141,6 +150,7 @@ public class QwpColumnLayout implements QuietCloseable {
         symbolDictHeapAddr = 0;
         symbolDictEntriesAddr = 0;
         symbolDictSize = 0;
+        symbolStringCache.clear();
         nextAddr = 0;
     }
 

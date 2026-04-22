@@ -31,10 +31,10 @@ public class BasicQueryExample {
                             // It is valid only for the duration of this callback — copy out
                             // anything you need to retain after the method returns.
                             for (int row = 0; row < batch.getRowCount(); row++) {
-                                long timestamp = batch.getLong(0, row);       // TIMESTAMP → microseconds since epoch
-                                String symbol = batch.getString(1, row);      // SYMBOL → String
-                                double price = batch.getDouble(2, row);       // DOUBLE
-                                long qty = batch.getLong(3, row);             // LONG
+                                long timestamp = batch.getLongValue(0, row);  // TIMESTAMP -> microseconds since epoch
+                                String symbol = batch.getString(1, row);      // SYMBOL -> String
+                                double price = batch.getDoubleValue(2, row);  // DOUBLE
+                                long qty = batch.getLongValue(3, row);        // LONG
 
                                 System.out.printf(
                                         "ts=%d sym=%s price=%.4f qty=%d%n",

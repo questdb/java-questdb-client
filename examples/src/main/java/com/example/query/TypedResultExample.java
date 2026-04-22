@@ -4,6 +4,8 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.std.Long256Impl;
+import io.questdb.client.std.Uuid;
 
 /**
  * Reading every supported wire type from a {@link QwpColumnBatch}.
@@ -31,6 +33,11 @@ public class TypedResultExample {
         try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
             client.connect();
             client.execute("SELECT * FROM demo LIMIT 5", new QwpColumnBatchHandler() {
+                // Sinks live at the handler level so they're reused across every
+                // (row, col) that needs a UUID or LONG256/DECIMAL256 decode.
+                final Long256Impl long256Sink = new Long256Impl();
+                final Uuid uuidSink = new Uuid();
+
                 @Override
                 public void onBatch(QwpColumnBatch batch) {
                     int cols = batch.getColumnCount();
@@ -43,7 +50,7 @@ public class TypedResultExample {
                             if (batch.isNull(col, row)) {
                                 line.append("NULL");
                             } else {
-                                appendCell(line, batch, col, row);
+                                appendCell(line, batch, col, row, uuidSink, long256Sink);
                             }
                         }
                         System.out.println(line);
@@ -65,49 +72,72 @@ public class TypedResultExample {
     /**
      * Appends a typed value to the builder using the column's wire type to pick
      * the right accessor. The set of wire type codes is in {@link QwpConstants}.
+     * {@code uuidSink} and {@code long256Sink} are reusable sinks owned by the
+     * caller; passing them in keeps UUID / LONG256 / DECIMAL256 decoding
+     * allocation-free across all cells in the query.
      */
-    private static void appendCell(StringBuilder out, QwpColumnBatch batch, int col, int row) {
+    private static void appendCell(StringBuilder out, QwpColumnBatch batch, int col, int row,
+                                   Uuid uuidSink, Long256Impl long256Sink) {
         byte type = batch.getColumnWireType(col);
-        if (type == QwpConstants.TYPE_BOOLEAN) {
-            out.append(((Boolean) batch.getValue(col, row)).booleanValue());
-        } else if (type == QwpConstants.TYPE_BYTE
-                || type == QwpConstants.TYPE_SHORT
-                || type == QwpConstants.TYPE_CHAR
-                || type == QwpConstants.TYPE_INT
-                || type == QwpConstants.TYPE_LONG
-                || type == QwpConstants.TYPE_DATE
-                || type == QwpConstants.TYPE_TIMESTAMP
-                || type == QwpConstants.TYPE_TIMESTAMP_NANOS
-                || type == QwpConstants.TYPE_DECIMAL64) {
-            out.append(batch.getLong(col, row));
-        } else if (type == QwpConstants.TYPE_FLOAT) {
-            out.append(batch.getFloat(col, row));
-        } else if (type == QwpConstants.TYPE_DOUBLE) {
-            out.append(batch.getDouble(col, row));
-        } else if (type == QwpConstants.TYPE_SYMBOL) {
-            out.append(batch.getString(col, row));
-        } else if (type == QwpConstants.TYPE_VARCHAR) {
-            out.append(new String(batch.getVarchar(col, row)));
-        } else if (type == QwpConstants.TYPE_UUID) {
-            long[] parts = batch.getLongArray(col, row); // [lo, hi]
-            out.append(String.format("%016x-%016x", parts[1], parts[0]));
-        } else if (type == QwpConstants.TYPE_LONG256) {
-            long[] parts = batch.getLongArray(col, row); // 4 longs LSB-first
-            out.append(String.format("0x%016x%016x%016x%016x",
-                    parts[3], parts[2], parts[1], parts[0]));
-        } else if (type == QwpConstants.TYPE_GEOHASH) {
-            out.append("geohash(").append(batch.getGeohashPrecisionBits(col))
-                    .append("b)=0x").append(Long.toHexString(batch.getLong(col, row)));
-        } else if (type == QwpConstants.TYPE_DECIMAL128 || type == QwpConstants.TYPE_DECIMAL256) {
-            long[] parts = batch.getLongArray(col, row);
-            out.append("decimal(");
-            for (int i = 0; i < parts.length; i++) {
-                if (i > 0) out.append(',');
-                out.append(parts[i]);
-            }
-            out.append(')');
-        } else {
-            out.append("(type 0x").append(Integer.toHexString(type & 0xFF)).append(")");
+        switch (type) {
+            case QwpConstants.TYPE_BOOLEAN:
+                out.append(batch.getBoolValue(col, row));
+                break;
+            case QwpConstants.TYPE_BYTE:
+                out.append(batch.getByteValue(col, row));
+                break;
+            case QwpConstants.TYPE_SHORT:
+                out.append(batch.getShortValue(col, row));
+                break;
+            case QwpConstants.TYPE_CHAR:
+                out.append(batch.getCharValue(col, row));
+                break;
+            case QwpConstants.TYPE_INT:
+            case QwpConstants.TYPE_IPv4:
+                out.append(batch.getIntValue(col, row));
+                break;
+            case QwpConstants.TYPE_LONG:
+            case QwpConstants.TYPE_DATE:
+            case QwpConstants.TYPE_TIMESTAMP:
+            case QwpConstants.TYPE_TIMESTAMP_NANOS:
+            case QwpConstants.TYPE_DECIMAL64:
+                out.append(batch.getLongValue(col, row));
+                break;
+            case QwpConstants.TYPE_FLOAT:
+                out.append(batch.getFloatValue(col, row));
+                break;
+            case QwpConstants.TYPE_DOUBLE:
+                out.append(batch.getDoubleValue(col, row));
+                break;
+            case QwpConstants.TYPE_SYMBOL:
+            case QwpConstants.TYPE_VARCHAR:
+                out.append(batch.getString(col, row));
+                break;
+            case QwpConstants.TYPE_UUID:
+                batch.getUuid(col, row, uuidSink);
+                out.append(String.format("%016x-%016x", uuidSink.getHi(), uuidSink.getLo()));
+                break;
+            case QwpConstants.TYPE_LONG256:
+            case QwpConstants.TYPE_DECIMAL256:
+                batch.getLong256(col, row, long256Sink);
+                out.append(String.format("0x%016x%016x%016x%016x",
+                        long256Sink.getLong3(),
+                        long256Sink.getLong2(),
+                        long256Sink.getLong1(),
+                        long256Sink.getLong0()));
+                break;
+            case QwpConstants.TYPE_GEOHASH:
+                out.append("geohash(").append(batch.getGeohashPrecisionBits(col))
+                        .append("b)=0x").append(Long.toHexString(batch.getGeohashValue(col, row)));
+                break;
+            case QwpConstants.TYPE_DECIMAL128:
+                out.append("decimal(")
+                        .append(batch.getDecimal128Low(col, row)).append(',')
+                        .append(batch.getDecimal128High(col, row)).append(')');
+                break;
+            default:
+                out.append("(type 0x").append(Integer.toHexString(type & 0xFF)).append(")");
+                break;
         }
     }
 }

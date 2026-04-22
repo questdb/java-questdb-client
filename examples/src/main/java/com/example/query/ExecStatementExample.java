@@ -67,9 +67,9 @@ public class ExecStatementExample {
                             for (int row = 0; row < batch.getRowCount(); row++) {
                                 System.out.printf(
                                         "  ts=%d sym=%s qty=%d%n",
-                                        batch.getLong(0, row),
+                                        batch.getLongValue(0, row),
                                         batch.getString(1, row),
-                                        batch.getLong(2, row)
+                                        batch.getLongValue(2, row)
                                 );
                             }
                         }

@@ -25,41 +25,83 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.std.Long256Sink;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.Uuid;
 import io.questdb.client.std.bytes.DirectByteSequence;
+import io.questdb.client.std.bytes.DirectByteSlice;
+import io.questdb.client.std.str.CharSink;
 import io.questdb.client.std.str.DirectUtf8Sequence;
 import io.questdb.client.std.str.DirectUtf8String;
 
 import java.nio.charset.StandardCharsets;
 
 /**
- * Column-major view over one decoded {@code RESULT_BATCH}. Valid only during the
- * {@link QwpColumnBatchHandler#onBatch} callback; becomes stale once control returns
- * to the decoder.
+ * Column-major view over one decoded {@code RESULT_BATCH}. Handed to
+ * {@link QwpColumnBatchHandler#onBatch} and valid only for the duration of that
+ * callback; all pointers and row indices become stale once control returns to
+ * the decoder. To retain a value past the callback, copy it out.
  * <p>
- * Accessors are designed for zero-allocation on the hot path: fixed-width values
- * are read straight from the native WebSocket payload buffer, and string/varchar
- * access returns a reusable {@link DirectUtf8Sequence} view ({@link #getStrA} /
- * {@link #getStrB}) that re-points at the underlying bytes with each call.
+ * <strong>Threading:</strong> not thread-safe. The batch is produced on the
+ * client's I/O thread and consumed on whichever thread calls
+ * {@code onBatch}. Dispatching work to another thread requires copying values
+ * first.
  * <p>
- * Convenience accessors that materialise heap objects ({@link #getString},
- * {@link #getVarchar}, {@link #getLongArray}, {@link #getValue}) are provided for
- * ergonomics but allocate; use the native-view accessors on the hot path.
+ * <strong>Indexing:</strong> {@code col} and {@code row} are 0-based. Out-of-range
+ * values surface as {@link ArrayIndexOutOfBoundsException}.
+ * <p>
+ * <strong>Type contract:</strong> each typed accessor is valid only for a specific
+ * wire type (or small family of compatible wire types). Cross-check with
+ * {@link #getColumnWireType(int)} before dispatching. Calling an accessor whose
+ * type doesn't match the column's wire type yields <em>undefined</em> results --
+ * the underlying native read uses a stride that matches the declared type, so
+ * you will silently get bytes at the wrong offset.
+ * <p>
+ * <strong>NULL handling:</strong> call {@link #isNull(int, int)} when NULL vs.
+ * value must be distinguished. When a typed accessor is called on a NULL row
+ * the returned value is a type-dependent zero: {@code 0} / {@code 0L} for
+ * integer and boolean accessors, {@code Double.NaN} / {@code Float.NaN} for
+ * floating-point, {@code null} for reference types, {@code false} for sink
+ * accessors. Sink accessors leave the sink's previous contents untouched on
+ * NULL. Per-accessor NULL behaviour is not repeated in method docs; this
+ * paragraph is the contract.
+ * <p>
+ * <strong>Four zero-allocation idioms</strong> -- pick whichever matches the
+ * wire type of the column:
+ * <ul>
+ *   <li><b>Primitive accessors</b> ({@link #getLongValue}, {@link #getIntValue},
+ *       {@link #getDoubleValue}, {@link #getBoolValue}, etc.) read fixed-width
+ *       values straight from the payload buffer with one native load.</li>
+ *   <li><b>UTF-8 views</b> ({@link #getStrA}, {@link #getStrB}) return reusable
+ *       {@link DirectUtf8Sequence} flyweights pointing into the payload (or into
+ *       the symbol dict heap for SYMBOL columns). Each call re-points the view,
+ *       so hold at most two live views at once via the A/B pair.</li>
+ *   <li><b>Sink accessors</b> ({@link #getLong256(int, int, Long256Sink)},
+ *       {@link #getUuid(int, int, Uuid)},
+ *       {@link #getString(int, int, CharSink)}) copy multi-word or variable-width
+ *       values into a caller-owned sink in a single call. Reuse the sink across
+ *       rows.</li>
+ *   <li><b>Symbol cache</b> ({@link #getSymbol}, {@link #getSymbolForId},
+ *       {@link #getSymbolId}) materialises each distinct SYMBOL dict entry into
+ *       a {@link String} at most once per batch, regardless of how many rows
+ *       reference it.</li>
+ * </ul>
+ * The heap-allocating convenience accessors {@link #getString(int, int)},
+ * {@link #getBinary(int, int)}, and {@link #getDoubleArrayElements(int, int)}
+ * allocate per call and are meant for low-volume access only.
  */
 public class QwpColumnBatch {
 
     final ObjList<QwpColumnLayout> columnLayouts = new ObjList<>();
     // BINARY views -- re-pointed per call, never re-allocated.
-    private final io.questdb.client.std.bytes.DirectByteSlice binaryA = new io.questdb.client.std.bytes.DirectByteSlice();
-    private final io.questdb.client.std.bytes.DirectByteSlice binaryB = new io.questdb.client.std.bytes.DirectByteSlice();
+    private final DirectByteSlice binaryA = new DirectByteSlice();
+    private final DirectByteSlice binaryB = new DirectByteSlice();
     // Reusable views for zero-alloc UTF-8 access. strA and strB are dual views
     // (same pattern as QuestDB Record.getStrA/getStrB) so callers can compare
     // two cells without one overwriting the other.
     private final DirectUtf8String strA = new DirectUtf8String();
     private final DirectUtf8String strB = new DirectUtf8String();
-    private final DirectUtf8String varcharA = new DirectUtf8String();
-    private final DirectUtf8String varcharB = new DirectUtf8String();
     long batchSeq;
     int columnCount;
     ObjList<QwpEgressColumnInfo> columns;
@@ -68,6 +110,11 @@ public class QwpColumnBatch {
     long requestId;
     int rowCount;
 
+    /**
+     * Server-assigned monotonic sequence number for this batch within the query.
+     * First batch is 0. Useful for cross-referencing client-side timings with
+     * server logs or for detecting batch gaps.
+     */
     public long batchSeq() {
         return batchSeq;
     }
@@ -83,9 +130,9 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Heap-allocating convenience. Returns the raw bytes of a BINARY value, or {@code null}
-     * for NULL rows. Allocates a new {@code byte[]} per call; on the hot path prefer
-     * {@link #getBinaryA} which returns a reusable native view.
+     * Heap-allocating convenience. Returns the raw bytes of a BINARY value. Allocates
+     * a new {@code byte[]} per call; on the hot path prefer {@link #getBinaryA} which
+     * returns a reusable native view.
      */
     public byte[] getBinary(int col, int row) {
         io.questdb.client.std.bytes.DirectByteSequence v = lookupBinaryBytes(col, row, binaryA);
@@ -115,7 +162,11 @@ public class QwpColumnBatch {
         return lookupBinaryBytes(col, row, binaryB);
     }
 
-    public boolean getBool(int col, int row) {
+    /**
+     * Returns a single BOOLEAN value. Caller must know the column is BOOLEAN.
+     * Values are bit-packed on the wire (8 per byte).
+     */
+    public boolean getBoolValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return false;
         int denseIdx = l.denseIndex(row);
@@ -125,8 +176,7 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Returns a single BYTE value without the type-dispatch branch in {@link #getLong}.
-     * The caller must know the column is BYTE.
+     * Returns a single BYTE value. The caller must know the column is BYTE.
      */
     public byte getByteValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
@@ -143,14 +193,26 @@ public class QwpColumnBatch {
         return (char) Unsafe.getUnsafe().getShort(l.valuesAddr + 2L * l.denseIndex(row));
     }
 
+    /**
+     * Number of columns in the result schema. Matches the projection of the SELECT.
+     */
     public int getColumnCount() {
         return columnCount;
     }
 
+    /**
+     * Column name as declared by the schema (e.g. the SELECT alias or underlying
+     * column identifier). Same across every batch of the query.
+     */
     public String getColumnName(int col) {
         return columns.getQuick(col).name;
     }
 
+    /**
+     * QWP wire type code for the column, used to choose the right typed accessor.
+     * See {@link io.questdb.client.cutlass.qwp.protocol.QwpConstants} for the
+     * {@code TYPE_*} constants.
+     */
     public byte getColumnWireType(int col) {
         return columns.getQuick(col).wireType;
     }
@@ -173,21 +235,27 @@ public class QwpColumnBatch {
         return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.denseIndex(row));
     }
 
+    /**
+     * Scale (number of fractional digits) for DECIMAL64 / DECIMAL128 / DECIMAL256
+     * columns. Same across every row in the batch. Undefined for non-DECIMAL columns.
+     */
     public int getDecimalScale(int col) {
         return columns.getQuick(col).scale;
     }
 
-    public double getDouble(int col, int row) {
+    /**
+     * Returns a single DOUBLE value. Caller must know the column is DOUBLE.
+     */
+    public double getDoubleValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return Double.NaN;
         return Unsafe.getUnsafe().getDouble(l.valuesAddr + 8L * l.denseIndex(row));
     }
 
     /**
-     * Returns the flattened elements of a DOUBLE_ARRAY value in row-major order, or
-     * {@code null} for NULL rows. Heap-allocating convenience -- on the hot path, use
-     * {@link #getArrayNDims}/ and read directly from the
-     * wire via {@code arrayRowAddr}.
+     * Returns the flattened elements of a DOUBLE_ARRAY value in row-major order.
+     * Heap-allocating convenience; use {@link #getArrayNDims} to discover
+     * dimensionality separately if you need it.
      */
     public double[] getDoubleArrayElements(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
@@ -206,19 +274,43 @@ public class QwpColumnBatch {
         return out;
     }
 
-    public float getFloat(int col, int row) {
+    /**
+     * Returns a single FLOAT value. Caller must know the column is FLOAT.
+     */
+    public float getFloatValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return Float.NaN;
         return Unsafe.getUnsafe().getFloat(l.valuesAddr + 4L * l.denseIndex(row));
     }
 
+    /**
+     * Precision (in bits) of a GEOHASH column, in the range 1..60. Same across
+     * every row in the batch. Undefined for non-GEOHASH columns.
+     */
     public int getGeohashPrecisionBits(int col) {
         return columns.getQuick(col).precisionBits;
     }
 
     /**
-     * Returns a single INT value without type dispatch. Caller must know the
-     * column is INT or IPv4. Returns 0 for NULL rows.
+     * Returns a GEOHASH value packed into a long (up to 60 bits of precision).
+     * Caller must know the column is GEOHASH; use {@link #getGeohashPrecisionBits}
+     * to retrieve the bit width.
+     */
+    public long getGeohashValue(int col, int row) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return 0L;
+        int denseIdx = l.denseIndex(row);
+        int bytesPerValue = (l.info.precisionBits + 7) >>> 3;
+        long p = l.valuesAddr + (long) bytesPerValue * denseIdx;
+        long bits = 0;
+        for (int b = 0; b < bytesPerValue; b++) {
+            bits |= ((long) (Unsafe.getUnsafe().getByte(p + b) & 0xFF)) << (b * 8);
+        }
+        return bits;
+    }
+
+    /**
+     * Returns a single INT value. Caller must know the column is INT or IPv4.
      */
     public int getIntValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
@@ -227,49 +319,24 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Returns a LONG / INT / SHORT / BYTE / CHAR / TIMESTAMP / DATE / DECIMAL64 / GEOHASH value,
-     * dispatching by the column's wire type. Convenience for schema-agnostic code.
-     * Hot loops should call the type-specific accessors ({@link #getLongValue},
-     * {@link #getIntValue}, {@link #getShortValue}, {@link #getByteValue}, {@link #getCharValue})
-     * to skip the branch chain.
-     * Returns 0 for NULL rows; use {@link #isNull} first when that matters.
+     * Zero-allocation read of a LONG256 or DECIMAL256 value. Copies all four
+     * 64-bit words into {@code sink} in a single call. Returns {@code true}
+     * on a hit, {@code false} for NULL rows (the sink is left untouched).
+     * Prefer this over four {@link #getLong256Word} calls on the hot path --
+     * one virtual dispatch instead of four, one address computation instead
+     * of four.
      */
-    public long getLong(int col, int row) {
+    public boolean getLong256(int col, int row, Long256Sink sink) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
-        if (isLayoutNull(l, row)) return 0L;
-        byte wt = l.info.wireType;
-        int denseIdx = l.denseIndex(row);
-        if (wt == QwpConstants.TYPE_LONG || wt == QwpConstants.TYPE_DATE
-                || wt == QwpConstants.TYPE_TIMESTAMP || wt == QwpConstants.TYPE_TIMESTAMP_NANOS
-                || wt == QwpConstants.TYPE_DECIMAL64) {
-            return Unsafe.getUnsafe().getLong(l.valuesAddr + 8L * denseIdx);
-        }
-        if (wt == QwpConstants.TYPE_INT || wt == QwpConstants.TYPE_IPv4) {
-            return Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * denseIdx);
-        }
-        if (wt == QwpConstants.TYPE_SHORT || wt == QwpConstants.TYPE_CHAR) {
-            return Unsafe.getUnsafe().getShort(l.valuesAddr + 2L * denseIdx);
-        }
-        if (wt == QwpConstants.TYPE_BYTE) {
-            return Unsafe.getUnsafe().getByte(l.valuesAddr + denseIdx);
-        }
-        if (wt == QwpConstants.TYPE_GEOHASH) {
-            int precBits = l.info.precisionBits;
-            int bytesPerValue = (precBits + 7) >>> 3;
-            long p = l.valuesAddr + (long) bytesPerValue * denseIdx;
-            long bits = 0;
-            for (int b = 0; b < bytesPerValue; b++) {
-                bits |= ((long) (Unsafe.getUnsafe().getByte(p + b) & 0xFF)) << (b * 8);
-            }
-            return bits;
-        }
-        throw new IllegalStateException("getLong() not applicable for wire type 0x"
-                + Integer.toHexString(wt & 0xFF));
+        if (isLayoutNull(l, row)) return false;
+        sink.fromAddress(l.valuesAddr + 32L * l.denseIndex(row));
+        return true;
     }
 
     /**
      * Returns one of the four 64-bit words of a LONG256 or DECIMAL256 value.
-     * {@code wordIndex} 0 is least significant, 3 is most significant.
+     * {@code wordIndex} 0 is least significant, 3 is most significant. For
+     * bulk reads prefer {@link #getLong256(int, int, Long256Sink)}.
      */
     public long getLong256Word(int col, int row, int wordIndex) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
@@ -277,49 +344,9 @@ public class QwpColumnBatch {
         return Unsafe.getUnsafe().getLong(l.valuesAddr + 32L * l.denseIndex(row) + 8L * wordIndex);
     }
 
-    // Raw column-address API -- for zero-branch hot inner loops.
-    //
-    // Typical usage:
-    //   long base = batch.valuesAddr(col);
-    //   int[] idx = batch.nonNullIndex(col);
-    //   for (int r = 0; r < rowCount; r++) {
-    //       if (idx[r] < 0) continue;              // NULL
-    //       long v = Unsafe.getLong(base + 8L * idx[r]);
-    //       ...
-    //   }
-    //
-    // All four accessors return constant-time views; no allocation.
-
     /**
-     * Convenience: returns a length-{@code N} long array with the components of a UUID,
-     * LONG256, DECIMAL128, or DECIMAL256 value. Allocates -- avoid on the hot path;
-     * use {@link #getUuidLo}/{@link #getUuidHi} or {@link #getLong256Word} instead.
-     */
-    public long[] getLongArray(int col, int row) {
-        QwpColumnLayout l = columnLayouts.getQuick(col);
-        if (isLayoutNull(l, row)) return null;
-        byte wt = l.info.wireType;
-        int denseIdx = l.denseIndex(row);
-        if (wt == QwpConstants.TYPE_UUID || wt == QwpConstants.TYPE_DECIMAL128) {
-            long base = l.valuesAddr + 16L * denseIdx;
-            return new long[]{Unsafe.getUnsafe().getLong(base), Unsafe.getUnsafe().getLong(base + 8)};
-        }
-        if (wt == QwpConstants.TYPE_LONG256 || wt == QwpConstants.TYPE_DECIMAL256) {
-            long base = l.valuesAddr + 32L * denseIdx;
-            return new long[]{
-                    Unsafe.getUnsafe().getLong(base),
-                    Unsafe.getUnsafe().getLong(base + 8),
-                    Unsafe.getUnsafe().getLong(base + 16),
-                    Unsafe.getUnsafe().getLong(base + 24)
-            };
-        }
-        throw new IllegalStateException("getLongArray() not applicable for wire type 0x"
-                + Integer.toHexString(wt & 0xFF));
-    }
-
-    /**
-     * Returns an 8-byte LONG / TIMESTAMP / DATE / DECIMAL64 value without type dispatch.
-     * Caller must know the column is a LONG-family type. Returns 0 for NULL rows.
+     * Returns an 8-byte LONG / TIMESTAMP / DATE / DECIMAL64 value.
+     * Caller must know the column is a LONG-family type.
      */
     public long getLongValue(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
@@ -327,6 +354,11 @@ public class QwpColumnBatch {
         return Unsafe.getUnsafe().getLong(l.valuesAddr + 8L * l.denseIndex(row));
     }
 
+    /**
+     * Number of rows in this batch, including NULL rows. The server caps this
+     * to its {@code max_batch_rows} setting (typically 4096), so a query that
+     * returns more rows arrives split across multiple {@code onBatch} calls.
+     */
     public int getRowCount() {
         return rowCount;
     }
@@ -342,27 +374,39 @@ public class QwpColumnBatch {
 
     /**
      * Zero-allocation UTF-8 view over the STRING / VARCHAR / SYMBOL value at
-     * {@code (col, row)}. The returned view is invalidated by the next call to
-     * {@code getStrA} / {@code getStrB} / {@code getVarcharA} / {@code getVarcharB}
-     * or once the enclosing {@code onBatch} callback returns.
+     * {@code (col, row)}. For STRING / VARCHAR the view points into the payload
+     * buffer; for SYMBOL it points into the per-batch symbol dictionary heap
+     * (same lifetime either way -- both are invalidated when {@code onBatch}
+     * returns). The returned view is also invalidated by the next call to
+     * {@code getStrA} on this batch; use {@link #getStrB} for the dual slot
+     * when two concurrent views are needed.
      */
     public DirectUtf8Sequence getStrA(int col, int row) {
         return lookupStringBytes(col, row, strA);
     }
 
     /**
-     * Dual of {@link #getStrA}; use when you need to hold two string views concurrently.
+     * Dual of {@link #getStrA}; use when you need to hold two string views
+     * concurrently (e.g. row-vs-row comparisons within one batch).
      */
     public DirectUtf8Sequence getStrB(int col, int row) {
         return lookupStringBytes(col, row, strB);
     }
 
     /**
-     * Heap-allocating convenience. Returns a {@link String} for STRING / SYMBOL
-     * columns, or the UTF-8 bytes as a {@link String} for VARCHAR. Returns {@code null}
-     * for NULL rows. Allocates; on the hot path prefer {@link #getStrA}.
+     * Heap-allocating convenience. Returns a {@link String} for STRING / SYMBOL /
+     * VARCHAR columns. For STRING / VARCHAR each call allocates a new String; on
+     * the hot path prefer {@link #getStrA} or {@link #getString(int, int, CharSink)}.
+     * For SYMBOL the result is cached per dict entry (see {@link #getSymbol}) so
+     * repeated calls against rows sharing a dict entry return the same String
+     * instance.
      */
     public String getString(int col, int row) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return null;
+        if (l.info.wireType == QwpConstants.TYPE_SYMBOL) {
+            return lookupCachedSymbol(l, l.symbolRowIds[row]);
+        }
         DirectUtf8Sequence v = lookupStringBytes(col, row, strA);
         if (v == null) return null;
         int size = v.size();
@@ -374,7 +418,82 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Returns the high 64 bits of a UUID value.
+     * Zero-allocation variant of {@link #getString(int, int)}. Writes the STRING /
+     * SYMBOL / VARCHAR value at {@code (col, row)} into {@code sink} -- UTF-8 bytes
+     * pass straight through to a {@link io.questdb.client.std.str.Utf8Sink}; a
+     * {@link io.questdb.client.std.str.Utf16Sink} transcodes to UTF-16 en route.
+     * Returns {@code true} when a value was written, {@code false} when the row is
+     * NULL (the sink is left untouched).
+     */
+    public boolean getString(int col, int row, CharSink<?> sink) {
+        DirectUtf8Sequence v = lookupStringBytes(col, row, strA);
+        if (v == null) return false;
+        sink.put(v);
+        return true;
+    }
+
+    /**
+     * Materialises the SYMBOL value at {@code (col, row)} as a {@link String}.
+     * The result is cached per dict entry on the batch, so a scan over N rows
+     * that share K distinct symbols allocates at most K Strings -- the same
+     * String instance is returned for every row pointing at the same dict
+     * entry.
+     */
+    public String getSymbol(int col, int row) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return null;
+        return lookupCachedSymbol(l, l.symbolRowIds[row]);
+    }
+
+    /**
+     * Number of distinct entries in the SYMBOL column's dictionary for this batch.
+     * Caller must know the column is SYMBOL. In delta mode this equals the size
+     * of the connection-scoped dictionary at the time the batch was decoded.
+     */
+    public int getSymbolDictSize(int col) {
+        return columnLayouts.getQuick(col).symbolDictSize;
+    }
+
+    /**
+     * Materialises the dict entry at {@code dictId} as a {@link String}, with the
+     * same per-entry caching as {@link #getSymbol}. Use together with
+     * {@link #getSymbolId} to walk rows by id instead of value -- e.g. to key a
+     * {@code HashMap<int, ...>} on dict id without ever allocating a String.
+     * Caller must know the column is SYMBOL.
+     */
+    public String getSymbolForId(int col, int dictId) {
+        return lookupCachedSymbol(columnLayouts.getQuick(col), dictId);
+    }
+
+    /**
+     * Dict id for the SYMBOL value at {@code (col, row)}, or {@code -1} for NULL
+     * rows. Ids are stable across a batch and allow id-based processing (see
+     * {@link #getSymbolForId}). Caller must know the column is SYMBOL.
+     */
+    public int getSymbolId(int col, int row) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return -1;
+        return l.symbolRowIds[row];
+    }
+
+    /**
+     * Zero-allocation read of a UUID value. Copies both 64-bit words into
+     * {@code sink} in a single call. Returns {@code true} on a hit,
+     * {@code false} for NULL rows (the sink is left untouched). Prefer this
+     * over paired {@link #getUuidLo} / {@link #getUuidHi} calls on the hot
+     * path -- one virtual dispatch instead of two, one address computation
+     * instead of two.
+     */
+    public boolean getUuid(int col, int row, Uuid sink) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return false;
+        sink.fromAddress(l.valuesAddr + 16L * l.denseIndex(row));
+        return true;
+    }
+
+    /**
+     * Returns the high 64 bits of a UUID value. For bulk reads prefer
+     * {@link #getUuid(int, int, Uuid)}.
      */
     public long getUuidHi(int col, int row) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
@@ -389,55 +508,6 @@ public class QwpColumnBatch {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
         return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.denseIndex(row));
-    }
-
-    /**
-     * Heap-allocating convenience: returns the boxed raw value using the same rules
-     * as the legacy API (Boolean, Long, Float, Double, String, byte[], long[]).
-     * Allocates per call. Prefer the typed accessors.
-     */
-    public Object getValue(int col, int row) {
-        if (isNull(col, row)) return null;
-        QwpColumnLayout l = columnLayouts.getQuick(col);
-        byte wt = l.info.wireType;
-        if (wt == QwpConstants.TYPE_BOOLEAN) return getBool(col, row);
-        if (wt == QwpConstants.TYPE_FLOAT) return getFloat(col, row);
-        if (wt == QwpConstants.TYPE_DOUBLE) return getDouble(col, row);
-        if (wt == QwpConstants.TYPE_SYMBOL) return getString(col, row);
-        if (wt == QwpConstants.TYPE_VARCHAR) return getVarchar(col, row);
-        if (wt == QwpConstants.TYPE_UUID || wt == QwpConstants.TYPE_DECIMAL128
-                || wt == QwpConstants.TYPE_LONG256 || wt == QwpConstants.TYPE_DECIMAL256) {
-            return getLongArray(col, row);
-        }
-        return getLong(col, row);
-    }
-
-    /**
-     * Heap-allocating convenience. Returns the raw UTF-8 bytes of a VARCHAR value,
-     * or {@code null} for NULL rows. Allocates; on the hot path prefer
-     * {@link #getVarcharA}.
-     */
-    public byte[] getVarchar(int col, int row) {
-        DirectUtf8Sequence v = lookupStringBytes(col, row, varcharA);
-        if (v == null) return null;
-        int size = v.size();
-        byte[] bytes = new byte[size];
-        for (int i = 0; i < size; i++) {
-            bytes[i] = v.byteAt(i);
-        }
-        return bytes;
-    }
-
-    /**
-     * Zero-allocation VARCHAR view. Semantically identical to {@link #getStrA} on
-     * VARCHAR columns but conventionally paired with {@link #getVarcharB}.
-     */
-    public DirectUtf8Sequence getVarcharA(int col, int row) {
-        return lookupStringBytes(col, row, varcharA);
-    }
-
-    public DirectUtf8Sequence getVarcharB(int col, int row) {
-        return lookupStringBytes(col, row, varcharB);
     }
 
     /**
@@ -456,8 +526,8 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Number of non-null rows in this column, i.e. the count of entries in the
-     * dense values array pointed to by {@link #valuesAddr(int)}.
+     * Number of non-null rows in the column for this batch. Equal to
+     * {@link #getRowCount()} minus the NULL-row count.
      */
     public int nonNullCount(int col) {
         return columnLayouts.getQuick(col).nonNullCount;
@@ -469,13 +539,14 @@ public class QwpColumnBatch {
      * {@link #getRowCount()}. Valid only during the current {@code onBatch}
      * callback; do not retain.
      * <p>
-     * For columns with no nulls in this batch the decoder skips populating
-     * this array (saves O(rowCount * columnCount) per batch on the typical
-     * no-nulls hot path). This accessor lazy-materialises an identity mapping
-     * on demand for raw-API callers; the result is cached on the layout so
-     * repeated calls within the same batch reuse the allocation. The typed
-     * accessors ({@link #getLong}, {@link #getDouble}, etc.) avoid this
-     * allocation entirely via {@link QwpColumnLayout#denseIndex}.
+     * Most callers don't need this -- the typed accessors
+     * ({@link #getLongValue}, {@link #getDoubleValue}, etc.) already resolve
+     * dense indices internally. Use only when writing custom readers against
+     * the raw column-address API.
+     * <p>
+     * For columns with no nulls the decoder skips populating this array, so
+     * this accessor lazy-materialises an identity mapping on demand; the
+     * result is cached until the next batch.
      */
     public int[] nonNullIndex(int col) {
         QwpColumnLayout l = columnLayouts.getQuick(col);
@@ -504,6 +575,11 @@ public class QwpColumnBatch {
         return payloadLimit;
     }
 
+    /**
+     * Client-assigned request id this batch belongs to. Matches the id the I/O
+     * thread attached to the {@code QUERY_REQUEST} frame. Useful for correlating
+     * batches with {@code execute} calls in diagnostics.
+     */
     public long requestId() {
         return requestId;
     }
@@ -550,6 +626,31 @@ public class QwpColumnBatch {
         int startOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * denseIdx);
         int endOff = Unsafe.getUnsafe().getInt(l.valuesAddr + 4L * (denseIdx + 1));
         return view.of(l.stringBytesAddr + startOff, endOff - startOff);
+    }
+
+    /**
+     * Lazily materialises and caches the String for a SYMBOL dict entry.
+     * The cache lives on the {@link QwpColumnLayout} and is reset to size 0
+     * in {@link QwpColumnLayout#clear()} on every batch reset.
+     */
+    private String lookupCachedSymbol(QwpColumnLayout l, int dictId) {
+        ObjList<String> cache = l.symbolStringCache;
+        if (cache.size() < l.symbolDictSize) {
+            cache.setPos(l.symbolDictSize);
+        }
+        String s = cache.getQuick(dictId);
+        if (s == null) {
+            long packed = Unsafe.getUnsafe().getLong(l.symbolDictEntriesAddr + ((long) dictId << 3));
+            long start = l.symbolDictHeapAddr + (packed & 0xFFFFFFFFL);
+            int len = (int) (packed >>> 32);
+            byte[] bytes = new byte[len];
+            for (int i = 0; i < len; i++) {
+                bytes[i] = Unsafe.getUnsafe().getByte(start + i);
+            }
+            s = new String(bytes, StandardCharsets.UTF_8);
+            cache.setQuick(dictId, s);
+        }
+        return s;
     }
 
     /**

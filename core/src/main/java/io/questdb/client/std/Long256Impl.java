@@ -25,18 +25,41 @@
 package io.questdb.client.std;
 
 /**
- * A 256-bit value split into four 64-bit words, least-significant first.
- * Also used for QuestDB's DECIMAL256 unscaled value (same wire layout).
- * Pair with {@link Long256Impl} as a reusable sink.
+ * Mutable concrete {@link Long256} backed by four {@code long} fields. Intended
+ * as a reusable sink: hand the same instance to a series of producers (e.g.
+ * QWP batch accessors) to avoid per-row allocation.
  */
-public interface Long256 {
-    int BYTES = 32;
+public class Long256Impl implements Long256, Long256Sink {
+    private long l0;
+    private long l1;
+    private long l2;
+    private long l3;
 
-    long getLong0();
+    @Override
+    public long getLong0() {
+        return l0;
+    }
 
-    long getLong1();
+    @Override
+    public long getLong1() {
+        return l1;
+    }
 
-    long getLong2();
+    @Override
+    public long getLong2() {
+        return l2;
+    }
 
-    long getLong3();
+    @Override
+    public long getLong3() {
+        return l3;
+    }
+
+    @Override
+    public void setAll(long l0, long l1, long l2, long l3) {
+        this.l0 = l0;
+        this.l1 = l1;
+        this.l2 = l2;
+        this.l3 = l3;
+    }
 }

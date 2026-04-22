@@ -26,17 +26,21 @@ package io.questdb.client.cutlass.qwp.client;
 
 /**
  * Per-column metadata recorded when a schema is registered on a client connection.
+ * Internal to the QWP client; callers read column attributes through the forwarder
+ * methods on {@link QwpColumnBatch} (for example {@link QwpColumnBatch#getColumnName}).
  */
-public class QwpEgressColumnInfo {
-    public String name;
-    public int precisionBits; // valid only for GEOHASH
-    public int scale;         // valid only for DECIMAL*
-    public byte wireType;
+class QwpEgressColumnInfo {
+    String name;
+    int precisionBits; // valid only for GEOHASH; set per-batch by QwpResultBatchDecoder.parseColumn
+    int scale;         // valid only for DECIMAL*;  set per-batch by QwpResultBatchDecoder.parseColumn
+    byte wireType;
 
-    public void of(String name, byte wireType, int scale, int precisionBits) {
+    void of(String name, byte wireType) {
         this.name = name;
         this.wireType = wireType;
-        this.scale = scale;
-        this.precisionBits = precisionBits;
+        // scale / precisionBits come from the per-batch column data section, not the schema.
+        // Reset here in case a schema slot is reused for a different schema.
+        this.scale = 0;
+        this.precisionBits = 0;
     }
 }

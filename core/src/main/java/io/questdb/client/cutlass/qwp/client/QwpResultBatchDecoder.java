@@ -405,7 +405,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
                 String colName = readUtf8(p, colNameLen);
                 p += colNameLen;
                 byte wireType = Unsafe.getUnsafe().getByte(p++);
-                columns.getQuick(i).of(colName, wireType, 0, 0);
+                columns.getQuick(i).of(colName, wireType);
             }
         } else if (schemaMode == QwpConstants.SCHEMA_MODE_REFERENCE) {
             if (schemaId >= schemaRegistry.size() || schemaRegistry.getQuick(schemaId) == null) {
