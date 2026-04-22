@@ -181,8 +181,12 @@ public final class Utf8s {
      * @return the number of UTF-8 bytes written
      */
     public static int strCpyUtf8(@NotNull CharSequence src, long destAddr, int maxBytes) {
+        return strCpyUtf8(src, 0, destAddr, maxBytes);
+    }
+
+    public static int strCpyUtf8(@NotNull CharSequence src, int srcLo, long destAddr, int maxBytes) {
         int pos = 0;
-        for (int i = 0, n = src.length(); i < n; i++) {
+        for (int i = srcLo, n = src.length(); i < n; i++) {
             char c = src.charAt(i);
             if (c < 0x80) {
                 if (pos + 1 > maxBytes) {
@@ -263,10 +267,12 @@ public final class Utf8s {
     }
 
     public static int utf8Bytes(@NotNull CharSequence sequence) {
-        int count = 0;
-        int len = sequence.length();
+        return utf8Bytes(sequence, 0, sequence.length());
+    }
 
-        for (int i = 0; i < len; i++) {
+    public static int utf8Bytes(@NotNull CharSequence sequence, int lo, int hi) {
+        int count = 0;
+        for (int i = lo; i < hi; i++) {
             char ch = sequence.charAt(i);
             if (ch < 0x80) {
                 count++;
@@ -274,7 +280,7 @@ public final class Utf8s {
                 count += 2;
             } else if (Character.isSurrogate(ch)) {
                 if (Character.isHighSurrogate(ch)) {
-                    if (i + 1 < len && Character.isLowSurrogate(sequence.charAt(i + 1))) {
+                    if (i + 1 < hi && Character.isLowSurrogate(sequence.charAt(i + 1))) {
                         count += 4;
                         i++;
                     } else {

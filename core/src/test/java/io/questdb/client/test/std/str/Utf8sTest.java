@@ -271,6 +271,27 @@ public class Utf8sTest {
     }
 
     @Test
+    public void testStrCpyUtf8FromOffset() {
+        final int bufSize = 64;
+        long mem = Unsafe.malloc(bufSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            final byte sentinel = 0x5A;
+            String value = "ascii-prefixé世\uD83D\uDE00\uD800x";
+            int lo = "ascii-prefix".length();
+            int expectedBytes = Utf8s.utf8Bytes(value, lo, value.length());
+
+            fill(mem, bufSize, sentinel);
+            Assert.assertEquals(expectedBytes, Utf8s.strCpyUtf8(value, lo, mem, expectedBytes));
+            Assert.assertEquals("é世\uD83D\uDE00?x", readUtf8(mem, expectedBytes));
+            for (int i = expectedBytes; i < bufSize; i++) {
+                Assert.assertEquals("write past copied bytes at offset " + i, sentinel, Unsafe.getUnsafe().getByte(mem + i));
+            }
+        } finally {
+            Unsafe.free(mem, bufSize, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
     public void testStrCpyUtf8DoesNotSplitCharactersAtLimit() {
         final int bufSize = 16;
         long mem = Unsafe.malloc(bufSize, MemoryTag.NATIVE_DEFAULT);
@@ -317,6 +338,14 @@ public class Utf8sTest {
         Assert.assertEquals(2, Utf8s.utf8Bytes("\uDE00b"));
         Assert.assertEquals(1, Utf8s.utf8Bytes("\uD83D"));
         Assert.assertEquals(1, Utf8s.utf8Bytes("\uDE00"));
+    }
+
+    @Test
+    public void testUtf8BytesRange() {
+        String value = "xxAé世\uD83D\uDE00yy";
+        Assert.assertEquals(10, Utf8s.utf8Bytes(value, 2, 7));
+        Assert.assertEquals(1, Utf8s.utf8Bytes(value, 5, 6));
+        Assert.assertEquals(4, Utf8s.utf8Bytes(value, 5, 7));
     }
 
     @Test

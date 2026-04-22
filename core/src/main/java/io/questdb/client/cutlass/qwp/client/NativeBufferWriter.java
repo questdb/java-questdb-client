@@ -289,10 +289,9 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
             // All ASCII — done in a single pass
             position += charLen;
         } else {
-            // Non-ASCII — fall back to two-pass (re-encodes from start)
-            int utf8Len = utf8Length(value);
-            ensureCapacity(utf8Len);
-            encodeUtf8(value, utf8Len);
+            int utf8Len = Utf8s.utf8Bytes(value, i, charLen);
+            ensureCapacity(i + utf8Len);
+            position += i + Utf8s.strCpyUtf8(value, i, bufferPtr + position + i, utf8Len);
         }
     }
 

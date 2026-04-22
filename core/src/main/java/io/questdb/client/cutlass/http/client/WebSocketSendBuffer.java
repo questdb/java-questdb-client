@@ -334,7 +334,7 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         int charLen = value.length();
         ensureCapacity(charLen);
 
-        // Single-pass ASCII path. Non-ASCII falls back to the shared UTF-8 utility.
+        // Single-pass for ASCII. Mixed strings keep the ASCII prefix and resume UTF-8 encoding.
         long addr = bufPtr + writePos;
         int i = 0;
         for (; i < charLen; i++) {
@@ -348,9 +348,9 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         if (i == charLen) {
             writePos += charLen;
         } else {
-            int utf8Len = NativeBufferWriter.utf8Length(value);
-            ensureCapacity(utf8Len);
-            writePos += Utf8s.strCpyUtf8(value, bufPtr + writePos, utf8Len);
+            int utf8Len = Utf8s.utf8Bytes(value, i, charLen);
+            ensureCapacity(i + utf8Len);
+            writePos += i + Utf8s.strCpyUtf8(value, i, bufPtr + writePos + i, utf8Len);
         }
     }
 
