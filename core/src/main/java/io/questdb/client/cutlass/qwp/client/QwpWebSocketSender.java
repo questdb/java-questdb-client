@@ -85,6 +85,17 @@ import java.util.concurrent.atomic.AtomicReference;
  *     sender.flush();
  * }
  * </pre>
+ * <p>
+ * Failure handling: after this sender has established a WebSocket connection,
+ * any WebSocket send failure, receive failure, ACK timeout, server error ACK,
+ * invalid ACK, or server close is terminal for this sender instance. The first
+ * such failure is retained and subsequent public operations rethrow the same
+ * {@link LineSenderException}. {@link #reset()} only discards buffered row data;
+ * it does not recover a terminal WebSocket failure. To resume sending after a
+ * terminal WebSocket failure, close this sender and create a new instance.
+ * <p>
+ * Initial connection failures are not retained as terminal sender state; a later
+ * operation may try to connect again.
  */
 public class QwpWebSocketSender implements Sender {
 
@@ -730,6 +741,20 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    /**
+     * Flushes buffered rows and waits until the server acknowledges all submitted
+     * WebSocket batches.
+     * <p>
+     * If a WebSocket send, receive, ACK timeout, server error ACK, invalid ACK,
+     * or server close is observed after the connection has been established, the
+     * sender enters a terminal failed state. The first failure is retained and
+     * subsequent public operations rethrow the same {@link LineSenderException}.
+     * Create a new sender to resume sending.
+     *
+     * @throws LineSenderException if the sender is closed, a row is still in
+     *                             progress, connection setup fails, or a terminal
+     *                             WebSocket failure is observed
+     */
     @Override
     public void flush() {
         checkNotClosed();
