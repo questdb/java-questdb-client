@@ -67,7 +67,7 @@ import java.nio.charset.StandardCharsets;
  * NULL. Per-accessor NULL behaviour is not repeated in method docs; this
  * paragraph is the contract.
  * <p>
- * <strong>Four zero-allocation idioms</strong> -- pick whichever matches the
+ * <strong>Five zero-allocation idioms</strong> -- pick whichever matches the
  * wire type of the column:
  * <ul>
  *   <li><b>Primitive accessors</b> ({@link #getLongValue}, {@link #getIntValue},
@@ -86,6 +86,13 @@ import java.nio.charset.StandardCharsets;
  *       {@link #getSymbolId}) materialises each distinct SYMBOL dict entry into
  *       a {@link String} at most once per batch, regardless of how many rows
  *       reference it.</li>
+ *   <li><b>Row / column views</b> ({@link #row(int)}, {@link #column(int)},
+ *       {@link #forEachRow(RowCallback)}) wrap the {@code (col, row)} primitives
+ *       with single-arg accessors. {@link RowView} pins the current row;
+ *       {@link ColumnView} pins the column once and exposes a direct-address
+ *       surface ({@link ColumnView#valuesAddr()}, {@link ColumnView#nullBitmapAddr()},
+ *       etc.) for SIMD or JNI consumers. Both flyweights are batch-owned and
+ *       reused.</li>
  * </ul>
  * The heap-allocating convenience accessors {@link #getString(int, int)},
  * {@link #getBinary(int, int)}, and {@link #getDoubleArrayElements(int, int)}
@@ -97,6 +104,10 @@ public class QwpColumnBatch {
     // BINARY views -- re-pointed per call, never re-allocated.
     private final DirectByteSlice binaryA = new DirectByteSlice();
     private final DirectByteSlice binaryB = new DirectByteSlice();
+    // One ColumnView per column index, lazily created by column(int). Slots are
+    // re-pointed in place across batches; the list grows but never shrinks so a
+    // wide-then-narrow query sequence keeps reusing the same instances.
+    private final ObjList<ColumnView> columnViews = new ObjList<>();
     // Reusable views for zero-alloc UTF-8 access. strA and strB are dual views
     // (same pattern as QuestDB Record.getStrA/getStrB) so callers can compare
     // two cells without one overwriting the other.
@@ -109,6 +120,8 @@ public class QwpColumnBatch {
     long payloadLimit;
     long requestId;
     int rowCount;
+    // Lazily created on first row(int) / forEachRow call; reused for the batch lifetime.
+    private RowView rowView;
 
     /**
      * Server-assigned monotonic sequence number for this batch within the query.
@@ -117,6 +130,43 @@ public class QwpColumnBatch {
      */
     public long batchSeq() {
         return batchSeq;
+    }
+
+    /**
+     * Returns the {@link ColumnView} for {@code col}, pinned and ready to read.
+     * The view is owned by the batch and cached per column index, so calling
+     * {@code column(0)} and {@code column(1)} returns two distinct instances
+     * that can be held side-by-side. Calling {@code column(c)} a second time
+     * with the same {@code c} returns the same instance with its layout
+     * pointer refreshed against the current batch state.
+     */
+    public ColumnView column(int col) {
+        if (columnViews.size() <= col) {
+            columnViews.setPos(col + 1);
+        }
+        ColumnView view = columnViews.getQuick(col);
+        if (view == null) {
+            view = new ColumnView(this);
+            columnViews.setQuick(col, view);
+        }
+        return view.of(col);
+    }
+
+    /**
+     * Iterates rows in this batch and invokes {@code callback} for each one.
+     * The {@link RowView} handed to the callback is re-pointed in place across
+     * iterations -- do not retain it past {@link RowCallback#onRow(RowView)}.
+     * Throwing from the callback aborts iteration and propagates the exception.
+     */
+    public void forEachRow(RowCallback callback) {
+        if (rowView == null) {
+            rowView = new RowView(this);
+        }
+        int n = rowCount;
+        for (int r = 0; r < n; r++) {
+            rowView.of(r);
+            callback.onRow(rowView);
+        }
     }
 
     /**
@@ -585,6 +635,19 @@ public class QwpColumnBatch {
     }
 
     /**
+     * Returns the cached {@link RowView} pointed at {@code row}. Use as an
+     * escape hatch from {@link #forEachRow(RowCallback)} when you need to
+     * drive iteration manually (e.g., interleaved with another data source).
+     * Single shared instance per batch; two calls overwrite each other.
+     */
+    public RowView row(int row) {
+        if (rowView == null) {
+            rowView = new RowView(this);
+        }
+        return rowView.of(row);
+    }
+
+    /**
      * Address of the column's packed non-null values in the payload buffer.
      * Layout depends on the wire type:
      * <ul>
@@ -605,8 +668,9 @@ public class QwpColumnBatch {
      * Fast null check once the layout is in hand. Inlining pattern used by all the
      * typed accessors: load layout once, check bitmap, read value. Eliminates the
      * second {@code ObjList.getQuick(col)} that separate {@code isNull(col,row)} would cost.
+     * Also reused by {@link ColumnView} so it can keep the layout pointer cached.
      */
-    private static boolean isLayoutNull(QwpColumnLayout l, int row) {
+    static boolean isLayoutNull(QwpColumnLayout l, int row) {
         if (l.nullBitmapAddr == 0) return false;
         byte bm = Unsafe.getUnsafe().getByte(l.nullBitmapAddr + (row >>> 3));
         return (bm & (1 << (row & 7))) != 0;

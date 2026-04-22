@@ -10,6 +10,11 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  * Connects to a QuestDB server over the /read/v1 WebSocket endpoint,
  * runs a SELECT query, and prints each row as the batches arrive.
  * <p>
+ * Iterates rows via {@link QwpColumnBatch#forEachRow}, which hands a reusable
+ * row-pinned view to the lambda. Single-arg accessors keep the read path
+ * compact; the underlying batch is still column-major and the {@code (col, row)}
+ * primitives remain available on {@code batch} for callers that prefer them.
+ * <p>
  * Assumes a table exists:
  * <pre>
  *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
@@ -27,20 +32,20 @@ public class BasicQueryExample {
                     new QwpColumnBatchHandler() {
                         @Override
                         public void onBatch(QwpColumnBatch batch) {
-                            // The batch is a column-major view of one RESULT_BATCH frame.
-                            // It is valid only for the duration of this callback — copy out
-                            // anything you need to retain after the method returns.
-                            for (int row = 0; row < batch.getRowCount(); row++) {
-                                long timestamp = batch.getLongValue(0, row);  // TIMESTAMP -> microseconds since epoch
-                                String symbol = batch.getString(1, row);      // SYMBOL -> String
-                                double price = batch.getDoubleValue(2, row);  // DOUBLE
-                                long qty = batch.getLongValue(3, row);        // LONG
+                            // The RowView handed to the lambda is reusable and pinned to the
+                            // current row; copy values out before the callback returns if you
+                            // need to retain them past the surrounding onBatch call.
+                            batch.forEachRow(row -> {
+                                long timestamp = row.getLongValue(0);  // TIMESTAMP -> microseconds since epoch
+                                String symbol = row.getSymbol(1);      // SYMBOL -> String
+                                double price = row.getDoubleValue(2);  // DOUBLE
+                                long qty = row.getLongValue(3);        // LONG
 
                                 System.out.printf(
                                         "ts=%d sym=%s price=%.4f qty=%d%n",
                                         timestamp, symbol, price, qty
                                 );
-                            }
+                            });
                         }
 
                         @Override
