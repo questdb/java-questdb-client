@@ -89,6 +89,19 @@ public final class QwpConstants {
      */
     public static final byte SCHEMA_MODE_REFERENCE = 0x01;
     /**
+     * Status byte on a {@code QUERY_ERROR} frame: the query was cancelled,
+     * either by a client {@code CANCEL} frame or by explicit server-side
+     * cancel. Egress extension of the ingress {@code STATUS_*} namespace
+     * (0x00-0x09).
+     */
+    public static final byte STATUS_CANCELLED = 0x0A;
+    /**
+     * Status byte on a {@code QUERY_ERROR} frame: a server-side limit was hit
+     * (query timeout, memory cap, circuit breaker, OOM). Egress extension of
+     * the ingress {@code STATUS_*} namespace (0x00-0x09).
+     */
+    public static final byte STATUS_LIMIT_EXCEEDED = 0x0B;
+    /**
      * Column type: BINARY (length-prefixed opaque bytes).
      * Wire format: identical to VARCHAR — (N+1) x uint32 offsets + concatenated bytes.
      */

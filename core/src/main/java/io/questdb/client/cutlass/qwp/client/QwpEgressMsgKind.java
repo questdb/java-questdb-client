@@ -30,6 +30,13 @@ package io.questdb.client.cutlass.qwp.client;
  * egress payload identifies which of the egress message types it carries.
  */
 public final class QwpEgressMsgKind {
+    /**
+     * Server -> client. Connection-scoped cache reset. Body: {@code reset_mask:u8}
+     * with bit 0 = SYMBOL dict, bit 1 = schema-fingerprint cache. Sent between
+     * queries when a cache hits its server-side soft cap. Recipient clears the
+     * indicated caches; subsequent RESULT_BATCH delta sections start fresh.
+     */
+    public static final byte CACHE_RESET = 0x17;
     public static final byte CANCEL = 0x14;
     public static final byte CREDIT = 0x15;
     /**
@@ -39,21 +46,16 @@ public final class QwpEgressMsgKind {
     public static final byte EXEC_DONE = 0x16;
     public static final byte QUERY_ERROR = 0x13;
     public static final byte QUERY_REQUEST = 0x10;
+    /**
+     * Reset mask bit: clear the connection-scoped SYMBOL dict.
+     */
+    public static final byte RESET_MASK_DICT = 0x01;
+    /**
+     * Reset mask bit: clear the connection-scoped schema-fingerprint cache.
+     */
+    public static final byte RESET_MASK_SCHEMAS = 0x02;
     public static final byte RESULT_BATCH = 0x11;
     public static final byte RESULT_END = 0x12;
-
-    // Egress-specific QUERY_ERROR status codes. Extend the ingress
-    // QwpConstants.STATUS_* namespace (0x00-0x09).
-    /**
-     * Status byte on a {@code QUERY_ERROR} frame: the query was cancelled,
-     * either by a client {@code CANCEL} frame or by explicit server-side cancel.
-     */
-    public static final byte STATUS_CANCELLED = 0x0A;
-    /**
-     * Status byte on a {@code QUERY_ERROR} frame: a server-side limit was hit
-     * (query timeout, memory cap, circuit breaker).
-     */
-    public static final byte STATUS_LIMIT_EXCEEDED = 0x0B;
 
     private QwpEgressMsgKind() {
     }

@@ -182,6 +182,15 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         } else if (msgKind == QwpEgressMsgKind.QUERY_ERROR) {
             decodeAndEmitError(payloadPtr, payloadLen);
             currentQueryDone = true;
+        } else if (msgKind == QwpEgressMsgKind.CACHE_RESET) {
+            // Server reached a configured soft cap on the connection-scoped
+            // SYMBOL dict or schema-fingerprint cache. Drop the indicated
+            // caches on this side so the next RESULT_BATCH's deltaStart and
+            // schema-reference ids line up with the server's fresh counter.
+            // No user-visible event -- CACHE_RESET never arrives between the
+            // RESULT_BATCH / RESULT_END / EXEC_DONE / QUERY_ERROR of a query
+            // and the user callback, only after it.
+            handleCacheReset(payloadPtr, payloadLen);
         } else {
             emitTerminalError("unknown msg_kind 0x" + Integer.toHexString(msgKind & 0xFF));
             currentQueryDone = true;
@@ -435,6 +444,22 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private void emitTerminalError(String message) {
         notifyTerminalFailure(message);
         emitError(WebSocketResponse.STATUS_INTERNAL_ERROR, message);
+    }
+
+    /**
+     * Decodes a {@code CACHE_RESET} frame body and clears the indicated
+     * connection-scoped caches on the client side. Body is a single byte mask:
+     * bit 0 = SYMBOL dict, bit 1 = schema-fingerprint cache.
+     */
+    private void handleCacheReset(long payloadPtr, int payloadLen) {
+        int bodyStart = QwpConstants.HEADER_SIZE + 1; // msg_kind byte consumed by caller
+        if (payloadLen < bodyStart + 1) {
+            emitTerminalError("CACHE_RESET frame truncated before reset_mask");
+            currentQueryDone = true;
+            return;
+        }
+        byte resetMask = Unsafe.getUnsafe().getByte(payloadPtr + bodyStart);
+        decoder.applyCacheReset(resetMask);
     }
 
     private void handleResultBatch(long payloadPtr, int payloadLen) {

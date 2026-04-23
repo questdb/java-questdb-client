@@ -28,6 +28,7 @@ import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.QuietCloseable;
@@ -65,7 +66,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Status byte convention on {@link QwpColumnBatchHandler#onError}: server-
  * emitted {@code QUERY_ERROR} frames surface with the server's status code
  * ({@link WebSocketResponse#STATUS_PARSE_ERROR}, {@code STATUS_INTERNAL_ERROR},
- * {@link QwpEgressMsgKind#STATUS_CANCELLED}, {@code STATUS_LIMIT_EXCEEDED},
+ * {@link QwpConstants#STATUS_CANCELLED}, {@link QwpConstants#STATUS_LIMIT_EXCEEDED},
  * etc.). Failures detected client-side (closed client, bind encoding error,
  * truncated / unknown frame, decoder out of sync, I/O thread interrupt) all
  * surface with {@link WebSocketResponse#STATUS_INTERNAL_ERROR} and the
