@@ -110,8 +110,10 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Single pending buffer slot (double-buffering means at most 1 item in queue)
     // Zero allocation - just a volatile reference handoff
     private volatile MicrobatchBuffer pendingBuffer;
-    private volatile boolean pingRequested;
     private volatile boolean pingComplete;
+    private volatile boolean pingRequested;
+    private volatile boolean pongReceived;
+    private long pingDeadlineNanos;
     // Running state
     private volatile boolean running;
     private volatile boolean shuttingDown;
@@ -347,10 +349,16 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
-     * Requests the I/O thread to send a PING and drain any pending frames
-     * (including STATUS_DURABLE_ACK). Blocks until the I/O thread completes.
+     * Requests the I/O thread to send a WebSocket PING and blocks until
+     * the PONG arrives. The I/O loop continues its normal work (sending
+     * batches, draining ACKs) while waiting for the PONG.
+     * <p>
+     * The server flushes pending durable ACKs before sending the PONG,
+     * so after this method returns {@code getDurableSeqTxn()} reflects
+     * all durable progress up to the moment the server processed the PING.
      */
-    public void pingAndDrain() {
+    public void ping() {
+        checkError();
         synchronized (processingLock) {
             pingComplete = false;
             pingRequested = true;
@@ -369,6 +377,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                 }
             }
         }
+        checkError();
     }
 
     /**
@@ -396,12 +405,12 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
-     * Computes the current I/O state based on queue and in-flight status.
+     * Computes the current I/O state based on queue, in-flight, and ping status.
      */
     private IoState computeState(boolean hasInFlight) {
         if (!isPendingEmpty()) {
             return IoState.ACTIVE;
-        } else if (hasInFlight) {
+        } else if (hasInFlight || pingDeadlineNanos > 0) {
             return IoState.DRAINING;
         } else {
             return IoState.IDLE;
@@ -463,18 +472,17 @@ public class WebSocketSendQueue implements QuietCloseable {
         try {
             int drainIdleCycles = 0;
             while (running || !isPendingEmpty()) {
+                // Send a pending PING if requested
                 if (pingRequested) {
                     pingRequested = false;
+                    pongReceived = false;
+                    pingDeadlineNanos = System.nanoTime() + InFlightWindow.DEFAULT_TIMEOUT_MS * 1_000_000L;
                     try {
                         client.sendPing(1000);
-                        tryReceiveAcks();
                     } catch (Exception e) {
+                        pingDeadlineNanos = 0;
                         failTransport(new LineSenderException("Ping failed", e));
-                    } finally {
-                        synchronized (processingLock) {
-                            pingComplete = true;
-                            processingLock.notifyAll();
-                        }
+                        completePing();
                     }
                 }
 
@@ -489,7 +497,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         // Nothing to do - wait for work under lock
                         synchronized (processingLock) {
                             // Re-check under lock to avoid missed wakeup
-                            if (isPendingEmpty() && running) {
+                            if (isPendingEmpty() && running && !pingRequested) {
                                 try {
                                     processingLock.wait(100);
                                 } catch (InterruptedException e) {
@@ -502,8 +510,20 @@ public class WebSocketSendQueue implements QuietCloseable {
                     case ACTIVE:
                     case DRAINING:
                         // Try to receive any pending ACKs (non-blocking)
-                        if (hasInFlight && client.isConnected()) {
+                        if (client.isConnected()) {
                             receivedAcks = tryReceiveAcks();
+                        }
+
+                        // Check if a pending PING has been answered
+                        if (pingDeadlineNanos > 0) {
+                            if (pongReceived) {
+                                pingDeadlineNanos = 0;
+                                completePing();
+                            } else if (System.nanoTime() >= pingDeadlineNanos) {
+                                pingDeadlineNanos = 0;
+                                failTransport(new LineSenderException("Ping timed out waiting for PONG"));
+                                completePing();
+                            }
                         }
 
                         // Try to dequeue and send a batch
@@ -547,6 +567,13 @@ public class WebSocketSendQueue implements QuietCloseable {
         } finally {
             shutdownLatch.countDown();
             LOG.info("I/O loop stopped [totalAcks={}, totalErrors={}]", totalAcks.get(), totalErrors.get());
+        }
+    }
+
+    private void completePing() {
+        synchronized (processingLock) {
+            pingComplete = true;
+            processingLock.notifyAll();
         }
     }
 
@@ -748,6 +775,11 @@ public class WebSocketSendQueue implements QuietCloseable {
         public void onClose(int code, String reason) {
             LOG.info("WebSocket closed by server [code={}, reason={}]", code, reason);
             failTransport(new LineSenderException("WebSocket closed by server [code=" + code + ", reason=" + reason + ']'));
+        }
+
+        @Override
+        public void onPong(long payloadPtr, int payloadLen) {
+            pongReceived = true;
         }
     }
 

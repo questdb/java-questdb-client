@@ -1022,13 +1022,17 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Sends a WebSocket PING and reads frames until the PONG comes back,
-     * processing any STATUS_DURABLE_ACK or STATUS_OK frames along the way.
-     * After this method returns, {@link #getHighestDurableSeqTxn(CharSequence)} reflects
-     * the latest durable watermark reported by the server.
+     * Sends a WebSocket PING and blocks until the PONG arrives, processing
+     * any STATUS_DURABLE_ACK or STATUS_OK frames along the way.
      * <p>
-     * In async mode the PING is queued for the I/O thread; this method
-     * returns once the I/O thread has sent it and processed the response.
+     * The server flushes pending durable ACKs before sending the PONG, so
+     * after this method returns, {@link #getHighestDurableSeqTxn(CharSequence)}
+     * reflects all durable progress up to the moment the server processed
+     * the PING.
+     * <p>
+     * In async mode the PING is sent by the I/O thread; the I/O loop
+     * continues its normal work (sending batches, draining ACKs) while
+     * waiting for the PONG.
      *
      * @throws LineSenderException if the connection is closed or the ping times out
      */
@@ -1036,7 +1040,7 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         ensureConnected();
         if (inFlightWindowSize > 1) {
-            sendQueue.pingAndDrain();
+            sendQueue.ping();
         } else {
             syncPing();
         }

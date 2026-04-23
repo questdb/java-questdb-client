@@ -451,24 +451,31 @@ public class WebSocketSendQueueTest {
     }
 
     @Test
-    public void testPingAndDrainCompletesSuccessfully() throws Exception {
+    public void testPingBlocksUntilPong() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
             WebSocketSendQueue queue = null;
             try (FakeWebSocketClient client = new FakeWebSocketClient()) {
-                AtomicBoolean ackDelivered = new AtomicBoolean(false);
+                AtomicInteger callCount = new AtomicInteger();
                 client.setTryReceiveBehavior(handler -> {
-                    if (ackDelivered.compareAndSet(false, true)) {
-                        emitDurableAck(handler, "t", 7);
-                        return true;
+                    int n = callCount.getAndIncrement();
+                    switch (n) {
+                        case 0:
+                            emitDurableAck(handler, "t", 7);
+                            return true;
+                        case 1:
+                            handler.onPong(0, 0);
+                            return true;
+                        default:
+                            return false;
                     }
-                    return false;
                 });
 
                 queue = new WebSocketSendQueue(client, window, 1_000, 500);
 
-                queue.pingAndDrain();
+                queue.ping();
 
+                // After ping() returns, durable ACK must already be processed
                 assertEquals(7, queue.getDurableSeqTxn("t"));
             } finally {
                 closeQuietly(queue);
@@ -477,7 +484,7 @@ public class WebSocketSendQueueTest {
     }
 
     @Test
-    public void testPingAndDrainWithInFlightBatches() throws Exception {
+    public void testPingWithInFlightBatches() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
             WebSocketSendQueue queue = null;
@@ -495,6 +502,9 @@ public class WebSocketSendQueueTest {
                         case 1:
                             emitDurableAck(handler, "t", 5);
                             return true;
+                        case 2:
+                            handler.onPong(0, 0);
+                            return true;
                         default:
                             return false;
                     }
@@ -502,10 +512,58 @@ public class WebSocketSendQueueTest {
 
                 queue = new WebSocketSendQueue(client, window, 1_000, 500);
 
-                queue.pingAndDrain();
+                queue.ping();
 
                 assertEquals(0, window.getInFlightCount());
                 assertEquals(5, queue.getDurableSeqTxn("t"));
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testPingTimesOutWhenNoPong() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                // Never emit a PONG
+                client.setTryReceiveBehavior(handler -> false);
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+
+                try {
+                    queue.ping();
+                    fail("Expected ping timeout");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Ping timed out"));
+                }
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testPingSurfacesTransportError() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                client.setPingSendBehavior(() -> {
+                    throw new RuntimeException("ping-send-fail");
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+
+                try {
+                    queue.ping();
+                    fail("Expected error from ping");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Ping failed")
+                            || e.getMessage().contains("Error in send queue"));
+                }
             } finally {
                 closeQuietly(queue);
             }
@@ -603,6 +661,7 @@ public class WebSocketSendQueueTest {
     private static class FakeWebSocketClient extends WebSocketClient {
         private volatile TryReceiveBehavior behavior = handler -> false;
         private volatile boolean connected = true;
+        private volatile Runnable pingSendBehavior = () -> {};
         private volatile ReceiveBehavior receiveBehavior = (handler, timeout) -> false;
         private volatile SendBehavior sendBehavior = (dataPtr, length) -> {
         };
@@ -629,6 +688,11 @@ public class WebSocketSendQueueTest {
 
         @Override
         public void sendPing(int timeout) {
+            pingSendBehavior.run();
+        }
+
+        public void setPingSendBehavior(Runnable pingSendBehavior) {
+            this.pingSendBehavior = pingSendBehavior;
         }
 
         public void setSendBehavior(SendBehavior sendBehavior) {
