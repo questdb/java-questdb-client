@@ -84,6 +84,15 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@link QwpColumnBatchHandler#onError} with the stored status/message. Per-
  * query {@code QUERY_ERROR} responses are NOT terminal -- the connection
  * remains usable for the next query.
+ * <p>
+ * Status byte convention on {@link QwpColumnBatchHandler#onError}: server-
+ * emitted {@code QUERY_ERROR} frames surface with the server's status code
+ * ({@link WebSocketResponse#STATUS_PARSE_ERROR}, {@code STATUS_INTERNAL_ERROR},
+ * {@link QwpConstants#STATUS_CANCELLED}, {@link QwpConstants#STATUS_LIMIT_EXCEEDED},
+ * etc.). Failures detected client-side (closed client, bind encoding error,
+ * truncated / unknown frame, decoder out of sync, I/O thread interrupt) all
+ * surface with {@link WebSocketResponse#STATUS_INTERNAL_ERROR} and the
+ * specific cause in the message.
  */
 public class QwpQueryClient implements QuietCloseable {
 

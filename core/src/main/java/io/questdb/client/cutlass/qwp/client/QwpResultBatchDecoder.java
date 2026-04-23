@@ -120,6 +120,29 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     private long varintPos;
     private long varintValue;
 
+    /**
+     * Clears the caches indicated by {@code resetMask} (bitwise OR of
+     * {@link QwpEgressMsgKind#RESET_MASK_DICT} and
+     * {@link QwpEgressMsgKind#RESET_MASK_SCHEMAS}). Drives the client-side
+     * state machine when the server emits a {@code CACHE_RESET} frame after
+     * hitting a connection-level soft cap: discards the SYMBOL dict and / or
+     * schema-fingerprint cache so the next batch's {@code deltaStart} and
+     * schema-reference ids line up with the server's fresh counter.
+     * <p>
+     * The native dict buffers are reused (positions reset to 0, capacity
+     * retained) so a workload that churns just above the cap does not reallocate
+     * on every reset.
+     */
+    public void applyCacheReset(byte resetMask) {
+        if ((resetMask & QwpEgressMsgKind.RESET_MASK_DICT) != 0) {
+            connDictSize = 0;
+            connDictHeapPos = 0;
+        }
+        if ((resetMask & QwpEgressMsgKind.RESET_MASK_SCHEMAS) != 0) {
+            schemaRegistry.clear();
+        }
+    }
+
     @Override
     public void close() {
         if (connDictHeapAddr != 0) {
