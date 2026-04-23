@@ -38,6 +38,16 @@ import io.questdb.client.std.Unsafe;
 public class QwpColumnLayout implements QuietCloseable {
 
     /**
+     * SYMBOL: lazy String cache indexed by dict ID. Populated on first
+     * {@code getSymbol}/{@code getSymbolForId}/{@code getString}(SYMBOL) call
+     * so a query over 10M rows with N distinct symbols materialises only N
+     * Strings per batch. The cache survives across batches in delta mode (the
+     * connection dict is stable) and invalidates lazily when
+     * {@link #symbolDictVersion} disagrees with {@link #symbolCacheVersion} --
+     * see {@code QwpColumnBatch#lookupCachedSymbol}.
+     */
+    final ObjList<String> symbolStringCache = new ObjList<>();
+    /**
      * ARRAY: per-row starting offset (absolute address) of the array bytes. -1 for NULL rows.
      */
     long[] arrayRowAddr;
@@ -72,6 +82,13 @@ public class QwpColumnLayout implements QuietCloseable {
      */
     long stringBytesAddr;
     /**
+     * Last {@link #symbolDictVersion} the {@link #symbolStringCache} was known
+     * valid under. Updated at cache read time (not write time) -- if the dict
+     * has been re-stamped since the last lookup, the cache is wiped and this
+     * field catches up to the current version before the lookup proceeds.
+     */
+    long symbolCacheVersion;
+    /**
      * SYMBOL: absolute address of the native entries array. Each entry is a packed
      * 8-byte pair {@code (offset:i32 | length:i32<<32)} relative to
      * {@link #symbolDictHeapAddr}. Access in the hot path is a single 64-bit
@@ -89,18 +106,22 @@ public class QwpColumnLayout implements QuietCloseable {
      */
     int symbolDictSize;
     /**
+     * Version of the dict currently bound to this layout. Stamped by the
+     * decoder at parse time. Encoding:
+     * <ul>
+     *   <li>delta mode: {@code connDictGeneration << 1} (bit 0 clear)</li>
+     *   <li>non-delta:  {@code dictBase | 1} (bit 0 set, address changes each batch)</li>
+     * </ul>
+     * The split low bit stops a delta generation count from colliding with a
+     * non-delta address token. Consumers compare this against
+     * {@link #symbolCacheVersion} to decide whether the cache is still valid.
+     */
+    long symbolDictVersion;
+    /**
      * SYMBOL: per-row dictionary ID. Sized to {@code rowCount}; NULL rows are
      * left with stale values -- use {@link #nonNullIdx}/null-check first.
      */
     int[] symbolRowIds;
-    /**
-     * SYMBOL: lazy String cache indexed by dict ID. Populated on first
-     * {@code getSymbol}/{@code getSymbolForId}/{@code getString}(SYMBOL) call
-     * so a query over 10M rows with N distinct symbols materialises only N
-     * Strings per batch instead of one per row. Cleared (size reset to 0) in
-     * {@link #clear()} because a reused layout may be rebound to a different dict.
-     */
-    final ObjList<String> symbolStringCache = new ObjList<>();
     /**
      * Absolute payload address where this column's non-null values start. For
      * fixed-width types this is the dense values array. For strings/varchars
@@ -126,21 +147,6 @@ public class QwpColumnLayout implements QuietCloseable {
     private long timestampDecodeAddr;
     private int timestampDecodeCapacity;
 
-    /**
-     * Returns the dense index of {@code row} into the non-null values array.
-     * For columns with no nulls in this batch ({@code nullBitmapAddr == 0}),
-     * dense index equals row and {@link #nonNullIdx} is left unread (the
-     * decoder skips the per-row array fill on this path). Otherwise the
-     * pre-computed slot is returned.
-     * <p>
-     * Caller MUST have null-checked the cell first via the surrounding
-     * {@code isNull} / {@code isLayoutNull} guard -- this method does not
-     * detect null rows on its own.
-     */
-    public int denseIndex(int row) {
-        return nullBitmapAddr == 0 ? row : nonNullIdx[row];
-    }
-
     public void clear() {
         info = null;
         valuesAddr = 0;
@@ -150,7 +156,10 @@ public class QwpColumnLayout implements QuietCloseable {
         symbolDictHeapAddr = 0;
         symbolDictEntriesAddr = 0;
         symbolDictSize = 0;
-        symbolStringCache.clear();
+        // symbolStringCache is intentionally NOT wiped here. Lazy invalidation
+        // via symbolDictVersion / symbolCacheVersion keeps connection-stable
+        // dict entries cached across batches and wipes on the first lookup
+        // after a dict-version mismatch (non-delta batch or CACHE_RESET).
         nextAddr = 0;
     }
 
@@ -166,6 +175,21 @@ public class QwpColumnLayout implements QuietCloseable {
             timestampDecodeAddr = 0;
             timestampDecodeCapacity = 0;
         }
+    }
+
+    /**
+     * Returns the dense index of {@code row} into the non-null values array.
+     * For columns with no nulls in this batch ({@code nullBitmapAddr == 0}),
+     * dense index equals row and {@link #nonNullIdx} is left unread (the
+     * decoder skips the per-row array fill on this path). Otherwise the
+     * pre-computed slot is returned.
+     * <p>
+     * Caller MUST have null-checked the cell first via the surrounding
+     * {@code isNull} / {@code isLayoutNull} guard -- this method does not
+     * detect null rows on its own.
+     */
+    public int denseIndex(int row) {
+        return nullBitmapAddr == 0 ? row : nonNullIdx[row];
     }
 
     /**

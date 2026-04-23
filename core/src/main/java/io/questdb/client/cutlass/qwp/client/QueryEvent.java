@@ -46,8 +46,8 @@ public class QueryEvent {
     public static final int KIND_TRANSPORT_ERROR = 4;
 
     public QwpBatchBuffer buffer;     // valid for KIND_BATCH (must be released to pool by consumer)
-    public byte errorStatus;          // valid for KIND_ERROR
     public String errorMessage;       // valid for KIND_ERROR
+    public byte errorStatus;          // valid for KIND_ERROR
     public int kind;
     public short opType;              // valid for KIND_EXEC_DONE (matches CompiledQuery.SELECT/INSERT/etc.)
     public long rowsAffected;         // valid for KIND_EXEC_DONE
@@ -88,5 +88,23 @@ public class QueryEvent {
         this.errorStatus = status;
         this.errorMessage = message;
         return this;
+    }
+
+    /**
+     * Clears object references and resets primitive fields so a pooled event is
+     * safe to reuse across queries. The I/O thread calls the {@code asX(...)}
+     * builders after borrowing, which overwrites fields anyway; resetting on
+     * release still helps because it (1) drops the buffer / message references
+     * promptly so they are not held past the consumer callback, and (2) keeps
+     * the event in a consistent "no kind bound" state for diagnostics.
+     */
+    public void reset() {
+        this.kind = -1;
+        this.buffer = null;
+        this.errorMessage = null;
+        this.errorStatus = 0;
+        this.opType = 0;
+        this.rowsAffected = 0;
+        this.totalRows = 0;
     }
 }

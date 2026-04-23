@@ -294,15 +294,6 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Returns a single DOUBLE value. Caller must know the column is DOUBLE.
-     */
-    public double getDoubleValue(int col, int row) {
-        QwpColumnLayout l = columnLayouts.getQuick(col);
-        if (isLayoutNull(l, row)) return Double.NaN;
-        return Unsafe.getUnsafe().getDouble(l.valuesAddr + 8L * l.denseIndex(row));
-    }
-
-    /**
      * Returns the flattened elements of a DOUBLE_ARRAY value in row-major order.
      * Heap-allocating convenience; use {@link #getArrayNDims} to discover
      * dimensionality separately if you need it.
@@ -322,6 +313,15 @@ public class QwpColumnBatch {
             out[i] = Unsafe.getUnsafe().getDouble(base + 8L * i);
         }
         return out;
+    }
+
+    /**
+     * Returns a single DOUBLE value. Caller must know the column is DOUBLE.
+     */
+    public double getDoubleValue(int col, int row) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return Double.NaN;
+        return Unsafe.getUnsafe().getDouble(l.valuesAddr + 8L * l.denseIndex(row));
     }
 
     /**
@@ -665,18 +665,6 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Fast null check once the layout is in hand. Inlining pattern used by all the
-     * typed accessors: load layout once, check bitmap, read value. Eliminates the
-     * second {@code ObjList.getQuick(col)} that separate {@code isNull(col,row)} would cost.
-     * Also reused by {@link ColumnView} so it can keep the layout pointer cached.
-     */
-    static boolean isLayoutNull(QwpColumnLayout l, int row) {
-        if (l.nullBitmapAddr == 0) return false;
-        byte bm = Unsafe.getUnsafe().getByte(l.nullBitmapAddr + (row >>> 3));
-        return (bm & (1 << (row & 7))) != 0;
-    }
-
-    /**
      * Resolves the {@code (col, row)} cell for a BINARY column and points the supplied
      * slice at the underlying bytes in the payload buffer. Returns {@code null} for NULL
      * rows or if the column is not BINARY.
@@ -693,12 +681,21 @@ public class QwpColumnBatch {
     }
 
     /**
-     * Lazily materialises and caches the String for a SYMBOL dict entry.
-     * The cache lives on the {@link QwpColumnLayout} and is reset to size 0
-     * in {@link QwpColumnLayout#clear()} on every batch reset.
+     * Lazily materialises and caches the String for a SYMBOL dict entry. The
+     * cache lives on the {@link QwpColumnLayout} and survives across batches in
+     * delta mode, where {@code dictId} resolves to the same bytes for the life
+     * of the connection-scoped dict. When the decoder re-stamps
+     * {@link QwpColumnLayout#symbolDictVersion} (non-delta batch, or CACHE_RESET
+     * bump of the dict generation), this method wipes the cache on the first
+     * lookup and catches {@link QwpColumnLayout#symbolCacheVersion} up to the
+     * current version.
      */
     private String lookupCachedSymbol(QwpColumnLayout l, int dictId) {
         ObjList<String> cache = l.symbolStringCache;
+        if (l.symbolCacheVersion != l.symbolDictVersion) {
+            cache.clear();
+            l.symbolCacheVersion = l.symbolDictVersion;
+        }
         if (cache.size() < l.symbolDictSize) {
             cache.setPos(l.symbolDictSize);
         }
@@ -742,5 +739,17 @@ public class QwpColumnBatch {
             return view.of(start, end);
         }
         return null;
+    }
+
+    /**
+     * Fast null check once the layout is in hand. Inlining pattern used by all the
+     * typed accessors: load layout once, check bitmap, read value. Eliminates the
+     * second {@code ObjList.getQuick(col)} that separate {@code isNull(col,row)} would cost.
+     * Also reused by {@link ColumnView} so it can keep the layout pointer cached.
+     */
+    static boolean isLayoutNull(QwpColumnLayout l, int row) {
+        if (l.nullBitmapAddr == 0) return false;
+        byte bm = Unsafe.getUnsafe().getByte(l.nullBitmapAddr + (row >>> 3));
+        return (bm & (1 << (row & 7))) != 0;
     }
 }

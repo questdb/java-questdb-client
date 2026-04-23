@@ -54,6 +54,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private static final long POLL_TIMEOUT_MS = 100;
     private static final Object RELEASE_TOKEN = new Object();
     private final QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+    // Pool of reusable QueryEvent instances flowing back from the user thread
+    // to the I/O thread. Producer = user thread (calls {@link #releaseEvent}
+    // after a handler returns). Consumer = I/O thread (calls {@link #borrowEvent}
+    // before publishing a RESULT_BATCH). Pre-filled at construction so the
+    // per-batch publish path stays allocation-free after warmup.
+    private final QwpSpscQueue<QueryEvent> eventPool;
     // Events delivered from I/O thread (producer) to user thread (consumer):
     // RESULT_BATCH / RESULT_END / EXEC_DONE / QUERY_ERROR. Hot path of every
     // query. Purpose-built SPSC with spin-then-park avoids the ~2 microseconds
@@ -110,6 +116,16 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // frame the I/O thread may emit on shutdown, so a full buffer pool
         // never stalls the producer.
         this.events = new QwpSpscQueue<>(bufferPoolSize + 2);
+        // Pool capacity must be at least (events capacity) + 2 so that even when
+        // the events queue is full, the I/O thread can still borrow one event
+        // (being filled between borrow and offer) while the user thread holds
+        // another (between take and release). Pre-fill so the steady-state
+        // batch-publish path never allocates.
+        int eventPoolCapacity = bufferPoolSize + 4;
+        this.eventPool = new QwpSpscQueue<>(eventPoolCapacity);
+        for (int i = 0; i < eventPoolCapacity; i++) {
+            eventPool.offer(new QueryEvent());
+        }
         // Track allocations as we go so a partial-pool failure (e.g. native
         // OOM at iteration K) frees the K-1 buffers already in freeBuffers.
         // Without this, the half-built QwpEgressIoThread instance escapes the
@@ -236,6 +252,20 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
+     * Returns a consumed event to the pool for reuse. Called by the user thread
+     * after the handler has processed the event. No-op when {@code event} is
+     * null. When the pool is already at capacity (e.g. a cold path allocated a
+     * fresh fallback event), the extra event is dropped and GC reclaims it.
+     */
+    public void releaseEvent(QueryEvent event) {
+        if (event == null) {
+            return;
+        }
+        event.reset();
+        eventPool.offer(event);
+    }
+
+    /**
      * Queues a CANCEL frame for {@code requestId} to be sent by the I/O thread
      * between the next two {@code receiveFrame} iterations (typically within
      * {@link #POLL_TIMEOUT_MS}). Safe to call from any thread. If a CANCEL for
@@ -273,7 +303,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         } catch (Throwable t) {
             String msg = "I/O thread failure: " + t.getMessage();
             notifyTerminalFailure(msg);
-            emitTransportErrorBlocking(WebSocketResponse.STATUS_INTERNAL_ERROR, msg);
+            emitTransportErrorBlocking(msg);
         } finally {
             // Wake any user thread blocked on events.take(). Without this, a close()
             // (or any abnormal exit) while a user thread is mid-execute() would let
@@ -290,7 +320,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                     emitError(WebSocketResponse.STATUS_INTERNAL_ERROR, msg);
                 } else {
                     notifyTerminalFailure(msg);
-                    emitTransportErrorBlocking(WebSocketResponse.STATUS_INTERNAL_ERROR, msg);
+                    emitTransportErrorBlocking(msg);
                 }
                 currentQueryDone = true;
             }
@@ -335,6 +365,22 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      */
     public QueryEvent takeEvent() throws InterruptedException {
         return events.take();
+    }
+
+    /**
+     * Takes a pre-allocated {@link QueryEvent} from the pool for the I/O thread
+     * to populate before offering to {@link #events}. Falls back to a fresh
+     * allocation if the pool is momentarily empty -- under normal flow the pool
+     * is sized above the events-queue capacity so the fallback never fires, but
+     * defensive allocation keeps the I/O thread making progress if accounting
+     * drifts on a cold path.
+     */
+    private QueryEvent borrowEvent() {
+        QueryEvent ev = eventPool.poll();
+        if (ev != null) {
+            return ev;
+        }
+        return new QueryEvent();
     }
 
     private void decodeAndEmitError(long payload, int payloadLen) {
@@ -423,28 +469,6 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     /**
-     * Like {@link #emitError} but emits a {@code KIND_TRANSPORT_ERROR} event
-     * rather than {@code KIND_ERROR}, and retries until the event is enqueued.
-     * Used on transport-failure paths where the WebSocket is torn down and
-     * the user thread needs to be woken so failover can kick in.
-     */
-    private void emitTransportErrorBlocking(byte status, String message) {
-        QueryEvent ev = new QueryEvent().asTransportError(status, message);
-        while (!events.offer(ev)) {
-            // Events queue is bounded; the consumer side (user thread) drains
-            // steadily under a cooperative shutdown. Yield between retries so
-            // we don't busy-spin while the consumer is scheduled.
-            Thread.yield();
-            if (Thread.currentThread().isInterrupted()) {
-                // Restore the interrupt and abandon the error publish. Caller
-                // paths that rely on the error reaching the user may see a
-                // silent drop -- acceptable under explicit interrupt.
-                return;
-            }
-        }
-    }
-
-    /**
      * Emits a {@code KIND_TRANSPORT_ERROR} event AND latches the client's
      * terminal-failure state. Use for transport- or protocol-level faults
      * where the WebSocket is no longer usable (server close, send/recv
@@ -458,6 +482,28 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private void emitTerminalTransportError(String message) {
         notifyTerminalFailure(message);
         events.offer(new QueryEvent().asTransportError(WebSocketResponse.STATUS_INTERNAL_ERROR, message));
+    }
+
+    /**
+     * Like {@link #emitError} but emits a {@code KIND_TRANSPORT_ERROR} event
+     * rather than {@code KIND_ERROR}, and retries until the event is enqueued.
+     * Used on transport-failure paths where the WebSocket is torn down and
+     * the user thread needs to be woken so failover can kick in.
+     */
+    private void emitTransportErrorBlocking(String message) {
+        QueryEvent ev = new QueryEvent().asTransportError(WebSocketResponse.STATUS_INTERNAL_ERROR, message);
+        while (!events.offer(ev)) {
+            // Events queue is bounded; the consumer side (user thread) drains
+            // steadily under a cooperative shutdown. Yield between retries so
+            // we don't busy-spin while the consumer is scheduled.
+            Thread.yield();
+            if (Thread.currentThread().isInterrupted()) {
+                // Restore the interrupt and abandon the error publish. Caller
+                // paths that rely on the error reaching the user may see a
+                // silent drop -- acceptable under explicit interrupt.
+                return;
+            }
+        }
     }
 
     /**
@@ -510,7 +556,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             currentQueryDone = true;
             return;
         }
-        events.offer(new QueryEvent().asBatch(buf));
+        events.offer(borrowEvent().asBatch(buf));
         // Park on the release latch. Returning sooner would let receiveFrame
         // compact the WebSocket recv buffer, overwriting the bytes that the
         // user-visible column pointers still reference. User thread's

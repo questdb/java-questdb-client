@@ -611,46 +611,55 @@ public class QwpQueryClient implements QuietCloseable {
     public void close() {
         connected = false;
         lastCloseTimedOut = false;
-        if (ioThread != null) {
-            ioThread.shutdown();
-            // Wake the thread from any blocking poll / recv so it sees the shutdown flag promptly.
-            if (ioThreadHandle != null) {
-                ioThreadHandle.interrupt();
-                boolean joined;
-                try {
-                    ioThreadHandle.join(shutdownJoinMs);
-                    joined = !ioThreadHandle.isAlive();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    // Don't free anything -- preserve clean shutdown semantics on the next attempt.
-                    return;
+        try {
+            if (ioThread != null) {
+                ioThread.shutdown();
+                // Wake the thread from any blocking poll / recv so it sees the shutdown flag promptly.
+                if (ioThreadHandle != null) {
+                    ioThreadHandle.interrupt();
+                    boolean joined;
+                    try {
+                        ioThreadHandle.join(shutdownJoinMs);
+                        joined = !ioThreadHandle.isAlive();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        // Don't free anything else -- preserve clean shutdown semantics on the next
+                        // attempt. bindValues still closes via the enclosing finally because its
+                        // bytes are copied into sendScratch at submit time and no other thread
+                        // references it after that.
+                        return;
+                    }
+                    if (!joined) {
+                        // Daemon thread is still running -- buffer pool and WebSocketClient may
+                        // be in use. Leak them rather than risk a SIGSEGV by freeing under it.
+                        // Log at ERROR so operators notice; wasLastCloseTimedOut() is the
+                        // programmatic hook for monitoring or tests that want to assert on it.
+                        LOG.error("QwpQueryClient close timed out after {} ms; leaking I/O thread, "
+                                        + "buffer pool, and WebSocket to avoid freeing them from under "
+                                        + "a running daemon. Common cause: a batch handler that never "
+                                        + "returns (e.g. blocking I/O or deadlock).",
+                                shutdownJoinMs);
+                        lastCloseTimedOut = true;
+                        ioThread = null;
+                        ioThreadHandle = null;
+                        webSocketClient = null;
+                        return;
+                    }
                 }
-                if (!joined) {
-                    // Daemon thread is still running -- buffer pool and WebSocketClient may
-                    // be in use. Leak them rather than risk a SIGSEGV by freeing under it.
-                    // Log at ERROR so operators notice; wasLastCloseTimedOut() is the
-                    // programmatic hook for monitoring or tests that want to assert on it.
-                    LOG.error("QwpQueryClient close timed out after {} ms; leaking I/O thread, "
-                                    + "buffer pool, and WebSocket to avoid freeing them from under "
-                                    + "a running daemon. Common cause: a batch handler that never "
-                                    + "returns (e.g. blocking I/O or deadlock).",
-                            shutdownJoinMs);
-                    lastCloseTimedOut = true;
-                    ioThread = null;
-                    ioThreadHandle = null;
-                    webSocketClient = null;
-                    return;
-                }
+                ioThread.closePool();
+                ioThread = null;
+                ioThreadHandle = null;
             }
-            ioThread.closePool();
-            ioThread = null;
-            ioThreadHandle = null;
+            if (webSocketClient != null) {
+                webSocketClient.close();
+                webSocketClient = null;
+            }
+        } finally {
+            // bindValues owns native scratch that is not shared with the I/O thread
+            // (submitQuery copies its bytes into sendScratch), so it is safe to free
+            // even when we otherwise leak the I/O thread and buffer pool.
+            bindValues.close();
         }
-        if (webSocketClient != null) {
-            webSocketClient.close();
-            webSocketClient = null;
-        }
-        bindValues.close();
     }
 
     /**
@@ -880,10 +889,9 @@ public class QwpQueryClient implements QuietCloseable {
         return lastCloseTimedOut;
     }
 
-    public QwpQueryClient withAuthorization(String authorizationHeader) {
+    public void withAuthorization(String authorizationHeader) {
         checkPreConnect("withAuthorization");
         this.authorizationHeader = authorizationHeader;
-        return this;
     }
 
     /**
@@ -925,21 +933,19 @@ public class QwpQueryClient implements QuietCloseable {
      * smaller pools reduce memory but may stall the I/O thread on slow consumers.
      * Must be called before {@link #connect()}.
      */
-    public QwpQueryClient withBufferPoolSize(int size) {
+    public void withBufferPoolSize(int size) {
         checkPreConnect("withBufferPoolSize");
         if (size < 1) throw new IllegalArgumentException("bufferPoolSize must be >= 1");
         this.bufferPoolSize = size;
-        return this;
     }
 
     /**
      * Overrides the {@code X-QWP-Client-Id} header sent during the upgrade handshake.
      * Must be called before {@link #connect()}.
      */
-    public QwpQueryClient withClientId(String clientId) {
+    public void withClientId(String clientId) {
         checkPreConnect("withClientId");
         this.clientId = clientId;
-        return this;
     }
 
     /**
@@ -949,7 +955,7 @@ public class QwpQueryClient implements QuietCloseable {
      * compression level hint passed to the server; clamped server-side to
      * [1, 9]. Must be called before {@link #connect}.
      */
-    public QwpQueryClient withCompression(String preference, int level) {
+    public void withCompression(String preference, int level) {
         checkPreConnect("withCompression");
         if (!"zstd".equals(preference) && !"raw".equals(preference) && !"auto".equals(preference)) {
             throw new IllegalArgumentException(
@@ -960,13 +966,11 @@ public class QwpQueryClient implements QuietCloseable {
         }
         this.compressionPreference = preference;
         this.compressionLevel = level;
-        return this;
     }
 
-    public QwpQueryClient withEndpointPath(String endpointPath) {
+    public void withEndpointPath(String endpointPath) {
         checkPreConnect("withEndpointPath");
         this.endpointPath = endpointPath;
-        return this;
     }
 
     /**
@@ -974,10 +978,9 @@ public class QwpQueryClient implements QuietCloseable {
      * Default is {@code true}: transport failures during {@link #execute} are
      * transparently retried against another endpoint.
      */
-    public QwpQueryClient withFailover(boolean enabled) {
+    public void withFailover(boolean enabled) {
         checkPreConnect("withFailover");
         this.failoverEnabled = enabled;
-        return this;
     }
 
     /**
@@ -990,7 +993,7 @@ public class QwpQueryClient implements QuietCloseable {
      * Defaults: initial {@value #DEFAULT_FAILOVER_INITIAL_BACKOFF_MS} ms,
      * max {@value #DEFAULT_FAILOVER_MAX_BACKOFF_MS} ms.
      */
-    public QwpQueryClient withFailoverBackoff(long initialMs, long maxMs) {
+    public void withFailoverBackoff(long initialMs, long maxMs) {
         checkPreConnect("withFailoverBackoff");
         if (initialMs < 0) throw new IllegalArgumentException("failoverInitialBackoffMs must be >= 0");
         if (maxMs < initialMs) {
@@ -998,7 +1001,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
         this.failoverInitialBackoffMs = initialMs;
         this.failoverMaxBackoffMs = maxMs;
-        return this;
     }
 
     /**
@@ -1069,11 +1071,10 @@ public class QwpQueryClient implements QuietCloseable {
      * Overrides the {@link #DEFAULT_SERVER_INFO_TIMEOUT_MS} wait for the v2
      * {@code SERVER_INFO} frame. Must be called before {@link #connect}.
      */
-    public QwpQueryClient withServerInfoTimeout(int ms) {
+    public void withServerInfoTimeout(int ms) {
         checkPreConnect("withServerInfoTimeout");
         if (ms < 1) throw new IllegalArgumentException("serverInfoTimeoutMs must be >= 1");
         this.serverInfoTimeoutMs = ms;
-        return this;
     }
 
     /**
@@ -1081,14 +1082,13 @@ public class QwpQueryClient implements QuietCloseable {
      * One of {@link #TARGET_ANY} (default), {@link #TARGET_PRIMARY},
      * {@link #TARGET_REPLICA}.
      */
-    public QwpQueryClient withTarget(String target) {
+    public void withTarget(String target) {
         checkPreConnect("withTarget");
         if (!TARGET_ANY.equals(target) && !TARGET_PRIMARY.equals(target) && !TARGET_REPLICA.equals(target)) {
             throw new IllegalArgumentException(
                     "invalid target: " + target + " (expected any, primary, or replica)");
         }
         this.target = target;
-        return this;
     }
 
     /**
@@ -1361,7 +1361,7 @@ public class QwpQueryClient implements QuietCloseable {
                 // transport failures -- they're deterministic on the user thread --
                 // so they must not trigger failover.
                 bindValues.reset();
-                probe.deliverFinal(WebSocketResponse.STATUS_INTERNAL_ERROR,
+                probe.deliverFinal(
                         "bind encoding failed: " + e.getMessage());
                 return;
             }
@@ -1372,41 +1372,49 @@ public class QwpQueryClient implements QuietCloseable {
             io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen());
             while (true) {
                 QueryEvent ev = io.takeEvent();
-                switch (ev.kind) {
-                    case QueryEvent.KIND_BATCH:
-                        try {
-                            probe.onBatch(ev.buffer.batch);
-                        } finally {
-                            io.releaseBuffer(ev.buffer);
-                        }
-                        break;
-                    case QueryEvent.KIND_END:
-                        probe.onEnd(ev.totalRows);
-                        return;
-                    case QueryEvent.KIND_EXEC_DONE:
-                        probe.onExecDone(ev.opType, ev.rowsAffected);
-                        return;
-                    case QueryEvent.KIND_ERROR:
-                        // Server-emitted QUERY_ERROR. Connection remains healthy;
-                        // pass straight through to the user. Never triggers failover.
-                        probe.onError(ev.errorStatus, ev.errorMessage);
-                        return;
-                    case QueryEvent.KIND_TRANSPORT_ERROR:
-                        // Transport / protocol-level failure synthesised by the
-                        // I/O thread. Tag as a transport failure so the outer
-                        // execute loop can decide whether to replay (failover=on)
-                        // or surface as a final onError (failover=off).
-                        probe.markTransportFailure(ev.errorStatus, ev.errorMessage);
-                        return;
-                    default:
-                        probe.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind);
-                        return;
+                try {
+                    switch (ev.kind) {
+                        case QueryEvent.KIND_BATCH:
+                            try {
+                                probe.onBatch(ev.buffer.batch);
+                            } finally {
+                                io.releaseBuffer(ev.buffer);
+                            }
+                            break;
+                        case QueryEvent.KIND_END:
+                            probe.onEnd(ev.totalRows);
+                            return;
+                        case QueryEvent.KIND_EXEC_DONE:
+                            probe.onExecDone(ev.opType, ev.rowsAffected);
+                            return;
+                        case QueryEvent.KIND_ERROR:
+                            // Server-emitted QUERY_ERROR. Connection remains healthy;
+                            // pass straight through to the user. Never triggers failover.
+                            probe.onError(ev.errorStatus, ev.errorMessage);
+                            return;
+                        case QueryEvent.KIND_TRANSPORT_ERROR:
+                            // Transport / protocol-level failure synthesised by the
+                            // I/O thread. Tag as a transport failure so the outer
+                            // execute loop can decide whether to replay (failover=on)
+                            // or surface as a final onError (failover=off).
+                            probe.markTransportFailure(ev.errorStatus, ev.errorMessage);
+                            return;
+                        default:
+                            probe.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind);
+                            return;
+                    }
+                } finally {
+                    // Return the event to the I/O thread's pool so steady-state
+                    // publishes stay allocation-free. Safe even if the handler
+                    // threw: releaseEvent clears the event's fields and offers
+                    // it to the pool, with overflow silently dropped.
+                    io.releaseEvent(ev);
                 }
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             // Interrupt on the user thread is not a transport failure; surface directly.
-            probe.deliverFinal(WebSocketResponse.STATUS_INTERNAL_ERROR, "interrupted while waiting for server response");
+            probe.deliverFinal("interrupted while waiting for server response");
         } finally {
             currentRequestId = -1L;
         }
@@ -1476,19 +1484,31 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * Walks the endpoint list starting at the entry right after the one that
-     * just failed, wrapping around if necessary so every endpoint gets a try.
+     * just failed, wrapping around so every <em>other</em> endpoint gets a
+     * try. The failed endpoint itself is deliberately <strong>not</strong>
+     * retried: a transport failure is likely to repeat immediately on the same
+     * socket ({@code PeerDisconnectedException} from a server that's still
+     * accepting new connections but torn the old one down, for example), and
+     * a retry would just burn an attempt. The outer {@link #execute} loop
+     * can revisit the failed endpoint on a subsequent failover attempt if
+     * every other endpoint is also unreachable.
+     * <p>
      * On success, leaves the client in the same state {@link #connect()}
      * produces: {@code connected=true}, {@code ioThread} spawned,
      * {@code serverInfo} populated. On exhaustion, raises the same exceptions
      * as {@link #connect()}.
      */
     private void reconnectSkippingIndex(int failedIndex) {
+        int total = endpoints.size();
+        // When failedIndex is known, walk the other (total - 1) entries only.
+        // When it is not (defensive path: currentEndpointIndex was never set
+        // before the failure), fall back to the full (total) walk.
         int startFrom = failedIndex < 0 ? 0 : failedIndex + 1;
+        int stepCount = failedIndex < 0 ? total : total - 1;
         QwpServerInfo lastMismatch = null;
         boolean sawV1Mismatch = false;
         Throwable lastError = null;
-        int total = endpoints.size();
-        for (int step = 0; step < total; step++) {
+        for (int step = 0; step < stepCount; step++) {
             int i = (startFrom + step) % total;
             Endpoint ep = endpoints.get(i);
             try {
@@ -1528,21 +1548,6 @@ public class QwpQueryClient implements QuietCloseable {
         throw new HttpClientException(
                 "all QWP endpoints unreachable on failover [count=" + total
                         + ", lastError=" + (lastError == null ? "<none>" : lastError.getMessage()) + ']');
-    }
-
-    /**
-     * Test-only / diagnostics hook: injects a synthetic terminal failure
-     * through the current generation's listener. Production code does not
-     * call this -- transport failures arrive through the I/O thread's own
-     * callback path. Reachable via reflection from tests that want to
-     * simulate the I/O thread reporting a failure without actually tearing
-     * the WebSocket down.
-     */
-    void recordTerminalFailure(byte status, String message) {
-        GenerationListener listener = currentGenerationListener;
-        if (listener != null) {
-            listener.onTerminalFailure(status, message);
-        }
     }
 
     private static final class Endpoint {
@@ -1605,8 +1610,8 @@ public class QwpQueryClient implements QuietCloseable {
          * user. Used for failures that are not transport-related (bind-encode
          * errors, interrupts) so they don't trigger a spurious failover.
          */
-        void deliverFinal(byte status, String message) {
-            delegate.onError(status, message);
+        void deliverFinal(String message) {
+            delegate.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, message);
         }
 
         /**

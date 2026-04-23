@@ -75,6 +75,14 @@ public class QwpResultBatchDecoder implements QuietCloseable {
      * a negative varint that long-to-int casts negative).
      */
     private static final int MAX_SCHEMAS_PER_CONNECTION = 65_535;
+    // Reusable scratch for decoding column names during SCHEMA_MODE_FULL parsing.
+    // Sized to the wire-level cap so {@link #readColumnName} can copy bytes
+    // without allocating a fresh {@code byte[]} per column. The returned
+    // {@code String} is still a fresh allocation (immutable + retained
+    // long-term on {@link QwpEgressColumnInfo#name}), but dropping the
+    // throwaway byte[] is measurable on schema-heavy workloads and post
+    // CACHE_RESET re-registration.
+    private final byte[] colNameScratch = new byte[QwpConstants.MAX_COLUMN_NAME_LENGTH];
     // Reused for Gorilla-encoded TIMESTAMP / TIMESTAMP_NANOS / DATE columns.
     // Stateful per-column -- {@link #parseTimestampColumn} calls {@code reset}
     // before decoding each column so residue from a previous column never bleeds
@@ -95,6 +103,11 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     private final ObjList<ObjList<QwpEgressColumnInfo>> schemaRegistry = new ObjList<>();
     private long connDictEntriesAddr;
     private int connDictEntriesCapacity;
+    // Monotonic generation counter for the connection-scoped dict. Incremented
+    // whenever {@link #applyCacheReset} wipes the dict, so per-layout SYMBOL
+    // String caches (which key by dict id) can detect a reset and wipe lazily
+    // instead of paying an eager clear on every batch.
+    private long connDictGeneration;
     private long connDictHeapAddr;
     private int connDictHeapCapacity;
     private int connDictHeapPos;
@@ -137,6 +150,10 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         if ((resetMask & QwpEgressMsgKind.RESET_MASK_DICT) != 0) {
             connDictSize = 0;
             connDictHeapPos = 0;
+            // Bump generation so any per-layout SYMBOL String cache populated
+            // against the pre-reset dict detects the change on its next lookup
+            // and wipes before reading.
+            connDictGeneration++;
         }
         if ((resetMask & QwpEgressMsgKind.RESET_MASK_SCHEMAS) != 0) {
             schemaRegistry.clear();
@@ -234,16 +251,6 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         }
         return layout.stringBytesAddr + totalBytes;
     }
-
-    private static String readUtf8(long p, long len) {
-        byte[] bytes = new byte[(int) len];
-        for (int i = 0; i < len; i++) {
-            bytes[i] = Unsafe.getUnsafe().getByte(p + i);
-        }
-        return new String(bytes, StandardCharsets.UTF_8);
-    }
-
-    // Varint / string helpers
 
     private void decodePayload(QwpBatchBuffer buffer, long payload, int payloadLen) throws QwpDecodeException {
         if (payloadLen < QwpConstants.HEADER_SIZE + 10) {
@@ -425,7 +432,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
                 int colNameLen = (int) varintValue;
                 p = varintPos;
                 if (p + colNameLen + 1 > limit) throw new QwpDecodeException("truncated column def");
-                String colName = readUtf8(p, colNameLen);
+                String colName = readColumnName(p, colNameLen);
                 p += colNameLen;
                 byte wireType = Unsafe.getUnsafe().getByte(p++);
                 columns.getQuick(i).of(colName, wireType);
@@ -744,6 +751,11 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             layout.symbolDictHeapAddr = connDictHeapAddr;
             layout.symbolDictEntriesAddr = connDictEntriesAddr;
             dictSize = connDictSize;
+            // Stamp the cache version with an even-tagged generation so the
+            // String cache populated on a previous delta-mode batch stays
+            // valid until CACHE_RESET bumps the generation. Low bit 0 marks
+            // delta-mode tokens; non-delta uses bit 0 = 1 (see else branch).
+            layout.symbolDictVersion = connDictGeneration << 1;
         } else {
             decodeVarint(p, limit);
             dictSize = (int) varintValue;
@@ -764,6 +776,12 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             }
             layout.symbolDictHeapAddr = dictBase;
             layout.symbolDictEntriesAddr = entriesAddr;
+            // Non-delta: the dict lives inside the payload and changes every
+            // batch, so the cache must invalidate on every parse. Using
+            // (dictBase | 1) picks up the per-batch address change and also
+            // sets the low bit so a non-delta token can never collide with a
+            // delta generation token.
+            layout.symbolDictVersion = dictBase | 1L;
         }
         layout.symbolDictSize = dictSize;
         // Materialise per-row IDs into int[rowCount] so random access is O(1).
@@ -838,7 +856,19 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         return end;
     }
 
-    // Batch reset
+    /**
+     * Copies {@code len} bytes from native address {@code p} into the reusable
+     * {@link #colNameScratch} buffer and materialises them as a UTF-8 {@code
+     * String}. Callers must hold {@code len <= MAX_COLUMN_NAME_LENGTH}; the
+     * varint-length parse ({@link QwpConstants#MAX_COLUMN_NAME_LENGTH} guard)
+     * upstream in {@link #decodePayload} already ensures that.
+     */
+    private String readColumnName(long p, int len) {
+        for (int i = 0; i < len; i++) {
+            colNameScratch[i] = Unsafe.getUnsafe().getByte(p + i);
+        }
+        return new String(colNameScratch, 0, len, StandardCharsets.UTF_8);
+    }
 
     private void resetBatch(
             QwpBatchBuffer buffer,
