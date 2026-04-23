@@ -232,7 +232,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             throw new QwpDecodeException("bad magic 0x" + Integer.toHexString(magic));
         }
         byte version = Unsafe.getUnsafe().getByte(payload + 4);
-        if (version != QwpConstants.VERSION_1) {
+        if (version < QwpConstants.VERSION_1 || version > QwpConstants.MAX_SUPPORTED_VERSION) {
             throw new QwpDecodeException("unsupported version " + (version & 0xFF));
         }
         byte flags = Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS);

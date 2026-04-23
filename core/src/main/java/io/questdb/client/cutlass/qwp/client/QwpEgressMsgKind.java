@@ -41,9 +41,34 @@ public final class QwpEgressMsgKind {
     public static final byte QUERY_REQUEST = 0x10;
     public static final byte RESULT_BATCH = 0x11;
     public static final byte RESULT_END = 0x12;
-
-    // Egress-specific QUERY_ERROR status codes. Extend the ingress
-    // QwpConstants.STATUS_* namespace (0x00-0x09).
+    /**
+     * Role value on {@code SERVER_INFO.role}: the authoritative write node.
+     */
+    public static final byte ROLE_PRIMARY = 1;
+    /**
+     * Role value on {@code SERVER_INFO.role}: promotion-in-progress. Clients
+     * insisting on primary-only reads may still route here; clients needing
+     * write-visible reads should wait for {@link #ROLE_PRIMARY}.
+     */
+    public static final byte ROLE_PRIMARY_CATCHUP = 3;
+    /**
+     * Role value on {@code SERVER_INFO.role}: the node is a read-only replica
+     * that pulls WAL segments from the shared object store. Reads may lag the
+     * primary by the replication poll interval plus transport time.
+     */
+    public static final byte ROLE_REPLICA = 2;
+    /**
+     * Role value on {@code SERVER_INFO.role}: no replication is configured. The
+     * standalone OSS default; behaves like a primary for routing purposes.
+     */
+    public static final byte ROLE_STANDALONE = 0;
+    /**
+     * Server -> client. Unsolicited frame delivered as the first QWP message
+     * on every v2 WebSocket connection. Body (little-endian): {@code
+     * msg_kind:u8, role:u8, epoch:u64, capabilities:u32, server_wall_ns:i64,
+     * cluster_id:u16_len+utf8, node_id:u16_len+utf8}.
+     */
+    public static final byte SERVER_INFO = 0x17;
     /**
      * Status byte on a {@code QUERY_ERROR} frame: the query was cancelled,
      * either by a client {@code CANCEL} frame or by explicit server-side cancel.

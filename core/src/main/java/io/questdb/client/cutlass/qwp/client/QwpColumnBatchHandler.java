@@ -67,6 +67,26 @@ public interface QwpColumnBatchHandler {
     void onError(byte status, String message);
 
     /**
+     * Invoked when {@link QwpQueryClient#execute} has transparently reconnected
+     * to another endpoint after a transport failure and is about to re-submit
+     * the query (with {@code failover=on}, the default).
+     * <p>
+     * {@code newNode} is the {@link QwpServerInfo} of the endpoint the client
+     * just bound to, or {@code null} if the new server negotiated the v1
+     * protocol (no SERVER_INFO frame).
+     * <p>
+     * After this callback fires, {@link #onBatch} will be invoked again with
+     * {@code batch_seq} restarting at 0 on the new connection. Handlers that
+     * accumulate rows across batches should discard whatever they built up
+     * from the previous attempt. The default implementation is a no-op, safe
+     * for handlers that don't care (for example, simple row-count aggregators
+     * that are idempotent against replays) and for applications that set
+     * {@code failover=off}.
+     */
+    default void onFailoverReset(QwpServerInfo newNode) {
+    }
+
+    /**
      * Invoked in place of {@link #onBatch} + {@link #onEnd} when the query was
      * a non-SELECT (DDL, INSERT, UPDATE, etc.). No batches are delivered for
      * such queries -- the server executes the statement and replies with a

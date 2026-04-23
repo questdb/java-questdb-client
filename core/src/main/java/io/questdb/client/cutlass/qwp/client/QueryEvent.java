@@ -36,6 +36,14 @@ public class QueryEvent {
     public static final int KIND_END = 1;
     public static final int KIND_ERROR = 2;
     public static final int KIND_EXEC_DONE = 3;
+    /**
+     * Synthesised on the I/O thread when the server closes the socket,
+     * receiveFrame / decode raises, or the I/O thread abnormally exits.
+     * Distinct from {@link #KIND_ERROR} (server-emitted {@code QUERY_ERROR})
+     * so {@code execute()} can decide whether to trigger failover without
+     * having to reconstruct the classification from a side-channel latch.
+     */
+    public static final int KIND_TRANSPORT_ERROR = 4;
 
     public QwpBatchBuffer buffer;     // valid for KIND_BATCH (must be released to pool by consumer)
     public byte errorStatus;          // valid for KIND_ERROR
@@ -71,6 +79,14 @@ public class QueryEvent {
         this.buffer = null;
         this.opType = opType;
         this.rowsAffected = rowsAffected;
+        return this;
+    }
+
+    public QueryEvent asTransportError(byte status, String message) {
+        this.kind = KIND_TRANSPORT_ERROR;
+        this.buffer = null;
+        this.errorStatus = status;
+        this.errorMessage = message;
         return this;
     }
 }

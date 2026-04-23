@@ -194,9 +194,25 @@ public final class QwpConstants {
      */
     public static final byte VERSION_1 = 1;
     /**
-     * Maximum protocol version supported by this client.
+     * Protocol v2 adds an unsolicited {@code SERVER_INFO} control frame
+     * delivered as the first WebSocket frame after the 101 upgrade. Servers that
+     * advertise v2 send the frame automatically; v2 clients must consume it
+     * before submitting the first query and may use the role value it carries
+     * to route reads to primary vs replica.
      */
-    public static final byte MAX_SUPPORTED_VERSION = VERSION_1;
+    public static final byte VERSION_2 = 2;
+    /**
+     * Maximum protocol version the ingest path advertises / accepts. Pinned to
+     * v1 because the v2 bump only adds an egress control frame; bumping the
+     * ingest wire to v2 would silently round-trip a version byte that no v1
+     * server can accept.
+     */
+    public static final byte MAX_SUPPORTED_INGEST_VERSION = VERSION_1;
+    /**
+     * Maximum protocol version supported by this client on the egress path.
+     * Ingest pins to {@link #MAX_SUPPORTED_INGEST_VERSION}.
+     */
+    public static final byte MAX_SUPPORTED_VERSION = VERSION_2;
 
     private QwpConstants() {
         // utility class

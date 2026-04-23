@@ -1213,7 +1213,7 @@ public class QwpWebSocketSender implements Sender {
 
             // Connect and upgrade to WebSocket
             try {
-                client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_VERSION);
+                client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
                 client.setQwpClientId(QwpConstants.CLIENT_ID);
                 client.connect(host, port);
                 client.upgrade(WRITE_PATH, authorizationHeader);
