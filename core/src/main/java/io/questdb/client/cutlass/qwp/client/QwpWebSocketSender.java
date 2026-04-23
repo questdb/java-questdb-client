@@ -1757,10 +1757,10 @@ public class QwpWebSocketSender implements Sender {
             if (received) {
                 if (sawBinaryAck) {
                     if (ackResponse.isDurableAck()) {
-                        updateSyncDurableSeqTxns();
+                        updateSyncSeqTxns(syncDurableSeqTxns);
                     } else if (ackResponse.isSuccess()) {
                         inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
-                        updateSyncCommittedSeqTxns();
+                        updateSyncSeqTxns(syncCommittedSeqTxns);
                     }
                 }
                 if (sawPong) {
@@ -1771,22 +1771,12 @@ public class QwpWebSocketSender implements Sender {
         throw new LineSenderException("Ping timed out");
     }
 
-    private void updateSyncCommittedSeqTxns() {
+    private void updateSyncSeqTxns(CharSequenceLongHashMap seqTxns) {
         for (int i = 0, n = ackResponse.getTableEntryCount(); i < n; i++) {
             String name = ackResponse.getTableName(i);
             long seqTxn = ackResponse.getTableSeqTxn(i);
-            if (seqTxn > syncCommittedSeqTxns.get(name)) {
-                syncCommittedSeqTxns.put(name, seqTxn);
-            }
-        }
-    }
-
-    private void updateSyncDurableSeqTxns() {
-        for (int i = 0, n = ackResponse.getTableEntryCount(); i < n; i++) {
-            String name = ackResponse.getTableName(i);
-            long seqTxn = ackResponse.getTableSeqTxn(i);
-            if (seqTxn > syncDurableSeqTxns.get(name)) {
-                syncDurableSeqTxns.put(name, seqTxn);
+            if (seqTxn > seqTxns.get(name)) {
+                seqTxns.put(name, seqTxn);
             }
         }
     }
@@ -1842,12 +1832,12 @@ public class QwpWebSocketSender implements Sender {
                     if (ackResponse.isSuccess()) {
                         long sequence = ackResponse.getSequence();
                         inFlightWindow.acknowledgeUpTo(sequence);
-                        updateSyncCommittedSeqTxns();
+                        updateSyncSeqTxns(syncCommittedSeqTxns);
                         if (sequence >= expectedSequence) {
                             return;
                         }
                     } else if (ackResponse.isDurableAck()) {
-                        updateSyncDurableSeqTxns();
+                        updateSyncSeqTxns(syncDurableSeqTxns);
                     } else {
                         long sequence = ackResponse.getSequence();
                         String errorMessage = ackResponse.getErrorMessage();

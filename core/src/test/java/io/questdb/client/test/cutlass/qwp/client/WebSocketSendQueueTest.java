@@ -38,6 +38,7 @@ import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
 import org.junit.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -316,6 +317,47 @@ public class WebSocketSendQueueTest {
                 batch0.close();
                 batch1.close();
                 client.close();
+            }
+        });
+    }
+
+    @Test
+    public void testStatusOkWithTableEntriesUpdatesCommittedSeqTxn() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch ackDelivered = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean(false);
+                window.addInFlight(0);
+                client.setTryReceiveBehavior(handler -> {
+                    if (fired.compareAndSet(false, true)) {
+                        emitAckWithTables(handler,
+                                new String[]{"trades", "orders"},
+                                new long[]{10L, 20L});
+                        ackDelivered.countDown();
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue("Expected ACK callback",
+                        ackDelivered.await(2, TimeUnit.SECONDS));
+
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (queue.getCommittedSeqTxn("trades") < 0
+                        && System.currentTimeMillis() < deadline) {
+                    Os.sleep(5);
+                }
+
+                assertEquals(10L, queue.getCommittedSeqTxn("trades"));
+                assertEquals(20L, queue.getCommittedSeqTxn("orders"));
+                assertEquals(-1L, queue.getCommittedSeqTxn("other"));
+                assertEquals(0, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
             }
         });
     }
@@ -620,6 +662,39 @@ public class WebSocketSendQueueTest {
         long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         try {
             response.writeTo(ptr);
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void emitAckWithTables(WebSocketFrameHandler handler,
+                                          String[] tableNames, long[] seqTxns) {
+        byte[][] nameBytes = new byte[tableNames.length][];
+        int size = 1 + 8 + 2;
+        for (int i = 0; i < tableNames.length; i++) {
+            nameBytes[i] = tableNames[i].getBytes(StandardCharsets.UTF_8);
+            size += 2 + nameBytes[i].length + 8;
+        }
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            int offset = 0;
+            Unsafe.getUnsafe().putByte(ptr + offset, WebSocketResponse.STATUS_OK);
+            offset += 1;
+            Unsafe.getUnsafe().putLong(ptr + offset, 0);
+            offset += 8;
+            Unsafe.getUnsafe().putShort(ptr + offset, (short) tableNames.length);
+            offset += 2;
+            for (int i = 0; i < tableNames.length; i++) {
+                Unsafe.getUnsafe().putShort(ptr + offset, (short) nameBytes[i].length);
+                offset += 2;
+                for (int j = 0; j < nameBytes[i].length; j++) {
+                    Unsafe.getUnsafe().putByte(ptr + offset + j, nameBytes[i][j]);
+                }
+                offset += nameBytes[i].length;
+                Unsafe.getUnsafe().putLong(ptr + offset, seqTxns[i]);
+                offset += 8;
+            }
             handler.onBinaryMessage(ptr, size);
         } finally {
             Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);

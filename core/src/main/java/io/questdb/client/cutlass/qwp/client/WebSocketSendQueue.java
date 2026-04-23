@@ -809,11 +809,8 @@ public class WebSocketSendQueue implements QuietCloseable {
         SeqTxn existing = map.get(tableName);
         if (existing != null) {
             existing.advance(seqTxn);
-        } else {
-            existing = map.putIfAbsent(tableName, new SeqTxn(seqTxn));
-            if (existing != null) {
-                existing.advance(seqTxn);
-            }
+            return;
         }
+        map.computeIfAbsent(tableName, k -> new SeqTxn(seqTxn)).advance(seqTxn);
     }
 }
