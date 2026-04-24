@@ -42,17 +42,14 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testAddrAcceptsHostWithoutPort() {
-        QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db.internal;");
         // Host-only accepted; port defaults to the public DEFAULT_WS_PORT constant.
-        Assert.assertNotNull(c);
+        assertParses("ws::addr=db.internal;");
     }
 
     @Test
     public void testAddrAcceptsMultipleEntries() {
         // Three-endpoint config must parse without error.
-        QwpQueryClient c = QwpQueryClient.fromConfig(
-                "ws::addr=a.internal:9000,b.internal:9000,c.internal:9000;");
-        Assert.assertNotNull(c);
+        assertParses("ws::addr=a.internal:9000,b.internal:9000,c.internal:9000;");
     }
 
     @Test
@@ -142,20 +139,21 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testBufferPoolSizeValidAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;buffer_pool_size=8;"));
+        assertParses("ws::addr=db:9000;buffer_pool_size=8;");
     }
 
     @Test
     public void testCompressionAutoAccepted() {
-        Assert.assertEquals("auto",
-                QwpQueryClient.fromConfig("ws::addr=db:9000;compression=auto;")
-                        .getCompressionPreference());
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;compression=auto;")) {
+            Assert.assertEquals("auto", c.getCompressionPreference());
+        }
     }
 
     @Test
     public void testCompressionDefaultIsRaw() {
-        Assert.assertEquals("raw",
-                QwpQueryClient.fromConfig("ws::addr=db:9000;").getCompressionPreference());
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;")) {
+            Assert.assertEquals("raw", c.getCompressionPreference());
+        }
     }
 
     @Test
@@ -168,13 +166,13 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testCompressionLevelAtLowerBoundAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;compression=zstd;compression_level=1;"));
+        assertParses("ws::addr=db:9000;compression=zstd;compression_level=1;");
     }
 
     @Test
     public void testCompressionLevelAtUpperBoundAccepted() {
         // Parse-time cap is [1, 22]; server-side runtime clamp to [1, 9] is a separate concern.
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;compression=zstd;compression_level=22;"));
+        assertParses("ws::addr=db:9000;compression=zstd;compression_level=22;");
     }
 
     @Test
@@ -199,16 +197,16 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testCompressionRawAccepted() {
-        Assert.assertEquals("raw",
-                QwpQueryClient.fromConfig("ws::addr=db:9000;compression=raw;")
-                        .getCompressionPreference());
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;compression=raw;")) {
+            Assert.assertEquals("raw", c.getCompressionPreference());
+        }
     }
 
     @Test
     public void testCompressionZstdAccepted() {
-        Assert.assertEquals("zstd",
-                QwpQueryClient.fromConfig("ws::addr=db:9000;compression=zstd;")
-                        .getCompressionPreference());
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;compression=zstd;")) {
+            Assert.assertEquals("zstd", c.getCompressionPreference());
+        }
     }
 
     @Test
@@ -220,7 +218,7 @@ public class QwpQueryClientFromConfigTest {
     public void testFailoverDefaultIsOn() {
         // No failover= key: happy path, no throw. Internal default is on; not directly
         // observable from the public API so we assert successful parse only.
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;"));
+        assertParses("ws::addr=db:9000;");
     }
 
     @Test
@@ -233,17 +231,17 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testFailoverOffAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;failover=off;"));
+        assertParses("ws::addr=db:9000;failover=off;");
     }
 
     @Test
     public void testFailoverOnAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;failover=on;"));
+        assertParses("ws::addr=db:9000;failover=on;");
     }
 
     @Test
     public void testFailoverBackoffInitialAtZeroAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;failover_backoff_initial_ms=0;"));
+        assertParses("ws::addr=db:9000;failover_backoff_initial_ms=0;");
     }
 
     @Test
@@ -264,9 +262,7 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testFailoverBackoffMaxAndInitialBothAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig(
-                "ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=500;"
-        ));
+        assertParses("ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=500;");
     }
 
     @Test
@@ -295,7 +291,7 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testFailoverMaxAttemptsAcceptedAtOne() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;failover_max_attempts=1;"));
+        assertParses("ws::addr=db:9000;failover_max_attempts=1;");
     }
 
     @Test
@@ -326,7 +322,7 @@ public class QwpQueryClientFromConfigTest {
                 + "compression=zstd;compression_level=5;"
                 + "max_batch_rows=512;"
                 + "tls_verify=on;";
-        Assert.assertNotNull(QwpQueryClient.fromConfig(conf));
+        assertParses(conf);
     }
 
     @Test
@@ -347,12 +343,12 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testMaxBatchRowsAtLowerBoundAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;max_batch_rows=1;"));
+        assertParses("ws::addr=db:9000;max_batch_rows=1;");
     }
 
     @Test
     public void testMaxBatchRowsAtUpperBoundAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;max_batch_rows=1048576;"));
+        assertParses("ws::addr=db:9000;max_batch_rows=1048576;");
     }
 
     @Test
@@ -378,12 +374,12 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testMinimalWsConfigAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=localhost:9000;"));
+        assertParses("ws::addr=localhost:9000;");
     }
 
     @Test
     public void testMinimalWssConfigAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("wss::addr=secure.internal:9443;"));
+        assertParses("wss::addr=secure.internal:9443;");
     }
 
     @Test
@@ -418,12 +414,12 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testPathOverrideAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;path=/custom/read;"));
+        assertParses("ws::addr=db:9000;path=/custom/read;");
     }
 
     @Test
     public void testTargetAnyAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;target=any;"));
+        assertParses("ws::addr=db:9000;target=any;");
     }
 
     @Test
@@ -436,12 +432,12 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testTargetPrimaryAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;target=primary;"));
+        assertParses("ws::addr=db:9000;target=primary;");
     }
 
     @Test
     public void testTargetReplicaAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("ws::addr=db:9000;target=replica;"));
+        assertParses("ws::addr=db:9000;target=replica;");
     }
 
     @Test
@@ -462,9 +458,7 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testTlsRootsWithPasswordAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig(
-                "wss::addr=db:9000;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;"
-        ));
+        assertParses("wss::addr=db:9000;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;");
     }
 
     @Test
@@ -477,7 +471,7 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testTlsVerifyOnWssAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("wss::addr=db:9000;tls_verify=on;"));
+        assertParses("wss::addr=db:9000;tls_verify=on;");
     }
 
     @Test
@@ -490,7 +484,7 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testTlsVerifyUnsafeOffOnWssAccepted() {
-        Assert.assertNotNull(QwpQueryClient.fromConfig("wss::addr=db:9000;tls_verify=unsafe_off;"));
+        assertParses("wss::addr=db:9000;tls_verify=unsafe_off;");
     }
 
     @Test
@@ -530,42 +524,31 @@ public class QwpQueryClientFromConfigTest {
         // Each of the three auth modes has a dedicated mutual-exclusion test;
         // the positive happy path is asserted here so the parser's per-key
         // dispatch and the post-loop "no auth set" path both have coverage.
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;auth=Bearer xyz;")) {
-            Assert.assertNotNull(c);
-        }
+        assertParses("ws::addr=db:9000;auth=Bearer xyz;");
     }
 
     @Test
     public void testBasicAuthAcceptedAlone() {
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;username=alice;password=secret;")) {
-            Assert.assertNotNull(c);
-        }
+        assertParses("ws::addr=db:9000;username=alice;password=secret;");
     }
 
     @Test
     public void testTokenAcceptedAlone() {
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;token=ey.payload.sig;")) {
-            Assert.assertNotNull(c);
-        }
+        assertParses("ws::addr=db:9000;token=ey.payload.sig;");
     }
 
     @Test
     public void testClientIdAcceptedAlone() {
         // Sent as the X-QWP-Client-Id header on the upgrade request; useful for
         // server-side telemetry. No format constraints from the parser.
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;client_id=batch-job/42;")) {
-            Assert.assertNotNull(c);
-        }
+        assertParses("ws::addr=db:9000;client_id=batch-job/42;");
     }
 
     @Test
     public void testFailoverMaxBackoffEqualToInitialAccepted() {
         // The "max < initial" rejection path is tested already; verify the
         // boundary case (max == initial) is the lowest legal max and parses.
-        try (QwpQueryClient c = QwpQueryClient.fromConfig(
-                "ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=100;")) {
-            Assert.assertNotNull(c);
-        }
+        assertParses("ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=100;");
     }
 
     @Test
@@ -584,7 +567,17 @@ public class QwpQueryClientFromConfigTest {
         // The parser splits on commas and trims; a single leading space on a
         // valid entry must therefore be tolerated rather than rejected as
         // "empty". Pin so a future refactor that drops trim() breaks here.
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr= db1:9000 , db2:9000 ;")) {
+        assertParses("ws::addr= db1:9000 , db2:9000 ;");
+    }
+
+    /**
+     * Asserts that {@code conf} parses into a non-null {@link QwpQueryClient}
+     * and closes the result on the way out. Centralising both checks here
+     * stops every happy-path test from leaking the I/O scaffolding the
+     * client allocates eagerly in fromConfig().
+     */
+    private static void assertParses(String conf) {
+        try (QwpQueryClient c = QwpQueryClient.fromConfig(conf)) {
             Assert.assertNotNull(c);
         }
     }

@@ -47,8 +47,7 @@ public class QwpColumnLayoutTest {
     @Test
     public void testClearResetsScalarsButPreservesSymbolCacheReference() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            QwpColumnLayout layout = new QwpColumnLayout();
-            try {
+            try (QwpColumnLayout layout = new QwpColumnLayout()) {
                 writeLong(layout, "valuesAddr", 0xDEADBEEFL);
                 writeLong(layout, "nullBitmapAddr", 0xCAFEBABEL);
                 writeLong(layout, "stringBytesAddr", 0x1000L);
@@ -78,8 +77,6 @@ public class QwpColumnLayoutTest {
                 // symbolDictVersion vs. symbolCacheVersion at lookup time.
                 Assert.assertSame("clear() must NOT replace the symbolStringCache instance",
                         cacheBefore, readField(layout, "symbolStringCache"));
-            } finally {
-                layout.close();
             }
         });
     }
@@ -87,8 +84,7 @@ public class QwpColumnLayoutTest {
     @Test
     public void testEnsureOwnedEntriesAddrLazyAllocAndGrowth() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            QwpColumnLayout layout = new QwpColumnLayout();
-            try {
+            try (QwpColumnLayout layout = new QwpColumnLayout()) {
                 Method ensure = QwpColumnLayout.class.getDeclaredMethod("ensureOwnedEntriesAddr", int.class);
                 ensure.setAccessible(true);
 
@@ -114,8 +110,6 @@ public class QwpColumnLayoutTest {
                 ensure.invoke(layout, (int) prevCap + 1);
                 Assert.assertTrue("capacity must grow past the previous capacity",
                         readInt(layout, "ownedEntriesCapacity") > prevCap);
-            } finally {
-                layout.close();
             }
         });
     }
@@ -123,8 +117,7 @@ public class QwpColumnLayoutTest {
     @Test
     public void testEnsureTimestampDecodeAddrLazyAllocAndGrowth() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            QwpColumnLayout layout = new QwpColumnLayout();
-            try {
+            try (QwpColumnLayout layout = new QwpColumnLayout()) {
                 Method ensure = QwpColumnLayout.class.getDeclaredMethod("ensureTimestampDecodeAddr", int.class);
                 ensure.setAccessible(true);
 
@@ -139,8 +132,6 @@ public class QwpColumnLayoutTest {
                 long addr3 = (long) ensure.invoke(layout, 65);
                 Assert.assertNotEquals(0L, addr3);
                 Assert.assertTrue(readInt(layout, "timestampDecodeCapacity") >= 65);
-            } finally {
-                layout.close();
             }
         });
     }
@@ -197,8 +188,7 @@ public class QwpColumnLayoutTest {
     @Test
     public void testDenseIndexFastPathWhenNoNulls() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            QwpColumnLayout layout = new QwpColumnLayout();
-            try {
+            try (QwpColumnLayout layout = new QwpColumnLayout()) {
                 // nullBitmapAddr == 0 means "column has no nulls in this batch";
                 // dense index equals row index. The decoder skips populating
                 // nonNullIdx in that case, so we must NOT touch it here.
@@ -206,8 +196,6 @@ public class QwpColumnLayoutTest {
                 Assert.assertEquals(0, layout.denseIndex(0));
                 Assert.assertEquals(7, layout.denseIndex(7));
                 Assert.assertEquals(99, layout.denseIndex(99));
-            } finally {
-                layout.close();
             }
         });
     }
@@ -215,8 +203,7 @@ public class QwpColumnLayoutTest {
     @Test
     public void testDenseIndexSlowPathReadsNonNullIdx() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            QwpColumnLayout layout = new QwpColumnLayout();
-            try {
+            try (QwpColumnLayout layout = new QwpColumnLayout()) {
                 // Non-zero nullBitmapAddr -- decoder has populated nonNullIdx.
                 // Row 1 is null (-1), rows 0/2/3 map to dense indices 0/1/2.
                 writeLong(layout, "nullBitmapAddr", 0xABCDL);
@@ -226,8 +213,6 @@ public class QwpColumnLayoutTest {
                 Assert.assertEquals(-1, layout.denseIndex(1));
                 Assert.assertEquals(1, layout.denseIndex(2));
                 Assert.assertEquals(2, layout.denseIndex(3));
-            } finally {
-                layout.close();
             }
         });
     }

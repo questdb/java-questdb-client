@@ -55,14 +55,11 @@ public class QueryEventTest {
     @Test
     public void testAsBatchSetsBufferAndKind() {
         QueryEvent ev = new QueryEvent();
-        QwpBatchBuffer buf = new QwpBatchBuffer(64);
-        try {
+        try (QwpBatchBuffer buf = new QwpBatchBuffer(64)) {
             QueryEvent returned = ev.asBatch(buf);
             Assert.assertSame("builder must return this for chaining", ev, returned);
             Assert.assertEquals(QueryEvent.KIND_BATCH, ev.kind);
             Assert.assertSame(buf, ev.buffer);
-        } finally {
-            buf.close();
         }
     }
 
@@ -70,16 +67,13 @@ public class QueryEventTest {
     public void testAsEndSetsTotalRowsAndClearsBuffer() {
         QueryEvent ev = new QueryEvent();
         // pre-populate to verify asEnd clears the buffer field.
-        QwpBatchBuffer stale = new QwpBatchBuffer(64);
-        try {
+        try (QwpBatchBuffer stale = new QwpBatchBuffer(64)) {
             ev.asBatch(stale);
             QueryEvent returned = ev.asEnd(123_456L);
             Assert.assertSame(ev, returned);
             Assert.assertEquals(QueryEvent.KIND_END, ev.kind);
             Assert.assertEquals(123_456L, ev.totalRows);
             Assert.assertNull("asEnd must drop the stale buffer reference", ev.buffer);
-        } finally {
-            stale.close();
         }
     }
 
@@ -152,14 +146,11 @@ public class QueryEventTest {
     @Test
     public void testResetClearsEverythingFromBatch() {
         QueryEvent ev = new QueryEvent();
-        QwpBatchBuffer buf = new QwpBatchBuffer(64);
-        try {
+        try (QwpBatchBuffer buf = new QwpBatchBuffer(64)) {
             ev.asBatch(buf);
             ev.reset();
             Assert.assertEquals(-1, ev.kind);
             Assert.assertNull("reset must drop the buffer reference for prompt GC", ev.buffer);
-        } finally {
-            buf.close();
         }
     }
 
