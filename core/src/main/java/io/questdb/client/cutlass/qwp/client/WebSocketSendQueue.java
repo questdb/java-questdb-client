@@ -507,7 +507,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         client.sendPing(1000);
                     } catch (Exception e) {
                         pingDeadlineNanos = 0;
-                        failTransport(new LineSenderException("Ping failed", e));
+                        failConnection(new LineSenderException("Ping failed", e));
                         completePing();
                     }
                 }
@@ -547,7 +547,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                                 completePing();
                             } else if (System.nanoTime() >= pingDeadlineNanos) {
                                 pingDeadlineNanos = 0;
-                                failTransport(new LineSenderException("Ping timed out waiting for PONG"));
+                                failConnection(new LineSenderException("Ping timed out waiting for PONG"));
                                 completePing();
                             }
                         }
