@@ -112,8 +112,12 @@ public class QwpServerInfoTest {
     @Test
     public void testRoleMismatchExceptionIsHttpClientException() {
         QwpRoleMismatchException ex = new QwpRoleMismatchException("any", null, "msg");
-        Assert.assertTrue("must be assignable to HttpClientException for catch-site compatibility",
-                ex instanceof HttpClientException);
+        // The static-typed assignment below would fail to compile if
+        // QwpRoleMismatchException stopped extending HttpClientException --
+        // a load-bearing relationship since callers catch the parent type.
+        // A runtime instanceof check would always be true here, so it adds
+        // nothing; this compile-time check is the meaningful guard.
+        @SuppressWarnings("unused") HttpClientException base = ex;
         Assert.assertNull("nullable lastObserved must round-trip", ex.getLastObserved());
         Assert.assertEquals("any", ex.getTargetRole());
     }

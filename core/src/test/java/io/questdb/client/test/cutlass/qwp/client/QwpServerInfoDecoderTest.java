@@ -169,26 +169,22 @@ public class QwpServerInfoDecoderTest {
     @Test
     public void testTruncatedBeforeClusterIdLengthRejected() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // Exactly fixedBytes -- one byte short of the cluster_id length prefix.
-            // (fixedBytes already counts 2 bytes for cluster_id_len, so to land
-            // before its length we need to pass payloadLen = OFF_CLUSTER_ID_LEN.)
-            int len = OFF_CLUSTER_ID_LEN + 1; // length sits at OFF_CLUSTER_ID_LEN..+1; only 1 of 2 bytes present
-            // fixedBytes = HEADER_SIZE + 1+1+8+4+8+2 = OFF_CLUSTER_ID_LEN+2; we go below that.
-            int passLen = OFF_CLUSTER_ID_LEN + 1;
-            long buf = Unsafe.malloc(passLen, MemoryTag.NATIVE_DEFAULT);
+            // fixedBytes = HEADER_SIZE + 1+1+8+4+8+2 = OFF_CLUSTER_ID_LEN+2. Pass
+            // one byte less so the up-front fixed-prelude check rejects before
+            // ever reading the cluster_id length prefix.
+            int payloadLen = OFF_CLUSTER_ID_LEN + 1;
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
             try {
-                zero(buf, passLen);
+                zero(buf, payloadLen);
                 Unsafe.getUnsafe().putByte(buf + OFF_MSG_KIND, QwpEgressMsgKind.SERVER_INFO);
-                QwpServerInfoDecoder.decode(buf, passLen);
+                QwpServerInfoDecoder.decode(buf, payloadLen);
                 Assert.fail("decoder must reject payload that ends before cluster_id length");
             } catch (QwpDecodeException expected) {
                 Assert.assertTrue("error mentions truncation: " + expected.getMessage(),
                         expected.getMessage().contains("truncated"));
             } finally {
-                Unsafe.free(buf, passLen, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
             }
-            // suppress unused-variable lint
-            Assert.assertTrue(len >= 0);
         });
     }
 
