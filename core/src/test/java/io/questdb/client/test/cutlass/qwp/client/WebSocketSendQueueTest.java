@@ -616,7 +616,7 @@ public class WebSocketSendQueueTest {
     @Test
     public void testPingTimesOutWhenNoPong() throws Exception {
         assertMemoryLeak(() -> {
-            InFlightWindow window = new InFlightWindow(8, 5_000);
+            InFlightWindow window = new InFlightWindow(8, 2_000);
             WebSocketSendQueue queue = null;
             try (FakeWebSocketClient client = new FakeWebSocketClient()) {
                 // Never emit a PONG

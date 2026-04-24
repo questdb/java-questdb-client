@@ -74,6 +74,7 @@ public class WebSocketSendQueue implements QuietCloseable {
     private final WebSocketClient client;
     // Configuration
     private final long enqueueTimeoutMs;
+    private final long pingTimeoutMs;
     @Nullable
     private final ConnectionFailureListener connectionFailureListener;
     // Optional InFlightWindow for tracking sent batches awaiting ACK
@@ -153,6 +154,7 @@ public class WebSocketSendQueue implements QuietCloseable {
         this.inFlightWindow = inFlightWindow;
         this.enqueueTimeoutMs = enqueueTimeoutMs;
         this.shutdownTimeoutMs = shutdownTimeoutMs;
+        this.pingTimeoutMs = inFlightWindow != null ? inFlightWindow.getTimeoutMs() : InFlightWindow.DEFAULT_TIMEOUT_MS;
         this.connectionFailureListener = connectionFailureListener;
         this.running = true;
         this.shuttingDown = false;
@@ -381,7 +383,7 @@ public class WebSocketSendQueue implements QuietCloseable {
             pingComplete = false;
             pingRequested = true;
             processingLock.notifyAll();
-            long deadline = System.nanoTime() + InFlightWindow.DEFAULT_TIMEOUT_MS * 1_000_000L;
+            long deadline = System.nanoTime() + pingTimeoutMs * 1_000_000L;
             while (!pingComplete && running) {
                 long remaining = (deadline - System.nanoTime()) / 1_000_000L;
                 if (remaining <= 0) {
@@ -502,7 +504,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                 if (pingRequested) {
                     pingRequested = false;
                     pongReceived = false;
-                    pingDeadlineNanos = System.nanoTime() + InFlightWindow.DEFAULT_TIMEOUT_MS * 1_000_000L;
+                    pingDeadlineNanos = System.nanoTime() + pingTimeoutMs * 1_000_000L;
                     try {
                         client.sendPing(1000);
                     } catch (Exception e) {

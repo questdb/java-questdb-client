@@ -393,6 +393,13 @@ public class InFlightWindow {
     }
 
     /**
+     * Returns the timeout (ms) applied to blocking window operations.
+     */
+    public long getTimeoutMs() {
+        return timeoutMs;
+    }
+
+    /**
      * Returns the total number of batches acknowledged.
      */
     public long getTotalAcked() {
