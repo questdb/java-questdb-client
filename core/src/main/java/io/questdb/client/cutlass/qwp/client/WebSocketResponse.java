@@ -371,20 +371,14 @@ public class WebSocketResponse {
     }
 
     private boolean readTableEntries(long ptr, int remaining) {
-        if (remaining < 2) {
+        if (!validateTableEntries(ptr, remaining)) {
             return false;
         }
         int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
         int offset = 2;
         for (int i = 0; i < tableCount; i++) {
-            if (remaining < offset + 2) {
-                return false;
-            }
             int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
             offset += 2;
-            if (remaining < offset + nameLen + 8) {
-                return false;
-            }
             long nameLo = ptr + offset;
             long nameHi = nameLo + nameLen;
             offset += nameLen;
@@ -393,7 +387,7 @@ public class WebSocketResponse {
             tableNames.add(internTableName(nameLo, nameHi));
             tableSeqTxns.add(seqTxn);
         }
-        return remaining == offset;
+        return true;
     }
 
     private String internTableName(long lo, long hi) {
@@ -427,7 +421,10 @@ public class WebSocketResponse {
             }
             int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
             offset += 2;
-            if (remaining < offset + nameLen + 8) {
+            // Empty table names are rejected as structurally invalid - a valid
+            // table name is never zero bytes, and accepting empty names would
+            // let a misbehaving server poison the per-table tracker with "" entries.
+            if (nameLen == 0 || remaining < offset + nameLen + 8) {
                 return false;
             }
             offset += nameLen + 8;

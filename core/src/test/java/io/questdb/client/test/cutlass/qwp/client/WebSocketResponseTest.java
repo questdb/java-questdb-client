@@ -206,9 +206,11 @@ public class WebSocketResponseTest {
     }
 
     @Test
-    public void testEmptyTableName() throws Exception {
+    public void testEmptyTableNameRejected() throws Exception {
         assertMemoryLeak(() -> {
-            // STATUS_OK with nameLen=0 (empty table name)
+            // STATUS_OK with nameLen=0 - a well-behaved server never emits
+            // an empty table name; the frame must be rejected as structurally
+            // invalid so it cannot corrupt the per-table tracker.
             int size = 1 + 8 + 2 + (2 + 8);
             long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
             try {
@@ -223,13 +225,10 @@ public class WebSocketResponseTest {
                 offset += 2;
                 Unsafe.getUnsafe().putLong(ptr + offset, 42L);
 
-                Assert.assertTrue(WebSocketResponse.isStructurallyValid(ptr, size));
+                Assert.assertFalse(WebSocketResponse.isStructurallyValid(ptr, size));
 
                 WebSocketResponse parsed = new WebSocketResponse();
-                Assert.assertTrue(parsed.readFrom(ptr, size));
-                Assert.assertEquals(1, parsed.getTableEntryCount());
-                Assert.assertEquals("", parsed.getTableName(0));
-                Assert.assertEquals(42L, parsed.getTableSeqTxn(0));
+                Assert.assertFalse(parsed.readFrom(ptr, size));
             } finally {
                 Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
             }
