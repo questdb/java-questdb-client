@@ -1817,6 +1817,19 @@ public class QwpWebSocketSender implements Sender {
                     } else if (ackResponse.isSuccess()) {
                         inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
                         updateSyncSeqTxns(syncCommittedSeqTxns);
+                    } else {
+                        // Server-side error on a pending batch (parse /
+                        // schema / security / internal / write error).
+                        // Route through inFlightWindow.fail so the next
+                        // waitForAck / flush surfaces it, matching the
+                        // normal waitForAck error-handling path. Do not
+                        // throw from syncPing: that would hide any
+                        // durable/committed progress already observed in
+                        // this ping round.
+                        inFlightWindow.fail(
+                                ackResponse.getSequence(),
+                                new LineSenderException(ackResponse.getErrorMessage())
+                        );
                     }
                 }
                 if (sawPong) {
