@@ -261,7 +261,7 @@ public class WebSocketSendQueueTest {
                 client.setTryReceiveBehavior(handler -> {
                     long sent = highestSent.get();
                     if (sent >= 0 && fired.compareAndSet(false, true)) {
-                        emitError(handler, sent, WebSocketResponse.STATUS_WRITE_ERROR, "disk full");
+                        emitError(handler, sent);
                         errorDelivered.countDown();
                         return true;
                     }
@@ -762,8 +762,8 @@ public class WebSocketSendQueueTest {
         }
     }
 
-    private static void emitError(WebSocketFrameHandler handler, long sequence, byte status, String errorMessage) {
-        WebSocketResponse response = WebSocketResponse.error(sequence, status, errorMessage);
+    private static void emitError(WebSocketFrameHandler handler, long sequence) {
+        WebSocketResponse response = WebSocketResponse.error(sequence, WebSocketResponse.STATUS_WRITE_ERROR, "disk full");
         int size = response.serializedSize();
         long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         try {
