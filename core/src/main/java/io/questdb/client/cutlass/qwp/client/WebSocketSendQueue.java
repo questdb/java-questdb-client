@@ -74,6 +74,8 @@ public class WebSocketSendQueue implements QuietCloseable {
     private final WebSocketClient client;
     // Configuration
     private final long enqueueTimeoutMs;
+    @Nullable
+    private final ConnectionFailureListener connectionFailureListener;
     // Optional InFlightWindow for tracking sent batches awaiting ACK
     @Nullable
     private final InFlightWindow inFlightWindow;
@@ -128,6 +130,21 @@ public class WebSocketSendQueue implements QuietCloseable {
      */
     public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
                               long enqueueTimeoutMs, long shutdownTimeoutMs) {
+        this(client, inFlightWindow, enqueueTimeoutMs, shutdownTimeoutMs, null);
+    }
+
+    /**
+     * Creates a new send queue with custom configuration.
+     *
+     * @param client                    the WebSocket client for I/O
+     * @param inFlightWindow            the window to track sent batches awaiting ACK (may be null)
+     * @param enqueueTimeoutMs          timeout for enqueue operations (ms)
+     * @param shutdownTimeoutMs         timeout for graceful shutdown (ms)
+     * @param connectionFailureListener notified once when the queue detects a terminal connection failure
+     */
+    public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
+                              long enqueueTimeoutMs, long shutdownTimeoutMs,
+                              @Nullable ConnectionFailureListener connectionFailureListener) {
         if (client == null) {
             throw new IllegalArgumentException("client cannot be null");
         }
@@ -136,6 +153,7 @@ public class WebSocketSendQueue implements QuietCloseable {
         this.inFlightWindow = inFlightWindow;
         this.enqueueTimeoutMs = enqueueTimeoutMs;
         this.shutdownTimeoutMs = shutdownTimeoutMs;
+        this.connectionFailureListener = connectionFailureListener;
         this.running = true;
         this.shuttingDown = false;
         this.shutdownLatch = new CountDownLatch(1);
@@ -233,20 +251,20 @@ public class WebSocketSendQueue implements QuietCloseable {
             throw new LineSenderException("Buffer must be sealed before enqueue, state=" +
                     MicrobatchBuffer.stateName(buffer.getState()));
         }
+        checkError();
         if (!running || shuttingDown) {
+            checkError();
             throw new LineSenderException("Send queue is not running");
         }
-
-        // Check for errors from I/O thread
-        checkError();
 
         final long deadline = System.currentTimeMillis() + enqueueTimeoutMs;
         synchronized (processingLock) {
             while (true) {
+                checkError();
                 if (!running || shuttingDown) {
+                    checkError();
                     throw new LineSenderException("Send queue is not running");
                 }
-                checkError();
 
                 if (offerPending(buffer)) {
                     processingLock.notifyAll();
@@ -417,11 +435,19 @@ public class WebSocketSendQueue implements QuietCloseable {
         }
     }
 
-    private void failTransport(LineSenderException error) {
+    private void failConnection(LineSenderException error) {
         Throwable rootError = lastError;
+        boolean firstFailure = rootError == null;
         if (rootError == null) {
             lastError = error;
             rootError = error;
+        }
+        if (firstFailure && connectionFailureListener != null) {
+            try {
+                connectionFailureListener.onConnectionFailure(error);
+            } catch (Throwable t) {
+                LOG.error("Error notifying connection failure listener", t);
+            }
         }
         running = false;
         shuttingDown = true;
@@ -614,7 +640,7 @@ public class WebSocketSendQueue implements QuietCloseable {
             sendBatch(batch);
         } catch (Throwable t) {
             LOG.error("Error sending batch [id={}]{}", batch.getBatchId(), "", t);
-            failTransport(new LineSenderException("Error sending batch " + batch.getBatchId() + ": " + t.getMessage(), t));
+            failConnection(new LineSenderException("Error sending batch " + batch.getBatchId() + ": " + t.getMessage(), t));
             // Mark as recycled even on error to allow cleanup
             if (batch.isSealed()) {
                 batch.markSending();
@@ -690,7 +716,7 @@ public class WebSocketSendQueue implements QuietCloseable {
         } catch (Exception e) {
             if (running) {
                 LOG.error("Error receiving response: {}", e.getMessage());
-                failTransport(new LineSenderException("Error receiving response: " + e.getMessage(), e));
+                failConnection(new LineSenderException("Error receiving response: " + e.getMessage(), e));
             }
         }
         return received;
@@ -708,6 +734,11 @@ public class WebSocketSendQueue implements QuietCloseable {
         IDLE, ACTIVE, DRAINING
     }
 
+    @FunctionalInterface
+    public interface ConnectionFailureListener {
+        void onConnectionFailure(LineSenderException error);
+    }
+
     /**
      * Handler for received WebSocket frames (ACKs from server).
      */
@@ -720,7 +751,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         "Invalid ACK response payload [length=" + payloadLen + ']'
                 );
                 LOG.error("Invalid ACK response payload [length={}]", payloadLen);
-                failTransport(error);
+                failConnection(error);
                 return;
             }
 
@@ -728,7 +759,7 @@ public class WebSocketSendQueue implements QuietCloseable {
             if (!response.readFrom(payloadPtr, payloadLen)) {
                 LineSenderException error = new LineSenderException("Failed to parse ACK response");
                 LOG.error("Failed to parse response");
-                failTransport(error);
+                failConnection(error);
                 return;
             }
 
@@ -761,20 +792,18 @@ public class WebSocketSendQueue implements QuietCloseable {
                 String errorMessage = response.getErrorMessage();
                 LOG.error("Error response [seq={}, status={}, error={}]", sequence, response.getStatusName(), errorMessage);
 
-                if (inFlightWindow != null) {
-                    LineSenderException error = new LineSenderException(
-                            "Server error for batch " + sequence + ": " +
-                                    response.getStatusName() + " - " + errorMessage);
-                    inFlightWindow.fail(sequence, error);
-                }
+                LineSenderException error = new LineSenderException(
+                        "Server error for batch " + sequence + ": " +
+                                response.getStatusName() + " - " + errorMessage);
                 totalErrors.incrementAndGet();
+                failConnection(error);
             }
         }
 
         @Override
         public void onClose(int code, String reason) {
             LOG.info("WebSocket closed by server [code={}, reason={}]", code, reason);
-            failTransport(new LineSenderException("WebSocket closed by server [code=" + code + ", reason=" + reason + ']'));
+            failConnection(new LineSenderException("WebSocket closed by server [code=" + code + ", reason=" + reason + ']'));
         }
 
         @Override

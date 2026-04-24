@@ -244,6 +244,55 @@ public class WebSocketSendQueueTest {
     }
 
     @Test
+    public void testEnqueueAfterServerErrorAckSurfacesServerError() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer batch0 = sealedBuffer((byte) 42);
+            MicrobatchBuffer batch1 = sealedBuffer((byte) 43);
+            CountDownLatch errorDelivered = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean(false);
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicReference<LineSenderException> connectionFailure = new AtomicReference<>();
+
+            try {
+                client.setSendBehavior((dataPtr, length) -> highestSent.incrementAndGet());
+                client.setTryReceiveBehavior(handler -> {
+                    long sent = highestSent.get();
+                    if (sent >= 0 && fired.compareAndSet(false, true)) {
+                        emitError(handler, sent, WebSocketResponse.STATUS_WRITE_ERROR, "disk full");
+                        errorDelivered.countDown();
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500, connectionFailure::set);
+                queue.enqueue(batch0);
+                assertTrue("Expected server error ACK callback", errorDelivered.await(2, TimeUnit.SECONDS));
+                assertNotNull("Expected connection failure callback", connectionFailure.get());
+                assertTrue(connectionFailure.get().getMessage(), connectionFailure.get().getMessage().contains("WRITE_ERROR"));
+                assertTrue(connectionFailure.get().getMessage(), connectionFailure.get().getMessage().contains("disk full"));
+
+                try {
+                    queue.enqueue(batch1);
+                    fail("Expected enqueue failure after server error ACK");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage(), e.getMessage().contains("WRITE_ERROR"));
+                    assertTrue(e.getMessage(), e.getMessage().contains("disk full"));
+                    assertSame(connectionFailure.get(), e.getCause());
+                }
+            } finally {
+                closeQuietly(queue);
+                batch0.close();
+                batch1.close();
+                client.close();
+            }
+        });
+    }
+
+    @Test
     public void testAwaitPendingAcksKeepsDrainNonBlocking() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
@@ -703,6 +752,18 @@ public class WebSocketSendQueueTest {
 
     private static void emitAck(WebSocketFrameHandler handler, long sequence) {
         WebSocketResponse response = WebSocketResponse.success(sequence);
+        int size = response.serializedSize();
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            response.writeTo(ptr);
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void emitError(WebSocketFrameHandler handler, long sequence, byte status, String errorMessage) {
+        WebSocketResponse response = WebSocketResponse.error(sequence, status, errorMessage);
         int size = response.serializedSize();
         long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         try {

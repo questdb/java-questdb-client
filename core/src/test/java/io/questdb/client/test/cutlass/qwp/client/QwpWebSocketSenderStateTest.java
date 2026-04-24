@@ -61,6 +61,42 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class QwpWebSocketSenderStateTest extends AbstractTest {
 
     @Test
+    public void testConnectionFailureIsSenderLevelTerminalState() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 0, 10_000, 0, 0L, 8
+            );
+            try {
+                LineSenderException failure = new LineSenderException(
+                        "Server error for batch 7: WRITE_ERROR - disk full"
+                );
+                Assert.assertTrue(invokeRecordConnectionFailure(sender, failure));
+
+                try {
+                    sender.table("t");
+                    Assert.fail("Expected sender-level connection failure");
+                } catch (LineSenderException e) {
+                    Assert.assertSame(failure, e);
+                    assertStackContains(e, "table");
+                }
+
+                LineSenderException secondFailure = new LineSenderException("second failure");
+                Assert.assertFalse(invokeRecordConnectionFailure(sender, secondFailure));
+
+                try {
+                    sender.flush();
+                    Assert.fail("Expected original sender-level connection failure");
+                } catch (LineSenderException e) {
+                    Assert.assertSame(failure, e);
+                    assertStackContains(e, "flush");
+                }
+            } finally {
+                sender.close();
+            }
+        });
+    }
+
+    @Test
     public void testConnectWithDurableAckToClosedPort() throws Exception {
         assertMemoryLeak(() -> {
             try {
@@ -505,6 +541,22 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
         Method method = target.getClass().getDeclaredMethod("resetSchemaStateForNewConnection");
         method.setAccessible(true);
         method.invoke(target);
+    }
+
+    private static void assertStackContains(Throwable throwable, String methodName) {
+        for (StackTraceElement element : throwable.getStackTrace()) {
+            if (QwpWebSocketSender.class.getName().equals(element.getClassName())
+                    && methodName.equals(element.getMethodName())) {
+                return;
+            }
+        }
+        Assert.fail("Expected stack trace to contain QwpWebSocketSender." + methodName);
+    }
+
+    private static boolean invokeRecordConnectionFailure(Object target, LineSenderException error) throws Exception {
+        Method method = target.getClass().getDeclaredMethod("recordConnectionFailure", LineSenderException.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(target, error);
     }
 
     private static void setField(Object target, String fieldName, Object value) throws Exception {
