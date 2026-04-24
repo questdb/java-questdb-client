@@ -1804,27 +1804,38 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void syncPing() {
-        client.sendPing(1000);
-        long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
-        while (System.currentTimeMillis() < deadline) {
-            sawPong = false;
-            sawBinaryAck = false;
-            boolean received = client.receiveFrame(ackHandler, 1000);
-            if (received) {
-                if (sawBinaryAck) {
-                    if (ackResponse.isDurableAck()) {
-                        updateSyncSeqTxns(syncDurableSeqTxns);
-                    } else if (ackResponse.isSuccess()) {
-                        inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
-                        updateSyncSeqTxns(syncCommittedSeqTxns);
+        try {
+            client.sendPing(1000);
+            long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                sawPong = false;
+                sawBinaryAck = false;
+                boolean received = client.receiveFrame(ackHandler, 1000);
+                if (received) {
+                    if (sawBinaryAck) {
+                        if (ackResponse.isDurableAck()) {
+                            updateSyncSeqTxns(syncDurableSeqTxns);
+                        } else if (ackResponse.isSuccess()) {
+                            inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
+                            updateSyncSeqTxns(syncCommittedSeqTxns);
+                        }
+                    }
+                    if (sawPong) {
+                        return;
                     }
                 }
-                if (sawPong) {
-                    return;
-                }
             }
+        } catch (LineSenderException e) {
+            failConnectionIfNeeded(e);
+            throw e;
+        } catch (Exception e) {
+            LineSenderException wrapped = new LineSenderException("Error waiting for PONG: " + e.getMessage(), e);
+            failConnectionIfNeeded(wrapped);
+            throw wrapped;
         }
-        throw new LineSenderException("Ping timed out");
+        LineSenderException timeout = new LineSenderException("Ping timed out");
+        failConnectionIfNeeded(timeout);
+        throw timeout;
     }
 
     private void updateSyncSeqTxns(CharSequenceLongHashMap seqTxns) {

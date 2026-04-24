@@ -396,6 +396,10 @@ public class WebSocketSendQueue implements QuietCloseable {
                     throw new LineSenderException("Ping interrupted");
                 }
             }
+            if (!pingComplete) {
+                checkError();
+                throw new LineSenderException("Ping aborted: send queue is shutting down");
+            }
         }
         checkError();
     }

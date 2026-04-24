@@ -2007,6 +2007,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put(", requestedCapacity=").put(bufferCapacity)
                         .put("]");
             }
+            if (requestDurableAck && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
+            }
             if (protocol == PROTOCOL_HTTP) {
                 if (httpClientConfiguration.getMaximumRequestBufferSize() < httpClientConfiguration.getInitialRequestBufferSize()) {
                     throw new LineSenderException("maximum buffer capacity cannot be less than initial buffer capacity ")
