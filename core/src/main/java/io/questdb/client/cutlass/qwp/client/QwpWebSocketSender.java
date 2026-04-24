@@ -859,7 +859,7 @@ public class QwpWebSocketSender implements Sender {
      */
     public long getHighestAckedSeqTxn(CharSequence tableName) {
         if (sendQueue != null) {
-            return sendQueue.getCommittedSeqTxn(tableName.toString());
+            return sendQueue.getCommittedSeqTxn(tableName);
         }
         return syncCommittedSeqTxns.get(tableName);
     }
@@ -873,7 +873,7 @@ public class QwpWebSocketSender implements Sender {
      */
     public long getHighestDurableSeqTxn(CharSequence tableName) {
         if (sendQueue != null) {
-            return sendQueue.getDurableSeqTxn(tableName.toString());
+            return sendQueue.getDurableSeqTxn(tableName);
         }
         return syncDurableSeqTxns.get(tableName);
     }

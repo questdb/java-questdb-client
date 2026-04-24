@@ -27,12 +27,12 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -96,8 +96,10 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Synchronization for flush/close
     private final CountDownLatch shutdownLatch;
     private final long shutdownTimeoutMs;
-    private final ConcurrentHashMap<String, SeqTxn> committedSeqTxns = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, SeqTxn> durableSeqTxns = new ConcurrentHashMap<>();
+    // Per-table seqTxn watermarks. Written by the I/O thread only; read by user threads.
+    // All accesses synchronize on the map instance itself for publication and monotonic updates.
+    private final CharSequenceLongHashMap committedSeqTxns = new CharSequenceLongHashMap();
+    private final CharSequenceLongHashMap durableSeqTxns = new CharSequenceLongHashMap();
     // Statistics - receiving
     private final AtomicLong totalAcks = new AtomicLong(0);
     // Statistics - sending
@@ -358,14 +360,16 @@ public class WebSocketSendQueue implements QuietCloseable {
         return lastError;
     }
 
-    public long getCommittedSeqTxn(String tableName) {
-        SeqTxn s = committedSeqTxns.get(tableName);
-        return s != null ? s.get() : -1L;
+    public long getCommittedSeqTxn(CharSequence tableName) {
+        synchronized (committedSeqTxns) {
+            return committedSeqTxns.get(tableName);
+        }
     }
 
-    public long getDurableSeqTxn(String tableName) {
-        SeqTxn s = durableSeqTxns.get(tableName);
-        return s != null ? s.get() : -1L;
+    public long getDurableSeqTxn(CharSequence tableName) {
+        synchronized (durableSeqTxns) {
+            return durableSeqTxns.get(tableName);
+        }
     }
 
     /**
@@ -818,34 +822,12 @@ public class WebSocketSendQueue implements QuietCloseable {
         }
     }
 
-    static final class SeqTxn {
-        private final AtomicLong value;
-
-        SeqTxn(long value) {
-            this.value = new AtomicLong(value);
+    @SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
+    private static void advanceSeqTxn(CharSequenceLongHashMap map, String tableName, long seqTxn) {
+        synchronized (map) {
+            if (seqTxn > map.get(tableName)) {
+                map.put(tableName, seqTxn);
+            }
         }
-
-        long get() {
-            return value.get();
-        }
-
-        void advance(long newValue) {
-            long curr;
-            do {
-                curr = value.get();
-                if (curr >= newValue) {
-                    return;
-                }
-            } while (!value.compareAndSet(curr, newValue));
-        }
-    }
-
-    private static void advanceSeqTxn(ConcurrentHashMap<String, SeqTxn> map, String tableName, long seqTxn) {
-        SeqTxn existing = map.get(tableName);
-        if (existing != null) {
-            existing.advance(seqTxn);
-            return;
-        }
-        map.computeIfAbsent(tableName, k -> new SeqTxn(seqTxn)).advance(seqTxn);
     }
 }

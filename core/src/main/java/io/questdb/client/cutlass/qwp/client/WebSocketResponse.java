@@ -27,6 +27,8 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.std.LongList;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.Utf8SequenceObjHashMap;
+import io.questdb.client.std.str.DirectUtf8String;
 import io.questdb.client.std.str.Utf8s;
 import org.jetbrains.annotations.TestOnly;
 
@@ -79,12 +81,18 @@ public class WebSocketResponse {
     public static final byte STATUS_SCHEMA_MISMATCH = 0x03;
     public static final byte STATUS_SECURITY_ERROR = 0x08;
     public static final byte STATUS_WRITE_ERROR = 0x09;
+    private final DirectUtf8String lookupKey = new DirectUtf8String();
+    // Caches decoded table names so the same native-memory byte sequence resolves to
+    // the same interned String across frames. First sight of a name allocates a String
+    // (decoded via Utf8s.stringFromUtf8Bytes) and an owned Utf8String map key; every
+    // subsequent sight is allocation-free.
+    private final Utf8SequenceObjHashMap<String> tableNameCache = new Utf8SequenceObjHashMap<>();
+    private final ObjList<String> tableNames = new ObjList<>();
+    private final LongList tableSeqTxns = new LongList();
     private String errorMessage;
     private int errorMessageUtf8Length;
     private long sequence;
     private byte status;
-    private final ObjList<String> tableNames = new ObjList<>();
-    private final LongList tableSeqTxns = new LongList();
 
     public WebSocketResponse() {
         this.status = STATUS_OK;
@@ -377,17 +385,26 @@ public class WebSocketResponse {
             if (remaining < offset + nameLen + 8) {
                 return false;
             }
-            byte[] nameBytes = new byte[nameLen];
-            for (int j = 0; j < nameLen; j++) {
-                nameBytes[j] = Unsafe.getUnsafe().getByte(ptr + offset + j);
-            }
+            long nameLo = ptr + offset;
+            long nameHi = nameLo + nameLen;
             offset += nameLen;
             long seqTxn = Unsafe.getUnsafe().getLong(ptr + offset);
             offset += 8;
-            tableNames.add(new String(nameBytes, StandardCharsets.UTF_8));
+            tableNames.add(internTableName(nameLo, nameHi));
             tableSeqTxns.add(seqTxn);
         }
         return remaining == offset;
+    }
+
+    private String internTableName(long lo, long hi) {
+        lookupKey.of(lo, hi);
+        int keyIndex = tableNameCache.keyIndex(lookupKey);
+        if (keyIndex < 0) {
+            return tableNameCache.valueAtQuick(keyIndex);
+        }
+        String decoded = Utf8s.stringFromUtf8Bytes(lo, hi);
+        tableNameCache.putAt(keyIndex, lookupKey, decoded);
+        return decoded;
     }
 
     private int tableEntriesSize() {
