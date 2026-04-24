@@ -583,18 +583,28 @@ public class WebSocketSendQueueTest {
                 window.addInFlight(0);
                 window.addInFlight(1);
 
+                AtomicBoolean pingSent = new AtomicBoolean(false);
+                client.setPingSendBehavior(() -> pingSent.set(true));
+
                 AtomicInteger callCount = new AtomicInteger();
                 client.setTryReceiveBehavior(handler -> {
-                    int n = callCount.getAndIncrement();
+                    int n = callCount.get();
                     switch (n) {
                         case 0:
                             emitAck(handler, 1);
+                            callCount.incrementAndGet();
                             return true;
                         case 1:
                             emitDurableAck(handler, "t", 5);
+                            callCount.incrementAndGet();
                             return true;
                         case 2:
+                            // Pong can only arrive in response to a PING
+                            if (!pingSent.get()) {
+                                return false;
+                            }
                             handler.onPong(0, 0);
+                            callCount.incrementAndGet();
                             return true;
                         default:
                             return false;
