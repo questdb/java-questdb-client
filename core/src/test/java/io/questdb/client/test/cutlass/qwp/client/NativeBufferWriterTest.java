@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.Utf8s;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -518,6 +519,21 @@ public class NativeBufferWriterTest {
                 Assert.assertEquals((byte) 'd', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 6));
                 Assert.assertEquals((byte) 'e', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 7));
                 Assert.assertEquals((byte) 'f', Unsafe.getUnsafe().getByte(writer.getBufferPtr() + 8));
+            }
+        });
+    }
+
+    @Test
+    public void testWriteUtf8MixedAsciiAndNonAsciiAfterGrow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (NativeBufferWriter writer = new NativeBufferWriter(8)) {
+                String value = "abcdefghijklmnop世界世界世界世界世界世界世界世界世界世界";
+
+                writer.putUtf8(value);
+
+                int utf8Len = Utf8s.utf8Bytes(value);
+                Assert.assertEquals(utf8Len, writer.getPosition());
+                Assert.assertEquals(value, Utf8s.stringFromUtf8Bytes(writer.getBufferPtr(), writer.getBufferPtr() + utf8Len));
             }
         });
     }
