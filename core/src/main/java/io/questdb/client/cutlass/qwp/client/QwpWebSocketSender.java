@@ -1804,38 +1804,40 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void syncPing() {
-        try {
-            client.sendPing(1000);
-            long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
-            while (System.currentTimeMillis() < deadline) {
-                sawPong = false;
-                sawBinaryAck = false;
-                boolean received = client.receiveFrame(ackHandler, 1000);
-                if (received) {
-                    if (sawBinaryAck) {
-                        if (ackResponse.isDurableAck()) {
-                            updateSyncSeqTxns(syncDurableSeqTxns);
-                        } else if (ackResponse.isSuccess()) {
-                            inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
-                            updateSyncSeqTxns(syncCommittedSeqTxns);
-                        }
-                    }
-                    if (sawPong) {
-                        return;
+        client.sendPing(1000);
+        long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            sawPong = false;
+            sawBinaryAck = false;
+            boolean received = client.receiveFrame(ackHandler, 1000);
+            if (received) {
+                if (sawBinaryAck) {
+                    if (ackResponse.isDurableAck()) {
+                        updateSyncSeqTxns(syncDurableSeqTxns);
+                    } else if (ackResponse.isSuccess()) {
+                        inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
+                        updateSyncSeqTxns(syncCommittedSeqTxns);
+                    } else {
+                        // Server-side error on a pending batch (parse /
+                        // schema / security / internal / write error).
+                        // Route through inFlightWindow.fail so the next
+                        // waitForAck / flush surfaces it, matching the
+                        // normal waitForAck error-handling path. Do not
+                        // throw from syncPing: that would hide any
+                        // durable/committed progress already observed in
+                        // this ping round.
+                        inFlightWindow.fail(
+                                ackResponse.getSequence(),
+                                new LineSenderException(ackResponse.getErrorMessage())
+                        );
                     }
                 }
+                if (sawPong) {
+                    return;
+                }
             }
-        } catch (LineSenderException e) {
-            failConnectionIfNeeded(e);
-            throw e;
-        } catch (Exception e) {
-            LineSenderException wrapped = new LineSenderException("Error waiting for PONG: " + e.getMessage(), e);
-            failConnectionIfNeeded(wrapped);
-            throw wrapped;
         }
-        LineSenderException timeout = new LineSenderException("Ping timed out");
-        failConnectionIfNeeded(timeout);
-        throw timeout;
+        throw new LineSenderException("Ping timed out");
     }
 
     private void updateSyncSeqTxns(CharSequenceLongHashMap seqTxns) {

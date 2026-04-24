@@ -250,6 +250,63 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
     }
 
     @Test
+    public void testSyncPingSurfacesServerErrorFrame() throws Exception {
+        // Regression: syncPing used to branch only on isDurableAck() /
+        // isSuccess(). Any error frame (parse / schema / security / internal
+        // / write error) arriving between PING and PONG was parsed into
+        // ackResponse, neither branch fired, and the error was silently
+        // discarded. A caller using ping() to confirm "all my batches
+        // landed" would get a false affirmative; the error only surfaced
+        // on the next flush's waitForAck.
+        //
+        // Fix: route the error through inFlightWindow.fail so it is
+        // observable via getLastError() and the next waitForAck raises it.
+        assertMemoryLeak(() -> {
+            // inFlightWindowSize=1 routes ping() through syncPing (the code under test).
+            // The injected inFlightWindow can still hold multiple batches.
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            PingTestClient client = new PingTestClient();
+            try {
+                // Server sends an error frame for seq=2, then PONG.
+                client.frameSequence.add(handler -> emitBinaryResponse(
+                        handler,
+                        WebSocketResponse.error(2L, WebSocketResponse.STATUS_SCHEMA_MISMATCH, "column type mismatch")
+                ));
+                client.frameSequence.add(handler -> handler.onPong(0, 0));
+
+                setField(sender, "client", client);
+                setField(sender, "connected", true);
+                InFlightWindow window = new InFlightWindow(8, InFlightWindow.DEFAULT_TIMEOUT_MS);
+                window.addInFlight(0);
+                window.addInFlight(1);
+                window.addInFlight(2);
+                setField(sender, "inFlightWindow", window);
+
+                sender.ping();
+
+                Assert.assertTrue(client.pingSent);
+                // Fix: error recorded on the window, visible to the next
+                // waitForAck / flush. Without the fix, getLastError() is null.
+                Throwable err = window.getLastError();
+                Assert.assertNotNull(
+                        "syncPing must surface server error frames via inFlightWindow.fail",
+                        err
+                );
+                Assert.assertTrue(err instanceof LineSenderException);
+                Assert.assertTrue(
+                        "error message must be propagated from the server frame",
+                        err.getMessage() != null && err.getMessage().contains("column type mismatch")
+                );
+            } finally {
+                setField(sender, "client", null);
+                setField(sender, "connected", false);
+                sender.close();
+                client.close();
+            }
+        });
+    }
+
+    @Test
     public void testSyncPingReturnsOnPong() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
