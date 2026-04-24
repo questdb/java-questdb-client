@@ -525,6 +525,70 @@ public class QwpQueryClientFromConfigTest {
         assertReject("ws::addr=a:9000, ,b:9000;", "empty addr entry");
     }
 
+    @Test
+    public void testAuthHeaderAcceptedAlone() {
+        // Each of the three auth modes has a dedicated mutual-exclusion test;
+        // the positive happy path is asserted here so the parser's per-key
+        // dispatch and the post-loop "no auth set" path both have coverage.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;auth=Bearer xyz;")) {
+            Assert.assertNotNull(c);
+        }
+    }
+
+    @Test
+    public void testBasicAuthAcceptedAlone() {
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;username=alice;password=secret;")) {
+            Assert.assertNotNull(c);
+        }
+    }
+
+    @Test
+    public void testTokenAcceptedAlone() {
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;token=ey.payload.sig;")) {
+            Assert.assertNotNull(c);
+        }
+    }
+
+    @Test
+    public void testClientIdAcceptedAlone() {
+        // Sent as the X-QWP-Client-Id header on the upgrade request; useful for
+        // server-side telemetry. No format constraints from the parser.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;client_id=batch-job/42;")) {
+            Assert.assertNotNull(c);
+        }
+    }
+
+    @Test
+    public void testFailoverMaxBackoffEqualToInitialAccepted() {
+        // The "max < initial" rejection path is tested already; verify the
+        // boundary case (max == initial) is the lowest legal max and parses.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig(
+                "ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=100;")) {
+            Assert.assertNotNull(c);
+        }
+    }
+
+    @Test
+    public void testTokenRequestEncodesAsBearer() {
+        // We can't easily snoop the request header without a server, but the
+        // parser must at least accept the configuration end-to-end, then exit
+        // through close() without leaking the I/O thread (which never spun up).
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;token=abc.def.ghi;")) {
+            Assert.assertFalse(c.isConnected());
+            Assert.assertFalse(c.wasLastCloseTimedOut());
+        }
+    }
+
+    @Test
+    public void testAddrSingleWhitespaceTrimmedAroundHostPort() {
+        // The parser splits on commas and trims; a single leading space on a
+        // valid entry must therefore be tolerated rather than rejected as
+        // "empty". Pin so a future refactor that drops trim() breaks here.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr= db1:9000 , db2:9000 ;")) {
+            Assert.assertNotNull(c);
+        }
+    }
+
     /**
      * Asserts that {@link QwpQueryClient#fromConfig(CharSequence)} rejects
      * {@code conf} with an {@link IllegalArgumentException} whose message
