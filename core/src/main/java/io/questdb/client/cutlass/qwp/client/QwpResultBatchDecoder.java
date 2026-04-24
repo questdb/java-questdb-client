@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.cairo.ColumnType;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpGorillaDecoder;
 import io.questdb.client.std.MemoryTag;
@@ -555,6 +556,10 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             }
             if (p + 1 > limit) throw new QwpDecodeException("truncated ARRAY header");
             int nDims = Unsafe.getUnsafe().getByte(p) & 0xFF;
+            if (nDims < 1 || nDims > ColumnType.ARRAY_NDIMS_LIMIT) {
+                throw new QwpDecodeException("invalid array dimensions: " + nDims
+                        + " (must be 1-" + ColumnType.ARRAY_NDIMS_LIMIT + ")");
+            }
             long headerEnd = p + 1 + 4L * nDims;
             if (headerEnd > limit) throw new QwpDecodeException("truncated ARRAY dims");
             long elements = 1;
