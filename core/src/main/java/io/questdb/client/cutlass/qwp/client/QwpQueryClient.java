@@ -1550,6 +1550,23 @@ public class QwpQueryClient implements QuietCloseable {
                         + ", lastError=" + (lastError == null ? "<none>" : lastError.getMessage()) + ']');
     }
 
+    /**
+     * Test-only / diagnostics hook: injects a synthetic terminal failure
+     * through the current generation's listener. Production code does not
+     * call this -- transport failures arrive through the I/O thread's own
+     * callback path. Package-private so it does not leak into the public
+     * client API; tests in a different package reach it via reflection to
+     * simulate the I/O thread reporting a failure without actually tearing
+     * the WebSocket down.
+     */
+    @SuppressWarnings("unused")
+    void recordTerminalFailure(byte status, String message) {
+        GenerationListener listener = currentGenerationListener;
+        if (listener != null) {
+            listener.onTerminalFailure(status, message);
+        }
+    }
+
     private static final class Endpoint {
         final String host;
         final int port;
