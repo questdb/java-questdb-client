@@ -26,9 +26,10 @@ package io.questdb.client.test.cutlass.http.client;
 
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
 import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+import io.questdb.client.std.str.Utf8s;
 import org.junit.Test;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.assertEquals;
 
 public class WebSocketSendBufferTest {
@@ -43,6 +44,21 @@ public class WebSocketSendBufferTest {
                 assertEquals(2, buf.getWritePos());
                 assertEquals((byte) '?', Unsafe.getUnsafe().getByte(buf.getBufferPtr()));
                 assertEquals((byte) 'X', Unsafe.getUnsafe().getByte(buf.getBufferPtr() + 1));
+            }
+        });
+    }
+
+    @Test
+    public void testPutUtf8MixedAsciiAndNonAsciiAfterGrow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (WebSocketSendBuffer buf = new WebSocketSendBuffer(8)) {
+                String value = "abcdefghijklmnop世界世界世界世界世界世界世界世界世界世界";
+
+                buf.putUtf8(value);
+
+                int utf8Len = Utf8s.utf8Bytes(value);
+                assertEquals(utf8Len, buf.getWritePos());
+                assertEquals(value, Utf8s.stringFromUtf8Bytes(buf.getBufferPtr(), buf.getBufferPtr() + utf8Len));
             }
         });
     }

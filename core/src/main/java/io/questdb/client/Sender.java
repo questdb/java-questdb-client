@@ -102,6 +102,11 @@ import java.util.concurrent.TimeUnit;
  * <br>
  * Note: If the underlying error is permanent, retrying {@link #flush()} will fail again.
  * Use {@link #reset()} to discard the problematic data and continue with new data.
+ * <br>
+ * Note: WebSocket transport uses a terminal sender-level failure model after a
+ * connection has been established. After a WebSocket send, ACK, or connection
+ * failure, {@link #reset()} does not recover the sender; close it and create a
+ * new one.
  *
  */
 public interface Sender extends Closeable, ArraySender<Sender> {

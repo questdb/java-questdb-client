@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.Utf8s;
 
 import java.nio.charset.StandardCharsets;
 
@@ -66,6 +67,7 @@ public class WebSocketResponse {
     public static final byte STATUS_SECURITY_ERROR = 0x08;
     public static final byte STATUS_WRITE_ERROR = 0x09;
     private String errorMessage;
+    private int errorMessageUtf8Length;
     private long sequence;
     private byte status;
 
@@ -73,6 +75,7 @@ public class WebSocketResponse {
         this.status = STATUS_OK;
         this.sequence = 0;
         this.errorMessage = null;
+        this.errorMessageUtf8Length = -1;
     }
 
     /**
@@ -83,6 +86,7 @@ public class WebSocketResponse {
         response.status = status;
         response.sequence = sequence;
         response.errorMessage = errorMessage;
+        response.errorMessageUtf8Length = -1;
         return response;
     }
 
@@ -124,6 +128,7 @@ public class WebSocketResponse {
         WebSocketResponse response = new WebSocketResponse();
         response.status = STATUS_OK;
         response.sequence = sequence;
+        response.errorMessageUtf8Length = -1;
         return response;
     }
 
@@ -203,11 +208,14 @@ public class WebSocketResponse {
                     msgBytes[i] = Unsafe.getUnsafe().getByte(ptr + offset + i);
                 }
                 errorMessage = new String(msgBytes, StandardCharsets.UTF_8);
+                errorMessageUtf8Length = -1;
             } else {
                 errorMessage = null;
+                errorMessageUtf8Length = 0;
             }
         } else {
             errorMessage = null;
+            errorMessageUtf8Length = -1;
         }
 
         return true;
@@ -217,13 +225,10 @@ public class WebSocketResponse {
      * Calculates the serialized size of this response.
      */
     public int serializedSize() {
-        int size = MIN_RESPONSE_SIZE;
-        if (errorMessage != null && !errorMessage.isEmpty()) {
-            byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
-            int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
-            size += 2 + msgLen; // 2 bytes for length prefix
+        if (status == STATUS_OK) {
+            return MIN_RESPONSE_SIZE;
         }
-        return size;
+        return MIN_ERROR_RESPONSE_SIZE + getErrorMessageUtf8Length();
     }
 
     @Override
@@ -253,22 +258,30 @@ public class WebSocketResponse {
         Unsafe.getUnsafe().putLong(ptr + offset, sequence);
         offset += 8;
 
-        // Error message (if any)
-        if (status != STATUS_OK && errorMessage != null && !errorMessage.isEmpty()) {
-            byte[] msgBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
-            int msgLen = Math.min(msgBytes.length, MAX_ERROR_MESSAGE_LENGTH);
-
+        // Error message length and bytes (if any)
+        if (status != STATUS_OK) {
+            int msgLen = getErrorMessageUtf8Length();
             // Length prefix (2 bytes, little-endian)
             Unsafe.getUnsafe().putShort(ptr + offset, (short) msgLen);
             offset += 2;
 
             // Message bytes
-            for (int i = 0; i < msgLen; i++) {
-                Unsafe.getUnsafe().putByte(ptr + offset + i, msgBytes[i]);
+            if (msgLen > 0) {
+                offset += Utf8s.strCpyUtf8(errorMessage, ptr + offset, msgLen);
             }
-            offset += msgLen;
         }
 
         return offset;
+    }
+
+    private int getErrorMessageUtf8Length() {
+        if (status == STATUS_OK || errorMessage == null || errorMessage.isEmpty()) {
+            errorMessageUtf8Length = 0;
+            return 0;
+        }
+        if (errorMessageUtf8Length < 0) {
+            errorMessageUtf8Length = Utf8s.utf8Bytes(errorMessage, MAX_ERROR_MESSAGE_LENGTH);
+        }
+        return errorMessageUtf8Length;
     }
 }

@@ -35,6 +35,7 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.SecureRnd;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
+import io.questdb.client.std.str.Utf8s;
 
 /**
  * Zero-GC WebSocket send buffer that implements {@link ArrayBufferAppender} for direct
@@ -208,13 +209,13 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
     }
 
     @Override
-    public long getWriteAddress() {
-        return bufPtr + writePos;
+    public int getWritableBytes() {
+        return bufCapacity - writePos;
     }
 
     @Override
-    public int getWritableBytes() {
-        return bufCapacity - writePos;
+    public long getWriteAddress() {
+        return bufPtr + writePos;
     }
 
     /**
@@ -329,32 +330,27 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         if (value == null || value.isEmpty()) {
             return;
         }
-        for (int i = 0, n = value.length(); i < n; i++) {
+
+        int charLen = value.length();
+        ensureCapacity(charLen);
+
+        // Single-pass for ASCII. Mixed strings keep the ASCII prefix and resume UTF-8 encoding.
+        long addr = bufPtr + writePos;
+        int i = 0;
+        for (; i < charLen; i++) {
             char c = value.charAt(i);
-            if (c < 0x80) {
-                putByte((byte) c);
-            } else if (c < 0x800) {
-                putByte((byte) (0xC0 | (c >> 6)));
-                putByte((byte) (0x80 | (c & 0x3F)));
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
-                char c2 = value.charAt(++i);
-                if (Character.isLowSurrogate(c2)) {
-                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
-                    putByte((byte) (0xF0 | (codePoint >> 18)));
-                    putByte((byte) (0x80 | ((codePoint >> 12) & 0x3F)));
-                    putByte((byte) (0x80 | ((codePoint >> 6) & 0x3F)));
-                    putByte((byte) (0x80 | (codePoint & 0x3F)));
-                } else {
-                    putByte((byte) '?');
-                    i--;
-                }
-            } else if (Character.isSurrogate(c)) {
-                putByte((byte) '?');
-            } else {
-                putByte((byte) (0xE0 | (c >> 12)));
-                putByte((byte) (0x80 | ((c >> 6) & 0x3F)));
-                putByte((byte) (0x80 | (c & 0x3F)));
+            if (c >= 0x80) {
+                break;
             }
+            Unsafe.getUnsafe().putByte(addr++, (byte) c);
+        }
+
+        if (i == charLen) {
+            writePos += charLen;
+        } else {
+            int utf8Len = Utf8s.utf8Bytes(value, i, charLen);
+            ensureCapacity(i + utf8Len);
+            writePos += i + Utf8s.strCpyUtf8(value, i, bufPtr + writePos + i, utf8Len);
         }
     }
 
@@ -397,10 +393,10 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
      */
     public FrameInfo writeCloseFrame(int code, String reason) {
         int payloadLen = 2; // status code
-        byte[] reasonBytes = null;
+        int reasonLen = 0;
         if (reason != null && !reason.isEmpty()) {
-            reasonBytes = reason.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            payloadLen += reasonBytes.length;
+            reasonLen = Utf8s.utf8Bytes(reason);
+            payloadLen += reasonLen;
         }
 
         if (payloadLen > 125) {
@@ -422,10 +418,8 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         writePos += 2;
 
         // Write reason if present
-        if (reasonBytes != null) {
-            for (byte reasonByte : reasonBytes) {
-                Unsafe.getUnsafe().putByte(bufPtr + writePos++, reasonByte);
-            }
+        if (reasonLen > 0) {
+            writePos += Utf8s.strCpyUtf8(reason, bufPtr + writePos, reasonLen);
         }
 
         // Mask the payload (including status code and reason)
