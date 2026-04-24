@@ -280,6 +280,145 @@ public class QwpResultBatchDecoderHardeningTest {
     }
 
     /**
+     * Regression: a delta SYMBOL dict entry whose length exceeds
+     * {@link Integer#MAX_VALUE} must be rejected. Prior to the fix, the
+     * per-entry guard checked {@code entryLen < 0} (on the long varint value)
+     * and {@code p + entryLen > limit}; neither catches a value that is
+     * positive-as-long but wraps to a negative int after the subsequent
+     * {@code (int) entryLen} cast, which then fed a negative length into
+     * {@code ensureConnDictHeapCapacity} (no-op) and finally into
+     * {@code copyMemory} (undefined behaviour).
+     */
+    @Test
+    public void testDeltaSymbolDictHugeEntryLenIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(512);
+            long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // 5-byte varint for 0x1_0000_0000L (2^32). That is positive as
+                // long but (int) wraps to 0. A wider check is needed to catch
+                // the int-cast hazard; a varint of 2^32 exceeds Integer.MAX_VALUE
+                // and must be rejected before the cast.
+                byte[] entryLenVarint = new byte[]{
+                        (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x10
+                };
+                int len = writeDeltaSymbolDictFrame(staging, entryLenVarint);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject delta dict entryLen > Integer.MAX_VALUE");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error must mention truncated delta symbol entry: " + expected.getMessage(),
+                            expected.getMessage().contains("truncated delta symbol entry"));
+                }
+            } finally {
+                Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
+     * Regression: a non-delta SYMBOL column with a dict size above
+     * {@code rowCount} must be rejected. Prior to the fix, {@code dictSize}
+     * was read as a raw int with no bound -- a hostile varint could drive
+     * {@code dictSize * 8} to overflow silently, causing
+     * {@code ensureOwnedEntriesAddr} to skip the realloc (because the
+     * overflowed-negative requested size is less than any non-negative
+     * capacity) and the subsequent {@code Unsafe.putLong} to write past the
+     * allocated buffer.
+     */
+    @Test
+    public void testSymbolColumnNonDeltaHugeDictSizeIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(512);
+            long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // rowCount=1 column carrying dictSize=Integer.MAX_VALUE (which
+                // would drive dictSize*8 to overflow). Must reject on the bound
+                // rather than letting the overflowed allocation through.
+                int len = writeSymbolResultBatch(staging, /*rowCount=*/ 1, /*dictSize=*/ Integer.MAX_VALUE);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject SYMBOL dictSize above rowCount");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error must mention SYMBOL dict size: " + expected.getMessage(),
+                            expected.getMessage().contains("SYMBOL dict size"));
+                }
+            } finally {
+                Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
+     * Regression: GEOHASH precisionBits on the wire must be in {@code [1, 60]}.
+     * A hostile varint decoding to 0, 61, or anything above 60 used to
+     * flow through as-is into {@code bytesPerValue = (precisionBits + 7) >>> 3},
+     * generating nonsense bytesPerValue (e.g. 0 bytes per value for
+     * precision=0, or 8+ bytes for a large precision) that skewed the
+     * subsequent truncated-column check.
+     */
+    @Test
+    public void testGeohashPrecisionAboveMaxIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int len = writeGeohashResultBatch(staging, /*precisionBits=*/ 61);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject GEOHASH precision above 60");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error must mention GEOHASH precision: " + expected.getMessage(),
+                            expected.getMessage().contains("GEOHASH precision"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
+     * Complementary regression: precision 0 (below the [1, 60] range) must
+     * also be rejected. Without a lower-bound check the subsequent length
+     * computation degenerates to zero bytes per value, masking the corruption.
+     */
+    @Test
+    public void testGeohashPrecisionBelowMinIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int len = writeGeohashResultBatch(staging, /*precisionBits=*/ 0);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject GEOHASH precision 0");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error must mention GEOHASH precision: " + expected.getMessage(),
+                            expected.getMessage().contains("GEOHASH precision"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
      * Regression for CR-2: a RESULT_BATCH frame with FLAG_ZSTD set and a body
      * that is not a valid zstd frame must be rejected via the up-front
      * frame-header check, NOT by the old grow-the-scratch-and-retry loop. The
@@ -442,6 +581,67 @@ public class QwpResultBatchDecoderHardeningTest {
         return (int) (p - buf);
     }
 
+    /**
+     * Crafts a RESULT_BATCH frame with FLAG_DELTA_SYMBOL_DICT set and a
+     * delta-dict section of one entry whose length varint is supplied as
+     * raw bytes. No further table block is emitted; the decoder must fail
+     * in {@code parseDeltaSymbolDict} before reaching it.
+     */
+    private static int writeDeltaSymbolDictFrame(long buf, byte[] entryLenVarint) {
+        long p = buf;
+        p = putInt(p, QwpConstants.MAGIC_MESSAGE);
+        p = putByte(p, QwpConstants.VERSION_1);
+        // Flags byte lives at HEADER_OFFSET_FLAGS (=5). Existing helpers with
+        // flags=0 don't care about the exact slot; a delta-mode frame does.
+        p = putByte(p, QwpConstants.FLAG_DELTA_SYMBOL_DICT);
+        p = putByte(p, (byte) 0);       // reserved slot at offset 6
+        p = putByte(p, (byte) 1);       // table_count
+        p = putInt(p, 0);               // payload_length placeholder
+        p = putByte(p, (byte) 0x11);    // msg_kind = RESULT_BATCH
+        p = putLong(p, 1L);             // request_id
+        p = putVarint(p, 0L);           // batch_seq
+        // Delta dict section: deltaStart=0, deltaCount=1, then the raw entry
+        // length varint the test wants to probe.
+        p = putVarint(p, 0L);
+        p = putVarint(p, 1L);
+        for (byte b : entryLenVarint) p = putByte(p, b);
+        return (int) (p - buf);
+    }
+
+    /**
+     * Crafts a minimal RESULT_BATCH frame carrying a single GEOHASH column
+     * with {@code rowCount=0} and caller-chosen {@code precisionBits}.
+     * Because rowCount is zero, no per-row value bytes follow the precision
+     * varint; the decoder still decodes the precision up front and the range
+     * check must fire there.
+     */
+    private static int writeGeohashResultBatch(long buf, long precisionBits) {
+        long p = buf;
+        p = putInt(p, QwpConstants.MAGIC_MESSAGE);
+        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, (byte) 0);       // header msg_kind (unused)
+        p = putByte(p, (byte) 0);       // flags (no delta dict)
+        p = putByte(p, (byte) 1);       // table_count
+        p = putInt(p, 0);               // payload_length placeholder
+        p = putByte(p, (byte) 0x11);    // msg_kind = RESULT_BATCH
+        p = putLong(p, 1L);             // request_id
+        p = putVarint(p, 0L);           // batch_seq
+        p = putVarint(p, 0L);           // table_name_len
+        p = putVarint(p, 0L);           // row_count (no data rows)
+        p = putVarint(p, 1L);           // column_count
+        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
+        p = putVarint(p, 0L);           // schema_id
+        // Schema: one column "g" of TYPE_GEOHASH.
+        p = putVarint(p, 1L);
+        p = putByte(p, (byte) 'g');
+        p = putByte(p, QwpConstants.TYPE_GEOHASH);
+        // Column body: null_flag=0 (no nulls), then precision_bits varint.
+        // With row_count=0 no value bytes follow.
+        p = putByte(p, (byte) 0);       // null_flag
+        p = putVarint(p, precisionBits);
+        return (int) (p - buf);
+    }
+
     private static int writeStringResultBatch(long buf, int nonNull, int totalBytes) {
         long p = buf;
         // Header: magic + version + msg_kind + flags + table_count + payload_length
@@ -476,6 +676,40 @@ public class QwpResultBatchDecoderHardeningTest {
         // decoder must reject before consuming them.
         byte[] s = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
         for (byte b : s) p = putByte(p, b);
+        return (int) (p - buf);
+    }
+
+    /**
+     * Crafts a RESULT_BATCH carrying a single SYMBOL column in non-delta mode
+     * (FLAG_DELTA_SYMBOL_DICT unset). The caller supplies the raw
+     * {@code dictSize} varint so bounds tests can push values that would
+     * otherwise flow through untouched.
+     */
+    private static int writeSymbolResultBatch(long buf, long rowCount, long dictSize) {
+        long p = buf;
+        p = putInt(p, QwpConstants.MAGIC_MESSAGE);
+        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, (byte) 0);
+        p = putByte(p, (byte) 0);       // flags: no delta dict, so non-delta SYMBOL path
+        p = putByte(p, (byte) 1);
+        p = putInt(p, 0);
+        p = putByte(p, (byte) 0x11);
+        p = putLong(p, 1L);
+        p = putVarint(p, 0L);           // batch_seq
+        p = putVarint(p, 0L);           // table_name_len
+        p = putVarint(p, rowCount);
+        p = putVarint(p, 1L);           // column_count
+        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
+        p = putVarint(p, 0L);           // schema_id
+        // Schema: one column "s" of TYPE_SYMBOL.
+        p = putVarint(p, 1L);
+        p = putByte(p, (byte) 's');
+        p = putByte(p, QwpConstants.TYPE_SYMBOL);
+        // Column body: null_flag=0 (no nulls), then the dict_size varint.
+        // The decoder reads dict_size and must reject before attempting to
+        // decode dict_size entries (which don't even exist in this frame).
+        p = putByte(p, (byte) 0);
+        p = putVarint(p, dictSize);
         return (int) (p - buf);
     }
 }

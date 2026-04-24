@@ -93,10 +93,31 @@ public class QwpBatchBuffer implements QuietCloseable {
     }
 
     private void ensureCapacity(int required) {
+        if (required < 0) {
+            // A negative request cannot be honoured. Reject loudly rather than
+            // silently wrapping through the doubling loop.
+            throw new IllegalArgumentException("QwpBatchBuffer required capacity must be non-negative: " + required);
+        }
         if (required <= scratchCapacity) return;
-        int newCap = scratchCapacity;
-        while (newCap < required) newCap *= 2;
-        scratchAddr = Unsafe.realloc(scratchAddr, scratchCapacity, newCap, MemoryTag.NATIVE_DEFAULT);
-        scratchCapacity = newCap;
+        // Start the doubling at max(current, 1) so a buffer constructed with
+        // initialCapacity=0 can still grow (0 *= 2 would spin forever). Cap the
+        // double step against Integer.MAX_VALUE because `newCap *= 2` wraps
+        // negative once newCap passes 2^30, at which point the while loop
+        // could never reach `required` and would spin indefinitely.
+        long newCap = Math.max(scratchCapacity, 1);
+        while (newCap < required) {
+            newCap <<= 1;
+            if (newCap > Integer.MAX_VALUE) {
+                newCap = Integer.MAX_VALUE;
+                break;
+            }
+        }
+        if (newCap < required) {
+            throw new OutOfMemoryError("QwpBatchBuffer required capacity " + required
+                    + " exceeds Integer.MAX_VALUE");
+        }
+        int capped = (int) newCap;
+        scratchAddr = Unsafe.realloc(scratchAddr, scratchCapacity, capped, MemoryTag.NATIVE_DEFAULT);
+        scratchCapacity = capped;
     }
 }

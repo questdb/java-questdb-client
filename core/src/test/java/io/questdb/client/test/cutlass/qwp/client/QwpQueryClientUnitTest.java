@@ -144,6 +144,42 @@ public class QwpQueryClientUnitTest {
         c.close();
     }
 
+    /**
+     * Regression: concurrent close() calls must not double-free the shared
+     * bindValues native scratch (or re-enter the I/O thread shutdown path).
+     * Prior to the AtomicBoolean gate on close(), two threads could both
+     * walk the shutdown body; the internal close() of each native resource
+     * is individually idempotent, but stacking the whole sequence twice
+     * wastes work and makes state transitions harder to reason about.
+     */
+    @Test(timeout = 10_000L)
+    public void testConcurrentCloseIsSafe() throws Exception {
+        QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000);
+        int threads = 8;
+        java.util.concurrent.CountDownLatch ready = new java.util.concurrent.CountDownLatch(threads);
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger failed = new java.util.concurrent.atomic.AtomicInteger();
+        Thread[] workers = new Thread[threads];
+        for (int i = 0; i < threads; i++) {
+            workers[i] = new Thread(() -> {
+                ready.countDown();
+                try {
+                    start.await();
+                    c.close();
+                } catch (Throwable t) {
+                    failed.incrementAndGet();
+                }
+            }, "close-race-" + i);
+            workers[i].start();
+        }
+        ready.await();
+        start.countDown();
+        for (Thread w : workers) w.join();
+        Assert.assertEquals("no close() invocation should have thrown", 0, failed.get());
+        // A third serial close for good measure -- also a no-op.
+        c.close();
+    }
+
     @Test
     public void testWasLastCloseTimedOutDefaultFalse() {
         // No connection attempt -> no I/O thread to time out joining; the flag

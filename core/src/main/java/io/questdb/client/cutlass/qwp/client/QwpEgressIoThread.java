@@ -247,8 +247,19 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // surfaces as a broken buffer rather than a slow native-memory leak.
         if (!freeBuffers.offer(buffer)) {
             buffer.close();
+            return;
         }
         pendingRelease.offer(RELEASE_TOKEN);
+        // Close race: closePool may have set closed AND drained freeBuffers
+        // between our closed-check above and our offer. In that window the
+        // buffer landed in a cleared-and-abandoned queue with no consumer.
+        // Re-check after offer: if closed is now true and the buffer is
+        // still in freeBuffers, remove it and close in place. remove() is
+        // atomic on ArrayBlockingQueue, so if closePool's drain beat us to
+        // it, remove returns false and we skip the double-close.
+        if (closed && freeBuffers.remove(buffer)) {
+            buffer.close();
+        }
     }
 
     /**

@@ -42,6 +42,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -150,12 +151,12 @@ public class QwpQueryClient implements QuietCloseable {
     // keep the per-query path zero-alloc after warmup. Freed in close() on the
     // clean-join path; leaked together with the buffer pool on the timeout path.
     private final QwpBindValues bindValues = new QwpBindValues();
+    // Gates {@link #close()} so concurrent or repeat invocations are a no-op
+    // after the first. Without this, a second close() would run through the
+    // full shutdown path again and double-free {@link #bindValues} native
+    // scratch.
+    private final AtomicBoolean closedFlag = new AtomicBoolean();
     private final List<Endpoint> endpoints = new ArrayList<>();
-    // Latched when the I/O thread reports a transport- or protocol-level
-    // failure (see QwpEgressIoThread notifyTerminalFailure callers). Checked
-    // on every user-facing method so a broken connection short-circuits
-    // instead of submitting work that will only collect an error event.
-    private final AtomicReference<TerminalFailure> terminalFailure = new AtomicReference<>();
     private String authorizationHeader;
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private String clientId;
@@ -609,6 +610,12 @@ public class QwpQueryClient implements QuietCloseable {
      */
     @Override
     public void close() {
+        if (!closedFlag.compareAndSet(false, true)) {
+            // Second (or concurrent) close call. Without this guard, two
+            // closes would each Misc.free(bindValues.writer) the shared native
+            // scratch, double-freeing it.
+            return;
+        }
         connected = false;
         lastCloseTimedOut = false;
         try {
@@ -1268,7 +1275,6 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient = null;
         serverInfo = null;
         currentEndpointIndex = -1;
-        terminalFailure.set(null);
     }
 
     private void connectToEndpoint(Endpoint ep) {
@@ -1308,13 +1314,12 @@ public class QwpQueryClient implements QuietCloseable {
             probeZstdAvailable();
         }
 
-        terminalFailure.set(null);
-        // Wire a fresh generation-scoped listener into this I/O thread. If the
-        // thread later fails to join during cleanup, cleanupFailedConnect()
-        // orphans this listener so its callback becomes a no-op -- an
-        // orphaned I/O thread calling back against a stale generation cannot
-        // pollute the next connection's terminal-failure latch.
-        GenerationListener listener = new GenerationListener(terminalFailure);
+        // Wire a fresh generation-scoped listener into this I/O thread. Each
+        // listener owns its own terminal-failure latch, so even if a dying
+        // I/O thread slips a late onTerminalFailure callback past the orphan
+        // flag, the write lands on a ref nobody reads rather than poisoning
+        // the next connection's state.
+        GenerationListener listener = new GenerationListener();
         currentGenerationListener = listener;
         ioThread = new QwpEgressIoThread(webSocketClient, bufferPoolSize, listener);
         ioThreadHandle = new Thread(ioThread, "qwp-egress-io");
@@ -1338,7 +1343,8 @@ public class QwpQueryClient implements QuietCloseable {
             probe.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "QwpQueryClient is closed");
             return;
         }
-        TerminalFailure tf = terminalFailure.get();
+        GenerationListener listener = currentGenerationListener;
+        TerminalFailure tf = listener != null ? listener.get() : null;
         if (tf != null) {
             // I/O thread already reported a transport- or protocol-level failure
             // on a previous call. Tag it as a transport failure so the failover
@@ -1709,23 +1715,23 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * One-shot terminal-failure listener scoped to a single {@link
-     * QwpEgressIoThread} instance. The I/O thread captures an instance of
-     * this listener at construction and calls through on transport-level
-     * failures. When {@code cleanupFailedConnect} transitions to a new
-     * connection, it calls {@link #orphan()} on the outgoing listener so any
-     * in-flight or subsequent callback from the dying I/O thread becomes a
-     * no-op. This cleanly sidesteps the otherwise-subtle bug where an
-     * orphaned I/O thread that failed to join within the shutdown timeout
-     * could fire a late CAS on the shared terminalFailure latch, poisoning
-     * the new connection's state and triggering spurious failover on the
-     * next execute().
+     * QwpEgressIoThread} instance. Each instance owns its own
+     * {@link AtomicReference} latch so an orphaned-but-in-flight callback
+     * writes into its own generation's slot and cannot poison a successor
+     * generation. The orphan flag is advisory: a late callback from a
+     * dying I/O thread observes it and short-circuits; if it squeaks past
+     * the check and into the CAS, the write lands on a ref that nobody
+     * reads, so no poisoning occurs either way.
+     * <p>
+     * {@link #cleanupFailedConnect} calls {@link #orphan()} on the outgoing
+     * listener before creating the next generation.
      */
     private static final class GenerationListener implements QwpEgressIoThread.TerminalFailureListener {
-        private final AtomicReference<TerminalFailure> target;
+        private final AtomicReference<TerminalFailure> target = new AtomicReference<>();
         private volatile boolean orphaned;
 
-        GenerationListener(AtomicReference<TerminalFailure> target) {
-            this.target = target;
+        TerminalFailure get() {
+            return target.get();
         }
 
         @Override

@@ -164,6 +164,10 @@ public class QwpBindEncoderTest {
 
     @Test
     public void testEncodeDecimal128ConvenienceNullSentinel() throws Exception {
+        // The server reads the DECIMAL128 scale byte regardless of the null
+        // flag (it becomes part of the bound variable's type), so the client
+        // must emit it on the NULL path too -- and preserve the scale from
+        // the supplied Decimal128 sentinel rather than defaulting to 0.
         assertMemoryLeak(() -> {
             try (QwpBindValues binds = new QwpBindValues()) {
                 Decimal128 nullValue = new Decimal128(Decimals.DECIMAL128_HI_NULL, Decimals.DECIMAL128_LO_NULL, 4);
@@ -172,6 +176,7 @@ public class QwpBindEncoderTest {
                     writer.write(QwpConstants.TYPE_DECIMAL128);
                     writer.write(NULL_FLAG);
                     writer.write(NULL_BITMAP);
+                    writer.write(4);
                 }));
             }
         });
@@ -186,6 +191,26 @@ public class QwpBindEncoderTest {
                     Assert.fail("expected IllegalArgumentException");
                 } catch (IllegalArgumentException expected) {
                     Assert.assertTrue(expected.getMessage().contains("scale"));
+                }
+            }
+        });
+    }
+
+    /**
+     * DECIMAL128 tops out at 38 digits of precision, so scale above 38 is
+     * mathematically invalid. Reject per-width rather than against the
+     * DECIMAL256 ceiling (76) the shared cap used to fall back to.
+     */
+    @Test
+    public void testEncodeDecimal128RejectsScaleAbove38() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                try {
+                    binds.setDecimal128(0, 39, 1L, 0L);
+                    Assert.fail("expected IllegalArgumentException");
+                } catch (IllegalArgumentException expected) {
+                    Assert.assertTrue("message must mention DECIMAL128: " + expected.getMessage(),
+                            expected.getMessage().contains("DECIMAL128"));
                 }
             }
         });
@@ -225,6 +250,9 @@ public class QwpBindEncoderTest {
 
     @Test
     public void testEncodeDecimal256ConvenienceNullSentinel() throws Exception {
+        // Parallel to the DECIMAL128 case: the scale from the null sentinel
+        // is propagated to the wire so it survives round-trip as part of the
+        // bound variable's type.
         assertMemoryLeak(() -> {
             try (QwpBindValues binds = new QwpBindValues()) {
                 Decimal256 nullValue = new Decimal256(
@@ -238,7 +266,21 @@ public class QwpBindEncoderTest {
                     writer.write(QwpConstants.TYPE_DECIMAL256);
                     writer.write(NULL_FLAG);
                     writer.write(NULL_BITMAP);
+                    writer.write(3);
                 }));
+            }
+        });
+    }
+
+    @Test
+    public void testEncodeDecimal256AllowsScale76() throws Exception {
+        // Top of the DECIMAL256 range: scale 76 is the documented ceiling.
+        // Verify the encoder accepts it (used to pass under the shared-cap
+        // check; the per-width split must not accidentally lower the ceiling).
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                binds.setDecimal256(0, 76, 1L, 0L, 0L, 0L);
+                Assert.assertEquals(1, binds.count());
             }
         });
     }
@@ -254,6 +296,27 @@ public class QwpBindEncoderTest {
                     writer.write(2);
                     writeLongLe(writer, 12345L);
                 }));
+            }
+        });
+    }
+
+    /**
+     * DECIMAL64 holds 18 digits of precision, so scale above 18 is
+     * mathematically invalid. Under the shared-cap regime a scale up to 76
+     * was silently accepted; the per-width check rejects at the correct
+     * boundary.
+     */
+    @Test
+    public void testEncodeDecimal64RejectsScaleAbove18() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                try {
+                    binds.setDecimal64(0, 19, 1L);
+                    Assert.fail("expected IllegalArgumentException");
+                } catch (IllegalArgumentException expected) {
+                    Assert.assertTrue("message must mention DECIMAL64: " + expected.getMessage(),
+                            expected.getMessage().contains("DECIMAL64"));
+                }
             }
         });
     }
@@ -337,6 +400,53 @@ public class QwpBindEncoderTest {
                 } catch (IllegalArgumentException expected) {
                     Assert.assertTrue(expected.getMessage().contains("precision"));
                 }
+            }
+        });
+    }
+
+    /**
+     * Regression: before the fix, {@code setGeohash} did not mask {@code value}
+     * to {@code precisionBits}. For a precision that is not a multiple of 8
+     * (e.g. 5 bits, 1 byte on the wire) the top byte would leak whatever bits
+     * the caller happened to have set above bit 4, silently changing the geohash
+     * the server stored. The fix masks the high bits off before encoding.
+     */
+    @Test
+    public void testEncodeGeohashMasksHighBitsForSubByteprecision() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                // precisionBits=5 -> 1 byte on the wire, 5 low bits significant.
+                // Bits above 4 must be masked away so 0xFF on the wire becomes 0x1F.
+                binds.setGeohash(0, 5, 0xFFL);
+                assertEncoded(binds, 1, expected(writer -> {
+                    writer.write(QwpConstants.TYPE_GEOHASH);
+                    writer.write(NON_NULL);
+                    writeVarint(writer, 5);
+                    writer.write((byte) 0x1F);
+                }));
+            }
+        });
+    }
+
+    /**
+     * Same regression at the 60-bit ceiling: the top nibble (bits 60-63) must
+     * never reach the wire, regardless of the caller-supplied {@code value}.
+     */
+    @Test
+    public void testEncodeGeohashMasksHighBitsAtMaxPrecision() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                // All 64 bits set -- the encoder must zero bits 60..63.
+                binds.setGeohash(0, 60, -1L);
+                long expectedValue = (1L << 60) - 1L;
+                assertEncoded(binds, 1, expected(writer -> {
+                    writer.write(QwpConstants.TYPE_GEOHASH);
+                    writer.write(NON_NULL);
+                    writeVarint(writer, 60);
+                    for (int i = 0; i < 8; i++) {
+                        writer.write((byte) (expectedValue >>> (i * 8)));
+                    }
+                }));
             }
         });
     }
@@ -458,8 +568,83 @@ public class QwpBindEncoderTest {
         });
     }
 
+    /**
+     * {@link QwpBindValues#setNullDecimal128(int, int)} explicitly names the
+     * scale, which survives to the wire even for a NULL value (the server
+     * treats scale as part of the bound variable's type). Pins the framing:
+     * type + null_flag + null_bitmap + scale.
+     */
+    @Test
+    public void testEncodeNullDecimal128WithExplicitScale() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                binds.setNullDecimal128(0, 12);
+                assertEncoded(binds, 1, expected(writer -> {
+                    writer.write(QwpConstants.TYPE_DECIMAL128);
+                    writer.write(NULL_FLAG);
+                    writer.write(NULL_BITMAP);
+                    writer.write(12);
+                }));
+            }
+        });
+    }
+
+    @Test
+    public void testEncodeNullDecimal256WithExplicitScale() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                binds.setNullDecimal256(0, 50);
+                assertEncoded(binds, 1, expected(writer -> {
+                    writer.write(QwpConstants.TYPE_DECIMAL256);
+                    writer.write(NULL_FLAG);
+                    writer.write(NULL_BITMAP);
+                    writer.write(50);
+                }));
+            }
+        });
+    }
+
+    @Test
+    public void testEncodeNullDecimal64WithExplicitScale() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                binds.setNullDecimal64(0, 3);
+                assertEncoded(binds, 1, expected(writer -> {
+                    writer.write(QwpConstants.TYPE_DECIMAL64);
+                    writer.write(NULL_FLAG);
+                    writer.write(NULL_BITMAP);
+                    writer.write(3);
+                }));
+            }
+        });
+    }
+
+    /**
+     * {@link QwpBindValues#setNullGeohash(int, int)} pins the precision_bits
+     * even for NULL, since the server reads the varint unconditionally before
+     * inspecting the null flag.
+     */
+    @Test
+    public void testEncodeNullGeohashWithExplicitPrecision() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpBindValues binds = new QwpBindValues()) {
+                binds.setNullGeohash(0, 40);
+                assertEncoded(binds, 1, expected(writer -> {
+                    writer.write(QwpConstants.TYPE_GEOHASH);
+                    writer.write(NULL_FLAG);
+                    writer.write(NULL_BITMAP);
+                    writeVarint(writer, 40);
+                }));
+            }
+        });
+    }
+
     @Test
     public void testEncodeNullTypesExhaustive() throws Exception {
+        // DECIMAL64/128/256 and GEOHASH NULLs carry a trailing scale byte
+        // (or precision_bits varint) because the server reads those fields
+        // unconditionally. All other types emit only type + null flag +
+        // null bitmap. The exhaustive walk pins both shapes.
         byte[] allTypes = {
                 QwpConstants.TYPE_BOOLEAN,
                 QwpConstants.TYPE_BYTE,
@@ -492,6 +677,16 @@ public class QwpBindEncoderTest {
                     out.write(t);
                     out.write(NULL_FLAG);
                     out.write(NULL_BITMAP);
+                    if (t == QwpConstants.TYPE_DECIMAL64
+                            || t == QwpConstants.TYPE_DECIMAL128
+                            || t == QwpConstants.TYPE_DECIMAL256) {
+                        // setNull defaults to scale 0 for decimals.
+                        out.write(0);
+                    } else if (t == QwpConstants.TYPE_GEOHASH) {
+                        // setNull defaults to the minimum valid precision (1 bit),
+                        // encoded as a single-byte varint.
+                        out.write(1);
+                    }
                 }
                 Assert.assertArrayEquals(out.toByteArray(), got);
             }

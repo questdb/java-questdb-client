@@ -61,6 +61,22 @@ import java.util.UUID;
 public final class QwpBindValues implements QuietCloseable {
 
     /**
+     * Maximum scale for a DECIMAL128 bind. DECIMAL128 stores up to 38 digits of
+     * precision, so scale above 38 is mathematically invalid even though the
+     * wire format can carry any byte value.
+     */
+    private static final int DECIMAL128_MAX_SCALE = 38;
+    /**
+     * Maximum scale for a DECIMAL256 bind. DECIMAL256 is the widest decimal
+     * type and its scale cap matches {@link Decimals#MAX_SCALE} (76).
+     */
+    private static final int DECIMAL256_MAX_SCALE = Decimals.MAX_SCALE;
+    /**
+     * Maximum scale for a DECIMAL64 bind. DECIMAL64 stores up to 18 digits of
+     * precision, so scale above 18 is mathematically invalid.
+     */
+    private static final int DECIMAL64_MAX_SCALE = 18;
+    /**
      * Maximum GEOHASH precision in bits, matching the server's
      * {@code ColumnType.GEOLONG_MAX_BITS} check.
      */
@@ -108,7 +124,7 @@ public final class QwpBindValues implements QuietCloseable {
     }
 
     public QwpBindValues setDecimal128(int index, int scale, long lo, long hi) {
-        checkScale(scale);
+        checkScale128(scale);
         advance(index);
         writeHeader(QwpConstants.TYPE_DECIMAL128, false);
         writer.putByte((byte) scale);
@@ -120,18 +136,21 @@ public final class QwpBindValues implements QuietCloseable {
     /**
      * Convenience overload that takes the scale and limbs from the supplied
      * {@link Decimal128}. If the value is NULL (Decimal128's canonical NULL
-     * sentinel), an explicit DECIMAL128 NULL is encoded; otherwise the scale
-     * and 128-bit unscaled value are encoded as-is.
+     * sentinel), an explicit DECIMAL128 NULL is encoded preserving
+     * {@code value.getScale()}; a {@code null} reference encodes with scale 0.
      */
     public QwpBindValues setDecimal128(int index, Decimal128 value) {
-        if (value == null || Decimal128.isNull(value.getHigh(), value.getLow())) {
-            return setNull(index, QwpConstants.TYPE_DECIMAL128);
+        if (value == null) {
+            return setNullDecimal128(index, 0);
+        }
+        if (Decimal128.isNull(value.getHigh(), value.getLow())) {
+            return setNullDecimal128(index, value.getScale());
         }
         return setDecimal128(index, value.getScale(), value.getLow(), value.getHigh());
     }
 
     public QwpBindValues setDecimal256(int index, int scale, long ll, long lh, long hl, long hh) {
-        checkScale(scale);
+        checkScale256(scale);
         advance(index);
         writeHeader(QwpConstants.TYPE_DECIMAL256, false);
         writer.putByte((byte) scale);
@@ -145,17 +164,21 @@ public final class QwpBindValues implements QuietCloseable {
     /**
      * Convenience overload that takes the scale and limbs from the supplied
      * {@link Decimal256}. If the value is NULL (Decimal256's canonical NULL
-     * sentinel), an explicit DECIMAL256 NULL is encoded.
+     * sentinel), an explicit DECIMAL256 NULL is encoded preserving
+     * {@code value.getScale()}; a {@code null} reference encodes with scale 0.
      */
     public QwpBindValues setDecimal256(int index, Decimal256 value) {
-        if (value == null || Decimal256.isNull(value.getHh(), value.getHl(), value.getLh(), value.getLl())) {
-            return setNull(index, QwpConstants.TYPE_DECIMAL256);
+        if (value == null) {
+            return setNullDecimal256(index, 0);
+        }
+        if (Decimal256.isNull(value.getHh(), value.getHl(), value.getLh(), value.getLl())) {
+            return setNullDecimal256(index, value.getScale());
         }
         return setDecimal256(index, value.getScale(), value.getLl(), value.getLh(), value.getHl(), value.getHh());
     }
 
     public QwpBindValues setDecimal64(int index, int scale, long unscaledValue) {
-        checkScale(scale);
+        checkScale64(scale);
         advance(index);
         writeHeader(QwpConstants.TYPE_DECIMAL64, false);
         writer.putByte((byte) scale);
@@ -181,19 +204,21 @@ public final class QwpBindValues implements QuietCloseable {
      * Encodes a GEOHASH bind with the given precision (in bits) and packed
      * value. The value is stored little-endian in {@code ceil(precisionBits / 8)}
      * bytes. Precision must be in {@code [1, 60]}.
+     * <p>
+     * {@code value} is masked to {@code precisionBits} before encoding, so bits
+     * above the declared precision cannot leak into the top wire byte (which
+     * would otherwise pass through when {@code precisionBits} is not a multiple
+     * of 8).
      */
     public QwpBindValues setGeohash(int index, int precisionBits, long value) {
-        if (precisionBits < GEOHASH_MIN_BITS || precisionBits > GEOHASH_MAX_BITS) {
-            throw new IllegalArgumentException(
-                    "GEOHASH precision must be in [" + GEOHASH_MIN_BITS + ", " + GEOHASH_MAX_BITS
-                            + "], got " + precisionBits);
-        }
+        checkGeohashPrecision(precisionBits);
         advance(index);
         writeHeader(QwpConstants.TYPE_GEOHASH, false);
         writer.putVarint(precisionBits);
+        long masked = maskGeohashBits(value, precisionBits);
         int byteCount = (precisionBits + 7) >>> 3;
         for (int b = 0; b < byteCount; b++) {
-            writer.putByte((byte) (value >>> (b * 8)));
+            writer.putByte((byte) (masked >>> (b * 8)));
         }
         return this;
     }
@@ -226,11 +251,80 @@ public final class QwpBindValues implements QuietCloseable {
      * Binds an explicit NULL with the given QWP wire type. The type code must
      * be one of the supported scalar bind types; ARRAY, BINARY, and IPv4 are
      * rejected because the server decoder does not accept them as binds.
+     * <p>
+     * DECIMAL64/128/256 NULLs are encoded with scale 0 and GEOHASH NULLs with
+     * precision {@value #GEOHASH_MIN_BITS} bit; use {@link #setNullDecimal64},
+     * {@link #setNullDecimal128}, {@link #setNullDecimal256}, or
+     * {@link #setNullGeohash} when the scale/precision matters (it becomes part
+     * of the bound variable's type on the server).
      */
     public QwpBindValues setNull(int index, byte qwpTypeCode) {
         checkBindType(qwpTypeCode);
+        if (qwpTypeCode == QwpConstants.TYPE_DECIMAL64) {
+            return setNullDecimal64(index, 0);
+        }
+        if (qwpTypeCode == QwpConstants.TYPE_DECIMAL128) {
+            return setNullDecimal128(index, 0);
+        }
+        if (qwpTypeCode == QwpConstants.TYPE_DECIMAL256) {
+            return setNullDecimal256(index, 0);
+        }
+        if (qwpTypeCode == QwpConstants.TYPE_GEOHASH) {
+            return setNullGeohash(index, GEOHASH_MIN_BITS);
+        }
         advance(index);
         writeHeader(qwpTypeCode, true);
+        return this;
+    }
+
+    /**
+     * Binds an explicit NULL with DECIMAL128 type and the given scale. The
+     * server reads the scale byte regardless of null, so the scale must be
+     * supplied even for NULL (it becomes part of the bound variable's type).
+     */
+    public QwpBindValues setNullDecimal128(int index, int scale) {
+        checkScale128(scale);
+        advance(index);
+        writeHeader(QwpConstants.TYPE_DECIMAL128, true);
+        writer.putByte((byte) scale);
+        return this;
+    }
+
+    /**
+     * Binds an explicit NULL with DECIMAL256 type and the given scale. See
+     * {@link #setNullDecimal128} for the rationale.
+     */
+    public QwpBindValues setNullDecimal256(int index, int scale) {
+        checkScale256(scale);
+        advance(index);
+        writeHeader(QwpConstants.TYPE_DECIMAL256, true);
+        writer.putByte((byte) scale);
+        return this;
+    }
+
+    /**
+     * Binds an explicit NULL with DECIMAL64 type and the given scale. See
+     * {@link #setNullDecimal128} for the rationale.
+     */
+    public QwpBindValues setNullDecimal64(int index, int scale) {
+        checkScale64(scale);
+        advance(index);
+        writeHeader(QwpConstants.TYPE_DECIMAL64, true);
+        writer.putByte((byte) scale);
+        return this;
+    }
+
+    /**
+     * Binds an explicit NULL with GEOHASH type and the given precision (bits).
+     * The server reads the precision_bits varint regardless of null, so
+     * precision must be supplied even for NULL (it becomes part of the bound
+     * variable's type).
+     */
+    public QwpBindValues setNullGeohash(int index, int precisionBits) {
+        checkGeohashPrecision(precisionBits);
+        advance(index);
+        writeHeader(QwpConstants.TYPE_GEOHASH, true);
+        writer.putVarint(precisionBits);
         return this;
     }
 
@@ -351,6 +445,14 @@ public final class QwpBindValues implements QuietCloseable {
         expectedNextIndex = 0;
     }
 
+    private static void checkGeohashPrecision(int precisionBits) {
+        if (precisionBits < GEOHASH_MIN_BITS || precisionBits > GEOHASH_MAX_BITS) {
+            throw new IllegalArgumentException(
+                    "GEOHASH precision must be in [" + GEOHASH_MIN_BITS + ", " + GEOHASH_MAX_BITS
+                            + "], got " + precisionBits);
+        }
+    }
+
     private static boolean isAscii(CharSequence value, int charLen) {
         for (int i = 0; i < charLen; i++) {
             if (value.charAt(i) >= 0x80) {
@@ -358,6 +460,10 @@ public final class QwpBindValues implements QuietCloseable {
             }
         }
         return true;
+    }
+
+    private static long maskGeohashBits(long value, int precisionBits) {
+        return precisionBits >= 64 ? value : value & ((1L << precisionBits) - 1L);
     }
 
     private void advance(int index) {
@@ -400,10 +506,24 @@ public final class QwpBindValues implements QuietCloseable {
         }
     }
 
-    private void checkScale(int scale) {
-        if (scale < 0 || scale > Decimals.MAX_SCALE) {
+    private void checkScale128(int scale) {
+        if (scale < 0 || scale > DECIMAL128_MAX_SCALE) {
             throw new IllegalArgumentException(
-                    "scale must be in [0, " + Decimals.MAX_SCALE + "], got " + scale);
+                    "DECIMAL128 scale must be in [0, " + DECIMAL128_MAX_SCALE + "], got " + scale);
+        }
+    }
+
+    private void checkScale256(int scale) {
+        if (scale < 0 || scale > DECIMAL256_MAX_SCALE) {
+            throw new IllegalArgumentException(
+                    "DECIMAL256 scale must be in [0, " + DECIMAL256_MAX_SCALE + "], got " + scale);
+        }
+    }
+
+    private void checkScale64(int scale) {
+        if (scale < 0 || scale > DECIMAL64_MAX_SCALE) {
+            throw new IllegalArgumentException(
+                    "DECIMAL64 scale must be in [0, " + DECIMAL64_MAX_SCALE + "], got " + scale);
         }
     }
 

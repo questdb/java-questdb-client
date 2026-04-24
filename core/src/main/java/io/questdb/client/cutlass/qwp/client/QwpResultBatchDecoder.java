@@ -54,11 +54,27 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     private static final int CONN_DICT_INITIAL_BYTES = 4096;
     private static final int CONN_DICT_INITIAL_ENTRIES = 512;
     /**
-     * Cap on per-row ARRAY element count. 8 bytes per element x this ~ 256 MB max payload,
+     * Hard cap on per-row ARRAY element count. 8 bytes per element x this ~ 256 MB max payload,
      * which fits in {@code int} once {@code rowEnd - p} is computed. A malicious or buggy
      * server cannot push a negative or wrap-around length past this guard.
      */
     private static final long MAX_ARRAY_ELEMENTS = (Integer.MAX_VALUE - 1024) / 8L;
+    /**
+     * Hard cap on the connection-scoped SYMBOL dict's UTF-8 heap size in bytes.
+     * Well below {@link Integer#MAX_VALUE} to prevent {@code connDictHeapPos + len}
+     * from wrapping negative (which would bypass {@link #ensureConnDictHeapCapacity}
+     * and let {@code copyMemory} write past the allocated heap). Servers that
+     * approach this cap are expected to emit {@code CACHE_RESET}; crossing it
+     * means either a broken server or a hostile frame, so we fail hard.
+     */
+    private static final int MAX_CONN_DICT_HEAP_BYTES = 256 * 1024 * 1024;
+    /**
+     * Hard cap on the connection-scoped SYMBOL dict entry count. Matches the
+     * rationale for {@link #MAX_CONN_DICT_HEAP_BYTES}: a hostile server that
+     * never emits {@code CACHE_RESET} cannot drive {@code connDictSize} to
+     * {@link Integer#MAX_VALUE} without being rejected first.
+     */
+    private static final int MAX_CONN_DICT_SIZE = 8_388_608;
     /**
      * Hard cap on {@code row_count} per batch. Matches the server's MAX_ROWS_PER_BATCH.
      * A hostile server could otherwise encode row_count = Integer.MAX_VALUE; ensureIntArray
@@ -629,6 +645,13 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         }
         if (wt == QwpConstants.TYPE_GEOHASH) {
             decodeVarint(p, limit);
+            // The server enforces [1, 60] on GEOLONG precision; mirror the
+            // check here so a hostile varint that decodes out of range (or
+            // negative once cast to int) fails fast rather than driving a
+            // nonsense bytesPerValue into the length calculation below.
+            if (varintValue < 1 || varintValue > 60) {
+                throw new QwpDecodeException("GEOHASH precision bits out of range (1..60): " + varintValue);
+            }
             layout.info.precisionBits = (int) varintValue;
             p = varintPos;
             int bytesPerValue = (layout.info.precisionBits + 7) >>> 3;
@@ -665,7 +688,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         long deltaCount = varintValue;
         p = varintPos;
         if (deltaStart < 0 || deltaCount < 0
-                || deltaStart + deltaCount > Integer.MAX_VALUE) {
+                || deltaStart + deltaCount > MAX_CONN_DICT_SIZE) {
             throw new QwpDecodeException("delta symbol section out of range: start="
                     + deltaStart + ", count=" + deltaCount);
         }
@@ -679,11 +702,20 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             decodeVarint(p, limit);
             long entryLen = varintValue;
             p = varintPos;
-            if (entryLen < 0 || p + entryLen > limit) {
+            if (entryLen < 0 || entryLen > Integer.MAX_VALUE || p + entryLen > limit) {
                 throw new QwpDecodeException("truncated delta symbol entry");
             }
             int len = (int) entryLen;
-            ensureConnDictHeapCapacity(connDictHeapPos + len);
+            // Long arithmetic so a hostile (connDictHeapPos + len) that would
+            // wrap int-negative gets caught by the cap check instead of
+            // silently skipping ensureConnDictHeapCapacity (which would let
+            // copyMemory write past the heap).
+            long newHeapPos = (long) connDictHeapPos + (long) len;
+            if (newHeapPos > MAX_CONN_DICT_HEAP_BYTES) {
+                throw new QwpDecodeException("connection SYMBOL dict heap exceeds cap ("
+                        + MAX_CONN_DICT_HEAP_BYTES + " bytes); server must emit CACHE_RESET");
+            }
+            ensureConnDictHeapCapacity((int) newHeapPos);
             int offset = connDictHeapPos;
             Unsafe.getUnsafe().copyMemory(p, connDictHeapAddr + offset, len);
             // Pack (offset, length) into one 8-byte entry. Low 32 bits = offset,
@@ -692,7 +724,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             long packed = (offset & 0xFFFFFFFFL) | ((long) len << 32);
             Unsafe.getUnsafe().putLong(connDictEntriesAddr + 8L * connDictSize, packed);
             connDictSize++;
-            connDictHeapPos += len;
+            connDictHeapPos = (int) newHeapPos;
             p += len;
         }
         return p;
@@ -763,6 +795,15 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             layout.symbolDictVersion = connDictGeneration << 1;
         } else {
             decodeVarint(p, limit);
+            // A column can have at most rowCount distinct symbols, and a
+            // hostile varint can decode negative once cast to int. Reject both
+            // before the int-multiply below, which would otherwise overflow
+            // silently and let {@code ensureOwnedEntriesAddr} return without
+            // growing the buffer.
+            if (varintValue < 0 || varintValue > rowCount) {
+                throw new QwpDecodeException("SYMBOL dict size out of range: " + varintValue
+                        + " (rowCount=" + rowCount + ")");
+            }
             dictSize = (int) varintValue;
             p = varintPos;
             // Non-delta: dict entries point directly into the payload buffer. Build
@@ -771,13 +812,21 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             long entriesAddr = layout.ensureOwnedEntriesAddr(dictSize * 8);
             for (int e = 0; e < dictSize; e++) {
                 decodeVarint(p, limit);
-                int entryLen = (int) varintValue;
+                long entryLen = varintValue;
                 p = varintPos;
-                if (p + entryLen > limit) throw new QwpDecodeException("truncated symbol entry");
+                // entryLen must be non-negative and fit in int. Without this,
+                // a hostile varint can drive `p + entryLen` negative (int-cast
+                // sign-extend on the long addend wraps), slipping the
+                // `> limit` check; the subsequent `p += entryLen` then
+                // advances backwards through previously-consumed bytes.
+                if (entryLen < 0 || entryLen > Integer.MAX_VALUE || p + entryLen > limit) {
+                    throw new QwpDecodeException("truncated symbol entry");
+                }
+                int lenBytes = (int) entryLen;
                 int offset = (int) (p - dictBase);
-                long packed = (offset & 0xFFFFFFFFL) | ((long) entryLen << 32);
+                long packed = (offset & 0xFFFFFFFFL) | ((long) lenBytes << 32);
                 Unsafe.getUnsafe().putLong(entriesAddr + 8L * e, packed);
-                p += entryLen;
+                p += lenBytes;
             }
             layout.symbolDictHeapAddr = dictBase;
             layout.symbolDictEntriesAddr = entriesAddr;
