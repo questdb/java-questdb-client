@@ -331,11 +331,16 @@ public final class JavaTlsClientSocket implements Socket {
                                 // there cannot be underflow since wrap() during handshake does not read from the input buffer at all
                                 throw new AssertionError("Buffer underflow during TLS handshake. This should not happen. please report as a bug");
                             case BUFFER_OVERFLOW:
-                                if (wrapOutputBuffer.position() == 0) {
-                                    // in theory, this can happen if the output buffer is too small to fit a single TLS handshake record,
-                                    // but that would indicate our starting buffer is too small.
-                                    growWrapOutputBuffer();
+                                if (wrapOutputBuffer.position() != 0) {
+                                    // wrap() left bytes behind without producing a complete record. The OK
+                                    // branch is the only place that drains and clears, so a non-empty
+                                    // buffer here means we would re-enter NEED_WRAP with identical state
+                                    // and spin forever. Fail loudly instead.
+                                    throw new AssertionError("Buffer overflow during TLS handshake with non-empty output buffer. This should not happen, please report as a bug");
                                 }
+                                // in theory, this can happen if the output buffer is too small to fit a single TLS handshake record,
+                                // but that would indicate our starting buffer is too small.
+                                growWrapOutputBuffer();
                                 break;
                             case OK:
                                 // wrapOutputBuffer: write mode
@@ -367,11 +372,15 @@ public final class JavaTlsClientSocket implements Socket {
                                 // we need to receive more data from a socket, let's try again
                                 break;
                             case BUFFER_OVERFLOW:
-                                if (unwrapOutputBuffer.position() == 0) {
-                                    // in theory, this can happen if the output buffer is too small to fit a single TLS handshake record,
-                                    // but that would indicate our starting buffer is too small.
-                                    growUnwrapOutputBuffer();
+                                if (unwrapOutputBuffer.position() != 0) {
+                                    // unwrap() produced plaintext but signalled overflow without consuming
+                                    // the next record. Nothing in the handshake loop drains this buffer,
+                                    // so re-entering NEED_UNWRAP would spin forever. Fail loudly.
+                                    throw new AssertionError("Buffer overflow during TLS handshake with non-empty output buffer. This should not happen, please report as a bug");
                                 }
+                                // in theory, this can happen if the output buffer is too small to fit a single TLS handshake record,
+                                // but that would indicate our starting buffer is too small.
+                                growUnwrapOutputBuffer();
                                 break;
                             case OK:
                                 // good, let's see what we need to do next

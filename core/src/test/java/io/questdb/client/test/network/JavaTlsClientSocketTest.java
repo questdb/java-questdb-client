@@ -37,7 +37,6 @@ import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
-import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
 import java.lang.reflect.Field;
@@ -264,7 +263,7 @@ public class JavaTlsClientSocketTest {
         }
 
         @Override
-        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) throws SSLException {
+        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) {
             if (length == 0) {
                 throw new IllegalArgumentException("no destination buffers");
             }
