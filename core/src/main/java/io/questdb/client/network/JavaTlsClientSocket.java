@@ -77,6 +77,7 @@ public final class JavaTlsClientSocket implements Socket {
     private static final int STATE_EMPTY = 0;
     private static final int STATE_PLAINTEXT = 1;
     private static final int STATE_TLS = 2;
+    private final ByteBuffer callerOutputBuffer;
     private final Socket delegate;
     private final Logger log;
     private final ClientTlsConfiguration tlsConfig;
@@ -87,6 +88,7 @@ public final class JavaTlsClientSocket implements Socket {
     private SSLEngine sslEngine;
     private int state = STATE_EMPTY;
     private long unwrapInputBufferPtr;
+    private long unwrapOutputBufferPtr;
     private long wrapOutputBufferPtr;
 
     JavaTlsClientSocket(NetworkFacade nf, Logger log, ClientTlsConfiguration tlsConfig) {
@@ -94,18 +96,19 @@ public final class JavaTlsClientSocket implements Socket {
         this.log = log;
         this.tlsConfig = tlsConfig;
 
-        // wrapInputBuffer are just placeholders. we set the internal address, capacity and limit in send() and recv().
-        // so read/write from/to a buffer supplied by the caller and avoid unnecessary memory copies.
-        // also, handshake does not to read/write from/to these buffers so it does not matter if they have capacity = 0
-        // during handshake.
+        // wrapInputBuffer and callerOutputBuffer are just placeholders: their address, capacity and
+        // limit are reset to point at the caller's buffer in send() and recv() respectively, so the
+        // SSLEngine can read/write the caller's memory directly without an extra copy. They have
+        // capacity = 0 during handshake because handshake does not touch them.
         this.wrapInputBuffer = ByteBuffer.allocateDirect(0);
-        this.unwrapOutputBuffer = ByteBuffer.allocateDirect(0);
+        this.callerOutputBuffer = ByteBuffer.allocateDirect(0);
 
-        // wrapOutputBuffer and unwrapInputBuffer are crated with capacity 0. why?
-        // we allocate the actual memory only when starting a new TLS session.
-        // this way we can reuse the same ByteBuffer instances for multiple TLS sessions.
+        // wrapOutputBuffer, unwrapInputBuffer and unwrapOutputBuffer all back internal allocations
+        // that are only created when starting a new TLS session, so the ByteBuffer instances can be
+        // reused across sessions.
         this.wrapOutputBuffer = ByteBuffer.allocateDirect(0);
         this.unwrapInputBuffer = ByteBuffer.allocateDirect(0);
+        this.unwrapOutputBuffer = ByteBuffer.allocateDirect(0);
     }
 
     @Override
@@ -167,51 +170,73 @@ public final class JavaTlsClientSocket implements Socket {
     public int recv(long bufferPtr, int bufferLen) {
         assert sslEngine != null;
 
-        resetBufferToPointer(unwrapOutputBuffer, bufferPtr, bufferLen);
-        unwrapOutputBuffer.position(0);
-
         try {
-            int plainBytesReceived = 0;
+            // Pending plaintext from a previous spill is held in the internal buffer. Drain it first.
+            if (unwrapOutputBuffer.position() != 0) {
+                return drainUnwrapOutputBuffer(bufferPtr, bufferLen);
+            }
+
+            // Fast path: have the SSLEngine decrypt straight into the caller's buffer. We only fall
+            // back to the internal spill buffer if a single TLS record does not fit in the caller's
+            // buffer, in which case we drain the spill buffer to the caller and return.
+            resetBufferToPointer(callerOutputBuffer, bufferPtr, bufferLen);
+            ByteBuffer output = callerOutputBuffer;
+            boolean spilling = false;
+
             for (; ; ) {
                 int n = readFromSocket();
                 assert unwrapInputBuffer.position() == 0 : "unwrapInputBuffer is not compacted";
                 int bytesAvailable = unwrapInputBuffer.limit();
                 if (n < 0 && bytesAvailable == 0) {
-                    if (plainBytesReceived == 0) {
-                        // we didn't manage to read anything from the socket, let's return the error
-                        return n;
+                    if (output.position() != 0) {
+                        return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
                     }
-                    // we have some data to return, let's return it
-                    return plainBytesReceived;
+                    return n;
                 }
-
                 if (bytesAvailable == 0) {
-                    // nothing to unwrap, we are done
-                    return plainBytesReceived;
+                    if (output.position() != 0) {
+                        return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
+                    }
+                    return 0;
                 }
 
-                SSLEngineResult result = sslEngine.unwrap(unwrapInputBuffer, unwrapOutputBuffer);
-                plainBytesReceived += result.bytesProduced();
+                SSLEngineResult result = sslEngine.unwrap(unwrapInputBuffer, output);
 
                 // compact the TLS buffer
                 int bytesConsumed = result.bytesConsumed();
                 int bytesRemaining = bytesAvailable - bytesConsumed;
-                Vect.memcpy(unwrapInputBufferPtr, unwrapInputBufferPtr + bytesConsumed, bytesRemaining);
+                if (bytesRemaining > 0) {
+                    Vect.memcpy(unwrapInputBufferPtr, unwrapInputBufferPtr + bytesConsumed, bytesRemaining);
+                }
                 unwrapInputBuffer.position(0);
                 unwrapInputBuffer.limit(bytesRemaining);
 
                 switch (result.getStatus()) {
                     case BUFFER_UNDERFLOW:
-                        // we need more data to unwrap, let's return whatever we have
-                        return plainBytesReceived;
-                    case BUFFER_OVERFLOW:
-                        if (unwrapOutputBuffer.position() == 0) {
-                            // not even a single byte was written to the output buffer even the buffer is empty
-                            throw new AssertionError("Output buffer too small to fit a single TLS record. This should not happen, please report as a bug.");
+                        if (output.position() != 0) {
+                            return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
                         }
-                        // we have some data to return, let's return it
-                        return plainBytesReceived;
+                        return 0;
+                    case BUFFER_OVERFLOW:
+                        if (output.position() != 0) {
+                            // Output already has plaintext: hand it to the caller and let the
+                            // unprocessed record be picked up on the next recv() call.
+                            return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
+                        }
+                        if (spilling) {
+                            // Internal buffer cannot fit a single record either: grow and retry.
+                            growUnwrapOutputBuffer();
+                        } else {
+                            // Caller's buffer cannot fit a single record. Switch to the internal
+                            // spill buffer for this record (and any further records that fit), then
+                            // drain to the caller.
+                            output = unwrapOutputBuffer;
+                            spilling = true;
+                        }
+                        break;
                     case OK:
+                        // Plaintext (if any) is accumulating in `output`. Keep looping so we either
+                        // batch more records or hit BUFFER_UNDERFLOW / BUFFER_OVERFLOW.
                         break;
                     case CLOSED:
                         log.debug("SSL engine closed");
@@ -220,7 +245,10 @@ public final class JavaTlsClientSocket implements Socket {
                         // If a caller calls recv() again and we have no remaining plaintext to return, we will return -1 so the
                         // caller learned that the connection is closed.
                         // If we have no plaintext data to return now then we can immediately indicate that we are done with the connection.
-                        return plainBytesReceived == 0 ? -1 : plainBytesReceived;
+                        if (output.position() != 0) {
+                            return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
+                        }
+                        return -1;
                 }
             }
         } catch (SSLException e) {
@@ -303,9 +331,17 @@ public final class JavaTlsClientSocket implements Socket {
                                 // there cannot be underflow since wrap() during handshake does not read from the input buffer at all
                                 throw new AssertionError("Buffer underflow during TLS handshake. This should not happen. please report as a bug");
                             case BUFFER_OVERFLOW:
-                                // in theory, this can happen if the output buffer is too small to fit a single TLS handshake record, but that would indicate
-                                // our starting buffer is too small.
-                                throw new AssertionError("Buffer overflow during TLS handshake. This should not happen, please report as a bug");
+                                if (wrapOutputBuffer.position() != 0) {
+                                    // wrap() left bytes behind without producing a complete record. The OK
+                                    // branch is the only place that drains and clears, so a non-empty
+                                    // buffer here means we would re-enter NEED_WRAP with identical state
+                                    // and spin forever. Fail loudly instead.
+                                    throw new AssertionError("Buffer overflow during TLS handshake with non-empty output buffer. This should not happen, please report as a bug");
+                                }
+                                // in theory, this can happen if the output buffer is too small to fit a single TLS handshake record,
+                                // but that would indicate our starting buffer is too small.
+                                growWrapOutputBuffer();
+                                break;
                             case OK:
                                 // wrapOutputBuffer: write mode
                                 int written = 0;
@@ -336,7 +372,16 @@ public final class JavaTlsClientSocket implements Socket {
                                 // we need to receive more data from a socket, let's try again
                                 break;
                             case BUFFER_OVERFLOW:
-                                throw new AssertionError("Buffer overflow during TLS handshake. This should not happen, please report as a bug");
+                                if (unwrapOutputBuffer.position() != 0) {
+                                    // unwrap() produced plaintext but signalled overflow without consuming
+                                    // the next record. Nothing in the handshake loop drains this buffer,
+                                    // so re-entering NEED_UNWRAP would spin forever. Fail loudly.
+                                    throw new AssertionError("Buffer overflow during TLS handshake with non-empty output buffer. This should not happen, please report as a bug");
+                                }
+                                // in theory, this can happen if the output buffer is too small to fit a single TLS handshake record,
+                                // but that would indicate our starting buffer is too small.
+                                growUnwrapOutputBuffer();
+                                break;
                             case OK:
                                 // good, let's see what we need to do next
                                 break;
@@ -352,7 +397,8 @@ public final class JavaTlsClientSocket implements Socket {
             unwrapInputBuffer.limit(0);
 
             // write mode and empty
-            unwrapOutputBuffer.clear();
+            unwrapOutputBuffer.position(0);
+            unwrapOutputBuffer.limit(unwrapOutputBuffer.capacity());
             wrapOutputBuffer.clear();
             state = STATE_TLS;
         } catch (KeyManagementException | NoSuchAlgorithmException | KeyStoreException | IOException |
@@ -478,6 +524,13 @@ public final class JavaTlsClientSocket implements Socket {
             ptrToFree = unwrapInputBufferPtr;
             unwrapInputBufferPtr = 0;
             Unsafe.free(ptrToFree, capacity, MemoryTag.NATIVE_TLS_RSS);
+
+            capacity = unwrapOutputBuffer.capacity();
+            assert capacity != 0;
+            resetBufferToPointer(unwrapOutputBuffer, 0, 0);
+            ptrToFree = unwrapOutputBufferPtr;
+            unwrapOutputBufferPtr = 0;
+            Unsafe.free(ptrToFree, capacity, MemoryTag.NATIVE_TLS_RSS);
         }
     }
 
@@ -485,11 +538,28 @@ public final class JavaTlsClientSocket implements Socket {
         wrapOutputBufferPtr = expandBuffer(wrapOutputBuffer, wrapOutputBufferPtr);
     }
 
+    private void growUnwrapOutputBuffer() {
+        unwrapOutputBufferPtr = expandBuffer(unwrapOutputBuffer, unwrapOutputBufferPtr);
+    }
+
     private void prepareInternalBuffers() {
         int initialCapacity = Integer.getInteger("questdb.experimental.tls.buffersize", INITIAL_BUFFER_CAPACITY_BYTES);
         this.wrapOutputBufferPtr = allocateMemoryAndResetBuffer(wrapOutputBuffer, initialCapacity);
         this.unwrapInputBufferPtr = allocateMemoryAndResetBuffer(unwrapInputBuffer, initialCapacity);
         unwrapInputBuffer.flip(); // read mode
+        this.unwrapOutputBufferPtr = allocateMemoryAndResetBuffer(unwrapOutputBuffer, initialCapacity);
+    }
+
+    private int drainUnwrapOutputBuffer(long bufferPtr, int bufferLen) {
+        unwrapOutputBuffer.flip();
+        int oldPosition = unwrapOutputBuffer.position();
+        int len = Math.min(bufferLen, unwrapOutputBuffer.remaining());
+        if (len > 0) {
+            Vect.memcpy(bufferPtr, unwrapOutputBufferPtr + oldPosition, len);
+        }
+        unwrapOutputBuffer.position(oldPosition + len);
+        unwrapOutputBuffer.compact();
+        return len;
     }
 
     private int readFromSocket() {
