@@ -77,6 +77,7 @@ public final class JavaTlsClientSocket implements Socket {
     private static final int STATE_EMPTY = 0;
     private static final int STATE_PLAINTEXT = 1;
     private static final int STATE_TLS = 2;
+    private final ByteBuffer callerOutputBuffer;
     private final Socket delegate;
     private final Logger log;
     private final ClientTlsConfiguration tlsConfig;
@@ -95,18 +96,19 @@ public final class JavaTlsClientSocket implements Socket {
         this.log = log;
         this.tlsConfig = tlsConfig;
 
-        // wrapInputBuffer are just placeholders. we set the internal address, capacity and limit in send() and recv().
-        // so read/write from/to a buffer supplied by the caller and avoid unnecessary memory copies.
-        // also, handshake does not to read/write from/to these buffers so it does not matter if they have capacity = 0
-        // during handshake.
+        // wrapInputBuffer and callerOutputBuffer are just placeholders: their address, capacity and
+        // limit are reset to point at the caller's buffer in send() and recv() respectively, so the
+        // SSLEngine can read/write the caller's memory directly without an extra copy. They have
+        // capacity = 0 during handshake because handshake does not touch them.
         this.wrapInputBuffer = ByteBuffer.allocateDirect(0);
-        this.unwrapOutputBuffer = ByteBuffer.allocateDirect(0);
+        this.callerOutputBuffer = ByteBuffer.allocateDirect(0);
 
-        // wrapOutputBuffer and unwrapInputBuffer are crated with capacity 0. why?
-        // we allocate the actual memory only when starting a new TLS session.
-        // this way we can reuse the same ByteBuffer instances for multiple TLS sessions.
+        // wrapOutputBuffer, unwrapInputBuffer and unwrapOutputBuffer all back internal allocations
+        // that are only created when starting a new TLS session, so the ByteBuffer instances can be
+        // reused across sessions.
         this.wrapOutputBuffer = ByteBuffer.allocateDirect(0);
         this.unwrapInputBuffer = ByteBuffer.allocateDirect(0);
+        this.unwrapOutputBuffer = ByteBuffer.allocateDirect(0);
     }
 
     @Override
@@ -169,24 +171,36 @@ public final class JavaTlsClientSocket implements Socket {
         assert sslEngine != null;
 
         try {
+            // Pending plaintext from a previous spill is held in the internal buffer. Drain it first.
             if (unwrapOutputBuffer.position() != 0) {
                 return drainUnwrapOutputBuffer(bufferPtr, bufferLen);
             }
+
+            // Fast path: have the SSLEngine decrypt straight into the caller's buffer. We only fall
+            // back to the internal spill buffer if a single TLS record does not fit in the caller's
+            // buffer, in which case we drain the spill buffer to the caller and return.
+            resetBufferToPointer(callerOutputBuffer, bufferPtr, bufferLen);
+            ByteBuffer output = callerOutputBuffer;
+            boolean spilling = false;
 
             for (; ; ) {
                 int n = readFromSocket();
                 assert unwrapInputBuffer.position() == 0 : "unwrapInputBuffer is not compacted";
                 int bytesAvailable = unwrapInputBuffer.limit();
                 if (n < 0 && bytesAvailable == 0) {
+                    if (output.position() != 0) {
+                        return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
+                    }
                     return n;
                 }
-
                 if (bytesAvailable == 0) {
-                    // nothing to unwrap, we are done
+                    if (output.position() != 0) {
+                        return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
+                    }
                     return 0;
                 }
 
-                SSLEngineResult result = sslEngine.unwrap(unwrapInputBuffer, unwrapOutputBuffer);
+                SSLEngineResult result = sslEngine.unwrap(unwrapInputBuffer, output);
 
                 // compact the TLS buffer
                 int bytesConsumed = result.bytesConsumed();
@@ -199,24 +213,31 @@ public final class JavaTlsClientSocket implements Socket {
 
                 switch (result.getStatus()) {
                     case BUFFER_UNDERFLOW:
-                        if (unwrapOutputBuffer.position() != 0) {
-                            return drainUnwrapOutputBuffer(bufferPtr, bufferLen);
+                        if (output.position() != 0) {
+                            return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
                         }
-                        // we need more data to unwrap, let's return control to the caller
                         return 0;
                     case BUFFER_OVERFLOW:
-                        if (unwrapOutputBuffer.position() == 0) {
-                            // not even a single byte was written to the output buffer even the buffer is empty
-                            // apparently the output buffer cannot fit even a single TLS record. let's grow it and try again!
+                        if (output.position() != 0) {
+                            // Output already has plaintext: hand it to the caller and let the
+                            // unprocessed record be picked up on the next recv() call.
+                            return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
+                        }
+                        if (spilling) {
+                            // Internal buffer cannot fit a single record either: grow and retry.
                             growUnwrapOutputBuffer();
-                            break;
+                        } else {
+                            // Caller's buffer cannot fit a single record. Switch to the internal
+                            // spill buffer for this record (and any further records that fit), then
+                            // drain to the caller.
+                            output = unwrapOutputBuffer;
+                            spilling = true;
                         }
-                        return drainUnwrapOutputBuffer(bufferPtr, bufferLen);
+                        break;
                     case OK:
-                        if (unwrapOutputBuffer.position() != 0) {
-                            return drainUnwrapOutputBuffer(bufferPtr, bufferLen);
-                        }
-                        return 0;
+                        // Plaintext (if any) is accumulating in `output`. Keep looping so we either
+                        // batch more records or hit BUFFER_UNDERFLOW / BUFFER_OVERFLOW.
+                        break;
                     case CLOSED:
                         log.debug("SSL engine closed");
                         // We received a TLS close notification from the server. We don't expect any further data from this connection.
@@ -224,10 +245,10 @@ public final class JavaTlsClientSocket implements Socket {
                         // If a caller calls recv() again and we have no remaining plaintext to return, we will return -1 so the
                         // caller learned that the connection is closed.
                         // If we have no plaintext data to return now then we can immediately indicate that we are done with the connection.
-                        if (unwrapOutputBuffer.position() == 0) {
-                            return -1;
+                        if (output.position() != 0) {
+                            return spilling ? drainUnwrapOutputBuffer(bufferPtr, bufferLen) : output.position();
                         }
-                        return drainUnwrapOutputBuffer(bufferPtr, bufferLen);
+                        return -1;
                 }
             }
         } catch (SSLException e) {

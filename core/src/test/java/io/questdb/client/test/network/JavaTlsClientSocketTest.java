@@ -78,17 +78,107 @@ public class JavaTlsClientSocketTest {
                         assertEquals(4, n1);
                         assertBytes("abcd", out1, n1);
 
-                        ByteBuffer unwrapOutputBuffer = getField(socket, "unwrapOutputBuffer");
-                        assertEquals(16, unwrapOutputBuffer.capacity());
-
                         int n2 = socket.recv(out2, 4);
                         assertEquals(2, n2);
                         assertBytes("ef", out2, n2);
 
+                        ByteBuffer unwrapOutputBuffer = getField(socket, "unwrapOutputBuffer");
                         assertEquals(0, unwrapOutputBuffer.position());
                     } finally {
                         Unsafe.free(out2, 4, MemoryTag.NATIVE_DEFAULT);
                         Unsafe.free(out1, 4, MemoryTag.NATIVE_DEFAULT);
+                    }
+                }
+            });
+        } finally {
+            if (previous == null) {
+                System.clearProperty(TLS_BUFFER_SIZE_PROP);
+            } else {
+                System.setProperty(TLS_BUFFER_SIZE_PROP, previous);
+            }
+        }
+    }
+
+    @Test
+    public void testRecvSpillsAndGrowsInternalBufferForOversizedRecord() throws Exception {
+        String previous = System.getProperty(TLS_BUFFER_SIZE_PROP);
+        try {
+            System.setProperty(TLS_BUFFER_SIZE_PROP, "4");
+            TestUtils.assertMemoryLeak(() -> {
+                try (JavaTlsClientSocket socket = newSocket()) {
+                    invoke(socket, "prepareInternalBuffers");
+                    setField(socket, "sslEngine", new RealisticOverflowSslEngine("012345".getBytes()));
+                    setIntField(socket, "state", 2);
+
+                    ByteBuffer unwrapInputBuffer = getField(socket, "unwrapInputBuffer");
+                    long unwrapInputBufferPtr = getLongField(socket, "unwrapInputBufferPtr");
+                    for (int i = 0; i < 4; i++) {
+                        Unsafe.getUnsafe().putByte(unwrapInputBufferPtr + i, (byte) ('a' + i));
+                    }
+                    unwrapInputBuffer.position(0);
+                    unwrapInputBuffer.limit(4);
+
+                    long out1 = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+                    long out2 = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+                    try {
+                        int n1 = socket.recv(out1, 4);
+                        assertEquals(4, n1);
+                        assertBytes("0123", out1, n1);
+
+                        // Caller's 4-byte buffer forced a spill into the internal buffer; the internal
+                        // buffer was 4 bytes too, so the spill path had to grow it (4 -> 8) before the
+                        // SSLEngine could write the 6-byte payload.
+                        ByteBuffer unwrapOutputBuffer = getField(socket, "unwrapOutputBuffer");
+                        assertEquals(8, unwrapOutputBuffer.capacity());
+
+                        int n2 = socket.recv(out2, 4);
+                        assertEquals(2, n2);
+                        assertBytes("45", out2, n2);
+                    } finally {
+                        Unsafe.free(out2, 4, MemoryTag.NATIVE_DEFAULT);
+                        Unsafe.free(out1, 4, MemoryTag.NATIVE_DEFAULT);
+                    }
+                }
+            });
+        } finally {
+            if (previous == null) {
+                System.clearProperty(TLS_BUFFER_SIZE_PROP);
+            } else {
+                System.setProperty(TLS_BUFFER_SIZE_PROP, previous);
+            }
+        }
+    }
+
+    @Test
+    public void testRecvProcessesBufferedRecordAfterEmptyOkUnwrap() throws Exception {
+        String previous = System.getProperty(TLS_BUFFER_SIZE_PROP);
+        try {
+            System.setProperty(TLS_BUFFER_SIZE_PROP, "32");
+            TestUtils.assertMemoryLeak(() -> {
+                try (JavaTlsClientSocket socket = newSocket()) {
+                    invoke(socket, "prepareInternalBuffers");
+                    setField(socket, "sslEngine", new TicketThenDataSslEngine("DATA12".getBytes()));
+                    setIntField(socket, "state", 2);
+
+                    ByteBuffer unwrapInputBuffer = getField(socket, "unwrapInputBuffer");
+                    long unwrapInputBufferPtr = getLongField(socket, "unwrapInputBufferPtr");
+                    // 12 bytes: first 6 simulate a post-handshake control record (e.g. TLS 1.3 NewSessionTicket)
+                    // that consumes input but produces no plaintext, the next 6 bytes are a real data record.
+                    for (int i = 0; i < 12; i++) {
+                        Unsafe.getUnsafe().putByte(unwrapInputBufferPtr + i, (byte) ('a' + i));
+                    }
+                    unwrapInputBuffer.position(0);
+                    unwrapInputBuffer.limit(12);
+
+                    long out = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                    try {
+                        int n = socket.recv(out, 16);
+                        // recv must keep unwrapping after an OK-with-zero-output result and deliver the
+                        // plaintext from the buffered data record.
+                        assertEquals(6, n);
+                        assertBytes("DATA12", out, n);
+                    } finally {
+                        Unsafe.free(out, 16, MemoryTag.NATIVE_DEFAULT);
                     }
                 }
             });
@@ -165,22 +255,12 @@ public class JavaTlsClientSocketTest {
         }
     }
 
-    private static final class OverflowThenPayloadSslEngine extends SSLEngine {
+    private static final class OverflowThenPayloadSslEngine extends StubSslEngine {
         private final byte[] payload;
         private int unwrapCalls;
 
         private OverflowThenPayloadSslEngine(byte[] payload) {
             this.payload = payload;
-        }
-
-        @Override
-        public SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst) {
-            return new SSLEngineResult(
-                    SSLEngineResult.Status.OK,
-                    SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
-                    0,
-                    0
-            );
         }
 
         @Override
@@ -215,10 +295,48 @@ public class JavaTlsClientSocketTest {
                     payload.length
             );
         }
+    }
+
+    private static final class RealisticOverflowSslEngine extends StubSslEngine {
+        private final byte[] payload;
+        private boolean payloadWritten;
+
+        private RealisticOverflowSslEngine(byte[] payload) {
+            this.payload = payload;
+        }
 
         @Override
-        public Runnable getDelegatedTask() {
-            return null;
+        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) {
+            ByteBuffer dst = dsts[offset];
+            if (dst.remaining() < payload.length) {
+                return new SSLEngineResult(
+                        SSLEngineResult.Status.BUFFER_OVERFLOW,
+                        SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                        0,
+                        0
+                );
+            }
+            if (payloadWritten) {
+                throw new IllegalStateException("payload already written");
+            }
+            int consumed = src.remaining();
+            src.position(src.position() + consumed);
+            payloadWritten = true;
+            for (byte b : payload) {
+                dst.put(b);
+            }
+            return new SSLEngineResult(
+                    SSLEngineResult.Status.OK,
+                    SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                    consumed,
+                    payload.length
+            );
+        }
+    }
+
+    private static abstract class StubSslEngine extends SSLEngine {
+        @Override
+        public void beginHandshake() {
         }
 
         @Override
@@ -226,35 +344,21 @@ public class JavaTlsClientSocketTest {
         }
 
         @Override
-        public boolean isInboundDone() {
-            return false;
-        }
-
-        @Override
         public void closeOutbound() {
         }
 
         @Override
-        public boolean isOutboundDone() {
-            return false;
+        public String getApplicationProtocol() {
+            return null;
         }
 
         @Override
-        public String[] getSupportedCipherSuites() {
-            return new String[0];
+        public Runnable getDelegatedTask() {
+            return null;
         }
 
         @Override
         public String[] getEnabledCipherSuites() {
-            return new String[0];
-        }
-
-        @Override
-        public void setEnabledCipherSuites(String[] suites) {
-        }
-
-        @Override
-        public String[] getSupportedProtocols() {
             return new String[0];
         }
 
@@ -264,16 +368,18 @@ public class JavaTlsClientSocketTest {
         }
 
         @Override
-        public void setEnabledProtocols(String[] protocols) {
+        public boolean getEnableSessionCreation() {
+            return false;
         }
 
         @Override
-        public SSLSession getSession() {
+        public String getHandshakeApplicationProtocol() {
             return null;
         }
 
         @Override
-        public void beginHandshake() {
+        public BiFunction<SSLEngine, List<String>, String> getHandshakeApplicationProtocolSelector() {
+            return null;
         }
 
         @Override
@@ -282,38 +388,7 @@ public class JavaTlsClientSocketTest {
         }
 
         @Override
-        public void setUseClientMode(boolean mode) {
-        }
-
-        @Override
-        public boolean getUseClientMode() {
-            return true;
-        }
-
-        @Override
-        public void setNeedClientAuth(boolean need) {
-        }
-
-        @Override
         public boolean getNeedClientAuth() {
-            return false;
-        }
-
-        @Override
-        public void setWantClientAuth(boolean want) {
-        }
-
-        @Override
-        public boolean getWantClientAuth() {
-            return false;
-        }
-
-        @Override
-        public void setEnableSessionCreation(boolean flag) {
-        }
-
-        @Override
-        public boolean getEnableSessionCreation() {
             return false;
         }
 
@@ -323,17 +398,50 @@ public class JavaTlsClientSocketTest {
         }
 
         @Override
-        public void setSSLParameters(SSLParameters params) {
-        }
-
-        @Override
-        public String getApplicationProtocol() {
+        public SSLSession getSession() {
             return null;
         }
 
         @Override
-        public String getHandshakeApplicationProtocol() {
-            return null;
+        public String[] getSupportedCipherSuites() {
+            return new String[0];
+        }
+
+        @Override
+        public String[] getSupportedProtocols() {
+            return new String[0];
+        }
+
+        @Override
+        public boolean getUseClientMode() {
+            return true;
+        }
+
+        @Override
+        public boolean getWantClientAuth() {
+            return false;
+        }
+
+        @Override
+        public boolean isInboundDone() {
+            return false;
+        }
+
+        @Override
+        public boolean isOutboundDone() {
+            return false;
+        }
+
+        @Override
+        public void setEnableSessionCreation(boolean flag) {
+        }
+
+        @Override
+        public void setEnabledCipherSuites(String[] suites) {
+        }
+
+        @Override
+        public void setEnabledProtocols(String[] protocols) {
         }
 
         @Override
@@ -341,8 +449,68 @@ public class JavaTlsClientSocketTest {
         }
 
         @Override
-        public BiFunction<SSLEngine, List<String>, String> getHandshakeApplicationProtocolSelector() {
-            return null;
+        public void setNeedClientAuth(boolean need) {
+        }
+
+        @Override
+        public void setSSLParameters(SSLParameters params) {
+        }
+
+        @Override
+        public void setUseClientMode(boolean mode) {
+        }
+
+        @Override
+        public void setWantClientAuth(boolean want) {
+        }
+
+        @Override
+        public SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst) {
+            return new SSLEngineResult(
+                    SSLEngineResult.Status.OK,
+                    SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                    0,
+                    0
+            );
+        }
+    }
+
+    private static final class TicketThenDataSslEngine extends StubSslEngine {
+        private final byte[] payload;
+        private int unwrapCalls;
+
+        private TicketThenDataSslEngine(byte[] payload) {
+            this.payload = payload;
+        }
+
+        @Override
+        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) {
+            unwrapCalls++;
+            if (unwrapCalls == 1) {
+                // Simulate a post-handshake control record (e.g. NewSessionTicket): consume input,
+                // produce no plaintext.
+                src.position(src.position() + 6);
+                return new SSLEngineResult(
+                        SSLEngineResult.Status.OK,
+                        SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                        6,
+                        0
+                );
+            }
+            if (unwrapCalls > 2) {
+                throw new IllegalStateException("unexpected extra unwrap call");
+            }
+            ByteBuffer dst = dsts[offset];
+            for (byte b : payload) {
+                dst.put(b);
+            }
+            src.position(src.position() + payload.length);
+            return new SSLEngineResult(
+                    SSLEngineResult.Status.OK,
+                    SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                    payload.length,
+                    payload.length
+            );
         }
     }
 }
