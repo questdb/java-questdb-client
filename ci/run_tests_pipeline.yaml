@@ -23,6 +23,9 @@ stages:
         pool:
           name: "Azure Pipelines"
           vmImage: "ubuntu-latest"
+        variables:
+          jdkArch: "x64"
+          imageName: "ubuntu-latest"
         steps:
           - checkout: self
             fetchDepth: 0
@@ -33,12 +36,7 @@ stages:
               git checkout FETCH_HEAD
             displayName: "Checkout PR source branch"
             condition: eq(variables['Build.Reason'], 'PullRequest')
-          - task: JavaToolInstaller@0
-            displayName: "Install Java 17"
-            inputs:
-              versionSpec: "17"
-              jdkArchitectureOption: "x64"
-              jdkSourceOption: "PreInstalled"
+          - template: setup.yaml
           - bash: mvn -f core/pom.xml javadoc:javadoc -Pjavadoc --batch-mode
             displayName: "Verify Javadoc"
 
