@@ -83,6 +83,92 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testAddrIpv6BareMultiColonTreatedAsHost() {
+        // Multi-colon, unbracketed: treated as bare IPv6 host with default
+        // port. Custom port on IPv6 requires brackets.
+        assertParses("ws::addr=fe80::1;");
+    }
+
+    @Test
+    public void testAddrIpv6BracketedEmptyHostRejected() {
+        assertReject("ws::addr=[]:9000;", "empty host in addr entry: []:9000");
+    }
+
+    @Test
+    public void testAddrIpv6BracketedMixedListAccepted() {
+        assertParses("ws::addr=[::1]:9000,[fe80::1],host.local:9001;");
+    }
+
+    @Test
+    public void testAddrIpv6BracketedRejectsTrailingGarbageBeforePort() {
+        // "]" must be followed immediately by ':' (or end of entry), not by
+        // trailing characters. Surfaces obvious typos rather than guessing.
+        assertReject("ws::addr=[::1]9000;",
+                "expected ':' after ']' in IPv6 addr entry: [::1]9000");
+    }
+
+    @Test
+    public void testAddrIpv6BracketedWithPortAccepted() {
+        // Per RFC 3986, IPv6 addresses must be bracketed when carrying a port.
+        assertParses("ws::addr=[::1]:9000;");
+    }
+
+    @Test
+    public void testAddrIpv6BracketedWithoutPortAccepted() {
+        assertParses("ws::addr=[fe80::1];");
+    }
+
+    @Test
+    public void testAddrIpv6MissingClosingBracketRejected() {
+        assertReject("ws::addr=[::1:9000;",
+                "missing closing ']' in IPv6 addr entry: [::1:9000");
+    }
+
+    @Test
+    public void testAddrPortAbove65535Rejected() {
+        assertReject("ws::addr=db:65536;",
+                "port out of range in addr: db:65536 (must be 1-65535)");
+    }
+
+    @Test
+    public void testAddrPortIpv6BracketedOutOfRangeRejected() {
+        assertReject("ws::addr=[::1]:0;",
+                "port out of range in addr: [::1]:0 (must be 1-65535)");
+    }
+
+    @Test
+    public void testAddrPortMaxValueRejected() {
+        // Integer.MAX_VALUE parses successfully but is well above 65535.
+        assertReject("ws::addr=db:2147483647;",
+                "port out of range in addr: db:2147483647 (must be 1-65535)");
+    }
+
+    @Test
+    public void testAddrPortNegativeRejected() {
+        assertReject("ws::addr=db:-1;", "port out of range in addr: db:-1 (must be 1-65535)");
+    }
+
+    @Test
+    public void testAddrPortWhitespaceTolerated() {
+        // Hand-edited config strings sometimes pick up a stray space around
+        // the port. Tolerate it rather than surface as opaque "invalid port".
+        assertParses("ws::addr=host: 9000;");
+    }
+
+    @Test
+    public void testAddrPortZeroRejected() {
+        assertReject("ws::addr=db:0;", "port out of range in addr: db:0 (must be 1-65535)");
+    }
+
+    @Test
+    public void testAddrSingleWhitespaceTrimmedAroundHostPort() {
+        // The parser splits on commas and trims; a single leading space on a
+        // valid entry must therefore be tolerated rather than rejected as
+        // "empty". Pin so a future refactor that drops trim() breaks here.
+        assertParses("ws::addr= db1:9000 , db2:9000 ;");
+    }
+
+    @Test
     public void testAuthAndBasicMutuallyExclusive() {
         assertReject(
                 "ws::addr=db:9000;auth=Bearer xyz;username=admin;password=quest;",
@@ -96,6 +182,19 @@ public class QwpQueryClientFromConfigTest {
                 "ws::addr=db:9000;auth=Bearer xyz;token=ey.xyz;",
                 "auth, username/password, and token are mutually exclusive"
         );
+    }
+
+    @Test
+    public void testAuthHeaderAcceptedAlone() {
+        // Each of the three auth modes has a dedicated mutual-exclusion test;
+        // the positive happy path is asserted here so the parser's per-key
+        // dispatch and the post-loop "no auth set" path both have coverage.
+        assertParses("ws::addr=db:9000;auth=Bearer xyz;");
+    }
+
+    @Test
+    public void testBasicAuthAcceptedAlone() {
+        assertParses("ws::addr=db:9000;username=alice;password=secret;");
     }
 
     @Test
@@ -140,6 +239,13 @@ public class QwpQueryClientFromConfigTest {
     @Test
     public void testBufferPoolSizeValidAccepted() {
         assertParses("ws::addr=db:9000;buffer_pool_size=8;");
+    }
+
+    @Test
+    public void testClientIdAcceptedAlone() {
+        // Sent as the X-QWP-Client-Id header on the upgrade request; useful for
+        // server-side telemetry. No format constraints from the parser.
+        assertParses("ws::addr=db:9000;client_id=batch-job/42;");
     }
 
     @Test
@@ -215,31 +321,6 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testFailoverDefaultIsOn() {
-        // No failover= key: happy path, no throw. Internal default is on; not directly
-        // observable from the public API so we assert successful parse only.
-        assertParses("ws::addr=db:9000;");
-    }
-
-    @Test
-    public void testFailoverInvalidRejected() {
-        assertReject(
-                "ws::addr=db:9000;failover=maybe;",
-                "invalid failover: maybe (expected on or off)"
-        );
-    }
-
-    @Test
-    public void testFailoverOffAccepted() {
-        assertParses("ws::addr=db:9000;failover=off;");
-    }
-
-    @Test
-    public void testFailoverOnAccepted() {
-        assertParses("ws::addr=db:9000;failover=on;");
-    }
-
-    @Test
     public void testFailoverBackoffInitialAtZeroAccepted() {
         assertParses("ws::addr=db:9000;failover_backoff_initial_ms=0;");
     }
@@ -290,6 +371,21 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testFailoverDefaultIsOn() {
+        // No failover= key: happy path, no throw. Internal default is on; not directly
+        // observable from the public API so we assert successful parse only.
+        assertParses("ws::addr=db:9000;");
+    }
+
+    @Test
+    public void testFailoverInvalidRejected() {
+        assertReject(
+                "ws::addr=db:9000;failover=maybe;",
+                "invalid failover: maybe (expected on or off)"
+        );
+    }
+
+    @Test
     public void testFailoverMaxAttemptsAcceptedAtOne() {
         assertParses("ws::addr=db:9000;failover_max_attempts=1;");
     }
@@ -308,6 +404,23 @@ public class QwpQueryClientFromConfigTest {
                 "ws::addr=db:9000;failover_max_attempts=0;",
                 "failover_max_attempts must be >= 1"
         );
+    }
+
+    @Test
+    public void testFailoverMaxBackoffEqualToInitialAccepted() {
+        // The "max < initial" rejection path is tested already; verify the
+        // boundary case (max == initial) is the lowest legal max and parses.
+        assertParses("ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=100;");
+    }
+
+    @Test
+    public void testFailoverOffAccepted() {
+        assertParses("ws::addr=db:9000;failover=off;");
+    }
+
+    @Test
+    public void testFailoverOnAccepted() {
+        assertParses("ws::addr=db:9000;failover=on;");
     }
 
     @Test
@@ -331,7 +444,7 @@ public class QwpQueryClientFromConfigTest {
         // bails out; fromConfig surfaces the parser's scratch sink verbatim in
         // the "invalid configuration string [error=...]" shape.
         try {
-            QwpQueryClient.fromConfig("ws::addr=db:9000;bogus;");
+            QwpQueryClient.fromConfig("ws::addr=db:9000;bogus;").close();
             Assert.fail("expected IllegalArgumentException for malformed key=value");
         } catch (IllegalArgumentException e) {
             Assert.assertTrue(
@@ -392,7 +505,7 @@ public class QwpQueryClientFromConfigTest {
         // No "::" separator -- the schema parser returns negative and fromConfig
         // reports the parser's error sink.
         try {
-            QwpQueryClient.fromConfig("addr=db:9000;");
+            QwpQueryClient.fromConfig("addr=db:9000;").close();
             Assert.fail("expected IllegalArgumentException for missing schema");
         } catch (IllegalArgumentException e) {
             // ConfStringParser either surfaces as "unsupported schema" (if it
@@ -441,11 +554,24 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testTlsRootsOnWsRejected() {
+        assertReject(
+                "ws::addr=db:9000;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;",
+                "tls_verify/tls_roots/tls_roots_password require the wss:: schema"
+        );
+    }
+
+    @Test
     public void testTlsRootsPasswordWithoutPathRejected() {
         assertReject(
                 "wss::addr=db:9000;tls_roots_password=secret;",
                 "tls_roots and tls_roots_password must be provided together"
         );
+    }
+
+    @Test
+    public void testTlsRootsWithPasswordAccepted() {
+        assertParses("wss::addr=db:9000;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;");
     }
 
     @Test
@@ -457,21 +583,11 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testTlsRootsWithPasswordAccepted() {
-        assertParses("wss::addr=db:9000;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;");
-    }
-
-    @Test
     public void testTlsVerifyInvalidRejected() {
         assertReject(
                 "wss::addr=db:9000;tls_verify=strict;",
                 "invalid tls_verify: strict (expected on or unsafe_off)"
         );
-    }
-
-    @Test
-    public void testTlsVerifyOnWssAccepted() {
-        assertParses("wss::addr=db:9000;tls_verify=on;");
     }
 
     @Test
@@ -483,16 +599,29 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testTlsVerifyOnWssAccepted() {
+        assertParses("wss::addr=db:9000;tls_verify=on;");
+    }
+
+    @Test
     public void testTlsVerifyUnsafeOffOnWssAccepted() {
         assertParses("wss::addr=db:9000;tls_verify=unsafe_off;");
     }
 
     @Test
-    public void testTlsRootsOnWsRejected() {
-        assertReject(
-                "ws::addr=db:9000;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;",
-                "tls_verify/tls_roots/tls_roots_password require the wss:: schema"
-        );
+    public void testTokenAcceptedAlone() {
+        assertParses("ws::addr=db:9000;token=ey.payload.sig;");
+    }
+
+    @Test
+    public void testTokenRequestEncodesAsBearer() {
+        // We can't easily snoop the request header without a server, but the
+        // parser must at least accept the configuration end-to-end, then exit
+        // through close() without leaking the I/O thread (which never spun up).
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;token=abc.def.ghi;")) {
+            Assert.assertFalse(c.isConnected());
+            Assert.assertFalse(c.wasLastCloseTimedOut());
+        }
     }
 
     @Test
@@ -519,57 +648,6 @@ public class QwpQueryClientFromConfigTest {
         assertReject("ws::addr=a:9000, ,b:9000;", "empty addr entry");
     }
 
-    @Test
-    public void testAuthHeaderAcceptedAlone() {
-        // Each of the three auth modes has a dedicated mutual-exclusion test;
-        // the positive happy path is asserted here so the parser's per-key
-        // dispatch and the post-loop "no auth set" path both have coverage.
-        assertParses("ws::addr=db:9000;auth=Bearer xyz;");
-    }
-
-    @Test
-    public void testBasicAuthAcceptedAlone() {
-        assertParses("ws::addr=db:9000;username=alice;password=secret;");
-    }
-
-    @Test
-    public void testTokenAcceptedAlone() {
-        assertParses("ws::addr=db:9000;token=ey.payload.sig;");
-    }
-
-    @Test
-    public void testClientIdAcceptedAlone() {
-        // Sent as the X-QWP-Client-Id header on the upgrade request; useful for
-        // server-side telemetry. No format constraints from the parser.
-        assertParses("ws::addr=db:9000;client_id=batch-job/42;");
-    }
-
-    @Test
-    public void testFailoverMaxBackoffEqualToInitialAccepted() {
-        // The "max < initial" rejection path is tested already; verify the
-        // boundary case (max == initial) is the lowest legal max and parses.
-        assertParses("ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=100;");
-    }
-
-    @Test
-    public void testTokenRequestEncodesAsBearer() {
-        // We can't easily snoop the request header without a server, but the
-        // parser must at least accept the configuration end-to-end, then exit
-        // through close() without leaking the I/O thread (which never spun up).
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;token=abc.def.ghi;")) {
-            Assert.assertFalse(c.isConnected());
-            Assert.assertFalse(c.wasLastCloseTimedOut());
-        }
-    }
-
-    @Test
-    public void testAddrSingleWhitespaceTrimmedAroundHostPort() {
-        // The parser splits on commas and trims; a single leading space on a
-        // valid entry must therefore be tolerated rather than rejected as
-        // "empty". Pin so a future refactor that drops trim() breaks here.
-        assertParses("ws::addr= db1:9000 , db2:9000 ;");
-    }
-
     /**
      * Asserts that {@code conf} parses into a non-null {@link QwpQueryClient}
      * and closes the result on the way out. Centralising both checks here
@@ -591,7 +669,7 @@ public class QwpQueryClientFromConfigTest {
      */
     private static void assertReject(String conf, String expectedMessage) {
         try {
-            QwpQueryClient.fromConfig(conf);
+            QwpQueryClient.fromConfig(conf).close();
             Assert.fail("expected IllegalArgumentException for: " + conf);
         } catch (IllegalArgumentException e) {
             Assert.assertEquals(expectedMessage, e.getMessage());

@@ -144,6 +144,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                 b.close();
             }
             freeBuffers.clear();
+            // sendScratch and decoder are field initializers that run BEFORE
+            // this constructor body. NativeBufferWriter allocates 8 KiB native
+            // immediately on construction; QwpResultBatchDecoder allocates
+            // lazily on first decode but still owns native scratch over its
+            // lifetime. Free both here so a partial-pool failure (native OOM
+            // mid-loop) doesn't leak them along with the half-built instance.
+            Misc.free(sendScratch);
+            Misc.free(decoder);
             throw t;
         }
     }
@@ -189,8 +197,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         if (msgKind == QwpEgressMsgKind.RESULT_BATCH) {
             handleResultBatch(payloadPtr, payloadLen);
         } else if (msgKind == QwpEgressMsgKind.RESULT_END) {
-            long total = decodeResultEnd(payloadPtr, payloadLen);
-            events.offer(new QueryEvent().asEnd(total));
+            decodeAndEmitResultEnd(payloadPtr, payloadLen);
             currentQueryDone = true;
         } else if (msgKind == QwpEgressMsgKind.EXEC_DONE) {
             decodeAndEmitExecDone(payloadPtr, payloadLen);
@@ -413,15 +420,27 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         byte opType = Unsafe.getUnsafe().getByte(p++);
         long rowsAffected = 0;
         int shift = 0;
+        boolean terminated = false;
         while (p < limit) {
             byte b = Unsafe.getUnsafe().getByte(p++);
             rowsAffected |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) break;
+            if ((b & 0x80) == 0) {
+                terminated = true;
+                break;
+            }
             shift += 7;
             if (shift > 63) {
                 emitTerminalTransportError("EXEC_DONE rows_affected varint overflow");
                 return;
             }
+        }
+        // The loop also exits when {@code p == limit} on a frame that ended
+        // mid-varint without a terminator byte. Without this guard, a buggy or
+        // hostile server could truncate the frame and the partial value would
+        // surface to the user handler as if the EXEC_DONE completed normally.
+        if (!terminated) {
+            emitTerminalTransportError("EXEC_DONE frame truncated mid rows_affected varint");
+            return;
         }
         events.offer(new QueryEvent().asExecDone(opType, rowsAffected));
     }
@@ -431,35 +450,56 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * We only need total_rows. Both varint loops cap at 10 bytes so a hostile
      * server cannot drive {@code shift} past 63 (where Java's {@code <<} masks
      * the count to 6 bits and silently wraps high bytes back into the low bits,
-     * producing a wildly wrong total).
+     * producing a wildly wrong total). A frame that ends mid-varint surfaces
+     * as a terminal transport error rather than a partial-value RESULT_END.
      */
-    private long decodeResultEnd(long payload, int payloadLen) {
+    private void decodeAndEmitResultEnd(long payload, int payloadLen) {
         long p = payload + QwpConstants.HEADER_SIZE + 1 + 8;
         long limit = payload + payloadLen;
         int seqBytes = 0;
-        while (p < limit && (Unsafe.getUnsafe().getByte(p++) & 0x80) != 0) {
+        boolean seqTerminated = false;
+        while (p < limit) {
+            byte b = Unsafe.getUnsafe().getByte(p++);
+            if ((b & 0x80) == 0) {
+                seqTerminated = true;
+                break;
+            }
             if (++seqBytes > 9) {
                 // Continuation bit set on byte 10 of the final_seq varint --
-                // malformed. Surface a 0 total rather than read into the
-                // total_rows section with a desynced cursor.
-                return 0L;
+                // malformed. Surface as terminal so the caller cannot proceed
+                // with a desynced cursor.
+                emitTerminalTransportError("RESULT_END final_seq varint overflow");
+                return;
             }
+        }
+        if (!seqTerminated) {
+            emitTerminalTransportError("RESULT_END frame truncated mid final_seq varint");
+            return;
         }
         long total = 0;
         int shift = 0;
+        boolean totalTerminated = false;
         while (p < limit) {
             byte b = Unsafe.getUnsafe().getByte(p++);
             total |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) break;
+            if ((b & 0x80) == 0) {
+                totalTerminated = true;
+                break;
+            }
             shift += 7;
             if (shift > 63) {
                 // Same overflow guard decodeAndEmitExecDone uses; without it,
                 // byte 10 of total_rows could land in the sign bit and bytes
                 // 11+ would silently wrap.
-                return 0L;
+                emitTerminalTransportError("RESULT_END total_rows varint overflow");
+                return;
             }
         }
-        return total;
+        if (!totalTerminated) {
+            emitTerminalTransportError("RESULT_END frame truncated mid total_rows varint");
+            return;
+        }
+        events.offer(new QueryEvent().asEnd(total));
     }
 
     /**
@@ -572,12 +612,27 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // compact the WebSocket recv buffer, overwriting the bytes that the
         // user-visible column pointers still reference. User thread's
         // releaseBuffer offers the token that unblocks this take.
-        try {
-            pendingRelease.take();
-        } catch (InterruptedException ie) {
-            // Shutdown path: leave the batch to the user thread; they'll see
-            // either the in-progress batch or a subsequent close event.
-            return;
+        //
+        // Wait uninterruptibly: if close() interrupts us here we MUST NOT
+        // unwind back to tryParseFrame, because tryParseFrame's tail
+        // advances recvReadPos and runs compactRecvBuffer (Vect.memmove)
+        // over the bytes the user's column pointers still alias inside
+        // recv-buf. A premature unwind on interrupt is the close()-during-
+        // onBatch UAF: the user thread's onBatch reads garbage mid-call.
+        // Stay parked; close()'s 5-second join timeout will abandon the
+        // I/O thread (the documented timeout-leak path), but only AFTER
+        // the user's onBatch has finished -- no UAF.
+        boolean interrupted = false;
+        while (true) {
+            try {
+                pendingRelease.take();
+                break;
+            } catch (InterruptedException ie) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
         // Credit replenish: the user is done with the batch, so the recv-buffer
         // bytes are free. Tell the server it can stream {@code payloadLen} more

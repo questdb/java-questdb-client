@@ -111,15 +111,14 @@ public class QwpQueryClient implements QuietCloseable {
     public static final String TARGET_ANY = "any";
     public static final String TARGET_PRIMARY = "primary";
     public static final String TARGET_REPLICA = "replica";
-    private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
     /**
-     * How long {@link #connect()} waits to read the v2 {@code SERVER_INFO} frame
-     * from each endpoint before giving up and moving to the next. 5 seconds is
-     * comfortable on a WAN; the server writes SERVER_INFO into the same send
-     * buffer as the 101 upgrade response so under normal conditions the frame
-     * is already in the client's kernel recv buffer by the time this wait starts.
+     * Default initial backoff between failover attempts, in milliseconds.
+     * Doubled on each subsequent retry up to
+     * {@link #DEFAULT_FAILOVER_MAX_BACKOFF_MS}. Keeps a tight reconnect
+     * storm from overwhelming an already-struggling cluster; small enough
+     * that a one-off transient hiccup barely adds latency to the replay.
      */
-    private static final int DEFAULT_SERVER_INFO_TIMEOUT_MS = 5_000;
+    private static final long DEFAULT_FAILOVER_INITIAL_BACKOFF_MS = 50L;
     /**
      * Default cap on the number of {@code executeOnce} invocations per call
      * to {@link #execute}. Counts the initial attempt plus every failover
@@ -130,20 +129,21 @@ public class QwpQueryClient implements QuietCloseable {
      */
     private static final int DEFAULT_FAILOVER_MAX_ATTEMPTS = 8;
     /**
-     * Default initial backoff between failover attempts, in milliseconds.
-     * Doubled on each subsequent retry up to
-     * {@link #DEFAULT_FAILOVER_MAX_BACKOFF_MS}. Keeps a tight reconnect
-     * storm from overwhelming an already-struggling cluster; small enough
-     * that a one-off transient hiccup barely adds latency to the replay.
-     */
-    private static final long DEFAULT_FAILOVER_INITIAL_BACKOFF_MS = 50L;
-    /**
      * Default ceiling on the exponential failover backoff. A minutes-long
      * outage that burns through {@code failoverMaxAttempts} still completes
      * in bounded wall time: with 8 attempts and a 1 s cap the client gives
      * up after roughly 5 s of cumulative sleep.
      */
     private static final long DEFAULT_FAILOVER_MAX_BACKOFF_MS = 1_000L;
+    private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
+    /**
+     * How long {@link #connect()} waits to read the v2 {@code SERVER_INFO} frame
+     * from each endpoint before giving up and moving to the next. 5 seconds is
+     * comfortable on a WAN; the server writes SERVER_INFO into the same send
+     * buffer as the 101 upgrade response so under normal conditions the frame
+     * is already in the client's kernel recv buffer by the time this wait starts.
+     */
+    private static final int DEFAULT_SERVER_INFO_TIMEOUT_MS = 5_000;
     private static final Logger LOG = LoggerFactory.getLogger(QwpQueryClient.class);
     // Reusable typed bind-value sink. Populated on the user thread by the
     // {@link QwpBindSetter} passed to execute(); the pre-encoded bytes are
@@ -174,18 +174,18 @@ public class QwpQueryClient implements QuietCloseable {
     // configuration writes and so a second thread calling cancel() or close()
     // observes the freshly-bound state without explicit synchronisation.
     private volatile boolean connected;
-    // One-shot terminal-failure listener held by the currently-bound I/O
-    // thread. Every new QwpEgressIoThread gets a fresh instance wired to it
-    // at construction time; {@link #cleanupFailedConnect} orphans the
-    // outgoing instance so a late callback from an I/O thread that failed
-    // to join cannot pollute the new connection's terminalFailure latch.
-    private volatile GenerationListener currentGenerationListener;
     // Index of the endpoint the current connection is bound to. -1 when
     // disconnected. Used by the failover path to skip the current endpoint
     // when picking the next one to try. Volatile because execute() on the
     // user thread reads + rewrites across a cleanup-reconnect handoff and
     // cancel() from another thread may also read it for diagnostics.
     private volatile int currentEndpointIndex = -1;
+    // One-shot terminal-failure listener held by the currently-bound I/O
+    // thread. Every new QwpEgressIoThread gets a fresh instance wired to it
+    // at construction time; {@link #cleanupFailedConnect} orphans the
+    // outgoing instance so a late callback from an I/O thread that failed
+    // to join cannot pollute the new connection's terminalFailure latch.
+    private volatile GenerationListener currentGenerationListener;
     // Written on the user thread at entry to {@link #execute} and cleared on exit.
     // Read by {@link #cancel} from any thread. {@code volatile} to guarantee the
     // user thread's write is visible to a concurrent cancel caller; 64-bit writes
@@ -200,8 +200,8 @@ public class QwpQueryClient implements QuietCloseable {
     // rejected across threads.
     private volatile boolean failoverEnabled = true;
     private long failoverInitialBackoffMs = DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
-    private long failoverMaxBackoffMs = DEFAULT_FAILOVER_MAX_BACKOFF_MS;
     private int failoverMaxAttempts = DEFAULT_FAILOVER_MAX_ATTEMPTS;
+    private long failoverMaxBackoffMs = DEFAULT_FAILOVER_MAX_BACKOFF_MS;
     // Credit-flow send-ahead budget. 0 = unbounded (Phase-1 default, no CREDIT
     // bookkeeping on either side). A positive value puts the stream under byte-
     // based flow control: the server emits at most this many bytes of result
@@ -212,8 +212,15 @@ public class QwpQueryClient implements QuietCloseable {
     // connect() sees the published reference (and a concurrent null-out from
     // close() is observed without a stale-reference race). The thread-safety
     // contract documented on cancel() relies on this.
+    // ioThreadHandle is volatile and written BEFORE the ioThread volatile
+    // write in connectToEndpoint. Together this gives close() (called from a
+    // third thread) the guarantee that a non-null read of ioThread implies a
+    // visible non-null ioThreadHandle. Without volatile here, a third-thread
+    // close could observe ioThread != null && ioThreadHandle == null, skip
+    // the join, and then closePool() / Misc.free under a still-running daemon
+    // -- crashing the JVM on the next decode cycle.
     private volatile QwpEgressIoThread ioThread;
-    private Thread ioThreadHandle;
+    private volatile Thread ioThreadHandle;
     private boolean lastCloseTimedOut;
     // Client preference for server-side per-batch row cap. 0 means "unset",
     // server uses its default. Set via {@code max_batch_rows=N} in the
@@ -1130,24 +1137,11 @@ public class QwpQueryClient implements QuietCloseable {
         return this;
     }
 
-    /**
-     * Guard for configuration setters that only apply at connect time.
-     * Calling them after {@link #connect()} has bound to an endpoint is a
-     * programming error: the new value would silently not apply until the
-     * next reconnect, which is almost never what the caller wants. Throw
-     * early with a clear message instead.
-     */
-    private void checkPreConnect(String setterName) {
-        if (connected) {
-            throw new IllegalStateException(setterName
-                    + " must be called before connect(); the current value has already taken effect on the bound connection");
-        }
-    }
-
     private static String defaultClientId() {
         return "questdb-java-egress/1.0.0";
     }
 
+    @SuppressWarnings("BooleanMethodIsAlwaysInverted")
     private static boolean matchesTarget(byte role, String target) {
         if (TARGET_ANY.equals(target)) {
             return true;
@@ -1165,8 +1159,16 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * Parses an {@code addr=} value that may be a single {@code host[:port]}
-     * or a comma-separated list of such entries. A single entry without a port
-     * falls back to {@link #DEFAULT_WS_PORT}.
+     * or a comma-separated list of such entries. A single entry without a
+     * port falls back to {@link #DEFAULT_WS_PORT}. The port (when present)
+     * must be in {@code [1, 65535]}.
+     * <p>
+     * IPv6 addresses must be wrapped in brackets when carrying a port, per
+     * RFC 3986: {@code [::1]:9000}, {@code [fe80::1]}. An unbracketed entry
+     * containing more than one colon is treated as a bare IPv6 host with
+     * the default port (no syntactic way to distinguish {@code host:port}
+     * from a bare IPv6 address otherwise; users wanting a custom port on
+     * IPv6 must bracket).
      */
     private static List<Endpoint> parseEndpointList(String value) {
         List<Endpoint> list = new ArrayList<>();
@@ -1181,18 +1183,37 @@ public class QwpQueryClient implements QuietCloseable {
                 if (entry.isEmpty()) {
                     throw new IllegalArgumentException("empty addr entry");
                 }
-                int colon = entry.indexOf(':');
                 String host;
                 int port;
-                if (colon < 0) {
+                if (entry.charAt(0) == '[') {
+                    // Bracketed IPv6: [host] or [host]:port.
+                    int closeBracket = entry.indexOf(']');
+                    if (closeBracket < 0) {
+                        throw new IllegalArgumentException(
+                                "missing closing ']' in IPv6 addr entry: " + entry);
+                    }
+                    host = entry.substring(1, closeBracket);
+                    if (closeBracket == entry.length() - 1) {
+                        port = DEFAULT_WS_PORT;
+                    } else if (entry.charAt(closeBracket + 1) != ':') {
+                        throw new IllegalArgumentException(
+                                "expected ':' after ']' in IPv6 addr entry: " + entry);
+                    } else {
+                        port = parsePort(entry.substring(closeBracket + 2), entry);
+                    }
+                } else if (entry.indexOf(':') != entry.lastIndexOf(':')) {
+                    // Multi-colon, unbracketed: treat as bare IPv6 host with
+                    // the default port. Custom port on IPv6 requires brackets.
                     host = entry;
                     port = DEFAULT_WS_PORT;
                 } else {
-                    host = entry.substring(0, colon);
-                    try {
-                        port = Integer.parseInt(entry.substring(colon + 1));
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid port in addr: " + entry);
+                    int colon = entry.indexOf(':');
+                    if (colon < 0) {
+                        host = entry;
+                        port = DEFAULT_WS_PORT;
+                    } else {
+                        host = entry.substring(0, colon);
+                        port = parsePort(entry.substring(colon + 1), entry);
                     }
                 }
                 if (host.isEmpty()) {
@@ -1203,6 +1224,27 @@ public class QwpQueryClient implements QuietCloseable {
             }
         }
         return list;
+    }
+
+    /**
+     * Parses {@code portStr} into a TCP port in the inclusive range
+     * {@code [1, 65535]}. Surrounding whitespace is tolerated so config
+     * strings hand-edited around the {@code :} don't surface as opaque
+     * "invalid port" errors. {@code entry} is the full
+     * {@code host[:port]} fragment, used only for the error message.
+     */
+    private static int parsePort(String portStr, String entry) {
+        int port;
+        try {
+            port = Integer.parseInt(portStr.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("invalid port in addr: " + entry);
+        }
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException(
+                    "port out of range in addr: " + entry + " (must be 1-65535)");
+        }
+        return port;
     }
 
     /**
@@ -1218,6 +1260,20 @@ public class QwpQueryClient implements QuietCloseable {
             return null;
         }
         return "zstd;level=" + compressionLevel + ",raw";
+    }
+
+    /**
+     * Guard for configuration setters that only apply at connect time.
+     * Calling them after {@link #connect()} has bound to an endpoint is a
+     * programming error: the new value would silently not apply until the
+     * next reconnect, which is almost never what the caller wants. Throw
+     * early with a clear message instead.
+     */
+    private void checkPreConnect(String setterName) {
+        if (connected) {
+            throw new IllegalStateException(setterName
+                    + " must be called before connect(); the current value has already taken effect on the bound connection");
+        }
     }
 
     /**
@@ -1321,10 +1377,18 @@ public class QwpQueryClient implements QuietCloseable {
         // the next connection's state.
         GenerationListener listener = new GenerationListener();
         currentGenerationListener = listener;
-        ioThread = new QwpEgressIoThread(webSocketClient, bufferPoolSize, listener);
-        ioThreadHandle = new Thread(ioThread, "qwp-egress-io");
-        ioThreadHandle.setDaemon(true);
-        ioThreadHandle.start();
+        // Publish ioThreadHandle BEFORE ioThread. Both fields are volatile;
+        // a third-thread close() that reads ioThread != null is guaranteed
+        // (via the volatile happens-before edge on the write below) to also
+        // see the non-null ioThreadHandle. Without this ordering, close()
+        // could observe (ioThread != null, ioThreadHandle == null), skip the
+        // join, and call closePool() / Misc.free with the daemon still alive.
+        QwpEgressIoThread newIoThread = new QwpEgressIoThread(webSocketClient, bufferPoolSize, listener);
+        Thread handle = new Thread(newIoThread, "qwp-egress-io");
+        handle.setDaemon(true);
+        handle.start();
+        ioThreadHandle = handle;
+        ioThread = newIoThread;
     }
 
     /**
@@ -1652,6 +1716,40 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * One-shot terminal-failure listener scoped to a single {@link
+     * QwpEgressIoThread} instance. Each instance owns its own
+     * {@link AtomicReference} latch so an orphaned-but-in-flight callback
+     * writes into its own generation's slot and cannot poison a successor
+     * generation. The orphan flag is advisory: a late callback from a
+     * dying I/O thread observes it and short-circuits; if it squeaks past
+     * the check and into the CAS, the write lands on a ref that nobody
+     * reads, so no poisoning occurs either way.
+     * <p>
+     * {@link #cleanupFailedConnect} calls {@link #orphan()} on the outgoing
+     * listener before creating the next generation.
+     */
+    private static final class GenerationListener implements QwpEgressIoThread.TerminalFailureListener {
+        private final AtomicReference<TerminalFailure> target = new AtomicReference<>();
+        private volatile boolean orphaned;
+
+        @Override
+        public void onTerminalFailure(byte status, String message) {
+            if (orphaned) {
+                return;
+            }
+            target.compareAndSet(null, new TerminalFailure(status, message));
+        }
+
+        TerminalFailure get() {
+            return target.get();
+        }
+
+        void orphan() {
+            this.orphaned = true;
+        }
+    }
+
+    /**
      * Buffers the inbound {@code SERVER_INFO} frame on the user thread during
      * {@link QwpQueryClient#connect()}. Exactly one of {@link #info},
      * {@link #decodeError}, {@link #closeCode} gets set per connect attempt;
@@ -1710,40 +1808,6 @@ public class QwpQueryClient implements QuietCloseable {
         TerminalFailure(byte status, String message) {
             this.status = status;
             this.message = message;
-        }
-    }
-
-    /**
-     * One-shot terminal-failure listener scoped to a single {@link
-     * QwpEgressIoThread} instance. Each instance owns its own
-     * {@link AtomicReference} latch so an orphaned-but-in-flight callback
-     * writes into its own generation's slot and cannot poison a successor
-     * generation. The orphan flag is advisory: a late callback from a
-     * dying I/O thread observes it and short-circuits; if it squeaks past
-     * the check and into the CAS, the write lands on a ref that nobody
-     * reads, so no poisoning occurs either way.
-     * <p>
-     * {@link #cleanupFailedConnect} calls {@link #orphan()} on the outgoing
-     * listener before creating the next generation.
-     */
-    private static final class GenerationListener implements QwpEgressIoThread.TerminalFailureListener {
-        private final AtomicReference<TerminalFailure> target = new AtomicReference<>();
-        private volatile boolean orphaned;
-
-        TerminalFailure get() {
-            return target.get();
-        }
-
-        @Override
-        public void onTerminalFailure(byte status, String message) {
-            if (orphaned) {
-                return;
-            }
-            target.compareAndSet(null, new TerminalFailure(status, message));
-        }
-
-        void orphan() {
-            this.orphaned = true;
         }
     }
 }

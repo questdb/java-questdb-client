@@ -266,6 +266,24 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         if (totalBytes < 0 || layout.stringBytesAddr + totalBytes > limit) {
             throw new QwpDecodeException("invalid string column total bytes: " + totalBytes);
         }
+        // Validate per-row offsets: each must be in [0, totalBytes] and
+        // monotonically non-decreasing. Without this loop only offset[nonNull]
+        // is checked; a hostile server can supply a negative or out-of-order
+        // intermediate offset that QwpColumnBatch.lookupBinaryBytes /
+        // lookupStringBytes will then turn into a negative-length view (which
+        // surfaces as NegativeArraySizeException in getBinary) or a native
+        // address before stringBytesAddr (out-of-bounds read of unrelated
+        // native memory). Cost is one int load per non-null row over bytes
+        // already in cache.
+        int prev = 0;
+        for (int i = 0; i < nonNull; i++) {
+            int off = Unsafe.getUnsafe().getInt(p + 4L * i);
+            if (off < prev || off > totalBytes) {
+                throw new QwpDecodeException("invalid string column offset[" + i + "]="
+                        + off + " (prev=" + prev + ", total=" + totalBytes + ")");
+            }
+            prev = off;
+        }
         return layout.stringBytesAddr + totalBytes;
     }
 
@@ -581,7 +599,17 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             long elements = 1;
             for (int d = 0; d < nDims; d++) {
                 int dl = Unsafe.getUnsafe().getInt(p + 1 + 4L * d);
-                if (dl < 0) throw new QwpDecodeException("ARRAY dim " + d + " is negative: " + dl);
+                // Require dl >= 1 in every dimension. A dl of 0 in any
+                // position would zero out {@code elements} and short-circuit
+                // the {@code MAX_ARRAY_ELEMENTS} cap for the rest of the
+                // loop, letting subsequent dimensions hold arbitrary values
+                // unchecked. The encoder side never emits dl == 0 (see
+                // {@code ColumnType} which asserts nDims >= 1 and treats
+                // every dimension symmetrically), so reject the
+                // wire-format inconsistency outright.
+                if (dl < 1) {
+                    throw new QwpDecodeException("ARRAY dim " + d + " must be >= 1: " + dl);
+                }
                 elements *= dl;
                 if (elements > MAX_ARRAY_ELEMENTS) {
                     throw new QwpDecodeException("ARRAY element count exceeds limit ("
@@ -687,8 +715,17 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         decodeVarint(p, limit);
         long deltaCount = varintValue;
         p = varintPos;
+        // Validate operands separately rather than via the sum: a hostile
+        // (deltaStart, deltaCount) pair where deltaStart matches connDictSize
+        // and deltaCount is large enough to make deltaStart + deltaCount wrap
+        // negative would otherwise bypass the cap check, then the (int)
+        // deltaCount cast in newSize below collapses to a small/negative int
+        // and the for-loop iterates while writing past connDictEntriesAddr.
+        // After the deltaStart upper-bound, MAX_CONN_DICT_SIZE - deltaStart is
+        // non-negative and the deltaCount comparison is well-defined.
         if (deltaStart < 0 || deltaCount < 0
-                || deltaStart + deltaCount > MAX_CONN_DICT_SIZE) {
+                || deltaStart > MAX_CONN_DICT_SIZE
+                || deltaCount > MAX_CONN_DICT_SIZE - deltaStart) {
             throw new QwpDecodeException("delta symbol section out of range: start="
                     + deltaStart + ", count=" + deltaCount);
         }

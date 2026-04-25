@@ -102,7 +102,17 @@ public class QwpBitReader {
             long mask = bitsToTake == 64 ? -1L : (1L << bitsToTake) - 1;
             result |= (bitBuffer & mask) << resultShift;
 
-            bitBuffer >>>= bitsToTake;
+            // Java masks the right operand of {@code >>>} by 0x3F for long, so
+            // {@code bitBuffer >>>= 64} is a no-op and would leave the just-
+            // consumed 64 bits in {@code bitBuffer}. The next ensureBits OR-fills
+            // a fresh byte at bit 0 of that stale buffer, silently corrupting
+            // every subsequent read. Special-case the full-width consume so
+            // callers using readBits(64) (or readSigned(64)) are safe.
+            if (bitsToTake == 64) {
+                bitBuffer = 0L;
+            } else {
+                bitBuffer >>>= bitsToTake;
+            }
             bitsInBuffer -= bitsToTake;
             bitsRemaining -= bitsToTake;
             resultShift += bitsToTake;
@@ -135,6 +145,7 @@ public class QwpBitReader {
         this.totalBitsRead = 0;
     }
 
+    @SuppressWarnings("BooleanMethodIsAlwaysInverted")
     private boolean ensureBits(int bitsNeeded) {
         while (bitsInBuffer < bitsNeeded && bitsInBuffer <= 56 && currentAddress < endAddress) {
             byte b = Unsafe.getUnsafe().getByte(currentAddress++);
