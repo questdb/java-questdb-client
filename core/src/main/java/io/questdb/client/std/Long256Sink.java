@@ -25,18 +25,29 @@
 package io.questdb.client.std;
 
 /**
- * A 256-bit value split into four 64-bit words, least-significant first.
- * Also used for QuestDB's DECIMAL256 unscaled value (same wire layout).
- * Pair with {@link Long256Impl} as a reusable sink.
+ * Write-side of a 256-bit value split into four 64-bit words. Implementations
+ * accept a full value in a single call, so producers can ship all four words
+ * with one virtual dispatch instead of one per word.
  */
-public interface Long256 {
-    int BYTES = 32;
+public interface Long256Sink {
 
-    long getLong0();
+    /**
+     * Copies four little-endian 64-bit words starting at {@code address} into
+     * this sink. Default implementation issues four native 64-bit loads and
+     * delegates to {@link #setAll}.
+     */
+    default void fromAddress(long address) {
+        setAll(
+                Unsafe.getUnsafe().getLong(address),
+                Unsafe.getUnsafe().getLong(address + 8L),
+                Unsafe.getUnsafe().getLong(address + 16L),
+                Unsafe.getUnsafe().getLong(address + 24L)
+        );
+    }
 
-    long getLong1();
-
-    long getLong2();
-
-    long getLong3();
+    /**
+     * Sets all four 64-bit words of this value. {@code l0} is the least
+     * significant word; {@code l3} the most significant.
+     */
+    void setAll(long l0, long l1, long l2, long l3);
 }

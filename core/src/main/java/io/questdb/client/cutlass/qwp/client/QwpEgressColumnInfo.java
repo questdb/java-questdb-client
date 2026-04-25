@@ -22,21 +22,25 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.std;
+package io.questdb.client.cutlass.qwp.client;
 
 /**
- * A 256-bit value split into four 64-bit words, least-significant first.
- * Also used for QuestDB's DECIMAL256 unscaled value (same wire layout).
- * Pair with {@link Long256Impl} as a reusable sink.
+ * Per-column metadata recorded when a schema is registered on a client connection.
+ * Internal to the QWP client; callers read column attributes through the forwarder
+ * methods on {@link QwpColumnBatch} (for example {@link QwpColumnBatch#getColumnName}).
  */
-public interface Long256 {
-    int BYTES = 32;
+class QwpEgressColumnInfo {
+    String name;
+    int precisionBits; // valid only for GEOHASH; set per-batch by QwpResultBatchDecoder.parseColumn
+    int scale;         // valid only for DECIMAL*;  set per-batch by QwpResultBatchDecoder.parseColumn
+    byte wireType;
 
-    long getLong0();
-
-    long getLong1();
-
-    long getLong2();
-
-    long getLong3();
+    void of(String name, byte wireType) {
+        this.name = name;
+        this.wireType = wireType;
+        // scale / precisionBits come from the per-batch column data section, not the schema.
+        // Reset here in case a schema slot is reused for a different schema.
+        this.scale = 0;
+        this.precisionBits = 0;
+    }
 }

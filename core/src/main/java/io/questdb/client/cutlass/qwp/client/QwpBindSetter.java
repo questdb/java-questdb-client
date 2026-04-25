@@ -22,21 +22,24 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.std;
+package io.questdb.client.cutlass.qwp.client;
 
 /**
- * A 256-bit value split into four 64-bit words, least-significant first.
- * Also used for QuestDB's DECIMAL256 unscaled value (same wire layout).
- * Pair with {@link Long256Impl} as a reusable sink.
+ * Callback that populates the typed bind parameters of a single
+ * {@link QwpQueryClient#execute(String, QwpBindSetter, QwpColumnBatchHandler)}
+ * invocation. The callback runs on the user thread while the client prepares
+ * the QUERY_REQUEST frame; the encoded bind bytes are then handed to the I/O
+ * thread for transmission.
+ * <p>
+ * Implementations must call the typed setters on the supplied
+ * {@link QwpBindValues} in strictly ascending index order starting at 0, with
+ * no gaps. The client validates this and throws on violation.
  */
-public interface Long256 {
-    int BYTES = 32;
-
-    long getLong0();
-
-    long getLong1();
-
-    long getLong2();
-
-    long getLong3();
+@FunctionalInterface
+public interface QwpBindSetter {
+    /**
+     * Populates the supplied bind-value sink. Callers must invoke the typed
+     * setters in ascending index order (0, 1, 2, ...).
+     */
+    void apply(QwpBindValues binds);
 }

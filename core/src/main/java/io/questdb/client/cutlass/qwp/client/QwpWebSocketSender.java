@@ -1368,7 +1368,7 @@ public class QwpWebSocketSender implements Sender {
 
             // Connect and upgrade to WebSocket
             try {
-                client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_VERSION);
+                client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
                 client.setQwpClientId(QwpConstants.CLIENT_ID);
                 client.setQwpRequestDurableAck(requestDurableAck);
                 client.connect(host, port);
@@ -1441,7 +1441,7 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
-        // Invalidate cached column references — table buffers will be reset below
+        // Invalidate cached column references -- table buffers will be reset below
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
@@ -1548,7 +1548,7 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
-        // Invalidate cached column references — table buffers will be reset below
+        // Invalidate cached column references -- table buffers will be reset below
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 

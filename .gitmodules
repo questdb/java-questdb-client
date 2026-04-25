@@ -1,0 +1,3 @@
+[submodule "core/src/main/c/share/zstd"]
+	path = core/src/main/c/share/zstd
+	url = https://github.com/facebook/zstd.git

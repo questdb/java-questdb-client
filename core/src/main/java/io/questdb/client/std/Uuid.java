@@ -25,18 +25,40 @@
 package io.questdb.client.std;
 
 /**
- * A 256-bit value split into four 64-bit words, least-significant first.
- * Also used for QuestDB's DECIMAL256 unscaled value (same wire layout).
- * Pair with {@link Long256Impl} as a reusable sink.
+ * Mutable 128-bit UUID value split into two 64-bit words. Intended as a
+ * reusable sink: hand the same instance to a series of producers (e.g. QWP
+ * batch accessors) and read {@link #getLo} / {@link #getHi} after each
+ * {@link #setAll} call.
  */
-public interface Long256 {
-    int BYTES = 32;
+public class Uuid {
+    public static final int BYTES = 16;
+    private long hi;
+    private long lo;
 
-    long getLong0();
+    /**
+     * Loads the two 64-bit words from {@code address} (little-endian, low word first).
+     */
+    public void fromAddress(long address) {
+        setAll(
+                Unsafe.getUnsafe().getLong(address),
+                Unsafe.getUnsafe().getLong(address + 8L)
+        );
+    }
 
-    long getLong1();
+    public long getHi() {
+        return hi;
+    }
 
-    long getLong2();
+    public long getLo() {
+        return lo;
+    }
 
-    long getLong3();
+    /**
+     * Sets both 64-bit words. {@code lo} is the least significant; {@code hi}
+     * the most significant.
+     */
+    public void setAll(long lo, long hi) {
+        this.lo = lo;
+        this.hi = hi;
+    }
 }

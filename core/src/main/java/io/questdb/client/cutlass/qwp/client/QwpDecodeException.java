@@ -22,21 +22,14 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.std;
+package io.questdb.client.cutlass.qwp.client;
 
 /**
- * A 256-bit value split into four 64-bit words, least-significant first.
- * Also used for QuestDB's DECIMAL256 unscaled value (same wire layout).
- * Pair with {@link Long256Impl} as a reusable sink.
+ * Thrown by {@link QwpResultBatchDecoder} when an inbound frame is malformed
+ * or references unknown connection state.
  */
-public interface Long256 {
-    int BYTES = 32;
-
-    long getLong0();
-
-    long getLong1();
-
-    long getLong2();
-
-    long getLong3();
+public class QwpDecodeException extends Exception {
+    public QwpDecodeException(String message) {
+        super(message);
+    }
 }

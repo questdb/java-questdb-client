@@ -22,21 +22,25 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.std;
+package io.questdb.client.cutlass.qwp.client;
 
 /**
- * A 256-bit value split into four 64-bit words, least-significant first.
- * Also used for QuestDB's DECIMAL256 unscaled value (same wire layout).
- * Pair with {@link Long256Impl} as a reusable sink.
+ * Per-row callback consumed by {@link QwpColumnBatch#forEachRow(RowCallback)}.
+ * The {@link RowView} handed to {@link #onRow(RowView)} is a reusable flyweight
+ * pointing at the current row; do not retain it past the call. To capture a
+ * row's values, copy them out of the view.
+ * <p>
+ * Throwing from {@link #onRow} aborts iteration and propagates the exception
+ * out of {@code forEachRow} on the caller's thread.
  */
-public interface Long256 {
-    int BYTES = 32;
+@FunctionalInterface
+public interface RowCallback {
 
-    long getLong0();
-
-    long getLong1();
-
-    long getLong2();
-
-    long getLong3();
+    /**
+     * Invoked once for each row in the batch, in row-index order starting at 0.
+     *
+     * @param row reusable view bound to the current row; valid only for the
+     *            duration of this call
+     */
+    void onRow(RowView row);
 }
