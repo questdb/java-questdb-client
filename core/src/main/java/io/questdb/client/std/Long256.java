@@ -25,9 +25,18 @@
 package io.questdb.client.std;
 
 /**
- * A 256-bit hash with string representation up to 64 hex digits following a prefix '0x'.
- * (e.g. 0xaba86bf575ba7fde98b6673bb7d85bf489fd71a619cddaecba5de0378e3d22ed)
+ * A 256-bit value split into four 64-bit words, least-significant first.
+ * Also used for QuestDB's DECIMAL256 unscaled value (same wire layout).
+ * Pair with {@link Long256Impl} as a reusable sink.
  */
 public interface Long256 {
     int BYTES = 32;
+
+    long getLong0();
+
+    long getLong1();
+
+    long getLong2();
+
+    long getLong3();
 }

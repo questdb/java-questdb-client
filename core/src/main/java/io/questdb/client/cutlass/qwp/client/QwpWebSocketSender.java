@@ -35,6 +35,7 @@ import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.CharSequenceObjHashMap;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
@@ -51,6 +52,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * QWP v1 WebSocket client sender for streaming data to QuestDB.
@@ -84,6 +86,17 @@ import java.util.concurrent.TimeUnit;
  *     sender.flush();
  * }
  * </pre>
+ * <p>
+ * Failure handling: after this sender has established a WebSocket connection,
+ * any WebSocket send failure, receive failure, ACK timeout, server error ACK,
+ * invalid ACK, or server close is terminal for this sender instance. The first
+ * such failure is retained and subsequent public operations rethrow the same
+ * {@link LineSenderException}. {@link #reset()} only discards buffered row data;
+ * it does not recover a terminal WebSocket failure. To resume sending after a
+ * terminal WebSocket failure, close this sender and create a new instance.
+ * <p>
+ * Initial connection failures are not retained as terminal sender state; a later
+ * operation may try to connect again.
  */
 public class QwpWebSocketSender implements Sender {
 
@@ -112,6 +125,7 @@ public class QwpWebSocketSender implements Sender {
     private final String host;
     // Flow control configuration
     private final int inFlightWindowSize;
+    private final AtomicReference<LineSenderException> connectionError = new AtomicReference<>();
     private final int maxSchemasPerConnection;
     private final int port;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
@@ -138,7 +152,7 @@ public class QwpWebSocketSender implements Sender {
     // Flow control
     private InFlightWindow inFlightWindow;
     private int maxSentSchemaId = -1;
-    // Track highest symbol ID sent to server (for delta encoding)
+    // Track the highest symbol ID sent to server (for delta encoding)
     // Once sent over TCP, server is guaranteed to receive it (or connection dies)
     private int maxSentSymbolId = -1;
     // Batch sequence counter (must match server's messageSequence)
@@ -147,7 +161,11 @@ public class QwpWebSocketSender implements Sender {
     // Async mode: pending row tracking
     private long pendingBytes;
     private int pendingRowCount;
+    private final CharSequenceLongHashMap syncCommittedSeqTxns = new CharSequenceLongHashMap();
+    private final CharSequenceLongHashMap syncDurableSeqTxns = new CharSequenceLongHashMap();
+    private boolean requestDurableAck;
     private boolean sawBinaryAck;
+    private boolean sawPong;
     private WebSocketSendQueue sendQueue;
 
     private QwpWebSocketSender(
@@ -290,6 +308,33 @@ public class QwpWebSocketSender implements Sender {
         return sender;
     }
 
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck
+    ) {
+        QwpWebSocketSender sender = new QwpWebSocketSender(
+                host, port, tlsConfig,
+                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
+        );
+        try {
+            sender.setRequestDurableAck(requestDurableAck);
+            sender.ensureConnected();
+        } catch (Throwable t) {
+            sender.close();
+            throw t;
+        }
+        return sender;
+    }
+
     /**
      * Creates a sender without connecting. For testing only.
      * <p>
@@ -302,10 +347,14 @@ public class QwpWebSocketSender implements Sender {
      * @return unconnected sender
      */
     public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
+        return createForTesting(host, port, inFlightWindowSize, null);
+    }
+
+    public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize, String authorizationHeader) {
         return new QwpWebSocketSender(
                 host, port, null,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                inFlightWindowSize, null, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
+                inFlightWindowSize, authorizationHeader, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
         );
     }
 
@@ -482,7 +531,7 @@ public class QwpWebSocketSender implements Sender {
 
             // Flush any remaining data
             try {
-                if (inFlightWindowSize > 1) {
+                if (connectionError.get() == null && inFlightWindowSize > 1) {
                     // Async mode (window > 1): flush accumulated rows in table buffers first
                     flushPendingRows();
 
@@ -496,7 +545,7 @@ public class QwpWebSocketSender implements Sender {
                     } else if (inFlightWindow != null) {
                         inFlightWindow.awaitEmpty();
                     }
-                } else {
+                } else if (connectionError.get() == null) {
                     // Sync mode (window=1): flush pending rows synchronously
                     if (pendingRowCount > 0 && client != null && client.isConnected()) {
                         flushSync();
@@ -728,6 +777,20 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    /**
+     * Flushes buffered rows and waits until the server acknowledges all submitted
+     * WebSocket batches.
+     * <p>
+     * If a WebSocket send, receive, ACK timeout, server error ACK, invalid ACK,
+     * or server close is observed after the connection has been established, the
+     * sender enters a terminal failed state. The first failure is retained and
+     * subsequent public operations rethrow the same {@link LineSenderException}.
+     * Create a new sender to resume sending.
+     *
+     * @throws LineSenderException if the sender is closed, a row is still in
+     *                             progress, connection setup fails, or a terminal
+     *                             WebSocket failure is observed
+     */
     @Override
     public void flush() {
         checkNotClosed();
@@ -744,10 +807,21 @@ public class QwpWebSocketSender implements Sender {
             }
 
             // Wait for all pending batches to be sent to the server
-            sendQueue.flush();
+            try {
+                sendQueue.flush();
+            } catch (LineSenderException e) {
+                checkConnectionError();
+                throw e;
+            }
 
             // Wait for all in-flight batches to be acknowledged by the server
-            sendQueue.awaitPendingAcks();
+            try {
+                sendQueue.awaitPendingAcks();
+            } catch (LineSenderException e) {
+                checkConnectionError();
+                throw e;
+            }
+            checkConnectionError();
 
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Flush complete [totalBatches={}, totalBytes={}, totalAcked={}]", sendQueue.getTotalBatchesSent(), sendQueue.getTotalBytesSent(), inFlightWindow.getTotalAcked());
@@ -777,6 +851,31 @@ public class QwpWebSocketSender implements Sender {
      */
     public int getAutoFlushRows() {
         return autoFlushRows;
+    }
+
+    /**
+     * Returns the highest seqTxn committed (written to WAL) for the given
+     * table, or -1 if no commit has been acknowledged for that table yet.
+     */
+    public long getHighestAckedSeqTxn(CharSequence tableName) {
+        if (sendQueue != null) {
+            return sendQueue.getCommittedSeqTxn(tableName);
+        }
+        return syncCommittedSeqTxns.get(tableName);
+    }
+
+    /**
+     * Returns the highest seqTxn durably uploaded to object store for the
+     * given table, or -1 if no durable ACK has been observed for that table.
+     * Only meaningful when the connection was opened with
+     * {@link #setRequestDurableAck(boolean)} = true on a server where primary
+     * replication is enabled.
+     */
+    public long getHighestDurableSeqTxn(CharSequence tableName) {
+        if (sendQueue != null) {
+            return sendQueue.getDurableSeqTxn(tableName);
+        }
+        return syncDurableSeqTxns.get(tableName);
     }
 
     /**
@@ -960,6 +1059,31 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    /**
+     * Sends a WebSocket PING and blocks until the PONG arrives, processing
+     * any STATUS_DURABLE_ACK or STATUS_OK frames along the way.
+     * <p>
+     * The server flushes pending durable ACKs before sending the PONG, so
+     * after this method returns, {@link #getHighestDurableSeqTxn(CharSequence)}
+     * reflects all durable progress up to the moment the server processed
+     * the PING.
+     * <p>
+     * In async mode the PING is sent by the I/O thread; the I/O loop
+     * continues its normal work (sending batches, draining ACKs) while
+     * waiting for the PONG.
+     *
+     * @throws LineSenderException if the connection is closed or the ping times out
+     */
+    public void ping() {
+        checkNotClosed();
+        ensureConnected();
+        if (inFlightWindowSize > 1) {
+            sendQueue.ping();
+        } else {
+            syncPing();
+        }
+    }
+
     @Override
     public void reset() {
         checkNotClosed();
@@ -986,6 +1110,27 @@ public class QwpWebSocketSender implements Sender {
     public void setGorillaEnabled(boolean enabled) {
         this.gorillaEnabled = enabled;
         this.encoder.setGorillaEnabled(enabled);
+    }
+
+    /**
+     * Opts the connection in for STATUS_DURABLE_ACK frames. Must be called
+     * before any send operation — the flag is consulted once, during WebSocket
+     * upgrade. Setting this true on a server without primary replication
+     * enabled is a no-op: the server silently ignores the header.
+     * <p>
+     * Observe durable progress via {@link #getHighestDurableSeqTxn(CharSequence)}.
+     *
+     * @throws LineSenderException if the connection is already established or closed
+     */
+    public void setRequestDurableAck(boolean enabled) {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        if (connected) {
+            throw new LineSenderException(
+                    "setRequestDurableAck must be called before the first send");
+        }
+        this.requestDurableAck = enabled;
     }
 
     /**
@@ -1158,6 +1303,18 @@ public class QwpWebSocketSender implements Sender {
         if (closed) {
             throw new LineSenderException("Sender is closed");
         }
+        checkConnectionError();
+    }
+
+    private void checkConnectionError() {
+        LineSenderException error = connectionError.get();
+        if (error != null) {
+            // Refresh the stack so subsequent public API calls point at the
+            // call that observed the terminal sender state, not the I/O thread
+            // that originally recorded the failure.
+            error.fillInStackTrace();
+            throw error;
+        }
     }
 
     private void checkTableSelected() {
@@ -1200,9 +1357,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void ensureConnected() {
-        if (closed) {
-            throw new LineSenderException("Sender is closed");
-        }
+        checkNotClosed();
         if (!connected) {
             // Create WebSocket client using factory (zero-GC native implementation)
             if (tlsConfig != null) {
@@ -1213,8 +1368,9 @@ public class QwpWebSocketSender implements Sender {
 
             // Connect and upgrade to WebSocket
             try {
-                client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_VERSION);
+                client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
                 client.setQwpClientId(QwpConstants.CLIENT_ID);
+                client.setQwpRequestDurableAck(requestDurableAck);
                 client.connect(host, port);
                 client.upgrade(WRITE_PATH, authorizationHeader);
             } catch (Exception e) {
@@ -1232,7 +1388,8 @@ public class QwpWebSocketSender implements Sender {
                 try {
                     sendQueue = new WebSocketSendQueue(client, inFlightWindow,
                             WebSocketSendQueue.DEFAULT_ENQUEUE_TIMEOUT_MS,
-                            WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS);
+                            WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS,
+                            this::recordConnectionFailure);
                 } catch (Throwable t) {
                     inFlightWindow = null;
                     client.close();
@@ -1248,6 +1405,7 @@ public class QwpWebSocketSender implements Sender {
             // Server starts fresh on each connection, so any sender-local schema
             // IDs retained from a prior connection must be discarded as well.
             resetSchemaStateForNewConnection();
+            connectionError.set(null);
 
             connected = true;
             LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
@@ -1264,10 +1422,14 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    private void failExpectedIfNeeded(long expectedSequence, LineSenderException error) {
-        if (inFlightWindow != null && inFlightWindow.getLastError() == null) {
-            inFlightWindow.fail(expectedSequence, error);
+    private void failConnectionIfNeeded(LineSenderException error) {
+        if (recordConnectionFailure(error) && inFlightWindow != null) {
+            inFlightWindow.failAll(error);
         }
+    }
+
+    private boolean recordConnectionFailure(LineSenderException error) {
+        return connectionError.compareAndSet(null, error);
     }
 
     /**
@@ -1279,7 +1441,7 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
-        // Invalidate cached column references — table buffers will be reset below
+        // Invalidate cached column references -- table buffers will be reset below
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
@@ -1386,7 +1548,7 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
-        // Invalidate cached column references — table buffers will be reset below
+        // Invalidate cached column references -- table buffers will be reset below
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
@@ -1451,6 +1613,7 @@ public class QwpWebSocketSender implements Sender {
 
         // Track batch in InFlightWindow before sending
         long batchSequence = nextBatchSequence++;
+        checkConnectionError();
         inFlightWindow.addInFlight(batchSequence);
 
         if (LOG.isDebugEnabled()) {
@@ -1462,11 +1625,11 @@ public class QwpWebSocketSender implements Sender {
         try {
             client.sendBinary(buffer.getBufferPtr(), messageSize);
         } catch (LineSenderException e) {
-            failExpectedIfNeeded(batchSequence, e);
+            failConnectionIfNeeded(e);
             throw e;
         } catch (Throwable t) {
             LineSenderException error = new LineSenderException("Failed to send batch " + batchSequence, t);
-            failExpectedIfNeeded(batchSequence, error);
+            failConnectionIfNeeded(error);
             throw error;
         }
 
@@ -1583,6 +1746,7 @@ public class QwpWebSocketSender implements Sender {
             if (toSend.isSealed()) {
                 toSend.rollbackSealForRetry();
             }
+            checkConnectionError();
             throw e;
         }
     }
@@ -1639,6 +1803,58 @@ public class QwpWebSocketSender implements Sender {
         return false;
     }
 
+    private void syncPing() {
+        client.sendPing(1000);
+        long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
+        LineSenderException pingError = null;
+        while (System.currentTimeMillis() < deadline) {
+            sawPong = false;
+            sawBinaryAck = false;
+            boolean received = client.receiveFrame(ackHandler, 1000);
+            if (received) {
+                if (sawBinaryAck) {
+                    if (ackResponse.isDurableAck()) {
+                        updateSyncSeqTxns(syncDurableSeqTxns);
+                    } else if (ackResponse.isSuccess()) {
+                        inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
+                        updateSyncSeqTxns(syncCommittedSeqTxns);
+                    } else {
+                        // Server-side error on a pending batch (parse /
+                        // schema / security / internal / write error).
+                        // Route through inFlightWindow.fail so subsequent
+                        // waitForAck / flush calls also see it, capture the
+                        // first error and throw it after PONG so the caller
+                        // of ping() can react. We finish draining the round
+                        // before throwing so durable/committed progress
+                        // observed in this ping is preserved.
+                        LineSenderException err = new LineSenderException(ackResponse.getErrorMessage());
+                        inFlightWindow.fail(ackResponse.getSequence(), err);
+                        if (pingError == null) {
+                            pingError = err;
+                        }
+                    }
+                }
+                if (sawPong) {
+                    if (pingError != null) {
+                        throw pingError;
+                    }
+                    return;
+                }
+            }
+        }
+        throw new LineSenderException("Ping timed out");
+    }
+
+    private void updateSyncSeqTxns(CharSequenceLongHashMap seqTxns) {
+        for (int i = 0, n = ackResponse.getTableEntryCount(); i < n; i++) {
+            String name = ackResponse.getTableName(i);
+            long seqTxn = ackResponse.getTableSeqTxn(i);
+            if (seqTxn > seqTxns.get(name)) {
+                seqTxns.put(name, seqTxn);
+            }
+        }
+    }
+
     private long toMicros(long value, ChronoUnit unit) {
         switch (unit) {
             case NANOS:
@@ -1684,41 +1900,40 @@ public class QwpWebSocketSender implements Sender {
                 boolean received = client.receiveFrame(ackHandler, 1000); // 1 second timeout per read attempt
 
                 if (received) {
-                    // Non-binary frames (e.g. ping/pong/text) are not ACKs.
                     if (!sawBinaryAck) {
                         continue;
                     }
-                    long sequence = ackResponse.getSequence();
                     if (ackResponse.isSuccess()) {
-                        // Cumulative ACK - acknowledge all batches up to this sequence
+                        long sequence = ackResponse.getSequence();
                         inFlightWindow.acknowledgeUpTo(sequence);
+                        updateSyncSeqTxns(syncCommittedSeqTxns);
                         if (sequence >= expectedSequence) {
-                            return; // Our batch was acknowledged (cumulative)
+                            return;
                         }
-                        // Got ACK for lower sequence - continue waiting
+                    } else if (ackResponse.isDurableAck()) {
+                        updateSyncSeqTxns(syncDurableSeqTxns);
                     } else {
+                        long sequence = ackResponse.getSequence();
                         String errorMessage = ackResponse.getErrorMessage();
                         LineSenderException error = new LineSenderException(
                                 "Server error for batch " + sequence + ": " +
                                         ackResponse.getStatusName() + " - " + errorMessage);
-                        inFlightWindow.fail(sequence, error);
-                        if (sequence == expectedSequence) {
-                            throw error;
-                        }
+                        failConnectionIfNeeded(error);
+                        throw error;
                     }
                 }
             } catch (LineSenderException e) {
-                failExpectedIfNeeded(expectedSequence, e);
+                failConnectionIfNeeded(e);
                 throw e;
             } catch (Exception e) {
                 LineSenderException wrapped = new LineSenderException("Error waiting for ACK: " + e.getMessage(), e);
-                failExpectedIfNeeded(expectedSequence, wrapped);
+                failConnectionIfNeeded(wrapped);
                 throw wrapped;
             }
         }
 
         LineSenderException timeout = new LineSenderException("Timeout waiting for ACK for batch " + expectedSequence);
-        failExpectedIfNeeded(expectedSequence, timeout);
+        failConnectionIfNeeded(timeout);
         throw timeout;
     }
 
@@ -1732,19 +1947,22 @@ public class QwpWebSocketSender implements Sender {
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
             sender.sawBinaryAck = true;
-            if (!WebSocketResponse.isStructurallyValid(payloadPtr, payloadLen)) {
+            // readFrom validates inline; a single pass parses and bounds-checks.
+            if (!sender.ackResponse.readFrom(payloadPtr, payloadLen)) {
                 throw new LineSenderException(
                         "Invalid ACK response payload [length=" + payloadLen + ']'
                 );
-            }
-            if (!sender.ackResponse.readFrom(payloadPtr, payloadLen)) {
-                throw new LineSenderException("Failed to parse ACK response");
             }
         }
 
         @Override
         public void onClose(int code, String reason) {
-            throw new LineSenderException("WebSocket closed while waiting for ACK: " + reason);
+            throw new LineSenderException("WebSocket closed while waiting for ACK [code=" + code + ", reason=" + reason + ']');
+        }
+
+        @Override
+        public void onPong(long payloadPtr, int payloadLen) {
+            sender.sawPong = true;
         }
     }
 }

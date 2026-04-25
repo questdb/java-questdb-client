@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.Utf8s;
 
 /**
  * A simple native memory buffer writer for encoding QWP v1 messages.
@@ -61,24 +62,7 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
      * @return the number of bytes needed to encode the string as UTF-8
      */
     public static int utf8Length(String s) {
-        if (s == null) return 0;
-        int len = 0;
-        for (int i = 0, n = s.length(); i < n; i++) {
-            char c = s.charAt(i);
-            if (c < 0x80) {
-                len++;
-            } else if (c < 0x800) {
-                len += 2;
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
-                i++;
-                len += 4;
-            } else if (Character.isSurrogate(c)) {
-                len++;
-            } else {
-                len += 3;
-            }
-        }
-        return len;
+        return s == null ? 0 : Utf8s.utf8Bytes(s);
     }
 
     /**
@@ -274,7 +258,7 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
             int utf8Len = utf8Length(value);
             putVarint(utf8Len);
             ensureCapacity(utf8Len);
-            encodeUtf8(value);
+            encodeUtf8(value, utf8Len);
         }
     }
 
@@ -305,10 +289,9 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
             // All ASCII — done in a single pass
             position += charLen;
         } else {
-            // Non-ASCII — fall back to two-pass (re-encodes from start)
-            int utf8Len = utf8Length(value);
-            ensureCapacity(utf8Len);
-            encodeUtf8(value);
+            int utf8Len = Utf8s.utf8Bytes(value, i, charLen);
+            ensureCapacity(i + utf8Len);
+            position += i + Utf8s.strCpyUtf8(value, i, bufferPtr + position + i, utf8Len);
         }
     }
 
@@ -355,35 +338,7 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
         Unsafe.getUnsafe().putByte(addr, (byte) value);
     }
 
-    private void encodeUtf8(String value) {
-        long addr = bufferPtr + position;
-        for (int i = 0, n = value.length(); i < n; i++) {
-            char c = value.charAt(i);
-            if (c < 0x80) {
-                Unsafe.getUnsafe().putByte(addr++, (byte) c);
-            } else if (c < 0x800) {
-                Unsafe.getUnsafe().putByte(addr++, (byte) (0xC0 | (c >> 6)));
-                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (c & 0x3F)));
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
-                char c2 = value.charAt(++i);
-                if (Character.isLowSurrogate(c2)) {
-                    int codePoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
-                    Unsafe.getUnsafe().putByte(addr++, (byte) (0xF0 | (codePoint >> 18)));
-                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((codePoint >> 12) & 0x3F)));
-                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((codePoint >> 6) & 0x3F)));
-                    Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (codePoint & 0x3F)));
-                } else {
-                    Unsafe.getUnsafe().putByte(addr++, (byte) '?');
-                    i--;
-                }
-            } else if (Character.isSurrogate(c)) {
-                Unsafe.getUnsafe().putByte(addr++, (byte) '?');
-            } else {
-                Unsafe.getUnsafe().putByte(addr++, (byte) (0xE0 | (c >> 12)));
-                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | ((c >> 6) & 0x3F)));
-                Unsafe.getUnsafe().putByte(addr++, (byte) (0x80 | (c & 0x3F)));
-            }
-        }
-        position = (int) (addr - bufferPtr);
+    private void encodeUtf8(String value, int utf8Len) {
+        position += Utf8s.strCpyUtf8(value, bufferPtr + position, utf8Len);
     }
 }

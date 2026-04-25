@@ -461,8 +461,8 @@ public class AsyncModeIntegrationTest {
 
     /**
      * The server ACKs the first batch but returns a WRITE_ERROR for the
-     * second. {@link WebSocketSendQueue#flush()} completes (both batches
-     * were sent) but {@link InFlightWindow#awaitEmpty()} surfaces the error.
+     * second. The error is treated as a terminal connection failure and is
+     * surfaced by the next queue operation.
      */
     @Test
     public void testServerErrorPropagatesOnFlush() throws Exception {
@@ -471,6 +471,7 @@ public class AsyncModeIntegrationTest {
             FakeWebSocketClient client = new FakeWebSocketClient();
             AtomicLong highestSent = new AtomicLong(-1);
             AtomicLong highestDelivered = new AtomicLong(-1);
+            CountDownLatch errorDelivered = new CountDownLatch(1);
 
             client.setSendBehavior((ptr, len) -> highestSent.incrementAndGet());
             client.setTryReceiveBehavior(handler -> {
@@ -481,6 +482,7 @@ public class AsyncModeIntegrationTest {
                     highestDelivered.set(next);
                     if (next == 1) {
                         emitDiskFullError(handler, next);
+                        errorDelivered.countDown();
                     } else {
                         emitAck(handler, next);
                     }
@@ -506,12 +508,10 @@ public class AsyncModeIntegrationTest {
                 buf1.seal();
                 queue.enqueue(buf1);
 
-                // flush() waits for the queue to drain (both batches sent).
-                queue.flush();
+                assertTrue("Expected server error ACK", errorDelivered.await(2, TimeUnit.SECONDS));
 
-                // awaitEmpty() surfaces the server error for batch 1.
                 try {
-                    window.awaitEmpty();
+                    queue.flush();
                     fail("Expected server error to propagate");
                 } catch (LineSenderException e) {
                     assertTrue("Error should mention server failure",

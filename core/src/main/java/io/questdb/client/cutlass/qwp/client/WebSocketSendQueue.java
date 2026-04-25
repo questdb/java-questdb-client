@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -73,12 +74,20 @@ public class WebSocketSendQueue implements QuietCloseable {
     private final WebSocketClient client;
     // Configuration
     private final long enqueueTimeoutMs;
+    private final long pingTimeoutMs;
+    @Nullable
+    private final ConnectionFailureListener connectionFailureListener;
     // Optional InFlightWindow for tracking sent batches awaiting ACK
     @Nullable
     private final InFlightWindow inFlightWindow;
 
     // The I/O thread for async send/receive
     private final Thread ioThread;
+    // Serializes concurrent ping() callers so each one gets its own PING/PONG
+    // round-trip. Without this, two callers can race on pingComplete and the
+    // second caller can return on the first caller's PONG, observing a stale
+    // durable watermark.
+    private final Object pingLock = new Object();
     // Counter for batches currently being processed by the I/O thread
     // This tracks batches that have been dequeued but not yet fully sent
     private final AtomicInteger processingCount = new AtomicInteger(0);
@@ -92,6 +101,10 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Synchronization for flush/close
     private final CountDownLatch shutdownLatch;
     private final long shutdownTimeoutMs;
+    // Per-table seqTxn watermarks. Written by the I/O thread only; read by user threads.
+    // All accesses synchronize on the map instance itself for publication and monotonic updates.
+    private final CharSequenceLongHashMap committedSeqTxns = new CharSequenceLongHashMap();
+    private final CharSequenceLongHashMap durableSeqTxns = new CharSequenceLongHashMap();
     // Statistics - receiving
     private final AtomicLong totalAcks = new AtomicLong(0);
     // Statistics - sending
@@ -107,6 +120,10 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Single pending buffer slot (double-buffering means at most 1 item in queue)
     // Zero allocation - just a volatile reference handoff
     private volatile MicrobatchBuffer pendingBuffer;
+    private volatile boolean pingComplete;
+    private volatile boolean pingRequested;
+    private volatile boolean pongReceived;
+    private long pingDeadlineNanos;
     // Running state
     private volatile boolean running;
     private volatile boolean shuttingDown;
@@ -121,6 +138,21 @@ public class WebSocketSendQueue implements QuietCloseable {
      */
     public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
                               long enqueueTimeoutMs, long shutdownTimeoutMs) {
+        this(client, inFlightWindow, enqueueTimeoutMs, shutdownTimeoutMs, null);
+    }
+
+    /**
+     * Creates a new send queue with custom configuration.
+     *
+     * @param client                    the WebSocket client for I/O
+     * @param inFlightWindow            the window to track sent batches awaiting ACK (may be null)
+     * @param enqueueTimeoutMs          timeout for enqueue operations (ms)
+     * @param shutdownTimeoutMs         timeout for graceful shutdown (ms)
+     * @param connectionFailureListener notified once when the queue detects a terminal connection failure
+     */
+    public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
+                              long enqueueTimeoutMs, long shutdownTimeoutMs,
+                              @Nullable ConnectionFailureListener connectionFailureListener) {
         if (client == null) {
             throw new IllegalArgumentException("client cannot be null");
         }
@@ -129,6 +161,8 @@ public class WebSocketSendQueue implements QuietCloseable {
         this.inFlightWindow = inFlightWindow;
         this.enqueueTimeoutMs = enqueueTimeoutMs;
         this.shutdownTimeoutMs = shutdownTimeoutMs;
+        this.pingTimeoutMs = inFlightWindow != null ? inFlightWindow.getTimeoutMs() : InFlightWindow.DEFAULT_TIMEOUT_MS;
+        this.connectionFailureListener = connectionFailureListener;
         this.running = true;
         this.shuttingDown = false;
         this.shutdownLatch = new CountDownLatch(1);
@@ -226,20 +260,20 @@ public class WebSocketSendQueue implements QuietCloseable {
             throw new LineSenderException("Buffer must be sealed before enqueue, state=" +
                     MicrobatchBuffer.stateName(buffer.getState()));
         }
+        checkError();
         if (!running || shuttingDown) {
+            checkError();
             throw new LineSenderException("Send queue is not running");
         }
-
-        // Check for errors from I/O thread
-        checkError();
 
         final long deadline = System.currentTimeMillis() + enqueueTimeoutMs;
         synchronized (processingLock) {
             while (true) {
+                checkError();
                 if (!running || shuttingDown) {
+                    checkError();
                     throw new LineSenderException("Send queue is not running");
                 }
-                checkError();
 
                 if (offerPending(buffer)) {
                     processingLock.notifyAll();
@@ -331,6 +365,61 @@ public class WebSocketSendQueue implements QuietCloseable {
         return lastError;
     }
 
+    public long getCommittedSeqTxn(CharSequence tableName) {
+        synchronized (committedSeqTxns) {
+            return committedSeqTxns.get(tableName);
+        }
+    }
+
+    public long getDurableSeqTxn(CharSequence tableName) {
+        synchronized (durableSeqTxns) {
+            return durableSeqTxns.get(tableName);
+        }
+    }
+
+    /**
+     * Requests the I/O thread to send a WebSocket PING and blocks until
+     * the PONG arrives. The I/O loop continues its normal work (sending
+     * batches, draining ACKs) while waiting for the PONG.
+     * <p>
+     * The server flushes pending durable ACKs before sending the PONG,
+     * so after this method returns {@code getDurableSeqTxn()} reflects
+     * all durable progress up to the moment the server processed the PING.
+     * <p>
+     * Concurrent ping callers are serialized: each caller gets its own
+     * PING / PONG round-trip so the post-condition holds for every caller
+     * independently. A second caller may wait up to {@code pingTimeoutMs}
+     * for an in-flight ping to complete before its own ping starts.
+     */
+    public void ping() {
+        synchronized (pingLock) {
+            checkError();
+            synchronized (processingLock) {
+                pingComplete = false;
+                pingRequested = true;
+                processingLock.notifyAll();
+                long deadline = System.nanoTime() + pingTimeoutMs * 1_000_000L;
+                while (!pingComplete && running) {
+                    long remaining = (deadline - System.nanoTime()) / 1_000_000L;
+                    if (remaining <= 0) {
+                        throw new LineSenderException("Ping timed out");
+                    }
+                    try {
+                        processingLock.wait(remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new LineSenderException("Ping interrupted");
+                    }
+                }
+                if (!pingComplete) {
+                    checkError();
+                    throw new LineSenderException("Ping aborted: send queue is shutting down");
+                }
+            }
+            checkError();
+        }
+    }
+
     /**
      * Returns the total number of batches sent.
      */
@@ -356,23 +445,31 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
-     * Computes the current I/O state based on queue and in-flight status.
+     * Computes the current I/O state based on queue, in-flight, and ping status.
      */
     private IoState computeState(boolean hasInFlight) {
         if (!isPendingEmpty()) {
             return IoState.ACTIVE;
-        } else if (hasInFlight) {
+        } else if (hasInFlight || pingDeadlineNanos > 0) {
             return IoState.DRAINING;
         } else {
             return IoState.IDLE;
         }
     }
 
-    private void failTransport(LineSenderException error) {
+    private void failConnection(LineSenderException error) {
         Throwable rootError = lastError;
+        boolean firstFailure = rootError == null;
         if (rootError == null) {
             lastError = error;
             rootError = error;
+        }
+        if (firstFailure && connectionFailureListener != null) {
+            try {
+                connectionFailureListener.onConnectionFailure(error);
+            } catch (Throwable t) {
+                LOG.error("Error notifying connection failure listener", t);
+            }
         }
         running = false;
         shuttingDown = true;
@@ -423,6 +520,20 @@ public class WebSocketSendQueue implements QuietCloseable {
         try {
             int drainIdleCycles = 0;
             while (running || !isPendingEmpty()) {
+                // Send a pending PING if requested
+                if (pingRequested) {
+                    pingRequested = false;
+                    pongReceived = false;
+                    pingDeadlineNanos = System.nanoTime() + pingTimeoutMs * 1_000_000L;
+                    try {
+                        client.sendPing(1000);
+                    } catch (Exception e) {
+                        pingDeadlineNanos = 0;
+                        failConnection(new LineSenderException("Ping failed", e));
+                        completePing();
+                    }
+                }
+
                 MicrobatchBuffer batch = null;
                 boolean hasInFlight = (inFlightWindow != null && inFlightWindow.getInFlightCount() > 0);
                 IoState state = computeState(hasInFlight);
@@ -434,7 +545,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         // Nothing to do - wait for work under lock
                         synchronized (processingLock) {
                             // Re-check under lock to avoid missed wakeup
-                            if (isPendingEmpty() && running) {
+                            if (isPendingEmpty() && running && !pingRequested) {
                                 try {
                                     processingLock.wait(100);
                                 } catch (InterruptedException e) {
@@ -447,8 +558,20 @@ public class WebSocketSendQueue implements QuietCloseable {
                     case ACTIVE:
                     case DRAINING:
                         // Try to receive any pending ACKs (non-blocking)
-                        if (hasInFlight && client.isConnected()) {
+                        if (client.isConnected()) {
                             receivedAcks = tryReceiveAcks();
+                        }
+
+                        // Check if a pending PING has been answered
+                        if (pingDeadlineNanos > 0) {
+                            if (pongReceived) {
+                                pingDeadlineNanos = 0;
+                                completePing();
+                            } else if (System.nanoTime() >= pingDeadlineNanos) {
+                                pingDeadlineNanos = 0;
+                                failConnection(new LineSenderException("Ping timed out waiting for PONG"));
+                                completePing();
+                            }
                         }
 
                         // Try to dequeue and send a batch
@@ -495,6 +618,13 @@ public class WebSocketSendQueue implements QuietCloseable {
         }
     }
 
+    private void completePing() {
+        synchronized (processingLock) {
+            pingComplete = true;
+            processingLock.notifyAll();
+        }
+    }
+
     private boolean isPendingEmpty() {
         return pendingBuffer == null;
     }
@@ -532,7 +662,7 @@ public class WebSocketSendQueue implements QuietCloseable {
             sendBatch(batch);
         } catch (Throwable t) {
             LOG.error("Error sending batch [id={}]{}", batch.getBatchId(), "", t);
-            failTransport(new LineSenderException("Error sending batch " + batch.getBatchId() + ": " + t.getMessage(), t));
+            failConnection(new LineSenderException("Error sending batch " + batch.getBatchId() + ": " + t.getMessage(), t));
             // Mark as recycled even on error to allow cleanup
             if (batch.isSealed()) {
                 batch.markSending();
@@ -608,7 +738,7 @@ public class WebSocketSendQueue implements QuietCloseable {
         } catch (Exception e) {
             if (running) {
                 LOG.error("Error receiving response: {}", e.getMessage());
-                failTransport(new LineSenderException("Error receiving response: " + e.getMessage(), e));
+                failConnection(new LineSenderException("Error receiving response: " + e.getMessage(), e));
             }
         }
         return received;
@@ -626,6 +756,11 @@ public class WebSocketSendQueue implements QuietCloseable {
         IDLE, ACTIVE, DRAINING
     }
 
+    @FunctionalInterface
+    public interface ConnectionFailureListener {
+        void onConnectionFailure(LineSenderException error);
+    }
+
     /**
      * Handler for received WebSocket frames (ACKs from server).
      */
@@ -633,27 +768,19 @@ public class WebSocketSendQueue implements QuietCloseable {
 
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
-            if (!WebSocketResponse.isStructurallyValid(payloadPtr, payloadLen)) {
+            // readFrom validates inline; a single pass parses and bounds-checks.
+            if (!response.readFrom(payloadPtr, payloadLen)) {
                 LineSenderException error = new LineSenderException(
                         "Invalid ACK response payload [length=" + payloadLen + ']'
                 );
                 LOG.error("Invalid ACK response payload [length={}]", payloadLen);
-                failTransport(error);
-                return;
-            }
-
-            // Parse response from binary payload
-            if (!response.readFrom(payloadPtr, payloadLen)) {
-                LineSenderException error = new LineSenderException("Failed to parse ACK response");
-                LOG.error("Failed to parse response");
-                failTransport(error);
+                failConnection(error);
                 return;
             }
 
             long sequence = response.getSequence();
 
             if (response.isSuccess()) {
-                // Cumulative ACK - acknowledge all batches up to this sequence
                 if (inFlightWindow != null) {
                     int acked = inFlightWindow.acknowledgeUpTo(sequence);
                     if (acked > 0) {
@@ -665,25 +792,47 @@ public class WebSocketSendQueue implements QuietCloseable {
                         LOG.debug("ACK for already-acknowledged sequences [upTo={}]", sequence);
                     }
                 }
+                for (int i = 0, n = response.getTableEntryCount(); i < n; i++) {
+                    advanceSeqTxn(committedSeqTxns, response.getTableName(i), response.getTableSeqTxn(i));
+                }
+            } else if (response.isDurableAck()) {
+                for (int i = 0, n = response.getTableEntryCount(); i < n; i++) {
+                    advanceSeqTxn(durableSeqTxns, response.getTableName(i), response.getTableSeqTxn(i));
+                }
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Durable ACK received [tables={}]", response.getTableEntryCount());
+                }
             } else {
                 // Error - fail the batch
                 String errorMessage = response.getErrorMessage();
                 LOG.error("Error response [seq={}, status={}, error={}]", sequence, response.getStatusName(), errorMessage);
 
-                if (inFlightWindow != null) {
-                    LineSenderException error = new LineSenderException(
-                            "Server error for batch " + sequence + ": " +
-                                    response.getStatusName() + " - " + errorMessage);
-                    inFlightWindow.fail(sequence, error);
-                }
+                LineSenderException error = new LineSenderException(
+                        "Server error for batch " + sequence + ": " +
+                                response.getStatusName() + " - " + errorMessage);
                 totalErrors.incrementAndGet();
+                failConnection(error);
             }
         }
 
         @Override
         public void onClose(int code, String reason) {
             LOG.info("WebSocket closed by server [code={}, reason={}]", code, reason);
-            failTransport(new LineSenderException("WebSocket closed by server [code=" + code + ", reason=" + reason + ']'));
+            failConnection(new LineSenderException("WebSocket closed by server [code=" + code + ", reason=" + reason + ']'));
+        }
+
+        @Override
+        public void onPong(long payloadPtr, int payloadLen) {
+            pongReceived = true;
+        }
+    }
+
+    @SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
+    private static void advanceSeqTxn(CharSequenceLongHashMap map, String tableName, long seqTxn) {
+        synchronized (map) {
+            if (seqTxn > map.get(tableName)) {
+                map.put(tableName, seqTxn);
+            }
         }
     }
 }

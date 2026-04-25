@@ -105,8 +105,20 @@ public abstract class WebSocketClient implements QuietCloseable {
     private CharSequence host;
     private int port;
     // QWP version negotiation
+    // Verbatim header value sent as X-QWP-Accept-Encoding during upgrade, e.g.
+    // "zstd;level=3,raw". When null, the header is omitted and the server ships
+    // batches uncompressed. The echoed X-QWP-Content-Encoding response header
+    // is intentionally not parsed: the RESULT_BATCH decoder branches on
+    // FLAG_ZSTD in every frame, which is the authoritative signal.
+    private String qwpAcceptEncoding;
     private String qwpClientId;
+    // Client-requested per-batch row cap advertised via X-QWP-Max-Batch-Rows.
+    // 0 means "omit the header" (server uses its default cap). Server may clamp
+    // down to its own hard limit.
+    private int qwpMaxBatchRows;
     private int qwpMaxVersion = 1;
+    // Opt-in for STATUS_DURABLE_ACK frames; sent as X-QWP-Request-Durable-Ack: true
+    private boolean qwpRequestDurableAck;
     // Receive buffer (native memory)
     private long recvBufPtr;
     private int recvBufSize;
@@ -377,6 +389,16 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Sets the value sent as the {@code X-QWP-Accept-Encoding} upgrade header,
+     * e.g. {@code "zstd;level=3,raw"}. Pass {@code null} to omit the header
+     * entirely (server ships uncompressed batches). Must be called before
+     * {@link #upgrade}.
+     */
+    public void setQwpAcceptEncoding(String acceptEncoding) {
+        this.qwpAcceptEncoding = acceptEncoding;
+    }
+
+    /**
      * Sets the QWP client identifier sent in the X-QWP-Client-Id upgrade header.
      */
     public void setQwpClientId(String clientId) {
@@ -384,10 +406,32 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Sets the client's preferred per-batch row cap, sent in the
+     * {@code X-QWP-Max-Batch-Rows} upgrade header. {@code 0} (the default)
+     * omits the header entirely and the server uses its own cap. Positive
+     * values ask the server to flush batches sooner (lower time-to-first-row
+     * for streaming consumers, at the cost of more per-batch overhead); the
+     * server clamps down to its own maximum.
+     */
+    public void setQwpMaxBatchRows(int maxBatchRows) {
+        this.qwpMaxBatchRows = maxBatchRows;
+    }
+
+    /**
      * Sets the maximum QWP version this client supports, sent in the X-QWP-Max-Version upgrade header.
      */
     public void setQwpMaxVersion(int maxVersion) {
         this.qwpMaxVersion = maxVersion;
+    }
+
+    /**
+     * Enables the opt-in X-QWP-Request-Durable-Ack upgrade header. When set,
+     * servers with primary replication configured will additionally emit
+     * STATUS_DURABLE_ACK frames as the WAL containing committed client
+     * messages reaches the object store.
+     */
+    public void setQwpRequestDurableAck(boolean enabled) {
+        this.qwpRequestDurableAck = enabled;
     }
 
     /**
@@ -475,6 +519,19 @@ public abstract class WebSocketClient implements QuietCloseable {
             sendBuffer.putAscii("X-QWP-Client-Id: ");
             sendBuffer.putAscii(qwpClientId);
             sendBuffer.putAscii("\r\n");
+        }
+        if (qwpAcceptEncoding != null) {
+            sendBuffer.putAscii("X-QWP-Accept-Encoding: ");
+            sendBuffer.putAscii(qwpAcceptEncoding);
+            sendBuffer.putAscii("\r\n");
+        }
+        if (qwpMaxBatchRows > 0) {
+            sendBuffer.putAscii("X-QWP-Max-Batch-Rows: ");
+            sendBuffer.putAscii(Integer.toString(qwpMaxBatchRows));
+            sendBuffer.putAscii("\r\n");
+        }
+        if (qwpRequestDurableAck) {
+            sendBuffer.putAscii("X-QWP-Request-Durable-Ack: true\r\n");
         }
         if (authorizationHeader != null) {
             sendBuffer.putAscii("Authorization: ");
@@ -958,7 +1015,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
 
-        // Extract X-QWP-Version (optional — defaults to 1 if absent)
+        // Extract X-QWP-Version (optional, defaults to 1 if absent)
         serverQwpVersion = extractQwpVersion(response);
     }
 

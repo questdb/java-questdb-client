@@ -24,9 +24,17 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.DefaultHttpClientConfiguration;
+import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.InFlightWindow;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.network.PlainSocketFactory;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.AbstractTest;
 import org.junit.Assert;
 import org.junit.Test;
@@ -34,6 +42,9 @@ import org.junit.Test;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -48,6 +59,285 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * </ul>
  */
 public class QwpWebSocketSenderStateTest extends AbstractTest {
+
+    @Test
+    public void testConnectionFailureIsSenderLevelTerminalState() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 0, 10_000, 0, 0L, 8
+            )) {
+                LineSenderException failure = new LineSenderException(
+                        "Server error for batch 7: WRITE_ERROR - disk full"
+                );
+                Assert.assertTrue(invokeRecordConnectionFailure(sender, failure));
+
+                try {
+                    sender.table("t");
+                    Assert.fail("Expected sender-level connection failure");
+                } catch (LineSenderException e) {
+                    Assert.assertSame(failure, e);
+                    assertStackContains(e, "table");
+                }
+
+                LineSenderException secondFailure = new LineSenderException("second failure");
+                Assert.assertFalse(invokeRecordConnectionFailure(sender, secondFailure));
+
+                try {
+                    sender.flush();
+                    Assert.fail("Expected original sender-level connection failure");
+                } catch (LineSenderException e) {
+                    Assert.assertSame(failure, e);
+                    assertStackContains(e, "flush");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testConnectWithDurableAckToClosedPort() throws Exception {
+        assertMemoryLeak(() -> {
+            try {
+                QwpWebSocketSender.connect(
+                        "127.0.0.1", 1, null,
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                        QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                        1, null,
+                        QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                        true
+                ).close();
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("Failed to connect"));
+            }
+        });
+    }
+
+    @Test
+    public void testGetHighestDurableSeqTxnDefaultsToMinusOne() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
+                Assert.assertEquals(-1L, sender.getHighestDurableSeqTxn("any_table"));
+            }
+        });
+    }
+
+    @Test
+    public void testGetHighestAckedSeqTxnDefaultsToMinusOne() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
+                Assert.assertEquals(-1L, sender.getHighestAckedSeqTxn("any_table"));
+            }
+        });
+    }
+
+    @Test
+    public void testSetRequestDurableAckBeforeConnect() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
+                // Must not throw before connection is established
+                sender.setRequestDurableAck(true);
+                sender.setRequestDurableAck(false);
+            }
+        });
+    }
+
+    @Test
+    public void testSetRequestDurableAckAfterConnectThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            try {
+                setField(sender, "connected", true);
+                try {
+                    sender.setRequestDurableAck(true);
+                    Assert.fail("Expected exception for setRequestDurableAck after connect");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("before the first send"));
+                }
+            } finally {
+                setField(sender, "connected", false);
+                sender.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSetRequestDurableAckOnClosedSenderThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            sender.close();
+            try {
+                sender.setRequestDurableAck(true);
+                Assert.fail("Expected exception for setRequestDurableAck on closed sender");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testPingAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            sender.close();
+            try {
+                sender.ping();
+                Assert.fail("Expected exception");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testSyncPingProcessesDurableAck() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            PingTestClient client = new PingTestClient();
+            try {
+                client.frameSequence.add(handler -> emitBinaryResponse(handler, WebSocketResponse.durableAck("trades", 5)));
+                client.frameSequence.add(handler -> handler.onPong(0, 0));
+
+                setField(sender, "client", client);
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                sender.ping();
+
+                Assert.assertTrue(client.pingSent);
+                Assert.assertEquals(5L, sender.getHighestDurableSeqTxn("trades"));
+            } finally {
+                setField(sender, "client", null);
+                setField(sender, "connected", false);
+                sender.close();
+                client.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSyncPingProcessesStatusOk() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            PingTestClient client = new PingTestClient();
+            try {
+                client.frameSequence.add(handler -> emitBinaryResponse(handler, WebSocketResponse.success(3)));
+                client.frameSequence.add(handler -> handler.onPong(0, 0));
+
+                setField(sender, "client", client);
+                setField(sender, "connected", true);
+                InFlightWindow window = new InFlightWindow(8, InFlightWindow.DEFAULT_TIMEOUT_MS);
+                window.addInFlight(0);
+                window.addInFlight(1);
+                window.addInFlight(2);
+                window.addInFlight(3);
+                setField(sender, "inFlightWindow", window);
+
+                sender.ping();
+
+                Assert.assertTrue(client.pingSent);
+                Assert.assertEquals(0, window.getInFlightCount());
+            } finally {
+                setField(sender, "client", null);
+                setField(sender, "connected", false);
+                sender.close();
+                client.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSyncPingSurfacesServerErrorFrame() throws Exception {
+        // Regression: syncPing used to branch only on isDurableAck() /
+        // isSuccess(). Any error frame (parse / schema / security / internal
+        // / write error) arriving between PING and PONG was parsed into
+        // ackResponse, neither branch fired, and the error was silently
+        // discarded. A caller using ping() to confirm "all my batches
+        // landed" would get a false affirmative; the error only surfaced
+        // on the next flush's waitForAck.
+        //
+        // Fix: capture the first error during the ping round and throw it
+        // after PONG so ping() callers see the failure directly. Also route
+        // through inFlightWindow.fail so subsequent waitForAck / flush
+        // calls re-observe it. Frames arriving between the error and PONG
+        // are still processed so durable/committed progress is preserved.
+        assertMemoryLeak(() -> {
+            // inFlightWindowSize=1 routes ping() through syncPing (the code under test).
+            // The injected inFlightWindow can still hold multiple batches.
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            PingTestClient client = new PingTestClient();
+            try {
+                // Server sends an error frame for seq=2, a durable ack, then PONG.
+                client.frameSequence.add(handler -> emitBinaryResponse(
+                        handler,
+                        WebSocketResponse.error(2L, WebSocketResponse.STATUS_SCHEMA_MISMATCH, "column type mismatch")
+                ));
+                client.frameSequence.add(handler -> emitBinaryResponse(handler, WebSocketResponse.durableAck("trades", 9)));
+                client.frameSequence.add(handler -> handler.onPong(0, 0));
+
+                setField(sender, "client", client);
+                setField(sender, "connected", true);
+                InFlightWindow window = new InFlightWindow(8, InFlightWindow.DEFAULT_TIMEOUT_MS);
+                window.addInFlight(0);
+                window.addInFlight(1);
+                window.addInFlight(2);
+                setField(sender, "inFlightWindow", window);
+
+                try {
+                    sender.ping();
+                    Assert.fail("syncPing must throw on server error frame");
+                } catch (LineSenderException expected) {
+                    Assert.assertTrue(
+                            "error message must be propagated from the server frame",
+                            expected.getMessage() != null && expected.getMessage().contains("column type mismatch")
+                    );
+                }
+
+                Assert.assertTrue(client.pingSent);
+                // Durable progress observed before the throw must be preserved.
+                Assert.assertEquals(9L, sender.getHighestDurableSeqTxn("trades"));
+                // Error is also recorded on the window so the next waitForAck / flush sees it.
+                Throwable err = window.getLastError();
+                Assert.assertNotNull(
+                        "syncPing must also record the error on the inFlightWindow",
+                        err
+                );
+                Assert.assertTrue(err instanceof LineSenderException);
+                Assert.assertTrue(
+                        err.getMessage() != null && err.getMessage().contains("column type mismatch")
+                );
+            } finally {
+                setField(sender, "client", null);
+                setField(sender, "connected", false);
+                sender.close();
+                client.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSyncPingReturnsOnPong() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
+            PingTestClient client = new PingTestClient();
+            try {
+                client.frameSequence.add(handler -> handler.onPong(0, 0));
+
+                setField(sender, "client", client);
+                setField(sender, "connected", true);
+                setField(sender, "inFlightWindow", new InFlightWindow(1, InFlightWindow.DEFAULT_TIMEOUT_MS));
+
+                sender.ping();
+
+                Assert.assertTrue(client.pingSent);
+            } finally {
+                setField(sender, "client", null);
+                setField(sender, "connected", false);
+                sender.close();
+                client.close();
+            }
+        });
+    }
 
     @Test
     public void testAutoFlushAccumulatesRowsAcrossAllTables() throws Exception {
@@ -319,9 +609,77 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
         method.invoke(target);
     }
 
+    private static void assertStackContains(Throwable throwable, String methodName) {
+        for (StackTraceElement element : throwable.getStackTrace()) {
+            if (QwpWebSocketSender.class.getName().equals(element.getClassName())
+                    && methodName.equals(element.getMethodName())) {
+                return;
+            }
+        }
+        Assert.fail("Expected stack trace to contain QwpWebSocketSender." + methodName);
+    }
+
+    private static boolean invokeRecordConnectionFailure(Object target, LineSenderException error) throws Exception {
+        Method method = target.getClass().getDeclaredMethod("recordConnectionFailure", LineSenderException.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(target, error);
+    }
+
     private static void setField(Object target, String fieldName, Object value) throws Exception {
         Field f = target.getClass().getDeclaredField(fieldName);
         f.setAccessible(true);
         f.set(target, value);
+    }
+
+    private static void emitBinaryResponse(WebSocketFrameHandler handler, WebSocketResponse response) {
+        int size = response.serializedSize();
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            response.writeTo(ptr);
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static class PingTestClient extends WebSocketClient {
+        final List<Consumer<WebSocketFrameHandler>> frameSequence = new ArrayList<>();
+        boolean pingSent = false;
+        private int nextFrame = 0;
+
+        PingTestClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public boolean isConnected() {
+            return true;
+        }
+
+        @Override
+        public boolean receiveFrame(WebSocketFrameHandler handler, int timeout) {
+            if (nextFrame < frameSequence.size()) {
+                frameSequence.get(nextFrame++).accept(handler);
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+        }
+
+        @Override
+        public void sendPing(int timeout) {
+            pingSent = true;
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
+        }
     }
 }

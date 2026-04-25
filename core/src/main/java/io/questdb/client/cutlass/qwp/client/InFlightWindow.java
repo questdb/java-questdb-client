@@ -378,10 +378,25 @@ public class InFlightWindow {
     }
 
     /**
+     * Returns the highest batch sequence acknowledged by the server, or -1 if
+     * no acknowledgment has been received yet.
+     */
+    public long getHighestAckedSequence() {
+        return highestAcked;
+    }
+
+    /**
      * Returns the maximum window size.
      */
     public int getMaxWindowSize() {
         return maxWindowSize;
+    }
+
+    /**
+     * Returns the timeout (ms) applied to blocking window operations.
+     */
+    public long getTimeoutMs() {
+        return timeoutMs;
     }
 
     /**

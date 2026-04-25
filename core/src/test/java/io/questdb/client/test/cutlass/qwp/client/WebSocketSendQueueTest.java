@@ -36,9 +36,9 @@ import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
-import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import org.junit.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -46,20 +46,17 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.*;
 
 public class WebSocketSendQueueTest {
-
+    
     @Test
     public void testEnqueueTimeoutWhenPendingSlotOccupied() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(1, 1_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
-            MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
-            MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
             WebSocketSendQueue queue = null;
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient(); MicrobatchBuffer batch0 = sealedBuffer((byte) 1); MicrobatchBuffer batch1 = sealedBuffer((byte) 2)) {
                 // Keep window full so I/O thread cannot drain pending slot.
                 window.addInFlight(0);
                 queue = new WebSocketSendQueue(client, window, 100, 500);
@@ -74,9 +71,6 @@ public class WebSocketSendQueueTest {
             } finally {
                 window.acknowledgeUpTo(Long.MAX_VALUE);
                 closeQuietly(queue);
-                batch0.close();
-                batch1.close();
-                client.close();
             }
         });
     }
@@ -85,12 +79,8 @@ public class WebSocketSendQueueTest {
     public void testEnqueueWaitsUntilSlotAvailable() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(1, 1_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
-            MicrobatchBuffer batch0 = sealedBuffer((byte) 1);
-            MicrobatchBuffer batch1 = sealedBuffer((byte) 2);
             WebSocketSendQueue queue = null;
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient(); MicrobatchBuffer batch0 = sealedBuffer((byte) 1); MicrobatchBuffer batch1 = sealedBuffer((byte) 2)) {
                 window.addInFlight(0);
                 queue = new WebSocketSendQueue(client, window, 2_000, 500);
                 final WebSocketSendQueue finalQueue = queue;
@@ -124,9 +114,6 @@ public class WebSocketSendQueueTest {
             } finally {
                 window.acknowledgeUpTo(Long.MAX_VALUE);
                 closeQuietly(queue);
-                batch0.close();
-                batch1.close();
-                client.close();
             }
         });
     }
@@ -135,12 +122,10 @@ public class WebSocketSendQueueTest {
     public void testFlushFailsOnInvalidAckPayload() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
             WebSocketSendQueue queue = null;
-            CountDownLatch payloadDelivered = new CountDownLatch(1);
-            AtomicBoolean fired = new AtomicBoolean(false);
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch payloadDelivered = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean(false);
                 window.addInFlight(0);
                 client.setTryReceiveBehavior(handler -> {
                     if (fired.compareAndSet(false, true)) {
@@ -162,7 +147,6 @@ public class WebSocketSendQueueTest {
                 }
             } finally {
                 closeQuietly(queue);
-                client.close();
             }
         });
     }
@@ -171,11 +155,9 @@ public class WebSocketSendQueueTest {
     public void testFlushFailsOnReceiveIoError() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
             WebSocketSendQueue queue = null;
-            CountDownLatch receiveAttempted = new CountDownLatch(1);
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch receiveAttempted = new CountDownLatch(1);
                 window.addInFlight(0);
                 client.setTryReceiveBehavior(handler -> {
                     receiveAttempted.countDown();
@@ -198,7 +180,6 @@ public class WebSocketSendQueueTest {
                 }
             } finally {
                 closeQuietly(queue);
-                client.close();
             }
         });
     }
@@ -206,11 +187,8 @@ public class WebSocketSendQueueTest {
     @Test
     public void testFlushFailsOnSendIoError() throws Exception {
         assertMemoryLeak(() -> {
-            FakeWebSocketClient client = new FakeWebSocketClient();
-            MicrobatchBuffer batch = sealedBuffer((byte) 42);
             WebSocketSendQueue queue = null;
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient(); MicrobatchBuffer batch = sealedBuffer((byte) 42)) {
                 client.setSendBehavior((dataPtr, length) -> {
                     throw new RuntimeException("send-fail");
                 });
@@ -228,8 +206,6 @@ public class WebSocketSendQueueTest {
                 }
             } finally {
                 closeQuietly(queue);
-                batch.close();
-                client.close();
             }
         });
     }
@@ -238,12 +214,10 @@ public class WebSocketSendQueueTest {
     public void testFlushFailsWhenServerClosesConnection() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
-            FakeWebSocketClient client = new FakeWebSocketClient();
             WebSocketSendQueue queue = null;
-            CountDownLatch closeDelivered = new CountDownLatch(1);
-            AtomicBoolean fired = new AtomicBoolean(false);
-
-            try {
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch closeDelivered = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean(false);
                 window.addInFlight(0);
                 client.setTryReceiveBehavior(handler -> {
                     if (fired.compareAndSet(false, true)) {
@@ -265,6 +239,54 @@ public class WebSocketSendQueueTest {
                 }
             } finally {
                 closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testEnqueueAfterServerErrorAckSurfacesServerError() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            FakeWebSocketClient client = new FakeWebSocketClient();
+            WebSocketSendQueue queue = null;
+            MicrobatchBuffer batch0 = sealedBuffer((byte) 42);
+            MicrobatchBuffer batch1 = sealedBuffer((byte) 43);
+            CountDownLatch errorDelivered = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean(false);
+            AtomicLong highestSent = new AtomicLong(-1);
+            AtomicReference<LineSenderException> connectionFailure = new AtomicReference<>();
+
+            try {
+                client.setSendBehavior((dataPtr, length) -> highestSent.incrementAndGet());
+                client.setTryReceiveBehavior(handler -> {
+                    long sent = highestSent.get();
+                    if (sent >= 0 && fired.compareAndSet(false, true)) {
+                        emitError(handler, sent);
+                        errorDelivered.countDown();
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500, connectionFailure::set);
+                queue.enqueue(batch0);
+                assertTrue("Expected server error ACK callback", errorDelivered.await(2, TimeUnit.SECONDS));
+                assertNotNull("Expected connection failure callback", connectionFailure.get());
+                assertTrue(connectionFailure.get().getMessage(), connectionFailure.get().getMessage().contains("WRITE_ERROR"));
+                assertTrue(connectionFailure.get().getMessage(), connectionFailure.get().getMessage().contains("disk full"));
+
+                try {
+                    queue.enqueue(batch1);
+                    fail("Expected enqueue failure after server error ACK");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage(), e.getMessage().contains("WRITE_ERROR"));
+                    assertTrue(e.getMessage(), e.getMessage().contains("disk full"));
+                    assertSame(connectionFailure.get(), e.getCause());
+                }
+            } finally {
+                closeQuietly(queue);
+                batch0.close();
+                batch1.close();
                 client.close();
             }
         });
@@ -348,11 +370,406 @@ public class WebSocketSendQueueTest {
         });
     }
 
+    @Test
+    public void testStatusOkWithTableEntriesUpdatesCommittedSeqTxn() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch ackDelivered = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean(false);
+                window.addInFlight(0);
+                client.setTryReceiveBehavior(handler -> {
+                    if (fired.compareAndSet(false, true)) {
+                        emitAckWithTables(handler,
+                                new String[]{"trades", "orders"},
+                                new long[]{10L, 20L});
+                        ackDelivered.countDown();
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue("Expected ACK callback",
+                        ackDelivered.await(2, TimeUnit.SECONDS));
+
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (queue.getCommittedSeqTxn("trades") < 0
+                        && System.currentTimeMillis() < deadline) {
+                    Os.sleep(5);
+                }
+
+                assertEquals(10L, queue.getCommittedSeqTxn("trades"));
+                assertEquals(20L, queue.getCommittedSeqTxn("orders"));
+                assertEquals(-1L, queue.getCommittedSeqTxn("other"));
+                assertEquals(0, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testDurableAckUpdatesPerTableSeqTxn() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                CountDownLatch durableDelivered = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean(false);
+                window.addInFlight(0);
+                client.setTryReceiveBehavior(handler -> {
+                    if (fired.compareAndSet(false, true)) {
+                        emitDurableAck(handler, "trades", 10);
+                        durableDelivered.countDown();
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue("Expected durable ACK callback",
+                        durableDelivered.await(2, TimeUnit.SECONDS));
+
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (queue.getDurableSeqTxn("trades") < 0 && System.currentTimeMillis() < deadline) {
+                    Os.sleep(5);
+                }
+
+                assertEquals(10, queue.getDurableSeqTxn("trades"));
+                assertEquals(-1, queue.getDurableSeqTxn("other"));
+                assertEquals(1, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testDurableAckIsMonotonic() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                AtomicInteger callCount = new AtomicInteger();
+                CountDownLatch allDelivered = new CountDownLatch(1);
+                window.addInFlight(0);
+                window.addInFlight(1);
+                window.addInFlight(2);
+
+                client.setTryReceiveBehavior(handler -> {
+                    int n = callCount.getAndIncrement();
+                    switch (n) {
+                        case 0:
+                            emitDurableAck(handler, "t", 20);
+                            return true;
+                        case 1:
+                            emitDurableAck(handler, "t", 10);
+                            allDelivered.countDown();
+                            return true;
+                        default:
+                            return false;
+                    }
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue(allDelivered.await(2, TimeUnit.SECONDS));
+
+                long deadline = System.currentTimeMillis() + 2_000;
+                while (queue.getDurableSeqTxn("t") < 20 && System.currentTimeMillis() < deadline) {
+                    Os.sleep(5);
+                }
+
+                assertEquals(20, queue.getDurableSeqTxn("t"));
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testDurableAckInterleavedWithStatusOk() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                AtomicInteger callCount = new AtomicInteger();
+                CountDownLatch allDelivered = new CountDownLatch(1);
+                window.addInFlight(0);
+                window.addInFlight(1);
+
+                client.setTryReceiveBehavior(handler -> {
+                    int n = callCount.getAndIncrement();
+                    switch (n) {
+                        case 0:
+                            emitAck(handler, 0);
+                            return true;
+                        case 1:
+                            emitDurableAck(handler, "t", 10);
+                            return true;
+                        case 2:
+                            emitAck(handler, 1);
+                            return true;
+                        case 3:
+                            emitDurableAck(handler, "t", 20);
+                            allDelivered.countDown();
+                            return true;
+                        default:
+                            return false;
+                    }
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertTrue(allDelivered.await(2, TimeUnit.SECONDS));
+
+                long deadline = System.currentTimeMillis() + 2_000;
+                while ((queue.getDurableSeqTxn("t") < 20 || window.getInFlightCount() > 0)
+                        && System.currentTimeMillis() < deadline) {
+                    Os.sleep(5);
+                }
+
+                assertEquals(20, queue.getDurableSeqTxn("t"));
+                assertEquals(0, window.getInFlightCount());
+            } finally {
+                window.acknowledgeUpTo(Long.MAX_VALUE);
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testPingBlocksUntilPong() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                AtomicInteger callCount = new AtomicInteger();
+                client.setTryReceiveBehavior(handler -> {
+                    int n = callCount.getAndIncrement();
+                    switch (n) {
+                        case 0:
+                            emitDurableAck(handler, "t", 7);
+                            return true;
+                        case 1:
+                            handler.onPong(0, 0);
+                            return true;
+                        default:
+                            return false;
+                    }
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+
+                queue.ping();
+
+                // After ping() returns, durable ACK must already be processed
+                assertEquals(7, queue.getDurableSeqTxn("t"));
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testPingWithInFlightBatches() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                window.addInFlight(0);
+                window.addInFlight(1);
+
+                AtomicBoolean pingSent = new AtomicBoolean(false);
+                client.setPingSendBehavior(() -> pingSent.set(true));
+
+                AtomicInteger callCount = new AtomicInteger();
+                client.setTryReceiveBehavior(handler -> {
+                    int n = callCount.get();
+                    switch (n) {
+                        case 0:
+                            emitAck(handler, 1);
+                            callCount.incrementAndGet();
+                            return true;
+                        case 1:
+                            emitDurableAck(handler, "t", 5);
+                            callCount.incrementAndGet();
+                            return true;
+                        case 2:
+                            // Pong can only arrive in response to a PING
+                            if (!pingSent.get()) {
+                                return false;
+                            }
+                            handler.onPong(0, 0);
+                            callCount.incrementAndGet();
+                            return true;
+                        default:
+                            return false;
+                    }
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+
+                queue.ping();
+
+                assertEquals(0, window.getInFlightCount());
+                assertEquals(5, queue.getDurableSeqTxn("t"));
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testPingTimesOutWhenNoPong() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 2_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                // Never emit a PONG
+                client.setTryReceiveBehavior(handler -> false);
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+
+                try {
+                    queue.ping();
+                    fail("Expected ping timeout");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Ping timed out"));
+                }
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testPingSurfacesTransportError() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                client.setPingSendBehavior(() -> {
+                    throw new RuntimeException("ping-send-fail");
+                });
+
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+
+                try {
+                    queue.ping();
+                    fail("Expected error from ping");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("Ping failed")
+                            || e.getMessage().contains("Error in send queue"));
+                }
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testConcurrentPingCallersEachGetTheirOwnPing() throws Exception {
+        // Without serialization, two concurrent ping() callers can both wake up on
+        // the same PONG and return — the second caller observes a durable watermark
+        // taken before its own PING was processed. The pingLock around ping()
+        // guarantees each caller sends its own PING and waits for its own PONG.
+        //
+        // To trigger the bug deterministically the I/O thread is held inside the
+        // first sendPing call until all caller threads are parked, so the buggy
+        // code has all of them in the synchronized(processingLock) block before
+        // any PONG is processed and only one or two PINGs are emitted in total.
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                AtomicInteger pingsSent = new AtomicInteger();
+                AtomicInteger pendingPongs = new AtomicInteger();
+                CountDownLatch firstPingBarrier = new CountDownLatch(1);
+                client.setPingSendBehavior(() -> {
+                    int n = pingsSent.incrementAndGet();
+                    pendingPongs.incrementAndGet();
+                    if (n == 1) {
+                        try {
+                            firstPingBarrier.await();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                });
+                client.setTryReceiveBehavior(handler -> {
+                    if (pendingPongs.get() > 0 && pendingPongs.decrementAndGet() >= 0) {
+                        handler.onPong(0, 0);
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 5_000, 500);
+                final WebSocketSendQueue q = queue;
+
+                int callerCount = 3;
+                CountDownLatch ready = new CountDownLatch(callerCount);
+                CountDownLatch start = new CountDownLatch(1);
+                AtomicReference<Throwable> err = new AtomicReference<>();
+                Thread[] threads = new Thread[callerCount];
+                for (int i = 0; i < callerCount; i++) {
+                    threads[i] = new Thread(() -> {
+                        try {
+                            ready.countDown();
+                            start.await();
+                            q.ping();
+                        } catch (Throwable t) {
+                            err.set(t);
+                        }
+                    }, "ping-caller-" + i);
+                    threads[i].start();
+                }
+                ready.await();
+                start.countDown();
+                // Wait until every caller is parked: either in processingLock.wait()
+                // (buggy path) or BLOCKED on pingLock (fixed path).
+                for (Thread t : threads) {
+                    awaitThreadBlocked(t);
+                }
+                firstPingBarrier.countDown();
+                for (Thread t : threads) {
+                    t.join(10_000);
+                    assertFalse("ping caller " + t.getName() + " did not complete", t.isAlive());
+                }
+                if (err.get() != null) {
+                    throw new AssertionError("ping caller threw", err.get());
+                }
+                assertEquals("each concurrent caller must send its own PING",
+                        callerCount, pingsSent.get());
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
+    public void testDurableSeqTxnInitiallyMinusOne() throws Exception {
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                queue = new WebSocketSendQueue(client, window, 1_000, 500);
+                assertEquals(-1, queue.getDurableSeqTxn("any_table"));
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
     private static void awaitThreadBlocked(Thread thread) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
             Thread.State state = thread.getState();
-            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING || state == Thread.State.BLOCKED) {
                 return;
             }
             Os.sleep(1);
@@ -378,8 +795,65 @@ public class WebSocketSendQueueTest {
         }
     }
 
+    private static void emitDurableAck(WebSocketFrameHandler handler, String tableName, long seqTxn) {
+        WebSocketResponse response = WebSocketResponse.durableAck(tableName, seqTxn);
+        int size = response.serializedSize();
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            response.writeTo(ptr);
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void emitAckWithTables(WebSocketFrameHandler handler,
+                                          String[] tableNames, long[] seqTxns) {
+        byte[][] nameBytes = new byte[tableNames.length][];
+        int size = 1 + 8 + 2;
+        for (int i = 0; i < tableNames.length; i++) {
+            nameBytes[i] = tableNames[i].getBytes(StandardCharsets.UTF_8);
+            size += 2 + nameBytes[i].length + 8;
+        }
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            int offset = 0;
+            Unsafe.getUnsafe().putByte(ptr + offset, WebSocketResponse.STATUS_OK);
+            offset += 1;
+            Unsafe.getUnsafe().putLong(ptr + offset, 0);
+            offset += 8;
+            Unsafe.getUnsafe().putShort(ptr + offset, (short) tableNames.length);
+            offset += 2;
+            for (int i = 0; i < tableNames.length; i++) {
+                Unsafe.getUnsafe().putShort(ptr + offset, (short) nameBytes[i].length);
+                offset += 2;
+                for (int j = 0; j < nameBytes[i].length; j++) {
+                    Unsafe.getUnsafe().putByte(ptr + offset + j, nameBytes[i][j]);
+                }
+                offset += nameBytes[i].length;
+                Unsafe.getUnsafe().putLong(ptr + offset, seqTxns[i]);
+                offset += 8;
+            }
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     private static void emitAck(WebSocketFrameHandler handler, long sequence) {
         WebSocketResponse response = WebSocketResponse.success(sequence);
+        int size = response.serializedSize();
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            response.writeTo(ptr);
+            handler.onBinaryMessage(ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void emitError(WebSocketFrameHandler handler, long sequence) {
+        WebSocketResponse response = WebSocketResponse.error(sequence, WebSocketResponse.STATUS_WRITE_ERROR, "disk full");
         int size = response.serializedSize();
         long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -413,6 +887,7 @@ public class WebSocketSendQueueTest {
     private static class FakeWebSocketClient extends WebSocketClient {
         private volatile TryReceiveBehavior behavior = handler -> false;
         private volatile boolean connected = true;
+        private volatile Runnable pingSendBehavior = () -> {};
         private volatile ReceiveBehavior receiveBehavior = (handler, timeout) -> false;
         private volatile SendBehavior sendBehavior = (dataPtr, length) -> {
         };
@@ -435,6 +910,15 @@ public class WebSocketSendQueueTest {
         @Override
         public void sendBinary(long dataPtr, int length) {
             sendBehavior.send(dataPtr, length);
+        }
+
+        @Override
+        public void sendPing(int timeout) {
+            pingSendBehavior.run();
+        }
+
+        public void setPingSendBehavior(Runnable pingSendBehavior) {
+            this.pingSendBehavior = pingSendBehavior;
         }
 
         public void setSendBehavior(SendBehavior sendBehavior) {

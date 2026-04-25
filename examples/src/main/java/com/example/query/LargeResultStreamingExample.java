@@ -1,0 +1,70 @@
+package com.example.query;
+
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+
+/**
+ * Streaming over a large result set.
+ * <p>
+ * For result sets that don't fit in memory, the column-batch consumer is the
+ * right entry point: each {@code onBatch} callback sees one {@code RESULT_BATCH}
+ * frame (up to a few thousand rows), letting you process the data incrementally
+ * without the whole result set ever being materialised in the client.
+ * <p>
+ * The server streams continuously until the cursor is exhausted; batches arrive
+ * on the calling thread inside {@code client.execute(...)} as the WebSocket
+ * yields frames. Pacing naturally follows TCP back-pressure -- if the consumer
+ * is slower than the network, the kernel send buffer fills and the server
+ * parks between batches. For explicit byte-level flow control on top of that,
+ * see {@link CreditFlowControlExample}.
+ */
+public class LargeResultStreamingExample {
+
+    public static void main(String[] args) {
+        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
+            client.connect();
+
+            // Running totals we accumulate across all batches without ever holding
+            // the whole result set in memory.
+            final long[] rowsSeen = {0};
+            final long[] batchCount = {0};
+            final double[] priceSum = {0.0};
+
+            client.execute(
+                    "SELECT ts, price FROM trades WHERE ts > dateadd('d', -7, now())",
+                    new QwpColumnBatchHandler() {
+                        @Override
+                        public void onBatch(QwpColumnBatch batch) {
+                            batchCount[0]++;
+                            int rows = batch.getRowCount();
+                            for (int r = 0; r < rows; r++) {
+                                priceSum[0] += batch.getDoubleValue(1, r);
+                            }
+                            rowsSeen[0] += rows;
+
+                            // Per-batch progress marker for long-running queries.
+                            if (batchCount[0] % 10 == 0) {
+                                System.out.println("received " + rowsSeen[0] + " rows so far");
+                            }
+                        }
+
+                        @Override
+                        public void onEnd(long totalRows) {
+                            System.out.printf(
+                                    "done: rows=%d batches=%d priceSum=%.2f%n",
+                                    rowsSeen[0], batchCount[0], priceSum[0]
+                            );
+                        }
+
+                        @Override
+                        public void onError(byte status, String message) {
+                            throw new RuntimeException(
+                                    "query failed (status=" + status + "): " + message
+                            );
+                        }
+                    }
+            );
+        }
+    }
+}

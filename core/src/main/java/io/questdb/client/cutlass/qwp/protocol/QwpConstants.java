@@ -46,6 +46,12 @@ public final class QwpConstants {
      */
     public static final byte FLAG_GORILLA = 0x04;
     /**
+     * Flag bit: payload region after the prelude is zstd-compressed. Set only
+     * when the handshake negotiated zstd compression. Mirror of the server-side
+     * constant; see the server QwpConstants for the full description.
+     */
+    public static final byte FLAG_ZSTD = 0x10;
+    /**
      * Offset of flags byte in header.
      */
     public static final int HEADER_OFFSET_FLAGS = 5;
@@ -64,6 +70,17 @@ public final class QwpConstants {
      */
     public static final int MAX_COLUMNS_PER_TABLE = 2048;
     /**
+     * Maximum column name length in bytes. Mirrors the server's same-named
+     * constant so the decoder can reject hostile or malformed wire bytes that
+     * advertise an oversized name length.
+     */
+    public static final int MAX_COLUMN_NAME_LENGTH = 127;
+    /**
+     * Maximum table name length in bytes. Mirrors the server's same-named
+     * constant; used by the decoder to reject malformed wire bytes.
+     */
+    public static final int MAX_TABLE_NAME_LENGTH = 127;
+    /**
      * Schema mode: Full schema included.
      */
     public static final byte SCHEMA_MODE_FULL = 0x00;
@@ -71,6 +88,24 @@ public final class QwpConstants {
      * Schema mode: Schema reference (ID lookup).
      */
     public static final byte SCHEMA_MODE_REFERENCE = 0x01;
+    /**
+     * Status byte on a {@code QUERY_ERROR} frame: the query was cancelled,
+     * either by a client {@code CANCEL} frame or by explicit server-side
+     * cancel. Egress extension of the ingress {@code STATUS_*} namespace
+     * (0x00-0x09).
+     */
+    public static final byte STATUS_CANCELLED = 0x0A;
+    /**
+     * Status byte on a {@code QUERY_ERROR} frame: a server-side limit was hit
+     * (query timeout, memory cap, circuit breaker, OOM). Egress extension of
+     * the ingress {@code STATUS_*} namespace (0x00-0x09).
+     */
+    public static final byte STATUS_LIMIT_EXCEEDED = 0x0B;
+    /**
+     * Column type: BINARY (length-prefixed opaque bytes).
+     * Wire format: identical to VARCHAR — (N+1) x uint32 offsets + concatenated bytes.
+     */
+    public static final byte TYPE_BINARY = 0x17;
     /**
      * Column type: BOOLEAN (1 bit per value, packed).
      */
@@ -124,6 +159,11 @@ public final class QwpConstants {
      */
     public static final byte TYPE_INT = 0x04;
     /**
+     * Column type: IPv4 (32-bit address). Wire format: 4 bytes LE, identical to INT.
+     * NULL is signalled via the standard null bitmap.
+     */
+    public static final byte TYPE_IPv4 = 0x18;
+    /**
      * Column type: LONG (int64, little-endian).
      */
     public static final byte TYPE_LONG = 0x05;
@@ -167,9 +207,25 @@ public final class QwpConstants {
      */
     public static final byte VERSION_1 = 1;
     /**
-     * Maximum protocol version supported by this client.
+     * Protocol v2 adds an unsolicited {@code SERVER_INFO} control frame
+     * delivered as the first WebSocket frame after the 101 upgrade. Servers that
+     * advertise v2 send the frame automatically; v2 clients must consume it
+     * before submitting the first query and may use the role value it carries
+     * to route reads to primary vs replica.
      */
-    public static final byte MAX_SUPPORTED_VERSION = VERSION_1;
+    public static final byte VERSION_2 = 2;
+    /**
+     * Maximum protocol version the ingest path advertises / accepts. Pinned to
+     * v1 because the v2 bump only adds an egress control frame; bumping the
+     * ingest wire to v2 would silently round-trip a version byte that no v1
+     * server can accept.
+     */
+    public static final byte MAX_SUPPORTED_INGEST_VERSION = VERSION_1;
+    /**
+     * Maximum protocol version supported by this client on the egress path.
+     * Ingest pins to {@link #MAX_SUPPORTED_INGEST_VERSION}.
+     */
+    public static final byte MAX_SUPPORTED_VERSION = VERSION_2;
 
     private QwpConstants() {
         // utility class
@@ -187,8 +243,7 @@ public final class QwpConstants {
      * @return size in bytes, 0 for bit-packed (BOOLEAN), or -1 for variable-width types
      */
     public static int getFixedTypeSize(byte typeCode) {
-        int code = typeCode;
-        switch (code) {
+        switch ((int) typeCode) {
             case TYPE_BOOLEAN:
                 return 0; // Special: bit-packed
             case TYPE_BYTE:
@@ -226,9 +281,8 @@ public final class QwpConstants {
      * @return type name
      */
     public static String getTypeName(byte typeCode) {
-        int code = typeCode;
         String name;
-        switch (code) {
+        switch ((int) typeCode) {
             case TYPE_BOOLEAN:
                 name = "BOOLEAN";
                 break;
@@ -293,7 +347,7 @@ public final class QwpConstants {
                 name = "DECIMAL256";
                 break;
             default:
-                name = "UNKNOWN(" + code + ")";
+                name = "UNKNOWN(" + (int) typeCode + ")";
                 break;
         }
         return name;
@@ -306,22 +360,21 @@ public final class QwpConstants {
      * @return true if fixed-width
      */
     public static boolean isFixedWidthType(byte typeCode) {
-        int code = typeCode;
-        return code == TYPE_BOOLEAN ||
-                code == TYPE_BYTE ||
-                code == TYPE_SHORT ||
-                code == TYPE_CHAR ||
-                code == TYPE_INT ||
-                code == TYPE_LONG ||
-                code == TYPE_FLOAT ||
-                code == TYPE_DOUBLE ||
-                code == TYPE_TIMESTAMP ||
-                code == TYPE_TIMESTAMP_NANOS ||
-                code == TYPE_DATE ||
-                code == TYPE_UUID ||
-                code == TYPE_LONG256 ||
-                code == TYPE_DECIMAL64 ||
-                code == TYPE_DECIMAL128 ||
-                code == TYPE_DECIMAL256;
+        return (int) typeCode == TYPE_BOOLEAN ||
+                (int) typeCode == TYPE_BYTE ||
+                (int) typeCode == TYPE_SHORT ||
+                (int) typeCode == TYPE_CHAR ||
+                (int) typeCode == TYPE_INT ||
+                (int) typeCode == TYPE_LONG ||
+                (int) typeCode == TYPE_FLOAT ||
+                (int) typeCode == TYPE_DOUBLE ||
+                (int) typeCode == TYPE_TIMESTAMP ||
+                (int) typeCode == TYPE_TIMESTAMP_NANOS ||
+                (int) typeCode == TYPE_DATE ||
+                (int) typeCode == TYPE_UUID ||
+                (int) typeCode == TYPE_LONG256 ||
+                (int) typeCode == TYPE_DECIMAL64 ||
+                (int) typeCode == TYPE_DECIMAL128 ||
+                (int) typeCode == TYPE_DECIMAL256;
     }
 }
