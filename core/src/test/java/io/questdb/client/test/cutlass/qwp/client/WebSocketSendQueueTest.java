@@ -50,7 +50,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 import static org.junit.Assert.*;
 
 public class WebSocketSendQueueTest {
-
+    
     @Test
     public void testEnqueueTimeoutWhenPendingSlotOccupied() throws Exception {
         assertMemoryLeak(() -> {
@@ -672,6 +672,86 @@ public class WebSocketSendQueueTest {
     }
 
     @Test
+    public void testConcurrentPingCallersEachGetTheirOwnPing() throws Exception {
+        // Without serialization, two concurrent ping() callers can both wake up on
+        // the same PONG and return — the second caller observes a durable watermark
+        // taken before its own PING was processed. The pingLock around ping()
+        // guarantees each caller sends its own PING and waits for its own PONG.
+        //
+        // To trigger the bug deterministically the I/O thread is held inside the
+        // first sendPing call until all caller threads are parked, so the buggy
+        // code has all of them in the synchronized(processingLock) block before
+        // any PONG is processed and only one or two PINGs are emitted in total.
+        assertMemoryLeak(() -> {
+            InFlightWindow window = new InFlightWindow(8, 5_000);
+            WebSocketSendQueue queue = null;
+            try (FakeWebSocketClient client = new FakeWebSocketClient()) {
+                AtomicInteger pingsSent = new AtomicInteger();
+                AtomicInteger pendingPongs = new AtomicInteger();
+                CountDownLatch firstPingBarrier = new CountDownLatch(1);
+                client.setPingSendBehavior(() -> {
+                    int n = pingsSent.incrementAndGet();
+                    pendingPongs.incrementAndGet();
+                    if (n == 1) {
+                        try {
+                            firstPingBarrier.await();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                });
+                client.setTryReceiveBehavior(handler -> {
+                    if (pendingPongs.get() > 0 && pendingPongs.decrementAndGet() >= 0) {
+                        handler.onPong(0, 0);
+                        return true;
+                    }
+                    return false;
+                });
+
+                queue = new WebSocketSendQueue(client, window, 5_000, 500);
+                final WebSocketSendQueue q = queue;
+
+                int callerCount = 3;
+                CountDownLatch ready = new CountDownLatch(callerCount);
+                CountDownLatch start = new CountDownLatch(1);
+                AtomicReference<Throwable> err = new AtomicReference<>();
+                Thread[] threads = new Thread[callerCount];
+                for (int i = 0; i < callerCount; i++) {
+                    threads[i] = new Thread(() -> {
+                        try {
+                            ready.countDown();
+                            start.await();
+                            q.ping();
+                        } catch (Throwable t) {
+                            err.set(t);
+                        }
+                    }, "ping-caller-" + i);
+                    threads[i].start();
+                }
+                ready.await();
+                start.countDown();
+                // Wait until every caller is parked: either in processingLock.wait()
+                // (buggy path) or BLOCKED on pingLock (fixed path).
+                for (Thread t : threads) {
+                    awaitThreadBlocked(t);
+                }
+                firstPingBarrier.countDown();
+                for (Thread t : threads) {
+                    t.join(10_000);
+                    assertFalse("ping caller " + t.getName() + " did not complete", t.isAlive());
+                }
+                if (err.get() != null) {
+                    throw new AssertionError("ping caller threw", err.get());
+                }
+                assertEquals("each concurrent caller must send its own PING",
+                        callerCount, pingsSent.get());
+            } finally {
+                closeQuietly(queue);
+            }
+        });
+    }
+
+    @Test
     public void testDurableSeqTxnInitiallyMinusOne() throws Exception {
         assertMemoryLeak(() -> {
             InFlightWindow window = new InFlightWindow(8, 5_000);
@@ -689,7 +769,7 @@ public class WebSocketSendQueueTest {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
             Thread.State state = thread.getState();
-            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING || state == Thread.State.BLOCKED) {
                 return;
             }
             Os.sleep(1);

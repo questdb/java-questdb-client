@@ -1806,6 +1806,7 @@ public class QwpWebSocketSender implements Sender {
     private void syncPing() {
         client.sendPing(1000);
         long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
+        LineSenderException pingError = null;
         while (System.currentTimeMillis() < deadline) {
             sawPong = false;
             sawBinaryAck = false;
@@ -1820,19 +1821,23 @@ public class QwpWebSocketSender implements Sender {
                     } else {
                         // Server-side error on a pending batch (parse /
                         // schema / security / internal / write error).
-                        // Route through inFlightWindow.fail so the next
-                        // waitForAck / flush surfaces it, matching the
-                        // normal waitForAck error-handling path. Do not
-                        // throw from syncPing: that would hide any
-                        // durable/committed progress already observed in
-                        // this ping round.
-                        inFlightWindow.fail(
-                                ackResponse.getSequence(),
-                                new LineSenderException(ackResponse.getErrorMessage())
-                        );
+                        // Route through inFlightWindow.fail so subsequent
+                        // waitForAck / flush calls also see it, capture the
+                        // first error and throw it after PONG so the caller
+                        // of ping() can react. We finish draining the round
+                        // before throwing so durable/committed progress
+                        // observed in this ping is preserved.
+                        LineSenderException err = new LineSenderException(ackResponse.getErrorMessage());
+                        inFlightWindow.fail(ackResponse.getSequence(), err);
+                        if (pingError == null) {
+                            pingError = err;
+                        }
                     }
                 }
                 if (sawPong) {
+                    if (pingError != null) {
+                        throw pingError;
+                    }
                     return;
                 }
             }
@@ -1942,13 +1947,11 @@ public class QwpWebSocketSender implements Sender {
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
             sender.sawBinaryAck = true;
-            if (!WebSocketResponse.isStructurallyValid(payloadPtr, payloadLen)) {
+            // readFrom validates inline; a single pass parses and bounds-checks.
+            if (!sender.ackResponse.readFrom(payloadPtr, payloadLen)) {
                 throw new LineSenderException(
                         "Invalid ACK response payload [length=" + payloadLen + ']'
                 );
-            }
-            if (!sender.ackResponse.readFrom(payloadPtr, payloadLen)) {
-                throw new LineSenderException("Failed to parse ACK response");
             }
         }
 

@@ -370,15 +370,28 @@ public class WebSocketResponse {
         return offset;
     }
 
+    // Validates inline as it parses; returns false on truncation, lying-length
+    // entries, empty table names, or trailing garbage. On false, tableNames /
+    // tableSeqTxns may hold partial state, but the caller (readFrom) clears
+    // both lists at the start of every call so partial state never leaks.
     private boolean readTableEntries(long ptr, int remaining) {
-        if (!validateTableEntries(ptr, remaining)) {
+        if (remaining < 2) {
             return false;
         }
         int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
         int offset = 2;
         for (int i = 0; i < tableCount; i++) {
+            if (remaining < offset + 2) {
+                return false;
+            }
             int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
             offset += 2;
+            // Empty table names are rejected as structurally invalid - a valid
+            // table name is never zero bytes, and accepting empty names would
+            // let a misbehaving server poison the per-table tracker with "" entries.
+            if (nameLen == 0 || remaining < offset + nameLen + 8) {
+                return false;
+            }
             long nameLo = ptr + offset;
             long nameHi = nameLo + nameLen;
             offset += nameLen;
@@ -387,7 +400,7 @@ public class WebSocketResponse {
             tableNames.add(internTableName(nameLo, nameHi));
             tableSeqTxns.add(seqTxn);
         }
-        return true;
+        return remaining == offset;
     }
 
     private String internTableName(long lo, long hi) {

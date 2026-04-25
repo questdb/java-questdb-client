@@ -83,6 +83,11 @@ public class WebSocketSendQueue implements QuietCloseable {
 
     // The I/O thread for async send/receive
     private final Thread ioThread;
+    // Serializes concurrent ping() callers so each one gets its own PING/PONG
+    // round-trip. Without this, two callers can race on pingComplete and the
+    // second caller can return on the first caller's PONG, observing a stale
+    // durable watermark.
+    private final Object pingLock = new Object();
     // Counter for batches currently being processed by the I/O thread
     // This tracks batches that have been dequeued but not yet fully sent
     private final AtomicInteger processingCount = new AtomicInteger(0);
@@ -380,32 +385,39 @@ public class WebSocketSendQueue implements QuietCloseable {
      * The server flushes pending durable ACKs before sending the PONG,
      * so after this method returns {@code getDurableSeqTxn()} reflects
      * all durable progress up to the moment the server processed the PING.
+     * <p>
+     * Concurrent ping callers are serialized: each caller gets its own
+     * PING / PONG round-trip so the post-condition holds for every caller
+     * independently. A second caller may wait up to {@code pingTimeoutMs}
+     * for an in-flight ping to complete before its own ping starts.
      */
     public void ping() {
-        checkError();
-        synchronized (processingLock) {
-            pingComplete = false;
-            pingRequested = true;
-            processingLock.notifyAll();
-            long deadline = System.nanoTime() + pingTimeoutMs * 1_000_000L;
-            while (!pingComplete && running) {
-                long remaining = (deadline - System.nanoTime()) / 1_000_000L;
-                if (remaining <= 0) {
-                    throw new LineSenderException("Ping timed out");
+        synchronized (pingLock) {
+            checkError();
+            synchronized (processingLock) {
+                pingComplete = false;
+                pingRequested = true;
+                processingLock.notifyAll();
+                long deadline = System.nanoTime() + pingTimeoutMs * 1_000_000L;
+                while (!pingComplete && running) {
+                    long remaining = (deadline - System.nanoTime()) / 1_000_000L;
+                    if (remaining <= 0) {
+                        throw new LineSenderException("Ping timed out");
+                    }
+                    try {
+                        processingLock.wait(remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new LineSenderException("Ping interrupted");
+                    }
                 }
-                try {
-                    processingLock.wait(remaining);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new LineSenderException("Ping interrupted");
+                if (!pingComplete) {
+                    checkError();
+                    throw new LineSenderException("Ping aborted: send queue is shutting down");
                 }
             }
-            if (!pingComplete) {
-                checkError();
-                throw new LineSenderException("Ping aborted: send queue is shutting down");
-            }
+            checkError();
         }
-        checkError();
     }
 
     /**
@@ -756,19 +768,12 @@ public class WebSocketSendQueue implements QuietCloseable {
 
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
-            if (!WebSocketResponse.isStructurallyValid(payloadPtr, payloadLen)) {
+            // readFrom validates inline; a single pass parses and bounds-checks.
+            if (!response.readFrom(payloadPtr, payloadLen)) {
                 LineSenderException error = new LineSenderException(
                         "Invalid ACK response payload [length=" + payloadLen + ']'
                 );
                 LOG.error("Invalid ACK response payload [length={}]", payloadLen);
-                failConnection(error);
-                return;
-            }
-
-            // Parse response from binary payload
-            if (!response.readFrom(payloadPtr, payloadLen)) {
-                LineSenderException error = new LineSenderException("Failed to parse ACK response");
-                LOG.error("Failed to parse response");
                 failConnection(error);
                 return;
             }

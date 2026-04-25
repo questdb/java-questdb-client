@@ -63,10 +63,9 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
     @Test
     public void testConnectionFailureIsSenderLevelTerminalState() throws Exception {
         assertMemoryLeak(() -> {
-            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
                     "localhost", 0, 10_000, 0, 0L, 8
-            );
-            try {
+            )) {
                 LineSenderException failure = new LineSenderException(
                         "Server error for batch 7: WRITE_ERROR - disk full"
                 );
@@ -90,8 +89,6 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
                     Assert.assertSame(failure, e);
                     assertStackContains(e, "flush");
                 }
-            } finally {
-                sender.close();
             }
         });
     }
@@ -259,19 +256,23 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
         // landed" would get a false affirmative; the error only surfaced
         // on the next flush's waitForAck.
         //
-        // Fix: route the error through inFlightWindow.fail so it is
-        // observable via getLastError() and the next waitForAck raises it.
+        // Fix: capture the first error during the ping round and throw it
+        // after PONG so ping() callers see the failure directly. Also route
+        // through inFlightWindow.fail so subsequent waitForAck / flush
+        // calls re-observe it. Frames arriving between the error and PONG
+        // are still processed so durable/committed progress is preserved.
         assertMemoryLeak(() -> {
             // inFlightWindowSize=1 routes ping() through syncPing (the code under test).
             // The injected inFlightWindow can still hold multiple batches.
             QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1);
             PingTestClient client = new PingTestClient();
             try {
-                // Server sends an error frame for seq=2, then PONG.
+                // Server sends an error frame for seq=2, a durable ack, then PONG.
                 client.frameSequence.add(handler -> emitBinaryResponse(
                         handler,
                         WebSocketResponse.error(2L, WebSocketResponse.STATUS_SCHEMA_MISMATCH, "column type mismatch")
                 ));
+                client.frameSequence.add(handler -> emitBinaryResponse(handler, WebSocketResponse.durableAck("trades", 9)));
                 client.frameSequence.add(handler -> handler.onPong(0, 0));
 
                 setField(sender, "client", client);
@@ -282,19 +283,27 @@ public class QwpWebSocketSenderStateTest extends AbstractTest {
                 window.addInFlight(2);
                 setField(sender, "inFlightWindow", window);
 
-                sender.ping();
+                try {
+                    sender.ping();
+                    Assert.fail("syncPing must throw on server error frame");
+                } catch (LineSenderException expected) {
+                    Assert.assertTrue(
+                            "error message must be propagated from the server frame",
+                            expected.getMessage() != null && expected.getMessage().contains("column type mismatch")
+                    );
+                }
 
                 Assert.assertTrue(client.pingSent);
-                // Fix: error recorded on the window, visible to the next
-                // waitForAck / flush. Without the fix, getLastError() is null.
+                // Durable progress observed before the throw must be preserved.
+                Assert.assertEquals(9L, sender.getHighestDurableSeqTxn("trades"));
+                // Error is also recorded on the window so the next waitForAck / flush sees it.
                 Throwable err = window.getLastError();
                 Assert.assertNotNull(
-                        "syncPing must surface server error frames via inFlightWindow.fail",
+                        "syncPing must also record the error on the inFlightWindow",
                         err
                 );
                 Assert.assertTrue(err instanceof LineSenderException);
                 Assert.assertTrue(
-                        "error message must be propagated from the server frame",
                         err.getMessage() != null && err.getMessage().contains("column type mismatch")
                 );
             } finally {
