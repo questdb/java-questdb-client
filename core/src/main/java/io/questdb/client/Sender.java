@@ -619,6 +619,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private PrivateKey privateKey;
         private int protocol = PARAMETER_NOT_SET_EXPLICITLY;
         private int protocolVersion = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean requestDurableAck;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
         private boolean tlsEnabled;
@@ -932,7 +933,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         actualAutoFlushIntervalNanos,
                         actualInFlightWindowSize,
                         wsAuthHeader,
-                        actualMaxSchemasPerConnection
+                        actualMaxSchemasPerConnection,
+                        requestDurableAck
                 );
             }
 
@@ -1484,6 +1486,27 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Opts the connection in for STATUS_DURABLE_ACK frames. When enabled,
+         * servers with primary replication will emit per-table durable-upload
+         * watermarks as WAL data reaches the object store.
+         * <p>
+         * This setting is only supported for WebSocket transport.
+         * <p>
+         * Observe durable progress via
+         * {@link QwpWebSocketSender#getHighestDurableSeqTxn(CharSequence)}.
+         *
+         * @param enabled true to request durable ACKs
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder requestDurableAck(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
+            }
+            this.requestDurableAck = enabled;
+            return this;
+        }
+
+        /**
          * Configures the maximum time the Sender will spend retrying upon receiving a recoverable error from the server.
          * <br>
          * This setting is applicable only when communicating over the HTTP transport, and it is illegal to invoke this
@@ -1875,6 +1898,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "in_flight_window");
                     int windowSize = parseIntValue(sink, "in_flight_window");
                     inFlightWindowSize(windowSize);
+                } else if (Chars.equals("request_durable_ack", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "request_durable_ack");
+                    if (Chars.equalsIgnoreCase("on", sink)) {
+                        requestDurableAck(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink)) {
+                        requestDurableAck(false);
+                    } else {
+                        throw new LineSenderException("invalid request_durable_ack [value=").put(sink).put(", allowed-values=[on, off]]");
+                    }
                 } else if (Chars.equals("max_schemas_per_connection", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("max_schemas_per_connection is only supported for WebSocket transport");
@@ -1971,6 +2006,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put("[minimalCapacity=").put(MIN_BUFFER_SIZE)
                         .put(", requestedCapacity=").put(bufferCapacity)
                         .put("]");
+            }
+            if (requestDurableAck && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
             }
             if (protocol == PROTOCOL_HTTP) {
                 if (httpClientConfiguration.getMaximumRequestBufferSize() < httpClientConfiguration.getInitialRequestBufferSize()) {
