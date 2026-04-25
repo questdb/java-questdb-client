@@ -395,6 +395,42 @@ public class InFlightWindowTest {
     }
 
     @Test
+    public void testGetHighestAckedSequenceInitiallyMinusOne() {
+        InFlightWindow window = new InFlightWindow(8, 1000);
+        assertEquals(-1, window.getHighestAckedSequence());
+    }
+
+    @Test
+    public void testGetHighestAckedSequenceAdvancesOnAcknowledge() {
+        InFlightWindow window = new InFlightWindow(8, 1000);
+
+        window.addInFlight(0);
+        window.addInFlight(1);
+        window.addInFlight(2);
+
+        window.acknowledge(0);
+        assertEquals(0, window.getHighestAckedSequence());
+
+        window.acknowledgeUpTo(2);
+        assertEquals(2, window.getHighestAckedSequence());
+    }
+
+    @Test
+    public void testGetHighestAckedSequenceDoesNotRegress() {
+        InFlightWindow window = new InFlightWindow(8, 1000);
+
+        window.addInFlight(0);
+        window.addInFlight(1);
+
+        window.acknowledgeUpTo(1);
+        assertEquals(1, window.getHighestAckedSequence());
+
+        // Duplicate/lower ack should not regress
+        window.acknowledge(0);
+        assertEquals(1, window.getHighestAckedSequence());
+    }
+
+    @Test
     public void testDefaultWindowSize() {
         InFlightWindow window = new InFlightWindow();
         assertEquals(InFlightWindow.DEFAULT_WINDOW_SIZE, window.getMaxWindowSize());

@@ -24,41 +24,56 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.std.LongList;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.Utf8SequenceObjHashMap;
+import io.questdb.client.std.str.DirectUtf8String;
 import io.questdb.client.std.str.Utf8s;
+import org.jetbrains.annotations.TestOnly;
 
 import java.nio.charset.StandardCharsets;
 
 /**
  * Binary response format for WebSocket QWP v1 protocol.
  * <p>
- * Response format (little-endian):
+ * STATUS_OK response format (little-endian):
+ * <pre>
+ * +--------+----------+------------+--------------------------------------+
+ * | status | sequence | tableCount | table entries                         |
+ * | 1 byte | 8 bytes  | 2 bytes    | [nameLen(2)+name(N)+seqTxn(8)] * cnt |
+ * +--------+----------+------------+--------------------------------------+
+ * </pre>
+ * <p>
+ * STATUS_DURABLE_ACK response format:
+ * <pre>
+ * +--------+------------+--------------------------------------+
+ * | status | tableCount | table entries                         |
+ * | 1 byte | 2 bytes    | [nameLen(2)+name(N)+seqTxn(8)] * cnt |
+ * +--------+------------+--------------------------------------+
+ * </pre>
+ * <p>
+ * Error response format:
  * <pre>
  * +--------+----------+------------------+
- * | status | sequence | error (if any)   |
+ * | status | sequence | error            |
  * | 1 byte | 8 bytes  | 2 bytes + UTF-8  |
  * +--------+----------+------------------+
  * </pre>
- * <p>
- * Status codes:
- * <ul>
- *   <li>0x00: Success (ACK)</li>
- *   <li>0x05: Parse error</li>
- *   <li>0x03: Schema mismatch</li>
- *   <li>0x09: Write error</li>
- *   <li>0x08: Security error</li>
- *   <li>0x06: Internal error</li>
- * </ul>
- * <p>
- * The sequence number allows correlation with the original request.
- * Error message is only present when status != 0.
  */
 public class WebSocketResponse {
 
     public static final int MAX_ERROR_MESSAGE_LENGTH = 1024;
+    public static final int MIN_DURABLE_ACK_SIZE = 3; // status + tableCount
     public static final int MIN_ERROR_RESPONSE_SIZE = 11; // status + sequence + error length
-    // Minimum response size: status (1) + sequence (8)
-    public static final int MIN_RESPONSE_SIZE = 9;
+    public static final int MIN_OK_RESPONSE_SIZE = 11; // status + sequence + tableCount
+    /**
+     * Per-table durable-upload acknowledgment. Emitted by servers where
+     * primary replication is enabled and the connection opted in via
+     * X-QWP-Request-Durable-Ack. Payload: status + tableCount + per-table
+     * entries (nameLen + name + seqTxn).
+     */
+    public static final byte STATUS_DURABLE_ACK = 0x02;
     public static final byte STATUS_INTERNAL_ERROR = 0x06;
     // Status codes (must match QWP_SPECIFICATION.md)
     public static final byte STATUS_OK = 0x00;
@@ -66,6 +81,14 @@ public class WebSocketResponse {
     public static final byte STATUS_SCHEMA_MISMATCH = 0x03;
     public static final byte STATUS_SECURITY_ERROR = 0x08;
     public static final byte STATUS_WRITE_ERROR = 0x09;
+    private final DirectUtf8String lookupKey = new DirectUtf8String();
+    // Caches decoded table names so the same native-memory byte sequence resolves to
+    // the same interned String across frames. First sight of a name allocates a String
+    // (decoded via Utf8s.stringFromUtf8Bytes) and an owned Utf8String map key; every
+    // subsequent sight is allocation-free.
+    private final Utf8SequenceObjHashMap<String> tableNameCache = new Utf8SequenceObjHashMap<>();
+    private final ObjList<String> tableNames = new ObjList<>();
+    private final LongList tableSeqTxns = new LongList();
     private String errorMessage;
     private int errorMessageUtf8Length;
     private long sequence;
@@ -79,8 +102,22 @@ public class WebSocketResponse {
     }
 
     /**
+     * Creates a durable-upload ACK response with a single table entry.
+     */
+    @TestOnly
+    public static WebSocketResponse durableAck(String tableName, long seqTxn) {
+        WebSocketResponse response = new WebSocketResponse();
+        response.status = STATUS_DURABLE_ACK;
+        response.sequence = -1;
+        response.tableNames.add(tableName);
+        response.tableSeqTxns.add(seqTxn);
+        return response;
+    }
+
+    /**
      * Creates an error response.
      */
+    @TestOnly
     public static WebSocketResponse error(long sequence, byte status, String errorMessage) {
         WebSocketResponse response = new WebSocketResponse();
         response.status = status;
@@ -92,38 +129,43 @@ public class WebSocketResponse {
 
     /**
      * Validates binary response framing without allocating.
-     * <p>
-     * Accepted formats:
-     * <ul>
-     *   <li>OK: exactly 9 bytes (status + sequence)</li>
-     *   <li>Error: exactly 11 + errorLength bytes</li>
-     * </ul>
      *
      * @param ptr    response buffer pointer
      * @param length response frame payload length
      * @return true if payload structure is valid
      */
     public static boolean isStructurallyValid(long ptr, int length) {
-        if (length < MIN_RESPONSE_SIZE) {
+        if (length < 1) {
             return false;
         }
 
         byte status = Unsafe.getUnsafe().getByte(ptr);
         if (status == STATUS_OK) {
-            return length == MIN_RESPONSE_SIZE;
+            if (length < MIN_OK_RESPONSE_SIZE) {
+                return false;
+            }
+            return validateTableEntries(ptr + 9, length - 9);
         }
 
+        if (status == STATUS_DURABLE_ACK) {
+            if (length < MIN_DURABLE_ACK_SIZE) {
+                return false;
+            }
+            return validateTableEntries(ptr + 1, length - 1);
+        }
+
+        // Error response
         if (length < MIN_ERROR_RESPONSE_SIZE) {
             return false;
         }
-
-        int msgLen = Unsafe.getUnsafe().getShort(ptr + MIN_RESPONSE_SIZE) & 0xFFFF;
+        int msgLen = Unsafe.getUnsafe().getShort(ptr + 9) & 0xFFFF;
         return length == MIN_ERROR_RESPONSE_SIZE + msgLen;
     }
 
     /**
      * Creates a success response.
      */
+    @TestOnly
     public static WebSocketResponse success(long sequence) {
         WebSocketResponse response = new WebSocketResponse();
         response.status = STATUS_OK;
@@ -140,10 +182,18 @@ public class WebSocketResponse {
     }
 
     /**
-     * Returns the sequence number.
+     * Returns the client batch sequence number (STATUS_OK and error frames),
+     * or -1 for STATUS_DURABLE_ACK frames.
      */
     public long getSequence() {
         return sequence;
+    }
+
+    /**
+     * Returns the raw status byte.
+     */
+    public byte getStatus() {
+        return status;
     }
 
     /**
@@ -153,6 +203,8 @@ public class WebSocketResponse {
         switch (status) {
             case STATUS_OK:
                 return "OK";
+            case STATUS_DURABLE_ACK:
+                return "DURABLE_ACK";
             case STATUS_PARSE_ERROR:
                 return "PARSE_ERROR";
             case STATUS_SCHEMA_MISMATCH:
@@ -168,8 +220,27 @@ public class WebSocketResponse {
         }
     }
 
+    public int getTableEntryCount() {
+        return tableNames.size();
+    }
+
+    public String getTableName(int index) {
+        return tableNames.getQuick(index);
+    }
+
+    public long getTableSeqTxn(int index) {
+        return tableSeqTxns.getQuick(index);
+    }
+
     /**
-     * Returns true if this is a success response.
+     * Returns true when this is a per-table durable-upload ACK (STATUS_DURABLE_ACK).
+     */
+    public boolean isDurableAck() {
+        return status == STATUS_DURABLE_ACK;
+    }
+
+    /**
+     * Returns true if this is a success response (STATUS_OK).
      */
     public boolean isSuccess() {
         return status == STATUS_OK;
@@ -183,50 +254,70 @@ public class WebSocketResponse {
      * @return true if successfully parsed, false if not enough data
      */
     public boolean readFrom(long ptr, int length) {
-        if (length < MIN_RESPONSE_SIZE) {
+        tableNames.clear();
+        tableSeqTxns.clear();
+
+        if (length < 1) {
             return false;
         }
 
-        int offset = 0;
+        status = Unsafe.getUnsafe().getByte(ptr);
 
-        // Status (1 byte)
-        status = Unsafe.getUnsafe().getByte(ptr + offset);
-        offset += 1;
-
-        // Sequence (8 bytes, little-endian)
-        sequence = Unsafe.getUnsafe().getLong(ptr + offset);
-        offset += 8;
-
-        // Error message (if status != OK and more data available)
-        if (status != STATUS_OK && length >= offset + 2) {
-            int msgLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
-            offset += 2;
-
-            if (length >= offset + msgLen && msgLen > 0) {
-                byte[] msgBytes = new byte[msgLen];
-                for (int i = 0; i < msgLen; i++) {
-                    msgBytes[i] = Unsafe.getUnsafe().getByte(ptr + offset + i);
-                }
-                errorMessage = new String(msgBytes, StandardCharsets.UTF_8);
-                errorMessageUtf8Length = -1;
-            } else {
-                errorMessage = null;
-                errorMessageUtf8Length = 0;
+        if (status == STATUS_OK) {
+            if (length < MIN_OK_RESPONSE_SIZE) {
+                return false;
             }
-        } else {
+            sequence = Unsafe.getUnsafe().getLong(ptr + 1);
             errorMessage = null;
             errorMessageUtf8Length = -1;
+            return readTableEntries(ptr + 9, length - 9);
         }
 
+        if (status == STATUS_DURABLE_ACK) {
+            if (length < MIN_DURABLE_ACK_SIZE) {
+                return false;
+            }
+            sequence = -1;
+            errorMessage = null;
+            errorMessageUtf8Length = -1;
+            return readTableEntries(ptr + 1, length - 1);
+        }
+
+        // Error response
+        if (length < MIN_ERROR_RESPONSE_SIZE) {
+            return false;
+        }
+        sequence = Unsafe.getUnsafe().getLong(ptr + 1);
+        int offset = 9;
+        int msgLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+        offset += 2;
+        if (length < offset + msgLen) {
+            return false;
+        }
+        if (msgLen > 0) {
+            byte[] msgBytes = new byte[msgLen];
+            for (int i = 0; i < msgLen; i++) {
+                msgBytes[i] = Unsafe.getUnsafe().getByte(ptr + offset + i);
+            }
+            errorMessage = new String(msgBytes, StandardCharsets.UTF_8);
+            errorMessageUtf8Length = -1;
+        } else {
+            errorMessage = null;
+            errorMessageUtf8Length = 0;
+        }
         return true;
     }
 
     /**
      * Calculates the serialized size of this response.
      */
+    @TestOnly
     public int serializedSize() {
         if (status == STATUS_OK) {
-            return MIN_RESPONSE_SIZE;
+            return MIN_OK_RESPONSE_SIZE + tableEntriesSize();
+        }
+        if (status == STATUS_DURABLE_ACK) {
+            return MIN_DURABLE_ACK_SIZE + tableEntriesSize();
         }
         return MIN_ERROR_RESPONSE_SIZE + getErrorMessageUtf8Length();
     }
@@ -234,7 +325,9 @@ public class WebSocketResponse {
     @Override
     public String toString() {
         if (isSuccess()) {
-            return "WebSocketResponse{status=OK, seq=" + sequence + "}";
+            return "WebSocketResponse{status=OK, seq=" + sequence + ", tables=" + tableNames.size() + "}";
+        } else if (isDurableAck()) {
+            return "WebSocketResponse{status=DURABLE_ACK, tables=" + tableNames.size() + "}";
         } else {
             return "WebSocketResponse{status=" + getStatusName() + ", seq=" + sequence +
                     ", error=" + errorMessage + "}";
@@ -247,19 +340,23 @@ public class WebSocketResponse {
      * @param ptr destination address
      * @return number of bytes written
      */
+    @TestOnly
     public int writeTo(long ptr) {
         int offset = 0;
 
-        // Status (1 byte)
         Unsafe.getUnsafe().putByte(ptr + offset, status);
         offset += 1;
 
-        // Sequence (8 bytes, little-endian)
-        Unsafe.getUnsafe().putLong(ptr + offset, sequence);
-        offset += 8;
+        if (status == STATUS_OK) {
+            Unsafe.getUnsafe().putLong(ptr + offset, sequence);
+            offset += 8;
+            offset += writeTableEntries(ptr + offset);
+        } else if (status == STATUS_DURABLE_ACK) {
+            offset += writeTableEntries(ptr + offset);
+        } else {
+            Unsafe.getUnsafe().putLong(ptr + offset, sequence);
+            offset += 8;
 
-        // Error message length and bytes (if any)
-        if (status != STATUS_OK) {
             int msgLen = getErrorMessageUtf8Length();
             // Length prefix (2 bytes, little-endian)
             Unsafe.getUnsafe().putShort(ptr + offset, (short) msgLen);
@@ -270,12 +367,105 @@ public class WebSocketResponse {
                 offset += Utf8s.strCpyUtf8(errorMessage, ptr + offset, msgLen);
             }
         }
+        return offset;
+    }
 
+    // Validates inline as it parses; returns false on truncation, lying-length
+    // entries, empty table names, or trailing garbage. On false, tableNames /
+    // tableSeqTxns may hold partial state, but the caller (readFrom) clears
+    // both lists at the start of every call so partial state never leaks.
+    private boolean readTableEntries(long ptr, int remaining) {
+        if (remaining < 2) {
+            return false;
+        }
+        int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
+        int offset = 2;
+        for (int i = 0; i < tableCount; i++) {
+            if (remaining < offset + 2) {
+                return false;
+            }
+            int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+            offset += 2;
+            // Empty table names are rejected as structurally invalid - a valid
+            // table name is never zero bytes, and accepting empty names would
+            // let a misbehaving server poison the per-table tracker with "" entries.
+            if (nameLen == 0 || remaining < offset + nameLen + 8) {
+                return false;
+            }
+            long nameLo = ptr + offset;
+            long nameHi = nameLo + nameLen;
+            offset += nameLen;
+            long seqTxn = Unsafe.getUnsafe().getLong(ptr + offset);
+            offset += 8;
+            tableNames.add(internTableName(nameLo, nameHi));
+            tableSeqTxns.add(seqTxn);
+        }
+        return remaining == offset;
+    }
+
+    private String internTableName(long lo, long hi) {
+        lookupKey.of(lo, hi);
+        int keyIndex = tableNameCache.keyIndex(lookupKey);
+        if (keyIndex < 0) {
+            return tableNameCache.valueAtQuick(keyIndex);
+        }
+        String decoded = Utf8s.stringFromUtf8Bytes(lo, hi);
+        tableNameCache.putAt(keyIndex, lookupKey, decoded);
+        return decoded;
+    }
+
+    private int tableEntriesSize() {
+        int size = 0;
+        for (int i = 0, n = tableNames.size(); i < n; i++) {
+            size += 2 + tableNames.getQuick(i).getBytes(StandardCharsets.UTF_8).length + 8;
+        }
+        return size;
+    }
+
+    private static boolean validateTableEntries(long ptr, int remaining) {
+        if (remaining < 2) {
+            return false;
+        }
+        int tableCount = Unsafe.getUnsafe().getShort(ptr) & 0xFFFF;
+        int offset = 2;
+        for (int i = 0; i < tableCount; i++) {
+            if (remaining < offset + 2) {
+                return false;
+            }
+            int nameLen = Unsafe.getUnsafe().getShort(ptr + offset) & 0xFFFF;
+            offset += 2;
+            // Empty table names are rejected as structurally invalid - a valid
+            // table name is never zero bytes, and accepting empty names would
+            // let a misbehaving server poison the per-table tracker with "" entries.
+            if (nameLen == 0 || remaining < offset + nameLen + 8) {
+                return false;
+            }
+            offset += nameLen + 8;
+        }
+        return remaining == offset;
+    }
+
+    private int writeTableEntries(long ptr) {
+        int offset = 0;
+        int count = tableNames.size();
+        Unsafe.getUnsafe().putShort(ptr + offset, (short) count);
+        offset += 2;
+        for (int i = 0; i < count; i++) {
+            byte[] nameBytes = tableNames.getQuick(i).getBytes(StandardCharsets.UTF_8);
+            Unsafe.getUnsafe().putShort(ptr + offset, (short) nameBytes.length);
+            offset += 2;
+            for (int j = 0; j < nameBytes.length; j++) {
+                Unsafe.getUnsafe().putByte(ptr + offset + j, nameBytes[j]);
+            }
+            offset += nameBytes.length;
+            Unsafe.getUnsafe().putLong(ptr + offset, tableSeqTxns.getQuick(i));
+            offset += 8;
+        }
         return offset;
     }
 
     private int getErrorMessageUtf8Length() {
-        if (status == STATUS_OK || errorMessage == null || errorMessage.isEmpty()) {
+        if (status == STATUS_OK || status == STATUS_DURABLE_ACK || errorMessage == null || errorMessage.isEmpty()) {
             errorMessageUtf8Length = 0;
             return 0;
         }

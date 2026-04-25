@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
@@ -34,8 +35,13 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Integration tests for QWP v1 WebSocket ACK delivery mechanism.
@@ -195,17 +201,160 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
         }
     }
 
+    @Test
+    public void testDurableAckUpgradeHeaderNotSentByDefault() throws Exception {
+        int port = TEST_PORT + 31;
+        AtomicReference<String> capturedRequest = new AtomicReference<>();
+
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            serverSocket.setSoTimeout(5000);
+
+            Thread serverThread = new Thread(() -> {
+                try {
+                    Socket client = serverSocket.accept();
+                    InputStream in = client.getInputStream();
+                    StringBuilder request = new StringBuilder();
+                    byte[] buf = new byte[1];
+                    while (true) {
+                        int read = in.read(buf);
+                        if (read <= 0) {
+                            break;
+                        }
+                        request.append((char) buf[0]);
+                        if (request.toString().endsWith("\r\n\r\n")) {
+                            break;
+                        }
+                    }
+                    capturedRequest.set(request.toString());
+                    client.close();
+                } catch (Exception e) {
+                    // expected
+                }
+            });
+            serverThread.start();
+
+            try {
+                QwpWebSocketSender.connect("localhost", port, null,
+                        0, 0, 0, 1, null).close();
+            } catch (LineSenderException e) {
+                // expected - server doesn't complete handshake
+            }
+
+            serverThread.join(5000);
+
+            String request = capturedRequest.get();
+            Assert.assertNotNull("Server should have received upgrade request", request);
+            Assert.assertFalse("Request should NOT contain X-QWP-Request-Durable-Ack header",
+                    request.contains("X-QWP-Request-Durable-Ack"));
+        }
+    }
+
+    @Test
+    public void testDurableAckUpgradeHeaderSent() throws Exception {
+        int port = TEST_PORT + 30;
+        AtomicReference<String> capturedRequest = new AtomicReference<>();
+
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            serverSocket.setSoTimeout(5000);
+
+            Thread serverThread = new Thread(() -> {
+                try {
+                    Socket client = serverSocket.accept();
+                    InputStream in = client.getInputStream();
+                    StringBuilder request = new StringBuilder();
+                    byte[] buf = new byte[1];
+                    while (true) {
+                        int read = in.read(buf);
+                        if (read <= 0) {
+                            break;
+                        }
+                        request.append((char) buf[0]);
+                        if (request.toString().endsWith("\r\n\r\n")) {
+                            break;
+                        }
+                    }
+                    capturedRequest.set(request.toString());
+                    client.close();
+                } catch (Exception e) {
+                    // expected
+                }
+            });
+            serverThread.start();
+
+            try {
+                QwpWebSocketSender.connect("localhost", port, null,
+                        0, 0, 0, 1, null,
+                        QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                        true).close();
+            } catch (LineSenderException e) {
+                // expected - server doesn't complete handshake
+            }
+
+            serverThread.join(5000);
+
+            String request = capturedRequest.get();
+            Assert.assertNotNull("Server should have received upgrade request", request);
+            Assert.assertTrue("Request should contain X-QWP-Request-Durable-Ack header",
+                    request.contains("X-QWP-Request-Durable-Ack: true"));
+        }
+    }
+
+    @Test
+    public void testSyncDurableAckDuringWaitForAck() throws Exception {
+        int port = TEST_PORT + 25;
+        DurableAckThenStatusOkHandler handler = new DurableAckThenStatusOkHandler();
+
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("Server failed to start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            // window=1 for sync mode
+            try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", port, null, 0, 0, 0, 1, null)) {
+                sender.table("trades")
+                        .longColumn("price", 100)
+                        .atNow();
+                sender.flush();
+
+                Assert.assertEquals(42L, sender.getHighestDurableSeqTxn("trades"));
+                Assert.assertEquals(10L, sender.getHighestAckedSeqTxn("trades"));
+            }
+        }
+    }
+
+    @Test
+    public void testSyncFlushUpdatesCommittedSeqTxnsWithTableEntries() throws Exception {
+        int port = TEST_PORT + 24;
+        AckWithTableEntriesHandler handler = new AckWithTableEntriesHandler();
+
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("Server failed to start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            // window=1 for sync mode
+            try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", port, null, 0, 0, 0, 1, null)) {
+                sender.table("trades")
+                        .longColumn("price", 100)
+                        .atNow();
+                sender.flush();
+
+                Assert.assertEquals(10L, sender.getHighestAckedSeqTxn("trades"));
+                Assert.assertEquals(20L, sender.getHighestAckedSeqTxn("orders"));
+                Assert.assertEquals(-1L, sender.getHighestAckedSeqTxn("other"));
+            }
+        }
+    }
+
     /**
      * Creates a binary ACK response using WebSocketResponse format.
-     * Format: status (1 byte) + sequence (8 bytes little-endian)
+     * Format: status (1) + sequence (8) + tableCount (2, zero entries)
      */
     private static byte[] createAckResponse(long sequence) {
-        byte[] response = new byte[WebSocketResponse.MIN_RESPONSE_SIZE];
+        byte[] response = new byte[WebSocketResponse.MIN_OK_RESPONSE_SIZE];
 
-        // Status OK (0)
         response[0] = WebSocketResponse.STATUS_OK;
 
-        // Sequence (little-endian)
         response[1] = (byte) (sequence & 0xFF);
         response[2] = (byte) ((sequence >> 8) & 0xFF);
         response[3] = (byte) ((sequence >> 16) & 0xFF);
@@ -215,7 +364,80 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
         response[7] = (byte) ((sequence >> 48) & 0xFF);
         response[8] = (byte) ((sequence >> 56) & 0xFF);
 
+        // tableCount = 0
+        response[9] = 0;
+        response[10] = 0;
+
         return response;
+    }
+
+    private static byte[] createAckResponseWithTables(long sequence, String[] tableNames, long[] seqTxns) {
+        byte[][] nameBytes = new byte[tableNames.length][];
+        int size = 1 + 8 + 2;
+        for (int i = 0; i < tableNames.length; i++) {
+            nameBytes[i] = tableNames[i].getBytes(StandardCharsets.UTF_8);
+            size += 2 + nameBytes[i].length + 8;
+        }
+
+        byte[] response = new byte[size];
+        int offset = 0;
+        response[offset++] = WebSocketResponse.STATUS_OK;
+        for (int i = 0; i < 8; i++) {
+            response[offset++] = (byte) ((sequence >> (i * 8)) & 0xFF);
+        }
+        response[offset++] = (byte) (tableNames.length & 0xFF);
+        response[offset++] = (byte) ((tableNames.length >> 8) & 0xFF);
+        for (int i = 0; i < tableNames.length; i++) {
+            response[offset++] = (byte) (nameBytes[i].length & 0xFF);
+            response[offset++] = (byte) ((nameBytes[i].length >> 8) & 0xFF);
+            System.arraycopy(nameBytes[i], 0, response, offset, nameBytes[i].length);
+            offset += nameBytes[i].length;
+            for (int j = 0; j < 8; j++) {
+                response[offset++] = (byte) ((seqTxns[i] >> (j * 8)) & 0xFF);
+            }
+        }
+        return response;
+    }
+
+    private static byte[] createDurableAckResponse(String[] tableNames, long[] seqTxns) {
+        byte[][] nameBytes = new byte[tableNames.length][];
+        int size = 1 + 2;
+        for (int i = 0; i < tableNames.length; i++) {
+            nameBytes[i] = tableNames[i].getBytes(StandardCharsets.UTF_8);
+            size += 2 + nameBytes[i].length + 8;
+        }
+
+        byte[] response = new byte[size];
+        int offset = 0;
+        response[offset++] = WebSocketResponse.STATUS_DURABLE_ACK;
+        response[offset++] = (byte) (tableNames.length & 0xFF);
+        response[offset++] = (byte) ((tableNames.length >> 8) & 0xFF);
+        for (int i = 0; i < tableNames.length; i++) {
+            response[offset++] = (byte) (nameBytes[i].length & 0xFF);
+            response[offset++] = (byte) ((nameBytes[i].length >> 8) & 0xFF);
+            System.arraycopy(nameBytes[i], 0, response, offset, nameBytes[i].length);
+            offset += nameBytes[i].length;
+            for (int j = 0; j < 8; j++) {
+                response[offset++] = (byte) ((seqTxns[i] >> (j * 8)) & 0xFF);
+            }
+        }
+        return response;
+    }
+
+    private static class AckWithTableEntriesHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final AtomicLong nextSequence = new AtomicLong(0);
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long sequence = nextSequence.getAndIncrement();
+            try {
+                client.sendBinary(createAckResponseWithTables(sequence,
+                        new String[]{"trades", "orders"},
+                        new long[]{10L, 20L}));
+            } catch (IOException e) {
+                LOG.error("Failed to send ACK with tables", e);
+            }
+        }
     }
 
     private static class ClosingServerHandler implements TestWebSocketServer.WebSocketServerHandler {
@@ -256,6 +478,27 @@ public class QwpWebSocketAckIntegrationTest extends AbstractTest {
                     LOG.error("Failed to send delayed ACK", e);
                 }
             }).start();
+        }
+    }
+
+    private static class DurableAckThenStatusOkHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final AtomicLong nextSequence = new AtomicLong(0);
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long sequence = nextSequence.getAndIncrement();
+            try {
+                // Send durable ACK first
+                client.sendBinary(createDurableAckResponse(
+                        new String[]{"trades"},
+                        new long[]{42L}));
+                // Then send STATUS_OK with committed seqTxns
+                client.sendBinary(createAckResponseWithTables(sequence,
+                        new String[]{"trades"},
+                        new long[]{10L}));
+            } catch (IOException e) {
+                LOG.error("Failed to send ACK frames", e);
+            }
         }
     }
 
