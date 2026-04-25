@@ -1,10 +1,48 @@
 steps:
-  - task: JavaToolInstaller@0
-    displayName: "Install Java 17"
-    inputs:
-      versionSpec: "17"
-      jdkArchitectureOption: "$(jdkArch)"
-      jdkSourceOption: "PreInstalled"
+  - bash: |
+      set -eux
+      case "$(jdkArch)" in
+        arm64) ARCH="aarch64" ;;
+        *)     ARCH="x64" ;;
+      esac
+      curl -fsSL -o "$HOME/graalvm.tar.gz" \
+        "https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-${ARCH}_bin.tar.gz"
+      mkdir -p "$HOME/graalvm"
+      tar -xzf "$HOME/graalvm.tar.gz" -C "$HOME/graalvm" --strip-components=1
+      echo "##vso[task.setvariable variable=JAVA_HOME]$HOME/graalvm"
+      echo "##vso[task.prependpath]$HOME/graalvm/bin"
+    displayName: "Install GraalVM JDK 25 (Linux)"
+    condition: eq(variables['Agent.OS'], 'Linux')
+
+  - bash: |
+      set -eux
+      case "$(jdkArch)" in
+        arm64) ARCH="aarch64" ;;
+        *)     ARCH="x64" ;;
+      esac
+      curl -fsSL -o "$HOME/graalvm.tar.gz" \
+        "https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_macos-${ARCH}_bin.tar.gz"
+      mkdir -p "$HOME/graalvm"
+      tar -xzf "$HOME/graalvm.tar.gz" -C "$HOME/graalvm" --strip-components=1
+      echo "##vso[task.setvariable variable=JAVA_HOME]$HOME/graalvm/Contents/Home"
+      echo "##vso[task.prependpath]$HOME/graalvm/Contents/Home/bin"
+    displayName: "Install GraalVM JDK 25 (macOS)"
+    condition: eq(variables['Agent.OS'], 'Darwin')
+
+  - powershell: |
+      $ErrorActionPreference = "Stop"
+      $url = "https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_windows-x64_bin.zip"
+      $zip = Join-Path $env:USERPROFILE "graalvm.zip"
+      $dest = Join-Path $env:USERPROFILE "graalvm"
+      Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+      if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+      Expand-Archive -Path $zip -DestinationPath $dest -Force
+      $jdkDir = Get-ChildItem -Path $dest -Directory | Select-Object -First 1
+      $javaHome = $jdkDir.FullName
+      Write-Host "##vso[task.setvariable variable=JAVA_HOME]$javaHome"
+      Write-Host "##vso[task.prependpath]$javaHome\bin"
+    displayName: "Install GraalVM JDK 25 (Windows)"
+    condition: eq(variables['Agent.OS'], 'Windows_NT')
 
   - bash: sudo sysctl -w fs.file-max=500000
     displayName: "Increase file count on Linux"

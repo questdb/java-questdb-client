@@ -109,11 +109,12 @@ jobs:
           wget -nv https://github.com/Kitware/CMake/releases/download/v3.29.2/cmake-3.29.2-linux-x86_64.tar.gz
           tar -zxf cmake-3.29.2-linux-x86_64.tar.gz
           echo "PATH=`pwd`/cmake-3.29.2-linux-x86_64/bin/:$PATH" >> "$GITHUB_ENV"
-      - name: Install JDK17 (for jni.h)
+      - name: Install GraalVM JDK 25 (for jni.h)
         run: |
-          wget -nv https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.11%2B9/OpenJDK17U-jdk_x64_linux_hotspot_17.0.11_9.tar.gz
-          tar xfz OpenJDK17U-jdk_x64_linux_hotspot_17.0.11_9.tar.gz
-          echo "JAVA_HOME=`pwd`/jdk-17.0.11+9/" >> "$GITHUB_ENV"
+          wget -nv -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz
+          mkdir graalvm
+          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
+          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
       - name: Generate Makefiles
         run: |
           cd ./core
@@ -144,11 +145,12 @@ jobs:
         run: |
           yum update -y
           yum install wget nasm zstd -y
-      - name: Install JDK17 (for jni.h)
+      - name: Install GraalVM JDK 25 (for jni.h)
         run: |
-          wget -v --timeout=180 https://api.adoptium.net/v3/binary/version/jdk-17.0.11+9/linux/aarch64/jdk/hotspot/normal/eclipse
-          tar xfvz eclipse
-          echo "JAVA_HOME=`pwd`/jdk-17.0.11+9/" >> "$GITHUB_ENV"
+          wget -v --timeout=180 -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-aarch64_bin.tar.gz
+          mkdir graalvm
+          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
+          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
       - name: CMAKE linux-aarch64
         run: |
           cd ./core
@@ -177,10 +179,16 @@ jobs:
           sudo sysctl -w fs.file-max=500000
           sudo apt-get update -y
           sudo apt-get install -y nasm gcc-mingw-w64 g++-mingw-w64
-      - name: Download windows jni_md.h from JDK 11
+      - name: Install GraalVM JDK 25 (for jni.h)
+        run: |
+          wget -nv -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz
+          mkdir graalvm
+          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
+          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
+      - name: Download windows jni_md.h from JDK 25
         run: |
           cd core
-          curl https://raw.githubusercontent.com/AdoptOpenJDK/openjdk-jdk11/master/src/java.base/windows/native/include/jni_md.h > $JAVA_HOME/include/jni_md.h
+          curl https://raw.githubusercontent.com/openjdk/jdk25u/master/src/java.base/windows/native/include/jni_md.h > $JAVA_HOME/include/jni_md.h
       - name: CMake Windows
         run: |
           cd core
