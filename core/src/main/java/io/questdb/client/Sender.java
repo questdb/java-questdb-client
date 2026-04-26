@@ -1577,9 +1577,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * watermarks as WAL data reaches the object store.
          * <p>
          * This setting is only supported for WebSocket transport.
-         * <p>
-         * Observe durable progress via
-         * {@link QwpWebSocketSender#getHighestDurableSeqTxn(CharSequence)}.
          *
          * @param enabled true to request durable ACKs
          * @return this instance for method chaining

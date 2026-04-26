@@ -33,12 +33,10 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
-import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
-import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.CharSequenceObjHashMap;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
@@ -113,22 +111,19 @@ public class QwpWebSocketSender implements Sender {
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
     private static final int MAX_TABLE_NAME_LENGTH = 127;
     private static final String WRITE_PATH = "/write/v4";
-    private final AckFrameHandler ackHandler = new AckFrameHandler(this);
-    private final WebSocketResponse ackResponse = new WebSocketResponse();
     private final String authorizationHeader;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
     // Auto-flush configuration
     private final int autoFlushRows;
+    private final AtomicReference<LineSenderException> connectionError = new AtomicReference<>();
     private final Decimal256 currentDecimal256 = new Decimal256();
     // Encoder for QWP v1 messages
     private final QwpWebSocketEncoder encoder;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
     private final String host;
-    // Flow control configuration
     private final int inFlightWindowSize;
-    private final AtomicReference<LineSenderException> connectionError = new AtomicReference<>();
     private final int maxSchemasPerConnection;
     private final int port;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
@@ -150,58 +145,21 @@ public class QwpWebSocketSender implements Sender {
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
     private long firstPendingRowTimeNanos;
-    // Configuration
     private boolean gorillaEnabled = true;
-    // Flow control
-    private InFlightWindow inFlightWindow;
     private int maxSentSchemaId = -1;
     // Track the highest symbol ID sent to server (for delta encoding)
     // Once sent over TCP, server is guaranteed to receive it (or connection dies)
     private int maxSentSymbolId = -1;
-    // Batch sequence counter (must match server's messageSequence)
-    private long nextBatchSequence = 0;
     private int nextSchemaId;
-    // Async mode: pending row tracking
     private long pendingBytes;
     private int pendingRowCount;
-    private final CharSequenceLongHashMap syncCommittedSeqTxns = new CharSequenceLongHashMap();
-    private final CharSequenceLongHashMap syncDurableSeqTxns = new CharSequenceLongHashMap();
     private boolean requestDurableAck;
-    private boolean sawBinaryAck;
-    private boolean sawPong;
-    private WebSocketSendQueue sendQueue;
-    private SegmentLog segmentLog;
-    // True when this sender took ownership of segmentLog (e.g. via the
-    // connect-string builder); close() will then close the log too.
-    private boolean ownsSegmentLog;
-    // Cursor engine SF: when set, replaces the legacy sendQueue + SegmentLog
-    // pair. The producer (user thread) writes encoded QWP frames into the
-    // engine's mmap'd ring; the cursorSendLoop is the I/O thread that walks
-    // the ring and sends frames. Mutually exclusive with segmentLog.
+    // Cursor SF engine: the producer (user thread) writes encoded QWP frames
+    // into the engine's mmap'd ring; the cursorSendLoop is the I/O thread
+    // that walks the ring and sends frames.
     private CursorSendEngine cursorEngine;
     private boolean ownsCursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
-    // When true, every successful flush() (including the implicit flush
-    // during close()) routes a fsync request to the I/O thread before
-    // returning. Off by default — opt-in via setSegmentLogFsyncOnFlush
-    // or sf_fsync_on_flush=on in the connect string.
-    private boolean fsyncOnFlush;
-    // Set by the I/O thread after a successful SF reconnect; checked by the user
-    // thread on the next flushPendingRows so the next batch re-publishes schemas
-    // the new server doesn't yet know about.
-    private volatile boolean schemaResetNeeded;
-    // Monotonic counter bumped by performReconnect AFTER schemaResetNeeded is
-    // flipped. The user thread reads this at the very top of flushPendingRows
-    // (before checking schemaResetNeeded), then again after finishMessage; if
-    // the value changed, a reconnect happened mid-encode and the encoded bytes
-    // may carry stale schema refs the new server doesn't know — discard and
-    // re-encode. This closes the schema-reset race window where the previous
-    // code could persist a poisoned batch into SF that would replay-loop
-    // forever (or — post C4 fix — surface as a hard terminal failure with no
-    // self-heal). Single writer (the I/O thread) so plain volatile ++ is
-    // safe; readers establish happens-before via the volatile read pair.
-    private volatile long connectionGeneration;
-    private static final int MAX_SCHEMA_RACE_RETRIES = 10;
 
     private QwpWebSocketSender(
             String host,
@@ -229,25 +187,20 @@ public class QwpWebSocketSender implements Sender {
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
         this.inFlightWindowSize = inFlightWindowSize;
         this.maxSchemasPerConnection = maxSchemasPerConnection;
-
-        // Initialize global symbol dictionary for delta encoding
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
 
-        // Initialize double-buffering if async mode (window > 1)
-        if (inFlightWindowSize > 1) {
-            int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
-            try {
-                this.buffer0 = new MicrobatchBuffer(microbatchBufferSize);
-                this.buffer1 = new MicrobatchBuffer(microbatchBufferSize);
-            } catch (Throwable t) {
-                if (buffer0 != null) {
-                    buffer0.close();
-                }
-                encoder.close();
-                throw t;
+        int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
+        try {
+            this.buffer0 = new MicrobatchBuffer(microbatchBufferSize);
+            this.buffer1 = new MicrobatchBuffer(microbatchBufferSize);
+        } catch (Throwable t) {
+            if (buffer0 != null) {
+                buffer0.close();
             }
-            this.activeBuffer = buffer0;
+            encoder.close();
+            throw t;
         }
+        this.activeBuffer = buffer0;
     }
 
     /**
@@ -272,128 +225,35 @@ public class QwpWebSocketSender implements Sender {
      * @return connected sender
      */
     public static QwpWebSocketSender connect(String host, int port, ClientTlsConfiguration tlsConfig) {
-        return connect(
-                host, port, tlsConfig,
-                DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                DEFAULT_IN_FLIGHT_WINDOW_SIZE, null, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
-        );
-    }
-
-    /**
-     * Creates a new sender with full configuration and connects.
-     * <p>
-     * In-flight window size controls the flow behavior: 1 means synchronous (each batch
-     * waits for ACK), greater than 1 enables asynchronous pipelining with a background I/O thread.
-     *
-     * @param host                   server host
-     * @param port                   server HTTP port
-     * @param tlsConfig              TLS configuration, or null for plain text
-     * @param autoFlushRows          rows per batch (0 = no limit)
-     * @param autoFlushBytes         bytes per batch (0 = no limit)
-     * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
-     * @param inFlightWindowSize     max batches awaiting server ACK (1 = sync, default: 128)
-     * @param authorizationHeader    HTTP Authorization header value, or null
-     * @return connected sender
-     */
-    public static QwpWebSocketSender connect(
-            String host,
-            int port,
-            ClientTlsConfiguration tlsConfig,
-            int autoFlushRows,
-            int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            int inFlightWindowSize,
-            String authorizationHeader
-    ) {
-        return connect(
-                host,
-                port,
-                tlsConfig,
-                autoFlushRows,
-                autoFlushBytes,
-                autoFlushIntervalNanos,
-                inFlightWindowSize,
-                authorizationHeader,
-                DEFAULT_MAX_SCHEMAS_PER_CONNECTION
-        );
-    }
-
-    public static QwpWebSocketSender connect(
-            String host,
-            int port,
-            ClientTlsConfiguration tlsConfig,
-            int autoFlushRows,
-            int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            int inFlightWindowSize,
-            String authorizationHeader,
-            int maxSchemasPerConnection
-    ) {
-        QwpWebSocketSender sender = new QwpWebSocketSender(
-                host, port, tlsConfig,
-                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
+        // Build a memory-mode cursor engine with the same defaults Sender.build
+        // uses for an SF-less ws:: connect string (4 MiB segments, 128 MiB cap).
+        CursorSendEngine engine = new CursorSendEngine(
+                null,
+                4L * 1024 * 1024,
+                128L * 1024 * 1024,
+                CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS
         );
         try {
-            sender.ensureConnected();
+            return connect(
+                    host, port, tlsConfig,
+                    DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                    DEFAULT_IN_FLIGHT_WINDOW_SIZE, null, DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                    false, engine
+            );
         } catch (Throwable t) {
-            sender.close();
+            try {
+                engine.close();
+            } catch (Throwable ignored) {
+                // best-effort
+            }
             throw t;
         }
-        return sender;
-    }
-
-    public static QwpWebSocketSender connect(
-            String host,
-            int port,
-            ClientTlsConfiguration tlsConfig,
-            int autoFlushRows,
-            int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            int inFlightWindowSize,
-            String authorizationHeader,
-            int maxSchemasPerConnection,
-            boolean requestDurableAck
-    ) {
-        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection, requestDurableAck,
-                (SegmentLog) null);
     }
 
     /**
-     * Connect overload with store-and-forward. When {@code segmentLog} is non-null
-     * the sender takes ownership of it: closing the sender also closes the log.
-     */
-    public static QwpWebSocketSender connect(
-            String host,
-            int port,
-            ClientTlsConfiguration tlsConfig,
-            int autoFlushRows,
-            int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            int inFlightWindowSize,
-            String authorizationHeader,
-            int maxSchemasPerConnection,
-            boolean requestDurableAck,
-            SegmentLog segmentLog
-    ) {
-        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
-                maxSchemasPerConnection, requestDurableAck, segmentLog, false);
-    }
-
-    /**
-     * Connect overload with store-and-forward and an explicit
-     * fsync-on-flush opt-in. {@code fsyncOnFlush=true} routes a fsync of
-     * the SF active segment to the I/O thread at every {@link #flush()}
-     * (and at the implicit flush during {@link #close()}); off by default
-     * because small-batch / frequent-flush senders pay one disk fsync per
-     * call.
-     */
-    /**
-     * Connect overload that wires the cursor SF engine into the sender.
-     * Mutually exclusive with the {@code SegmentLog} overload — the
-     * connect-string builder picks one based on {@code sf_engine}.
+     * Master connect overload — used by {@code Sender.fromConfig}. Always
+     * runs through the cursor SF engine (memory-mode when {@code cursorEngine}
+     * was constructed without an {@code sfDir}, file-mode otherwise).
      */
     public static QwpWebSocketSender connect(
             String host,
@@ -414,43 +274,10 @@ public class QwpWebSocketSender implements Sender {
                 inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
         );
         try {
-            sender.setRequestDurableAck(requestDurableAck);
+            sender.requestDurableAck = requestDurableAck;
             if (cursorEngine != null) {
                 sender.setCursorEngine(cursorEngine, true);
             }
-            sender.ensureConnected();
-        } catch (Throwable t) {
-            sender.close();
-            throw t;
-        }
-        return sender;
-    }
-
-    public static QwpWebSocketSender connect(
-            String host,
-            int port,
-            ClientTlsConfiguration tlsConfig,
-            int autoFlushRows,
-            int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            int inFlightWindowSize,
-            String authorizationHeader,
-            int maxSchemasPerConnection,
-            boolean requestDurableAck,
-            SegmentLog segmentLog,
-            boolean fsyncOnFlush
-    ) {
-        QwpWebSocketSender sender = new QwpWebSocketSender(
-                host, port, tlsConfig,
-                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
-        );
-        try {
-            sender.setRequestDurableAck(requestDurableAck);
-            if (segmentLog != null) {
-                sender.setSegmentLog(segmentLog, true);
-            }
-            sender.setSegmentLogFsyncOnFlush(fsyncOnFlush);
             sender.ensureConnected();
         } catch (Throwable t) {
             sender.close();
@@ -467,7 +294,7 @@ public class QwpWebSocketSender implements Sender {
      *
      * @param host               server host (not connected)
      * @param port               server port (not connected)
-     * @param inFlightWindowSize window size: 1 for sync behavior, >1 for async
+     * @param inFlightWindowSize max batches awaiting server ACK (must be > 1)
      * @return unconnected sender
      */
     public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
@@ -490,7 +317,7 @@ public class QwpWebSocketSender implements Sender {
      * @param autoFlushRows          rows per batch (0 = no limit)
      * @param autoFlushBytes         bytes per batch (0 = no limit)
      * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
-     * @param inFlightWindowSize     window size: 1 for sync behavior, >1 for async
+     * @param inFlightWindowSize     max batches awaiting server ACK (must be > 1)
      * @return unconnected sender
      */
     public static QwpWebSocketSender createForTesting(
@@ -653,60 +480,28 @@ public class QwpWebSocketSender implements Sender {
             closed = true;
             boolean ioThreadStopped = true;
 
-            // Flush any remaining data
             try {
-                if (connectionError.get() == null && inFlightWindowSize > 1) {
-                    // Async mode (window > 1): flush accumulated rows in table buffers first
+                // Only drain when both the engine and the I/O loop are wired
+                // up — close() is also called from createForTesting() teardown
+                // and from connect() rollback paths where one or both may be null.
+                if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
+                    // Flush user-thread state (accumulated rows -> microbatch ->
+                    // engine append). The cursor engine append is durable
+                    // (on-disk in SF mode, in-RAM in memory mode); we don't
+                    // wait for the cursor I/O loop to acknowledge — the data
+                    // is already past the in-flight handoff.
                     flushPendingRows();
-
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
-                    // Wait for all batches to be sent and acknowledged before closing.
-                    // Under SF the durability guarantee is "data on disk", not "data
-                    // server-acked", so close() — like flush() — skips awaitPendingAcks.
-                    // Unsealed acks remain on disk; the next sender against the same
-                    // SF dir will replay them.
-                    if (cursorEngine != null) {
-                        // Cursor SF: appendBlocking ran on the user thread inside
-                        // sealAndSwapBuffer, so every batch is already durable on
-                        // its mmap'd segment. The cursor I/O thread keeps draining
-                        // to the wire in the background; we don't wait for it.
-                        cursorSendLoop.checkError();
-                    } else if (sendQueue != null) {
-                        sendQueue.flush();
-                        if (fsyncOnFlush && segmentLog != null) {
-                            // Same opt-in fsync as the public flush(): the
-                            // user asked for "data is durable on flush"
-                            // semantics, and close() implies a final flush.
-                            sendQueue.requestSegmentLogFsync();
-                        }
-                        if (segmentLog == null) {
-                            sendQueue.awaitPendingAcks();
-                        }
-                    } else if (inFlightWindow != null && segmentLog == null) {
-                        inFlightWindow.awaitEmpty();
-                    }
-                } else if (connectionError.get() == null) {
-                    // Sync mode (window=1): flush pending rows synchronously
-                    if (pendingRowCount > 0 && client != null && client.isConnected()) {
-                        flushSync();
-                    }
+                    cursorSendLoop.checkError();
                 }
             } catch (Exception e) {
                 LOG.error("Error during close: {}", String.valueOf(e));
             }
 
             // Shut down the I/O thread before closing the socket or buffers
-            // it may be using. This must run even if the flush above failed.
-            if (sendQueue != null) {
-                try {
-                    sendQueue.close();
-                } catch (Exception e) {
-                    ioThreadStopped = false;
-                    LOG.error("Error closing send queue: {}", String.valueOf(e));
-                }
-            }
+            // it may be using. Must run even if the flush above failed.
             if (cursorSendLoop != null) {
                 try {
                     cursorSendLoop.close();
@@ -730,12 +525,11 @@ public class QwpWebSocketSender implements Sender {
 
             if (!ioThreadStopped) {
                 // The I/O thread may still be using the socket and microbatch
-                // buffers (buffer0/buffer1). Freeing them would risk SIGSEGV.
+                // buffers. Freeing them would risk SIGSEGV.
                 LOG.error("I/O thread is still running, leaking WebSocket client and microbatch buffers");
                 return;
             }
 
-            // Close buffers (async mode only, window > 1)
             if (buffer0 != null) {
                 buffer0.close();
             }
@@ -748,18 +542,6 @@ public class QwpWebSocketSender implements Sender {
                 client = null;
             }
 
-            // Close the SegmentLog if we took ownership (typically via connect-string).
-            // Done after the I/O thread has stopped so no append/replay can race the close.
-            if (ownsSegmentLog && segmentLog != null) {
-                try {
-                    segmentLog.close();
-                } catch (Throwable t) {
-                    LOG.error("Error closing owned SegmentLog: {}", String.valueOf(t));
-                }
-                segmentLog = null;
-                ownsSegmentLog = false;
-            }
-            // Same lifecycle for the cursor engine.
             if (ownsCursorEngine && cursorEngine != null) {
                 try {
                     cursorEngine.close();
@@ -969,74 +751,16 @@ public class QwpWebSocketSender implements Sender {
         ensureNoInProgressRow();
         ensureConnected();
 
-        if (cursorEngine != null) {
-            // Cursor SF: SF.append happens on the user thread inside
-            // sealAndSwapBuffer, so by the time we reach here every encoded
-            // batch is durable on its mmap'd segment. No processingCount to
-            // drain, no awaitPendingAcks. Just surface any I/O thread error.
-            flushPendingRows();
-            if (activeBuffer != null && activeBuffer.hasData()) {
-                sealAndSwapBuffer();
-            }
-            cursorSendLoop.checkError();
-            checkConnectionError();
-            return;
+        // Cursor SF: SF.append happens on the user thread inside
+        // sealAndSwapBuffer, so by the time we reach here every encoded
+        // batch is durable on its mmap'd segment. No processingCount to
+        // drain, no awaitPendingAcks. Just surface any I/O thread error.
+        flushPendingRows();
+        if (activeBuffer != null && activeBuffer.hasData()) {
+            sealAndSwapBuffer();
         }
-
-        if (inFlightWindowSize > 1) {
-            // Async mode (window > 1): flush pending rows and wait for ACKs
-            flushPendingRows();
-
-            // Flush any remaining data in the active microbatch buffer
-            if (activeBuffer.hasData()) {
-                sealAndSwapBuffer();
-            }
-
-            // Wait for all pending batches to be sent to the server
-            try {
-                sendQueue.flush();
-            } catch (LineSenderException e) {
-                checkConnectionError();
-                throw e;
-            }
-
-            // Opt-in fsync of the SF active segment. Routed through the
-            // I/O thread (it owns SegmentLog) via the requestSegmentLogFsync
-            // signal; blocks until the syscall returns. Off by default
-            // because small-batch / frequent-flush senders pay one disk
-            // fsync per call.
-            if (fsyncOnFlush && segmentLog != null) {
-                try {
-                    sendQueue.requestSegmentLogFsync();
-                } catch (LineSenderException e) {
-                    checkConnectionError();
-                    throw e;
-                }
-            }
-
-            // Under SF the durability guarantee is "data is on disk", not "data is
-            // server-acked". sendQueue.flush() already waited for processingCount
-            // to drain, which means SF.append has run for every queued batch. Skip
-            // the wait-for-ack step so the user doesn't block through transient
-            // disconnects — server acks are processed in the background and trigger
-            // SF trim asynchronously.
-            if (segmentLog == null) {
-                try {
-                    sendQueue.awaitPendingAcks();
-                } catch (LineSenderException e) {
-                    checkConnectionError();
-                    throw e;
-                }
-            }
-            checkConnectionError();
-
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("Flush complete [totalBatches={}, totalBytes={}, totalAcked={}]", sendQueue.getTotalBatchesSent(), sendQueue.getTotalBytesSent(), inFlightWindow.getTotalAcked());
-            }
-        } else {
-            // Sync mode (window=1): flush pending rows and wait for ACKs synchronously
-            flushSync();
-        }
+        cursorSendLoop.checkError();
+        checkConnectionError();
     }
 
     /**
@@ -1058,39 +782,6 @@ public class QwpWebSocketSender implements Sender {
      */
     public int getAutoFlushRows() {
         return autoFlushRows;
-    }
-
-    /**
-     * Returns the highest seqTxn committed (written to WAL) for the given
-     * table, or -1 if no commit has been acknowledged for that table yet.
-     */
-    public long getHighestAckedSeqTxn(CharSequence tableName) {
-        if (sendQueue != null) {
-            return sendQueue.getCommittedSeqTxn(tableName);
-        }
-        return syncCommittedSeqTxns.get(tableName);
-    }
-
-    /**
-     * Returns the highest seqTxn durably uploaded to object store for the
-     * given table, or -1 if no durable ACK has been observed for that table.
-     * Only meaningful when the connection was opened with
-     * {@link #setRequestDurableAck(boolean)} = true on a server where primary
-     * replication is enabled.
-     */
-    public long getHighestDurableSeqTxn(CharSequence tableName) {
-        if (sendQueue != null) {
-            return sendQueue.getDurableSeqTxn(tableName);
-        }
-        return syncDurableSeqTxns.get(tableName);
-    }
-
-    /**
-     * Returns the max symbol ID sent to the server.
-     * Once sent over TCP, server is guaranteed to receive it (or connection dies).
-     */
-    public int getMaxSentSymbolId() {
-        return maxSentSymbolId;
     }
 
     /**
@@ -1266,36 +957,6 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
-    /**
-     * Sends a WebSocket PING and blocks until the PONG arrives, processing
-     * any STATUS_DURABLE_ACK or STATUS_OK frames along the way.
-     * <p>
-     * The server flushes pending durable ACKs before sending the PONG, so
-     * after this method returns, {@link #getHighestDurableSeqTxn(CharSequence)}
-     * reflects all durable progress up to the moment the server processed
-     * the PING.
-     * <p>
-     * In async mode the PING is sent by the I/O thread; the I/O loop
-     * continues its normal work (sending batches, draining ACKs) while
-     * waiting for the PONG.
-     *
-     * @throws LineSenderException if the connection is closed or the ping times out
-     */
-    public void ping() {
-        checkNotClosed();
-        ensureConnected();
-        if (cursorEngine != null) {
-            // PR1 cursor scope: ping/pong is on the legacy I/O loop only.
-            throw new LineSenderException(
-                    "ping() is not yet supported with sf_engine=cursor (deferred to a follow-up PR)");
-        }
-        if (inFlightWindowSize > 1) {
-            sendQueue.ping();
-        } else {
-            syncPing();
-        }
-    }
-
     @Override
     public void reset() {
         checkNotClosed();
@@ -1325,82 +986,8 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Opts the connection in for STATUS_DURABLE_ACK frames. Must be called
-     * before any send operation — the flag is consulted once, during WebSocket
-     * upgrade. Setting this true on a server without primary replication
-     * enabled is a no-op: the server silently ignores the header.
-     * <p>
-     * Observe durable progress via {@link #getHighestDurableSeqTxn(CharSequence)}.
-     *
-     * @throws LineSenderException if the connection is already established or closed
-     */
-    public void setRequestDurableAck(boolean enabled) {
-        if (closed) {
-            throw new LineSenderException("Sender is closed");
-        }
-        if (connected) {
-            throw new LineSenderException(
-                    "setRequestDurableAck must be called before the first send");
-        }
-        this.requestDurableAck = enabled;
-    }
-
-    /**
-     * Attach a store-and-forward log to capture every outgoing batch to disk
-     * before the wire send and trim it on cumulative ACK. The log also becomes
-     * the batch-sequence authority so sequencing survives sender restarts.
-     * <p>
-     * The caller retains ownership of {@code log} and is responsible for
-     * closing it after this sender has been closed; use the two-arg overload
-     * {@link #setSegmentLog(SegmentLog, boolean)} to transfer ownership.
-     * <p>
-     * Must be called before the first send. Requires async mode
-     * ({@code inFlightWindowSize > 1}).
-     *
-     * @throws LineSenderException if the sender is already connected or closed,
-     *                             or if async mode is not enabled
-     */
-    public void setSegmentLog(SegmentLog log) {
-        setSegmentLog(log, false);
-    }
-
-    /**
-     * Like {@link #setSegmentLog(SegmentLog)} but with explicit ownership
-     * transfer: when {@code takeOwnership} is true the sender closes
-     * {@code log} on its own {@link #close()}. Used by the connect-string
-     * builder to give the sender a self-contained lifecycle. Pass
-     * {@code false} to keep ownership with the caller.
-     */
-    public void setSegmentLog(SegmentLog log, boolean takeOwnership) {
-        if (closed) {
-            throw new LineSenderException("Sender is closed");
-        }
-        if (connected) {
-            throw new LineSenderException(
-                    "setSegmentLog must be called before the first send");
-        }
-        if (log != null && inFlightWindowSize <= 1) {
-            throw new LineSenderException(
-                    "store-and-forward requires async mode (inFlightWindowSize > 1)");
-        }
-        if (log != null && cursorEngine != null) {
-            throw new LineSenderException(
-                    "SegmentLog and CursorSendEngine are mutually exclusive (sf_engine selects one)");
-        }
-        this.segmentLog = log;
-        this.ownsSegmentLog = takeOwnership && log != null;
-    }
-
-    /**
-     * Attach a {@link CursorSendEngine} for store-and-forward, replacing the
-     * legacy {@link SegmentLog} pipeline. The cursor engine puts the SF append
-     * on the user thread (writing into an mmap'd ring) and runs a dedicated
-     * I/O thread to drain frames to the wire — substantially lower per-flush
-     * latency than the legacy queue's hand-off + pwrite model.
-     * <p>
-     * Must be called before the first send. Requires async mode
-     * ({@code inFlightWindowSize > 1}). Mutually exclusive with
-     * {@link #setSegmentLog(SegmentLog, boolean)}.
+     * Attach a {@link CursorSendEngine} for store-and-forward. Must be called
+     * before the first send.
      */
     public void setCursorEngine(CursorSendEngine engine, boolean takeOwnership) {
         if (closed) {
@@ -1410,48 +997,8 @@ public class QwpWebSocketSender implements Sender {
             throw new LineSenderException(
                     "setCursorEngine must be called before the first send");
         }
-        if (engine != null && inFlightWindowSize <= 1) {
-            throw new LineSenderException(
-                    "cursor engine requires async mode (inFlightWindowSize > 1)");
-        }
-        if (engine != null && segmentLog != null) {
-            throw new LineSenderException(
-                    "CursorSendEngine and SegmentLog are mutually exclusive (sf_engine selects one)");
-        }
         this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;
-    }
-
-    /**
-     * Opt in to fsyncing the SF active segment at every {@link #flush()}
-     * (and at the implicit flush during {@link #close()}). Off by default.
-     * <p>
-     * Useful for senders that flush coarsely and want OS-crash survival
-     * without paying the per-append fsync cost of {@code sf_fsync=on}.
-     * Avoid for high-rate small-batch + frequent-flush workloads — every
-     * flush blocks on a disk fsync.
-     * <p>
-     * Must be set before the first send (mirrors {@link #setSegmentLog}).
-     */
-    public void setSegmentLogFsyncOnFlush(boolean enabled) {
-        if (closed) {
-            throw new LineSenderException("Sender is closed");
-        }
-        if (connected) {
-            throw new LineSenderException(
-                    "setSegmentLogFsyncOnFlush must be called before the first send");
-        }
-        this.fsyncOnFlush = enabled;
-    }
-
-    /**
-     * Number of times an outgoing batch was stalled because the SF total disk cap
-     * was reached. Each stall blocks the user thread's flush() until ACKs trim
-     * sealed segments and free space. Useful for monitoring backpressure under
-     * production load.
-     */
-    public long getTotalSfDiskFullStalls() {
-        return sendQueue == null ? 0 : sendQueue.getTotalDiskFullStalls();
     }
 
     /**
@@ -1677,125 +1224,50 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    /**
-     * Build and connect a fresh {@link WebSocketClient}, replacing the current
-     * one. Invoked by the queue's I/O thread on SF reconnect. The client field
-     * is replaced atomically here; the user thread continues to read it via
-     * paths that aren't sensitive to the swap (sync mode is disabled under SF).
-     * <p>
-     * The encoder version is reset to whatever the server selects on the new
-     * connection, and {@link #schemaResetNeeded} is flipped so the next user
-     * thread {@code flushPendingRows} re-publishes table schemas — the server
-     * has no memory of the previous connection's schema-id assignments.
-     */
-    private WebSocketClient performReconnect() throws Exception {
-        if (client != null) {
-            try {
-                client.close();
-            } catch (Throwable ignored) {
-                // best-effort
-            }
-            client = null;
+    private void ensureConnected() {
+        checkNotClosed();
+        if (connected) {
+            return;
+        }
+        if (cursorEngine == null) {
+            throw new LineSenderException("cursor engine must be attached before connect");
         }
         if (tlsConfig != null) {
             client = WebSocketClientFactory.newTlsInstance(tlsConfig);
         } else {
             client = WebSocketClientFactory.newPlainTextInstance();
         }
-        client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
-        client.setQwpClientId(QwpConstants.CLIENT_ID);
-        client.setQwpRequestDurableAck(requestDurableAck);
-        client.connect(host, port);
-        client.upgrade(WRITE_PATH, authorizationHeader);
-        encoder.setVersion((byte) client.getServerQwpVersion());
-        // Tell the user thread to reset schema-id state on its next encode pass.
-        // Order is load-bearing: schemaResetNeeded BEFORE connectionGeneration
-        // bump. The user thread reads connectionGeneration first, then
-        // schemaResetNeeded; volatile happens-before guarantees that a user
-        // thread observing the new generation also observes the new
-        // schemaResetNeeded. The post-encode generation re-read catches the
-        // race where the user thread already passed the schemaResetNeeded
-        // check before this write landed.
-        schemaResetNeeded = true;
-        connectionGeneration++;
-        return client;
-    }
-
-    private void ensureConnected() {
-        checkNotClosed();
-        if (!connected) {
-            // Create WebSocket client using factory (zero-GC native implementation)
-            if (tlsConfig != null) {
-                client = WebSocketClientFactory.newTlsInstance(tlsConfig);
-            } else {
-                client = WebSocketClientFactory.newPlainTextInstance();
-            }
-
-            // Connect and upgrade to WebSocket
-            try {
-                client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
-                client.setQwpClientId(QwpConstants.CLIENT_ID);
-                client.setQwpRequestDurableAck(requestDurableAck);
-                client.connect(host, port);
-                client.upgrade(WRITE_PATH, authorizationHeader);
-            } catch (Exception e) {
-                client.close();
-                client = null;
-                throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
-            }
-
-            // a window for tracking batches awaiting ACK (both modes)
-            inFlightWindow = new InFlightWindow(inFlightWindowSize, InFlightWindow.DEFAULT_TIMEOUT_MS);
-
-            // Initialize send queue for async mode (window > 1)
-            // The send queue handles both sending AND receiving (single I/O thread)
-            if (inFlightWindowSize > 1) {
-                if (cursorEngine != null) {
-                    // Cursor SF: skip the legacy sendQueue entirely. The cursor
-                    // I/O loop polls publishedFsn and drains frames straight
-                    // from the mmap'd ring, so no enqueue / processingCount
-                    // handshake is needed on the user thread.
-                    try {
-                        cursorSendLoop = new CursorWebSocketSendLoop(client, cursorEngine);
-                        cursorSendLoop.start();
-                    } catch (Throwable t) {
-                        inFlightWindow = null;
-                        client.close();
-                        client = null;
-                        throw new LineSenderException(
-                                "Failed to start cursor I/O thread for " + host + ":" + port, t);
-                    }
-                } else {
-                    try {
-                        Reconnector reconnector = segmentLog != null ? this::performReconnect : null;
-                        sendQueue = new WebSocketSendQueue(client, inFlightWindow,
-                                WebSocketSendQueue.DEFAULT_ENQUEUE_TIMEOUT_MS,
-                                WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS,
-                                this::recordConnectionFailure,
-                                segmentLog,
-                                reconnector);
-                    } catch (Throwable t) {
-                        inFlightWindow = null;
-                        client.close();
-                        client = null;
-                        throw new LineSenderException("Failed to start I/O thread for " + host + ":" + port, t);
-                    }
-                }
-            }
-            // Sync mode (window=1): no send queue - we send and read ACKs synchronously
-
-            // Use the version selected by the server
-            encoder.setVersion((byte) client.getServerQwpVersion());
-
-            // Server starts fresh on each connection, so any sender-local schema
-            // IDs retained from a prior connection must be discarded as well.
-            resetSchemaStateForNewConnection();
-            connectionError.set(null);
-
-            connected = true;
-            LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
-                    host, port, inFlightWindowSize, client.getServerQwpVersion());
+        try {
+            client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
+            client.setQwpClientId(QwpConstants.CLIENT_ID);
+            client.setQwpRequestDurableAck(requestDurableAck);
+            client.connect(host, port);
+            client.upgrade(WRITE_PATH, authorizationHeader);
+        } catch (Exception e) {
+            client.close();
+            client = null;
+            throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
         }
+
+        try {
+            cursorSendLoop = new CursorWebSocketSendLoop(client, cursorEngine);
+            cursorSendLoop.start();
+        } catch (Throwable t) {
+            client.close();
+            client = null;
+            throw new LineSenderException(
+                    "Failed to start cursor I/O thread for " + host + ":" + port, t);
+        }
+
+        encoder.setVersion((byte) client.getServerQwpVersion());
+        // Server starts fresh on each connection — discard any schema IDs
+        // retained from prior state.
+        resetSchemaStateForNewConnection();
+        connectionError.set(null);
+
+        connected = true;
+        LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
+                host, port, inFlightWindowSize, client.getServerQwpVersion());
     }
 
     private void ensureNoInProgressRow() {
@@ -1804,12 +1276,6 @@ public class QwpWebSocketSender implements Sender {
                     "Cannot flush while row is in progress. "
                             + "Use sender.at(), sender.atNow(), or sender.cancelRow() first."
             );
-        }
-    }
-
-    private void failConnectionIfNeeded(LineSenderException error) {
-        if (recordConnectionFailure(error) && inFlightWindow != null) {
-            inFlightWindow.failAll(error);
         }
     }
 
@@ -1826,8 +1292,6 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
-        // Invalidate cached column references -- table buffers will be reset
-        // below (or on retry).
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
@@ -1844,162 +1308,7 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Flushing pending rows [count={}, tables={}]", pendingRowCount, tableCount);
         }
 
-        // Schema-reset race retry loop. The encoded message carries either
-        // full schema definitions or schema-id refs. If the I/O thread
-        // performs a reconnect mid-encode (schemaResetNeeded flips while
-        // we're emitting refs), the resulting bytes would be poisoned —
-        // the new server has no memory of those ids and would reject the
-        // batch. Connection-generation tagging closes the window: we read
-        // connectionGeneration BEFORE checking schemaResetNeeded, encode,
-        // re-read after finishMessage. If the value changed, a reconnect
-        // happened mid-encode; discard the encoded bytes (still in the
-        // encoder, not yet copied into activeBuffer; table buffers haven't
-        // been reset() yet) and retry from the top. Bounded at
-        // MAX_SCHEMA_RACE_RETRIES to surface a hard failure if reconnects
-        // are pathologically frequent.
         ensureActiveBufferReady();
-        int batchMaxSchemaId = maxSentSchemaId;
-        int messageSize;
-        QwpBufferWriter buffer;
-        int retries = 0;
-        while (true) {
-            long genBefore = connectionGeneration;
-            if (schemaResetNeeded) {
-                schemaResetNeeded = false;
-                resetSchemaStateForNewConnection();
-                // resetSchemaStateForNewConnection wipes nextSchemaId and
-                // every table's cached schema id; recompute batchMaxSchemaId
-                // against the fresh maxSentSchemaId.
-                batchMaxSchemaId = maxSentSchemaId;
-            }
-
-            // Encode all non-empty tables into a single QWP v1 message.
-            // beginMessage calls buffer.reset(), so this is safe to invoke
-            // on every retry without any explicit cleanup.
-            int currBatchMaxSchemaId = batchMaxSchemaId;
-            encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
-            for (int i = 0, n = keys.size(); i < n; i++) {
-                CharSequence tableName = keys.getQuick(i);
-                if (tableName == null) {
-                    continue;
-                }
-                QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-                if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                    continue;
-                }
-
-                if (tableBuffer.getSchemaId() < 0) {
-                    if (nextSchemaId >= maxSchemasPerConnection) {
-                        throw new LineSenderException("maximum schemas per connection exceeded")
-                                .put("[maxSchemasPerConnection=").put(maxSchemasPerConnection).put(']');
-                    }
-                    tableBuffer.setSchemaId(nextSchemaId++);
-                }
-                currBatchMaxSchemaId = Math.max(currBatchMaxSchemaId, tableBuffer.getSchemaId());
-                boolean useSchemaRef = tableBuffer.getSchemaId() <= maxSentSchemaId;
-
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, tableBuffer.getRowCount(), maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
-                }
-
-                encoder.addTable(tableBuffer, useSchemaRef);
-            }
-            messageSize = encoder.finishMessage();
-            buffer = encoder.getBuffer();
-
-            // Race detection: did connectionGeneration advance during the
-            // encode? If yes, the bytes we just produced may carry stale
-            // schema refs.
-            if (connectionGeneration == genBefore) {
-                batchMaxSchemaId = currBatchMaxSchemaId;
-                break;
-            }
-            retries++;
-            if (retries >= MAX_SCHEMA_RACE_RETRIES) {
-                throw new LineSenderException(
-                        "schema-reset race exceeded retry limit [" + MAX_SCHEMA_RACE_RETRIES
-                                + "] — reconnects are firing faster than the user thread "
-                                + "can encode a single batch");
-            }
-            // Discard and loop. Table buffers were not reset (that happens
-            // only after sealAndSwapBuffer below); the source rows are
-            // intact for the next attempt.
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("Schema-reset race detected mid-encode; retrying [attempt={}]", retries);
-            }
-        }
-
-        // Copy the single multi-table message to the microbatch buffer and seal
-        activeBuffer.ensureCapacity(messageSize);
-        activeBuffer.write(buffer.getBufferPtr(), messageSize);
-        activeBuffer.incrementRowCount();
-        sealAndSwapBuffer();
-
-        // Update sent state only after successful enqueue.
-        // If sealAndSwapBuffer() threw, these remain unchanged so the
-        // next batch's delta dictionary will correctly re-include the
-        // symbols and schema that the server never received.
-        maxSentSymbolId = currentBatchMaxSymbolId;
-        maxSentSchemaId = batchMaxSchemaId;
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                continue;
-            }
-            tableBuffer.reset();
-        }
-        currentBatchMaxSymbolId = -1;
-
-        // Reset pending count
-        pendingBytes = 0;
-        pendingRowCount = 0;
-        firstPendingRowTimeNanos = 0;
-    }
-
-    /**
-     * Flushes pending rows synchronously, blocking until server ACKs.
-     * Used in sync mode for simpler, blocking operation.
-     */
-    private void flushSync() {
-        if (pendingRowCount <= 0) {
-            return;
-        }
-
-        // Invalidate cached column references -- table buffers will be reset below
-        cachedTimestampColumn = null;
-        cachedTimestampNanosColumn = null;
-
-        ObjList<CharSequence> keys = tableBuffers.keys();
-
-        // Count non-empty tables for the message header
-        int tableCount = 0;
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
-                tableCount++;
-            }
-        }
-
-        if (tableCount == 0) {
-            pendingBytes = 0;
-            pendingRowCount = 0;
-            firstPendingRowTimeNanos = 0;
-            return;
-        }
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Sync flush [pendingRows={}, tables={}]", pendingRowCount, tableCount);
-        }
-
-        // Encode all non-empty tables into a single QWP v1 message
         int batchMaxSchemaId = maxSentSchemaId;
         encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
         for (int i = 0, n = keys.size(); i < n; i++) {
@@ -2029,38 +1338,17 @@ public class QwpWebSocketSender implements Sender {
             encoder.addTable(tableBuffer, useSchemaRef);
         }
         int messageSize = encoder.finishMessage();
-
         QwpBufferWriter buffer = encoder.getBuffer();
 
-        // Track batch in InFlightWindow before sending
-        long batchSequence = nextBatchSequence++;
-        checkConnectionError();
-        inFlightWindow.addInFlight(batchSequence);
+        activeBuffer.ensureCapacity(messageSize);
+        activeBuffer.write(buffer.getBufferPtr(), messageSize);
+        activeBuffer.incrementRowCount();
+        sealAndSwapBuffer();
 
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Sending sync batch [seq={}, bytes={}, tables={}, maxSentSymbolId={}]", batchSequence, messageSize, tableCount, currentBatchMaxSymbolId);
-        }
-
-        // Send over WebSocket and fail the in-flight entry if send throws,
-        // so close() does not hang waiting for an ACK that will never arrive.
-        try {
-            client.sendBinary(buffer.getBufferPtr(), messageSize);
-        } catch (LineSenderException e) {
-            failConnectionIfNeeded(e);
-            throw e;
-        } catch (Throwable t) {
-            LineSenderException error = new LineSenderException("Failed to send batch " + batchSequence, t);
-            failConnectionIfNeeded(error);
-            throw error;
-        }
-
-        // Wait for ACK synchronously
-        waitForAck(batchSequence);
-
-        // Update sent state only after successful send + ACK.
-        // If sendBinary() or waitForAck() threw, these remain unchanged
-        // so the next batch's delta dictionary will correctly re-include
-        // the symbols and schema that the server never received.
+        // Update sent state only after successful enqueue.
+        // If sealAndSwapBuffer() threw, these remain unchanged so the
+        // next batch's delta dictionary will correctly re-include the
+        // symbols and schema that the server never received.
         maxSentSymbolId = currentBatchMaxSymbolId;
         maxSentSchemaId = batchMaxSchemaId;
         for (int i = 0, n = keys.size(); i < n; i++) {
@@ -2076,14 +1364,10 @@ public class QwpWebSocketSender implements Sender {
         }
         currentBatchMaxSymbolId = -1;
 
-        // Reset pending row tracking
+        // Reset pending count
         pendingBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("Sync flush complete [totalAcked={}]", inFlightWindow.getTotalAcked());
-        }
     }
 
     private long getPendingBytes() {
@@ -2181,44 +1465,24 @@ public class QwpWebSocketSender implements Sender {
         }
         activeBuffer.reset();
 
-        // Hand off the sealed buffer. Cursor mode does it on the user
-        // thread (durable mmap append, returns once published);  legacy
-        // mode enqueues to the I/O thread.
-        if (cursorEngine != null) {
-            try {
-                toSend.markSending();
-                cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
-                toSend.markRecycled();
-            } catch (Throwable t) {
-                // Surface any I/O thread error first — appendBlocking itself
-                // only throws on PAYLOAD_TOO_LARGE, but the buffer pointer
-                // might have been corrupted by a concurrent failure. The
-                // cursorSendLoop can also have failed independently.
-                cursorSendLoop.checkError();
-                throw new LineSenderException("cursor SF append failed", t);
-            }
-        } else {
-            // Enqueue the sealed buffer for sending.
-            // If enqueue fails, roll back local state so the same batch can be retried.
-            try {
-                if (!sendQueue.enqueue(toSend)) {
-                    throw new LineSenderException("Failed to enqueue buffer for sending");
-                }
-            } catch (LineSenderException e) {
-                activeBuffer = toSend;
-                if (toSend.isSealed()) {
-                    toSend.rollbackSealForRetry();
-                }
-                checkConnectionError();
-                throw e;
-            }
+        // Hand off the sealed buffer to the cursor engine on the user thread
+        // (durable mmap append, returns once published).
+        try {
+            toSend.markSending();
+            cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
+            toSend.markRecycled();
+        } catch (Throwable t) {
+            // Surface any I/O thread error first — appendBlocking itself only
+            // throws on PAYLOAD_TOO_LARGE / backpressure deadline, but the
+            // I/O loop can have failed independently.
+            cursorSendLoop.checkError();
+            throw new LineSenderException("cursor SF append failed", t);
         }
     }
 
     /**
      * Accumulates the current row.
-     * Both sync and async modes buffer rows until flush (explicit or auto-flush).
-     * The difference is that sync mode flush() blocks until server ACKs.
+     * Rows buffer until flush (explicit or auto-flush).
      */
     private void sendRow() {
         ensureConnected();
@@ -2230,20 +1494,13 @@ public class QwpWebSocketSender implements Sender {
             currentTableBuffer.nextRow();
         }
 
-        // Both modes: accumulate rows, don't encode yet
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
         }
         pendingRowCount++;
 
-        // Check if any flush threshold is exceeded
         if (shouldAutoFlush()) {
-            if (inFlightWindowSize > 1) {
-                flushPendingRows();
-            } else {
-                // Sync mode (window=1): flush directly with ACK wait
-                flushSync();
-            }
+            flushPendingRows();
         }
     }
 
@@ -2265,58 +1522,6 @@ public class QwpWebSocketSender implements Sender {
             return ageNanos >= autoFlushIntervalNanos;
         }
         return false;
-    }
-
-    private void syncPing() {
-        client.sendPing(1000);
-        long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
-        LineSenderException pingError = null;
-        while (System.currentTimeMillis() < deadline) {
-            sawPong = false;
-            sawBinaryAck = false;
-            boolean received = client.receiveFrame(ackHandler, 1000);
-            if (received) {
-                if (sawBinaryAck) {
-                    if (ackResponse.isDurableAck()) {
-                        updateSyncSeqTxns(syncDurableSeqTxns);
-                    } else if (ackResponse.isSuccess()) {
-                        inFlightWindow.acknowledgeUpTo(ackResponse.getSequence());
-                        updateSyncSeqTxns(syncCommittedSeqTxns);
-                    } else {
-                        // Server-side error on a pending batch (parse /
-                        // schema / security / internal / write error).
-                        // Route through inFlightWindow.fail so subsequent
-                        // waitForAck / flush calls also see it, capture the
-                        // first error and throw it after PONG so the caller
-                        // of ping() can react. We finish draining the round
-                        // before throwing so durable/committed progress
-                        // observed in this ping is preserved.
-                        LineSenderException err = new LineSenderException(ackResponse.getErrorMessage());
-                        inFlightWindow.fail(ackResponse.getSequence(), err);
-                        if (pingError == null) {
-                            pingError = err;
-                        }
-                    }
-                }
-                if (sawPong) {
-                    if (pingError != null) {
-                        throw pingError;
-                    }
-                    return;
-                }
-            }
-        }
-        throw new LineSenderException("Ping timed out");
-    }
-
-    private void updateSyncSeqTxns(CharSequenceLongHashMap seqTxns) {
-        for (int i = 0, n = ackResponse.getTableEntryCount(); i < n; i++) {
-            String name = ackResponse.getTableName(i);
-            long seqTxn = ackResponse.getTableSeqTxn(i);
-            if (seqTxn > seqTxns.get(name)) {
-                seqTxns.put(name, seqTxn);
-            }
-        }
     }
 
     private long toMicros(long value, ChronoUnit unit) {
@@ -2352,81 +1557,4 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    /**
-     * Waits synchronously for an ACK from the server for the specified batch.
-     */
-    private void waitForAck(long expectedSequence) {
-        long deadline = System.currentTimeMillis() + InFlightWindow.DEFAULT_TIMEOUT_MS;
-
-        while (System.currentTimeMillis() < deadline) {
-            try {
-                sawBinaryAck = false;
-                boolean received = client.receiveFrame(ackHandler, 1000); // 1 second timeout per read attempt
-
-                if (received) {
-                    if (!sawBinaryAck) {
-                        continue;
-                    }
-                    if (ackResponse.isSuccess()) {
-                        long sequence = ackResponse.getSequence();
-                        inFlightWindow.acknowledgeUpTo(sequence);
-                        updateSyncSeqTxns(syncCommittedSeqTxns);
-                        if (sequence >= expectedSequence) {
-                            return;
-                        }
-                    } else if (ackResponse.isDurableAck()) {
-                        updateSyncSeqTxns(syncDurableSeqTxns);
-                    } else {
-                        long sequence = ackResponse.getSequence();
-                        String errorMessage = ackResponse.getErrorMessage();
-                        LineSenderException error = new LineSenderException(
-                                "Server error for batch " + sequence + ": " +
-                                        ackResponse.getStatusName() + " - " + errorMessage);
-                        failConnectionIfNeeded(error);
-                        throw error;
-                    }
-                }
-            } catch (LineSenderException e) {
-                failConnectionIfNeeded(e);
-                throw e;
-            } catch (Exception e) {
-                LineSenderException wrapped = new LineSenderException("Error waiting for ACK: " + e.getMessage(), e);
-                failConnectionIfNeeded(wrapped);
-                throw wrapped;
-            }
-        }
-
-        LineSenderException timeout = new LineSenderException("Timeout waiting for ACK for batch " + expectedSequence);
-        failConnectionIfNeeded(timeout);
-        throw timeout;
-    }
-
-    private static class AckFrameHandler implements WebSocketFrameHandler {
-        private final QwpWebSocketSender sender;
-
-        AckFrameHandler(QwpWebSocketSender sender) {
-            this.sender = sender;
-        }
-
-        @Override
-        public void onBinaryMessage(long payloadPtr, int payloadLen) {
-            sender.sawBinaryAck = true;
-            // readFrom validates inline; a single pass parses and bounds-checks.
-            if (!sender.ackResponse.readFrom(payloadPtr, payloadLen)) {
-                throw new LineSenderException(
-                        "Invalid ACK response payload [length=" + payloadLen + ']'
-                );
-            }
-        }
-
-        @Override
-        public void onClose(int code, String reason) {
-            throw new LineSenderException("WebSocket closed while waiting for ACK [code=" + code + ", reason=" + reason + ']');
-        }
-
-        @Override
-        public void onPong(long payloadPtr, int payloadLen) {
-            sender.sawPong = true;
-        }
-    }
 }

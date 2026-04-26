@@ -94,8 +94,9 @@ import java.util.concurrent.TimeUnit;
  *   <li>{@code -Dsf=true} to enable store-and-forward. {@code -Dsf.dir=<path>}
  *       overrides the SF directory (default: a fresh tmp dir per trial).</li>
  *   <li>{@code -Dfsync.on.flush=true} to also fsync the SF segment on every
- *       flush ({@code sf_fsync_on_flush=on}; only meaningful with
- *       {@code -Dsf=true}).</li>
+ *       flush ({@code sf_durability=flush}; only meaningful with
+ *       {@code -Dsf=true}). Note: cursor engine does not yet implement
+ *       {@code sf_durability=flush}, so this currently fails fast at build().</li>
  * </ul>
  * <p>
  * Run via Maven exec:
@@ -191,9 +192,10 @@ public class QwpIngressLatencyBenchmark {
                     "qdb-sf-ingress-bench-" + System.nanoTime()).toString();
             cfg += "sf_dir=" + sfDir + ";";
             if (FSYNC_ON_FLUSH) {
-                cfg += "sf_fsync_on_flush=on;";
+                cfg += "sf_durability=flush;";
             }
-            System.out.println("SF enabled, dir=" + sfDir + ", sf_fsync_on_flush=" + FSYNC_ON_FLUSH);
+            System.out.println("SF enabled, dir=" + sfDir + ", sf_durability=" +
+                    (FSYNC_ON_FLUSH ? "flush" : "memory"));
         }
         sender = Sender.fromConfig(cfg);
 
