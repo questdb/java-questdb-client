@@ -394,17 +394,31 @@ public final class SegmentLog implements QuietCloseable {
         }
     }
 
-    /** Lowest seq currently on disk, or -1 if log is empty. */
+    /**
+     * Lowest seq currently on disk that {@link #replay} will visit, or -1 if
+     * none. Must skip {@code removePending} segments — replay() does the same
+     * (line 277), and {@code WebSocketSendQueue.doReconnectCycle} pins
+     * {@code fsnAtZero} to this value before invoking replay. A mismatch here
+     * trips the "SF replay FSN drift" guard inside the replay visitor and
+     * aborts every reconnect attempt, turning a transient remove() failure
+     * into a permanent reconnect loop.
+     */
     public long oldestSeq() {
         ensureOpen();
-        if (segments.size() == 0) {
-            return -1;
+        for (int i = 0, n = segments.size(); i < n; i++) {
+            Segment s = segments.getQuick(i);
+            if (s.removePending) {
+                continue;
+            }
+            if (s.frameCount == 0) {
+                // Empty segment can only be the tail active (sealed segments
+                // always carry frames — rotate drops empty ones). Nothing
+                // after this is replay-visible.
+                return -1;
+            }
+            return s.baseSeq;
         }
-        Segment first = segments.getQuick(0);
-        if (first.frameCount == 0) {
-            return -1;
-        }
-        return first.baseSeq;
+        return -1;
     }
 
     /** Sequence number that will be assigned to the next {@link #append}. */
@@ -503,7 +517,23 @@ public final class SegmentLog implements QuietCloseable {
 
         scanDirectory();
         if (active == null) {
-            createActive(FIRST_SEQ);
+            // Mid-rotate crash recovery: rotate() has a window between
+            // ff.rename(.sfa → .sfs) and createActive(lastSeq + 1) where the
+            // process can die (or createActive can throw, leaving the .sfa
+            // removed by its own catch block) with sealed segments on disk
+            // and no active. Resuming at FIRST_SEQ here would let the next
+            // session's appends produce frames whose FSNs collide with FSNs
+            // already on disk in the sealed segments, breaking ACK
+            // translation, trim, and replay. Pick up past the highest sealed
+            // lastSeqOnDisk instead. scanDirectory sorts segments by baseSeq
+            // and sealed segments cover non-overlapping FSN ranges, so the
+            // last entry holds the largest lastSeqOnDisk.
+            long resumeFrom = FIRST_SEQ;
+            int n = segments.size();
+            if (n > 0) {
+                resumeFrom = segments.getQuick(n - 1).lastSeqOnDisk + 1;
+            }
+            createActive(resumeFrom);
         }
         nextSeq = active.baseSeq + active.frameCount;
     }
@@ -511,7 +541,17 @@ public final class SegmentLog implements QuietCloseable {
     private void scanDirectory() {
         long find = ff.findFirst(dir);
         if (find == 0) {
-            return;
+            // findFirst returns 0 for either "directory could not be opened"
+            // (errno set — transient EACCES/EMFILE/ESTALE/ENOMEM) or
+            // "directory is empty." By the time we get here, openInternal has
+            // created the directory if missing AND opened+locked the lock
+            // file inside it, so an empty listing is impossible — find==0
+            // here can only mean opendir failed. Treating it as "nothing to
+            // scan" would let openInternal proceed to createActive(...) on
+            // top of any unscanned on-disk segments, silently aliasing or
+            // overwriting still-existing data. A durability layer must
+            // refuse to proceed from an unknown view of its own log.
+            throw new SfException("findFirst failed for SF directory: " + dir);
         }
         try {
             int rc = 1;
@@ -525,6 +565,15 @@ public final class SegmentLog implements QuietCloseable {
                     }
                 }
                 rc = ff.findNext(find);
+            }
+            if (rc < 0) {
+                // findNext == -1 is a readdir read error (EIO/ESTALE on NFS,
+                // etc.). The in-memory `segments` list is now a partial view
+                // of what's on disk. Same hazard as findFirst==0: subsequent
+                // createActive(...) or appends would alias unscanned on-disk
+                // segments. Refuse rather than recover from an unknown
+                // partial state.
+                throw new SfException("findNext failed mid-scan of SF directory: " + dir);
             }
         } finally {
             ff.findClose(find);

@@ -40,6 +40,7 @@ import org.junit.Test;
 
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -1167,6 +1168,528 @@ public class SegmentLogTest {
         });
     }
 
+    /**
+     * Red test for the mid-rotate-crash recovery bug.
+     * <p>
+     * {@code rotate()} has a window where the old {@code .sfa} has already
+     * been renamed to {@code .sfs} but the new active {@code .sfa} has not
+     * been created yet (between {@code ff.rename(...)} and the
+     * {@code createActive(lastSeq + 1)} call at the end of {@code rotate}).
+     * If the process dies in that window — or if any of the steps after the
+     * rename throws (e.g. {@code allocNativePath} OOMs inside
+     * {@code createActive}) and the process exits afterwards — the on-disk
+     * state on the next start is: one or more sealed {@code .sfs} files,
+     * zero {@code .sfa}.
+     * <p>
+     * {@code openInternal} sees {@code active == null} after
+     * {@code scanDirectory} and falls through to
+     * {@code createActive(FIRST_SEQ=0)}, restarting the FSN sequence at 0
+     * even though sealed segments on disk already cover 0..N. Subsequent
+     * appends produce frames whose FSNs collide with frames already on disk:
+     * <ul>
+     *   <li><b>ACK translation breaks:</b> {@code fsnAtZero} is stamped from
+     *       {@code segmentLog.nextSeq()} at connect time. With nextSeq=0 a
+     *       broker ACK for "sequence 1" translates to FSN 1, which is the
+     *       sealed segment's frame, not the new connection's frame.</li>
+     *   <li><b>trim corrupts old data:</b> {@code trim(ackedFsn)} deletes
+     *       sealed segments whose {@code lastSeq <= ackedFsn}. Since the new
+     *       active's frames are labelled with the same FSN range as the
+     *       sealed segments, an ACK that "should" cover only the new frames
+     *       also wipes old sealed segments holding never-acked data.</li>
+     *   <li><b>replay re-ships old data:</b> reconnect-replay walks
+     *       {@code segments} in list order and visits every frame's payload
+     *       with its disk FSN. The old sealed frames are replayed as
+     *       FSN 0..N — the new server receives them as if they were the new
+     *       client's data, with FSNs that the new connection will go on to
+     *       reuse.</li>
+     *   <li><b>future seal collision:</b> when the new active eventually
+     *       rotates, {@code sealedPathFor(0, lastSeq)} can collide with an
+     *       existing {@code .sfs} filename on disk (or on a different
+     *       restart — same {@code 0000000000000000-...sfs} filename pattern).
+     *       {@code ff.rename} fails or — worse — silently overwrites
+     *       depending on platform.</li>
+     * </ul>
+     * <p>
+     * Required behaviour: when {@code openInternal} finds {@code active ==
+     * null} but sealed segments exist, the new active's {@code baseSeq} must
+     * be derived from the highest sealed {@code lastSeqOnDisk + 1}, not
+     * hard-coded to {@link SegmentLog#FIRST_SEQ}.
+     * <p>
+     * Repro: drive a real rotate by appending past {@code maxBytes}, with
+     * the FdTrackingFacade armed to fail the new active's
+     * {@code allocNativePath} inside {@code createActive}. After the rename
+     * has succeeded but {@code createActive} fails, the on-disk state
+     * matches a process killed mid-rotate. Close the log (best-effort —
+     * {@code close()} writes nothing), then reopen with a clean facade and
+     * assert {@code nextSeq()} resumes past the sealed range.
+     */
+    @Test
+    public void testMidRotateCrashRecoveryPreservesFsnMonotonicity() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // maxBytes = 64. payload = 8, frame total = 16. HEADER = 24.
+            //   Two frames fit:   24 + 16 + 16 = 56 ≤ 64
+            //   Third frame:      56 + 16 = 72 > 64 → rotate triggered
+            // The rotate seals segment 0 (FSNs 0, 1, lastSeq = 1) by rename,
+            // then calls createActive(2). With failNextActiveAllocNativePath
+            // armed, the .sfa allocation throws inside createActive. The
+            // catch block removes the orphan .sfa file. On-disk we are left
+            // with exactly one .sfs file (the freshly-sealed segment 0) and
+            // zero .sfa — the same state a process killed mid-rotate would
+            // produce.
+            final long maxBytes = 64;
+            final int payload = 8;
+
+            long buf = Unsafe.malloc(payload, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payload; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, (byte) i);
+                }
+
+                // Phase 1: drive the rotate, fail it inside createActive, close.
+                FdTrackingFacade tracker = new FdTrackingFacade();
+                try (SegmentLog log = SegmentLog.open(tmpDir, tracker, maxBytes, 1L << 30, false)) {
+                    long s0 = log.append(buf, payload);
+                    long s1 = log.append(buf, payload);
+                    assertEquals(0L, s0);
+                    assertEquals(1L, s1);
+
+                    tracker.failNextActiveAllocNativePath = true;
+                    try {
+                        log.append(buf, payload);
+                        fail("expected createActive's allocNativePath to throw inside rotate");
+                    } catch (Throwable expected) {
+                        String msg = expected.getMessage() == null ? "" : expected.getMessage();
+                        String causeMsg = expected.getCause() == null
+                                || expected.getCause().getMessage() == null
+                                ? "" : expected.getCause().getMessage();
+                        assertTrue("wrong failure surfaced: " + expected,
+                                msg.contains("simulated") || msg.contains("OOM")
+                                        || causeMsg.contains("simulated") || causeMsg.contains("OOM"));
+                    }
+                }
+
+                // Verify the on-disk state matches the post-crash scenario:
+                // exactly one .sfs file, zero .sfa.
+                int sfaCount = 0;
+                int sfsCount = 0;
+                long find = Files.findFirst(tmpDir);
+                Assert.assertNotEquals("test setup: tmpDir must contain files",
+                        0L, find);
+                try {
+                    int rc = 1;
+                    while (rc > 0) {
+                        String name = Files.utf8ToString(Files.findName(find));
+                        if (name != null) {
+                            if (name.endsWith(".sfa")) sfaCount++;
+                            if (name.endsWith(".sfs")) sfsCount++;
+                        }
+                        rc = Files.findNext(find);
+                    }
+                } finally {
+                    Files.findClose(find);
+                }
+                assertEquals("test setup: should have exactly one sealed file on disk",
+                        1, sfsCount);
+                assertEquals("test setup: should have zero active files on disk "
+                        + "(createActive's catch must have removed the orphan .sfa)",
+                        0, sfaCount);
+
+                // Phase 2: reopen with a clean facade — the same state a
+                // process restart would observe. Recovery must resume FSN
+                // assignment past the sealed range; otherwise new appends
+                // collide with sealed FSNs already on disk.
+                try (SegmentLog log = SegmentLog.open(tmpDir, maxBytes)) {
+                    assertEquals(
+                            "BUG: after mid-rotate crash recovery, nextSeq must resume "
+                            + "past the highest sealed FSN to preserve monotonicity. "
+                            + "Restarting at FSN 0 lets new appends reuse FSNs already "
+                            + "on disk in sealed segments, corrupting ACK translation, "
+                            + "trim, and replay. Required: nextSeq == lastSealedSeq + 1.",
+                            2L, log.nextSeq());
+
+                    long fsn = log.append(buf, payload);
+                    assertEquals(
+                            "first append after crash recovery must continue past the "
+                                    + "sealed range (FSN 2), not collide with sealed "
+                                    + "frame FSN 0",
+                            2L, fsn);
+
+                    // Stronger end-to-end check: the next rotation must
+                    // produce a sealed filename that does NOT collide with
+                    // the existing 0000000000000000-0000000000000001.sfs.
+                    // With the bug, the recovered active starts at baseSeq=0
+                    // and a small write can rotate it to a sealed file
+                    // 0000000000000000-0000000000000002.sfs (and so on),
+                    // which is a DIFFERENT filename so it would not literally
+                    // collide here — but the FSN reuse downstream is the
+                    // load-bearing breakage. The above nextSeq + first-append
+                    // assertions cover that.
+                }
+            } finally {
+                Unsafe.free(buf, payload, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Regression coverage for the "process restart with only sealed segments
+     * on disk" recovery scenario. This is the post-state of a process killed
+     * mid-rotate (between the {@code .sfa → .sfs} rename and the new
+     * {@code createActive(lastSeq + 1)} call), or of a backup/snapshot
+     * captured between those two steps.
+     * <p>
+     * {@link #testMidRotateCrashRecoveryPreservesFsnMonotonicity} drives the
+     * same code path via fault injection inside {@code rotate()}; this test
+     * produces the same on-disk state purely by filesystem manipulation
+     * (write frames with the production code, then manually rename the
+     * {@code .sfa} to its sealed equivalent), then verifies the full
+     * recovery contract end-to-end:
+     * <ul>
+     *   <li>{@code nextSeq} resumes past the sealed range</li>
+     *   <li>{@code oldestSeq} reports the lowest sealed {@code baseSeq}</li>
+     *   <li>{@code replay} visits every persisted frame in seq order</li>
+     *   <li>subsequent appends continue past the sealed range</li>
+     * </ul>
+     */
+    @Test
+    public void testRestartWithOnlySealedSegmentsRecoversCorrectly() throws Exception {
+        final int payloadSize = 8;
+        final long maxBytes = 64; // 2 frames per segment: 24+16+16=56 ≤ 64
+
+        // Phase 1 (outside assertMemoryLeak: long-running malloc/free is in
+        // the inner closure). Write 6 frames spread across two sealed
+        // segments and one active using the production code path, then
+        // manually rename the active .sfa to its sealed equivalent — the
+        // exact on-disk state a process killed mid-rotate would leave.
+        long setupBuf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < payloadSize; i++) {
+                Unsafe.getUnsafe().putByte(setupBuf + i, (byte) (i + 1));
+            }
+            try (SegmentLog log = SegmentLog.open(tmpDir, maxBytes)) {
+                for (int i = 0; i < 6; i++) {
+                    log.append(setupBuf, payloadSize);
+                }
+                assertEquals("setup: nextSeq should be 6 before manual seal",
+                        6L, log.nextSeq());
+            }
+        } finally {
+            Unsafe.free(setupBuf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+        }
+
+        String activePath = findActivePath(tmpDir);
+        Assert.assertNotNull("setup: active .sfa file must exist", activePath);
+        String activeName = activePath.substring(activePath.lastIndexOf('/') + 1);
+        long baseSeq = Long.parseUnsignedLong(activeName.substring(0, 16), 16);
+        long lastSeq = baseSeq + 2 - 1; // active had 2 frames (FSN baseSeq, baseSeq+1)
+        String sealedName = String.format("%016x-%016x.sfs", baseSeq, lastSeq);
+        String sealedPath = activePath.substring(0, activePath.lastIndexOf('/') + 1) + sealedName;
+        assertEquals("manual seal: rename .sfa → .sfs must succeed",
+                0, Files.rename(activePath, sealedPath));
+        Assert.assertNull("manual seal: no .sfa file should remain",
+                findActivePath(tmpDir));
+
+        // Phase 2: reopen and verify the full recovery contract. Wraps in
+        // assertMemoryLeak — every malloc inside must balance.
+        TestUtils.assertMemoryLeak(() -> {
+            try (SegmentLog log = SegmentLog.open(tmpDir, maxBytes)) {
+                assertEquals(
+                        "nextSeq must resume past the sealed range "
+                                + "(highest sealed lastSeq + 1)",
+                        6L, log.nextSeq());
+                assertEquals(
+                        "oldestSeq must report the lowest sealed baseSeq",
+                        0L, log.oldestSeq());
+
+                List<Long> seenFsns = new ArrayList<>();
+                log.replay((seq, addr, len) -> {
+                    seenFsns.add(seq);
+                    return true;
+                });
+                assertEquals(
+                        "replay must visit all 6 persisted frames in seq order",
+                        Arrays.asList(0L, 1L, 2L, 3L, 4L, 5L), seenFsns);
+
+                long buf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    for (int i = 0; i < payloadSize; i++) {
+                        Unsafe.getUnsafe().putByte(buf + i, (byte) (i + 1));
+                    }
+                    long fsn = log.append(buf, payloadSize);
+                    assertEquals(
+                            "first append after restart must continue past the "
+                                    + "sealed range (FSN 6), not collide with sealed "
+                                    + "frame FSN 0",
+                            6L, fsn);
+
+                    // And replay now sees the new frame appended onto the
+                    // recovered sequence — proves the new active is properly
+                    // wired into the segments list and FSN-monotonic with
+                    // the recovered sealed segments.
+                    seenFsns.clear();
+                    log.replay((seq, addr, len) -> {
+                        seenFsns.add(seq);
+                        return true;
+                    });
+                    assertEquals(
+                            "replay after one new append must visit FSNs 0..6 "
+                                    + "in order",
+                            Arrays.asList(0L, 1L, 2L, 3L, 4L, 5L, 6L),
+                            seenFsns);
+                } finally {
+                    Unsafe.free(buf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+                }
+            }
+        });
+    }
+
+    /**
+     * Red test for the oldestSeq()-vs-replay() inconsistency that turns a
+     * transient remove failure into a permanent reconnect loop.
+     * <p>
+     * {@code trim()} keeps a sealed segment whose disk-side {@code remove()}
+     * failed in the in-memory {@code segments} list with
+     * {@code removePending=true}. {@code replay()} (line 277) correctly skips
+     * such segments so already-acked frames are not re-shipped.
+     * {@code oldestSeq()} (line 398), however, returns
+     * {@code segments.getQuick(0).baseSeq} unconditionally — including when
+     * the first segment is {@code removePending}. The two getters disagree.
+     * <p>
+     * {@code WebSocketSendQueue.doReconnectCycle} (line 925-926) anchors
+     * {@code fsnAtZero} to {@code oldestSeq()}, then immediately calls
+     * {@code replayPersistedFrames}. Inside the replay visitor (line 974) the
+     * invariant {@code fsn == fsnAtZero + wireSeq} is asserted on every
+     * frame; the first frame {@code replay()} actually visits is the first
+     * non-pending segment's {@code baseSeq}, which differs from the
+     * {@code removePending} segment's {@code baseSeq} that fsnAtZero was
+     * pinned to. The check throws {@code "SF replay FSN drift"};
+     * {@code doReconnectCycle} catches it and returns false; the I/O loop
+     * retries; the underlying remove fault is still present so the next
+     * cycle hits the same drift; <b>permanent reconnect loop</b> until
+     * either the FS issue clears AND a non-reconnect trim happens, or the
+     * sender is closed.
+     * <p>
+     * Required behaviour: {@code oldestSeq()} must agree with
+     * {@code replay()} about the first FSN. The simplest fix is to skip
+     * {@code removePending} segments in {@code oldestSeq()} the same way
+     * {@code replay()} does.
+     */
+    @Test
+    public void testOldestSeqMustSkipRemovePendingToMatchReplay() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            RemoveFailingFacade ff = new RemoveFailingFacade();
+            // maxBytes=64, payload=8, frame=16, HEADER=24.
+            //   Two frames in a segment: 24+16+16 = 56 ≤ 64.
+            //   Third frame in same segment: 56+16=72 > 64 → rotate.
+            // Five appends produce: sealed[0..1], sealed[2..3], active[4..].
+            final long maxBytes = 64;
+            final int payload = 8;
+
+            long buf = Unsafe.malloc(payload, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payload; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, (byte) i);
+                }
+
+                try (SegmentLog log = SegmentLog.open(tmpDir, ff, maxBytes, 1L << 30, false)) {
+                    for (int i = 0; i < 5; i++) {
+                        log.append(buf, payload);
+                    }
+                    assertEquals("setup: two sealed + one active",
+                            3, log.segmentCount());
+                    assertEquals("setup: oldestSeq before trim is sealed[0].baseSeq",
+                            0L, log.oldestSeq());
+
+                    // Arm the fault before trim. trim(1) acks every frame in
+                    // the first sealed segment (FSNs 0, 1). With the fault,
+                    // remove() returns false; trim keeps the segment in the
+                    // list with removePending=true.
+                    ff.failAllRemoves = true;
+                    log.trim(1L);
+                    assertEquals(
+                            "setup: removePending segment must remain in list — "
+                                    + "trimSealedSegments must NOT drop it on remove failure",
+                            3, log.segmentCount());
+
+                    // Capture the first FSN replay() actually visits. With the
+                    // fault, replay() skips sealed[0] (removePending) and
+                    // starts at sealed[1].baseSeq = 2.
+                    long[] firstReplayedFsn = {-1};
+                    log.replay((seq, addr, len) -> {
+                        if (firstReplayedFsn[0] < 0) {
+                            firstReplayedFsn[0] = seq;
+                        }
+                        return true;
+                    });
+                    assertEquals(
+                            "setup: replay must skip the removePending sealed[0] and "
+                                    + "start at sealed[1].baseSeq=2",
+                            2L, firstReplayedFsn[0]);
+
+                    // The load-bearing assertion: oldestSeq() MUST agree with
+                    // replay() about the first FSN. WebSocketSendQueue uses
+                    // oldestSeq() to pin fsnAtZero on every reconnect, then
+                    // asserts fsn == fsnAtZero + wireSeq inside the replay
+                    // visitor. A mismatch here throws "SF replay FSN drift",
+                    // which doReconnectCycle treats as a failed reconnect →
+                    // retry loop → permanent.
+                    assertEquals(
+                            "BUG: oldestSeq()=" + log.oldestSeq()
+                                    + " must equal the first FSN that replay() visits ("
+                                    + firstReplayedFsn[0] + "). Otherwise "
+                                    + "WebSocketSendQueue.doReconnectCycle pins fsnAtZero "
+                                    + "to a removePending segment, replay starts at a "
+                                    + "later FSN, and the FSN-drift check (line 974) "
+                                    + "aborts every reconnect attempt — turning a "
+                                    + "transient remove() failure into a permanent "
+                                    + "reconnect loop.",
+                            firstReplayedFsn[0], log.oldestSeq());
+                }
+            } finally {
+                Unsafe.free(buf, payload, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Red test for the {@code findFirst()==0} silent-empty-recovery bug.
+     * <p>
+     * {@link Files#findFirst(String)} returns {@code 0} on either "directory
+     * could not be opened" (errno set — transient EACCES, EMFILE, ESTALE on
+     * NFS, ENOMEM, etc.) or "directory is empty." {@code scanDirectory}
+     * conflates the two via {@code if (find == 0) return;}. By the time
+     * {@code scanDirectory} runs, {@code openInternal} has already created
+     * the directory if missing AND opened+locked the lock file inside it, so
+     * "empty" is impossible here — {@code findFirst==0} can only mean opendir
+     * failed. Treating it as "nothing to scan" lets {@code openInternal} fall
+     * through to {@code createActive(FIRST_SEQ)} (or, with the mid-rotate
+     * recovery fix, {@code createActive(resumeFrom=FIRST_SEQ)} since
+     * {@code segments} is empty), placing a fresh active on top of any
+     * still-existing on-disk segments. The new segment claims FSNs starting
+     * at 0 that overlap unscanned sealed segments → ACK translation, trim,
+     * and replay all corrupt against on-disk data the recovery never saw.
+     * <p>
+     * Required behaviour: a {@code findFirst} failure during recovery must
+     * abort {@code open} with a hard {@link SfException}. A durability layer
+     * cannot proceed from a partial / unknown view of its own log.
+     */
+    @Test
+    public void testScanDirectoryFailsWhenFindFirstReturnsZero() throws Exception {
+        // Step 1: create real on-disk state with multiple frames so the bug
+        // would silently destroy data if recovery proceeded.
+        final int payloadSize = 8;
+        long buf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < payloadSize; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) (i + 1));
+            }
+            try (SegmentLog log = SegmentLog.open(tmpDir, 4096)) {
+                for (int i = 0; i < 5; i++) {
+                    log.append(buf, payloadSize);
+                }
+            }
+        } finally {
+            Unsafe.free(buf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+        }
+
+        // Step 2: reopen with a facade that forces findFirst to return 0
+        // (simulating opendir failure). Pre-fix: open silently succeeds with
+        // an empty in-memory segments list; nextSeq=0, oldestSeq=-1; the
+        // next append would collide with the FSN range still on disk. Post-
+        // fix: open throws SfException because the recovery scan refuses to
+        // proceed from an unknown view of the log.
+        TestUtils.assertMemoryLeak(() -> {
+            FindFailingFacade ff = new FindFailingFacade();
+            ff.failFindFirst = true;
+            try (SegmentLog log = SegmentLog.open(tmpDir, ff, 4096, 1L << 30, false)) {
+                fail("BUG: scanDirectory silently treated findFirst()==0 as 'empty "
+                        + "directory' even though the lock file inside the SF dir "
+                        + "guarantees it is non-empty. Recovery proceeded from a "
+                        + "partial/unknown view; nextSeq=" + log.nextSeq()
+                        + ", segmentCount=" + log.segmentCount()
+                        + " (real on-disk state has 5 frames spread across one or "
+                        + "more segments). createActive will overwrite or alias "
+                        + "still-existing on-disk data.");
+            } catch (SfException expected) {
+                // ok — recovery refused to proceed from an unknown directory state.
+                // Acceptable to surface as the original SfException or wrap it.
+                String msg = expected.getMessage() == null ? "" : expected.getMessage();
+                assertTrue(
+                        "SfException must reference the directory scan failure. Got: " + msg,
+                        msg.toLowerCase().contains("findfirst")
+                                || msg.toLowerCase().contains("opendir")
+                                || msg.toLowerCase().contains("scan")
+                                || msg.toLowerCase().contains("directory"));
+            }
+        });
+    }
+
+    /**
+     * Red test for the {@code findNext()==-1} silent-partial-scan bug.
+     * <p>
+     * {@link Files#findNext(long)}'s contract (Files.java:373-375) is
+     * {@code 1=success, 0=end-of-directory, -1=read error}. {@code
+     * scanDirectory}'s {@code while (rc > 0)} loop exits identically on both
+     * {@code 0} and {@code -1}. A transient readdir failure (ESTALE/EIO on
+     * NFS, etc.) mid-scan thus leaves {@code segments} as a partial view of
+     * what's actually on disk — the entries past the failure point are
+     * silently dropped from the in-memory model. Subsequent {@code
+     * createActive(...)} or appends can then collide with unscanned on-disk
+     * segments, breaking ACK translation / trim / replay against data the
+     * recovery never saw.
+     * <p>
+     * Required behaviour: a {@code findNext()==-1} during recovery must
+     * abort {@code open} with a hard {@link SfException}, the same way a
+     * {@code findFirst()} failure must.
+     */
+    @Test
+    public void testScanDirectoryFailsWhenFindNextReturnsError() throws Exception {
+        // Step 1: write enough frames to produce multiple .sfs files so a
+        // mid-scan abort actually drops segments rather than just bailing
+        // before there's anything to drop.
+        final int payloadSize = 8;
+        final long maxBytes = 64; // forces rotation every 2 frames
+        long buf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < payloadSize; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) (i + 1));
+            }
+            try (SegmentLog log = SegmentLog.open(tmpDir, maxBytes)) {
+                for (int i = 0; i < 7; i++) {
+                    log.append(buf, payloadSize);
+                }
+            }
+        } finally {
+            Unsafe.free(buf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+        }
+
+        // Step 2: reopen with a facade whose findNext returns -1 immediately
+        // (simulating a readdir read error at the start of the scan).
+        // Pre-fix: open succeeds; segments contains AT MOST the entry
+        // findFirst returned and silently misses everything else.
+        // Post-fix: open throws SfException.
+        TestUtils.assertMemoryLeak(() -> {
+            FindFailingFacade ff = new FindFailingFacade();
+            ff.failFindNext = true;
+            try (SegmentLog log = SegmentLog.open(tmpDir, ff, maxBytes, 1L << 30, false)) {
+                fail("BUG: scanDirectory silently treated findNext()==-1 as "
+                        + "end-of-directory. Recovery proceeded from a partial "
+                        + "view of the on-disk log; nextSeq=" + log.nextSeq()
+                        + ", segmentCount=" + log.segmentCount() + ". The "
+                        + "unscanned segments are still on disk and will be "
+                        + "aliased / overwritten by subsequent appends.");
+            } catch (SfException expected) {
+                String msg = expected.getMessage() == null ? "" : expected.getMessage();
+                assertTrue(
+                        "SfException must reference the readdir failure. Got: " + msg,
+                        msg.toLowerCase().contains("findnext")
+                                || msg.toLowerCase().contains("readdir")
+                                || msg.toLowerCase().contains("scan")
+                                || msg.toLowerCase().contains("directory"));
+            }
+        });
+    }
+
     /** Sums the byte length of every .sfs/.sfa file in {@code dir}. */
     private static long realDiskUsage(String dir) {
         long sum = 0;
@@ -1189,6 +1712,129 @@ public class SegmentLogTest {
             }
         }
         return sum;
+    }
+
+    /**
+     * Delegates everything to {@link FilesFacade#INSTANCE}; forces
+     * {@code findFirst} to return 0 (opendir failure) or {@code findNext} to
+     * return -1 (readdir error) when armed.
+     */
+    private static class FindFailingFacade implements FilesFacade {
+        volatile boolean failFindFirst;
+        volatile boolean failFindNext;
+
+        @Override
+        public long allocNativePath(String path) {
+            return FilesFacade.INSTANCE.allocNativePath(path);
+        }
+
+        @Override
+        public int close(int fd) {
+            return FilesFacade.INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return FilesFacade.INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            if (findPtr != 0) {
+                FilesFacade.INSTANCE.findClose(findPtr);
+            }
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            if (failFindFirst) {
+                return 0;
+            }
+            return FilesFacade.INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return FilesFacade.INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            if (failFindNext) {
+                return -1;
+            }
+            return FilesFacade.INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            return FilesFacade.INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return FilesFacade.INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return FilesFacade.INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return FilesFacade.INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            return FilesFacade.INSTANCE.openCleanRW(path, size);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return FilesFacade.INSTANCE.openRW(path);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            return FilesFacade.INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            return FilesFacade.INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return FilesFacade.INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return FilesFacade.INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.write(fd, addr, len, offset);
+        }
     }
 
     /** Delegates everything to {@link FilesFacade#INSTANCE}; fails {@code remove} when armed. */

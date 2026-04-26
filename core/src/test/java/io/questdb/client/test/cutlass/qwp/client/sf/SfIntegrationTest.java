@@ -473,6 +473,156 @@ public class SfIntegrationTest {
     }
 
     /**
+     * End-to-end regression test for the
+     * {@code oldestSeq()}-vs-{@code replay()} drift bug in the reconnect /
+     * initial-replay path.
+     * <p>
+     * Setup: a {@link SegmentLog} whose first segment has been trimmed but
+     * whose {@code remove()} call failed (Windows sharing-violation under AV,
+     * transient NFS error, etc.) so the segment stayed in the in-memory list
+     * with {@code removePending=true}. {@code SegmentLog.replay} skips it
+     * (since its frames were acked by the previous server); {@code
+     * SegmentLog.oldestSeq} used to return its {@code baseSeq} unconditionally,
+     * disagreeing with replay's first-visited FSN.
+     * <p>
+     * The drift bites in two places, both load-bearing for SF:
+     * <ul>
+     *   <li>{@code WebSocketSendQueue} constructor pins {@code fsnAtZero =
+     *       segmentLog.oldestSeq()} (line 247-248).</li>
+     *   <li>{@code WebSocketSendQueue.doReconnectCycle} re-pins
+     *       {@code fsnAtZero} on every reconnect (line 925-926).</li>
+     * </ul>
+     * Inside {@code replayPersistedFrames} the assertion {@code fsn ==
+     * fsnAtZero + wireSeq} (line 974) throws "SF replay FSN drift" on the
+     * first replayed frame; the catch at line 1022 invokes
+     * {@code failConnection(non-fatal)}, which sets
+     * {@code reconnectRequested=true}; the I/O loop re-enters
+     * {@code doReconnectCycle}, calls {@code oldestSeq()} again with the same
+     * stale return, and drift fires identically. Permanent reconnect loop
+     * until either (a) the FS issue clears AND a non-reconnect trim fires
+     * (which it can't, because the I/O thread is stuck reconnecting), or (b)
+     * the user closes the sender (which blocks on the I/O thread).
+     * <p>
+     * Pre-fix: this test would never reach its assertions and {@code @Test
+     * timeout=30_000} would fire. Post-fix ({@code oldestSeq()} skips
+     * removePending to match {@code replay()}): the two unacked frames in
+     * the active segment replay successfully on initial connect and a
+     * subsequent send completes normally.
+     */
+    @Test(timeout = 30_000)
+    public void testReplaySucceedsWithRemovePendingSegmentAtHeadOfList() throws Exception {
+        int port = TEST_PORT + 90;
+        CountingAckHandler handler = new CountingAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            // Phase 1: build a SegmentLog whose head is a removePending sealed
+            // segment. The same SegmentLog will serve the sender's own frames
+            // post-replay, so maxBytes must be large enough to hold real
+            // schema-bearing wire frames (~50-100 bytes for a one-column
+            // batch). We size for that, then pick a synthetic payload large
+            // enough to force a rotation after 2 appends.
+            //
+            // maxBytes=8192, payload=3000, frame=3008, header=24:
+            //   frame 0 → writePos=24+3008=3032
+            //   frame 1 → writePos=6040
+            //   frame 2 → 6040+3008=9048>8192 ⇒ rotate; sealed[0..1] (FSN
+            //             0,1, lastSeq=1); new active starts at FSN 2; frame
+            //             2 placed at writePos=24+3008=3032
+            //   frame 3 → writePos=6040
+            // After 4 appends: segments = [sealed[0..1], active[2..3]],
+            // nextSeq=4. trim(1) acks every frame in sealed[0..1]; with
+            // failAllRemoves armed, remove() returns false; sealed becomes
+            // removePending and stays in the list.
+            RemoveFailingSfFacade ff = new RemoveFailingSfFacade();
+            final int payloadSize = 3000;
+            final long maxBytesPerSegment = 8192;
+            long buf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payloadSize; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, (byte) (i + 1));
+                }
+
+                SegmentLog log = SegmentLog.open(sfDir, ff, maxBytesPerSegment, 1L << 30, false);
+                try {
+                    for (int i = 0; i < 4; i++) {
+                        log.append(buf, payloadSize);
+                    }
+                    Assert.assertEquals(4L, log.nextSeq());
+                    ff.failAllRemoves = true;
+                    log.trim(1L);
+                    Assert.assertEquals(
+                            "setup: removePending sealed must remain in segments list",
+                            2, log.segmentCount());
+
+                    // Phase 2: connect a sender. The I/O thread's initial
+                    // replayPersistedFrames (WebSocketSendQueue.java:670)
+                    // visits the active segment's two frames. The drift
+                    // check at line 974 must NOT throw — pre-fix it would,
+                    // catching at 1022 and entering an infinite reconnect
+                    // loop that the test timeout catches.
+                    try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                            "localhost", port,
+                            QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                            QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                            QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                            8)) {
+                        sender.setSegmentLog(log);
+
+                        // Trigger lazy connect: send a fresh row + flush.
+                        // ensureConnected() on the user thread starts the
+                        // I/O thread, which immediately runs
+                        // replayPersistedFrames at WebSocketSendQueue.java:670.
+                        // Pre-fix: replay's first FSN (active's baseSeq=2)
+                        // != fsnAtZero(0) + wireSeq(0) → "SF replay FSN
+                        // drift" → failConnection(non-fatal) →
+                        // reconnectRequested → loop forever, the new frame
+                        // never reaches the server.
+                        // Post-fix: replay succeeds, the 2 unacked frames
+                        // from active reach the server, then the new send
+                        // reaches the server too.
+                        sender.table("foo").longColumn("v", 99L).atNow();
+                        sender.flush();
+
+                        // Expect 3 frames: 2 from replaying active + 1 from
+                        // the fresh send. The removePending sealed[0..1]
+                        // must NOT be re-shipped (its frames were acked
+                        // previously) so 3, not 5.
+                        long deadline = System.currentTimeMillis() + 15_000;
+                        while (System.currentTimeMillis() < deadline
+                                && handler.frameCount() < 3) {
+                            Thread.sleep(20);
+                        }
+                        Assert.assertTrue(
+                                "expected initial replay (2 frames) + fresh send "
+                                        + "(1 frame) = 3 frames; server saw "
+                                        + handler.frameCount() + " frame(s). Pre-fix "
+                                        + "the FSN-drift check aborts replay and the "
+                                        + "I/O thread enters an infinite reconnect "
+                                        + "loop; the new send never reaches the wire.",
+                                handler.frameCount() >= 3);
+
+                        // Sanity: server must NOT have seen the removePending
+                        // sealed segment's frames (they were acked previously
+                        // and replay must skip them).
+                        Assert.assertTrue(
+                                "server saw " + handler.frameCount()
+                                        + " frames; must not exceed 2 replay + N "
+                                        + "fresh sends — removePending sealed[0..1] "
+                                        + "must not be re-shipped",
+                                handler.frameCount() <= 4);
+                    }
+                } finally {
+                    log.close();
+                }
+            } finally {
+                Unsafe.free(buf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+            }
+        }
+    }
+
+    /**
      * Multi-table sender survives a reconnect. Schemas for both tables must be
      * re-published after reconnect; the sender must not crash on the second pair.
      */
@@ -2041,6 +2191,122 @@ public class SfIntegrationTest {
      * tests to observe whether {@code flush()} routed an fsync to the I/O
      * thread (opt-in path) or skipped it (default path).
      */
+    /** Delegates everything to {@link FilesFacade#INSTANCE}; fails {@code remove} when armed. */
+    private static class RemoveFailingSfFacade implements FilesFacade {
+        volatile boolean failAllRemoves;
+
+        @Override
+        public long allocNativePath(String path) {
+            return FilesFacade.INSTANCE.allocNativePath(path);
+        }
+
+        @Override
+        public int close(int fd) {
+            return FilesFacade.INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return FilesFacade.INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            FilesFacade.INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return FilesFacade.INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return FilesFacade.INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return FilesFacade.INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            return FilesFacade.INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return FilesFacade.INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return FilesFacade.INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return FilesFacade.INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            return FilesFacade.INSTANCE.openCleanRW(path, size);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return FilesFacade.INSTANCE.openRW(path);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            if (failAllRemoves) {
+                return false;
+            }
+            return FilesFacade.INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            if (failAllRemoves) {
+                return false;
+            }
+            return FilesFacade.INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return FilesFacade.INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return FilesFacade.INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
     private static class FsyncCountingFacade implements FilesFacade {
         final java.util.concurrent.atomic.AtomicInteger fsyncs = new java.util.concurrent.atomic.AtomicInteger();
 
