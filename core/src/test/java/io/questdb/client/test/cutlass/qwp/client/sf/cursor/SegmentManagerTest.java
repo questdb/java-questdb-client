@@ -37,7 +37,6 @@ import org.junit.Test;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -150,6 +149,56 @@ public class SegmentManagerTest {
                     waitFor(() -> !Files.exists(seg0Path), 2000));
         } finally {
             Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testMaxTotalBytesCapBlocksProvisioningUntilTrimFrees() throws Exception {
+        long segSize = MmapSegment.HEADER_SIZE
+                + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+        // Cap = exactly 2 manager-provisioned segments. The engine's initial
+        // active is "free" per the cap's documented approximation.
+        long cap = 2 * segSize;
+        MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
+        long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+        try (SegmentRing ring = new SegmentRing(seg0, segSize);
+             SegmentManager mgr = new SegmentManager(segSize, 200_000L, cap)) {
+            mgr.start();
+            mgr.register(ring, tmpDir);
+
+            // Manager provisions spare 1 → counter = 1*segSize.
+            assertTrue(waitFor(() -> !ring.needsHotSpare(), 2000));
+            // Fill initial (becomes sealed), rotate to spare 1.
+            ring.appendOrFsn(buf, 64);
+            ring.appendOrFsn(buf, 64);
+            ring.appendOrFsn(buf, 64); // forces rotation
+            // Manager provisions spare 2 → counter = 2*segSize. At cap.
+            assertTrue(waitFor(() -> !ring.needsHotSpare(), 2000));
+            // Fill spare 1 (becomes sealed), rotate to spare 2.
+            ring.appendOrFsn(buf, 64);
+            ring.appendOrFsn(buf, 64); // forces rotation again
+            // Manager would provision spare 3 → would be 3*segSize > cap. Refused.
+            // The ring should sit in needsHotSpare=true indefinitely.
+            // Verify: after ample time, still no spare.
+            Thread.sleep(150);
+            assertTrue("manager must respect cap and not provision spare 3", ring.needsHotSpare());
+            // Producer's appendOrFsn must report backpressure.
+            ring.appendOrFsn(buf, 64); // fills the second-to-last slot of spare 2
+            ring.appendOrFsn(buf, 64); // fills the last slot, spare 2 now full
+            assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, ring.appendOrFsn(buf, 64));
+
+            // Now ACK enough frames to make the oldest sealed segment trimmable.
+            // The initial held FSN 0..1 (2 frames). ACK frame 1 → initial trims.
+            ring.acknowledge(1L);
+            // The manager should trim → totalBytes drops by 1*segSize → headroom
+            // for one more spare → spare 3 gets installed.
+            assertTrue("manager must provision a spare once trim freed space",
+                    waitFor(() -> !ring.needsHotSpare(), 2000));
+            // And the once-stuck producer's append now succeeds.
+            assertNotEquals(SegmentRing.BACKPRESSURE_NO_SPARE,
+                    ring.appendOrFsn(buf, 64));
+        } finally {
+            Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
         }
     }
 

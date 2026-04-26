@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
@@ -203,6 +204,112 @@ public class SegmentRingTest {
 
                 // No further trimmable segments.
                 assertNull(ring.drainTrimmable());
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testOpenExistingReturnsNullOnEmptyDir() {
+        assertEquals("nothing in dir → null ring",
+                null, SegmentRing.openExisting(tmpDir, 8192));
+    }
+
+    @Test
+    public void testOpenExistingRecoversActivePlusSealed() {
+        long segSize = MmapSegment.HEADER_SIZE
+                + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            // Write three segments with FSN ranges 0..3, 4..7, 8..9 (last
+            // partially full so the recovered ring has appendable room).
+            MmapSegment s0 = MmapSegment.create(tmpDir + "/r0.sfa", 0, segSize);
+            for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+            s0.close();
+
+            MmapSegment s1 = MmapSegment.create(tmpDir + "/r1.sfa", 4, segSize);
+            for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
+            s1.close();
+
+            MmapSegment s2 = MmapSegment.create(tmpDir + "/r2.sfa", 8, segSize);
+            s2.tryAppend(buf, 16);
+            s2.tryAppend(buf, 16);
+            s2.close();
+
+            try (SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize)) {
+                assertNotNull(recovered);
+                // Active is the highest-baseSeq segment (s2) with 2 frames.
+                assertEquals(8, recovered.getActive().baseSeq());
+                assertEquals(2, recovered.getActive().frameCount());
+                // Two sealed segments, oldest first.
+                assertEquals(2, recovered.getSealedSegments().size());
+                assertEquals(0, recovered.getSealedSegments().get(0).baseSeq());
+                assertEquals(4, recovered.getSealedSegments().get(1).baseSeq());
+                // nextSeq must continue past the recovered frames.
+                assertEquals(10, recovered.nextSeqHint());
+                // Further appends land into the active and assign FSN 10.
+                assertEquals(10, recovered.appendOrFsn(buf, 16));
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testOpenExistingDetectsFsnGap() {
+        long segSize = MmapSegment.HEADER_SIZE
+                + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            MmapSegment s0 = MmapSegment.create(tmpDir + "/g0.sfa", 0, segSize);
+            for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+            s0.close();
+
+            // Gap: should be baseSeq=4 next, but we use 100 — simulating
+            // a segment file that was deleted out from under us.
+            MmapSegment s2 = MmapSegment.create(tmpDir + "/g2.sfa", 100, segSize);
+            s2.tryAppend(buf, 16);
+            s2.close();
+
+            try {
+                SegmentRing.openExisting(tmpDir, segSize);
+                throw new AssertionError("expected FSN gap to be detected");
+            } catch (MmapSegmentException expected) {
+                assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("FSN gap"));
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testOpenExistingSkipsBadMagicFile() {
+        long segSize = MmapSegment.HEADER_SIZE
+                + (MmapSegment.FRAME_HEADER_SIZE + 16);
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            // One good segment.
+            MmapSegment s0 = MmapSegment.create(tmpDir + "/good.sfa", 0, segSize);
+            s0.tryAppend(buf, 16);
+            s0.close();
+            // One stray .sfa with no proper header — must be ignored.
+            int fd = Files.openCleanRW(tmpDir + "/stray.sfa", 64);
+            long hdr = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().putLong(hdr, 0xBADBADBADBADBADBL);
+                Files.write(fd, hdr, 8, 0);
+                Files.fsync(fd);
+            } finally {
+                Files.close(fd);
+                Unsafe.free(hdr, 8, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            try (SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize)) {
+                assertNotNull(recovered);
+                assertEquals(0, recovered.getActive().baseSeq());
+                assertEquals(0, recovered.getSealedSegments().size());
             }
         } finally {
             Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);

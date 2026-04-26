@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 
@@ -68,7 +69,10 @@ public final class SegmentRing implements QuietCloseable {
     // looks at sealedSegments after observing a higher ackedFsn, by which
     // point the producer thread's add to sealedSegments has retired.
     private final ObjList<MmapSegment> sealedSegments = new ObjList<>();
-    private MmapSegment active;
+    // active: written by producer (constructor + appendOrFsn rotation),
+    // read by I/O thread via getActive(). Volatile so the I/O thread sees
+    // rotations promptly and never observes a torn reference.
+    private volatile MmapSegment active;
     private volatile long ackedFsn = -1L;
     // hotSpare: written by segment manager (installHotSpare), read+cleared by
     // producer thread on rotation. Volatile so the producer sees fresh installs.
@@ -89,6 +93,110 @@ public final class SegmentRing implements QuietCloseable {
         this.maxBytesPerSegment = maxBytesPerSegment;
         this.nextSeq = initialActive.baseSeq() + initialActive.frameCount();
         this.publishedFsn = nextSeq - 1;
+    }
+
+    /**
+     * Recovers a ring from segments already on disk in {@code sfDir}. Used at
+     * sender startup when the user's previous session left durable but
+     * not-yet-acked frames behind. Walks every {@code *.sfa} file in the
+     * directory, opens each via {@link MmapSegment#openExisting}, and
+     * arranges them by baseSeq:
+     * <ul>
+     *   <li>Highest-baseSeq segment becomes the active (further appends land
+     *       there until it fills, at which point normal rotation kicks in).</li>
+     *   <li>All others become sealed segments awaiting ACK and trim.</li>
+     * </ul>
+     * Returns {@code null} if the directory is empty or contains no
+     * recognizable {@code .sfa} files — the caller should then construct a
+     * fresh ring with {@link #SegmentRing(MmapSegment, long)} and a freshly
+     * created initial segment.
+     * <p>
+     * Recovery is best-effort: a single bad-magic file is silently skipped
+     * (logged-then-ignored is the right call here; a stray unrelated file in
+     * the SF dir shouldn't take the whole sender down). A failure to open
+     * an otherwise-valid segment IS fatal — the caller's data integrity
+     * depends on every segment being readable.
+     */
+    public static SegmentRing openExisting(String sfDir, long maxBytesPerSegment) {
+        if (!Files.exists(sfDir)) {
+            return null;
+        }
+        ObjList<MmapSegment> opened = new ObjList<>();
+        long find = Files.findFirst(sfDir);
+        if (find == 0) {
+            return null;
+        }
+        try {
+            int rc = 1;
+            while (rc > 0) {
+                String name = Files.utf8ToString(Files.findName(find));
+                if (name != null && name.endsWith(".sfa") && !".".equals(name) && !"..".equals(name)) {
+                    String path = sfDir + "/" + name;
+                    try {
+                        opened.add(MmapSegment.openExisting(path));
+                    } catch (MmapSegmentException ignored) {
+                        // Stray file with the .sfa extension but bad header /
+                        // unreadable: skip rather than fail the recovery.
+                        // Logging is the engine's responsibility — SegmentRing
+                        // doesn't have a logger of its own.
+                    }
+                }
+                rc = Files.findNext(find);
+            }
+        } finally {
+            Files.findClose(find);
+        }
+        if (opened.size() == 0) {
+            return null;
+        }
+        // Sort by baseSeq ascending. ObjList lacks sort; do a simple selection
+        // sort — typical recovery is < 100 segments, O(n^2) is fine.
+        for (int i = 0, n = opened.size(); i < n; i++) {
+            int minIdx = i;
+            long minBase = opened.get(i).baseSeq();
+            for (int j = i + 1; j < n; j++) {
+                long b = opened.get(j).baseSeq();
+                if (b < minBase) {
+                    minBase = b;
+                    minIdx = j;
+                }
+            }
+            if (minIdx != i) {
+                MmapSegment tmp = opened.get(i);
+                opened.setQuick(i, opened.get(minIdx));
+                opened.setQuick(minIdx, tmp);
+            }
+        }
+        // Sanity: the recovered segments must form a contiguous FSN range.
+        // Detect gaps so a partial-write/manual-deletion mishap doesn't
+        // silently produce duplicate or missing FSNs after recovery.
+        for (int i = 1, n = opened.size(); i < n; i++) {
+            MmapSegment prev = opened.get(i - 1);
+            MmapSegment curr = opened.get(i);
+            long expected = prev.baseSeq() + prev.frameCount();
+            if (curr.baseSeq() != expected) {
+                // Close everything we've opened so the file handles don't leak.
+                for (int j = 0; j < n; j++) opened.get(j).close();
+                throw new MmapSegmentException(
+                        "FSN gap in recovered segments: prev baseSeq=" + prev.baseSeq()
+                                + " frameCount=" + prev.frameCount()
+                                + " expected next baseSeq=" + expected
+                                + " but got " + curr.baseSeq());
+            }
+        }
+        // The newest segment becomes the active. Even if it's full, that's OK:
+        // the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager
+        // installs a hot spare, the producer rotates. Same fast path as a
+        // mid-life ring.
+        int last = opened.size() - 1;
+        MmapSegment active = opened.get(last);
+        opened.remove(last);
+        SegmentRing ring = new SegmentRing(active, maxBytesPerSegment);
+        // Older segments become sealed in baseSeq order.
+        for (int i = 0, n = opened.size(); i < n; i++) {
+            ring.sealedSegments.add(opened.get(i));
+        }
+        return ring;
     }
 
     /**
@@ -137,7 +245,12 @@ public final class SegmentRing implements QuietCloseable {
             // earlier guess at baseSeq is irrelevant.
             long actualBase = active.baseSeq() + active.frameCount();
             spare.rebaseSeq(actualBase);
-            sealedSegments.add(active);
+            // Mutate sealedSegments under the same monitor used by
+            // snapshotSealedSegments — the I/O thread reads through that
+            // path and must not see a half-resized ObjList.
+            synchronized (this) {
+                sealedSegments.add(active);
+            }
             active = spare;
             hotSpare = null;
             offset = active.tryAppend(payloadAddr, payloadLen);
@@ -179,11 +292,13 @@ public final class SegmentRing implements QuietCloseable {
      * when nothing is eligible (avoids ObjList allocation in the steady
      * state where most polls are no-ops).
      */
-    public ObjList<MmapSegment> drainTrimmable() {
+    public synchronized ObjList<MmapSegment> drainTrimmable() {
         long acked = ackedFsn;
         ObjList<MmapSegment> out = null;
         // Sealed segments are in baseSeq order, oldest first; once we hit one
         // that isn't fully acked, none of the later ones can be either.
+        // Synchronized so the I/O thread's snapshotSealedSegments() can't
+        // race against the remove(0) shuffling slots underneath it.
         while (sealedSegments.size() > 0) {
             MmapSegment s = sealedSegments.get(0);
             long lastSeq = s.baseSeq() + s.frameCount() - 1;
@@ -204,9 +319,42 @@ public final class SegmentRing implements QuietCloseable {
         return active;
     }
 
-    /** Snapshot view of sealed segments (oldest first); for I/O thread to drain. */
+    /**
+     * Direct view of sealed segments (oldest first). NOT thread-safe — use
+     * only from the producer thread, or alongside a lock that excludes
+     * concurrent rotation. Cross-thread readers (typically the I/O loop)
+     * should use {@link #snapshotSealedSegments(MmapSegment[])} instead.
+     */
     public ObjList<MmapSegment> getSealedSegments() {
         return sealedSegments;
+    }
+
+    /**
+     * Thread-safe snapshot of the current sealed-segment list. Copies
+     * references into the caller-supplied {@code target} array (oldest
+     * first, packed left). Returns the number of references copied. If
+     * {@code target} is too small, copies the first {@code target.length}
+     * references and returns {@code -1} as a signal that the caller needs
+     * to grow the buffer and retry.
+     * <p>
+     * Synchronized against rotation (producer's
+     * {@link #appendOrFsn} mutates {@code sealedSegments}). Cost is one
+     * monitor acquire/release per call, paid by the I/O loop at most once
+     * per tick — far below the cost of the actual {@code sendBinary} that
+     * the I/O loop is about to do.
+     */
+    public synchronized int snapshotSealedSegments(MmapSegment[] target) {
+        int n = sealedSegments.size();
+        if (n > target.length) {
+            for (int i = 0; i < target.length; i++) {
+                target[i] = sealedSegments.get(i);
+            }
+            return -1;
+        }
+        for (int i = 0; i < n; i++) {
+            target[i] = sealedSegments.get(i);
+        }
+        return n;
     }
 
     /**
