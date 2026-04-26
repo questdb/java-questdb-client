@@ -73,9 +73,16 @@ public class WebSocketSendQueue implements QuietCloseable {
     public static final long DEFAULT_ENQUEUE_TIMEOUT_MS = 30_000;
     public static final long DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
     private static final Logger LOG = LoggerFactory.getLogger(WebSocketSendQueue.class);
-    // The WebSocket client for I/O (single-threaded access only). Replaced on
-    // reconnect when SF is enabled.
-    private WebSocketClient client;
+    // The WebSocket client for I/O. Owned by the I/O thread for normal use,
+    // but read by the user thread in close() at line 298 when awaitShutdown
+    // times out (the user thread calls forceDisconnect() to unblock a stuck
+    // I/O thread). Under SF, the I/O thread reassigns this on reconnect
+    // (doReconnectCycle line 826) outside any lock — without volatile the JMM
+    // does not require the user thread's stale-read at close-timeout to
+    // observe that write, in which case forceDisconnect() runs against the
+    // OLD client (no-op) and the I/O thread stays stuck on the live new
+    // socket until close() exhausts its second timeout and throws.
+    private volatile WebSocketClient client;
     @Nullable
     private final Reconnector reconnector;
     private volatile boolean reconnectRequested;
@@ -520,10 +527,6 @@ public class WebSocketSendQueue implements QuietCloseable {
         }
     }
 
-    private void failConnection(LineSenderException error) {
-        failConnection(error, false);
-    }
-
     /**
      * Mark the connection as failed. When {@code fatal} is true (e.g. an SF
      * storage error like corruption or a frame too large for a segment), bypass
@@ -633,7 +636,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         client.sendPing(1000);
                     } catch (Exception e) {
                         pingDeadlineNanos = 0;
-                        failConnection(new LineSenderException("Ping failed", e));
+                        failConnection(new LineSenderException("Ping failed", e), false);
                         completePing();
                     }
                 }
@@ -675,7 +678,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                                 completePing();
                             } else if (System.nanoTime() >= pingDeadlineNanos) {
                                 pingDeadlineNanos = 0;
-                                failConnection(new LineSenderException("Ping timed out waiting for PONG"));
+                                failConnection(new LineSenderException("Ping timed out waiting for PONG"), false);
                                 completePing();
                             }
                         }
@@ -729,7 +732,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                                 } catch (Throwable t) {
                                     LOG.error("Error sending batch [id={}]", batch.getBatchId(), t);
                                     failConnection(new LineSenderException(
-                                            "Error sending batch " + batch.getBatchId() + ": " + t.getMessage(), t));
+                                            "Error sending batch " + batch.getBatchId() + ": " + t.getMessage(), t), false);
                                     if (batch.isSealed()) batch.markSending();
                                     if (batch.isSending()) batch.markRecycled();
                                 }
@@ -778,19 +781,33 @@ public class WebSocketSendQueue implements QuietCloseable {
      * after a longer backoff.
      */
     private boolean doReconnectCycle(long sleepMs) {
-        // Drop any half-written buffer first so the user thread can keep producing.
-        synchronized (processingLock) {
-            //noinspection resource
-            MicrobatchBuffer dropped = pollPending();
-            if (dropped != null) {
-                if (dropped.isSealed()) {
-                    dropped.markSending();
+        // Don't touch pendingBuffer in the normal case. Dropping it here would
+        // silently lose bytes the user thought were durable: enqueue() returned
+        // success and flush() will return success once processingCount drops
+        // and the slot frees, but the bytes were never persisted to SF. Leave
+        // the buffer for the post-reconnect ACTIVE state to pollPending and
+        // run the standard sendBatch path, which persists to SF before send.
+        // <p>
+        // Exception: when we're shutting down, the I/O loop must be allowed to
+        // exit. Drop the pending buffer so {@code isPendingEmpty()} becomes
+        // true and the {@code while (running || !isPendingEmpty())} guard at
+        // the top of {@code ioLoop} terminates the loop. This is the same
+        // last-resort data-loss path as {@link #abandonStalled()}.
+        if (shuttingDown || !running) {
+            synchronized (processingLock) {
+                //noinspection resource
+                MicrobatchBuffer dropped = pollPending();
+                if (dropped != null) {
+                    if (dropped.isSealed()) {
+                        dropped.markSending();
+                    }
+                    if (dropped.isSending()) {
+                        dropped.markRecycled();
+                    }
                 }
-                if (dropped.isSending()) {
-                    dropped.markRecycled();
-                }
+                processingLock.notifyAll();
             }
-            processingLock.notifyAll();
+            return false;
         }
         try {
             client.forceDisconnect();
@@ -880,7 +897,7 @@ public class WebSocketSendQueue implements QuietCloseable {
             });
         } catch (Throwable t) {
             LOG.error("SF replay failed", t);
-            failConnection(new LineSenderException("SF replay failed: " + t.getMessage(), t));
+            failConnection(new LineSenderException("SF replay failed: " + t.getMessage(), t), false);
             return;
         }
         if (count[0] > 0) {
@@ -947,15 +964,17 @@ public class WebSocketSendQueue implements QuietCloseable {
             try {
                 Thread.sleep(50);
             } catch (InterruptedException ignored) {
-                if (!running) {
-                    Thread.currentThread().interrupt();
-                }
+                // Always preserve the interrupt status. The previous code only
+                // re-flagged when running==false, silently dropping interrupts
+                // raised while running — a footgun for any future caller that
+                // wants to wake the I/O thread cooperatively.
+                Thread.currentThread().interrupt();
             }
         } catch (Throwable t) {
             // Non-disk-full failure during retry — recycle and surface.
             LOG.error("Error retrying stalled batch [id={}]", batch.getBatchId(), t);
             failConnection(new LineSenderException(
-                    "Error retrying stalled batch " + batch.getBatchId() + ": " + t.getMessage(), t));
+                    "Error retrying stalled batch " + batch.getBatchId() + ": " + t.getMessage(), t), false);
             if (batch.isSealed()) batch.markSending();
             if (batch.isSending()) batch.markRecycled();
             cleared = true;
@@ -993,31 +1012,9 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
-     * Sends a batch with error handling. Does NOT manage processingCount.
-     */
-    private void safeSendBatch(MicrobatchBuffer batch) {
-        try {
-            sendBatch(batch);
-        } catch (Throwable t) {
-            LOG.error("Error sending batch [id={}]{}", batch.getBatchId(), "", t);
-            failConnection(new LineSenderException("Error sending batch " + batch.getBatchId() + ": " + t.getMessage(), t));
-            // Mark as recycled even on error to allow cleanup
-            if (batch.isSealed()) {
-                batch.markSending();
-            }
-            if (batch.isSending()) {
-                batch.markRecycled();
-            }
-        }
-    }
-
-    /**
      * Sends a single batch over the WebSocket channel.
      */
     private void sendBatch(MicrobatchBuffer batch) {
-        // Transition state: SEALED -> SENDING
-        batch.markSending();
-
         int bytes = batch.getBufferPos();
         int rows = batch.getRowCount();
 
@@ -1025,7 +1022,12 @@ public class WebSocketSendQueue implements QuietCloseable {
         // wire send still has the bytes recoverable for replay. The server tracks
         // its own per-connection seq starting at 0, so wireSeq stays decoupled from
         // the persistent SF FSN.
-        long batchSequence = nextBatchSequence++;
+        // Buffer state stays SEALED across the append: if append throws (disk-full
+        // or hard SF error), the I/O loop's stall/retry path can re-enter sendBatch
+        // and markSending() below will succeed because we never advanced past SEALED.
+        // nextBatchSequence is reserved but only committed after append succeeds —
+        // an exception here must leave it unchanged so the retry uses the same wireSeq.
+        long batchSequence = nextBatchSequence;
         if (segmentLog != null) {
             long fsn = segmentLog.append(batch.getBufferPtr(), bytes);
             // Sanity: SF.append produces FSNs strictly monotonic, and we always send
@@ -1035,6 +1037,10 @@ public class WebSocketSendQueue implements QuietCloseable {
                         "SF/wire seq drift: fsn=" + fsn + " expected=" + (fsnAtZero + batchSequence));
             }
         }
+        nextBatchSequence = batchSequence + 1;
+
+        // Transition state: SEALED -> SENDING
+        batch.markSending();
 
         if (LOG.isDebugEnabled()) {
             LOG.debug("Sending batch [seq={}, bytes={}, rows={}, bufferId={}]", batchSequence, bytes, rows, batch.getBatchId());
@@ -1089,7 +1095,7 @@ public class WebSocketSendQueue implements QuietCloseable {
         } catch (Exception e) {
             if (running) {
                 LOG.error("Error receiving response: {}", e.getMessage());
-                failConnection(new LineSenderException("Error receiving response: " + e.getMessage(), e));
+                failConnection(new LineSenderException("Error receiving response: " + e.getMessage(), e), false);
             }
         }
         return received;
@@ -1125,7 +1131,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         "Invalid ACK response payload [length=" + payloadLen + ']'
                 );
                 LOG.error("Invalid ACK response payload [length={}]", payloadLen);
-                failConnection(error);
+                failConnection(error, false);
                 return;
             }
 
@@ -1167,14 +1173,14 @@ public class WebSocketSendQueue implements QuietCloseable {
                         "Server error for batch " + sequence + ": " +
                                 response.getStatusName() + " - " + errorMessage);
                 totalErrors.incrementAndGet();
-                failConnection(error);
+                failConnection(error, false);
             }
         }
 
         @Override
         public void onClose(int code, String reason) {
             LOG.info("WebSocket closed by server [code={}, reason={}]", code, reason);
-            failConnection(new LineSenderException("WebSocket closed by server [code=" + code + ", reason=" + reason + ']'));
+            failConnection(new LineSenderException("WebSocket closed by server [code=" + code + ", reason=" + reason + ']'), false);
         }
 
         @Override

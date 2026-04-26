@@ -29,10 +29,14 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.io.File;
+import java.io.IOException;
 import java.nio.file.Paths;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -237,5 +241,81 @@ public class FilesTest {
         assertTrue("PAGE_SIZE positive", Files.PAGE_SIZE > 0);
         long ps = Files.PAGE_SIZE;
         assertEquals("PAGE_SIZE power of 2", 0, ps & (ps - 1));
+    }
+
+    /**
+     * Red test for bug M2 — {@code Files.close(int)} refuses fds 0/1/2 via
+     * the predicate {@code if (fd > 2)} (lines 42-47), returning -1 without
+     * invoking the underlying native {@code close(2)}. On a container where
+     * stdin/stdout/stderr were pre-closed before the JVM started,
+     * {@code openRW} can legitimately return 0/1/2 — and {@code Files.close}
+     * then leaks the descriptor until JVM exit. The fix is to remove the
+     * guard or change it to {@code if (fd >= 0)}.
+     * <p>
+     * Cannot test in-process because closing real fd 0/1/2 would break the
+     * test runner's stdin/stdout/stderr. Instead spawn a child JVM whose
+     * stdin is redirected to a temp file (so fd 0 is a closeable file). The
+     * child calls {@code Files.close(0)} and reports the result via exit
+     * code: 0 if close succeeded (post-fix expected), 1 if refused (current
+     * bug).
+     */
+    @Test
+    public void testFilesCloseAcceptsFdZero() throws Exception {
+        Assume.assumeTrue("subprocess test needs java executable on PATH",
+                new File(System.getProperty("java.home"), "bin/java").exists());
+
+        File stdinFile = File.createTempFile("m2-stdin-", ".tmp");
+        stdinFile.deleteOnExit();
+
+        File javaBin = new File(System.getProperty("java.home"), "bin/java");
+        // Surefire wraps the classpath in a manifest jar so java.class.path
+        // is useless here. Compute the classpath from the actual class locations.
+        File mainClasses = new File(
+                Files.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        File testClasses = new File(
+                FilesTest.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        String classpath = mainClasses.getAbsolutePath()
+                + File.pathSeparator + testClasses.getAbsolutePath();
+
+        ProcessBuilder pb = new ProcessBuilder(
+                javaBin.getAbsolutePath(),
+                "-cp", classpath,
+                FilesCloseFdZeroChild.class.getName()
+        );
+        pb.redirectInput(stdinFile);
+        pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+        pb.redirectError(ProcessBuilder.Redirect.INHERIT);
+
+        Process p = pb.start();
+        boolean finished = p.waitFor(30, TimeUnit.SECONDS);
+        if (!finished) {
+            p.destroyForcibly();
+            throw new AssertionError("child JVM did not exit within 30s");
+        }
+        int exit = p.exitValue();
+        // Exit 0: Files.close(0) returned 0 (close attempted and succeeded).
+        // Exit 1: Files.close(0) returned -1 (predicate refused — current bug).
+        // Exit 2: child harness error.
+        assertEquals(
+                "Files.close(0) must attempt the close. Child returned " + exit
+                        + " (1 = predicate refusal — bug M2; 0 = post-fix correct).",
+                0, exit);
+    }
+
+    /**
+     * Child JVM entry point for {@link #testFilesCloseAcceptsFdZero()}. Its
+     * stdin is the redirected temp file from {@link ProcessBuilder}, so fd 0
+     * is a regular file safe to close.
+     */
+    public static class FilesCloseFdZeroChild {
+        public static void main(String[] args) {
+            try {
+                int rc = Files.close(0);
+                System.exit(rc == 0 ? 0 : 1);
+            } catch (Throwable t) {
+                t.printStackTrace();
+                System.exit(2);
+            }
+        }
     }
 }

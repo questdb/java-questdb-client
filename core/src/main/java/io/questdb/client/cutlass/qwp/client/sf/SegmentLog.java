@@ -26,13 +26,11 @@ package io.questdb.client.cutlass.qwp.client.sf;
 
 import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
-
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
 
 /**
  * Segmented append-only log of opaque byte frames keyed by a monotonic 64-bit sequence number.
@@ -77,6 +75,7 @@ public final class SegmentLog implements QuietCloseable {
     private static final int MIN_BUF_BYTES = 64;
 
     private final String dir;
+    private final FilesFacade ff;
     private final long maxBytesPerSegment;
     private final long maxTotalBytes;
     // When true, every successful append() forces fsync of the active segment.
@@ -84,9 +83,14 @@ public final class SegmentLog implements QuietCloseable {
     // guarantee. Default off — fsync runs on rotation and on explicit flush().
     private final boolean fsyncEachAppend;
 
-    private final List<Segment> segments = new ArrayList<>();
+    private final ObjList<Segment> segments = new ObjList<>();
     private Segment active;
     private long nextSeq;
+    // Running sum of all segments' writePos. Maintained incrementally on
+    // append/rotate/trim/createActive so bytesOnDisk() is O(1) and zero-alloc
+    // on the I/O hot path. Re-derivable from segments at any time via the
+    // sum of writePos over each segment.
+    private long bytesOnDiskCache;
 
     private int lockFd = -1;
 
@@ -98,8 +102,9 @@ public final class SegmentLog implements QuietCloseable {
 
     private boolean closed;
 
-    private SegmentLog(String dir, long maxBytesPerSegment, long maxTotalBytes, boolean fsyncEachAppend) {
+    private SegmentLog(String dir, FilesFacade ff, long maxBytesPerSegment, long maxTotalBytes, boolean fsyncEachAppend) {
         this.dir = dir;
+        this.ff = ff;
         this.maxBytesPerSegment = maxBytesPerSegment;
         this.maxTotalBytes = maxTotalBytes;
         this.fsyncEachAppend = fsyncEachAppend;
@@ -111,7 +116,7 @@ public final class SegmentLog implements QuietCloseable {
      * Total disk usage is unbounded; use {@link #open(String, long, long)} to cap it.
      */
     public static SegmentLog open(String dir, long maxBytesPerSegment) {
-        return open(dir, maxBytesPerSegment, DEFAULT_MAX_TOTAL_BYTES, false);
+        return open(dir, FilesFacade.INSTANCE, maxBytesPerSegment, DEFAULT_MAX_TOTAL_BYTES, false);
     }
 
     /**
@@ -121,7 +126,7 @@ public final class SegmentLog implements QuietCloseable {
      * space (typically driven by server ACKs).
      */
     public static SegmentLog open(String dir, long maxBytesPerSegment, long maxTotalBytes) {
-        return open(dir, maxBytesPerSegment, maxTotalBytes, false);
+        return open(dir, FilesFacade.INSTANCE, maxBytesPerSegment, maxTotalBytes, false);
     }
 
     /**
@@ -131,6 +136,15 @@ public final class SegmentLog implements QuietCloseable {
      * an OS-level crash.
      */
     public static SegmentLog open(String dir, long maxBytesPerSegment, long maxTotalBytes, boolean fsyncEachAppend) {
+        return open(dir, FilesFacade.INSTANCE, maxBytesPerSegment, maxTotalBytes, fsyncEachAppend);
+    }
+
+    /**
+     * Open with an explicit {@link FilesFacade}. Used by tests to inject fault
+     * behavior at the file-I/O boundary; production callers should use the
+     * overloads above.
+     */
+    public static SegmentLog open(String dir, FilesFacade ff, long maxBytesPerSegment, long maxTotalBytes, boolean fsyncEachAppend) {
         if (maxBytesPerSegment < HEADER_SIZE + FRAME_HEADER_SIZE + 16) {
             throw new SfException("maxBytesPerSegment too small: " + maxBytesPerSegment);
         }
@@ -138,7 +152,7 @@ public final class SegmentLog implements QuietCloseable {
             throw new SfException("maxTotalBytes (" + maxTotalBytes
                     + ") must be >= maxBytesPerSegment (" + maxBytesPerSegment + ")");
         }
-        SegmentLog log = new SegmentLog(dir, maxBytesPerSegment, maxTotalBytes, fsyncEachAppend);
+        SegmentLog log = new SegmentLog(dir, ff, maxBytesPerSegment, maxTotalBytes, fsyncEachAppend);
         try {
             log.openInternal();
             return log;
@@ -193,26 +207,27 @@ public final class SegmentLog implements QuietCloseable {
         Unsafe.getUnsafe().putInt(envBuf, crc);
 
         long pos = active.writePos;
-        long w = Files.write(active.fd, envBuf, FRAME_HEADER_SIZE, pos);
+        long w = ff.write(active.fd, envBuf, FRAME_HEADER_SIZE, pos);
         if (w != FRAME_HEADER_SIZE) {
             // Most likely ENOSPC. Truncate any partial write back so a retry
             // (after disk space frees up) starts at the same position cleanly.
-            Files.truncate(active.fd, pos);
+            ff.truncate(active.fd, pos);
             throw new SfDiskFullException("short write of frame header at pos=" + pos
                     + " (got " + w + " of " + FRAME_HEADER_SIZE + ")");
         }
-        long w2 = Files.write(active.fd, payloadAddr, payloadLen, pos + FRAME_HEADER_SIZE);
+        long w2 = ff.write(active.fd, payloadAddr, payloadLen, pos + FRAME_HEADER_SIZE);
         if (w2 != payloadLen) {
             // Header landed but payload didn't fit. Truncate back to before the
             // header so the file is in a clean state for retry.
-            Files.truncate(active.fd, pos);
+            ff.truncate(active.fd, pos);
             throw new SfDiskFullException("short write of payload at pos=" + (pos + FRAME_HEADER_SIZE)
                     + " (got " + w2 + " of " + payloadLen + ")");
         }
         active.writePos = pos + total;
         active.frameCount++;
+        bytesOnDiskCache += total;
         nextSeq = seq + 1;
-        if (fsyncEachAppend && Files.fsync(active.fd) != 0) {
+        if (fsyncEachAppend && ff.fsync(active.fd) != 0) {
             throw new SfException("fsync after append failed for " + active.path);
         }
         return seq;
@@ -221,7 +236,7 @@ public final class SegmentLog implements QuietCloseable {
     /** Force durability of the active segment to disk. */
     public void fsync() {
         ensureOpen();
-        if (Files.fsync(active.fd) != 0) {
+        if (ff.fsync(active.fd) != 0) {
             throw new SfException("fsync failed for " + active.path);
         }
     }
@@ -233,8 +248,8 @@ public final class SegmentLog implements QuietCloseable {
      */
     public void replay(FrameVisitor visitor) {
         ensureOpen();
-        for (Segment seg : segments) {
-            if (!replaySegment(seg, visitor)) {
+        for (int i = 0, n = segments.size(); i < n; i++) {
+            if (!replaySegment(segments.getQuick(i), visitor)) {
                 return;
             }
         }
@@ -248,20 +263,23 @@ public final class SegmentLog implements QuietCloseable {
     public void trim(long ackedSeq) {
         ensureOpen();
         int writeIdx = 0;
-        for (int i = 0; i < segments.size(); i++) {
-            Segment s = segments.get(i);
+        for (int i = 0, n = segments.size(); i < n; i++) {
+            Segment s = segments.getQuick(i);
             if (!s.sealed) {
-                segments.set(writeIdx++, s);
+                segments.setQuick(writeIdx++, s);
                 continue;
             }
             if (s.lastSeq() <= ackedSeq) {
                 if (s.fd != -1) {
-                    Files.close(s.fd);
+                    ff.close(s.fd);
                     s.fd = -1;
                 }
-                Files.remove(s.path);
+                ff.remove(s.pathPtrNative);
+                Files.freeNativePath(s.pathPtrNative);
+                s.pathPtrNative = 0;
+                bytesOnDiskCache -= s.writePos;
             } else {
-                segments.set(writeIdx++, s);
+                segments.setQuick(writeIdx++, s);
             }
         }
         while (segments.size() > writeIdx) {
@@ -272,10 +290,10 @@ public final class SegmentLog implements QuietCloseable {
     /** Lowest seq currently on disk, or -1 if log is empty. */
     public long oldestSeq() {
         ensureOpen();
-        if (segments.isEmpty()) {
+        if (segments.size() == 0) {
             return -1;
         }
-        Segment first = segments.get(0);
+        Segment first = segments.getQuick(0);
         if (first.frameCount == 0) {
             return -1;
         }
@@ -291,11 +309,7 @@ public final class SegmentLog implements QuietCloseable {
     /** Total bytes used by all segments on disk (header + frames). */
     public long bytesOnDisk() {
         ensureOpen();
-        long total = 0;
-        for (Segment s : segments) {
-            total += s.writePos;
-        }
-        return total;
+        return bytesOnDiskCache;
     }
 
     public int segmentCount() {
@@ -309,16 +323,21 @@ public final class SegmentLog implements QuietCloseable {
             return;
         }
         closed = true;
-        for (Segment s : segments) {
+        for (int i = 0, n = segments.size(); i < n; i++) {
+            Segment s = segments.getQuick(i);
             if (s.fd != -1) {
-                Files.close(s.fd);
+                ff.close(s.fd);
                 s.fd = -1;
+            }
+            if (s.pathPtrNative != 0) {
+                Files.freeNativePath(s.pathPtrNative);
+                s.pathPtrNative = 0;
             }
         }
         segments.clear();
         active = null;
         if (lockFd != -1) {
-            Files.close(lockFd);
+            ff.close(lockFd);
             lockFd = -1;
         }
         if (envBuf != 0) {
@@ -335,9 +354,9 @@ public final class SegmentLog implements QuietCloseable {
     // ---- internals ----
 
     private void openInternal() {
-        if (!Files.exists(dir)) {
-            int rc = Files.mkdir(dir, 0755);
-            if (rc != 0 && !Files.exists(dir)) {
+        if (!ff.exists(dir)) {
+            int rc = ff.mkdir(dir, 0755);
+            if (rc != 0 && !ff.exists(dir)) {
                 throw new SfException("cannot create directory: " + dir);
             }
         }
@@ -348,11 +367,11 @@ public final class SegmentLog implements QuietCloseable {
 
         // single-writer lock
         String lockPath = dir + "/" + LOCK_FILE_NAME;
-        lockFd = Files.openRW(lockPath);
+        lockFd = ff.openRW(lockPath);
         if (lockFd < 0) {
             throw new SfException("cannot open lock file: " + lockPath);
         }
-        if (Files.lock(lockFd) != 0) {
+        if (ff.lock(lockFd) != 0) {
             throw new SfException("SegmentLog at " + dir + " is locked by another process");
         }
 
@@ -364,65 +383,82 @@ public final class SegmentLog implements QuietCloseable {
     }
 
     private void scanDirectory() {
-        long find = Files.findFirst(dir);
+        long find = ff.findFirst(dir);
         if (find == 0) {
             return;
         }
         try {
             int rc = 1;
             while (rc > 0) {
-                String name = Files.utf8ToString(Files.findName(find));
-                int type = Files.findType(find);
+                String name = Files.utf8ToString(ff.findName(find));
+                int type = ff.findType(find);
                 if (name != null && type != Files.DT_DIR && !LOCK_FILE_NAME.equals(name)) {
                     Segment s = parseFilename(name);
                     if (s != null) {
                         segments.add(s);
                     }
                 }
-                rc = Files.findNext(find);
+                rc = ff.findNext(find);
             }
         } finally {
-            Files.findClose(find);
+            ff.findClose(find);
         }
 
-        segments.sort(Comparator.comparingLong(s -> s.baseSeq));
+        // Insertion sort by baseSeq. Open-time only and N is typically small
+        // (one active segment plus a handful of unacked sealed segments), so
+        // the O(N^2) is irrelevant and avoids the java.util.Comparator alloc.
+        for (int i = 1, n = segments.size(); i < n; i++) {
+            Segment x = segments.getQuick(i);
+            int j = i - 1;
+            while (j >= 0 && Long.compareUnsigned(segments.getQuick(j).baseSeq, x.baseSeq) > 0) {
+                segments.setQuick(j + 1, segments.getQuick(j));
+                j--;
+            }
+            segments.setQuick(j + 1, x);
+        }
 
         // Validate: at most one active segment, and only as the last entry.
-        for (int i = 0; i < segments.size(); i++) {
-            Segment s = segments.get(i);
-            if (!s.sealed && i != segments.size() - 1) {
+        for (int i = 0, n = segments.size(); i < n; i++) {
+            Segment s = segments.getQuick(i);
+            if (!s.sealed && i != n - 1) {
                 throw new SfException("multiple active segments found, second one: " + s.path);
             }
         }
 
-        for (Segment s : segments) {
+        for (int i = 0, n = segments.size(); i < n; i++) {
+            Segment s = segments.getQuick(i);
             openSegment(s);
             if (s.sealed) {
                 // trust filename's lastSeq, but verify file size is consistent
                 long want = HEADER_SIZE; // body checked lazily on replay
-                if (Files.length(s.fd) < want) {
+                long len = ff.length(s.fd);
+                if (len < want) {
                     throw new SfException("sealed segment shorter than header: " + s.path);
                 }
-                s.writePos = Files.length(s.fd);
+                s.writePos = len;
                 s.frameCount = (s.lastSeqOnDisk - s.baseSeq) + 1;
             } else {
                 long count = scanActive(s);
                 s.frameCount = count;
                 active = s;
             }
+            bytesOnDiskCache += s.writePos;
         }
     }
 
     /** Returns frame count after truncating any torn tail. Updates s.writePos. */
     private long scanActive(Segment s) {
-        long fileLen = Files.length(s.fd);
+        long fileLen = ff.length(s.fd);
+        if (fileLen < 0) {
+            throw new SfException("fstat failed (length=" + fileLen + ") for " + s.path);
+        }
         long pos = HEADER_SIZE;
         long count = 0;
         while (pos < fileLen) {
             if (pos + FRAME_HEADER_SIZE > fileLen) {
                 break;
             }
-            long r = Files.read(s.fd, envBuf, FRAME_HEADER_SIZE, pos);
+            long r = ff.read(s.fd, envBuf, FRAME_HEADER_SIZE, pos);
             if (r != FRAME_HEADER_SIZE) {
                 break;
             }
@@ -432,13 +468,24 @@ public final class SegmentLog implements QuietCloseable {
                 break;
             }
             ensureReadBuf(payloadLen);
-            long r2 = Files.read(s.fd, readBuf, payloadLen, pos + FRAME_HEADER_SIZE);
+            long r2 = ff.read(s.fd, readBuf, payloadLen, pos + FRAME_HEADER_SIZE);
             if (r2 != payloadLen) {
                 break;
             }
             int computed = Crc32c.update(Crc32c.INIT, envBuf + 4, 4);
             computed = Crc32c.update(computed, readBuf, payloadLen);
             if (computed != crc) {
+                // A CRC mismatch only counts as a torn tail when the failing
+                // frame is the LAST one in the file. If the entire frame plus
+                // any subsequent bytes are still on disk, this is mid-stream
+                // bit-rot — silently truncating would drop every valid frame
+                // that follows. Surface the corruption loudly instead.
+                long fullFrameEnd = pos + FRAME_HEADER_SIZE + payloadLen;
+                if (fullFrameEnd < fileLen) {
+                    throw new SfException("CRC mismatch in " + s.path + " at " + pos
+                            + " (mid-stream — corrupted frame followed by "
+                            + (fileLen - fullFrameEnd) + " more bytes)");
+                }
                 break;
             }
             pos += FRAME_HEADER_SIZE + payloadLen;
@@ -446,7 +493,7 @@ public final class SegmentLog implements QuietCloseable {
         }
         if (pos < fileLen) {
             // torn tail or trailing garbage from a partial pre-allocation: truncate.
-            if (!Files.truncate(s.fd, pos)) {
+            if (!ff.truncate(s.fd, pos)) {
                 throw new SfException("failed to truncate torn tail of " + s.path);
             }
         }
@@ -458,14 +505,17 @@ public final class SegmentLog implements QuietCloseable {
         if (s.fd == -1) {
             openSegment(s);
         }
-        long fileLen = Files.length(s.fd);
+        long fileLen = ff.length(s.fd);
+        if (fileLen < 0) {
+            throw new SfException("fstat failed (length=" + fileLen + ") for " + s.path);
+        }
         long pos = HEADER_SIZE;
         long seq = s.baseSeq;
         while (pos < fileLen) {
             if (pos + FRAME_HEADER_SIZE > fileLen) {
                 break;
             }
-            long r = Files.read(s.fd, envBuf, FRAME_HEADER_SIZE, pos);
+            long r = ff.read(s.fd, envBuf, FRAME_HEADER_SIZE, pos);
             if (r != FRAME_HEADER_SIZE) {
                 throw new SfException("short read of frame header in " + s.path + " at " + pos);
             }
@@ -476,7 +526,7 @@ public final class SegmentLog implements QuietCloseable {
                         + " at " + pos);
             }
             ensureReadBuf(payloadLen);
-            long r2 = Files.read(s.fd, readBuf, payloadLen, pos + FRAME_HEADER_SIZE);
+            long r2 = ff.read(s.fd, readBuf, payloadLen, pos + FRAME_HEADER_SIZE);
             if (r2 != payloadLen) {
                 throw new SfException("short read of payload in " + s.path + " at " + pos);
             }
@@ -496,24 +546,30 @@ public final class SegmentLog implements QuietCloseable {
 
     private void rotate() {
         Segment old = active;
-        if (Files.fsync(old.fd) != 0) {
+        if (ff.fsync(old.fd) != 0) {
             throw new SfException("fsync failed during rotate of " + old.path);
         }
-        Files.close(old.fd);
+        ff.close(old.fd);
         old.fd = -1;
         long lastSeq = old.baseSeq + old.frameCount - 1;
         if (old.frameCount == 0) {
             // empty segment shouldn't happen via rotate, but be defensive: drop it
-            Files.remove(old.path);
+            ff.remove(old.pathPtrNative);
+            Files.freeNativePath(old.pathPtrNative);
+            old.pathPtrNative = 0;
+            bytesOnDiskCache -= old.writePos;
             segments.remove(segments.size() - 1);
             createActive(old.baseSeq);
             return;
         }
         String sealedPath = sealedPathFor(old.baseSeq, lastSeq);
-        if (Files.rename(old.path, sealedPath) != 0) {
+        if (ff.rename(old.path, sealedPath) != 0) {
             throw new SfException("failed to seal segment by rename " + old.path + " -> " + sealedPath);
         }
+        // Path changed — free old native ptr and re-encode for the sealed name.
+        Files.freeNativePath(old.pathPtrNative);
         old.path = sealedPath;
+        old.pathPtrNative = Files.allocNativePath(sealedPath);
         old.sealed = true;
         old.lastSeqOnDisk = lastSeq;
         createActive(lastSeq + 1);
@@ -521,22 +577,36 @@ public final class SegmentLog implements QuietCloseable {
 
     private void createActive(long baseSeq) {
         String path = activePathFor(baseSeq);
-        int fd = Files.openCleanRW(path, 0);
+        int fd = ff.openCleanRW(path, 0);
         if (fd < 0) {
             throw new SfException("cannot create active segment: " + path);
         }
         Segment s = new Segment();
         s.baseSeq = baseSeq;
         s.path = path;
+        s.pathPtrNative = Files.allocNativePath(path);
         s.fd = fd;
         s.sealed = false;
         s.frameCount = 0;
-        writeHeader(s);
-        s.writePos = HEADER_SIZE;
-        if (Files.fsync(fd) != 0) {
-            throw new SfException("fsync failed for new active segment " + path);
+        // The fd and pathPtrNative are owned locally until segments.add(s)
+        // below; close()'s cleanup loop only walks the segments list, so
+        // anything that throws between the openCleanRW above and segments.add
+        // must release them here or they leak.
+        try {
+            writeHeader(s);
+            s.writePos = HEADER_SIZE;
+            if (ff.fsync(fd) != 0) {
+                throw new SfException("fsync failed for new active segment " + path);
+            }
+        } catch (Throwable t) {
+            ff.close(fd);
+            s.fd = -1;
+            Files.freeNativePath(s.pathPtrNative);
+            s.pathPtrNative = 0;
+            throw t;
         }
         segments.add(s);
+        bytesOnDiskCache += HEADER_SIZE;
         active = s;
     }
 
@@ -549,7 +619,7 @@ public final class SegmentLog implements QuietCloseable {
             Unsafe.getUnsafe().putShort(buf + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(buf + 8, s.baseSeq);
             Unsafe.getUnsafe().putLong(buf + 16, io.questdb.client.std.Os.currentTimeMicros());
-            long w = Files.write(s.fd, buf, HEADER_SIZE, 0);
+            long w = ff.write(s.fd, buf, HEADER_SIZE, 0);
             if (w != HEADER_SIZE) {
                 throw new SfException("short write of header to " + s.path);
             }
@@ -559,17 +629,17 @@ public final class SegmentLog implements QuietCloseable {
     }
 
     private void openSegment(Segment s) {
-        s.fd = Files.openRW(s.path);
+        s.fd = ff.openRW(s.path);
         if (s.fd < 0) {
             throw new SfException("cannot open segment: " + s.path);
         }
-        long len = Files.length(s.fd);
+        long len = ff.length(s.fd);
         if (len < HEADER_SIZE) {
             throw new SfException("segment shorter than header: " + s.path);
         }
         long buf = Unsafe.malloc(HEADER_SIZE, MemoryTag.NATIVE_ILP_RSS);
         try {
-            long r = Files.read(s.fd, buf, HEADER_SIZE, 0);
+            long r = ff.read(s.fd, buf, HEADER_SIZE, 0);
             if (r != HEADER_SIZE) {
                 throw new SfException("short read of header in " + s.path);
             }
@@ -628,6 +698,7 @@ public final class SegmentLog implements QuietCloseable {
                 Segment s = new Segment();
                 s.baseSeq = Long.parseUnsignedLong(body, 16);
                 s.path = dir + "/" + name;
+                s.pathPtrNative = Files.allocNativePath(s.path);
                 s.sealed = false;
                 return s;
             }
@@ -641,6 +712,7 @@ public final class SegmentLog implements QuietCloseable {
                 s.baseSeq = Long.parseUnsignedLong(body.substring(0, 16), 16);
                 s.lastSeqOnDisk = Long.parseUnsignedLong(body.substring(17), 16);
                 s.path = dir + "/" + name;
+                s.pathPtrNative = Files.allocNativePath(s.path);
                 s.sealed = true;
                 return s;
             }
@@ -660,6 +732,10 @@ public final class SegmentLog implements QuietCloseable {
         long frameCount;
         long writePos;
         String path;
+        // Native UTF-8 path pointer cached so repeated remove() calls don't
+        // re-encode the path on every ACK-driven trim. Owned by the Segment;
+        // freed by SegmentLog on trim/rotate (after rename)/close.
+        long pathPtrNative;
         int fd = -1;
         boolean sealed;
 

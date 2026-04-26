@@ -44,6 +44,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
  * retry. Connection-fatal errors (auth failure, protocol mismatch) should still
  * be thrown; classification of fatal vs recoverable is the caller's job.
  */
+@FunctionalInterface
 public interface Reconnector {
     WebSocketClient reconnect() throws Exception;
 }

@@ -26,15 +26,41 @@ package io.questdb.client.std;
 
 /**
  * CRC-32C (Castagnoli, polynomial 0x1EDC6F41) checksum over off-heap memory.
- * Pass {@link #INIT} as the seed to start; chain partial buffers by passing
- * the previous return value as the next seed.
+ * Software-only implementation; no SSE 4.2 / ARMv8 hardware acceleration
+ * (the bottleneck this class is used for — SF segment frame headers — is
+ * never CRC-bound, so the simpler portable build is used everywhere).
+ * <p>
+ * Pass {@link #INIT} as the {@code seed} to start a fresh checksum. To
+ * chain across multiple non-contiguous buffers, pass the previous call's
+ * return value as the next call's seed:
+ * <pre>{@code
+ * int crc = Crc32c.INIT;
+ * crc = Crc32c.update(crc, header, 8);
+ * crc = Crc32c.update(crc, payload, payloadLen);
+ * // crc now holds the CRC-32C of header || payload
+ * }</pre>
+ * The empty-input case is idempotent: {@code update(seed, _, 0) == seed}.
  */
 public final class Crc32c {
+    /** Seed value to start a fresh CRC-32C accumulation. */
     public static final int INIT = 0;
 
     private Crc32c() {
     }
 
+    /**
+     * Update a running CRC-32C checksum with {@code len} bytes from native
+     * memory starting at {@code addr}.
+     *
+     * @param seed previous CRC value, or {@link #INIT} to start fresh
+     * @param addr off-heap address of the bytes to fold in (must point to
+     *             at least {@code len} readable bytes — no validation here,
+     *             a bad address will SIGSEGV the JVM)
+     * @param len  number of bytes to consume; pass 0 to no-op (returns
+     *             {@code seed} unchanged)
+     * @return the new CRC value, suitable as the {@code seed} for a
+     * subsequent chained call
+     */
     public static native int update(int seed, long addr, long len);
 
     static {

@@ -36,6 +36,8 @@ import io.questdb.client.cutlass.line.tcp.DelegatingTlsChannel;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
 import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
+import io.questdb.client.cutlass.qwp.client.sf.SfDiskFullException;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
@@ -931,7 +933,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     );
                 }
 
-                io.questdb.client.cutlass.qwp.client.sf.SegmentLog segmentLog = null;
+                SegmentLog segmentLog = null;
                 if (storeAndForward) {
                     if (sfDir == null) {
                         throw new LineSenderException(
@@ -942,12 +944,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                 "store_and_forward requires async mode (in_flight_window > 1)");
                     }
                     long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
-                            ? io.questdb.client.cutlass.qwp.client.sf.SegmentLog.DEFAULT_MAX_BYTES_PER_SEGMENT
+                            ? SegmentLog.DEFAULT_MAX_BYTES_PER_SEGMENT
                             : sfMaxBytes;
                     long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
-                            ? io.questdb.client.cutlass.qwp.client.sf.SegmentLog.DEFAULT_MAX_TOTAL_BYTES
+                            ? SegmentLog.DEFAULT_MAX_TOTAL_BYTES
                             : sfMaxTotalBytes;
-                    segmentLog = io.questdb.client.cutlass.qwp.client.sf.SegmentLog.open(
+                    segmentLog = SegmentLog.open(
                             sfDir, actualSfMaxBytes, actualSfMaxTotalBytes, sfFsync);
                 } else if (sfDir != null) {
                     throw new LineSenderException(
@@ -1589,7 +1591,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Maximum bytes per segment file before rotation. Defaults to
-         * {@link io.questdb.client.cutlass.qwp.client.sf.SegmentLog#DEFAULT_MAX_BYTES_PER_SEGMENT}
+         * {@link SegmentLog#DEFAULT_MAX_BYTES_PER_SEGMENT}
          * (64 MiB). Smaller segments mean faster trim of acked data; larger
          * segments mean fewer rotations.
          */
@@ -1606,7 +1608,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Hard cap on total bytes consumed by SF on disk. When the cap is reached,
-         * subsequent appends throw {@link io.questdb.client.cutlass.qwp.client.sf.SfDiskFullException}
+         * subsequent appends throw {@link SfDiskFullException}
          * which propagates as back-pressure: {@code flush()} blocks on the user
          * thread until ACKs trim acknowledged segments and free space. Default is
          * unbounded ({@link Long#MAX_VALUE}).
@@ -1689,6 +1691,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             try {
                 return Numbers.parseInt(value);
+            } catch (NumericException e) {
+                throw new LineSenderException("invalid ").put(name).put(" [value=").put(value).put("]");
+            }
+        }
+
+        private static long parseLongValue(@NotNull StringSink value, @NotNull String name) {
+            if (Chars.isBlank(value)) {
+                throw new LineSenderException(name).put(" cannot be empty");
+            }
+            try {
+                return Numbers.parseLong(value);
             } catch (NumericException e) {
                 throw new LineSenderException("invalid ").put(name).put(" [value=").put(value).put("]");
             }
@@ -2071,14 +2084,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         throw new LineSenderException("sf_max_bytes is only supported for WebSocket transport");
                     }
                     pos = getValue(configurationString, pos, sink, "sf_max_bytes");
-                    long maxBytes = parseIntValue(sink, "sf_max_bytes");
+                    long maxBytes = parseLongValue(sink, "sf_max_bytes");
                     storeAndForwardMaxBytes(maxBytes);
                 } else if (Chars.equals("sf_max_total_bytes", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sf_max_total_bytes is only supported for WebSocket transport");
                     }
                     pos = getValue(configurationString, pos, sink, "sf_max_total_bytes");
-                    long maxTotal = parseIntValue(sink, "sf_max_total_bytes");
+                    long maxTotal = parseLongValue(sink, "sf_max_total_bytes");
                     storeAndForwardMaxTotalBytes(maxTotal);
                 } else if (Chars.equals("sf_fsync", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {

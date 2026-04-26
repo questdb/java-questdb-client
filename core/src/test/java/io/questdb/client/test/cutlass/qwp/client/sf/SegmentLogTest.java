@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
 import io.questdb.client.cutlass.qwp.client.sf.SfDiskFullException;
 import io.questdb.client.cutlass.qwp.client.sf.SfException;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -38,7 +39,9 @@ import org.junit.Test;
 
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -356,17 +359,18 @@ public class SegmentLogTest {
                 Files.close(fd);
             }
 
-            // On reopen the corrupted frame is in a "valid-length but bad-CRC" state.
-            // Recovery scan stops at first bad CRC and truncates: the file becomes
-            // header-only, so 0 frames replay.
-            try (SegmentLog log = SegmentLog.open(tmpDir, 1L << 20)) {
-                int[] count = {0};
-                log.replay((seq, addr, len) -> {
-                    count[0]++;
-                    return true;
-                });
-                assertEquals(0, count[0]);
-                assertEquals(0, log.nextSeq());
+            // On reopen the corrupted frame is in a "valid-length but bad-CRC"
+            // state with a second valid frame still on disk after it. This is
+            // mid-stream bit-rot, not a torn tail — silently truncating would
+            // drop the trailing valid frame too. Recovery surfaces the
+            // corruption loudly (bug M1).
+            try {
+                SegmentLog.open(tmpDir, 1L << 20);
+                fail("expected SfException for mid-stream CRC mismatch");
+            } catch (SfException expected) {
+                assertTrue(
+                        "SfException must reference CRC, got: " + expected.getMessage(),
+                        expected.getMessage().toLowerCase().contains("crc"));
             }
         });
     }
@@ -538,6 +542,747 @@ public class SegmentLogTest {
                 assertTrue("oldest seq should advance past 1: " + oldest, oldest > 1);
             }
         });
+    }
+
+    /**
+     * Red test for bug C4 — fd leak in {@code SegmentLog.createActive} when
+     * {@code writeHeader} or {@code fsync} throws between {@code openCleanRW}
+     * and {@code segments.add(s)}.
+     * <p>
+     * The fd is opened (line 536), assigned to a local {@code Segment s} not
+     * yet added to the {@code segments} list. If the subsequent
+     * {@code writeHeader} short-write or {@code fsync} non-zero return throws,
+     * the local Segment is discarded; {@code close()}'s cleanup loop only
+     * walks {@code segments}, so the fd is unreachable and leaks. Reachable
+     * from {@code openInternal()} (one-shot) and {@code rotate()} (per
+     * rotation): under disk pressure or NFS flakiness every failed rotation
+     * leaks one fd; sustained loops will exhaust the process fd table.
+     * <p>
+     * Repro: a {@link FilesFacade} that wraps the default but forces
+     * {@code fsync} to fail on the very first {@code createActive} call. The
+     * test records every {@code openCleanRW} return value and verifies that
+     * each opened fd was {@code close}d before the {@link SfException}
+     * propagated out of {@code SegmentLog.open}.
+     */
+    @Test
+    public void testCreateActiveDoesNotLeakFdOnFsyncFailure() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            FdTrackingFacade tracker = new FdTrackingFacade();
+            tracker.failNextFsyncOnNewFd = true;
+            try {
+                SegmentLog.open(tmpDir, tracker, 4096, 4096, false);
+                fail("expected SfException because fsync was forced to fail");
+            } catch (SfException expected) {
+                Assert.assertTrue(
+                        "wrong failure surfaced: " + expected.getMessage(),
+                        expected.getMessage().contains("fsync"));
+            }
+            Set<Integer> leaked = new HashSet<>(tracker.opened);
+            leaked.removeAll(tracker.closed);
+            assertEquals(
+                    "createActive must close every fd it opened on the failure path; leaked=" + leaked,
+                    0, leaked.size());
+        });
+    }
+
+    /**
+     * Red test for bug M1 — {@code SegmentLog.scanActive} silently truncates
+     * every frame after a mid-stream CRC mismatch.
+     * <p>
+     * The {@code while (pos &lt; fileLen)} loop in {@code scanActive} treats a
+     * CRC mismatch identically to a torn tail: {@code break}, then truncate
+     * the file to {@code pos}. A single bit flip in the middle of a 5-frame
+     * segment causes silent loss of every valid frame after the corruption,
+     * with no log line and no exception.
+     * <p>
+     * Repro: write 5 frames to an active segment, close, flip a bit in
+     * frame 2's CRC field on disk, reopen. The fix must either preserve
+     * frames 3 and 4 (somehow scan past the corruption) or refuse to open
+     * the segment so an operator notices. It must NOT silently delete the
+     * tail.
+     */
+    @Test
+    public void testScanActiveRejectsMidStreamCrcMismatch() throws Exception {
+        final int frameCount = 5;
+        final int payloadSize = 32;
+
+        // Step 1: write 5 frames using the default facade.
+        long buf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < payloadSize; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) (i + 1));
+            }
+            try (SegmentLog log = SegmentLog.open(tmpDir, 4096)) {
+                for (int i = 0; i < frameCount; i++) {
+                    log.append(buf, payloadSize);
+                }
+            }
+        } finally {
+            Unsafe.free(buf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+        }
+
+        // Step 2: corrupt the CRC field of frame 2 (zero-indexed) on disk.
+        // Layout: [24-byte file header][frame0:8+32][frame1:8+32][frame2:8+32]...
+        // CRC of frame 2 starts at offset 24 + 2*(8+32) = 104.
+        String activePath = findActivePath(tmpDir);
+        Assert.assertNotNull("active segment file must exist", activePath);
+        long crcOffsetOfFrame2 = SegmentLog.HEADER_SIZE + 2L * (SegmentLog.FRAME_HEADER_SIZE + payloadSize);
+        int rwFd = Files.openRW(activePath);
+        Assert.assertTrue("openRW must succeed", rwFd >= 0);
+        try {
+            long bitflipBuf = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+            try {
+                long r = Files.read(rwFd, bitflipBuf, 4, crcOffsetOfFrame2);
+                Assert.assertEquals(4, r);
+                int crc = Unsafe.getUnsafe().getInt(bitflipBuf);
+                Unsafe.getUnsafe().putInt(bitflipBuf, crc ^ 0x00000001);
+                long w = Files.write(rwFd, bitflipBuf, 4, crcOffsetOfFrame2);
+                Assert.assertEquals(4, w);
+            } finally {
+                Unsafe.free(bitflipBuf, 4, MemoryTag.NATIVE_DEFAULT);
+            }
+        } finally {
+            Files.close(rwFd);
+        }
+
+        // Step 3: reopen and observe how the corruption is handled.
+        // Bug M1: open succeeds, scanActive silently truncates the file to
+        // pos == start-of-frame-2, dropping frames 2, 3, 4. Replay sees 2.
+        try (SegmentLog log = SegmentLog.open(tmpDir, 4096)) {
+            int[] visited = {0};
+            log.replay((seq, addr, len) -> {
+                visited[0]++;
+                return true;
+            });
+            // Either the implementation preserves frames 3+4 somehow (we
+            // don't expect this — it'd require resync logic), or it refuses
+            // to open and the close/SfException path runs. Silent truncate
+            // to 2 is the bug we're flagging.
+            Assert.assertNotEquals(
+                    "scanActive silently truncated frames 3 and 4 after a CRC mismatch in frame 2; "
+                            + "must error or preserve them, not drop silently",
+                    2, visited[0]);
+        } catch (SfException expected) {
+            // Acceptable: hard error referencing CRC.
+            Assert.assertTrue(
+                    "SfException must reference CRC corruption, got: " + expected.getMessage(),
+                    expected.getMessage().toLowerCase().contains("crc")
+                            || expected.getMessage().toLowerCase().contains("corrupt"));
+        }
+    }
+
+    /**
+     * Coverage gap from M9 — segment header version byte rejection.
+     * Production at {@code openSegment} line 581-583 throws
+     * {@code "unsupported version N"} when the header's version byte is not 1.
+     * Untested before this. Writes a header with valid magic but version byte
+     * 99 and verifies the exception surfaces.
+     */
+    @Test
+    public void testUnsupportedVersionRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String junkPath = tmpDir + "/0000000000000000.sfa";
+            int fd = Files.openCleanRW(junkPath, SegmentLog.HEADER_SIZE);
+            try {
+                long buf = Unsafe.malloc(SegmentLog.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    Unsafe.getUnsafe().putInt(buf, SegmentLog.FILE_MAGIC);
+                    Unsafe.getUnsafe().putByte(buf + 4, (byte) 99);  // unsupported version
+                    Unsafe.getUnsafe().putByte(buf + 5, (byte) 0);
+                    Unsafe.getUnsafe().putShort(buf + 6, (short) 0);
+                    Unsafe.getUnsafe().putLong(buf + 8, 0L);
+                    Unsafe.getUnsafe().putLong(buf + 16, 0L);
+                    Files.write(fd, buf, SegmentLog.HEADER_SIZE, 0);
+                } finally {
+                    Unsafe.free(buf, SegmentLog.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                Files.close(fd);
+            }
+            try {
+                SegmentLog.open(tmpDir, 1L << 20).close();
+                fail("expected open to reject unsupported version");
+            } catch (SfException expected) {
+                assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("unsupported version"));
+            }
+        });
+    }
+
+    /**
+     * Coverage gap from M9 — header baseSeq must match the value embedded in
+     * the filename. Production at {@code openSegment} line 585-588 throws
+     * {@code "baseSeq mismatch"} when the on-disk header carries a different
+     * value than the filename advertises.
+     */
+    @Test
+    public void testBaseSeqMismatchRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Filename advertises baseSeq=0; header carries baseSeq=99.
+            String junkPath = tmpDir + "/0000000000000000.sfa";
+            int fd = Files.openCleanRW(junkPath, SegmentLog.HEADER_SIZE);
+            try {
+                long buf = Unsafe.malloc(SegmentLog.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    Unsafe.getUnsafe().putInt(buf, SegmentLog.FILE_MAGIC);
+                    Unsafe.getUnsafe().putByte(buf + 4, (byte) 1);
+                    Unsafe.getUnsafe().putByte(buf + 5, (byte) 0);
+                    Unsafe.getUnsafe().putShort(buf + 6, (short) 0);
+                    Unsafe.getUnsafe().putLong(buf + 8, 99L);  // mismatches filename
+                    Unsafe.getUnsafe().putLong(buf + 16, 0L);
+                    Files.write(fd, buf, SegmentLog.HEADER_SIZE, 0);
+                } finally {
+                    Unsafe.free(buf, SegmentLog.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                Files.close(fd);
+            }
+            try {
+                SegmentLog.open(tmpDir, 1L << 20).close();
+                fail("expected open to reject baseSeq mismatch");
+            } catch (SfException expected) {
+                assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("baseSeq mismatch"));
+            }
+        });
+    }
+
+    /**
+     * Coverage gap from M9 — multiple active segments in the directory must
+     * be rejected. Production at {@code scanDirectory} line 406-408 throws
+     * {@code "multiple active segments"} when more than one .sfa is found
+     * (indicates a corrupted directory or a crash mid-rotation that left
+     * orphan files).
+     */
+    @Test
+    public void testMultipleActiveSegmentsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // First, create a legitimate SegmentLog with rotation enabled so we
+            // end up with a sealed segment + an active one.
+            long cap = SegmentLog.HEADER_SIZE + SegmentLog.FRAME_HEADER_SIZE + 16;
+            byte[] payload = new byte[16];
+            try (SegmentLog log = SegmentLog.open(tmpDir, cap)) {
+                long buf = alloc(payload);
+                try {
+                    log.append(buf, payload.length);  // first segment
+                    log.append(buf, payload.length);  // forces rotation
+                } finally {
+                    Unsafe.free(buf, payload.length, MemoryTag.NATIVE_DEFAULT);
+                }
+            }
+
+            // Now plant a second .sfa file with a higher baseSeq. After sort,
+            // the original active is no longer last and triggers the check.
+            String orphanActive = tmpDir + "/00000000000000ff.sfa";
+            int fd = Files.openCleanRW(orphanActive, SegmentLog.HEADER_SIZE);
+            try {
+                long buf = Unsafe.malloc(SegmentLog.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    Unsafe.getUnsafe().putInt(buf, SegmentLog.FILE_MAGIC);
+                    Unsafe.getUnsafe().putByte(buf + 4, (byte) 1);
+                    Unsafe.getUnsafe().putByte(buf + 5, (byte) 0);
+                    Unsafe.getUnsafe().putShort(buf + 6, (short) 0);
+                    Unsafe.getUnsafe().putLong(buf + 8, 0xffL);
+                    Unsafe.getUnsafe().putLong(buf + 16, 0L);
+                    Files.write(fd, buf, SegmentLog.HEADER_SIZE, 0);
+                } finally {
+                    Unsafe.free(buf, SegmentLog.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                Files.close(fd);
+            }
+
+            try {
+                SegmentLog.open(tmpDir, 1L << 20).close();
+                fail("expected open to reject multiple active segments");
+            } catch (SfException expected) {
+                assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("multiple active segments"));
+            }
+        });
+    }
+
+    /**
+     * Coverage gap from M9 — {@code oldestSeq()} edge cases that the existing
+     * tests didn't cover: a freshly-opened log and a log whose only segment
+     * is the empty active segment (post-trim of every sealed segment).
+     */
+    @Test
+    public void testOldestSeqEdgeCases() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // 1. Freshly opened log (no append yet) — oldestSeq must be -1.
+            try (SegmentLog log = SegmentLog.open(tmpDir, 1L << 20)) {
+                assertEquals("fresh log oldestSeq", -1L, log.oldestSeq());
+                assertEquals("fresh log nextSeq", 0L, log.nextSeq());
+            }
+
+            // 2. Log with one frame appended, then trimmed past it. Active is
+            //    never trimmed, so oldestSeq still reports the active's seq.
+            //    But if active is empty (no frames, only header), oldestSeq
+            //    must report -1.
+            //    To reach this state without rotation: open + close without
+            //    writing.
+            try (SegmentLog log = SegmentLog.open(tmpDir, 1L << 20)) {
+                assertEquals("never-appended log oldestSeq", -1L, log.oldestSeq());
+            }
+        });
+    }
+
+    /**
+     * Coverage gap from M9 — short-write recovery on the actual durability
+     * path. {@code SegmentLog.append} truncates the file back when
+     * {@code Files.write} reports a short write (typical ENOSPC) and throws
+     * {@link SfDiskFullException}. Production lines 211-216 (frame header
+     * short write) and 218-225 (payload short write). The fault facade
+     * forces the second {@code write(fd, ...)} (the payload) to return a
+     * short count.
+     */
+    @Test
+    public void testShortPayloadWriteTruncatesAndThrows() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ShortPayloadWriteFacade tracker = new ShortPayloadWriteFacade();
+            byte[] payload = new byte[64];
+            for (int i = 0; i < payload.length; i++) {
+                payload[i] = (byte) (i + 1);
+            }
+            try (SegmentLog log = SegmentLog.open(tmpDir, tracker, 4096, 4096, false)) {
+                long buf = alloc(payload);
+                try {
+                    // First append succeeds normally.
+                    log.append(buf, payload.length);
+                    // Arm the fault for the next append's payload write.
+                    tracker.failNextPayloadWrite = true;
+                    try {
+                        log.append(buf, payload.length);
+                        fail("expected SfDiskFullException for short payload write");
+                    } catch (SfDiskFullException expected) {
+                        assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("short write"));
+                    }
+                    // After the failure, the segment must be in a clean state:
+                    // a third append at the same writePos must succeed.
+                    log.append(buf, payload.length);
+                } finally {
+                    Unsafe.free(buf, payload.length, MemoryTag.NATIVE_DEFAULT);
+                }
+                // 2 successful appends out of 3 attempts.
+                assertEquals(2L, log.nextSeq());
+            }
+        });
+    }
+
+    /**
+     * Red test for bug C5 — {@code Files.length(fd)} returns -1 on
+     * {@code fstat} failure, but {@code SegmentLog.scanActive} (line 418)
+     * and {@code SegmentLog.replaySegment} (line 461) then run
+     * {@code while (pos &lt; fileLen)} which never iterates when
+     * {@code fileLen == -1}. The segment is silently treated as empty:
+     * {@code scanActive} returns 0 frames with {@code writePos == HEADER_SIZE},
+     * and {@code replay} visits zero frames. SF FSN monotonicity quietly
+     * breaks and any persisted-but-not-yet-acked data is hidden from replay.
+     * <p>
+     * {@code openSegment} (line 578) does check {@code len &lt; HEADER_SIZE}
+     * which catches a -1 from the FIRST {@code length} call. The unprotected
+     * paths are the subsequent calls inside {@code scanActive} and
+     * {@code replaySegment}. The fault facade lets the first call through and
+     * returns -1 on every subsequent one.
+     */
+    @Test
+    public void testReplayRejectsLengthFstatFailure() throws Exception {
+        // Step 1: write a real frame using the default facade so disk has data.
+        long payloadSize = 32;
+        long buf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (long i = 0; i < payloadSize; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) (i + 1));
+            }
+            try (SegmentLog log = SegmentLog.open(tmpDir, 4096)) {
+                log.append(buf, (int) payloadSize);
+                log.append(buf, (int) payloadSize);
+                log.append(buf, (int) payloadSize);
+            }
+        } finally {
+            Unsafe.free(buf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+        }
+
+        // Step 2: reopen with a facade whose length(fd) call after openSegment
+        // returns -1 (simulating fstat failure). Replay must not silently
+        // observe zero frames.
+        TestUtils.assertMemoryLeak(() -> {
+            FaultyLengthFacade tracker = new FaultyLengthFacade();
+            // Let the openSegment length-check pass (first 1 call), then start
+            // failing. scanActive does a second length() per active segment.
+            tracker.passFirstNLengthCalls = 1;
+
+            try (SegmentLog log = SegmentLog.open(tmpDir, tracker, 4096, 4096, false)) {
+                int[] visited = {0};
+                log.replay((seq, addr, len) -> {
+                    visited[0]++;
+                    return true;
+                });
+                Assert.assertNotEquals(
+                        "replay must not silently observe zero frames when length(fd) reports -1; " +
+                                "fault was triggered " + tracker.lengthFaultsTriggered + " time(s)",
+                        0, visited[0]);
+            } catch (SfException expected) {
+                // Acceptable alternative: surface a hard error instead of silent empty.
+                Assert.assertTrue(
+                        "SfException must reference fstat/length failure, got: " + expected.getMessage(),
+                        expected.getMessage().toLowerCase().contains("length")
+                                || expected.getMessage().toLowerCase().contains("fstat")
+                                || expected.getMessage().toLowerCase().contains("stat"));
+            }
+        });
+    }
+
+    /**
+     * Tracks every fd that {@code openCleanRW} or {@code openRW} returns and
+     * every fd that {@code close} consumes. Lets a test fault {@code fsync} on
+     * the freshly-opened fd (the one currently being initialized in
+     * {@code createActive}). All other calls delegate to the default facade.
+     */
+    private static class FdTrackingFacade implements FilesFacade {
+        final List<Integer> opened = new ArrayList<>();
+        final List<Integer> closed = new ArrayList<>();
+        // Set true to fault the NEXT fsync that targets a fd which was just
+        // opened (i.e., not yet closed). Auto-reset after firing once.
+        volatile boolean failNextFsyncOnNewFd;
+
+        @Override
+        public int close(int fd) {
+            int rc = FilesFacade.INSTANCE.close(fd);
+            if (rc == 0) {
+                closed.add(fd);
+            }
+            return rc;
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return FilesFacade.INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            FilesFacade.INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return FilesFacade.INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return FilesFacade.INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return FilesFacade.INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            if (failNextFsyncOnNewFd && opened.contains(fd) && !closed.contains(fd)) {
+                failNextFsyncOnNewFd = false;
+                return -1; // simulate EIO
+            }
+            return FilesFacade.INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return FilesFacade.INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return FilesFacade.INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return FilesFacade.INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            int fd = FilesFacade.INSTANCE.openCleanRW(path, size);
+            if (fd >= 0) {
+                opened.add(fd);
+            }
+            return fd;
+        }
+
+        @Override
+        public int openRW(String path) {
+            int fd = FilesFacade.INSTANCE.openRW(path);
+            if (fd >= 0) {
+                opened.add(fd);
+            }
+            return fd;
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            return FilesFacade.INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            return FilesFacade.INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return FilesFacade.INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return FilesFacade.INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
+    /**
+     * Lets the first N {@code length(fd)} calls succeed, then returns -1
+     * (simulating an {@code fstat} failure on a previously-readable fd).
+     */
+    private static class FaultyLengthFacade implements FilesFacade {
+        int passFirstNLengthCalls;
+        int lengthFaultsTriggered;
+        private int lengthCalls;
+
+        @Override
+        public int close(int fd) {
+            return FilesFacade.INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return FilesFacade.INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            FilesFacade.INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return FilesFacade.INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return FilesFacade.INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return FilesFacade.INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            return FilesFacade.INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            int n = ++lengthCalls;
+            if (n > passFirstNLengthCalls) {
+                lengthFaultsTriggered++;
+                return -1;
+            }
+            return FilesFacade.INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return FilesFacade.INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return FilesFacade.INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            return FilesFacade.INSTANCE.openCleanRW(path, size);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return FilesFacade.INSTANCE.openRW(path);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            return FilesFacade.INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            return FilesFacade.INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return FilesFacade.INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return FilesFacade.INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
+    /**
+     * Wraps the default facade and forces the next payload-sized
+     * {@code write(...)} call (i.e., the second write of an append, the one
+     * that writes the payload bytes) to return a short count, simulating
+     * mid-payload ENOSPC.
+     */
+    private static class ShortPayloadWriteFacade implements FilesFacade {
+        // Header writes are exactly FRAME_HEADER_SIZE bytes; payload writes
+        // are larger. Use length to disambiguate without inspecting content.
+        volatile boolean failNextPayloadWrite;
+
+        @Override
+        public int close(int fd) {
+            return FilesFacade.INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return FilesFacade.INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            FilesFacade.INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return FilesFacade.INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return FilesFacade.INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return FilesFacade.INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            return FilesFacade.INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return FilesFacade.INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return FilesFacade.INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return FilesFacade.INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            return FilesFacade.INSTANCE.openCleanRW(path, size);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return FilesFacade.INSTANCE.openRW(path);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            return FilesFacade.INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            return FilesFacade.INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return FilesFacade.INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return FilesFacade.INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            // Frame header writes are FRAME_HEADER_SIZE bytes; anything larger
+            // is a payload write. Fault only the payload, and only once.
+            if (failNextPayloadWrite && len > SegmentLog.FRAME_HEADER_SIZE) {
+                failNextPayloadWrite = false;
+                // Return a short count to simulate ENOSPC partway through.
+                long actual = FilesFacade.INSTANCE.write(fd, addr, len - 1, offset);
+                return actual >= 0 ? actual : 0;
+            }
+            return FilesFacade.INSTANCE.write(fd, addr, len, offset);
+        }
     }
 
     private static String findActivePath(String dir) {

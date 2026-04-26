@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -167,7 +168,7 @@ public class QwpWebSocketSender implements Sender {
     private boolean sawBinaryAck;
     private boolean sawPong;
     private WebSocketSendQueue sendQueue;
-    private io.questdb.client.cutlass.qwp.client.sf.SegmentLog segmentLog;
+    private SegmentLog segmentLog;
     // True when this sender took ownership of segmentLog (e.g. via the
     // connect-string builder); close() will then close the log too.
     private boolean ownsSegmentLog;
@@ -348,7 +349,7 @@ public class QwpWebSocketSender implements Sender {
             String authorizationHeader,
             int maxSchemasPerConnection,
             boolean requestDurableAck,
-            io.questdb.client.cutlass.qwp.client.sf.SegmentLog segmentLog
+            SegmentLog segmentLog
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsConfig,
@@ -1192,38 +1193,32 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Attach a store-and-forward log. Every outgoing batch is captured to disk
-     * before the wire send and trimmed on cumulative ACK; the log also becomes
-     * the batch-sequence authority so sequencing survives sender restarts. The
-     * caller retains ownership of the log and is responsible for closing it
-     * after this sender has been closed.
+     * Attach a store-and-forward log to capture every outgoing batch to disk
+     * before the wire send and trim it on cumulative ACK. The log also becomes
+     * the batch-sequence authority so sequencing survives sender restarts.
      * <p>
-     * Requires async mode ({@code inFlightWindowSize > 1}).
+     * The caller retains ownership of {@code log} and is responsible for
+     * closing it after this sender has been closed; use the two-arg overload
+     * {@link #setSegmentLog(SegmentLog, boolean)} to transfer ownership.
+     * <p>
+     * Must be called before the first send. Requires async mode
+     * ({@code inFlightWindowSize > 1}).
      *
      * @throws LineSenderException if the sender is already connected or closed,
      *                             or if async mode is not enabled
      */
-    public void setSegmentLog(io.questdb.client.cutlass.qwp.client.sf.SegmentLog log) {
+    public void setSegmentLog(SegmentLog log) {
         setSegmentLog(log, false);
     }
 
     /**
-     * Number of times an outgoing batch was stalled because the SF total disk cap
-     * was reached. Each stall blocks the user thread's flush() until ACKs trim
-     * sealed segments and free space. Useful for monitoring backpressure under
-     * production load.
+     * Like {@link #setSegmentLog(SegmentLog)} but with explicit ownership
+     * transfer: when {@code takeOwnership} is true the sender closes
+     * {@code log} on its own {@link #close()}. Used by the connect-string
+     * builder to give the sender a self-contained lifecycle. Pass
+     * {@code false} to keep ownership with the caller.
      */
-    public long getTotalSfDiskFullStalls() {
-        return sendQueue == null ? 0 : sendQueue.getTotalDiskFullStalls();
-    }
-
-    /**
-     * Like {@link #setSegmentLog(io.questdb.client.cutlass.qwp.client.sf.SegmentLog)} but
-     * with explicit ownership transfer: when {@code takeOwnership} is true, this
-     * sender will close the log on its own {@link #close()}. Used by the
-     * connect-string builder to give the sender a self-contained lifecycle.
-     */
-    public void setSegmentLog(io.questdb.client.cutlass.qwp.client.sf.SegmentLog log, boolean takeOwnership) {
+    public void setSegmentLog(SegmentLog log, boolean takeOwnership) {
         if (closed) {
             throw new LineSenderException("Sender is closed");
         }
@@ -1237,6 +1232,16 @@ public class QwpWebSocketSender implements Sender {
         }
         this.segmentLog = log;
         this.ownsSegmentLog = takeOwnership && log != null;
+    }
+
+    /**
+     * Number of times an outgoing batch was stalled because the SF total disk cap
+     * was reached. Each stall blocks the user thread's flush() until ACKs trim
+     * sealed segments and free space. Useful for monitoring backpressure under
+     * production load.
+     */
+    public long getTotalSfDiskFullStalls() {
+        return sendQueue == null ? 0 : sendQueue.getTotalDiskFullStalls();
     }
 
     /**
