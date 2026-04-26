@@ -622,6 +622,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private boolean requestDurableAck;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
+        // Store-and-forward (WebSocket only). storeAndForward must be true AND
+        // sfDir must be set for SF to activate.
+        private boolean storeAndForward;
+        private String sfDir;
+        private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean sfFsync;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -924,18 +931,56 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     );
                 }
 
-                return QwpWebSocketSender.connect(
-                        hosts.getQuick(0),
-                        ports.getQuick(0),
-                        wsTlsConfig,
-                        actualAutoFlushRows,
-                        actualAutoFlushBytes,
-                        actualAutoFlushIntervalNanos,
-                        actualInFlightWindowSize,
-                        wsAuthHeader,
-                        actualMaxSchemasPerConnection,
-                        requestDurableAck
-                );
+                io.questdb.client.cutlass.qwp.client.sf.SegmentLog segmentLog = null;
+                if (storeAndForward) {
+                    if (sfDir == null) {
+                        throw new LineSenderException(
+                                "store_and_forward=on requires sf_dir to be set");
+                    }
+                    if (actualInFlightWindowSize <= 1) {
+                        throw new LineSenderException(
+                                "store_and_forward requires async mode (in_flight_window > 1)");
+                    }
+                    long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
+                            ? io.questdb.client.cutlass.qwp.client.sf.SegmentLog.DEFAULT_MAX_BYTES_PER_SEGMENT
+                            : sfMaxBytes;
+                    long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
+                            ? io.questdb.client.cutlass.qwp.client.sf.SegmentLog.DEFAULT_MAX_TOTAL_BYTES
+                            : sfMaxTotalBytes;
+                    segmentLog = io.questdb.client.cutlass.qwp.client.sf.SegmentLog.open(
+                            sfDir, actualSfMaxBytes, actualSfMaxTotalBytes, sfFsync);
+                } else if (sfDir != null) {
+                    throw new LineSenderException(
+                            "sf_dir is set but store_and_forward is not enabled");
+                }
+
+                try {
+                    return QwpWebSocketSender.connect(
+                            hosts.getQuick(0),
+                            ports.getQuick(0),
+                            wsTlsConfig,
+                            actualAutoFlushRows,
+                            actualAutoFlushBytes,
+                            actualAutoFlushIntervalNanos,
+                            actualInFlightWindowSize,
+                            wsAuthHeader,
+                            actualMaxSchemasPerConnection,
+                            requestDurableAck,
+                            segmentLog
+                    );
+                } catch (Throwable t) {
+                    // If connect failed, the sender's close() ran and would have closed
+                    // the log; but if setSegmentLog never ran (e.g. validation threw earlier
+                    // in the connect path), we have to clean it up ourselves.
+                    if (segmentLog != null) {
+                        try {
+                            segmentLog.close();
+                        } catch (Throwable ignored) {
+                            // best-effort
+                        }
+                    }
+                    throw t;
+                }
             }
 
             if (protocol == PROTOCOL_UDP) {
@@ -1507,6 +1552,92 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Toggle store-and-forward. Must be paired with
+         * {@link #storeAndForwardDir(String)}; activating SF without a dir is a
+         * configuration error caught at build() time. WebSocket transport only.
+         */
+        public LineSenderBuilder storeAndForward(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            this.storeAndForward = enabled;
+            return this;
+        }
+
+        /**
+         * Set the store-and-forward directory. Has effect only when SF is also
+         * enabled via {@link #storeAndForward(boolean)} (or {@code store_and_forward=on}
+         * in the connect string). Every batch is persisted before it leaves the
+         * wire and trimmed when the server acknowledges it; on restart the sender
+         * replays whatever is on disk. WebSocket transport only.
+         * <p>
+         * The sender takes ownership of the underlying SegmentLog and closes it
+         * when the sender itself is closed.
+         *
+         * @param dir filesystem directory; created if it doesn't exist
+         */
+        public LineSenderBuilder storeAndForwardDir(String dir) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            if (dir == null || dir.isEmpty()) {
+                throw new LineSenderException("store_and_forward dir cannot be empty");
+            }
+            this.sfDir = dir;
+            return this;
+        }
+
+        /**
+         * Maximum bytes per segment file before rotation. Defaults to
+         * {@link io.questdb.client.cutlass.qwp.client.sf.SegmentLog#DEFAULT_MAX_BYTES_PER_SEGMENT}
+         * (64 MiB). Smaller segments mean faster trim of acked data; larger
+         * segments mean fewer rotations.
+         */
+        public LineSenderBuilder storeAndForwardMaxBytes(long maxBytes) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            if (maxBytes <= 0) {
+                throw new LineSenderException("sf_max_bytes must be positive: ").put(maxBytes);
+            }
+            this.sfMaxBytes = maxBytes;
+            return this;
+        }
+
+        /**
+         * Hard cap on total bytes consumed by SF on disk. When the cap is reached,
+         * subsequent appends throw {@link io.questdb.client.cutlass.qwp.client.sf.SfDiskFullException}
+         * which propagates as back-pressure: {@code flush()} blocks on the user
+         * thread until ACKs trim acknowledged segments and free space. Default is
+         * unbounded ({@link Long#MAX_VALUE}).
+         */
+        public LineSenderBuilder storeAndForwardMaxTotalBytes(long maxTotalBytes) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            if (maxTotalBytes <= 0) {
+                throw new LineSenderException("sf_max_total_bytes must be positive: ").put(maxTotalBytes);
+            }
+            this.sfMaxTotalBytes = maxTotalBytes;
+            return this;
+        }
+
+        /**
+         * When enabled, every successful SF append calls {@code fsync} on the
+         * active segment file before returning. Trades throughput for the
+         * strongest durability guarantee — captured frames survive even an OS
+         * crash, not just a process crash. Default: off (fsync runs on rotation
+         * and on explicit flush()).
+         */
+        public LineSenderBuilder storeAndForwardFsync(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            this.sfFsync = enabled;
+            return this;
+        }
+
+        /**
          * Configures the maximum time the Sender will spend retrying upon receiving a recoverable error from the server.
          * <br>
          * This setting is applicable only when communicating over the HTTP transport, and it is illegal to invoke this
@@ -1917,6 +2048,50 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "max_schemas_per_connection");
                     int maxSchemas = parseIntValue(sink, "max_schemas_per_connection");
                     maxSchemasPerConnection(maxSchemas);
+                } else if (Chars.equals("store_and_forward", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "store_and_forward");
+                    if (Chars.equalsIgnoreCase("on", sink)) {
+                        storeAndForward(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink)) {
+                        storeAndForward(false);
+                    } else {
+                        throw new LineSenderException("invalid store_and_forward [value=").put(sink).put(", allowed-values=[on, off]]");
+                    }
+                } else if (Chars.equals("sf_dir", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_dir is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_dir");
+                    storeAndForwardDir(sink.toString());
+                } else if (Chars.equals("sf_max_bytes", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_max_bytes is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_max_bytes");
+                    long maxBytes = parseIntValue(sink, "sf_max_bytes");
+                    storeAndForwardMaxBytes(maxBytes);
+                } else if (Chars.equals("sf_max_total_bytes", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_max_total_bytes is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_max_total_bytes");
+                    long maxTotal = parseIntValue(sink, "sf_max_total_bytes");
+                    storeAndForwardMaxTotalBytes(maxTotal);
+                } else if (Chars.equals("sf_fsync", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_fsync is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_fsync");
+                    if (Chars.equalsIgnoreCase("on", sink)) {
+                        storeAndForwardFsync(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink)) {
+                        storeAndForwardFsync(false);
+                    } else {
+                        throw new LineSenderException("invalid sf_fsync [value=").put(sink).put(", allowed-values=[on, off]]");
+                    }
                 } else if (Chars.equals("max_datagram_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");
                     int mds = parseIntValue(sink, "max_datagram_size");

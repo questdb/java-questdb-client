@@ -167,6 +167,14 @@ public class QwpWebSocketSender implements Sender {
     private boolean sawBinaryAck;
     private boolean sawPong;
     private WebSocketSendQueue sendQueue;
+    private io.questdb.client.cutlass.qwp.client.sf.SegmentLog segmentLog;
+    // True when this sender took ownership of segmentLog (e.g. via the
+    // connect-string builder); close() will then close the log too.
+    private boolean ownsSegmentLog;
+    // Set by the I/O thread after a successful SF reconnect; checked by the user
+    // thread on the next flushPendingRows so the next batch re-publishes schemas
+    // the new server doesn't yet know about.
+    private volatile boolean schemaResetNeeded;
 
     private QwpWebSocketSender(
             String host,
@@ -320,6 +328,28 @@ public class QwpWebSocketSender implements Sender {
             int maxSchemasPerConnection,
             boolean requestDurableAck
     ) {
+        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection, requestDurableAck,
+                null);
+    }
+
+    /**
+     * Connect overload with store-and-forward. When {@code segmentLog} is non-null
+     * the sender takes ownership of it: closing the sender also closes the log.
+     */
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            io.questdb.client.cutlass.qwp.client.sf.SegmentLog segmentLog
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -327,6 +357,9 @@ public class QwpWebSocketSender implements Sender {
         );
         try {
             sender.setRequestDurableAck(requestDurableAck);
+            if (segmentLog != null) {
+                sender.setSegmentLog(segmentLog, true);
+            }
             sender.ensureConnected();
         } catch (Throwable t) {
             sender.close();
@@ -538,11 +571,17 @@ public class QwpWebSocketSender implements Sender {
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
-                    // Wait for all batches to be sent and acknowledged before closing
+                    // Wait for all batches to be sent and acknowledged before closing.
+                    // Under SF the durability guarantee is "data on disk", not "data
+                    // server-acked", so close() — like flush() — skips awaitPendingAcks.
+                    // Unsealed acks remain on disk; the next sender against the same
+                    // SF dir will replay them.
                     if (sendQueue != null) {
                         sendQueue.flush();
-                        sendQueue.awaitPendingAcks();
-                    } else if (inFlightWindow != null) {
+                        if (segmentLog == null) {
+                            sendQueue.awaitPendingAcks();
+                        }
+                    } else if (inFlightWindow != null && segmentLog == null) {
                         inFlightWindow.awaitEmpty();
                     }
                 } else if (connectionError.get() == null) {
@@ -596,6 +635,18 @@ public class QwpWebSocketSender implements Sender {
             if (client != null) {
                 client.close();
                 client = null;
+            }
+
+            // Close the SegmentLog if we took ownership (typically via connect-string).
+            // Done after the I/O thread has stopped so no append/replay can race the close.
+            if (ownsSegmentLog && segmentLog != null) {
+                try {
+                    segmentLog.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing owned SegmentLog: {}", String.valueOf(t));
+                }
+                segmentLog = null;
+                ownsSegmentLog = false;
             }
 
             LOG.info("QwpWebSocketSender closed");
@@ -814,12 +865,19 @@ public class QwpWebSocketSender implements Sender {
                 throw e;
             }
 
-            // Wait for all in-flight batches to be acknowledged by the server
-            try {
-                sendQueue.awaitPendingAcks();
-            } catch (LineSenderException e) {
-                checkConnectionError();
-                throw e;
+            // Under SF the durability guarantee is "data is on disk", not "data is
+            // server-acked". sendQueue.flush() already waited for processingCount
+            // to drain, which means SF.append has run for every queued batch. Skip
+            // the wait-for-ack step so the user doesn't block through transient
+            // disconnects — server acks are processed in the background and trigger
+            // SF trim asynchronously.
+            if (segmentLog == null) {
+                try {
+                    sendQueue.awaitPendingAcks();
+                } catch (LineSenderException e) {
+                    checkConnectionError();
+                    throw e;
+                }
             }
             checkConnectionError();
 
@@ -1134,6 +1192,54 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Attach a store-and-forward log. Every outgoing batch is captured to disk
+     * before the wire send and trimmed on cumulative ACK; the log also becomes
+     * the batch-sequence authority so sequencing survives sender restarts. The
+     * caller retains ownership of the log and is responsible for closing it
+     * after this sender has been closed.
+     * <p>
+     * Requires async mode ({@code inFlightWindowSize > 1}).
+     *
+     * @throws LineSenderException if the sender is already connected or closed,
+     *                             or if async mode is not enabled
+     */
+    public void setSegmentLog(io.questdb.client.cutlass.qwp.client.sf.SegmentLog log) {
+        setSegmentLog(log, false);
+    }
+
+    /**
+     * Number of times an outgoing batch was stalled because the SF total disk cap
+     * was reached. Each stall blocks the user thread's flush() until ACKs trim
+     * sealed segments and free space. Useful for monitoring backpressure under
+     * production load.
+     */
+    public long getTotalSfDiskFullStalls() {
+        return sendQueue == null ? 0 : sendQueue.getTotalDiskFullStalls();
+    }
+
+    /**
+     * Like {@link #setSegmentLog(io.questdb.client.cutlass.qwp.client.sf.SegmentLog)} but
+     * with explicit ownership transfer: when {@code takeOwnership} is true, this
+     * sender will close the log on its own {@link #close()}. Used by the
+     * connect-string builder to give the sender a self-contained lifecycle.
+     */
+    public void setSegmentLog(io.questdb.client.cutlass.qwp.client.sf.SegmentLog log, boolean takeOwnership) {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        if (connected) {
+            throw new LineSenderException(
+                    "setSegmentLog must be called before the first send");
+        }
+        if (log != null && inFlightWindowSize <= 1) {
+            throw new LineSenderException(
+                    "store-and-forward requires async mode (inFlightWindowSize > 1)");
+        }
+        this.segmentLog = log;
+        this.ownsSegmentLog = takeOwnership && log != null;
+    }
+
+    /**
      * Adds a SHORT column value to the current row.
      *
      * @param columnName the column name
@@ -1356,6 +1462,44 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * Build and connect a fresh {@link WebSocketClient}, replacing the current
+     * one. Invoked by the queue's I/O thread on SF reconnect. The client field
+     * is replaced atomically here; the user thread continues to read it via
+     * paths that aren't sensitive to the swap (sync mode is disabled under SF).
+     * <p>
+     * The encoder version is reset to whatever the server selects on the new
+     * connection, and {@link #schemaResetNeeded} is flipped so the next user
+     * thread {@code flushPendingRows} re-publishes table schemas — the server
+     * has no memory of the previous connection's schema-id assignments.
+     */
+    private WebSocketClient performReconnect() throws Exception {
+        if (client != null) {
+            try {
+                client.close();
+            } catch (Throwable ignored) {
+                // best-effort
+            }
+            client = null;
+        }
+        if (tlsConfig != null) {
+            client = WebSocketClientFactory.newTlsInstance(tlsConfig);
+        } else {
+            client = WebSocketClientFactory.newPlainTextInstance();
+        }
+        client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
+        client.setQwpClientId(QwpConstants.CLIENT_ID);
+        client.setQwpRequestDurableAck(requestDurableAck);
+        client.connect(host, port);
+        client.upgrade(WRITE_PATH, authorizationHeader);
+        encoder.setVersion((byte) client.getServerQwpVersion());
+        // Tell the user thread to reset schema-id state on its next encode pass.
+        // Safe to set from here because the user thread reads this flag only at
+        // batch boundaries (top of flushPendingRows), not mid-encode.
+        schemaResetNeeded = true;
+        return client;
+    }
+
     private void ensureConnected() {
         checkNotClosed();
         if (!connected) {
@@ -1386,10 +1530,13 @@ public class QwpWebSocketSender implements Sender {
             // The send queue handles both sending AND receiving (single I/O thread)
             if (inFlightWindowSize > 1) {
                 try {
+                    Reconnector reconnector = segmentLog != null ? this::performReconnect : null;
                     sendQueue = new WebSocketSendQueue(client, inFlightWindow,
                             WebSocketSendQueue.DEFAULT_ENQUEUE_TIMEOUT_MS,
                             WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS,
-                            this::recordConnectionFailure);
+                            this::recordConnectionFailure,
+                            segmentLog,
+                            reconnector);
                 } catch (Throwable t) {
                     inFlightWindow = null;
                     client.close();
@@ -1439,6 +1586,14 @@ public class QwpWebSocketSender implements Sender {
     private void flushPendingRows() {
         if (pendingRowCount <= 0) {
             return;
+        }
+
+        // SF reconnect happened on the I/O thread; the new server has no memory
+        // of our previous schema-id assignments. Reset before encoding so the
+        // next batch carries full schema definitions, not just refs.
+        if (schemaResetNeeded) {
+            schemaResetNeeded = false;
+            resetSchemaStateForNewConnection();
         }
 
         // Invalidate cached column references -- table buffers will be reset below

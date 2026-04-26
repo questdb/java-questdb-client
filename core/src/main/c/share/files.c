@@ -22,10 +22,249 @@
  *
  ******************************************************************************/
 
+#define _GNU_SOURCE
+
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <stdint.h>
+
 #include "files.h"
+
+#define RESTARTABLE(_expr_, _rc_) \
+    do { _rc_ = (_expr_); } while ((_rc_) == -1 && errno == EINTR)
 
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_close0
         (JNIEnv *e, jclass cl, jint fd) {
     return close((int) fd);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRO0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    int fd;
+    RESTARTABLE(open((const char *) (uintptr_t) lpszName, O_RDONLY), fd);
+    return (jint) fd;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRW0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    int fd;
+    RESTARTABLE(open((const char *) (uintptr_t) lpszName, O_CREAT | O_RDWR, 0644), fd);
+    return (jint) fd;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openAppend0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    int fd;
+    RESTARTABLE(open((const char *) (uintptr_t) lpszName, O_CREAT | O_WRONLY | O_APPEND, 0644), fd);
+    return (jint) fd;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openCleanRW0
+        (JNIEnv *e, jclass cl, jlong lpszName, jlong size) {
+    int fd;
+    RESTARTABLE(open((const char *) (uintptr_t) lpszName, O_CREAT | O_TRUNC | O_RDWR, 0644), fd);
+    if (fd < 0) {
+        return -1;
+    }
+    if (size > 0) {
+        int rc;
+        RESTARTABLE(ftruncate(fd, (off_t) size), rc);
+        if (rc != 0) {
+            int saved = errno;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+    }
+    return (jint) fd;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_read
+        (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len, jlong offset) {
+    ssize_t res;
+    RESTARTABLE(pread((int) fd, (void *) (uintptr_t) addr, (size_t) len, (off_t) offset), res);
+    return (jlong) res;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_write
+        (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len, jlong offset) {
+    ssize_t res;
+    RESTARTABLE(pwrite((int) fd, (const void *) (uintptr_t) addr, (size_t) len, (off_t) offset), res);
+    return (jlong) res;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_append
+        (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len) {
+    ssize_t res;
+    RESTARTABLE(write((int) fd, (const void *) (uintptr_t) addr, (size_t) len), res);
+    return (jlong) res;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsync
+        (JNIEnv *e, jclass cl, jint fd) {
+    int res;
+    RESTARTABLE(fsync((int) fd), res);
+    return res;
+}
+
+JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_truncate
+        (JNIEnv *e, jclass cl, jint fd, jlong size) {
+    int res;
+    RESTARTABLE(ftruncate((int) fd, (off_t) size), res);
+    return res == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
+        (JNIEnv *e, jclass cl, jint fd, jlong size) {
+#if defined(__linux__)
+    int res = posix_fallocate((int) fd, 0, (off_t) size);
+    if (res == 0) {
+        return JNI_TRUE;
+    }
+    if (res != EINVAL && res != EOPNOTSUPP) {
+        errno = res;
+        return JNI_FALSE;
+    }
+    /* fall through to ftruncate */
+#elif defined(__APPLE__)
+    fstore_t fst;
+    fst.fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL;
+    fst.fst_posmode = F_PEOFPOSMODE;
+    fst.fst_offset = 0;
+    fst.fst_length = (off_t) size;
+    fst.fst_bytesalloc = 0;
+    if (fcntl((int) fd, F_PREALLOCATE, &fst) == -1) {
+        fst.fst_flags = F_ALLOCATEALL;
+        (void) fcntl((int) fd, F_PREALLOCATE, &fst);
+        /* if F_PREALLOCATE fails we still try ftruncate to set logical size */
+    }
+#endif
+    int res2;
+    RESTARTABLE(ftruncate((int) fd, (off_t) size), res2);
+    return res2 == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_length
+        (JNIEnv *e, jclass cl, jint fd) {
+    struct stat st;
+    if (fstat((int) fd, &st) != 0) {
+        return -1;
+    }
+    return (jlong) st.st_size;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_length0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    struct stat st;
+    if (stat((const char *) (uintptr_t) lpszName, &st) != 0) {
+        return -1;
+    }
+    return (jlong) st.st_size;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_lock
+        (JNIEnv *e, jclass cl, jint fd) {
+    return flock((int) fd, LOCK_EX | LOCK_NB);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mkdir0
+        (JNIEnv *e, jclass cl, jlong lpszPath, jint mode) {
+    return mkdir((const char *) (uintptr_t) lpszPath, (mode_t) mode);
+}
+
+JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_exists0
+        (JNIEnv *e, jclass cl, jlong lpszPath) {
+    return access((const char *) (uintptr_t) lpszPath, F_OK) == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_remove0
+        (JNIEnv *e, jclass cl, jlong lpszPath) {
+    return remove((const char *) (uintptr_t) lpszPath) == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_rename0
+        (JNIEnv *e, jclass cl, jlong lpszOld, jlong lpszNew) {
+    return rename((const char *) (uintptr_t) lpszOld, (const char *) (uintptr_t) lpszNew);
+}
+
+typedef struct {
+    DIR *dir;
+    struct dirent *entry;
+} qdb_find_t;
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_findFirst0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    DIR *dir = opendir((const char *) (uintptr_t) lpszName);
+    if (!dir) {
+        return 0;
+    }
+    qdb_find_t *find = (qdb_find_t *) malloc(sizeof(qdb_find_t));
+    if (!find) {
+        closedir(dir);
+        return 0;
+    }
+    find->dir = dir;
+    errno = 0;
+    find->entry = readdir(dir);
+    if (!find->entry) {
+        int saved = errno;
+        closedir(dir);
+        free(find);
+        errno = saved;
+        return 0;
+    }
+    return (jlong) (uintptr_t) find;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_findNext
+        (JNIEnv *e, jclass cl, jlong findPtr) {
+    qdb_find_t *find = (qdb_find_t *) (uintptr_t) findPtr;
+    if (!find) {
+        return -1;
+    }
+    errno = 0;
+    find->entry = readdir(find->dir);
+    if (find->entry) {
+        return 1;
+    }
+    return errno == 0 ? 0 : -1;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_findName
+        (JNIEnv *e, jclass cl, jlong findPtr) {
+    qdb_find_t *find = (qdb_find_t *) (uintptr_t) findPtr;
+    if (!find || !find->entry) {
+        return 0;
+    }
+    return (jlong) (uintptr_t) find->entry->d_name;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_findType
+        (JNIEnv *e, jclass cl, jlong findPtr) {
+    qdb_find_t *find = (qdb_find_t *) (uintptr_t) findPtr;
+    if (!find || !find->entry) {
+        return 0;
+    }
+    return (jint) find->entry->d_type;
+}
+
+JNIEXPORT void JNICALL Java_io_questdb_client_std_Files_findClose
+        (JNIEnv *e, jclass cl, jlong findPtr) {
+    qdb_find_t *find = (qdb_find_t *) (uintptr_t) findPtr;
+    if (find) {
+        closedir(find->dir);
+        free(find);
+    }
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_getPageSize0
+        (JNIEnv *e, jclass cl) {
+    long sz = sysconf(_SC_PAGESIZE);
+    return (jlong) (sz > 0 ? sz : 4096);
 }

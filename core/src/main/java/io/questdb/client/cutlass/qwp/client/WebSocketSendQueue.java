@@ -27,6 +27,9 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
+import io.questdb.client.cutlass.qwp.client.sf.SfDiskFullException;
+import io.questdb.client.cutlass.qwp.client.sf.SfException;
 import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.Nullable;
@@ -70,8 +73,12 @@ public class WebSocketSendQueue implements QuietCloseable {
     public static final long DEFAULT_ENQUEUE_TIMEOUT_MS = 30_000;
     public static final long DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
     private static final Logger LOG = LoggerFactory.getLogger(WebSocketSendQueue.class);
-    // The WebSocket client for I/O (single-threaded access only)
-    private final WebSocketClient client;
+    // The WebSocket client for I/O (single-threaded access only). Replaced on
+    // reconnect when SF is enabled.
+    private WebSocketClient client;
+    @Nullable
+    private final Reconnector reconnector;
+    private volatile boolean reconnectRequested;
     // Configuration
     private final long enqueueTimeoutMs;
     private final long pingTimeoutMs;
@@ -80,6 +87,12 @@ public class WebSocketSendQueue implements QuietCloseable {
     // Optional InFlightWindow for tracking sent batches awaiting ACK
     @Nullable
     private final InFlightWindow inFlightWindow;
+    // Optional SegmentLog for store-and-forward durability. When non-null, every
+    // outgoing batch is captured to disk before it leaves the wire and trimmed
+    // on cumulative ACK. The log also becomes the batch-sequence authority so
+    // sequence numbers survive restart.
+    @Nullable
+    private final SegmentLog segmentLog;
 
     // The I/O thread for async send/receive
     private final Thread ioThread;
@@ -115,11 +128,26 @@ public class WebSocketSendQueue implements QuietCloseable {
     private final AtomicBoolean closeCalled = new AtomicBoolean(false);
     // Error handling
     private volatile Throwable lastError;
-    // Batch sequence counter (must match server's messageSequence)
+    // Wire batch sequence counter — fresh per connection (must match server's messageSequence
+    // which starts at 0 for each new connection).
     private long nextBatchSequence = 0;
+    // SF frame-sequence number (FSN) that corresponds to wire seq 0 on this connection.
+    // Lets us translate between the wire seq the server acks and the persistent FSN that
+    // SegmentLog uses for trim. Invariant: fsn = fsnAtZero + wireSeq for every sent batch.
+    private long fsnAtZero;
     // Single pending buffer slot (double-buffering means at most 1 item in queue)
     // Zero allocation - just a volatile reference handoff
     private volatile MicrobatchBuffer pendingBuffer;
+    // Buffer that we polled out of pendingBuffer but couldn't persist (disk full
+    // on SF.append). The I/O thread keeps it here and retries on each loop iteration
+    // until disk space frees up via trim. While stalled, processingCount stays > 0
+    // so the user thread's flush() blocks — natural backpressure.
+    // Volatile because close()/isPendingEmpty() observe from the user thread.
+    private volatile MicrobatchBuffer stalledBuffer;
+    private long lastDiskFullLogMs;
+    // Counter exposed for tests/observability: number of times a batch was stalled
+    // due to disk-full and had to be retried.
+    private final AtomicLong totalDiskFullStalls = new AtomicLong(0);
     private volatile boolean pingComplete;
     private volatile boolean pingRequested;
     private volatile boolean pongReceived;
@@ -138,7 +166,20 @@ public class WebSocketSendQueue implements QuietCloseable {
      */
     public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
                               long enqueueTimeoutMs, long shutdownTimeoutMs) {
-        this(client, inFlightWindow, enqueueTimeoutMs, shutdownTimeoutMs, null);
+        this(client, inFlightWindow, enqueueTimeoutMs, shutdownTimeoutMs, null, null, null);
+    }
+
+    public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
+                              long enqueueTimeoutMs, long shutdownTimeoutMs,
+                              @Nullable ConnectionFailureListener connectionFailureListener) {
+        this(client, inFlightWindow, enqueueTimeoutMs, shutdownTimeoutMs, connectionFailureListener, null, null);
+    }
+
+    public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
+                              long enqueueTimeoutMs, long shutdownTimeoutMs,
+                              @Nullable ConnectionFailureListener connectionFailureListener,
+                              @Nullable SegmentLog segmentLog) {
+        this(client, inFlightWindow, enqueueTimeoutMs, shutdownTimeoutMs, connectionFailureListener, segmentLog, null);
     }
 
     /**
@@ -149,16 +190,30 @@ public class WebSocketSendQueue implements QuietCloseable {
      * @param enqueueTimeoutMs          timeout for enqueue operations (ms)
      * @param shutdownTimeoutMs         timeout for graceful shutdown (ms)
      * @param connectionFailureListener notified once when the queue detects a terminal connection failure
+     * @param segmentLog                optional store-and-forward log; when set, every outgoing batch
+     *                                  is captured to disk before send and trimmed on ACK, and seq
+     *                                  numbering is taken from the log so it survives restart
+     * @param reconnector               optional reconnect callback; when set together with segmentLog,
+     *                                  the queue absorbs transient connection failures by calling
+     *                                  {@link Reconnector#reconnect()} with exponential backoff and
+     *                                  replaying SF state. Required for SF auto-reconnect.
      */
     public WebSocketSendQueue(WebSocketClient client, @Nullable InFlightWindow inFlightWindow,
                               long enqueueTimeoutMs, long shutdownTimeoutMs,
-                              @Nullable ConnectionFailureListener connectionFailureListener) {
+                              @Nullable ConnectionFailureListener connectionFailureListener,
+                              @Nullable SegmentLog segmentLog,
+                              @Nullable Reconnector reconnector) {
         if (client == null) {
             throw new IllegalArgumentException("client cannot be null");
+        }
+        if (segmentLog != null && inFlightWindow == null) {
+            throw new IllegalArgumentException("segmentLog requires inFlightWindow (async mode)");
         }
 
         this.client = client;
         this.inFlightWindow = inFlightWindow;
+        this.segmentLog = segmentLog;
+        this.reconnector = reconnector;
         this.enqueueTimeoutMs = enqueueTimeoutMs;
         this.shutdownTimeoutMs = shutdownTimeoutMs;
         this.pingTimeoutMs = inFlightWindow != null ? inFlightWindow.getTimeoutMs() : InFlightWindow.DEFAULT_TIMEOUT_MS;
@@ -166,6 +221,14 @@ public class WebSocketSendQueue implements QuietCloseable {
         this.running = true;
         this.shuttingDown = false;
         this.shutdownLatch = new CountDownLatch(1);
+
+        if (segmentLog != null) {
+            // Wire seq always starts at 0 on a fresh connection. Persistent SF FSNs
+            // are decoupled from the wire — fsnAtZero pins the relationship so we
+            // can translate server acks (wire seq) back to SF FSNs for trim.
+            long oldest = segmentLog.oldestSeq();
+            this.fsnAtZero = oldest >= 0 ? oldest : segmentLog.nextSeq();
+        }
 
         // Start the I/O thread (handles both sending and receiving)
         this.ioThread = new Thread(this::ioLoop, "questdb-websocket-io");
@@ -458,6 +521,30 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     private void failConnection(LineSenderException error) {
+        failConnection(error, false);
+    }
+
+    /**
+     * Mark the connection as failed. When {@code fatal} is true (e.g. an SF
+     * storage error like corruption or a frame too large for a segment), bypass
+     * the SF auto-reconnect path and go terminal — these errors won't recover
+     * by reconnecting and silent retry would loop forever.
+     */
+    private void failConnection(LineSenderException error, boolean fatal) {
+        // SF + reconnector mode: don't go terminal for transient connection-level
+        // errors. Signal the I/O loop to close the broken client and reconnect
+        // with backoff. Bytes for any unacked batches are already on disk in the
+        // SegmentLog; replay-on-reconnect re-sends them.
+        if (!fatal && segmentLog != null && reconnector != null && !shuttingDown) {
+            if (!reconnectRequested) {
+                LOG.warn("Connection failed (SF will reconnect): {}", error.getMessage());
+                reconnectRequested = true;
+                synchronized (processingLock) {
+                    processingLock.notifyAll();
+                }
+            }
+            return;
+        }
         Throwable rootError = lastError;
         boolean firstFailure = rootError == null;
         if (rootError == null) {
@@ -517,9 +604,26 @@ public class WebSocketSendQueue implements QuietCloseable {
     private void ioLoop() {
         LOG.info("I/O loop started");
 
+        if (segmentLog != null) {
+            replayPersistedFrames();
+        }
+
+        long reconnectBackoffMs = 100;
         try {
             int drainIdleCycles = 0;
             while (running || !isPendingEmpty()) {
+
+                if (reconnectRequested) {
+                    boolean ok = doReconnectCycle(reconnectBackoffMs);
+                    if (ok) {
+                        reconnectBackoffMs = 100;
+                        reconnectRequested = false;
+                    } else {
+                        // reconnect attempt failed; keep flag set, retry after longer backoff
+                        reconnectBackoffMs = Math.min(reconnectBackoffMs * 2, 30_000);
+                    }
+                    continue; // re-evaluate state machine after reconnect attempt
+                }
                 // Send a pending PING if requested
                 if (pingRequested) {
                     pingRequested = false;
@@ -557,7 +661,9 @@ public class WebSocketSendQueue implements QuietCloseable {
 
                     case ACTIVE:
                     case DRAINING:
-                        // Try to receive any pending ACKs (non-blocking)
+                        // Try to receive any pending ACKs first — they may trim
+                        // sealed segments and free disk space, unblocking a stalled
+                        // SF retry.
                         if (client.isConnected()) {
                             receivedAcks = tryReceiveAcks();
                         }
@@ -574,6 +680,22 @@ public class WebSocketSendQueue implements QuietCloseable {
                             }
                         }
 
+                        // Retry the stalled batch (SF disk-full backpressure path).
+                        // While stalled, do not poll new batches — keep processingCount > 0
+                        // so the user thread's flush() blocks until disk frees.
+                        if (stalledBuffer != null) {
+                            if (!running) {
+                                // Shutdown requested with disk still full. Abandon the
+                                // stalled batch so the I/O loop can terminate. The
+                                // user's data was never persisted — this is the
+                                // "shutdown timeout under disk full" data-loss path.
+                                abandonStalled();
+                            } else {
+                                retryStalled();
+                            }
+                            break;
+                        }
+
                         // Try to dequeue and send a batch
                         boolean hasWindowSpace = (inFlightWindow == null || inFlightWindow.hasWindowSpace());
                         if (hasWindowSpace) {
@@ -586,10 +708,32 @@ public class WebSocketSendQueue implements QuietCloseable {
                             }
 
                             if (batch != null) {
+                                boolean stalled = false;
                                 try {
-                                    safeSendBatch(batch);
-                                } finally {
-                                    // Atomically: decrement + notify flush()
+                                    sendBatch(batch);
+                                } catch (SfDiskFullException dfe) {
+                                    stalled = true;
+                                    stalledBuffer = batch;
+                                    totalDiskFullStalls.incrementAndGet();
+                                    logDiskFull(batch.getBatchId());
+                                    // Do not recycle the buffer; retry will pick it up.
+                                } catch (SfException sfe) {
+                                    // Non-disk-full SF storage error (corruption, frame
+                                    // too large, etc.) — won't recover by reconnect; fail
+                                    // hard so the user sees it instead of looping.
+                                    LOG.error("Fatal SF storage error [id={}]", batch.getBatchId(), sfe);
+                                    failConnection(new LineSenderException(
+                                            "SF storage error: " + sfe.getMessage(), sfe), true);
+                                    if (batch.isSealed()) batch.markSending();
+                                    if (batch.isSending()) batch.markRecycled();
+                                } catch (Throwable t) {
+                                    LOG.error("Error sending batch [id={}]", batch.getBatchId(), t);
+                                    failConnection(new LineSenderException(
+                                            "Error sending batch " + batch.getBatchId() + ": " + t.getMessage(), t));
+                                    if (batch.isSealed()) batch.markSending();
+                                    if (batch.isSending()) batch.markRecycled();
+                                }
+                                if (!stalled) {
                                     synchronized (processingLock) {
                                         processingCount.decrementAndGet();
                                         processingLock.notifyAll();
@@ -625,8 +769,131 @@ public class WebSocketSendQueue implements QuietCloseable {
         }
     }
 
+    /**
+     * Tear down the broken connection, sleep for backoff, ask the {@link Reconnector}
+     * for a fresh client, reset wire-level state, and re-stream SF.
+     * <p>
+     * Returns {@code true} when the new connection is up and SF replay completed.
+     * Returns {@code false} if the reconnect itself failed; the caller will retry
+     * after a longer backoff.
+     */
+    private boolean doReconnectCycle(long sleepMs) {
+        // Drop any half-written buffer first so the user thread can keep producing.
+        synchronized (processingLock) {
+            //noinspection resource
+            MicrobatchBuffer dropped = pollPending();
+            if (dropped != null) {
+                if (dropped.isSealed()) {
+                    dropped.markSending();
+                }
+                if (dropped.isSending()) {
+                    dropped.markRecycled();
+                }
+            }
+            processingLock.notifyAll();
+        }
+        try {
+            client.forceDisconnect();
+        } catch (Throwable ignored) {
+            // best-effort
+        }
+        try {
+            Thread.sleep(sleepMs);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        if (!running) {
+            return false;
+        }
+        WebSocketClient newClient;
+        try {
+            newClient = reconnector.reconnect();
+        } catch (Throwable t) {
+            LOG.warn("SF reconnect failed: {}", t.getMessage());
+            return false;
+        }
+        this.client = newClient;
+        // Reset wire-level state. SegmentLog is the source of truth for unacked
+        // bytes; we discard the in-flight window's seq tracking and rebuild via
+        // replay.
+        nextBatchSequence = 0;
+        if (inFlightWindow != null) {
+            inFlightWindow.reset();
+        }
+        long oldest = segmentLog.oldestSeq();
+        fsnAtZero = oldest >= 0 ? oldest : segmentLog.nextSeq();
+        try {
+            replayPersistedFrames();
+        } catch (Throwable t) {
+            LOG.warn("SF replay after reconnect failed: {}", t.getMessage());
+            return false;
+        }
+        LOG.info("SF reconnect complete");
+        return true;
+    }
+
+    /**
+     * Stream every frame currently on disk back to the server. Runs once at I/O
+     * loop startup before any user-thread batches are pulled. The server dedups
+     * at table-seqTxn level (the seqTxn lives inside the captured wire bytes), so
+     * frames that the server already applied in a previous session are silently
+     * dropped on receive.
+     */
+    private void replayPersistedFrames() {
+        final long[] count = {0};
+        try {
+            segmentLog.replay((fsn, addr, len) -> {
+                if (!running) {
+                    return false;
+                }
+                long wireSeq = nextBatchSequence;
+                // FSNs come out of SF in monotonic order. Replay starts at the oldest
+                // FSN, which we pinned as fsnAtZero in the constructor — so the first
+                // replayed FSN must equal fsnAtZero, and subsequent ones increment
+                // alongside wireSeq. Drift here means SF state changed between open
+                // and ioLoop start, which shouldn't happen.
+                if (fsn != fsnAtZero + wireSeq) {
+                    throw new LineSenderException(
+                            "SF replay FSN drift: fsn=" + fsn + " expected=" + (fsnAtZero + wireSeq));
+                }
+                if (inFlightWindow != null) {
+                    while (running && !inFlightWindow.hasWindowSpace()) {
+                        if (client.isConnected()) {
+                            tryReceiveAcks();
+                        }
+                        Thread.onSpinWait();
+                    }
+                    if (!running) {
+                        return false;
+                    }
+                    if (!inFlightWindow.tryAddInFlight(wireSeq)) {
+                        return false;
+                    }
+                }
+                client.sendBinary(addr, len);
+                nextBatchSequence = wireSeq + 1;
+                totalBatchesSent.incrementAndGet();
+                totalBytesSent.addAndGet(len);
+                count[0]++;
+                return true;
+            });
+        } catch (Throwable t) {
+            LOG.error("SF replay failed", t);
+            failConnection(new LineSenderException("SF replay failed: " + t.getMessage(), t));
+            return;
+        }
+        if (count[0] > 0) {
+            LOG.info("Replayed {} persisted frames from SF [highestWireSeq={}, fsnAtZero={}]",
+                    count[0], nextBatchSequence - 1, fsnAtZero);
+        }
+    }
+
     private boolean isPendingEmpty() {
-        return pendingBuffer == null;
+        // A stalled buffer (SF disk-full) counts as pending — the user's flush()
+        // and close() must wait until it's either retried successfully or
+        // abandoned at shutdown timeout.
+        return pendingBuffer == null && stalledBuffer == null;
     }
 
     private boolean awaitShutdown(long timeoutMs) {
@@ -652,6 +919,77 @@ public class WebSocketSendQueue implements QuietCloseable {
             pendingBuffer = null;
         }
         return buffer;
+    }
+
+    private void logDiskFull(long bufferId) {
+        long now = System.currentTimeMillis();
+        if (now - lastDiskFullLogMs > 5_000) {
+            lastDiskFullLogMs = now;
+            LOG.warn("SF disk full — back-pressuring user thread [bufferId={}, totalStalls={}]",
+                    bufferId, totalDiskFullStalls.get());
+        }
+    }
+
+    /**
+     * Retries a stalled batch (set when SF.append failed with disk-full). Called
+     * from the I/O loop after each ACK-recv pass — any ACK may have triggered a
+     * trim that freed disk space. Brief sleep on continued failure to avoid
+     * busy-spinning on a permanently-full disk.
+     */
+    private void retryStalled() {
+        MicrobatchBuffer batch = stalledBuffer;
+        boolean cleared = false;
+        try {
+            sendBatch(batch);
+            cleared = true;
+        } catch (SfDiskFullException dfe) {
+            // still stuck; brief sleep so we don't burn CPU
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException ignored) {
+                if (!running) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        } catch (Throwable t) {
+            // Non-disk-full failure during retry — recycle and surface.
+            LOG.error("Error retrying stalled batch [id={}]", batch.getBatchId(), t);
+            failConnection(new LineSenderException(
+                    "Error retrying stalled batch " + batch.getBatchId() + ": " + t.getMessage(), t));
+            if (batch.isSealed()) batch.markSending();
+            if (batch.isSending()) batch.markRecycled();
+            cleared = true;
+        }
+        if (cleared) {
+            stalledBuffer = null;
+            synchronized (processingLock) {
+                processingCount.decrementAndGet();
+                processingLock.notifyAll();
+            }
+        }
+    }
+
+    public long getTotalDiskFullStalls() {
+        return totalDiskFullStalls.get();
+    }
+
+    /**
+     * Drop the stalled batch without retrying. Called from the I/O loop when the
+     * queue has been told to shut down while disk-full backpressure is active —
+     * we'd otherwise loop forever waiting for space that won't arrive.
+     */
+    private void abandonStalled() {
+        MicrobatchBuffer batch = stalledBuffer;
+        if (batch == null) return;
+        LOG.warn("Shutdown while SF disk full — abandoning stalled batch [bufferId={}]",
+                batch.getBatchId());
+        if (batch.isSealed()) batch.markSending();
+        if (batch.isSending()) batch.markRecycled();
+        stalledBuffer = null;
+        synchronized (processingLock) {
+            processingCount.decrementAndGet();
+            processingLock.notifyAll();
+        }
     }
 
     /**
@@ -680,10 +1018,23 @@ public class WebSocketSendQueue implements QuietCloseable {
         // Transition state: SEALED -> SENDING
         batch.markSending();
 
-        // Use our own sequence counter (must match server's messageSequence)
-        long batchSequence = nextBatchSequence++;
         int bytes = batch.getBufferPos();
         int rows = batch.getRowCount();
+
+        // Persist to disk first when SF is enabled, so a crash between persist and
+        // wire send still has the bytes recoverable for replay. The server tracks
+        // its own per-connection seq starting at 0, so wireSeq stays decoupled from
+        // the persistent SF FSN.
+        long batchSequence = nextBatchSequence++;
+        if (segmentLog != null) {
+            long fsn = segmentLog.append(batch.getBufferPtr(), bytes);
+            // Sanity: SF.append produces FSNs strictly monotonic, and we always send
+            // exactly what we appended in order, so fsn must equal fsnAtZero+wireSeq.
+            if (fsn != fsnAtZero + batchSequence) {
+                throw new LineSenderException(
+                        "SF/wire seq drift: fsn=" + fsn + " expected=" + (fsnAtZero + batchSequence));
+            }
+        }
 
         if (LOG.isDebugEnabled()) {
             LOG.debug("Sending batch [seq={}, bytes={}, rows={}, bufferId={}]", batchSequence, bytes, rows, batch.getBatchId());
@@ -791,6 +1142,11 @@ public class WebSocketSendQueue implements QuietCloseable {
                     } else if (LOG.isDebugEnabled()) {
                         LOG.debug("ACK for already-acknowledged sequences [upTo={}]", sequence);
                     }
+                }
+                if (segmentLog != null) {
+                    // Translate wire seq → FSN. Cumulative ack of wire seq N means
+                    // every FSN up to fsnAtZero+N has been applied server-side.
+                    segmentLog.trim(fsnAtZero + sequence);
                 }
                 for (int i = 0, n = response.getTableEntryCount(); i < n; i++) {
                     advanceSeqTxn(committedSeqTxns, response.getTableName(i), response.getTableSeqTxn(i));
