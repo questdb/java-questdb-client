@@ -274,9 +274,16 @@ public final class SegmentLog implements QuietCloseable {
                     ff.close(s.fd);
                     s.fd = -1;
                 }
-                ff.remove(s.pathPtrNative);
-                ff.freeNativePath(s.pathPtrNative);
-                s.pathPtrNative = 0;
+                if (s.pathPtrNative != 0) {
+                    ff.remove(s.pathPtrNative);
+                    ff.freeNativePath(s.pathPtrNative);
+                    s.pathPtrNative = 0;
+                } else {
+                    // Recovery case: rotate's allocNativePath OOMed and left
+                    // pathPtrNative=0. Fall back to the String form, which
+                    // does its own one-shot encode/free internally.
+                    ff.remove(s.path);
+                }
                 bytesOnDiskCache -= s.writePos;
             } else {
                 segments.setQuick(writeIdx++, s);
@@ -561,12 +568,21 @@ public final class SegmentLog implements QuietCloseable {
         if (ff.rename(old.path, sealedPath) != 0) {
             throw new SfException("failed to seal segment by rename " + old.path + " -> " + sealedPath);
         }
-        // Path changed — free old native ptr and re-encode for the sealed name.
+        // Filesystem is now in the sealed state. Update bookkeeping to match
+        // BEFORE re-encoding the path pointer; if allocNativePath OOMs:
+        //   - the stale freed pointer must not be left in the field, or
+        //     close() walks segments and calls freeNativePath on it again
+        //     → native double-free.
+        //   - sealed/lastSeqOnDisk must already be set, or trim never sees
+        //     this segment (the !s.sealed guard skips it) → permanent
+        //     on-disk leak that survives until the next process restart.
+        // trim() handles pathPtrNative==0 by falling back to ff.remove(path).
         ff.freeNativePath(old.pathPtrNative);
+        old.pathPtrNative = 0;
         old.path = sealedPath;
-        old.pathPtrNative = ff.allocNativePath(sealedPath);
         old.sealed = true;
         old.lastSeqOnDisk = lastSeq;
+        old.pathPtrNative = ff.allocNativePath(sealedPath);
         createActive(lastSeq + 1);
     }
 

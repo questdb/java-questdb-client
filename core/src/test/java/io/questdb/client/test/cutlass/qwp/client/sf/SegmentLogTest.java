@@ -637,6 +637,109 @@ public class SegmentLogTest {
         });
     }
 
+    /**
+     * Regression test for {@code rotate}'s mid-reseal OOM window.
+     * <p>
+     * Production order at lines 564-570 (pre-fix):
+     * <pre>
+     *   ff.freeNativePath(old.pathPtrNative);                  // ptr freed
+     *   old.path = sealedPath;
+     *   old.pathPtrNative = ff.allocNativePath(sealedPath);    // CAN throw OOM
+     *   old.sealed = true;
+     *   old.lastSeqOnDisk = lastSeq;
+     * </pre>
+     * If {@code allocNativePath} throws after the freed pointer is left in
+     * the field and before {@code sealed/lastSeqOnDisk} are set:
+     * <ul>
+     *   <li><b>native double-free on close:</b> {@code SegmentLog.close()}
+     *       walks {@code segments} and calls {@code freeNativePath} on the
+     *       stale freed pointer.</li>
+     *   <li><b>permanent on-disk leak:</b> {@code trim()}'s {@code !s.sealed}
+     *       guard skips the segment, so the {@code .sfs} file on disk is
+     *       never reclaimed within the lifetime of this process. Even after
+     *       restart it would re-replay forever (no ACK ever advances past
+     *       its lastSeq because the in-memory state lost it).</li>
+     * </ul>
+     * <p>
+     * The fix sets {@code pathPtrNative=0} immediately after the free and
+     * marks {@code sealed=true; lastSeqOnDisk=lastSeq} BEFORE allocating
+     * the new pointer. {@code trim()} falls back to {@code ff.remove(path)}
+     * when {@code pathPtrNative} is 0.
+     */
+    @Test
+    public void testRotateOomLeavesSegmentInRecoverableSealedState() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            FdTrackingFacade tracker = new FdTrackingFacade();
+            // maxBytes = HEADER_SIZE + FRAME_HEADER_SIZE + 16 = 48; first
+            // append fits the active segment exactly, the second forces
+            // rotation.
+            final long maxBytes = 48;
+            final int payloadSize = 16;
+
+            long buf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payloadSize; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, (byte) i);
+                }
+
+                SegmentLog log = SegmentLog.open(tmpDir, tracker, maxBytes, 1024, false);
+                try {
+                    long s0 = log.append(buf, payloadSize);
+                    assertEquals(0L, s0);
+
+                    // Arm the OOM at the rotate's allocNativePath(sealedPath).
+                    tracker.failNextSealedAllocNativePath = true;
+                    try {
+                        log.append(buf, payloadSize);
+                        fail("expected OOM during rotate's allocNativePath(sealedPath)");
+                    } catch (Throwable expected) {
+                        String msg = expected.getMessage() == null ? "" : expected.getMessage();
+                        String causeMsg = expected.getCause() == null
+                                || expected.getCause().getMessage() == null
+                                ? "" : expected.getCause().getMessage();
+                        assertTrue("wrong failure: " + expected,
+                                msg.contains("simulated") || msg.contains("OOM")
+                                        || causeMsg.contains("simulated") || causeMsg.contains("OOM"));
+                    }
+
+                    // The segment is sealed on disk and must be classified
+                    // as sealed in memory so trim() can reclaim it. Drop
+                    // every acked seq up to and including the (now-sealed)
+                    // segment's lastSeq, then assert the file is gone.
+                    log.trim(0);
+                } finally {
+                    // close() walks the segments list and frees pathPtrNative
+                    // for each. Under the bug the rotated segment's stale
+                    // freed pointer would be passed to freeNativePath again
+                    // → native double-free. The fix sets pathPtrNative=0
+                    // after the original free so close() skips it.
+                    log.close();
+                }
+
+                // No .sfs file should remain after trim().
+                long find = Files.findFirst(tmpDir);
+                if (find != 0) {
+                    try {
+                        int rc = 1;
+                        while (rc > 0) {
+                            String name = Files.utf8ToString(Files.findName(find));
+                            if (name != null && name.endsWith(".sfs")) {
+                                fail("sealed .sfs file leaked after trim: " + name
+                                        + " — rotate's mid-OOM left the segment unsealed in "
+                                        + "memory so trim's !s.sealed guard skipped it");
+                            }
+                            rc = Files.findNext(find);
+                        }
+                    } finally {
+                        Files.findClose(find);
+                    }
+                }
+            } finally {
+                Unsafe.free(buf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test
     public void testCreateActiveDoesNotLeakFdOnFsyncFailure() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -1024,12 +1127,23 @@ public class SegmentLogTest {
         // ACTIVE_SUFFIX. Simulates an OOM at the exact moment between
         // openCleanRW and the try-block in createActive. Auto-reset.
         volatile boolean failNextActiveAllocNativePath;
+        // Set true to fault the NEXT allocNativePath whose path ends in
+        // SEALED_SUFFIX. Simulates an OOM in the rotate-then-reseal path
+        // after the file rename succeeded but before the new pointer is
+        // installed. Auto-reset.
+        volatile boolean failNextSealedAllocNativePath;
 
         @Override
         public long allocNativePath(String path) {
-            // ".sfa" is SegmentLog.ACTIVE_SUFFIX (package-private, hardcoded here).
+            // ".sfa" / ".sfs" are SegmentLog.{ACTIVE,SEALED}_SUFFIX
+            // (package-private, hardcoded here).
             if (failNextActiveAllocNativePath && path.endsWith(".sfa")) {
                 failNextActiveAllocNativePath = false;
+                throw CairoException.nonCritical()
+                        .put("simulated OOM in allocNativePath: ").put(path);
+            }
+            if (failNextSealedAllocNativePath && path.endsWith(".sfs")) {
+                failNextSealedAllocNativePath = false;
                 throw CairoException.nonCritical()
                         .put("simulated OOM in allocNativePath: ").put(path);
             }
