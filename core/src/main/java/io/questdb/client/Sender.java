@@ -1569,9 +1569,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Set the store-and-forward directory. Has effect only when SF is also
          * enabled via {@link #storeAndForward(boolean)} (or {@code store_and_forward=on}
-         * in the connect string). Every batch is persisted before it leaves the
-         * wire and trimmed when the server acknowledges it; on restart the sender
-         * replays whatever is on disk. WebSocket transport only.
+         * in the connect string).
+         * <p>
+         * Every batch is persisted to disk before it leaves the wire and is
+         * reclaimed as soon as the server acknowledges it. On restart the
+         * sender replays only batches whose acknowledgement had not been
+         * received before the previous sender shut down — typically the last
+         * in-flight batches at close time. Acknowledged batches are not
+         * replayed: their disk space is freed during normal operation by an
+         * automatic per-frame trim that force-rotates the active segment
+         * once every frame in it has been acknowledged.
+         * <p>
+         * Note that {@link io.questdb.client.cutlass.qwp.client.QwpWebSocketSender#close()}
+         * under SF returns once data is on disk, not on server-ack, so a
+         * sender closed immediately after a flush may still have unacked
+         * batches in flight; those will be replayed by the next sender
+         * against the same directory. WebSocket transport only.
          * <p>
          * The sender takes ownership of the underlying SegmentLog and closes it
          * when the sender itself is closed.

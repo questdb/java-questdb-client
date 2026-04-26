@@ -182,7 +182,12 @@ public class SfIntegrationTest {
     @Test
     public void testCapturedBytesMatchWireBytes() throws Exception {
         int port = TEST_PORT + 2;
-        CapturingAckHandler handler = new CapturingAckHandler();
+        // Handler captures the wire bytes but does NOT ack. Without an ack
+        // the I/O thread never calls trim, so the active segment stays
+        // stable while the test thread calls log.replay() (avoiding a
+        // race against trim's force-rotate-on-fully-acked). The wire bytes
+        // are still observable on the server side.
+        CapturingNoAckHandler handler = new CapturingNoAckHandler();
         byte[] capturedFromDisk;
         byte[] wireBytes;
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
@@ -201,9 +206,13 @@ public class SfIntegrationTest {
                 sender.table("foo").longColumn("v", 42L).atNow();
                 sender.flush();
 
-                // Read what's on disk via replay BEFORE the server's ACK trim removes it.
-                // Note: ACK has already arrived for sealed segments (none here), but
-                // active segment is never trimmed, so the captured frame is still there.
+                // Wait for the server to receive the frame before reading
+                // from disk; flush() under SF returns once the bytes are
+                // persisted, but the wire send is async on the I/O thread.
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline && handler.frames.isEmpty()) {
+                    Thread.sleep(10);
+                }
                 log.replay((seq, addr, len) -> {
                     capturedHolder[0] = new byte[len];
                     for (int i = 0; i < len; i++) {
@@ -306,17 +315,30 @@ public class SfIntegrationTest {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
 
+                // Wait for msg1's ACK to round-trip and trim to fire its
+                // force-rotate-on-fully-acked path (drops bytesOnDisk back
+                // to HEADER_SIZE). Without this, msg2 may be appended to
+                // SF before the ACK lands, leaving both msg1 and msg2 in
+                // the active segment with only msg2 acked, defeating the
+                // "msg1 trimmed before disconnect" precondition the test
+                // is trying to demonstrate.
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline
+                        && log.bytesOnDisk() > SegmentLog.HEADER_SIZE) {
+                    Thread.sleep(20);
+                }
+
                 // Second send — server drops the connection right after receiving it.
                 sender.table("foo").longColumn("v", 2L).atNow();
                 sender.flush();
 
                 // Wait briefly for the reconnect cycle to play out: the I/O thread
                 // notices the dropped connection, sleeps 100ms, reconnects, replays
-                // the active segment (containing both msg1 and msg2 — msg1 was acked
-                // but it lives in the active segment which never gets trimmed, so it
-                // gets replayed too; server-side seqTxn dedup drops the duplicate).
-                long deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline && handler.frameCount() < 4) {
+                // the active segment. Under per-frame trim (force-rotate-on-fully-
+                // acked) msg1 was acked-and-trimmed before the disconnect, so only
+                // msg2 (the unacked frame) remains on disk to replay.
+                deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline && handler.frameCount() < 3) {
                     Thread.sleep(20);
                 }
 
@@ -326,16 +348,16 @@ public class SfIntegrationTest {
 
                 // Wait for it to be received.
                 deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline && handler.frameCount() < 5) {
+                while (System.currentTimeMillis() < deadline && handler.frameCount() < 4) {
                     Thread.sleep(20);
                 }
             }
         }
-        // Server saw: msg1 (conn1), msg2 (conn1, dropped), msg1-replay+msg2-replay (conn2),
-        // msg3 (conn2). Total = 5. The replayed msg1 is the documented worst case —
-        // already-acked frames in the active (unsealed) segment are re-sent on reconnect.
-        Assert.assertEquals("server saw 5 frames (msg1 + msg2 + msg1-replay + msg2-replay + msg3)",
-                5, handler.frameCount());
+        // Server saw: msg1 (conn1), msg2 (conn1, dropped), msg2-replay (conn2),
+        // msg3 (conn2). Total = 4. msg1 is NOT replayed because trim's force-
+        // rotate-on-fully-acked dropped it from SF as soon as the ACK arrived.
+        Assert.assertEquals("server saw 4 frames (msg1 + msg2 + msg2-replay + msg3)",
+                4, handler.frameCount());
         Assert.assertTrue("server saw at least 2 connections", handler.connectionCount() >= 2);
     }
 
@@ -491,16 +513,105 @@ public class SfIntegrationTest {
                 sender.flush();
 
                 deadline = System.currentTimeMillis() + 5_000;
-                // 6 frames expected: alpha-1, beta-1 (dropped), replay alpha-1,
-                // replay beta-1, alpha-2, beta-2.
-                while (System.currentTimeMillis() < deadline && handler.frameCount() < 6) {
+                // 5 frames expected: alpha-1 (acked + trimmed before drop),
+                // beta-1 (dropped without ack), beta-1 replay, alpha-2, beta-2.
+                // alpha-1 is NOT replayed because force-rotate-on-fully-acked
+                // dropped it from SF the moment its ACK landed.
+                while (System.currentTimeMillis() < deadline && handler.frameCount() < 5) {
                     Thread.sleep(20);
                 }
             }
         }
         Assert.assertTrue("at least 2 connections", handler.connectionCount() >= 2);
-        Assert.assertTrue("at least 6 frames received, saw " + handler.frameCount(),
-                handler.frameCount() >= 6);
+        Assert.assertTrue("at least 5 frames received, saw " + handler.frameCount(),
+                handler.frameCount() >= 5);
+    }
+
+    /**
+     * End-to-end verification of the per-frame trim behaviour. A quiet
+     * sender that flushes some batches, lets every ACK land, and then
+     * shuts down must leave nothing on disk for the next sender to
+     * replay. Before per-frame trim landed, the active segment retained
+     * every acked-but-unsealed frame and the next sender re-shipped them
+     * (relying on server-side seqTxn dedup to avoid duplicate rows). This
+     * test asserts the public Sender API doc — "trimmed when the server
+     * acknowledges it" — is now load-bearing.
+     */
+    @Test(timeout = 30_000)
+    public void testRestartAfterAckedBatchesReplaysNothing() throws Exception {
+        int port = TEST_PORT + 70;
+        CountingAckHandler handler = new CountingAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            // Phase 1: send N batches, wait for every ACK to land + trim to
+            // fire, then close. After this block the SF dir must contain
+            // only an empty active segment.
+            final int batchCount = 5;
+            try (SegmentLog log = SegmentLog.open(sfDir, 1L << 20);
+                 QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                         "localhost", port,
+                         /* autoFlushRows */ 1,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                         8)) {
+                sender.setSegmentLog(log);
+                for (int i = 0; i < batchCount; i++) {
+                    sender.table("foo").longColumn("v", (long) i).atNow();
+                }
+                sender.flush();
+
+                // Wait for every batch to reach the server AND for trim's
+                // force-rotate to land bytesOnDisk back at the empty
+                // active's header size.
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (System.currentTimeMillis() < deadline
+                        && (handler.frameCount() < batchCount
+                                || log.bytesOnDisk() > SegmentLog.HEADER_SIZE)) {
+                    Thread.sleep(20);
+                }
+                Assert.assertEquals(batchCount, handler.frameCount());
+                Assert.assertEquals(
+                        "active segment must be empty after every batch is acked",
+                        (long) SegmentLog.HEADER_SIZE, log.bytesOnDisk());
+                Assert.assertEquals("oldestSeq -1 = no frames on disk",
+                        -1L, log.oldestSeq());
+            }
+            long framesAfterPhase1 = handler.frameCount();
+            long connectionsAfterPhase1 = handler.connectionCount();
+
+            // Phase 2: open a fresh sender against the same SF dir. Send
+            // one new batch. The server must see exactly one new frame —
+            // no replay of the phase-1 batches.
+            try (SegmentLog log = SegmentLog.open(sfDir, 1L << 20);
+                 QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                         "localhost", port,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                         8)) {
+                sender.setSegmentLog(log);
+                sender.table("foo").longColumn("v", 99L).atNow();
+                sender.flush();
+
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline
+                        && handler.frameCount() < framesAfterPhase1 + 1) {
+                    Thread.sleep(20);
+                }
+            }
+
+            Assert.assertEquals(
+                    "phase-2 must ship exactly 1 frame; any extra means the trim "
+                            + "contract leaked acked-but-unsealed frames into replay. "
+                            + "Frames after phase1=" + framesAfterPhase1
+                            + ", frames after phase2=" + handler.frameCount(),
+                    framesAfterPhase1 + 1, handler.frameCount());
+            Assert.assertTrue(
+                    "phase-2 must open a fresh connection",
+                    handler.connectionCount() > connectionsAfterPhase1);
+        }
     }
 
     /**
@@ -675,6 +786,20 @@ public class SfIntegrationTest {
                 }
                 Assert.assertEquals("warm-up batch did not reach the server",
                         1, handler.frameCount());
+
+                // Wait for batch1's ACK to round-trip and for trim's force-
+                // rotate-on-fully-acked to settle (it triggers an extra
+                // rotate fsync on every ack). Without this wait the ACK
+                // could land AFTER step 2's flag arming and the rotate
+                // fsync would consume failNextFsync, masking the bug.
+                deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline
+                        && log.bytesOnDisk() > SegmentLog.HEADER_SIZE) {
+                    Thread.sleep(20);
+                }
+                Assert.assertEquals("post-ACK trim should leave only the new active's header",
+                        (long) SegmentLog.HEADER_SIZE, log.bytesOnDisk());
+
                 long connectionsBefore = handler.connectionCount();
                 Assert.assertEquals("expected exactly one connection so far",
                         1, connectionsBefore);
@@ -836,6 +961,22 @@ public class SfIntegrationTest {
             bb.putLong(seq);
             bb.putShort((short) 0);
             return buf;
+        }
+    }
+
+    /**
+     * Captures every binary frame but does NOT ack. Used by tests that need
+     * to read the SF active segment from the test thread without racing
+     * the I/O thread's trim (which under per-frame trim force-rotates the
+     * active when every frame is acked).
+     */
+    private static class CapturingNoAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final java.util.List<byte[]> frames = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            frames.add(data.clone());
+            // intentionally no ack
         }
     }
 

@@ -246,8 +246,14 @@ public class SegmentLogTest {
         });
     }
 
+    /**
+     * When ACK covers some-but-not-all of the active segment's frames, the
+     * active segment must remain on disk (force-rotate only fires when
+     * every frame is acked). Without this guard a partially-acked active
+     * would be sealed and the unacked frames would be silently lost.
+     */
     @Test
-    public void testTrimNeverDeletesActive() throws Exception {
+    public void testTrimPartialAckOfActiveLeavesItIntact() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             byte[] payload = "x".getBytes();
             try (SegmentLog log = SegmentLog.open(tmpDir, 1L << 20)) {
@@ -259,15 +265,77 @@ public class SegmentLogTest {
                     Unsafe.free(buf, payload.length, MemoryTag.NATIVE_DEFAULT);
                 }
                 log.fsync();
-                // ack way past everything; active is unsealed so must remain.
-                log.trim(Long.MAX_VALUE / 2);
+                // Ack only the first frame; second is still in flight. The
+                // active must NOT be force-rotated yet — that would seal a
+                // segment containing un-acked data.
+                log.trim(0);
                 assertEquals(1, log.segmentCount());
                 int[] count = {0};
                 log.replay((seq, addr, len) -> {
                     count[0]++;
                     return true;
                 });
-                assertEquals(2, count[0]);
+                assertEquals("both frames must still be on disk", 2, count[0]);
+            }
+        });
+    }
+
+    /**
+     * When ACK covers every frame in the active segment, the active is
+     * force-rotated and the just-sealed segment removed. nextSeq is
+     * preserved across the auto-rotate so subsequent appends keep
+     * monotonic FSNs. After reopen, replay yields zero frames — this is
+     * what makes "trimmed when the server acknowledges it" honest in the
+     * public Sender API.
+     */
+    @Test
+    public void testTrimRotatesAndDropsFullyAckedActiveSegment() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            byte[] payload = "x".getBytes();
+            try (SegmentLog log = SegmentLog.open(tmpDir, 1L << 20)) {
+                long buf = alloc(payload);
+                try {
+                    for (int i = 0; i < 5; i++) {
+                        log.append(buf, payload.length);
+                    }
+                } finally {
+                    Unsafe.free(buf, payload.length, MemoryTag.NATIVE_DEFAULT);
+                }
+                log.fsync();
+
+                long preTrimBytes = log.bytesOnDisk();
+                assertTrue("data must be on disk before trim",
+                        preTrimBytes > SegmentLog.HEADER_SIZE);
+                assertEquals(5L, log.nextSeq());
+
+                // Ack every frame; force-rotate kicks in, sealed segment
+                // removed in the same trim() call.
+                log.trim(4);
+
+                assertEquals("a fresh empty active must remain", 1, log.segmentCount());
+                assertEquals("nextSeq must survive the auto-rotate", 5L, log.nextSeq());
+                assertEquals("oldestSeq must report empty (no frames)", -1L, log.oldestSeq());
+                assertEquals("only the new active's header should be on disk",
+                        (long) SegmentLog.HEADER_SIZE, log.bytesOnDisk());
+                int[] count = {0};
+                log.replay((seq, addr, len) -> {
+                    count[0]++;
+                    return true;
+                });
+                assertEquals("no frames should remain after force-rotate-trim",
+                        0, count[0]);
+            }
+            // Reopen with a fresh SegmentLog; replay must visit zero frames.
+            try (SegmentLog log2 = SegmentLog.open(tmpDir, 1L << 20)) {
+                int[] count = {0};
+                log2.replay((seq, addr, len) -> {
+                    count[0]++;
+                    return true;
+                });
+                assertEquals(
+                        "acked-and-trimmed frames must not replay on restart",
+                        0, count[0]);
+                assertEquals("nextSeq must round-trip", 5L, log2.nextSeq());
             }
         });
     }

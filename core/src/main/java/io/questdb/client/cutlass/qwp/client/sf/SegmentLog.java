@@ -256,12 +256,49 @@ public final class SegmentLog implements QuietCloseable {
     }
 
     /**
-     * Delete every sealed segment whose lastSeq is &lt;= ackedSeq. The active
-     * segment is never trimmed, even if all of its frames are acked — it is only
-     * deleted when sealed by a rotation.
+     * Reclaim disk space for every frame whose seq is &lt;= ackedSeq.
+     * <p>
+     * Sealed segments whose {@code lastSeq <= ackedSeq} are deleted. If the
+     * current active segment also has all of its frames acked (i.e. its
+     * highest assigned seq &lt;= ackedSeq), it is force-rotated and the
+     * just-sealed file is immediately removed. {@code nextSeq} is preserved
+     * across the auto-rotate so future appends keep monotonic FSNs.
+     * <p>
+     * The force-rotate is what makes "trimmed when the server acknowledges
+     * it" honest in the public API: a quiet sender whose batches all
+     * acknowledge keeps disk at exactly one empty active segment, and on
+     * restart no acked frames are replayed.
      */
     public void trim(long ackedSeq) {
         ensureOpen();
+        trimSealedSegments(ackedSeq);
+
+        // Force-rotate the active segment when every frame in it has been
+        // acked. The just-sealed segment is then removed by a second pass
+        // of trimSealedSegments. Cost is one extra rotation per fully-acked
+        // burst (typically once per server cumulative ACK), which on a
+        // low-rate sender is amortised by the natural-rotation cost it
+        // displaces — the active will rotate anyway eventually.
+        //
+        // The {@code !active.sealed} guard handles the rotate-OOM recovery
+        // state from the M2 fix: after an OOM mid-rename, {@code active}
+        // points at the now-sealed segment with fd=-1 and pathPtrNative=0;
+        // attempting to rotate it again would fail in fsync. The sealed
+        // pass above already trimmed the file, so we just skip here.
+        //
+        // If rotate fails (e.g. fsync EIO), the SfException propagates to
+        // the caller. ResponseHandler.onBinaryMessage runs trim() inline
+        // with ACK processing, so a thrown SfException there will surface
+        // as a connection-level error and the sender goes terminal — the
+        // correct response to a broken disk.
+        if (active != null && !active.sealed && active.frameCount > 0
+                && active.baseSeq + active.frameCount - 1 <= ackedSeq) {
+            rotate();
+            trimSealedSegments(ackedSeq);
+        }
+    }
+
+    private void trimSealedSegments(long ackedSeq) {
         int writeIdx = 0;
         for (int i = 0, n = segments.size(); i < n; i++) {
             Segment s = segments.getQuick(i);
