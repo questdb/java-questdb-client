@@ -144,25 +144,32 @@ public final class CursorSendEngine implements QuietCloseable {
         this.ownsManager = ownsManager;
         this.appendDeadlineNanos = appendDeadlineNanos;
 
-        // Create the initial active segment with baseSeq=0. (No on-disk
-        // recovery in PR1 — assumes the directory is empty.) The manager will
-        // immediately notice that the ring needs a hot spare and provision one.
-        MmapSegment initial;
-        String initialPath = null;
-        if (memoryMode) {
-            initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
+        // Disk mode: try to recover any *.sfa files left behind by a prior
+        // session before deciding to start fresh. Without this the engine
+        // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
+        // already on disk and corrupting ACK translation, trim, and replay.
+        SegmentRing recovered = memoryMode ? null
+                : SegmentRing.openExisting(sfDir, segmentSizeBytes);
+        if (recovered != null) {
+            this.ring = recovered;
         } else {
-            initialPath = sfDir + "/sf-initial.sfa";
-            initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
-        }
-        try {
-            this.ring = new SegmentRing(initial, segmentSizeBytes);
-        } catch (Throwable t) {
-            initial.close();
-            if (initialPath != null) {
-                Files.remove(initialPath);
+            MmapSegment initial;
+            String initialPath = null;
+            if (memoryMode) {
+                initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
+            } else {
+                initialPath = sfDir + "/sf-initial.sfa";
+                initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
             }
-            throw t;
+            try {
+                this.ring = new SegmentRing(initial, segmentSizeBytes);
+            } catch (Throwable t) {
+                initial.close();
+                if (initialPath != null) {
+                    Files.remove(initialPath);
+                }
+                throw t;
+            }
         }
 
         if (ownsManager) {

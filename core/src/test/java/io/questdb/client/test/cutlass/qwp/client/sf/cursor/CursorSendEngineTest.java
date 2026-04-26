@@ -176,6 +176,60 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testRestartIntoNonEmptySfDirContinuesFsnSequence() {
+        // Red regression: restart against a populated SF dir must derive the
+        // new active's baseSeq from the highest sealed segment on disk, not
+        // hardcode 0. Previously CursorSendEngine always created a fresh
+        // sf-initial.sfa at baseSeq=0, so the second session's FSNs collided
+        // with frames the first session had already durably persisted.
+        long segSize = MmapSegment.HEADER_SIZE
+                + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+        int totalFrames = 5;
+        long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+        try {
+            // Session 1: write totalFrames, leaving the dir populated with
+            // sealed segments + a (partially-filled) active at the end.
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                for (int i = 0; i < totalFrames; i++) {
+                    long fsn = engine.appendBlocking(buf, 64);
+                    assertEquals(i, fsn);
+                }
+                assertEquals(totalFrames - 1, engine.publishedFsn());
+            }
+            // Confirm the dir really has *.sfa files left over — otherwise
+            // the test would pass for the wrong reason (empty dir == no bug).
+            long find = Files.findFirst(tmpDir);
+            assertTrue("findFirst() must succeed on populated tmpDir", find != 0);
+            int sfaCount = 0;
+            try {
+                int rc = 1;
+                while (rc > 0) {
+                    String name = Files.utf8ToString(Files.findName(find));
+                    if (name != null && name.endsWith(".sfa")) sfaCount++;
+                    rc = Files.findNext(find);
+                }
+            } finally {
+                Files.findClose(find);
+            }
+            assertTrue("session 1 must leave .sfa files behind: count=" + sfaCount,
+                    sfaCount >= 1);
+
+            // Session 2: open the same dir. The next FSN must continue from
+            // where session 1 left off, NOT restart at 0. Today this assertion
+            // fails because the engine constructs a fresh ring at baseSeq=0
+            // and ignores the on-disk segments.
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                long fsn = engine.appendBlocking(buf, 64);
+                assertEquals("FSN must continue, not restart — overlapping "
+                                + "FSNs would corrupt ACK translation, trim, and replay",
+                        totalFrames, fsn);
+            }
+        } finally {
+            Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
     public void testMemoryModeSkipsDirAndStillWorks() {
         // sfDir == null → memory-only ring. No files, no mkdir, no path.
         long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
