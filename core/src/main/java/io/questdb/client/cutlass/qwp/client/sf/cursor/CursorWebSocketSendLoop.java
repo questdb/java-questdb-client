@@ -87,9 +87,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
     private final AtomicLong totalAcks = new AtomicLong();
     private final AtomicLong totalFramesSent = new AtomicLong();
-    // Snapshot buffer for sealedSegments — reused across loop ticks to avoid
-    // per-iteration allocation. Grown if the snapshot ever overflows.
-    private MmapSegment[] sealedSnapshot = new MmapSegment[16];
     // sendingSegment: the segment we're currently consuming bytes from. Starts
     // at engine.activeSegment(); advances to newer sealed segments / the new
     // active as the producer rotates.
@@ -172,6 +169,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * drained. Returns the next segment to consume (newer sealed if available,
      * else the active). Returns the same segment if it's still being written
      * (we're on the active and just need to wait for more publishedFsn).
+     * <p>
+     * Uses {@link CursorSendEngine#nextSealedAfter} so we never have to
+     * snapshot the full sealed list — important when the producer outpaces
+     * the I/O thread and the sealed list can grow to thousands of entries
+     * (cursor SF lets the producer fan out at memory speed; the wire path
+     * catches up at WebSocket speed).
      */
     private MmapSegment advanceSegment() {
         MmapSegment current = sendingSegment;
@@ -182,37 +185,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // publishedOffset > sendOffset eventually and resume.
             return current;
         }
-        // current is a sealed segment. Find it in the snapshot and return
-        // the segment immediately after.
-        int n = engine.sealedSegmentsSnapshot(sealedSnapshot);
-        if (n == -1) {
-            // Snapshot buffer too small — grow and retry.
-            sealedSnapshot = new MmapSegment[sealedSnapshot.length * 2];
-            n = engine.sealedSegmentsSnapshot(sealedSnapshot);
-            if (n == -1) {
-                throw new IllegalStateException("sealed snapshot grew unexpectedly large");
-            }
-        }
-        for (int i = 0; i < n; i++) {
-            if (sealedSnapshot[i] == current) {
-                if (i + 1 < n) {
-                    sendOffset = MmapSegment.HEADER_SIZE;
-                    return sealedSnapshot[i + 1];
-                }
-                // No more sealed after us — move to the active.
-                sendOffset = MmapSegment.HEADER_SIZE;
-                return liveActive;
-            }
-        }
-        // current is not in the sealed list and not == active. It must have
-        // been trimmed out from under us — which can only happen if we
-        // already sent every frame in it. Move to the next remaining one.
-        // For robustness: fall back to the oldest sealed (if any), else active.
-        if (n > 0) {
-            sendOffset = MmapSegment.HEADER_SIZE;
-            return sealedSnapshot[0];
-        }
         sendOffset = MmapSegment.HEADER_SIZE;
+        MmapSegment next = engine.nextSealedAfter(current);
+        if (next != null) {
+            return next;
+        }
+        // current was the newest sealed (no later sealed exists). If it's
+        // still in the sealed list, the next segment must be the active;
+        // if it's been trimmed out from under us, fall back to the oldest
+        // remaining sealed before resorting to the active.
+        next = engine.firstSealed();
+        if (next != null && next.baseSeq() > current.baseSeq()) {
+            return next;
+        }
         return liveActive;
     }
 

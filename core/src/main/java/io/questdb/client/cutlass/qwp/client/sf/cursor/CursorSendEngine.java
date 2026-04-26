@@ -59,6 +59,13 @@ import java.util.concurrent.locks.LockSupport;
  */
 public final class CursorSendEngine implements QuietCloseable {
 
+    /** Default deadline for {@link #appendBlocking}: 30 seconds. */
+    public static final long DEFAULT_APPEND_DEADLINE_NANOS = 30_000_000_000L;
+    /** Throttle the "producer is backpressured" WARN log to at most once per this interval. */
+    public static final long BACKPRESSURE_LOG_THROTTLE_NANOS = 5_000_000_000L; // 5 s
+    private static final org.slf4j.Logger LOG =
+            org.slf4j.LoggerFactory.getLogger(CursorSendEngine.class);
+
     private final String sfDir;
     private final SegmentManager manager;
     // We own the manager iff the user constructed us with no manager — in that
@@ -67,53 +74,94 @@ public final class CursorSendEngine implements QuietCloseable {
     private final boolean ownsManager;
     private final SegmentRing ring;
     private final long segmentSizeBytes;
+    private final long appendDeadlineNanos;
+    // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
+    // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
+    // for the manager (or for ACKs) — not one per spin-park. Producer-thread
+    // writer; volatile because the user may sample it from any thread.
+    private final java.util.concurrent.atomic.AtomicLong backpressureStallCount =
+            new java.util.concurrent.atomic.AtomicLong();
+    // Producer-thread-only: timestamp of the last "we're backpressured" log
+    // line, used to throttle. Plain long is fine.
+    private long lastBackpressureLogNs;
     private boolean closed;
 
     /**
-     * Creates an engine with a private, non-shared {@link SegmentManager}.
-     * Convenient for one-off senders / tests; for multi-Sender JVMs prefer
-     * {@link #CursorSendEngine(String, long, SegmentManager)} with a shared
-     * manager so all rings share one background thread.
+     * Creates an engine with a private, non-shared {@link SegmentManager},
+     * unbounded total bytes (use only for tests / single-segment scenarios),
+     * and the default append deadline.
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes) {
-        this(sfDir, segmentSizeBytes, new SegmentManager(segmentSizeBytes), true);
+        this(sfDir, segmentSizeBytes, SegmentManager.UNLIMITED_TOTAL_BYTES,
+                DEFAULT_APPEND_DEADLINE_NANOS);
+    }
+
+    /**
+     * Creates an engine with a private, non-shared {@link SegmentManager}
+     * capped at {@code maxTotalBytes} of cursor-allocated memory/disk
+     * (active + spare + sealed). Producer's {@link #appendBlocking} blocks
+     * up to {@code appendDeadlineNanos} when the cap is full and ACKs
+     * haven't drained sealed segments; on deadline expiry it throws.
+     */
+    public CursorSendEngine(String sfDir, long segmentSizeBytes,
+                            long maxTotalBytes, long appendDeadlineNanos) {
+        this(sfDir, segmentSizeBytes,
+                new SegmentManager(segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes),
+                true, appendDeadlineNanos);
     }
 
     /**
      * Creates an engine that shares the given {@link SegmentManager} (which
      * must already be {@link SegmentManager#start()}'d). The caller retains
-     * ownership of the manager.
+     * ownership of the manager. Uses the default append deadline.
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager) {
-        this(sfDir, segmentSizeBytes, manager, false);
+        this(sfDir, segmentSizeBytes, manager, false, DEFAULT_APPEND_DEADLINE_NANOS);
     }
 
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
-                             boolean ownsManager) {
-        if (sfDir == null || sfDir.isEmpty()) {
-            throw new IllegalArgumentException("sfDir must not be empty");
-        }
-        if (!Files.exists(sfDir)) {
-            int rc = Files.mkdir(sfDir, 0755);
-            if (rc != 0) {
-                throw new IllegalStateException("could not create sf_dir: " + sfDir + " rc=" + rc);
+                             boolean ownsManager, long appendDeadlineNanos) {
+        // sfDir == null  → memory-only mode (non-SF async ingest). Same
+        //                  cursor architecture, no disk involvement; segments
+        //                  live in malloc'd native memory.
+        // sfDir != null  → store-and-forward mode. Segments are mmap'd files
+        //                  under sfDir, recoverable across sender restarts.
+        boolean memoryMode = sfDir == null;
+        if (!memoryMode) {
+            if (sfDir.isEmpty()) {
+                throw new IllegalArgumentException("sfDir must not be empty");
+            }
+            if (!Files.exists(sfDir)) {
+                int rc = Files.mkdir(sfDir, 0755);
+                if (rc != 0) {
+                    throw new IllegalStateException("could not create sf_dir: " + sfDir + " rc=" + rc);
+                }
             }
         }
         this.sfDir = sfDir;
         this.segmentSizeBytes = segmentSizeBytes;
         this.manager = manager;
         this.ownsManager = ownsManager;
+        this.appendDeadlineNanos = appendDeadlineNanos;
 
         // Create the initial active segment with baseSeq=0. (No on-disk
         // recovery in PR1 — assumes the directory is empty.) The manager will
         // immediately notice that the ring needs a hot spare and provision one.
-        String initialPath = sfDir + "/sf-initial.sfa";
-        MmapSegment initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
+        MmapSegment initial;
+        String initialPath = null;
+        if (memoryMode) {
+            initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
+        } else {
+            initialPath = sfDir + "/sf-initial.sfa";
+            initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
+        }
         try {
             this.ring = new SegmentRing(initial, segmentSizeBytes);
         } catch (Throwable t) {
             initial.close();
-            Files.remove(initialPath);
+            if (initialPath != null) {
+                Files.remove(initialPath);
+            }
             throw t;
         }
 
@@ -207,6 +255,16 @@ public final class CursorSendEngine implements QuietCloseable {
         return ring.snapshotSealedSegments(target);
     }
 
+    /** Pass-through to {@link SegmentRing#nextSealedAfter(MmapSegment)}. */
+    public MmapSegment nextSealedAfter(MmapSegment current) {
+        return ring.nextSealedAfter(current);
+    }
+
+    /** Pass-through to {@link SegmentRing#firstSealed()}. */
+    public MmapSegment firstSealed() {
+        return ring.firstSealed();
+    }
+
     /** Configured per-segment size in bytes. */
     public long segmentSizeBytes() {
         return segmentSizeBytes;
@@ -217,21 +275,60 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Convenience overload: park-park-spin variant that retries indefinitely
-     * (or until the engine is closed, in which case the caller will throw on
-     * the next access). Use only when the producer is OK blocking — for
-     * latency-sensitive paths, prefer
-     * {@link #appendOrFsn(long, int, long)} with a real deadline.
+     * Append the payload, blocking up to {@link #appendDeadlineNanos} when
+     * the cursor ring is at its memory/disk cap and waiting for ACK-driven
+     * trim to free space. Returns the assigned FSN on success.
+     * <p>
+     * Backpressure is surfaced two ways:
+     * <ul>
+     *   <li>{@link #getTotalBackpressureStalls()} counter — incremented once
+     *       per blocking-call that had to wait for the manager.</li>
+     *   <li>WARN log throttled to one line per
+     *       {@link #BACKPRESSURE_LOG_THROTTLE_NANOS} of sustained
+     *       backpressure, so ops can correlate slow flushes to the cap.</li>
+     * </ul>
+     * Throws {@link io.questdb.client.cutlass.line.LineSenderException} when
+     * the deadline expires — silent unbounded blocking would mask "wire path
+     * is wedged" failures (server down, slow disk, etc.) from the user.
      */
     public long appendBlocking(long payloadAddr, int payloadLen) {
-        long fsn;
+        long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
+        if (fsn >= 0) return fsn;
+        if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
+            throw new MmapSegmentException("payload too large for segment");
+        }
+        // First miss → record one stall (not one per spin) and start the
+        // deadline clock.
+        backpressureStallCount.incrementAndGet();
+        long deadlineNs = System.nanoTime() + appendDeadlineNanos;
         while (true) {
+            long now = System.nanoTime();
+            if (now >= deadlineNs) {
+                throw new io.questdb.client.cutlass.line.LineSenderException(
+                        "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
+                        .put(" ms — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)");
+            }
+            if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
+                lastBackpressureLogNs = now;
+                LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O drain — will throw after {} ms",
+                        backpressureStallCount.get(), appendDeadlineNanos / 1_000_000L);
+            }
+            LockSupport.parkNanos(50_000L); // 50 µs
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
             if (fsn >= 0) return fsn;
             if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 throw new MmapSegmentException("payload too large for segment");
             }
-            LockSupport.parkNanos(50_000L); // 50 µs
         }
+    }
+
+    /**
+     * Number of times {@link #appendBlocking} hit
+     * {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
+     * had to wait for the segment manager (or for ACKs) to free space.
+     * One increment per blocking-call, not per spin-park. Cumulative.
+     */
+    public long getTotalBackpressureStalls() {
+        return backpressureStallCount.get();
     }
 }

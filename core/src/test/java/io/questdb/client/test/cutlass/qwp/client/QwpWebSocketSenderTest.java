@@ -24,14 +24,10 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
-import io.questdb.client.DefaultHttpClientConfiguration;
-import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
-import io.questdb.client.cutlass.qwp.client.WebSocketSendQueue;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
-import io.questdb.client.network.PlainSocketFactory;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -295,36 +291,6 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
-    public void testSealAndSwapRollsBackOnEnqueueFailure() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedAsyncSender(); ThrowingOnceWebSocketSendQueue queue = new ThrowingOnceWebSocketSendQueue()) {
-                setSendQueue(sender, queue);
-
-                MicrobatchBuffer originalActive = getActiveBuffer(sender);
-                originalActive.writeByte((byte) 7);
-                originalActive.incrementRowCount();
-
-                try {
-                    invokeSealAndSwapBuffer(sender);
-                    Assert.fail("Expected LineSenderException");
-                } catch (LineSenderException e) {
-                    Assert.assertTrue(e.getMessage().contains("Synthetic enqueue failure"));
-                }
-
-                // Failed enqueue must not strand the sealed buffer.
-                Assert.assertSame(originalActive, getActiveBuffer(sender));
-                Assert.assertTrue(originalActive.isFilling());
-                Assert.assertTrue(originalActive.hasData());
-                Assert.assertEquals(1, originalActive.getRowCount());
-
-                // Retry should be possible on the same sender instance.
-                invokeSealAndSwapBuffer(sender);
-                Assert.assertNotSame(originalActive, getActiveBuffer(sender));
-            }
-        });
-    }
-
-    @Test
     public void testSetGorillaEnabled() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = createUnconnectedSender()) {
@@ -456,12 +422,6 @@ public class QwpWebSocketSenderTest {
         }
     }
 
-    private static void setSendQueue(QwpWebSocketSender sender, WebSocketSendQueue queue) throws Exception {
-        Field field = QwpWebSocketSender.class.getDeclaredField("sendQueue");
-        field.setAccessible(true);
-        field.set(sender, queue);
-    }
-
     /**
      * Creates an async sender without connecting.
      */
@@ -479,46 +439,4 @@ public class QwpWebSocketSenderTest {
         return QwpWebSocketSender.createForTesting("localhost", 9000, 1);  // window=1 for sync
     }
 
-    private static class NoOpWebSocketClient extends WebSocketClient {
-        private NoOpWebSocketClient() {
-            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
-        }
-
-        @Override
-        public boolean isConnected() {
-            return false;
-        }
-
-        @Override
-        public void sendBinary(long dataPtr, int length) {
-            // no-op
-        }
-
-        @Override
-        protected void ioWait(int timeout, int op) {
-            // no-op
-        }
-
-        @Override
-        protected void setupIoWait() {
-            // no-op
-        }
-    }
-
-    private static class ThrowingOnceWebSocketSendQueue extends WebSocketSendQueue {
-        private boolean failOnce = true;
-
-        private ThrowingOnceWebSocketSendQueue() {
-            super(new NoOpWebSocketClient(), null, 50, 50);
-        }
-
-        @Override
-        public boolean enqueue(MicrobatchBuffer buffer) {
-            if (failOnce) {
-                failOnce = false;
-                throw new LineSenderException("Synthetic enqueue failure");
-            }
-            return true;
-        }
-    }
 }

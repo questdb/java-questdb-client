@@ -630,9 +630,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testWsConfigString_inFlightWindowSync() throws Exception {
+        // Sync mode (in_flight_window=1) was removed alongside the legacy
+        // ingest path: cursor is the only async path now, and it requires
+        // window > 1. build() rejects sync at parse time rather than
+        // attempting to connect.
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
-            assertBadConfig("ws::addr=localhost:" + port + ";in_flight_window=1;", "connect", "Failed");
+            assertBadConfig("ws::addr=localhost:" + port + ";in_flight_window=1;",
+                    "async", "in_flight_window");
         });
     }
 

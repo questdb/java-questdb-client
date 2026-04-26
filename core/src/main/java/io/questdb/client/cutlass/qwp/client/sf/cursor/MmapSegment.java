@@ -66,6 +66,11 @@ public final class MmapSegment implements QuietCloseable {
 
     private final String path;
     private final long sizeBytes;
+    // memoryBacked: true when the segment buffer lives in malloc'd native
+    // memory rather than an mmap'd file. The "non-SF async" path uses
+    // memory-backed segments — same cursor architecture, no disk involvement.
+    // close() and msync() branch on this flag.
+    private final boolean memoryBacked;
     // appendCursor: written only by the producer thread, never read by anyone else
     // — it's the reservation cursor. Plain field is fine.
     private long appendCursor;
@@ -87,7 +92,8 @@ public final class MmapSegment implements QuietCloseable {
     private volatile long publishedCursor;
 
     private MmapSegment(String path, int fd, long mmapAddress, long sizeBytes,
-                        long baseSeq, long initialCursor, long frameCount) {
+                        long baseSeq, long initialCursor, long frameCount,
+                        boolean memoryBacked) {
         this.path = path;
         this.fd = fd;
         this.mmapAddress = mmapAddress;
@@ -96,6 +102,7 @@ public final class MmapSegment implements QuietCloseable {
         this.appendCursor = initialCursor;
         this.publishedCursor = initialCursor;
         this.frameCount = frameCount;
+        this.memoryBacked = memoryBacked;
     }
 
     /**
@@ -127,12 +134,42 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(path, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0);
+            return new MmapSegment(path, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
             }
             Files.close(fd);
+            throw t;
+        }
+    }
+
+    /**
+     * Creates a memory-backed segment with the same on-the-wire layout as
+     * {@link #create(String, long, long)} but without any file. Used by the
+     * non-SF async ingest path: cursor's lock-free append architecture is
+     * still the right answer, but durability is "in JVM memory" — no disk
+     * involvement. The segment is freed via {@link #close()} (Unsafe.free).
+     */
+    public static MmapSegment createInMemory(long baseSeq, long sizeBytes) {
+        if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
+            throw new IllegalArgumentException(
+                    "sizeBytes too small for header + one minimal frame: " + sizeBytes);
+        }
+        long addr = Unsafe.malloc(sizeBytes, MemoryTag.NATIVE_DEFAULT);
+        try {
+            // Write the same header so a hex dump of either backing looks
+            // identical and any future tool can scan a memory-backed
+            // segment without special casing.
+            Unsafe.getUnsafe().putInt(addr, FILE_MAGIC);
+            Unsafe.getUnsafe().putByte(addr + 4, VERSION);
+            Unsafe.getUnsafe().putByte(addr + 5, (byte) 0);
+            Unsafe.getUnsafe().putShort(addr + 6, (short) 0);
+            Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
+            Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
+            return new MmapSegment(null, -1, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, true);
+        } catch (Throwable t) {
+            Unsafe.free(addr, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             throw t;
         }
     }
@@ -172,7 +209,7 @@ public final class MmapSegment implements QuietCloseable {
             long baseSeq = Unsafe.getUnsafe().getLong(addr + 8);
             long lastGood = scanFrames(addr, fileSize);
             long count = countFrames(addr, lastGood);
-            return new MmapSegment(path, fd, addr, fileSize, baseSeq, lastGood, count);
+            return new MmapSegment(path, fd, addr, fileSize, baseSeq, lastGood, count, false);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
@@ -203,7 +240,11 @@ public final class MmapSegment implements QuietCloseable {
     @Override
     public void close() {
         if (mmapAddress != 0) {
-            Files.munmap(mmapAddress, sizeBytes, MemoryTag.MMAP_DEFAULT);
+            if (memoryBacked) {
+                Unsafe.free(mmapAddress, sizeBytes, MemoryTag.NATIVE_DEFAULT);
+            } else {
+                Files.munmap(mmapAddress, sizeBytes, MemoryTag.MMAP_DEFAULT);
+            }
             mmapAddress = 0;
         }
         if (fd >= 0) {
@@ -222,6 +263,7 @@ public final class MmapSegment implements QuietCloseable {
      * the user has opted into OS-crash durability (e.g. {@code sf_msync_on_flush=on}).
      */
     public void msync() {
+        if (memoryBacked) return; // no on-disk pages to flush
         long pub = publishedCursor;
         if (pub > HEADER_SIZE) {
             Files.msync(mmapAddress, pub, false);

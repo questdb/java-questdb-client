@@ -334,6 +334,102 @@ public class SegmentRingTest {
         }
     }
 
+    @Test
+    public void testNextSealedAfterWalksThousandsOfSegmentsWithoutOverflow() {
+        // Regression for "sealed snapshot grew unexpectedly large".
+        // The cursor I/O loop used to copy the entire sealed list into a
+        // fixed-size array (initial 16, grown once to 32) on every advance.
+        // Under load — producer outpacing the WS sender, no maxTotalBytes
+        // cap — sealed segments accumulate well past 32 and the I/O thread
+        // would crash. Walk via nextSealedAfter must work no matter how
+        // many sealed segments are in the list.
+        final int sealedCount = 200; // comfortably exceeds the old 32-slot cap
+        // One frame per segment keeps the test fast; rotation forces seal.
+        long segSize = MmapSegment.HEADER_SIZE
+                + (MmapSegment.FRAME_HEADER_SIZE + 16);
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/seg-0000.sfa", 0, segSize);
+            try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
+                fillPattern(buf, 16, 0);
+                // (sealedCount + 1) iterations puts exactly sealedCount segments
+                // into the sealed list: the first iteration just fills the
+                // initial active (no rotation yet); iterations 2..N each rotate
+                // the previous active onto the sealed list before appending.
+                for (int i = 0; i <= sealedCount; i++) {
+                    long fsn = ring.appendOrFsn(buf, 16);
+                    assertEquals("first append after rotation produces fsn=" + i, i, fsn);
+                    // Active is now full; install a spare so the next append rotates.
+                    MmapSegment spare = MmapSegment.create(
+                            tmpDir + "/seg-" + String.format("%04d", i + 1) + ".sfa",
+                            ring.nextSeqHint(), segSize);
+                    ring.installHotSpare(spare);
+                }
+                // After the loop we have `sealedCount` sealed segments and one
+                // active (containing nothing yet — its base = sealedCount).
+                // Now walk: oldest sealed, then nextSealedAfter() repeatedly.
+                MmapSegment cursor = ring.firstSealed();
+                assertNotNull(cursor);
+                assertEquals(0, cursor.baseSeq());
+                int visited = 1;
+                long prevBase = cursor.baseSeq();
+                while (true) {
+                    MmapSegment next = ring.nextSealedAfter(cursor);
+                    if (next == null) break;
+                    assertTrue("baseSeq must strictly increase: prev=" + prevBase
+                                    + " next=" + next.baseSeq(),
+                            next.baseSeq() > prevBase);
+                    prevBase = next.baseSeq();
+                    cursor = next;
+                    visited++;
+                }
+                assertEquals("must visit every sealed segment", sealedCount, visited);
+                // Walking past the last sealed → null (caller falls through to active).
+                assertNull(ring.nextSealedAfter(cursor));
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testNextSealedAfterStillReturnsCorrectlyWhenCursorWasTrimmed() {
+        // Bug class: I/O thread is mid-walk; trim removes the segment
+        // referenced by `cursor` between iterations. The next call must
+        // return the segment whose baseSeq is just above cursor.baseSeq()
+        // — not crash, not skip ahead, not loop forever. baseSeq comparison
+        // (rather than identity) is what makes this safe.
+        long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 16);
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/t-0.sfa", 0, segSize);
+            try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
+                fillPattern(buf, 16, 0);
+                // Build sealed: [seg0, seg1, seg2, seg3]; active = seg4.
+                for (int i = 0; i < 4; i++) {
+                    ring.appendOrFsn(buf, 16);
+                    ring.installHotSpare(MmapSegment.create(
+                            tmpDir + "/t-" + (i + 1) + ".sfa", ring.nextSeqHint(), segSize));
+                }
+                MmapSegment seg0Snapshot = ring.firstSealed();
+                assertEquals(0, seg0Snapshot.baseSeq());
+                // Simulate trim: ack everything in seg0 and seg1, drain.
+                ring.acknowledge(1);
+                ObjList<MmapSegment> trimmed = ring.drainTrimmable();
+                assertNotNull(trimmed);
+                assertEquals(2, trimmed.size());
+                for (int i = 0; i < trimmed.size(); i++) trimmed.get(i).close();
+                // I/O thread was holding seg0Snapshot; nextSealedAfter must
+                // still return seg2 (baseSeq=2), not crash, not return seg0Snapshot itself.
+                MmapSegment next = ring.nextSealedAfter(seg0Snapshot);
+                assertNotNull(next);
+                assertEquals(2L, next.baseSeq());
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     private static void fillPattern(long addr, int len, int seed) {
         for (int i = 0; i < len; i++) {
             Unsafe.getUnsafe().putByte(addr + i, (byte) (seed * 31 + i + 17));

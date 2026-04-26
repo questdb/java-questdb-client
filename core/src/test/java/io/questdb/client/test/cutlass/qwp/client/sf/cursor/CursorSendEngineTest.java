@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.std.Files;
@@ -38,6 +39,7 @@ import java.nio.file.Paths;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class CursorSendEngineTest {
 
@@ -134,5 +136,59 @@ public class CursorSendEngineTest {
         CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096);
         engine.close();
         engine.close();
+    }
+
+    @Test
+    public void testAppendBlockingThrowsOnDeadlineExpiryUnderCap() throws Exception {
+        // Cap counts manager-provisioned segments only (the initial active is
+        // "free" per SegmentManager's documented approximation). With cap =
+        // 2*segSize and segSize fitting 2 frames, the producer can land
+        // initial (2) + spare1 (2) + spare2 (2) = 6 frames. The 7th rotation
+        // needs a spare3 that the cap forbids → backpressure → deadline.
+        long segSize = MmapSegment.HEADER_SIZE
+                + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+        long cap = 2 * segSize;
+        long shortDeadlineNanos = 200_000_000L; // 200 ms
+        long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+        try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize, cap, shortDeadlineNanos)) {
+            for (int i = 0; i < 6; i++) {
+                long fsn = engine.appendBlocking(buf, 64);
+                assertEquals(i, fsn);
+            }
+            // Next append must wait for a third spare that the cap won't allow.
+            long t0 = System.nanoTime();
+            try {
+                engine.appendBlocking(buf, 64);
+                fail("expected backpressure deadline exception");
+            } catch (LineSenderException expected) {
+                long elapsed = System.nanoTime() - t0;
+                assertTrue("threw too early: " + elapsed + "ns",
+                        elapsed >= shortDeadlineNanos);
+                assertTrue("message must mention backpressure: " + expected.getMessage(),
+                        expected.getMessage().contains("backpressured"));
+            }
+            // Counter must record the stall.
+            assertTrue("stall counter must increment: " + engine.getTotalBackpressureStalls(),
+                    engine.getTotalBackpressureStalls() >= 1);
+        } finally {
+            Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testMemoryModeSkipsDirAndStillWorks() {
+        // sfDir == null → memory-only ring. No files, no mkdir, no path.
+        long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+        try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
+            assertEquals(null, engine.sfDir());
+            for (int i = 0; i < 16; i++) {
+                long fsn = engine.appendBlocking(buf, 32);
+                assertEquals(i, fsn);
+            }
+            // Active segment must be a memory-backed MmapSegment (path == null).
+            assertEquals(null, engine.activeSegment().path());
+        } finally {
+            Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 }

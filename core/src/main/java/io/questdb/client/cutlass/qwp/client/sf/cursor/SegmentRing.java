@@ -62,6 +62,12 @@ public final class SegmentRing implements QuietCloseable {
     public static final long PAYLOAD_TOO_LARGE = -2L;
 
     private final long maxBytesPerSegment;
+    // High-water byte offset within the active segment at which we proactively
+    // ask the segment manager to provision a spare (if one isn't already
+    // installed). Computed once as 3/4 of segment capacity — leaves the manager
+    // a quarter-of-a-segment of producer runway to do its open+mmap before the
+    // producer would otherwise hit BACKPRESSURE_NO_SPARE.
+    private final long signalAtBytes;
     // Sealed segments in baseSeq order, oldest first. Active is held separately.
     // Single-writer (producer thread, on rotation); single-reader at trim time
     // (the segment manager). For now, both sides synchronize via the single-
@@ -77,6 +83,18 @@ public final class SegmentRing implements QuietCloseable {
     // hotSpare: written by segment manager (installHotSpare), read+cleared by
     // producer thread on rotation. Volatile so the producer sees fresh installs.
     private volatile MmapSegment hotSpare;
+    // Optional callback the segment manager registers via setManagerWakeup
+    // so the producer can wake the manager out of its poll-park the moment
+    // a spare is needed (rotation just consumed one, or active crossed the
+    // high-water mark while no spare is installed). Without this, the
+    // manager only notices on its next polling tick — fine on average,
+    // but the worst-case wait is the full poll interval. Producer-thread-only.
+    private Runnable managerWakeup;
+    // Plain (producer-thread-only) flag; set to true the first time we ask
+    // the manager for a spare for the current active segment, cleared on
+    // every rotation. Coalesces multiple high-water-mark crossings into a
+    // single unpark per active.
+    private boolean wakeupRequestedForActive;
     private long nextSeq;
     private volatile long publishedFsn = -1L;
 
@@ -91,6 +109,9 @@ public final class SegmentRing implements QuietCloseable {
         }
         this.active = initialActive;
         this.maxBytesPerSegment = maxBytesPerSegment;
+        // 3/4 of capacity gives the manager a full quarter-segment of producer
+        // runway before backpressure kicks in. Long math, no float, no alloc.
+        this.signalAtBytes = (maxBytesPerSegment >> 2) * 3;
         this.nextSeq = initialActive.baseSeq() + initialActive.frameCount();
         this.publishedFsn = nextSeq - 1;
     }
@@ -253,11 +274,29 @@ public final class SegmentRing implements QuietCloseable {
             }
             active = spare;
             hotSpare = null;
+            // Fresh active just consumed the spare → ask the manager to start
+            // making the next one immediately, before this segment fills.
+            // Plain field reset is safe (producer-only state).
+            wakeupRequestedForActive = true;
+            Runnable wakeup = managerWakeup;
+            if (wakeup != null) {
+                wakeup.run();
+            }
             offset = active.tryAppend(payloadAddr, payloadLen);
             if (offset == -1L) {
                 // Doesn't fit even in a fresh segment — payload is genuinely too big.
                 return PAYLOAD_TOO_LARGE;
             }
+        } else if (!wakeupRequestedForActive
+                && hotSpare == null
+                && managerWakeup != null
+                && active.publishedOffset() >= signalAtBytes) {
+            // Backup signal: we're past the high-water mark and still don't
+            // have a spare (manager hasn't caught up yet, or this is the very
+            // first active and rotation hasn't fired the on-rotation wakeup).
+            // Fire once per active segment.
+            wakeupRequestedForActive = true;
+            managerWakeup.run();
         }
         long fsn = nextSeq++;
         // publishedFsn last so the I/O thread never observes a half-written frame.
@@ -358,6 +397,41 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * Returns the sealed segment whose {@code baseSeq} immediately follows
+     * {@code current.baseSeq()}, or {@code null} if no such segment exists
+     * (caller should fall through to {@link #getActive()}). Used by the I/O
+     * loop to walk forward through the sealed list one segment at a time
+     * without snapshotting the whole list — important when the producer
+     * outpaces the I/O thread and sealed segments accumulate well beyond
+     * any reasonable snapshot-array size.
+     * <p>
+     * Identity match is intentionally avoided: we compare {@code baseSeq}
+     * so the loop is robust against the case where {@code current} was
+     * trimmed out from under us (already ACK'd before the I/O thread
+     * advanced) — we still return the next segment in baseSeq order rather
+     * than failing. Synchronized against rotation.
+     */
+    public synchronized MmapSegment nextSealedAfter(MmapSegment current) {
+        long currentBase = current.baseSeq();
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            MmapSegment s = sealedSegments.get(i);
+            if (s.baseSeq() > currentBase) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Oldest sealed segment, or {@code null} if the sealed list is empty.
+     * Used by the I/O loop's "current was trimmed out from under us"
+     * fallback — see {@link #nextSealedAfter(MmapSegment)}.
+     */
+    public synchronized MmapSegment firstSealed() {
+        return sealedSegments.size() > 0 ? sealedSegments.get(0) : null;
+    }
+
+    /**
      * Segment manager pre-creates the next segment and parks it here. The
      * producer consumes the spare on its next rotation. Throws if a spare
      * is already installed (the manager should have polled {@link #needsHotSpare}
@@ -375,6 +449,20 @@ public final class SegmentRing implements QuietCloseable {
 
     public long maxBytesPerSegment() {
         return maxBytesPerSegment;
+    }
+
+    /**
+     * Registers a wakeup callback that the producer thread will invoke when
+     * a hot spare is needed — either right after a rotation has consumed the
+     * previous spare, or when the active segment crosses the 75% high-water
+     * mark while no spare is installed. The callback is expected to be cheap
+     * (e.g. {@code LockSupport.unpark} of the segment manager's worker).
+     * <p>
+     * Set once, before the producer starts appending. Idempotent re-set is
+     * allowed but not thread-safe.
+     */
+    public void setManagerWakeup(Runnable wakeup) {
+        this.managerWakeup = wakeup;
     }
 
     /** True when the segment manager should prepare and install a fresh spare. */

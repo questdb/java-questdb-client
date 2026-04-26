@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
+import org.openjdk.jmh.annotations.Fork;
 import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.Mode;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
@@ -34,6 +35,7 @@ import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
+import org.openjdk.jmh.profile.GCProfiler;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
@@ -107,6 +109,11 @@ import java.util.concurrent.TimeUnit;
 @State(Scope.Benchmark)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 @BenchmarkMode({Mode.SampleTime, Mode.AverageTime})
+// -Xlog:gc* prints every GC pause + reason to the fork's stdout. With JMH's
+// default forking, those lines are streamed live so a sub-millisecond pause
+// landing inside a measurement window is easy to correlate with the p99.99
+// outlier that prompted us to look. The unified-logging flag is JDK 9+.
+@Fork(jvmArgsAppend = {"-Xlog:gc*=info"})
 public class QwpIngressLatencyBenchmark {
 
     static {
@@ -149,6 +156,10 @@ public class QwpIngressLatencyBenchmark {
                 .measurementTime(TimeValue.seconds(2))
                 .threads(1)
                 .forks(2)
+                // GCProfiler reports allocation rate + young/old churn per
+                // iteration as extra result rows ("·gc.alloc.rate", etc.).
+                // Profilers can't be wired via annotation, so they go here.
+                .addProfiler(GCProfiler.class)
                 .build();
         new Runner(opt).run();
     }
@@ -178,7 +189,7 @@ public class QwpIngressLatencyBenchmark {
                     ? SF_DIR_OVERRIDE
                     : Paths.get(System.getProperty("java.io.tmpdir"),
                     "qdb-sf-ingress-bench-" + System.nanoTime()).toString();
-            cfg += "store_and_forward=on;sf_dir=" + sfDir + ";";
+            cfg += "sf_dir=" + sfDir + ";";
             if (FSYNC_ON_FLUSH) {
                 cfg += "sf_fsync_on_flush=on;";
             }

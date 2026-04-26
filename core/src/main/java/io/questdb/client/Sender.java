@@ -36,8 +36,7 @@ import io.questdb.client.cutlass.line.tcp.DelegatingTlsChannel;
 import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
 import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
-import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
-import io.questdb.client.cutlass.qwp.client.sf.SfDiskFullException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
@@ -547,6 +546,27 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *
      * @see Sender#fromConfig(CharSequence) for creating a Sender directly from a configuration String
      */
+    /**
+     * Durability contract for the store-and-forward write path. Selects when
+     * the SF segment file is fsynced; trades latency / throughput for
+     * crash-survival of unacked frames.
+     * <ul>
+     *   <li>{@link #MEMORY} — never fsync explicitly. Bytes live in the OS
+     *       page cache; survive a JVM crash but not an OS crash. Default
+     *       and the lowest-latency setting.</li>
+     *   <li>{@link #FLUSH} — fsync the active segment at every
+     *       {@code Sender.flush()} (and at the implicit close-flush). One
+     *       fsync per user flush, regardless of frame count.</li>
+     *   <li>{@link #APPEND} — fsync after every individual frame append.
+     *       Strongest guarantee, slowest path; pay a disk fsync per row.</li>
+     * </ul>
+     */
+    enum SfDurability {
+        MEMORY,
+        FLUSH,
+        APPEND
+    }
+
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
@@ -624,20 +644,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private boolean requestDurableAck;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
-        // Store-and-forward (WebSocket only). storeAndForward must be true AND
-        // sfDir must be set for SF to activate.
-        private boolean storeAndForward;
+        // Default per-segment size for the cursor SF/memory-mode ring (4 MiB).
+        // Smaller than the legacy 64 MiB default — cursor has no per-rotation
+        // syscall cost so smaller segments give finer trim granularity and
+        // make the cap arithmetic friendlier (cap / segment >> 2).
+        private static final long DEFAULT_SEGMENT_BYTES = 4L * 1024 * 1024;
+        // Default ceiling on cursor-allocated bytes (active + spare + sealed).
+        // RAM is precious; if you're not persisting to disk, you don't get
+        // to balloon. Memory mode = 128 MiB (32 segments at default size).
+        private static final long DEFAULT_MAX_BYTES_MEMORY = 128L * 1024 * 1024;
+        // Disk is cheap and SF's job is to absorb backpressure during wire
+        // outages — the cap should be large enough that normal traffic
+        // never approaches it. SF mode = 10 GiB (2560 segments at default
+        // size). Users can lower this on space-constrained hosts.
+        private static final long DEFAULT_MAX_BYTES_SF = 10L * 1024 * 1024 * 1024;
+        // Store-and-forward (WebSocket only). SF is enabled iff sfDir is non-null —
+        // there is no separate on/off flag (presence of the directory is the switch).
+        // null sfDir → memory-only async ingest (same lock-free architecture, no disk).
         private String sfDir;
         private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean sfFsync;
-        private boolean sfFsyncOnFlush;
-        // SF storage engine: "legacy" = SegmentLog + WebSocketSendQueue (today's
-        // default). "cursor" = mmap-backed SegmentRing + lock-free cursor design
-        // (in-progress; not yet wired into the Sender — selecting it at build
-        // time fails fast). null = parameter not explicitly set (defaults to
-        // "legacy").
-        private String sfEngine;
+        // Durability contract for SF append/flush. Today only MEMORY is
+        // implemented; FLUSH and APPEND are deferred follow-ups (cursor needs
+        // to learn fsync first).
+        private SfDurability sfDurability = SfDurability.MEMORY;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -940,42 +970,36 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     );
                 }
 
-                // Engine selection (legacy default). The cursor engine is
-                // implemented (see io.questdb.client.cutlass.qwp.client.sf.cursor)
-                // but not yet plumbed through QwpWebSocketSender — fail fast
-                // here instead of silently falling back to legacy.
-                if ("cursor".equals(sfEngine)) {
+                // Cursor is the only async ingest path. Setting sfDir enables
+                // store-and-forward (mmap'd, recoverable across sender restarts);
+                // omitting it gives memory-only mode (same lock-free architecture,
+                // no disk involvement). sf_durability != memory is a planned
+                // feature; throw today instead of silently downgrading.
+                if (actualInFlightWindowSize <= 1) {
                     throw new LineSenderException(
-                            "sf_engine=cursor is not yet wired into the Sender — the engine "
-                                    + "primitives (MmapSegment / SegmentRing / SegmentManager / "
-                                    + "CursorSendEngine) are in place but the WebSocketSendQueue "
-                                    + "rewrite that consumes them is the next PR. Track the "
-                                    + "follow-up issue and use sf_engine=legacy in the meantime.");
+                            "WebSocket transport requires async mode (in_flight_window > 1)");
                 }
-
-                SegmentLog segmentLog = null;
-                if (storeAndForward) {
-                    if (sfDir == null) {
-                        throw new LineSenderException(
-                                "store_and_forward=on requires sf_dir to be set");
-                    }
-                    if (actualInFlightWindowSize <= 1) {
-                        throw new LineSenderException(
-                                "store_and_forward requires async mode (in_flight_window > 1)");
-                    }
-                    long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
-                            ? SegmentLog.DEFAULT_MAX_BYTES_PER_SEGMENT
-                            : sfMaxBytes;
-                    long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
-                            ? SegmentLog.DEFAULT_MAX_TOTAL_BYTES
-                            : sfMaxTotalBytes;
-                    segmentLog = SegmentLog.open(
-                            sfDir, actualSfMaxBytes, actualSfMaxTotalBytes, sfFsync);
-                } else if (sfDir != null) {
+                if (sfDurability != SfDurability.MEMORY) {
                     throw new LineSenderException(
-                            "sf_dir is set but store_and_forward is not enabled");
+                            "sf_durability=" + sfDurability.name().toLowerCase()
+                                    + " is not yet supported (deferred follow-up; use sf_durability=memory)");
                 }
+                long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
+                        ? DEFAULT_SEGMENT_BYTES
+                        : sfMaxBytes;
+                // Default cap depends on backing: RAM (memory mode) is tight
+                // by default; disk (SF mode) is cheap so the default is
+                // generous enough that normal traffic never hits it.
+                long defaultMaxTotal = sfDir == null
+                        ? DEFAULT_MAX_BYTES_MEMORY
+                        : DEFAULT_MAX_BYTES_SF;
+                long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
+                        ? Math.max(defaultMaxTotal, actualSfMaxBytes * 2)
+                        : sfMaxTotalBytes;
 
+                CursorSendEngine cursorEngine = new CursorSendEngine(
+                        sfDir, actualSfMaxBytes,
+                        actualSfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
                 try {
                     return QwpWebSocketSender.connect(
                             hosts.getQuick(0),
@@ -988,19 +1012,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             wsAuthHeader,
                             actualMaxSchemasPerConnection,
                             requestDurableAck,
-                            segmentLog,
-                            sfFsyncOnFlush
+                            cursorEngine
                     );
                 } catch (Throwable t) {
-                    // If connect failed, the sender's close() ran and would have closed
-                    // the log; but if setSegmentLog never ran (e.g. validation threw earlier
-                    // in the connect path), we have to clean it up ourselves.
-                    if (segmentLog != null) {
-                        try {
-                            segmentLog.close();
-                        } catch (Throwable ignored) {
-                            // best-effort
-                        }
+                    try {
+                        cursorEngine.close();
+                    } catch (Throwable ignored) {
+                        // best-effort
                     }
                     throw t;
                 }
@@ -1575,22 +1593,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Toggle store-and-forward. Must be paired with
-         * {@link #storeAndForwardDir(String)}; activating SF without a dir is a
-         * configuration error caught at build() time. WebSocket transport only.
-         */
-        public LineSenderBuilder storeAndForward(boolean enabled) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
-            }
-            this.storeAndForward = enabled;
-            return this;
-        }
-
-        /**
-         * Set the store-and-forward directory. Has effect only when SF is also
-         * enabled via {@link #storeAndForward(boolean)} (or {@code store_and_forward=on}
-         * in the connect string).
+         * Enables store-and-forward and sets its directory. Setting the SF
+         * directory <i>is</i> the on-switch — there is no separate
+         * enable/disable flag. SF is off iff {@code dir} was never set.
          * <p>
          * Every batch is persisted to disk before it leaves the wire and is
          * reclaimed as soon as the server acknowledges it. On restart the
@@ -1607,8 +1612,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * batches in flight; those will be replayed by the next sender
          * against the same directory. WebSocket transport only.
          * <p>
-         * The sender takes ownership of the underlying SegmentLog and closes it
-         * when the sender itself is closed.
+         * The sender takes ownership of the underlying SF storage and closes
+         * it when the sender itself is closed.
          *
          * @param dir filesystem directory; created if it doesn't exist
          */
@@ -1625,7 +1630,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Maximum bytes per segment file before rotation. Defaults to
-         * {@link SegmentLog#DEFAULT_MAX_BYTES_PER_SEGMENT}
+         * {@code DEFAULT_SEGMENT_BYTES}
          * (64 MiB). Smaller segments mean faster trim of acked data; larger
          * segments mean fewer rotations.
          */
@@ -1641,11 +1646,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Hard cap on total bytes consumed by SF on disk. When the cap is reached,
-         * subsequent appends throw {@link SfDiskFullException}
-         * which propagates as back-pressure: {@code flush()} blocks on the user
-         * thread until ACKs trim acknowledged segments and free space. Default is
-         * unbounded ({@link Long#MAX_VALUE}).
+         * Hard cap on cursor-allocated bytes (active + spare + sealed
+         * segments). When the cap is reached, the producer's
+         * {@code Sender.flush()} blocks until ACK-driven trim frees space;
+         * if the cap is exhausted past the configured deadline (default 30 s),
+         * {@code flush()} throws. Default: {@code 128 MiB}, which applies to
+         * both memory-mode and SF-mode rings — for SF deployments with
+         * cheap disk, raise this knob explicitly. WebSocket transport only.
          */
         public LineSenderBuilder storeAndForwardMaxTotalBytes(long maxTotalBytes) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
@@ -1659,79 +1666,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * When enabled, every successful SF append calls {@code fsync} on the
-         * active segment file before returning. Trades throughput for the
-         * strongest durability guarantee — every captured frame survives an OS
-         * crash, not just a process crash.
+         * Selects the durability contract for SF appends and flushes. See
+         * {@link SfDurability} for the value semantics.
          * <p>
-         * Default: off. With {@code sf_fsync=off}, fsync only fires on
-         * segment rotation and new-segment header creation; bytes appended to
-         * the active segment between rotations live only in the OS page cache
-         * and may be lost in an OS crash, kernel panic, or power loss. The
-         * JVM going down is survived (the page cache outlives the process).
-         * <p>
-         * If you flush coarsely (one fsync per flush is acceptable) and want
-         * OS-crash survival without paying per-append fsync cost, set
-         * {@link #storeAndForwardFsyncOnFlush(boolean)} instead.
+         * Replaces the prior pair of independent {@code sf_fsync} and
+         * {@code sf_fsync_on_flush} booleans — they were three states
+         * crammed into two flags. WebSocket transport only.
          */
-        public LineSenderBuilder storeAndForwardFsync(boolean enabled) {
+        public LineSenderBuilder storeAndForwardDurability(SfDurability durability) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
             }
-            this.sfFsync = enabled;
+            if (durability == null) {
+                throw new LineSenderException("sf_durability cannot be null");
+            }
+            this.sfDurability = durability;
             return this;
         }
 
-        /**
-         * When enabled, every successful {@code Sender.flush()} (and the
-         * implicit flush during {@code close()}) calls {@code fsync} on the
-         * SF active segment file before returning. Trades flush latency
-         * (one fsync per flush) for OS-crash survival of every byte that
-         * the user explicitly flushed.
-         * <p>
-         * Off by default. Use this when batches are large or flushes are
-         * coarse and you want OS-crash durability without paying the
-         * per-append fsync cost of {@link #storeAndForwardFsync(boolean)}.
-         * Avoid it when batches are small and flushes are frequent — every
-         * flush blocks on a disk fsync, which is typically the slowest
-         * operation in the SF write path.
-         * <p>
-         * Combining {@code sf_fsync=on} and {@code sf_fsync_on_flush=on}
-         * is allowed but redundant: per-append fsync already covers every
-         * byte before flush returns.
-         */
-        public LineSenderBuilder storeAndForwardFsyncOnFlush(boolean enabled) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
-            }
-            this.sfFsyncOnFlush = enabled;
-            return this;
-        }
-
-        /**
-         * Selects the SF storage engine. Allowed values:
-         * <ul>
-         *   <li>{@code "legacy"} — pwrite-based {@code SegmentLog} routed
-         *       through {@code WebSocketSendQueue}. Today's default.</li>
-         *   <li>{@code "cursor"} — mmap-backed {@code SegmentRing} with a
-         *       background segment manager and a lock-free user-thread
-         *       append path. Substantially lower per-flush latency. NOT YET
-         *       WIRED into {@code QwpWebSocketSender}; selecting it at build
-         *       time throws {@link LineSenderException} so users can't
-         *       silently fall back to legacy. Tracking issue / future PR.</li>
-         * </ul>
-         */
-        public LineSenderBuilder storeAndForwardEngine(String engine) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("sf_engine is only supported for WebSocket transport");
-            }
-            if (!"legacy".equals(engine) && !"cursor".equals(engine)) {
-                throw new LineSenderException("invalid sf_engine [value=").put(engine)
-                        .put(", allowed-values=[legacy, cursor]]");
-            }
-            this.sfEngine = engine;
-            return this;
-        }
 
         /**
          * Configures the maximum time the Sender will spend retrying upon receiving a recoverable error from the server.
@@ -1799,6 +1751,68 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             } catch (NumericException e) {
                 throw new LineSenderException("invalid ").put(name).put(" [value=").put(value).put("]");
             }
+        }
+
+        /**
+         * Parses a byte-count value with optional unit suffix:
+         * <ul>
+         *   <li>plain decimal: {@code 67108864}</li>
+         *   <li>kibibyte: {@code 64k} or {@code 64kb}</li>
+         *   <li>mebibyte: {@code 64m} or {@code 64mb}</li>
+         *   <li>gibibyte: {@code 4g} or {@code 4gb}</li>
+         * </ul>
+         * Suffixes are case-insensitive. Powers of 2 (1024-based), not 1000;
+         * matches what most JVM size flags accept (-Xmx, -Xss, etc.).
+         */
+        private static long parseSizeValue(@NotNull StringSink value, @NotNull String name) {
+            if (Chars.isBlank(value)) {
+                throw new LineSenderException(name).put(" cannot be empty");
+            }
+            int len = value.length();
+            // Strip a trailing 'b' / 'B' so '64m' and '64mb' both work.
+            int end = len;
+            if (end > 0) {
+                char tail = value.charAt(end - 1);
+                if (tail == 'b' || tail == 'B') {
+                    end--;
+                }
+            }
+            long multiplier = 1L;
+            if (end > 0) {
+                char unit = value.charAt(end - 1);
+                switch (unit) {
+                    case 'k': case 'K': multiplier = 1024L;                    end--; break;
+                    case 'm': case 'M': multiplier = 1024L * 1024;             end--; break;
+                    case 'g': case 'G': multiplier = 1024L * 1024 * 1024;      end--; break;
+                    case 't': case 'T': multiplier = 1024L * 1024 * 1024 * 1024; end--; break;
+                    default: // no unit suffix — treat as raw bytes
+                }
+            }
+            if (end <= 0) {
+                throw new LineSenderException("invalid ").put(name).put(" [value=").put(value).put("]");
+            }
+            // parseLong only takes a full CharSequence. The suffix-trimming
+            // path is parser-time (called once per connect string), so a
+            // tiny per-call substring allocation is acceptable.
+            CharSequence digits = end == len ? (CharSequence) value : value.toString().substring(0, end);
+            try {
+                long n = Numbers.parseLong(digits);
+                // Overflow check on multiply.
+                if (multiplier != 1 && n != 0 && n > Long.MAX_VALUE / multiplier) {
+                    throw new LineSenderException(name).put(" overflows long [value=").put(value).put(']');
+                }
+                return n * multiplier;
+            } catch (NumericException e) {
+                throw new LineSenderException("invalid ").put(name).put(" [value=").put(value).put("]");
+            }
+        }
+
+        private static SfDurability parseDurabilityValue(@NotNull StringSink value) {
+            if (Chars.equalsIgnoreCase("memory", value)) return SfDurability.MEMORY;
+            if (Chars.equalsIgnoreCase("flush", value))  return SfDurability.FLUSH;
+            if (Chars.equalsIgnoreCase("append", value)) return SfDurability.APPEND;
+            throw new LineSenderException("invalid sf_durability [value=").put(value)
+                    .put(", allowed-values=[memory, flush, append]]");
         }
 
         private static int resolveIPv4(String host) {
@@ -2155,18 +2169,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "max_schemas_per_connection");
                     int maxSchemas = parseIntValue(sink, "max_schemas_per_connection");
                     maxSchemasPerConnection(maxSchemas);
-                } else if (Chars.equals("store_and_forward", sink)) {
-                    if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
-                    }
-                    pos = getValue(configurationString, pos, sink, "store_and_forward");
-                    if (Chars.equalsIgnoreCase("on", sink)) {
-                        storeAndForward(true);
-                    } else if (Chars.equalsIgnoreCase("off", sink)) {
-                        storeAndForward(false);
-                    } else {
-                        throw new LineSenderException("invalid store_and_forward [value=").put(sink).put(", allowed-values=[on, off]]");
-                    }
                 } else if (Chars.equals("sf_dir", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sf_dir is only supported for WebSocket transport");
@@ -2178,45 +2180,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         throw new LineSenderException("sf_max_bytes is only supported for WebSocket transport");
                     }
                     pos = getValue(configurationString, pos, sink, "sf_max_bytes");
-                    long maxBytes = parseLongValue(sink, "sf_max_bytes");
-                    storeAndForwardMaxBytes(maxBytes);
+                    storeAndForwardMaxBytes(parseSizeValue(sink, "sf_max_bytes"));
                 } else if (Chars.equals("sf_max_total_bytes", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sf_max_total_bytes is only supported for WebSocket transport");
                     }
                     pos = getValue(configurationString, pos, sink, "sf_max_total_bytes");
-                    long maxTotal = parseLongValue(sink, "sf_max_total_bytes");
-                    storeAndForwardMaxTotalBytes(maxTotal);
-                } else if (Chars.equals("sf_fsync", sink)) {
+                    storeAndForwardMaxTotalBytes(parseSizeValue(sink, "sf_max_total_bytes"));
+                } else if (Chars.equals("sf_durability", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("sf_fsync is only supported for WebSocket transport");
+                        throw new LineSenderException("sf_durability is only supported for WebSocket transport");
                     }
-                    pos = getValue(configurationString, pos, sink, "sf_fsync");
-                    if (Chars.equalsIgnoreCase("on", sink)) {
-                        storeAndForwardFsync(true);
-                    } else if (Chars.equalsIgnoreCase("off", sink)) {
-                        storeAndForwardFsync(false);
-                    } else {
-                        throw new LineSenderException("invalid sf_fsync [value=").put(sink).put(", allowed-values=[on, off]]");
-                    }
-                } else if (Chars.equals("sf_fsync_on_flush", sink)) {
-                    if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("sf_fsync_on_flush is only supported for WebSocket transport");
-                    }
-                    pos = getValue(configurationString, pos, sink, "sf_fsync_on_flush");
-                    if (Chars.equalsIgnoreCase("on", sink)) {
-                        storeAndForwardFsyncOnFlush(true);
-                    } else if (Chars.equalsIgnoreCase("off", sink)) {
-                        storeAndForwardFsyncOnFlush(false);
-                    } else {
-                        throw new LineSenderException("invalid sf_fsync_on_flush [value=").put(sink).put(", allowed-values=[on, off]]");
-                    }
-                } else if (Chars.equals("sf_engine", sink)) {
-                    if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("sf_engine is only supported for WebSocket transport");
-                    }
-                    pos = getValue(configurationString, pos, sink, "sf_engine");
-                    storeAndForwardEngine(sink.toString());
+                    pos = getValue(configurationString, pos, sink, "sf_durability");
+                    storeAndForwardDurability(parseDurabilityValue(sink));
                 } else if (Chars.equals("max_datagram_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");
                     int mds = parseIntValue(sink, "max_datagram_size");

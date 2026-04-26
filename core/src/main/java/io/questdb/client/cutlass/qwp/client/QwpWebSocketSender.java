@@ -34,6 +34,8 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -172,6 +174,13 @@ public class QwpWebSocketSender implements Sender {
     // True when this sender took ownership of segmentLog (e.g. via the
     // connect-string builder); close() will then close the log too.
     private boolean ownsSegmentLog;
+    // Cursor engine SF: when set, replaces the legacy sendQueue + SegmentLog
+    // pair. The producer (user thread) writes encoded QWP frames into the
+    // engine's mmap'd ring; the cursorSendLoop is the I/O thread that walks
+    // the ring and sends frames. Mutually exclusive with segmentLog.
+    private CursorSendEngine cursorEngine;
+    private boolean ownsCursorEngine;
+    private CursorWebSocketSendLoop cursorSendLoop;
     // When true, every successful flush() (including the implicit flush
     // during close()) routes a fsync request to the I/O thread before
     // returning. Off by default — opt-in via setSegmentLogFsyncOnFlush
@@ -348,7 +357,7 @@ public class QwpWebSocketSender implements Sender {
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 inFlightWindowSize, authorizationHeader, maxSchemasPerConnection, requestDurableAck,
-                null);
+                (SegmentLog) null);
     }
 
     /**
@@ -381,6 +390,42 @@ public class QwpWebSocketSender implements Sender {
      * because small-batch / frequent-flush senders pay one disk fsync per
      * call.
      */
+    /**
+     * Connect overload that wires the cursor SF engine into the sender.
+     * Mutually exclusive with the {@code SegmentLog} overload — the
+     * connect-string builder picks one based on {@code sf_engine}.
+     */
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine
+    ) {
+        QwpWebSocketSender sender = new QwpWebSocketSender(
+                host, port, tlsConfig,
+                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
+        );
+        try {
+            sender.setRequestDurableAck(requestDurableAck);
+            if (cursorEngine != null) {
+                sender.setCursorEngine(cursorEngine, true);
+            }
+            sender.ensureConnected();
+        } catch (Throwable t) {
+            sender.close();
+            throw t;
+        }
+        return sender;
+    }
+
     public static QwpWebSocketSender connect(
             String host,
             int port,
@@ -622,7 +667,13 @@ public class QwpWebSocketSender implements Sender {
                     // server-acked", so close() — like flush() — skips awaitPendingAcks.
                     // Unsealed acks remain on disk; the next sender against the same
                     // SF dir will replay them.
-                    if (sendQueue != null) {
+                    if (cursorEngine != null) {
+                        // Cursor SF: appendBlocking ran on the user thread inside
+                        // sealAndSwapBuffer, so every batch is already durable on
+                        // its mmap'd segment. The cursor I/O thread keeps draining
+                        // to the wire in the background; we don't wait for it.
+                        cursorSendLoop.checkError();
+                    } else if (sendQueue != null) {
                         sendQueue.flush();
                         if (fsyncOnFlush && segmentLog != null) {
                             // Same opt-in fsync as the public flush(): the
@@ -654,6 +705,14 @@ public class QwpWebSocketSender implements Sender {
                 } catch (Exception e) {
                     ioThreadStopped = false;
                     LOG.error("Error closing send queue: {}", String.valueOf(e));
+                }
+            }
+            if (cursorSendLoop != null) {
+                try {
+                    cursorSendLoop.close();
+                } catch (Exception e) {
+                    ioThreadStopped = false;
+                    LOG.error("Error closing cursor send loop: {}", String.valueOf(e));
                 }
             }
 
@@ -699,6 +758,16 @@ public class QwpWebSocketSender implements Sender {
                 }
                 segmentLog = null;
                 ownsSegmentLog = false;
+            }
+            // Same lifecycle for the cursor engine.
+            if (ownsCursorEngine && cursorEngine != null) {
+                try {
+                    cursorEngine.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
+                }
+                cursorEngine = null;
+                ownsCursorEngine = false;
             }
 
             LOG.info("QwpWebSocketSender closed");
@@ -899,6 +968,20 @@ public class QwpWebSocketSender implements Sender {
         checkNotClosed();
         ensureNoInProgressRow();
         ensureConnected();
+
+        if (cursorEngine != null) {
+            // Cursor SF: SF.append happens on the user thread inside
+            // sealAndSwapBuffer, so by the time we reach here every encoded
+            // batch is durable on its mmap'd segment. No processingCount to
+            // drain, no awaitPendingAcks. Just surface any I/O thread error.
+            flushPendingRows();
+            if (activeBuffer != null && activeBuffer.hasData()) {
+                sealAndSwapBuffer();
+            }
+            cursorSendLoop.checkError();
+            checkConnectionError();
+            return;
+        }
 
         if (inFlightWindowSize > 1) {
             // Async mode (window > 1): flush pending rows and wait for ACKs
@@ -1201,6 +1284,11 @@ public class QwpWebSocketSender implements Sender {
     public void ping() {
         checkNotClosed();
         ensureConnected();
+        if (cursorEngine != null) {
+            // PR1 cursor scope: ping/pong is on the legacy I/O loop only.
+            throw new LineSenderException(
+                    "ping() is not yet supported with sf_engine=cursor (deferred to a follow-up PR)");
+        }
         if (inFlightWindowSize > 1) {
             sendQueue.ping();
         } else {
@@ -1295,8 +1383,43 @@ public class QwpWebSocketSender implements Sender {
             throw new LineSenderException(
                     "store-and-forward requires async mode (inFlightWindowSize > 1)");
         }
+        if (log != null && cursorEngine != null) {
+            throw new LineSenderException(
+                    "SegmentLog and CursorSendEngine are mutually exclusive (sf_engine selects one)");
+        }
         this.segmentLog = log;
         this.ownsSegmentLog = takeOwnership && log != null;
+    }
+
+    /**
+     * Attach a {@link CursorSendEngine} for store-and-forward, replacing the
+     * legacy {@link SegmentLog} pipeline. The cursor engine puts the SF append
+     * on the user thread (writing into an mmap'd ring) and runs a dedicated
+     * I/O thread to drain frames to the wire — substantially lower per-flush
+     * latency than the legacy queue's hand-off + pwrite model.
+     * <p>
+     * Must be called before the first send. Requires async mode
+     * ({@code inFlightWindowSize > 1}). Mutually exclusive with
+     * {@link #setSegmentLog(SegmentLog, boolean)}.
+     */
+    public void setCursorEngine(CursorSendEngine engine, boolean takeOwnership) {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        if (connected) {
+            throw new LineSenderException(
+                    "setCursorEngine must be called before the first send");
+        }
+        if (engine != null && inFlightWindowSize <= 1) {
+            throw new LineSenderException(
+                    "cursor engine requires async mode (inFlightWindowSize > 1)");
+        }
+        if (engine != null && segmentLog != null) {
+            throw new LineSenderException(
+                    "CursorSendEngine and SegmentLog are mutually exclusive (sf_engine selects one)");
+        }
+        this.cursorEngine = engine;
+        this.ownsCursorEngine = takeOwnership && engine != null;
     }
 
     /**
@@ -1627,19 +1750,36 @@ public class QwpWebSocketSender implements Sender {
             // Initialize send queue for async mode (window > 1)
             // The send queue handles both sending AND receiving (single I/O thread)
             if (inFlightWindowSize > 1) {
-                try {
-                    Reconnector reconnector = segmentLog != null ? this::performReconnect : null;
-                    sendQueue = new WebSocketSendQueue(client, inFlightWindow,
-                            WebSocketSendQueue.DEFAULT_ENQUEUE_TIMEOUT_MS,
-                            WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS,
-                            this::recordConnectionFailure,
-                            segmentLog,
-                            reconnector);
-                } catch (Throwable t) {
-                    inFlightWindow = null;
-                    client.close();
-                    client = null;
-                    throw new LineSenderException("Failed to start I/O thread for " + host + ":" + port, t);
+                if (cursorEngine != null) {
+                    // Cursor SF: skip the legacy sendQueue entirely. The cursor
+                    // I/O loop polls publishedFsn and drains frames straight
+                    // from the mmap'd ring, so no enqueue / processingCount
+                    // handshake is needed on the user thread.
+                    try {
+                        cursorSendLoop = new CursorWebSocketSendLoop(client, cursorEngine);
+                        cursorSendLoop.start();
+                    } catch (Throwable t) {
+                        inFlightWindow = null;
+                        client.close();
+                        client = null;
+                        throw new LineSenderException(
+                                "Failed to start cursor I/O thread for " + host + ":" + port, t);
+                    }
+                } else {
+                    try {
+                        Reconnector reconnector = segmentLog != null ? this::performReconnect : null;
+                        sendQueue = new WebSocketSendQueue(client, inFlightWindow,
+                                WebSocketSendQueue.DEFAULT_ENQUEUE_TIMEOUT_MS,
+                                WebSocketSendQueue.DEFAULT_SHUTDOWN_TIMEOUT_MS,
+                                this::recordConnectionFailure,
+                                segmentLog,
+                                reconnector);
+                    } catch (Throwable t) {
+                        inFlightWindow = null;
+                        client.close();
+                        client = null;
+                        throw new LineSenderException("Failed to start I/O thread for " + host + ":" + port, t);
+                    }
                 }
             }
             // Sync mode (window=1): no send queue - we send and read ACKs synchronously
@@ -2041,19 +2181,37 @@ public class QwpWebSocketSender implements Sender {
         }
         activeBuffer.reset();
 
-        // Enqueue the sealed buffer for sending.
-        // If enqueue fails, roll back local state so the same batch can be retried.
-        try {
-            if (!sendQueue.enqueue(toSend)) {
-                throw new LineSenderException("Failed to enqueue buffer for sending");
+        // Hand off the sealed buffer. Cursor mode does it on the user
+        // thread (durable mmap append, returns once published);  legacy
+        // mode enqueues to the I/O thread.
+        if (cursorEngine != null) {
+            try {
+                toSend.markSending();
+                cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
+                toSend.markRecycled();
+            } catch (Throwable t) {
+                // Surface any I/O thread error first — appendBlocking itself
+                // only throws on PAYLOAD_TOO_LARGE, but the buffer pointer
+                // might have been corrupted by a concurrent failure. The
+                // cursorSendLoop can also have failed independently.
+                cursorSendLoop.checkError();
+                throw new LineSenderException("cursor SF append failed", t);
             }
-        } catch (LineSenderException e) {
-            activeBuffer = toSend;
-            if (toSend.isSealed()) {
-                toSend.rollbackSealForRetry();
+        } else {
+            // Enqueue the sealed buffer for sending.
+            // If enqueue fails, roll back local state so the same batch can be retried.
+            try {
+                if (!sendQueue.enqueue(toSend)) {
+                    throw new LineSenderException("Failed to enqueue buffer for sending");
+                }
+            } catch (LineSenderException e) {
+                activeBuffer = toSend;
+                if (toSend.isSealed()) {
+                    toSend.rollbackSealForRetry();
+                }
+                checkConnectionError();
+                throw e;
             }
-            checkConnectionError();
-            throw e;
         }
     }
 

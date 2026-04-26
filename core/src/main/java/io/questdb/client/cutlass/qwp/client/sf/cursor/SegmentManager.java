@@ -160,10 +160,30 @@ public final class SegmentManager implements QuietCloseable {
      * filesystem directory the ring's segments live in — used by the manager
      * both for creating spare files and unlinking trimmed ones. The ring
      * MUST already have its initial active segment in place.
+     * <p>
+     * Also wires the ring's "I need a spare" wakeup callback to
+     * {@link #wakeWorker()}, so the producer thread can preempt the polling
+     * tick the moment a rotation consumes the spare or the active crosses
+     * the high-water mark — no waiting on the next tick.
      */
     public void register(SegmentRing ring, String dir) {
         synchronized (lock) {
             rings.add(new RingEntry(ring, dir));
+        }
+        ring.setManagerWakeup(this::wakeWorker);
+    }
+
+    /**
+     * Unparks the worker thread out of its poll-park so it processes
+     * registered rings on the very next loop iteration. Cheap — a single
+     * {@code LockSupport.unpark}; safe to call from any thread; idempotent
+     * (multiple unparks coalesce into a single permit). No-op if the worker
+     * hasn't been {@link #start()}'d yet.
+     */
+    public void wakeWorker() {
+        Thread t = workerThread;
+        if (t != null) {
+            LockSupport.unpark(t);
         }
     }
 
@@ -184,39 +204,53 @@ public final class SegmentManager implements QuietCloseable {
         //    on this or a subsequent tick frees space. Logged at most once per
         //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
         //    doesn't drown the log.
+        boolean memoryMode = e.dir == null;
         if (e.ring.needsHotSpare()) {
             if (totalBytes + segmentSizeBytes > maxTotalBytes) {
                 long now = System.nanoTime();
                 if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
-                    LOG.warn("SF disk-full: cannot provision spare in {} "
+                    LOG.warn("SF {}: cannot provision spare in {} "
                                     + "(totalBytes={}, cap={}, segmentSize={}). "
                                     + "Producer is backpressured until ACK-driven trim frees space.",
-                            e.dir, totalBytes, maxTotalBytes, segmentSizeBytes);
+                            memoryMode ? "memory cap reached" : "disk-full",
+                            memoryMode ? "<memory>" : e.dir, totalBytes, maxTotalBytes, segmentSizeBytes);
                     lastDiskFullLogNs = now;
                 }
             } else {
-                String path = nextSparePath(e.dir);
                 try {
                     // baseSeq is provisional — SegmentRing.appendOrFsn calls
                     // rebaseSeq() at rotation time to pin the real value. We
                     // pass the manager's best guess (nextSeqHint at this
                     // instant), which is fine since it's overwritten anyway.
-                    MmapSegment spare = MmapSegment.create(path, e.ring.nextSeqHint(), segmentSizeBytes);
+                    MmapSegment spare;
+                    String path;
+                    if (memoryMode) {
+                        spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
+                        path = null;
+                    } else {
+                        path = nextSparePath(e.dir);
+                        spare = MmapSegment.create(path, e.ring.nextSeqHint(), segmentSizeBytes);
+                    }
                     try {
                         e.ring.installHotSpare(spare);
                         totalBytes += segmentSizeBytes;
                     } catch (Throwable t) {
                         spare.close();
-                        Files.remove(path);
+                        if (path != null) {
+                            Files.remove(path);
+                        }
                         throw t;
                     }
                 } catch (Throwable t) {
-                    LOG.warn("Failed to provision hot spare in {} (will retry next tick)", e.dir, t);
+                    LOG.warn("Failed to provision hot spare in {} (will retry next tick)",
+                            memoryMode ? "<memory>" : e.dir, t);
                 }
             }
         }
 
-        // 2. Trim any segments that the ring says are fully acked.
+        // 2. Trim any segments that the ring says are fully acked. For
+        //    memory-mode rings, "trim" is just close() (Unsafe.free) — no
+        //    file to unlink.
         ObjList<MmapSegment> trim = e.ring.drainTrimmable();
         if (trim != null) {
             for (int i = 0, n = trim.size(); i < n; i++) {
@@ -225,12 +259,12 @@ public final class SegmentManager implements QuietCloseable {
                 long sz = s.sizeBytes();
                 try {
                     s.close();
-                    if (!Files.remove(path)) {
+                    if (path != null && !Files.remove(path)) {
                         LOG.warn("Failed to unlink trimmed segment {}", path);
                     }
                     totalBytes -= sz;
                 } catch (Throwable t) {
-                    LOG.warn("Failed to trim segment {}", path, t);
+                    LOG.warn("Failed to trim segment {}", path == null ? "<memory>" : path, t);
                 }
             }
         }

@@ -203,6 +203,72 @@ public class SegmentManagerTest {
     }
 
     @Test
+    public void testProducerWakeupBeatsThePollInterval() throws Exception {
+        // Pick a poll interval long enough that any spare arriving "fast"
+        // could only have been triggered by the producer's wakeup, not by
+        // the manager's own polling tick.
+        long pollNanos = 5_000_000_000L; // 5 seconds
+        long segSize = MmapSegment.HEADER_SIZE
+                + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+        MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try (SegmentRing ring = new SegmentRing(seg0, segSize);
+             SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
+            mgr.start();
+            mgr.register(ring, tmpDir);
+            // First spare lands via the cold-start path: producer hasn't
+            // appended yet, but register() doesn't itself unpark, so we
+            // rely on the manager's first tick. Instead of waiting 5s,
+            // append once and let the high-water-mark wakeup signal it.
+            // (signalAtBytes = 3/4 of segSize; one frame is ~24 bytes which
+            // crosses the threshold easily on this tiny segment.)
+            long t0 = System.nanoTime();
+            ring.appendOrFsn(buf, 16); // crosses high-water → wakeup → manager creates spare
+            // 200 ms is generous for an open + truncate + mmap on a
+            // healthy machine; if we're still waiting, the wakeup didn't
+            // fire and we're stuck on the 5s poll.
+            assertTrue("manager must install spare via producer wakeup, not the 5s poll tick",
+                    waitFor(() -> !ring.needsHotSpare(), 200));
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+            assertTrue("spare arrived in " + elapsedMs + "ms — should be <<5000ms", elapsedMs < 1000);
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testRotationWakeupTriggersImmediateSparePrep() throws Exception {
+        // Segment small enough that one frame fills it; verifies that the
+        // post-rotation wakeup runs before the next 5s poll.
+        long pollNanos = 5_000_000_000L;
+        long segSize = MmapSegment.HEADER_SIZE
+                + 1 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+        MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try (SegmentRing ring = new SegmentRing(seg0, segSize);
+             SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
+            mgr.start();
+            mgr.register(ring, tmpDir);
+            // First spare via high-water signal on the very first append.
+            ring.appendOrFsn(buf, 16);
+            assertTrue(waitFor(() -> !ring.needsHotSpare(), 500));
+            // Now active is full → next append rotates → consumes the spare →
+            // hotSpare goes back to null → rotation-time wakeup runs →
+            // manager promptly provisions the next spare.
+            long beforeRotate = System.nanoTime();
+            long fsn = ring.appendOrFsn(buf, 16);
+            assertEquals(1, fsn);
+            assertTrue("rotation-time wakeup must trigger spare 2 well before 5s poll",
+                    waitFor(() -> !ring.needsHotSpare(), 500));
+            long elapsedMs = (System.nanoTime() - beforeRotate) / 1_000_000L;
+            assertTrue("spare 2 arrived in " + elapsedMs + "ms — should be <<5000ms",
+                    elapsedMs < 1000);
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
     public void testCloseStopsWorkerAndIsIdempotent() throws Exception {
         SegmentManager mgr = new SegmentManager(8192, 200_000L);
         mgr.start();
