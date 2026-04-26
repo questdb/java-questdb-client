@@ -479,6 +479,71 @@ public class SegmentLogTortureTest {
         });
     }
 
+    /**
+     * Open-time sort regression: at the documented {@code sf_max_total_bytes
+     * / sf_max_bytes} ceiling (~16K segments) the previous insertion sort
+     * over {@code segments} ran in O(N²) and burnt multi-second wall time
+     * before the I/O thread could even start. The test creates 1024 sealed
+     * segments by forcing one-frame-per-segment via a tiny per-segment cap,
+     * reopens, and asserts:
+     * <ul>
+     *   <li>every appended sequence is replayed exactly once, in order;</li>
+     *   <li>{@code nextSeq()} matches the total appended frame count;</li>
+     *   <li>reopen + replay completes within a generous wall-clock bound
+     *     that the old O(N²) sort would still satisfy at this scale, but
+     *     that catches a regression pushing back into multi-second land
+     *     for the documented production ceiling (~16K segments).</li>
+     * </ul>
+     */
+    @Test
+    public void testLargeSegmentCountReopensInOrder() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // maxBytes = HEADER_SIZE + FRAME_HEADER_SIZE + payload = 24+8+16 = 48.
+            // First frame fits in segment 0; every subsequent frame triggers
+            // rotation. 1024 frames → ~1023 sealed + 1 active = 1024 segments.
+            final int frameCount = 1024;
+            final int payloadSize = 16;
+            final long maxBytes = 48;
+
+            long buf = Unsafe.malloc(payloadSize, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payloadSize; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, (byte) (i & 0xff));
+                }
+                try (SegmentLog log = SegmentLog.open(tmpDir, maxBytes)) {
+                    long lastSeq = -1;
+                    for (int i = 0; i < frameCount; i++) {
+                        lastSeq = log.append(buf, payloadSize);
+                    }
+                    assertEquals(frameCount - 1, lastSeq);
+                    log.fsync();
+                }
+            } finally {
+                Unsafe.free(buf, payloadSize, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            long startMs = System.currentTimeMillis();
+            try (SegmentLog log2 = SegmentLog.open(tmpDir, maxBytes)) {
+                assertEquals(frameCount, log2.nextSeq());
+                final long[] expected = {0L};
+                final int[] count = {0};
+                log2.replay((seq, addr, len) -> {
+                    assertEquals("frame seq out of order at index " + count[0],
+                            expected[0], seq);
+                    expected[0]++;
+                    count[0]++;
+                    return true;
+                });
+                assertEquals("replayed " + count[0] + " frames, expected " + frameCount,
+                        frameCount, count[0]);
+            }
+            long elapsedMs = System.currentTimeMillis() - startMs;
+            assertTrue("reopen+replay took " + elapsedMs + "ms (expected < 5000ms); " +
+                            "regression suggests scanDirectory's segment sort is back to O(N²)",
+                    elapsedMs < 5_000);
+        });
+    }
+
     private static void appendBytes(SegmentLog log, byte[] bytes) {
         long buf = Unsafe.malloc(bytes.length, MemoryTag.NATIVE_DEFAULT);
         try {

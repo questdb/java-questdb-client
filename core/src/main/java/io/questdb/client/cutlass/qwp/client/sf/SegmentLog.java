@@ -404,18 +404,13 @@ public final class SegmentLog implements QuietCloseable {
             ff.findClose(find);
         }
 
-        // Insertion sort by baseSeq. Open-time only and N is typically small
-        // (one active segment plus a handful of unacked sealed segments), so
-        // the O(N^2) is irrelevant and avoids the java.util.Comparator alloc.
-        for (int i = 1, n = segments.size(); i < n; i++) {
-            Segment x = segments.getQuick(i);
-            int j = i - 1;
-            while (j >= 0 && Long.compareUnsigned(segments.getQuick(j).baseSeq, x.baseSeq) > 0) {
-                segments.setQuick(j + 1, segments.getQuick(j));
-                j--;
-            }
-            segments.setQuick(j + 1, x);
-        }
+        // Open-time sort by baseSeq. Worst case is `sf_max_total_bytes /
+        // sf_max_bytes` segments — at the documented limit (1 TiB / 64 MiB)
+        // that is ~16K entries, where the previous insertion sort spent
+        // multiple seconds in O(N²) compares + array shifts. In-place
+        // quicksort with median-of-three pivot keeps the no-allocation
+        // discipline of the surrounding code.
+        sortSegmentsByBaseSeq(0, segments.size());
 
         // Validate: at most one active segment, and only as the last entry.
         for (int i = 0, n = segments.size(); i < n; i++) {
@@ -696,6 +691,59 @@ public final class SegmentLog implements QuietCloseable {
         if (closed) {
             throw new SfException("SegmentLog is closed");
         }
+    }
+
+    /**
+     * In-place quicksort over {@code segments[lo, hi)} keyed by unsigned
+     * {@code baseSeq}. Median-of-three pivot selection avoids the
+     * pathological O(N²) on already-sorted input that {@code readdir} on
+     * many filesystems produces. Recursion depth is bounded by ~2 log₂(N);
+     * for the documented 16K-segment ceiling that is well under the JVM
+     * default stack.
+     */
+    private void sortSegmentsByBaseSeq(int lo, int hi) {
+        while (hi - lo > 1) {
+            int mid = (lo + hi) >>> 1;
+            long a = segments.getQuick(lo).baseSeq;
+            long b = segments.getQuick(mid).baseSeq;
+            long c = segments.getQuick(hi - 1).baseSeq;
+            // Median of {a, b, c} → pivot index.
+            int pivotIdx;
+            if (Long.compareUnsigned(a, b) < 0) {
+                if (Long.compareUnsigned(b, c) < 0) pivotIdx = mid;
+                else if (Long.compareUnsigned(a, c) < 0) pivotIdx = hi - 1;
+                else pivotIdx = lo;
+            } else {
+                if (Long.compareUnsigned(a, c) < 0) pivotIdx = lo;
+                else if (Long.compareUnsigned(b, c) < 0) pivotIdx = hi - 1;
+                else pivotIdx = mid;
+            }
+            long pivot = segments.getQuick(pivotIdx).baseSeq;
+            swapSegments(pivotIdx, hi - 1);
+            int store = lo;
+            for (int i = lo; i < hi - 1; i++) {
+                if (Long.compareUnsigned(segments.getQuick(i).baseSeq, pivot) < 0) {
+                    swapSegments(i, store++);
+                }
+            }
+            swapSegments(store, hi - 1);
+            // Recurse on the smaller partition; loop on the larger to keep
+            // recursion depth bounded by log₂(N).
+            if (store - lo < hi - store - 1) {
+                sortSegmentsByBaseSeq(lo, store);
+                lo = store + 1;
+            } else {
+                sortSegmentsByBaseSeq(store + 1, hi);
+                hi = store;
+            }
+        }
+    }
+
+    private void swapSegments(int i, int j) {
+        if (i == j) return;
+        Segment tmp = segments.getQuick(i);
+        segments.setQuick(i, segments.getQuick(j));
+        segments.setQuick(j, tmp);
     }
 
     /** Parse `<baseSeq>.sfa` or `<baseSeq>-<lastSeq>.sfs`. Returns null for unrecognized names. */
