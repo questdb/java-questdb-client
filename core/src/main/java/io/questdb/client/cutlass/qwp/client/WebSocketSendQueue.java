@@ -970,8 +970,21 @@ public class WebSocketSendQueue implements QuietCloseable {
                 // wants to wake the I/O thread cooperatively.
                 Thread.currentThread().interrupt();
             }
+        } catch (SfException sfe) {
+            // Fatal SF storage error during retry — same classification as
+            // the main-loop sendBatch catch (corruption, oversized frame,
+            // fsync EIO). Won't recover by reconnect; surface hard so the
+            // user sees it instead of looping.
+            LOG.error("Fatal SF storage error during retry [id={}]", batch.getBatchId(), sfe);
+            failConnection(new LineSenderException(
+                    "SF storage error: " + sfe.getMessage(), sfe), true);
+            if (batch.isSealed()) batch.markSending();
+            if (batch.isSending()) batch.markRecycled();
+            cleared = true;
         } catch (Throwable t) {
-            // Non-disk-full failure during retry — recycle and surface.
+            // Non-SF failure during retry (e.g. wire send error) — recycle
+            // and surface as transient so SF auto-reconnect (when configured)
+            // can absorb it.
             LOG.error("Error retrying stalled batch [id={}]", batch.getBatchId(), t);
             failConnection(new LineSenderException(
                     "Error retrying stalled batch " + batch.getBatchId() + ": " + t.getMessage(), t), false);
@@ -1165,7 +1178,14 @@ public class WebSocketSendQueue implements QuietCloseable {
                     LOG.debug("Durable ACK received [tables={}]", response.getTableEntryCount());
                 }
             } else {
-                // Error - fail the batch
+                // Server returned a per-batch error (parse, schema mismatch,
+                // write, security, internal). The bytes are the bytes —
+                // reconnecting and re-sending the same payload will produce
+                // the same error. Under SF, the rejected frame sits on disk
+                // and replay-on-reconnect would ship it again, so a
+                // transient classification turns into an unbounded
+                // reconnect loop. Treat as fatal so the user sees the
+                // failure instead of silent thrashing.
                 String errorMessage = response.getErrorMessage();
                 LOG.error("Error response [seq={}, status={}, error={}]", sequence, response.getStatusName(), errorMessage);
 
@@ -1173,7 +1193,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         "Server error for batch " + sequence + ": " +
                                 response.getStatusName() + " - " + errorMessage);
                 totalErrors.incrementAndGet();
-                failConnection(error, false);
+                failConnection(error, true);
             }
         }
 

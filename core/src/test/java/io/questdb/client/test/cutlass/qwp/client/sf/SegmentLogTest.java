@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf;
 
+import io.questdb.client.cairo.CairoException;
 import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
 import io.questdb.client.cutlass.qwp.client.sf.SfDiskFullException;
 import io.questdb.client.cutlass.qwp.client.sf.SfException;
@@ -564,6 +565,78 @@ public class SegmentLogTest {
      * each opened fd was {@code close}d before the {@link SfException}
      * propagated out of {@code SegmentLog.open}.
      */
+    /**
+     * Red test for the fd-leak gap between {@code openCleanRW} and the
+     * {@code try} block in {@code SegmentLog.createActive}.
+     * <p>
+     * Production order at lines 580-595:
+     * <pre>
+     *   int fd = ff.openCleanRW(path, 0);                  // fd opened
+     *   ...
+     *   s.pathPtrNative = ff.allocNativePath(path);        // CAN throw OOM
+     *   s.fd = fd;                                          // never reached on throw
+     *   try { ... } catch { ff.close(fd); ... }             // try not entered
+     * </pre>
+     * If {@code allocNativePath} throws (the {@code Unsafe.malloc} inside
+     * {@link io.questdb.client.std.Files#pathPtr(String)} wraps {@link OutOfMemoryError}
+     * in {@link CairoException}), the local {@code fd} is leaked: {@code s} was
+     * never added to {@code segments}, so {@code close()}'s cleanup loop never
+     * sees it. The orphan {@code .sfa} file also remains on disk and trips the
+     * "multiple active segments" guard on the next process restart that
+     * legitimately rotates.
+     * <p>
+     * On a long-running spacecraft client under intermittent memory pressure,
+     * each failed rotation leaks one fd; sustained loops will exhaust the
+     * process fd table.
+     * <p>
+     * The fix: register {@code s.fd = fd} BEFORE the throwing call, and
+     * extend the {@code try/catch} cleanup to cover the path allocation
+     * (and {@code ff.remove(path)} the orphan file).
+     */
+    @Test
+    public void testCreateActiveDoesNotLeakFdOnAllocNativePathOom() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            FdTrackingFacade tracker = new FdTrackingFacade();
+            tracker.failNextActiveAllocNativePath = true;
+            try {
+                SegmentLog.open(tmpDir, tracker, 4096, 4096, false);
+                fail("expected open to fail because allocNativePath was forced to throw");
+            } catch (Throwable expected) {
+                String msg = expected.getMessage() == null ? "" : expected.getMessage();
+                String causeMsg = expected.getCause() == null || expected.getCause().getMessage() == null
+                        ? "" : expected.getCause().getMessage();
+                assertTrue(
+                        "wrong failure surfaced: " + expected + " / cause=" + expected.getCause(),
+                        msg.contains("simulated") || msg.contains("OOM")
+                                || causeMsg.contains("simulated") || causeMsg.contains("OOM"));
+            }
+            Set<Integer> leaked = new HashSet<>(tracker.opened);
+            leaked.removeAll(tracker.closed);
+            assertEquals(
+                    "createActive must close every fd it opened when allocNativePath throws "
+                            + "between openCleanRW and the try-block; leaked=" + leaked,
+                    0, leaked.size());
+
+            // Also: no orphan .sfa file should remain on disk. The fix should
+            // ff.remove the half-created file so the next open sees a clean dir.
+            long find = Files.findFirst(tmpDir);
+            if (find != 0) {
+                try {
+                    int rc = 1;
+                    while (rc > 0) {
+                        String name = Files.utf8ToString(Files.findName(find));
+                        if (name != null && name.endsWith(".sfa")) {
+                            fail("orphan .sfa file remains after partial-init failure: " + name);
+                        }
+                        rc = Files.findNext(find);
+                    }
+                } finally {
+                    Files.findClose(find);
+                }
+            }
+        });
+    }
+
     @Test
     public void testCreateActiveDoesNotLeakFdOnFsyncFailure() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -947,6 +1020,21 @@ public class SegmentLogTest {
         // Set true to fault the NEXT fsync that targets a fd which was just
         // opened (i.e., not yet closed). Auto-reset after firing once.
         volatile boolean failNextFsyncOnNewFd;
+        // Set true to fault the NEXT allocNativePath whose path ends in
+        // ACTIVE_SUFFIX. Simulates an OOM at the exact moment between
+        // openCleanRW and the try-block in createActive. Auto-reset.
+        volatile boolean failNextActiveAllocNativePath;
+
+        @Override
+        public long allocNativePath(String path) {
+            // ".sfa" is SegmentLog.ACTIVE_SUFFIX (package-private, hardcoded here).
+            if (failNextActiveAllocNativePath && path.endsWith(".sfa")) {
+                failNextActiveAllocNativePath = false;
+                throw CairoException.nonCritical()
+                        .put("simulated OOM in allocNativePath: ").put(path);
+            }
+            return FilesFacade.INSTANCE.allocNativePath(path);
+        }
 
         @Override
         public int close(int fd) {
@@ -985,6 +1073,11 @@ public class SegmentLogTest {
         @Override
         public int findType(long findPtr) {
             return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
         }
 
         @Override
@@ -1070,6 +1163,11 @@ public class SegmentLogTest {
         private int lengthCalls;
 
         @Override
+        public long allocNativePath(String path) {
+            return FilesFacade.INSTANCE.allocNativePath(path);
+        }
+
+        @Override
         public int close(int fd) {
             return FilesFacade.INSTANCE.close(fd);
         }
@@ -1102,6 +1200,11 @@ public class SegmentLogTest {
         @Override
         public int findType(long findPtr) {
             return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
         }
 
         @Override
@@ -1182,6 +1285,11 @@ public class SegmentLogTest {
         volatile boolean failNextPayloadWrite;
 
         @Override
+        public long allocNativePath(String path) {
+            return FilesFacade.INSTANCE.allocNativePath(path);
+        }
+
+        @Override
         public int close(int fd) {
             return FilesFacade.INSTANCE.close(fd);
         }
@@ -1214,6 +1322,11 @@ public class SegmentLogTest {
         @Override
         public int findType(long findPtr) {
             return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
         }
 
         @Override

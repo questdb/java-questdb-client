@@ -29,7 +29,10 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.SegmentLog;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
+import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.After;
 import org.junit.Assert;
@@ -39,6 +42,7 @@ import org.junit.Test;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -499,6 +503,231 @@ public class SfIntegrationTest {
                 handler.frameCount() >= 6);
     }
 
+    /**
+     * Red test for the poisoned-frame reconnect loop.
+     * <p>
+     * SF persists wire frames before send and replays them on reconnect. If a
+     * persisted frame causes the server to return a non-success status (parse
+     * error, schema mismatch, write error, etc.), the client's
+     * {@code ResponseHandler} treats it as a transient connection failure and
+     * triggers an SF reconnect. The reconnect re-runs SF replay, which ships
+     * the same poisoned bytes, which provoke the same error, which triggers
+     * another reconnect — forever. The bytes are immutable on disk and there
+     * is no path that drops them after a server-error response.
+     * <p>
+     * This test plants a single malformed frame in SF, opens a sender against
+     * a server that responds with {@code STATUS_PARSE_ERROR} to every binary
+     * message, and counts the number of times the server sees the frame within
+     * a bounded window. Bug behaviour: tens of replays as the I/O thread loops
+     * through reconnect cycles. Fix behaviour: the sender either drops the
+     * poisoned frame after a bounded number of error responses (and trims it
+     * from SF) or surfaces a terminal {@code LineSenderException} to the user.
+     * <p>
+     * The schema-reset race documented in the PR description ("self-healing
+     * via the next reconnect cycle") is one way to produce a poisoned frame in
+     * SF, but the failure mode is the same regardless of how the frame got
+     * there. This test is independent of the race timing.
+     */
+    @Test(timeout = 30_000)
+    public void testPoisonedFrameInSfDoesNotLoopForever() throws Exception {
+        // Step 1: plant a malformed wire frame directly in SF. Bytes are
+        // arbitrary garbage; the server will treat it as an invalid QWP frame.
+        byte[] poison = new byte[]{(byte) 0xFF, (byte) 0xFE, 0x01, 0x02, 0x03};
+        try (SegmentLog plantLog = SegmentLog.open(sfDir, 1L << 20)) {
+            long buf = Unsafe.malloc(poison.length, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < poison.length; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, poison[i]);
+                }
+                plantLog.append(buf, poison.length);
+            } finally {
+                Unsafe.free(buf, poison.length, MemoryTag.NATIVE_DEFAULT);
+            }
+            plantLog.fsync();
+        }
+
+        // Step 2: server that responds STATUS_PARSE_ERROR to every binary
+        // frame. Counts how many times the poisoned frame is replayed.
+        int port = TEST_PORT + 50;
+        AlwaysParseErrorHandler handler = new AlwaysParseErrorHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            SegmentLog log = SegmentLog.open(sfDir, 1L << 20);
+            QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", port, /* tlsConfig */ null,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                    8, /* authHeader */ null,
+                    QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                    /* requestDurableAck */ false, log);
+            try {
+                // I/O thread is up. Replay-on-startup ships the poisoned frame.
+                // Server returns STATUS_PARSE_ERROR. failConnection(_, false)
+                // triggers SF reconnect. Reconnect re-replays the poisoned frame.
+                // Bug: this loop runs unbounded.
+                //
+                // 3-second observation window. With the 100 ms initial backoff
+                // (which resets to 100 ms after every successful reconnect)
+                // each cycle is roughly 100 ms + connect + replay. In 3 s a
+                // looping bug racks up well over 5 server-side frames.
+                Thread.sleep(3_000);
+
+                long frames = handler.frameCount();
+                long connections = handler.connectionCount();
+                Assert.assertTrue(
+                        "Sender entered an unbounded reconnect loop replaying the same poisoned "
+                                + "SF frame; connections=" + connections + ", frames=" + frames
+                                + ". The fix must drop the poisoned frame from SF after a bounded "
+                                + "number of server-error responses (or surface a terminal "
+                                + "LineSenderException to the user).",
+                        frames <= 5);
+            } finally {
+                try {
+                    sender.close();
+                } catch (Throwable ignored) {
+                    // Best-effort: under the bug the I/O thread may take time
+                    // to wind down through interrupts and shutdown timeouts.
+                }
+            }
+        }
+    }
+
+    /**
+     * Red test for the {@code retryStalled} mis-classification.
+     * <p>
+     * Production path at {@code WebSocketSendQueue.retryStalled} (lines 956-989):
+     * <pre>
+     *   try {
+     *       sendBatch(batch);  // can throw SfException, SfDiskFullException, or other
+     *       cleared = true;
+     *   } catch (SfDiskFullException dfe) { ... still stalled ... }
+     *   catch (Throwable t) {
+     *       failConnection(_, false);   // ← always fatal=false
+     *       if (batch.isSealed()) batch.markSending();
+     *       if (batch.isSending()) batch.markRecycled();   // ← recycles as if sent
+     *       cleared = true;
+     *   }
+     * </pre>
+     * The main-loop {@code sendBatch} catch ladder (lines 723-738) correctly
+     * splits {@code SfException} (fatal=true → terminal) from {@code Throwable}
+     * (fatal=false → reconnect). The retry path collapses both into fatal=false.
+     * <p>
+     * Two consequences:
+     * <ol>
+     *   <li><b>Wrong reconnect on fatal storage error:</b> instead of going
+     *       terminal and surfacing the error, the I/O thread reconnects.
+     *       For a transient fsync failure the next retry would succeed, so the
+     *       symptom is just an unnecessary reconnect cycle. For a persistent
+     *       fsync failure (e.g. an EIO-stuck filesystem), the loop would only
+     *       break when the next user-driven {@code sendBatch} hits the same
+     *       fault in the main loop and is correctly classified as fatal there
+     *       — by which time the user has already lost track of one batch.</li>
+     *   <li><b>Silent buffer recycle:</b> {@code markRecycled} runs as if the
+     *       batch was successfully sent, even though
+     *       {@code segmentLog.append} threw before persisting all bytes.</li>
+     * </ol>
+     * <p>
+     * Setup: a {@link FilesFacade} that (a) returns a short payload write on
+     * demand to trigger {@code SfDiskFullException} from
+     * {@code SegmentLog.append}, and (b) returns -1 from the next {@code fsync}
+     * to trigger {@code SfException} from the retry's {@code fsync}-after-append.
+     * Send a warm-up batch, arm both flags, send the second batch — the second
+     * batch stalls on the short write, the I/O thread retries, the retry's
+     * write succeeds (the short-write flag is one-shot) but the fsync fails.
+     * <p>
+     * Observation: handler connection count. Under the bug, {@code retryStalled}
+     * triggers a reconnect (count grows by 1). Under the fix, the sender goes
+     * terminal and connection count stays the same.
+     */
+    @Test(timeout = 30_000)
+    public void testRetryStalledTreatsSfStorageErrorAsTerminal() throws Exception {
+        int port = TEST_PORT + 60;
+        CountingAckHandler handler = new CountingAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            StallThenFsyncFailFacade ff = new StallThenFsyncFailFacade();
+            // Large segment + total caps so DiskFull is driven exclusively by the
+            // FF's short-write injection, never by real space pressure.
+            // fsyncEachAppend=true so every successful append calls fsync.
+            SegmentLog log = SegmentLog.open(sfDir, ff, 4096, Long.MAX_VALUE, /* fsyncEachAppend */ true);
+            QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", port, /* tlsConfig */ null,
+                    /* autoFlushRows */ 1,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                    8, /* authHeader */ null,
+                    QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                    /* requestDurableAck */ false, log);
+            try {
+                // Step 1: warm up. Send + flush batch1 normally so we know
+                // the connection is live and one fsync has already passed.
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline && handler.frameCount() < 1) {
+                    Thread.sleep(20);
+                }
+                Assert.assertEquals("warm-up batch did not reach the server",
+                        1, handler.frameCount());
+                long connectionsBefore = handler.connectionCount();
+                Assert.assertEquals("expected exactly one connection so far",
+                        1, connectionsBefore);
+
+                // Step 2: arm the failure pair. The next payload write returns
+                // a short count → SfDiskFullException → stall. The next fsync
+                // returns -1 → SfException → bug-triggering retry-path catch.
+                ff.failNextPayloadWrite = true;
+                ff.failNextFsync = true;
+
+                // Step 3: send batch2. atNow with autoFlushRows=1 enqueues the
+                // batch without blocking; the I/O thread picks it up and hits
+                // the short write, which sets stalledBuffer.
+                sender.table("foo").longColumn("v", 2L).atNow();
+
+                // Step 4: confirm the stall registered.
+                deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline
+                        && sender.getTotalSfDiskFullStalls() == 0) {
+                    Thread.sleep(20);
+                }
+                Assert.assertTrue("expected at least one disk-full stall, saw "
+                                + sender.getTotalSfDiskFullStalls(),
+                        sender.getTotalSfDiskFullStalls() > 0);
+
+                // Step 5: wait for the retry to fire. The retry's append:
+                //   - write succeeds (failNextPayloadWrite was consumed on first hit)
+                //   - fsync fails (failNextFsync still armed) → SfException
+                //   - bug: retryStalled catches Throwable, calls failConnection(_, false)
+                //     under SF+reconnector → reconnect → handler sees a new connection
+                //   - fix: catches SfException specifically, calls failConnection(_, true)
+                //     → terminal, no reconnect, handler sees no new connection
+                Thread.sleep(1_000);
+
+                long connectionsAfter = handler.connectionCount();
+                Assert.assertEquals(
+                        "WebSocketSendQueue.retryStalled (lines 973-980) must classify "
+                                + "SfException as fatal, like the main-loop sendBatch catch does. "
+                                + "Reconnecting on a fatal SF storage error masks the failure from "
+                                + "the user. connectionsBefore=" + connectionsBefore
+                                + ", connectionsAfter=" + connectionsAfter,
+                        connectionsBefore, connectionsAfter);
+            } finally {
+                try {
+                    sender.close();
+                } catch (Throwable ignored) {
+                    // best-effort: under the bug the I/O thread may be slow to
+                    // wind down through interrupt + shutdown timeout.
+                }
+            }
+        }
+    }
+
     /** {@code setSegmentLog} guards: rejects post-connect, post-close, and sync mode. */
     @Test
     public void testSetSegmentLogValidation() throws Exception {
@@ -829,6 +1058,220 @@ public class SfIntegrationTest {
                 client.sendBinary(EchoSeqAckHandler.buildAck(nextSeq.getAndIncrement()));
             } catch (IOException e) {
                 throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /**
+     * Acks every binary frame and counts both incoming frames and the number
+     * of distinct WebSocket connections opened against the server.
+     */
+    private static class CountingAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final java.util.IdentityHashMap<TestWebSocketServer.ClientHandler, Boolean> seen =
+                new java.util.IdentityHashMap<>();
+        private final AtomicLong connections = new AtomicLong(0);
+        private final AtomicLong frames = new AtomicLong(0);
+        private final AtomicLong nextSeq = new AtomicLong(0);
+
+        long connectionCount() {
+            return connections.get();
+        }
+
+        long frameCount() {
+            return frames.get();
+        }
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            synchronized (seen) {
+                if (seen.put(client, Boolean.TRUE) == null) {
+                    connections.incrementAndGet();
+                }
+            }
+            frames.incrementAndGet();
+            try {
+                client.sendBinary(EchoSeqAckHandler.buildAck(nextSeq.getAndIncrement()));
+            } catch (IOException ignored) {
+                // best-effort
+            }
+        }
+    }
+
+    /**
+     * One-shot fault injector for the C1 retry-classification test.
+     * <ul>
+     *   <li>{@code failNextPayloadWrite}: the next {@code write} whose length
+     *       exceeds the SF frame-header size (8 bytes) returns a short count,
+     *       which {@code SegmentLog.append} interprets as ENOSPC and raises
+     *       {@code SfDiskFullException}. Auto-resets on fire.</li>
+     *   <li>{@code failNextFsync}: the next {@code fsync} returns -1, which
+     *       {@code SegmentLog.append} (with {@code fsyncEachAppend=true})
+     *       turns into {@code SfException}. Auto-resets on fire.</li>
+     * </ul>
+     */
+    private static class StallThenFsyncFailFacade implements FilesFacade {
+        volatile boolean failNextFsync;
+        volatile boolean failNextPayloadWrite;
+
+        @Override
+        public long allocNativePath(String path) {
+            return FilesFacade.INSTANCE.allocNativePath(path);
+        }
+
+        @Override
+        public int close(int fd) {
+            return FilesFacade.INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return FilesFacade.INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            FilesFacade.INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return FilesFacade.INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return FilesFacade.INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return FilesFacade.INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            if (failNextFsync) {
+                failNextFsync = false;
+                return -1;
+            }
+            return FilesFacade.INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return FilesFacade.INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return FilesFacade.INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return FilesFacade.INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            return FilesFacade.INSTANCE.openCleanRW(path, size);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return FilesFacade.INSTANCE.openRW(path);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            return FilesFacade.INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            return FilesFacade.INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return FilesFacade.INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return FilesFacade.INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            // Frame header writes are exactly 8 bytes; payload writes are
+            // larger. Discriminate by length without inspecting content.
+            if (failNextPayloadWrite && len > 8) {
+                failNextPayloadWrite = false;
+                // Actually short-write 1 byte so the on-disk state is
+                // consistent with the short return value. SegmentLog.append
+                // truncates back via ff.truncate before throwing.
+                return FilesFacade.INSTANCE.write(fd, addr, 1, offset);
+            }
+            return FilesFacade.INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
+    /**
+     * Replies with {@code STATUS_PARSE_ERROR} to every incoming binary frame.
+     * Used to provoke the SF reconnect-on-error path and observe whether the
+     * client loops indefinitely replaying the same poisoned bytes.
+     */
+    private static class AlwaysParseErrorHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final AtomicLong frames = new AtomicLong(0);
+        private final AtomicLong connections = new AtomicLong(0);
+        private final java.util.IdentityHashMap<TestWebSocketServer.ClientHandler, Boolean> seen =
+                new java.util.IdentityHashMap<>();
+
+        long connectionCount() {
+            return connections.get();
+        }
+
+        long frameCount() {
+            return frames.get();
+        }
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            synchronized (seen) {
+                if (seen.put(client, Boolean.TRUE) == null) {
+                    connections.incrementAndGet();
+                }
+            }
+            frames.incrementAndGet();
+            try {
+                // Error frame layout: [status u8][sequence u64][msgLen u16][msg bytes]
+                String errMsg = "poisoned frame rejected";
+                byte[] errBytes = errMsg.getBytes(StandardCharsets.UTF_8);
+                byte[] response = new byte[1 + 8 + 2 + errBytes.length];
+                ByteBuffer bb = ByteBuffer.wrap(response).order(ByteOrder.LITTLE_ENDIAN);
+                bb.put(WebSocketResponse.STATUS_PARSE_ERROR);
+                bb.putLong(0L); // server doesn't track real seq for the test
+                bb.putShort((short) errBytes.length);
+                bb.put(errBytes);
+                client.sendBinary(response);
+            } catch (IOException ignored) {
+                // best-effort; the client may have already disconnected
             }
         }
     }

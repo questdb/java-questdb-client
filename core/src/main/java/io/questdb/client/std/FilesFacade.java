@@ -35,6 +35,15 @@ package io.questdb.client.std;
 public interface FilesFacade {
     FilesFacade INSTANCE = new DefaultFilesFacade();
 
+    /**
+     * Allocate a native UTF-8 path pointer. Test injection point: a wrapping
+     * facade can throw to simulate OOM without depending on actual memory
+     * pressure. Production callers must release the returned pointer via
+     * {@link #freeNativePath(long)}. Default delegates to
+     * {@link Files#allocNativePath(String)}.
+     */
+    long allocNativePath(String path);
+
     int close(int fd);
 
     boolean exists(String path);
@@ -48,6 +57,12 @@ public interface FilesFacade {
     int findNext(long findPtr);
 
     int findType(long findPtr);
+
+    /**
+     * Release a pointer returned by {@link #allocNativePath(String)}.
+     * Default delegates to {@link Files#freeNativePath(long)}.
+     */
+    void freeNativePath(long pathPtr);
 
     int fsync(int fd);
 

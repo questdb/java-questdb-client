@@ -32,6 +32,11 @@ package io.questdb.client.std;
 final class DefaultFilesFacade implements FilesFacade {
 
     @Override
+    public long allocNativePath(String path) {
+        return Files.allocNativePath(path);
+    }
+
+    @Override
     public int close(int fd) {
         return Files.close(fd);
     }
@@ -64,6 +69,11 @@ final class DefaultFilesFacade implements FilesFacade {
     @Override
     public int findType(long findPtr) {
         return Files.findType(findPtr);
+    }
+
+    @Override
+    public void freeNativePath(long pathPtr) {
+        Files.freeNativePath(pathPtr);
     }
 
     @Override

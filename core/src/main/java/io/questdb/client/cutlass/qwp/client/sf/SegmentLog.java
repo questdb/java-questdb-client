@@ -275,7 +275,7 @@ public final class SegmentLog implements QuietCloseable {
                     s.fd = -1;
                 }
                 ff.remove(s.pathPtrNative);
-                Files.freeNativePath(s.pathPtrNative);
+                ff.freeNativePath(s.pathPtrNative);
                 s.pathPtrNative = 0;
                 bytesOnDiskCache -= s.writePos;
             } else {
@@ -330,7 +330,7 @@ public final class SegmentLog implements QuietCloseable {
                 s.fd = -1;
             }
             if (s.pathPtrNative != 0) {
-                Files.freeNativePath(s.pathPtrNative);
+                ff.freeNativePath(s.pathPtrNative);
                 s.pathPtrNative = 0;
             }
         }
@@ -555,7 +555,7 @@ public final class SegmentLog implements QuietCloseable {
         if (old.frameCount == 0) {
             // empty segment shouldn't happen via rotate, but be defensive: drop it
             ff.remove(old.pathPtrNative);
-            Files.freeNativePath(old.pathPtrNative);
+            ff.freeNativePath(old.pathPtrNative);
             old.pathPtrNative = 0;
             bytesOnDiskCache -= old.writePos;
             segments.remove(segments.size() - 1);
@@ -567,9 +567,9 @@ public final class SegmentLog implements QuietCloseable {
             throw new SfException("failed to seal segment by rename " + old.path + " -> " + sealedPath);
         }
         // Path changed — free old native ptr and re-encode for the sealed name.
-        Files.freeNativePath(old.pathPtrNative);
+        ff.freeNativePath(old.pathPtrNative);
         old.path = sealedPath;
-        old.pathPtrNative = Files.allocNativePath(sealedPath);
+        old.pathPtrNative = ff.allocNativePath(sealedPath);
         old.sealed = true;
         old.lastSeqOnDisk = lastSeq;
         createActive(lastSeq + 1);
@@ -581,18 +581,19 @@ public final class SegmentLog implements QuietCloseable {
         if (fd < 0) {
             throw new SfException("cannot create active segment: " + path);
         }
-        Segment s = new Segment();
-        s.baseSeq = baseSeq;
-        s.path = path;
-        s.pathPtrNative = Files.allocNativePath(path);
-        s.fd = fd;
-        s.sealed = false;
-        s.frameCount = 0;
         // The fd and pathPtrNative are owned locally until segments.add(s)
         // below; close()'s cleanup loop only walks the segments list, so
         // anything that throws between the openCleanRW above and segments.add
-        // must release them here or they leak.
+        // must release them here or they leak. Note ff.allocNativePath can
+        // throw CairoException on OOM — keep it inside the try.
+        Segment s = new Segment();
+        s.baseSeq = baseSeq;
+        s.path = path;
+        s.fd = fd;
+        s.sealed = false;
+        s.frameCount = 0;
         try {
+            s.pathPtrNative = ff.allocNativePath(path);
             writeHeader(s);
             s.writePos = HEADER_SIZE;
             if (ff.fsync(fd) != 0) {
@@ -601,8 +602,18 @@ public final class SegmentLog implements QuietCloseable {
         } catch (Throwable t) {
             ff.close(fd);
             s.fd = -1;
-            Files.freeNativePath(s.pathPtrNative);
-            s.pathPtrNative = 0;
+            if (s.pathPtrNative != 0) {
+                ff.freeNativePath(s.pathPtrNative);
+                s.pathPtrNative = 0;
+            }
+            // Best-effort cleanup of the orphan .sfa file. If this also
+            // throws (e.g. another OOM during path encoding), let it
+            // propagate — the original failure is already on the way out.
+            try {
+                ff.remove(path);
+            } catch (Throwable ignored) {
+                // best-effort
+            }
             throw t;
         }
         segments.add(s);
@@ -698,7 +709,7 @@ public final class SegmentLog implements QuietCloseable {
                 Segment s = new Segment();
                 s.baseSeq = Long.parseUnsignedLong(body, 16);
                 s.path = dir + "/" + name;
-                s.pathPtrNative = Files.allocNativePath(s.path);
+                s.pathPtrNative = ff.allocNativePath(s.path);
                 s.sealed = false;
                 return s;
             }
@@ -712,7 +723,7 @@ public final class SegmentLog implements QuietCloseable {
                 s.baseSeq = Long.parseUnsignedLong(body.substring(0, 16), 16);
                 s.lastSeqOnDisk = Long.parseUnsignedLong(body.substring(17), 16);
                 s.path = dir + "/" + name;
-                s.pathPtrNative = Files.allocNativePath(s.path);
+                s.pathPtrNative = ff.allocNativePath(s.path);
                 s.sealed = true;
                 return s;
             }
