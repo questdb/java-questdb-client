@@ -189,9 +189,22 @@ public final class CursorSendEngine implements QuietCloseable {
         return ring.publishedFsn();
     }
 
-    /** I/O thread accessor: sealed segments waiting to drain. */
+    /**
+     * I/O thread accessor: sealed segments waiting to drain. Direct view —
+     * NOT thread-safe under producer-thread rotation. The I/O loop should
+     * use {@link #sealedSegmentsSnapshot(MmapSegment[])} instead.
+     */
     public io.questdb.client.std.ObjList<MmapSegment> sealedSegments() {
         return ring.getSealedSegments();
+    }
+
+    /**
+     * Thread-safe snapshot pass-through to
+     * {@link SegmentRing#snapshotSealedSegments(MmapSegment[])}. Returns
+     * the count copied, or -1 if the buffer is too small.
+     */
+    public int sealedSegmentsSnapshot(MmapSegment[] target) {
+        return ring.snapshotSealedSegments(target);
     }
 
     /** Configured per-segment size in bytes. */
