@@ -181,6 +181,18 @@ public class QwpWebSocketSender implements Sender {
     // thread on the next flushPendingRows so the next batch re-publishes schemas
     // the new server doesn't yet know about.
     private volatile boolean schemaResetNeeded;
+    // Monotonic counter bumped by performReconnect AFTER schemaResetNeeded is
+    // flipped. The user thread reads this at the very top of flushPendingRows
+    // (before checking schemaResetNeeded), then again after finishMessage; if
+    // the value changed, a reconnect happened mid-encode and the encoded bytes
+    // may carry stale schema refs the new server doesn't know — discard and
+    // re-encode. This closes the schema-reset race window where the previous
+    // code could persist a poisoned batch into SF that would replay-loop
+    // forever (or — post C4 fix — surface as a hard terminal failure with no
+    // self-heal). Single writer (the I/O thread) so plain volatile ++ is
+    // safe; readers establish happens-before via the volatile read pair.
+    private volatile long connectionGeneration;
+    private static final int MAX_SCHEMA_RACE_RETRIES = 10;
 
     private QwpWebSocketSender(
             String host,
@@ -1574,9 +1586,15 @@ public class QwpWebSocketSender implements Sender {
         client.upgrade(WRITE_PATH, authorizationHeader);
         encoder.setVersion((byte) client.getServerQwpVersion());
         // Tell the user thread to reset schema-id state on its next encode pass.
-        // Safe to set from here because the user thread reads this flag only at
-        // batch boundaries (top of flushPendingRows), not mid-encode.
+        // Order is load-bearing: schemaResetNeeded BEFORE connectionGeneration
+        // bump. The user thread reads connectionGeneration first, then
+        // schemaResetNeeded; volatile happens-before guarantees that a user
+        // thread observing the new generation also observes the new
+        // schemaResetNeeded. The post-encode generation re-read catches the
+        // race where the user thread already passed the schemaResetNeeded
+        // check before this write landed.
         schemaResetNeeded = true;
+        connectionGeneration++;
         return client;
     }
 
@@ -1668,33 +1686,13 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
-        // SF reconnect happened on the I/O thread; the new server has no memory
-        // of our previous schema-id assignments. Reset before encoding so the
-        // next batch carries full schema definitions, not just refs.
-        if (schemaResetNeeded) {
-            schemaResetNeeded = false;
-            resetSchemaStateForNewConnection();
-        }
-
-        // Invalidate cached column references -- table buffers will be reset below
+        // Invalidate cached column references -- table buffers will be reset
+        // below (or on retry).
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
 
         ObjList<CharSequence> keys = tableBuffers.keys();
-
-        // Count non-empty tables for the message header
-        int tableCount = 0;
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
-                tableCount++;
-            }
-        }
-
+        int tableCount = countNonEmptyTables(keys);
         if (tableCount == 0) {
             pendingBytes = 0;
             pendingRowCount = 0;
@@ -1706,42 +1704,90 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Flushing pending rows [count={}, tables={}]", pendingRowCount, tableCount);
         }
 
-        // Ensure activeBuffer is ready for writing
-        // It might be in RECYCLED state if previous batch was sent but we didn't swap yet
+        // Schema-reset race retry loop. The encoded message carries either
+        // full schema definitions or schema-id refs. If the I/O thread
+        // performs a reconnect mid-encode (schemaResetNeeded flips while
+        // we're emitting refs), the resulting bytes would be poisoned —
+        // the new server has no memory of those ids and would reject the
+        // batch. Connection-generation tagging closes the window: we read
+        // connectionGeneration BEFORE checking schemaResetNeeded, encode,
+        // re-read after finishMessage. If the value changed, a reconnect
+        // happened mid-encode; discard the encoded bytes (still in the
+        // encoder, not yet copied into activeBuffer; table buffers haven't
+        // been reset() yet) and retry from the top. Bounded at
+        // MAX_SCHEMA_RACE_RETRIES to surface a hard failure if reconnects
+        // are pathologically frequent.
         ensureActiveBufferReady();
-
-        // Encode all non-empty tables into a single QWP v1 message
         int batchMaxSchemaId = maxSentSchemaId;
-        encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                continue;
+        int messageSize;
+        QwpBufferWriter buffer;
+        int retries = 0;
+        while (true) {
+            long genBefore = connectionGeneration;
+            if (schemaResetNeeded) {
+                schemaResetNeeded = false;
+                resetSchemaStateForNewConnection();
+                // resetSchemaStateForNewConnection wipes nextSchemaId and
+                // every table's cached schema id; recompute batchMaxSchemaId
+                // against the fresh maxSentSchemaId.
+                batchMaxSchemaId = maxSentSchemaId;
             }
 
-            if (tableBuffer.getSchemaId() < 0) {
-                if (nextSchemaId >= maxSchemasPerConnection) {
-                    throw new LineSenderException("maximum schemas per connection exceeded")
-                            .put("[maxSchemasPerConnection=").put(maxSchemasPerConnection).put(']');
+            // Encode all non-empty tables into a single QWP v1 message.
+            // beginMessage calls buffer.reset(), so this is safe to invoke
+            // on every retry without any explicit cleanup.
+            int currBatchMaxSchemaId = batchMaxSchemaId;
+            encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                CharSequence tableName = keys.getQuick(i);
+                if (tableName == null) {
+                    continue;
                 }
-                tableBuffer.setSchemaId(nextSchemaId++);
-            }
-            batchMaxSchemaId = Math.max(batchMaxSchemaId, tableBuffer.getSchemaId());
-            boolean useSchemaRef = tableBuffer.getSchemaId() <= maxSentSchemaId;
+                QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+                if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                    continue;
+                }
 
+                if (tableBuffer.getSchemaId() < 0) {
+                    if (nextSchemaId >= maxSchemasPerConnection) {
+                        throw new LineSenderException("maximum schemas per connection exceeded")
+                                .put("[maxSchemasPerConnection=").put(maxSchemasPerConnection).put(']');
+                    }
+                    tableBuffer.setSchemaId(nextSchemaId++);
+                }
+                currBatchMaxSchemaId = Math.max(currBatchMaxSchemaId, tableBuffer.getSchemaId());
+                boolean useSchemaRef = tableBuffer.getSchemaId() <= maxSentSchemaId;
+
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, tableBuffer.getRowCount(), maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
+                }
+
+                encoder.addTable(tableBuffer, useSchemaRef);
+            }
+            messageSize = encoder.finishMessage();
+            buffer = encoder.getBuffer();
+
+            // Race detection: did connectionGeneration advance during the
+            // encode? If yes, the bytes we just produced may carry stale
+            // schema refs.
+            if (connectionGeneration == genBefore) {
+                batchMaxSchemaId = currBatchMaxSchemaId;
+                break;
+            }
+            retries++;
+            if (retries >= MAX_SCHEMA_RACE_RETRIES) {
+                throw new LineSenderException(
+                        "schema-reset race exceeded retry limit [" + MAX_SCHEMA_RACE_RETRIES
+                                + "] — reconnects are firing faster than the user thread "
+                                + "can encode a single batch");
+            }
+            // Discard and loop. Table buffers were not reset (that happens
+            // only after sealAndSwapBuffer below); the source rows are
+            // intact for the next attempt.
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, tableBuffer.getRowCount(), maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
+                LOG.debug("Schema-reset race detected mid-encode; retrying [attempt={}]", retries);
             }
-
-            encoder.addTable(tableBuffer, useSchemaRef);
         }
-        int messageSize = encoder.finishMessage();
-
-        QwpBufferWriter buffer = encoder.getBuffer();
 
         // Copy the single multi-table message to the microbatch buffer and seal
         activeBuffer.ensureCapacity(messageSize);
@@ -1902,6 +1948,21 @@ public class QwpWebSocketSender implements Sender {
 
     private long getPendingBytes() {
         return pendingBytes;
+    }
+
+    private int countNonEmptyTables(ObjList<CharSequence> keys) {
+        int tableCount = 0;
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
+                tableCount++;
+            }
+        }
+        return tableCount;
     }
 
     private void resetSchemaStateForNewConnection() {

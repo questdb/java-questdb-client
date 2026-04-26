@@ -40,6 +40,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -525,6 +526,162 @@ public class SfIntegrationTest {
         Assert.assertTrue("at least 2 connections", handler.connectionCount() >= 2);
         Assert.assertTrue("at least 5 frames received, saw " + handler.frameCount(),
                 handler.frameCount() >= 5);
+    }
+
+    /**
+     * Schema-reset race protection — between-batches case.
+     * <p>
+     * After a (real or simulated) reconnect, {@code connectionGeneration} is
+     * bumped and {@code schemaResetNeeded} flips. The next user-thread
+     * {@code flushPendingRows} must observe the bump, reset schema state,
+     * and emit a fresh batch — server receives a frame carrying full
+     * schema definitions, not stale refs into the previous connection's
+     * id space. This covers the simple "reconnect happened, then user
+     * flushes" path.
+     */
+    @Test
+    public void testGenerationBumpBetweenBatchesTriggersSchemaReset() throws Exception {
+        int port = TEST_PORT + 90;
+        CapturingAckHandler handler = new CapturingAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", port,
+                    1, // autoFlushRows = 1 → each atNow ships one batch
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                    8)) {
+                // First batch: server sees a fresh schema definition.
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline && handler.frames.size() < 1) {
+                    Thread.sleep(20);
+                }
+                Assert.assertEquals(1, handler.frames.size());
+                int firstBatchSize = handler.frames.get(0).length;
+
+                // Simulate a reconnect: flip schemaResetNeeded and bump
+                // connectionGeneration via reflection. Closes the loop
+                // without going through the network — we're testing the
+                // user-thread side of the contract here.
+                forceSchemaResetAndBumpGeneration(sender);
+
+                // Second batch: must carry a full schema definition again,
+                // not a ref. Frame should be at least as large as the
+                // first (definition is strictly heavier than a ref).
+                sender.table("foo").longColumn("v", 2L).atNow();
+                sender.flush();
+                deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline && handler.frames.size() < 2) {
+                    Thread.sleep(20);
+                }
+                Assert.assertEquals(2, handler.frames.size());
+                int secondBatchSize = handler.frames.get(1).length;
+                Assert.assertTrue(
+                        "post-reset batch must carry a fresh schema definition; "
+                                + "first=" + firstBatchSize + " bytes, second=" + secondBatchSize
+                                + " bytes (a ref-only batch would be strictly smaller)",
+                        secondBatchSize >= firstBatchSize);
+            }
+        }
+    }
+
+    /**
+     * Schema-reset race protection — concurrent stress.
+     * <p>
+     * Spawn a thread that bumps {@code connectionGeneration} as fast as
+     * it can while the main thread flushes batches in a tight loop. Any
+     * landing of a bump during {@code flushPendingRows}' encode window
+     * must be caught by the post-encode generation re-read and re-driven
+     * through the retry loop. The test passes as long as no exception
+     * escapes flush() (other than the bounded MAX_SCHEMA_RACE_RETRIES
+     * fail-fast, which we tolerate at the very upper end of bumper rates).
+     */
+    @Test(timeout = 30_000)
+    public void testSchemaResetRaceUnderConcurrentBumps() throws Exception {
+        int port = TEST_PORT + 91;
+        CapturingAckHandler handler = new CapturingAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", port,
+                    1,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                    8)) {
+                Field genField = QwpWebSocketSender.class.getDeclaredField("connectionGeneration");
+                genField.setAccessible(true);
+                Field resetField = QwpWebSocketSender.class.getDeclaredField("schemaResetNeeded");
+                resetField.setAccessible(true);
+
+                final int batches = 200;
+                final java.util.concurrent.atomic.AtomicBoolean stopBumper = new java.util.concurrent.atomic.AtomicBoolean(false);
+                final java.util.concurrent.atomic.AtomicLong bumpCount = new java.util.concurrent.atomic.AtomicLong(0);
+                Thread bumper = new Thread(() -> {
+                    try {
+                        while (!stopBumper.get()) {
+                            // Throttled: pause so most bumps land between
+                            // batches; a few will land mid-encode and
+                            // exercise the retry path.
+                            Thread.sleep(0, 50_000); // 50 microseconds
+                            resetField.setBoolean(sender, true);
+                            genField.setLong(sender, genField.getLong(sender) + 1);
+                            bumpCount.incrementAndGet();
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }, "schema-race-bumper");
+                bumper.setDaemon(true);
+                bumper.start();
+
+                try {
+                    int sent = 0;
+                    LineSenderException maxRetryError = null;
+                    for (int i = 0; i < batches; i++) {
+                        try {
+                            sender.table("foo").longColumn("v", (long) i).atNow();
+                            sender.flush();
+                            sent++;
+                        } catch (LineSenderException e) {
+                            // The only acceptable exception is the
+                            // bounded retry-limit fail-fast — bumper is
+                            // running flat-out so it can occasionally
+                            // win 10 races back-to-back.
+                            if (e.getMessage() != null
+                                    && e.getMessage().contains("schema-reset race exceeded retry limit")) {
+                                maxRetryError = e;
+                                break;
+                            }
+                            throw e;
+                        }
+                    }
+                    Assert.assertTrue(
+                            "bumper must have fired at least once; bumps=" + bumpCount.get(),
+                            bumpCount.get() > 0);
+                    Assert.assertTrue(
+                            "either every batch shipped or the retry-limit fail-fast tripped; "
+                                    + "sent=" + sent + ", maxRetryError=" + maxRetryError,
+                            sent == batches || maxRetryError != null);
+                } finally {
+                    stopBumper.set(true);
+                    bumper.join(5_000);
+                }
+            }
+        }
+    }
+
+    private static void forceSchemaResetAndBumpGeneration(QwpWebSocketSender sender) throws Exception {
+        Field genField = QwpWebSocketSender.class.getDeclaredField("connectionGeneration");
+        genField.setAccessible(true);
+        Field resetField = QwpWebSocketSender.class.getDeclaredField("schemaResetNeeded");
+        resetField.setAccessible(true);
+        resetField.setBoolean(sender, true);
+        genField.setLong(sender, genField.getLong(sender) + 1);
     }
 
     /**
