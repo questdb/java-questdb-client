@@ -632,6 +632,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean sfFsync;
         private boolean sfFsyncOnFlush;
+        // SF storage engine: "legacy" = SegmentLog + WebSocketSendQueue (today's
+        // default). "cursor" = mmap-backed SegmentRing + lock-free cursor design
+        // (in-progress; not yet wired into the Sender — selecting it at build
+        // time fails fast). null = parameter not explicitly set (defaults to
+        // "legacy").
+        private String sfEngine;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -932,6 +938,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     ? ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL
                                     : ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE
                     );
+                }
+
+                // Engine selection (legacy default). The cursor engine is
+                // implemented (see io.questdb.client.cutlass.qwp.client.sf.cursor)
+                // but not yet plumbed through QwpWebSocketSender — fail fast
+                // here instead of silently falling back to legacy.
+                if ("cursor".equals(sfEngine)) {
+                    throw new LineSenderException(
+                            "sf_engine=cursor is not yet wired into the Sender — the engine "
+                                    + "primitives (MmapSegment / SegmentRing / SegmentManager / "
+                                    + "CursorSendEngine) are in place but the WebSocketSendQueue "
+                                    + "rewrite that consumes them is the next PR. Track the "
+                                    + "follow-up issue and use sf_engine=legacy in the meantime.");
                 }
 
                 SegmentLog segmentLog = null;
@@ -1690,6 +1709,31 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Selects the SF storage engine. Allowed values:
+         * <ul>
+         *   <li>{@code "legacy"} — pwrite-based {@code SegmentLog} routed
+         *       through {@code WebSocketSendQueue}. Today's default.</li>
+         *   <li>{@code "cursor"} — mmap-backed {@code SegmentRing} with a
+         *       background segment manager and a lock-free user-thread
+         *       append path. Substantially lower per-flush latency. NOT YET
+         *       WIRED into {@code QwpWebSocketSender}; selecting it at build
+         *       time throws {@link LineSenderException} so users can't
+         *       silently fall back to legacy. Tracking issue / future PR.</li>
+         * </ul>
+         */
+        public LineSenderBuilder storeAndForwardEngine(String engine) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("sf_engine is only supported for WebSocket transport");
+            }
+            if (!"legacy".equals(engine) && !"cursor".equals(engine)) {
+                throw new LineSenderException("invalid sf_engine [value=").put(engine)
+                        .put(", allowed-values=[legacy, cursor]]");
+            }
+            this.sfEngine = engine;
+            return this;
+        }
+
+        /**
          * Configures the maximum time the Sender will spend retrying upon receiving a recoverable error from the server.
          * <br>
          * This setting is applicable only when communicating over the HTTP transport, and it is illegal to invoke this
@@ -2167,6 +2211,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     } else {
                         throw new LineSenderException("invalid sf_fsync_on_flush [value=").put(sink).put(", allowed-values=[on, off]]");
                     }
+                } else if (Chars.equals("sf_engine", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_engine is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_engine");
+                    storeAndForwardEngine(sink.toString());
                 } else if (Chars.equals("max_datagram_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");
                     int mds = parseIntValue(sink, "max_datagram_size");

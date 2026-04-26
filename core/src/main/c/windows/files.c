@@ -468,3 +468,95 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_getPageSize0
     GetSystemInfo(&si);
     return (jlong) si.dwAllocationGranularity;
 }
+
+/* Mirror of io.questdb.client.std.Files.MAP_RO / MAP_RW. */
+#define QDB_MAP_RO 1
+#define QDB_MAP_RW 2
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_mmap0
+        (JNIEnv *e, jclass cl, jint fd, jlong len, jlong offset, jint flags, jlong baseAddress) {
+    if (len == 0) {
+        /* Win32 MapViewOfFileEx interprets dwNumberOfBytesToMap == 0 as
+         * "map to end of mapping". Reject explicitly so the wrapper has
+         * POSIX-compatible semantics (POSIX mmap with len==0 returns
+         * EINVAL). */
+        SetLastError(ERROR_INVALID_PARAMETER);
+        SaveLastError();
+        return -1;
+    }
+
+    jlong maxsize = offset + len;
+    DWORD flProtect;
+    DWORD dwDesiredAccess;
+    if (flags == QDB_MAP_RW) {
+        flProtect = PAGE_READWRITE;
+        dwDesiredAccess = FILE_MAP_WRITE;
+    } else {
+        flProtect = PAGE_READONLY;
+        dwDesiredAccess = FILE_MAP_READ;
+    }
+
+    HANDLE hMapping = CreateFileMapping(
+            FD_TO_HANDLE(fd),
+            NULL,
+            flProtect | SEC_RESERVE,
+            (DWORD) (maxsize >> 32),
+            (DWORD) maxsize,
+            NULL);
+    if (hMapping == NULL) {
+        SaveLastError();
+        return -1;
+    }
+
+    LPCVOID address = MapViewOfFileEx(
+            hMapping,
+            dwDesiredAccess,
+            (DWORD) (offset >> 32),
+            (DWORD) offset,
+            (SIZE_T) len,
+            (LPVOID) (uintptr_t) baseAddress);
+
+    SaveLastError();
+
+    /* The mapping handle can be closed immediately — the view holds its own
+     * reference and the file mapping persists until the last view is unmapped. */
+    if (CloseHandle(hMapping) == 0) {
+        SaveLastError();
+        if (address != NULL) {
+            UnmapViewOfFile(address);
+        }
+        return -1;
+    }
+
+    if (address == NULL) {
+        return -1;
+    }
+    return (jlong) (uintptr_t) address;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_munmap0
+        (JNIEnv *e, jclass cl, jlong address, jlong len) {
+    if (UnmapViewOfFile((LPCVOID) (uintptr_t) address) == 0) {
+        SaveLastError();
+        return -1;
+    }
+    return 0;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_msync
+        (JNIEnv *e, jclass cl, jlong addr, jlong len, jboolean async) {
+    /* FlushViewOfFile schedules a write, blocking until the file system
+     * driver has accepted the write into its cache. For "fully durable"
+     * (POSIX MS_SYNC equivalent) we need a follow-up FlushFileBuffers,
+     * but that needs the file handle which we no longer hold here.
+     * MS_ASYNC maps cleanly: don't wait for further confirmation. */
+    if (FlushViewOfFile((LPCVOID) (uintptr_t) addr, (SIZE_T) len) == 0) {
+        SaveLastError();
+        return -1;
+    }
+    /* We deliberately do NOT call FlushFileBuffers in the async case;
+     * sync callers wanting the strongest durability should fsync the fd
+     * separately via Files.fsync. */
+    (void) async;
+    return 0;
+}

@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -35,6 +36,12 @@
 #include <stdint.h>
 
 #include "files.h"
+
+/* Mirror of io.questdb.client.std.Files.MAP_RO / MAP_RW. Hard-coded rather
+ * than #include'd from a javah-generated header because this file does not
+ * pull in any generated symbols (the rest of the file works the same way). */
+#define QDB_MAP_RO 1
+#define QDB_MAP_RW 2
 
 #define RESTARTABLE(_expr_, _rc_) \
     do { _rc_ = (_expr_); } while ((_rc_) == -1 && errno == EINTR)
@@ -267,4 +274,27 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_getPageSize0
         (JNIEnv *e, jclass cl) {
     long sz = sysconf(_SC_PAGESIZE);
     return (jlong) (sz > 0 ? sz : 4096);
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_mmap0
+        (JNIEnv *e, jclass cl, jint fd, jlong len, jlong offset, jint flags, jlong baseAddress) {
+    int prot = 0;
+    if (flags == QDB_MAP_RO) {
+        prot = PROT_READ;
+    } else if (flags == QDB_MAP_RW) {
+        prot = PROT_READ | PROT_WRITE;
+    }
+    void *addr = mmap((void *) (uintptr_t) baseAddress, (size_t) len, prot, MAP_SHARED, (int) fd, (off_t) offset);
+    /* MAP_FAILED is (void *) -1; cast to jlong gives -1 sentinel matching FAILED_MMAP_ADDRESS. */
+    return (jlong) (intptr_t) addr;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_munmap0
+        (JNIEnv *e, jclass cl, jlong address, jlong len) {
+    return munmap((void *) (uintptr_t) address, (size_t) len);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_msync
+        (JNIEnv *e, jclass cl, jlong addr, jlong len, jboolean async) {
+    return msync((void *) (uintptr_t) addr, (size_t) len, async ? MS_ASYNC : MS_SYNC);
 }

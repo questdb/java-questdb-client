@@ -243,6 +243,44 @@ public class FilesTest {
         assertEquals("PAGE_SIZE power of 2", 0, ps & (ps - 1));
     }
 
+    @Test
+    public void testMmapRoundtrip() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/mmap.bin";
+            int fd = Files.openCleanRW(path, 8192);
+            try {
+                long addr = Files.mmap(fd, 8192, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
+                assertNotEquals("mmap returned FAILED", Files.FAILED_MMAP_ADDRESS, addr);
+                try {
+                    // Write through the mapping.
+                    Unsafe.getUnsafe().putLong(addr, 0xDEADBEEFCAFEBABEL);
+                    Unsafe.getUnsafe().putLong(addr + 8, 0x0123456789ABCDEFL);
+                    // Force pages to disk so a separate read sees them.
+                    assertEquals(0, Files.msync(addr, 16, false));
+                } finally {
+                    Files.munmap(addr, 8192, MemoryTag.MMAP_DEFAULT);
+                }
+            } finally {
+                Files.close(fd);
+            }
+
+            // Re-open and verify via pread that the bytes hit the file.
+            int fd2 = Files.openRO(path);
+            try {
+                long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    assertEquals(16, Files.read(fd2, buf, 16, 0));
+                    assertEquals(0xDEADBEEFCAFEBABEL, Unsafe.getUnsafe().getLong(buf));
+                    assertEquals(0x0123456789ABCDEFL, Unsafe.getUnsafe().getLong(buf + 8));
+                } finally {
+                    Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                Files.close(fd2);
+            }
+        });
+    }
+
     /**
      * Red test for bug M2 — {@code Files.close(int)} refuses fds 0/1/2 via
      * the predicate {@code if (fd > 2)} (lines 42-47), returning -1 without

@@ -78,6 +78,19 @@ public final class Files {
     /** {@code dirent.d_type}: symbolic link entry. */
     public static final int DT_LNK = 10;
 
+    /** {@link #mmap} flag: map for read-only access. */
+    public static final int MAP_RO = 1;
+    /** {@link #mmap} flag: map for read-write access. */
+    public static final int MAP_RW = 2;
+
+    /**
+     * Sentinel returned by {@link #mmap} on failure. The value mirrors
+     * POSIX {@code MAP_FAILED} ({@code (void*)-1}); on Win32 we map
+     * {@code MapViewOfFileEx} failure to the same sentinel so callers
+     * have a single value to test against.
+     */
+    public static final long FAILED_MMAP_ADDRESS = -1L;
+
     private Files() {
     }
 
@@ -363,6 +376,49 @@ public final class Files {
     public static native int lock(int fd);
 
     /**
+     * Maps {@code len} bytes of {@code fd} starting at {@code offset} into
+     * the process address space. {@code flags} is one of {@link #MAP_RO} or
+     * {@link #MAP_RW}; the mapping is always {@code MAP_SHARED} so writes
+     * are visible to other mappers and to the underlying file. Returns the
+     * native address of the mapping, or {@link #FAILED_MMAP_ADDRESS} on
+     * failure (errno set). On success the {@code memoryTag} bucket is
+     * incremented by {@code len} for accounting.
+     * <p>
+     * The file must already exist and be at least {@code offset + len} bytes
+     * long; mmap does not extend files. Use {@link #allocate(int, long)} or
+     * {@link #truncate(int, long)} first.
+     */
+    public static long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+        long addr = mmap0(fd, len, offset, flags, 0);
+        if (addr != FAILED_MMAP_ADDRESS) {
+            Unsafe.recordMemAlloc(len, memoryTag);
+        }
+        return addr;
+    }
+
+    /**
+     * Releases a mapping established by {@link #mmap}. {@code address} and
+     * {@code len} must match the values returned/used by the corresponding
+     * {@link #mmap} call (partial unmap of a single mapping is technically
+     * legal on POSIX but not supported by this wrapper). On success the
+     * {@code memoryTag} bucket is decremented by {@code len}.
+     */
+    public static void munmap(long address, long len, int memoryTag) {
+        if (munmap0(address, len) == 0) {
+            Unsafe.recordMemAlloc(-len, memoryTag);
+        }
+    }
+
+    /**
+     * Flushes dirty pages in {@code [addr, addr+len)} of an mmap'd region
+     * to durable storage. {@code async = true} issues {@code MS_ASYNC}
+     * (kicks the writeback off, returns immediately); {@code async = false}
+     * issues {@code MS_SYNC} (blocks until pages are persisted). Returns
+     * 0 on success, non-zero on failure.
+     */
+    public static native int msync(long addr, long len, boolean async);
+
+    /**
      * Returns a native pointer to the current entry's null-terminated name
      * (UTF-8). Pointer is valid only until the next {@link #findNext(long)}
      * or {@link #findClose(long)} on the same find handle.
@@ -405,6 +461,10 @@ public final class Files {
     static native int rename0(long lpszOld, long lpszNew);
 
     static native long findFirst0(long lpszName);
+
+    static native long mmap0(int fd, long len, long offset, int flags, long baseAddress);
+
+    static native int munmap0(long address, long len);
 
     private static native long getPageSize0();
 

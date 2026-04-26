@@ -21,6 +21,7 @@ core/questdb/client/bin-local
 core/cmake-build-debug
 core/cmake-build-debug-coverage
 core/cmake-build-release
+core/build_native
 core/CMakeCache.txt
 **/.project
 **/.settings
