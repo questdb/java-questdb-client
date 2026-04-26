@@ -528,6 +528,90 @@ public class SfIntegrationTest {
     }
 
     /**
+     * sf_fsync_on_flush=off (default): the user's flush() must NOT call
+     * segmentLog.fsync(). Pre-fix the docs claimed an fsync happened on
+     * every flush in the default config, which would have penalised the
+     * common small-batch + frequent-flush workload — exactly why the
+     * user wanted this knob to be opt-in.
+     */
+    @Test
+    public void testFlushDoesNotFsyncByDefault() throws Exception {
+        runFlushFsyncObservation(/* fsyncOnFlush */ false, /* expectFsync */ false);
+    }
+
+    /**
+     * sf_fsync_on_flush=on (opt-in): the user's flush() must route a
+     * fsync to the I/O thread before returning. Proves the wiring from
+     * Sender.storeAndForwardFsyncOnFlush → QwpWebSocketSender.flush →
+     * WebSocketSendQueue.requestSegmentLogFsync → SegmentLog.fsync →
+     * ff.fsync is end-to-end functional.
+     */
+    @Test
+    public void testFlushFsyncsWhenOptedIn() throws Exception {
+        runFlushFsyncObservation(/* fsyncOnFlush */ true, /* expectFsync */ true);
+    }
+
+    private void runFlushFsyncObservation(boolean fsyncOnFlush, boolean expectFsync) throws Exception {
+        int port = TEST_PORT + (fsyncOnFlush ? 81 : 80);
+        SilentHandler handler = new SilentHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            FsyncCountingFacade ff = new FsyncCountingFacade();
+            // Open SegmentLog first with a no-op count so the open-time
+            // createActive's header fsync doesn't pollute the per-flush
+            // counter we're about to observe.
+            SegmentLog log = SegmentLog.open(sfDir, ff, 1L << 20, Long.MAX_VALUE, false);
+            int fsyncsAtStartup = ff.fsyncs.get();
+
+            QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                    "localhost", port, /* tlsConfig */ null,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                    QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                    8, /* authHeader */ null,
+                    QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                    /* requestDurableAck */ false, log, fsyncOnFlush);
+            try {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                int fsyncsBeforeFlush = ff.fsyncs.get();
+                sender.flush();
+
+                // Wait for any I/O-thread-side fsync to settle. flush()
+                // under SF returns once data is on disk; the
+                // requestSegmentLogFsync path (when opted in) blocks on
+                // the I/O thread fsync round-trip, so by the time
+                // flush() returns the counter reflects the request.
+                int fsyncsAfterFlush = ff.fsyncs.get();
+                int delta = fsyncsAfterFlush - fsyncsBeforeFlush;
+
+                if (expectFsync) {
+                    Assert.assertTrue(
+                            "opt-in flush must trigger at least one fsync; "
+                                    + "fsyncs at startup=" + fsyncsAtStartup
+                                    + ", before flush=" + fsyncsBeforeFlush
+                                    + ", after flush=" + fsyncsAfterFlush,
+                            delta >= 1);
+                } else {
+                    Assert.assertEquals(
+                            "default flush must NOT fsync; "
+                                    + "fsyncs at startup=" + fsyncsAtStartup
+                                    + ", before flush=" + fsyncsBeforeFlush
+                                    + ", after flush=" + fsyncsAfterFlush,
+                            0, delta);
+                }
+            } finally {
+                try {
+                    sender.close();
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+            }
+        }
+    }
+
+    /**
      * End-to-end verification of the per-frame trim behaviour. A quiet
      * sender that flushes some batches, lets every ACK land, and then
      * shuts down must leave nothing on disk for the next sender to
@@ -1250,6 +1334,121 @@ public class SfIntegrationTest {
      *       turns into {@code SfException}. Auto-resets on fire.</li>
      * </ul>
      */
+    /**
+     * Counts every {@code ff.fsync(fd)} call. Used by the sf_fsync_on_flush
+     * tests to observe whether {@code flush()} routed an fsync to the I/O
+     * thread (opt-in path) or skipped it (default path).
+     */
+    private static class FsyncCountingFacade implements FilesFacade {
+        final java.util.concurrent.atomic.AtomicInteger fsyncs = new java.util.concurrent.atomic.AtomicInteger();
+
+        @Override
+        public long allocNativePath(String path) {
+            return FilesFacade.INSTANCE.allocNativePath(path);
+        }
+
+        @Override
+        public int close(int fd) {
+            return FilesFacade.INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return FilesFacade.INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            FilesFacade.INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return FilesFacade.INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return FilesFacade.INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return FilesFacade.INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            fsyncs.incrementAndGet();
+            return FilesFacade.INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return FilesFacade.INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return FilesFacade.INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return FilesFacade.INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            return FilesFacade.INSTANCE.openCleanRW(path, size);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return FilesFacade.INSTANCE.openRW(path);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            return FilesFacade.INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            return FilesFacade.INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return FilesFacade.INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return FilesFacade.INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
     private static class StallThenFsyncFailFacade implements FilesFacade {
         volatile boolean failNextFsync;
         volatile boolean failNextPayloadWrite;

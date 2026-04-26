@@ -172,6 +172,11 @@ public class QwpWebSocketSender implements Sender {
     // True when this sender took ownership of segmentLog (e.g. via the
     // connect-string builder); close() will then close the log too.
     private boolean ownsSegmentLog;
+    // When true, every successful flush() (including the implicit flush
+    // during close()) routes a fsync request to the I/O thread before
+    // returning. Off by default — opt-in via setSegmentLogFsyncOnFlush
+    // or sf_fsync_on_flush=on in the connect string.
+    private boolean fsyncOnFlush;
     // Set by the I/O thread after a successful SF reconnect; checked by the user
     // thread on the next flushPendingRows so the next batch re-publishes schemas
     // the new server doesn't yet know about.
@@ -351,6 +356,33 @@ public class QwpWebSocketSender implements Sender {
             boolean requestDurableAck,
             SegmentLog segmentLog
     ) {
+        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                maxSchemasPerConnection, requestDurableAck, segmentLog, false);
+    }
+
+    /**
+     * Connect overload with store-and-forward and an explicit
+     * fsync-on-flush opt-in. {@code fsyncOnFlush=true} routes a fsync of
+     * the SF active segment to the I/O thread at every {@link #flush()}
+     * (and at the implicit flush during {@link #close()}); off by default
+     * because small-batch / frequent-flush senders pay one disk fsync per
+     * call.
+     */
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            SegmentLog segmentLog,
+            boolean fsyncOnFlush
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -361,6 +393,7 @@ public class QwpWebSocketSender implements Sender {
             if (segmentLog != null) {
                 sender.setSegmentLog(segmentLog, true);
             }
+            sender.setSegmentLogFsyncOnFlush(fsyncOnFlush);
             sender.ensureConnected();
         } catch (Throwable t) {
             sender.close();
@@ -579,6 +612,12 @@ public class QwpWebSocketSender implements Sender {
                     // SF dir will replay them.
                     if (sendQueue != null) {
                         sendQueue.flush();
+                        if (fsyncOnFlush && segmentLog != null) {
+                            // Same opt-in fsync as the public flush(): the
+                            // user asked for "data is durable on flush"
+                            // semantics, and close() implies a final flush.
+                            sendQueue.requestSegmentLogFsync();
+                        }
                         if (segmentLog == null) {
                             sendQueue.awaitPendingAcks();
                         }
@@ -864,6 +903,20 @@ public class QwpWebSocketSender implements Sender {
             } catch (LineSenderException e) {
                 checkConnectionError();
                 throw e;
+            }
+
+            // Opt-in fsync of the SF active segment. Routed through the
+            // I/O thread (it owns SegmentLog) via the requestSegmentLogFsync
+            // signal; blocks until the syscall returns. Off by default
+            // because small-batch / frequent-flush senders pay one disk
+            // fsync per call.
+            if (fsyncOnFlush && segmentLog != null) {
+                try {
+                    sendQueue.requestSegmentLogFsync();
+                } catch (LineSenderException e) {
+                    checkConnectionError();
+                    throw e;
+                }
             }
 
             // Under SF the durability guarantee is "data is on disk", not "data is
@@ -1232,6 +1285,28 @@ public class QwpWebSocketSender implements Sender {
         }
         this.segmentLog = log;
         this.ownsSegmentLog = takeOwnership && log != null;
+    }
+
+    /**
+     * Opt in to fsyncing the SF active segment at every {@link #flush()}
+     * (and at the implicit flush during {@link #close()}). Off by default.
+     * <p>
+     * Useful for senders that flush coarsely and want OS-crash survival
+     * without paying the per-append fsync cost of {@code sf_fsync=on}.
+     * Avoid for high-rate small-batch + frequent-flush workloads — every
+     * flush blocks on a disk fsync.
+     * <p>
+     * Must be set before the first send (mirrors {@link #setSegmentLog}).
+     */
+    public void setSegmentLogFsyncOnFlush(boolean enabled) {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        if (connected) {
+            throw new LineSenderException(
+                    "setSegmentLogFsyncOnFlush must be called before the first send");
+        }
+        this.fsyncOnFlush = enabled;
     }
 
     /**

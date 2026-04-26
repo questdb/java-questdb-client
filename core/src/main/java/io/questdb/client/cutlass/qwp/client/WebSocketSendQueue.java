@@ -159,6 +159,17 @@ public class WebSocketSendQueue implements QuietCloseable {
     private volatile boolean pingRequested;
     private volatile boolean pongReceived;
     private long pingDeadlineNanos;
+    // Signal-based fsync: user thread sets fsyncRequested + waits on
+    // fsyncComplete; I/O thread (the only thread that owns SegmentLog)
+    // observes the flag, calls segmentLog.fsync(), publishes outcome
+    // via fsyncError + fsyncComplete. Mirrors the ping handshake.
+    private volatile boolean fsyncRequested;
+    private volatile boolean fsyncComplete;
+    private volatile Throwable fsyncError;
+    // Serialises concurrent requestSegmentLogFsync callers, same idiom as
+    // pingLock — each caller gets its own round-trip so post-conditions
+    // hold per caller.
+    private final Object fsyncLock = new Object();
     // Running state
     private volatile boolean running;
     private volatile boolean shuttingDown;
@@ -491,6 +502,55 @@ public class WebSocketSendQueue implements QuietCloseable {
     }
 
     /**
+     * Asks the I/O thread to fsync the SF active segment and blocks until
+     * the syscall returns. No-op when no SegmentLog is configured.
+     * <p>
+     * SegmentLog is single-threaded — the I/O thread owns every read,
+     * write, trim and rotate. Calling {@code segmentLog.fsync()} from the
+     * user thread would race against an in-flight {@code trim()} (which
+     * may force-rotate the active segment under per-frame trim) or
+     * against {@code append()} from a concurrent send. The signal pattern
+     * keeps SegmentLog ownership clean.
+     * <p>
+     * Concurrent callers are serialised via {@link #fsyncLock} so each
+     * one gets its own round-trip — the post-condition "every byte
+     * persisted before the call returned is durable on disk" holds per
+     * caller independently.
+     */
+    public void requestSegmentLogFsync() {
+        if (segmentLog == null) {
+            return;
+        }
+        synchronized (fsyncLock) {
+            checkError();
+            synchronized (processingLock) {
+                fsyncComplete = false;
+                fsyncError = null;
+                fsyncRequested = true;
+                processingLock.notifyAll();
+                while (!fsyncComplete && running) {
+                    try {
+                        processingLock.wait(1000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new LineSenderException("SF fsync interrupted");
+                    }
+                }
+                if (!fsyncComplete) {
+                    checkError();
+                    throw new LineSenderException(
+                            "SF fsync aborted: send queue is shutting down");
+                }
+            }
+            Throwable err = fsyncError;
+            if (err != null) {
+                throw new LineSenderException("SF fsync failed: " + err.getMessage(), err);
+            }
+            checkError();
+        }
+    }
+
+    /**
      * Returns the total number of batches sent.
      */
     public long getTotalBatchesSent() {
@@ -641,6 +701,30 @@ public class WebSocketSendQueue implements QuietCloseable {
                     }
                 }
 
+                // Honour any pending SF fsync request. Runs before batch
+                // processing so the user's flush() observes a stable
+                // "every byte appended before the request is durable"
+                // invariant. A failure here is published to the caller
+                // via fsyncError; we do NOT failConnection because an
+                // fsync EIO is a storage problem, not a wire problem,
+                // and the user can decide whether to retry vs. close.
+                if (fsyncRequested) {
+                    fsyncRequested = false;
+                    Throwable err = null;
+                    try {
+                        if (segmentLog != null) {
+                            segmentLog.fsync();
+                        }
+                    } catch (Throwable t) {
+                        err = t;
+                    }
+                    fsyncError = err;
+                    synchronized (processingLock) {
+                        fsyncComplete = true;
+                        processingLock.notifyAll();
+                    }
+                }
+
                 MicrobatchBuffer batch = null;
                 boolean hasInFlight = (inFlightWindow != null && inFlightWindow.getInFlightCount() > 0);
                 IoState state = computeState(hasInFlight);
@@ -652,7 +736,7 @@ public class WebSocketSendQueue implements QuietCloseable {
                         // Nothing to do - wait for work under lock
                         synchronized (processingLock) {
                             // Re-check under lock to avoid missed wakeup
-                            if (isPendingEmpty() && running && !pingRequested) {
+                            if (isPendingEmpty() && running && !pingRequested && !fsyncRequested) {
                                 try {
                                     processingLock.wait(100);
                                 } catch (InterruptedException e) {

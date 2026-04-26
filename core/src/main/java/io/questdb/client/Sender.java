@@ -631,6 +631,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean sfFsync;
+        private boolean sfFsyncOnFlush;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -968,7 +969,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             wsAuthHeader,
                             actualMaxSchemasPerConnection,
                             requestDurableAck,
-                            segmentLog
+                            segmentLog,
+                            sfFsyncOnFlush
                     );
                 } catch (Throwable t) {
                     // If connect failed, the sender's close() ran and would have closed
@@ -1640,15 +1642,50 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * When enabled, every successful SF append calls {@code fsync} on the
          * active segment file before returning. Trades throughput for the
-         * strongest durability guarantee — captured frames survive even an OS
-         * crash, not just a process crash. Default: off (fsync runs on rotation
-         * and on explicit flush()).
+         * strongest durability guarantee — every captured frame survives an OS
+         * crash, not just a process crash.
+         * <p>
+         * Default: off. With {@code sf_fsync=off}, fsync only fires on
+         * segment rotation and new-segment header creation; bytes appended to
+         * the active segment between rotations live only in the OS page cache
+         * and may be lost in an OS crash, kernel panic, or power loss. The
+         * JVM going down is survived (the page cache outlives the process).
+         * <p>
+         * If you flush coarsely (one fsync per flush is acceptable) and want
+         * OS-crash survival without paying per-append fsync cost, set
+         * {@link #storeAndForwardFsyncOnFlush(boolean)} instead.
          */
         public LineSenderBuilder storeAndForwardFsync(boolean enabled) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
             }
             this.sfFsync = enabled;
+            return this;
+        }
+
+        /**
+         * When enabled, every successful {@code Sender.flush()} (and the
+         * implicit flush during {@code close()}) calls {@code fsync} on the
+         * SF active segment file before returning. Trades flush latency
+         * (one fsync per flush) for OS-crash survival of every byte that
+         * the user explicitly flushed.
+         * <p>
+         * Off by default. Use this when batches are large or flushes are
+         * coarse and you want OS-crash durability without paying the
+         * per-append fsync cost of {@link #storeAndForwardFsync(boolean)}.
+         * Avoid it when batches are small and flushes are frequent — every
+         * flush blocks on a disk fsync, which is typically the slowest
+         * operation in the SF write path.
+         * <p>
+         * Combining {@code sf_fsync=on} and {@code sf_fsync_on_flush=on}
+         * is allowed but redundant: per-append fsync already covers every
+         * byte before flush returns.
+         */
+        public LineSenderBuilder storeAndForwardFsyncOnFlush(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            this.sfFsyncOnFlush = enabled;
             return this;
         }
 
@@ -2117,6 +2154,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         storeAndForwardFsync(false);
                     } else {
                         throw new LineSenderException("invalid sf_fsync [value=").put(sink).put(", allowed-values=[on, off]]");
+                    }
+                } else if (Chars.equals("sf_fsync_on_flush", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_fsync_on_flush is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_fsync_on_flush");
+                    if (Chars.equalsIgnoreCase("on", sink)) {
+                        storeAndForwardFsyncOnFlush(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink)) {
+                        storeAndForwardFsyncOnFlush(false);
+                    } else {
+                        throw new LineSenderException("invalid sf_fsync_on_flush [value=").put(sink).put(", allowed-values=[on, off]]");
                     }
                 } else if (Chars.equals("max_datagram_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");

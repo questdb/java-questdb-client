@@ -499,6 +499,53 @@ public class SfFromConfigTest {
         }
     }
 
+    /**
+     * sf_fsync_on_flush is opt-in. Verify the connect-string parses both
+     * values and the wiring reaches the sender (basic round-trip — the
+     * actual fsync-on-flush behaviour is exercised in WebSocketSendQueueTest
+     * with a counting FilesFacade).
+     */
+    @Test
+    public void testSfFsyncOnFlushParses() throws Exception {
+        int port = TEST_PORT + 6;
+        AckHandler handler = new AckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            String config = "ws::addr=localhost:" + port
+                    + ";store_and_forward=on;sf_dir=" + sfDir
+                    + ";sf_fsync_on_flush=on;";
+            try (Sender sender = Sender.fromConfig(config)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+            }
+            Assert.assertTrue(Files.exists(sfDir));
+        }
+    }
+
+    @Test
+    public void testInvalidSfFsyncOnFlushValueRejected() {
+        String config = "ws::addr=localhost:1;store_and_forward=on;sf_dir=" + sfDir
+                + ";sf_fsync_on_flush=maybe;";
+        try (Sender ignored = Sender.fromConfig(config)) {
+            Assert.fail("expected rejection");
+        } catch (LineSenderException expected) {
+            Assert.assertTrue(expected.getMessage(),
+                    expected.getMessage().contains("invalid sf_fsync_on_flush"));
+        }
+    }
+
+    @Test
+    public void testSfFsyncOnFlushOnTcpRejected() {
+        String config = "tcp::addr=localhost:1;sf_fsync_on_flush=on;";
+        try (Sender ignored = Sender.fromConfig(config)) {
+            Assert.fail("expected rejection");
+        } catch (LineSenderException expected) {
+            Assert.assertTrue(expected.getMessage(),
+                    expected.getMessage().contains("WebSocket"));
+        }
+    }
+
     @Test
     public void testStoreAndForwardWithSyncWindowRejected() {
         String config = "ws::addr=localhost:1;store_and_forward=on;sf_dir=" + sfDir
