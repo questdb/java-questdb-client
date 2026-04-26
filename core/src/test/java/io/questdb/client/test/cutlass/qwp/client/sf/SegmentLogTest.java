@@ -537,8 +537,91 @@ public class SegmentLogTest {
         });
     }
 
+    /**
+     * Direct repro for the "single active segment" deadlock the user
+     * documented before per-frame trim landed: when {@code sf_max_bytes}
+     * is generous (or never reached) but {@code sf_max_total_bytes} is
+     * tight, every appended frame lives in one active segment with no
+     * rotations. Pre per-frame trim, an ACK covering every frame freed
+     * nothing — {@code trim} only reclaimed sealed segments — so the
+     * sender stalled permanently even though the server had acknowledged
+     * everything. The force-rotate-on-fully-acked path makes the active
+     * itself reclaimable and breaks the deadlock.
+     */
     @Test
-    public void testMaxTotalBytesTriggersDiskFull() throws Exception {
+    public void testSingleActiveSegmentDoesNotDeadlockOnFullCap() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // perSeg == totalCap: no natural rotation can ever fire,
+            // because the projection check (writePos + total > perSeg
+            // ⇒ projected += HEADER_SIZE) trips disk-full before rotate
+            // is reached. Pre per-frame trim, the only path out of this
+            // state was a natural rotation — which the projection
+            // permanently blocks — so the sender deadlocked.
+            final long perSeg = 200;
+            final long totalCap = 200;
+            byte[] payload = new byte[50];
+            try (SegmentLog log = SegmentLog.open(tmpDir, perSeg, totalCap)) {
+                long buf = alloc(payload);
+                try {
+                    int appended = 0;
+                    SfDiskFullException dfe = null;
+                    for (int i = 0; i < 100 && dfe == null; i++) {
+                        try {
+                            log.append(buf, payload.length);
+                            appended++;
+                        } catch (SfDiskFullException e) {
+                            dfe = e;
+                        }
+                    }
+                    Assert.assertNotNull("expected disk-full once cap was hit", dfe);
+                    Assert.assertEquals("only the active segment should exist",
+                            1, log.segmentCount());
+
+                    // Ack every appended frame. Force-rotate-on-fully-acked
+                    // must reclaim the active segment.
+                    log.trim(appended - 1);
+
+                    Assert.assertEquals("oldestSeq -1 = active drained",
+                            -1L, log.oldestSeq());
+                    Assert.assertEquals("only the new empty active should remain",
+                            1, log.segmentCount());
+
+                    // Stress the recovery: keep appending until the cap
+                    // is hit a second time. This proves the freed space
+                    // is genuinely reusable, not a one-shot trick.
+                    int reAppended = 0;
+                    SfDiskFullException secondDfe = null;
+                    for (int i = 0; i < 100 && secondDfe == null; i++) {
+                        try {
+                            log.append(buf, payload.length);
+                            reAppended++;
+                        } catch (SfDiskFullException e) {
+                            secondDfe = e;
+                        }
+                    }
+                    Assert.assertNotNull("cap should fire again after refill", secondDfe);
+                    Assert.assertTrue("second round must accept at least one frame",
+                            reAppended > 0);
+                } finally {
+                    Unsafe.free(buf, payload.length, MemoryTag.NATIVE_DEFAULT);
+                }
+            }
+        });
+    }
+
+    /**
+     * sf_max_total_bytes back-pressure: filling the cap raises
+     * {@link SfDiskFullException}, and once every appended frame has been
+     * acked, the next append must succeed. Pre per-frame trim, this case
+     * could deadlock when the user's data fit entirely in the active
+     * segment — trim only reclaimed sealed segments, so an ACK that
+     * covered every appended frame still freed nothing. The
+     * force-rotate-on-fully-acked path in {@link SegmentLog#trim} fixes
+     * that: when every frame in the active segment is acked, the active
+     * is sealed and immediately removed, so capacity returns.
+     */
+    @Test
+    public void testMaxTotalBytesTriggersDiskFullThenRecoversOnAck() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // tiny: header (24) + ~4 frames of 50 bytes
             long perSeg = SegmentLog.HEADER_SIZE + 2L * (SegmentLog.FRAME_HEADER_SIZE + 50);
@@ -560,18 +643,17 @@ public class SegmentLogTest {
                     Assert.assertNotNull("eventually disk-full", dfe);
                     Assert.assertTrue("appended at least one frame before disk-full", appended > 0);
 
-                    // Trim what we have; active segment never trims, but if any sealed
-                    // exists it should go.
+                    // Ack every appended frame. trim must reclaim space
+                    // even when the unacked tail lives entirely in the
+                    // active segment.
                     log.trim(appended - 1);
-                    // Try one more append after trim — could succeed if sealed segment was
-                    // dropped, freeing space.
-                    try {
-                        log.append(buf, payload.length);
-                    } catch (SfDiskFullException ignored) {
-                        // Acceptable: only the active was on disk and active doesn't trim.
-                        // The point is the disk-full exception fires, not that trim always
-                        // recovers from a single segment scenario.
-                    }
+
+                    // Recovery is the load-bearing assertion. Pre per-frame
+                    // trim, this could throw SfDiskFullException again when
+                    // the active segment held all the capacity and trim
+                    // couldn't touch it — a permanent stall after every
+                    // frame had been acked.
+                    log.append(buf, payload.length);
                 } finally {
                     Unsafe.free(buf, payload.length, MemoryTag.NATIVE_DEFAULT);
                 }
