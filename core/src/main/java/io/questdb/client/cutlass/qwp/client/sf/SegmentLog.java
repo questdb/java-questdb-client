@@ -31,6 +31,8 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Segmented append-only log of opaque byte frames keyed by a monotonic 64-bit sequence number.
@@ -59,6 +61,9 @@ import io.questdb.client.std.Unsafe;
  * This class is single-threaded — one owner thread does all reads/writes/trims.
  */
 public final class SegmentLog implements QuietCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SegmentLog.class);
+
 
     public static final long DEFAULT_MAX_BYTES_PER_SEGMENT = 64L * 1024 * 1024;
     public static final long DEFAULT_MAX_TOTAL_BYTES = Long.MAX_VALUE;
@@ -173,6 +178,21 @@ public final class SegmentLog implements QuietCloseable {
      */
     public long append(long payloadAddr, int payloadLen) {
         ensureOpen();
+        // Guard against the partial-rotate failure state (bug C1). When
+        // rotate() fails between rename and createActive (e.g. allocNativePath
+        // OOMs at the second alloc, or createActive's openCleanRW/fsync fails
+        // for the new segment), `active` is left pointing at the now-sealed
+        // segment with sealed=true and fd=-1. Without this guard, a small
+        // subsequent append that fits under the cap would bypass the rotate
+        // trigger below and fall through to ff.write(fd=-1) — which returns
+        // -1 and is wrapped as SfDiskFullException (a recoverable backpressure
+        // signal) by the short-write branch. The I/O thread would then retry
+        // forever and the user thread would deadlock in flush(). Surface a
+        // fatal SfException instead so the connection terminates cleanly.
+        if (active.sealed || active.fd < 0) {
+            throw new SfException("SegmentLog is unusable after a prior rotate failure: "
+                    + active.path + " (sealed=" + active.sealed + ", fd=" + active.fd + ")");
+        }
         if (payloadLen <= 0) {
             throw new SfException("payloadLen must be > 0, got " + payloadLen);
         }
@@ -249,7 +269,15 @@ public final class SegmentLog implements QuietCloseable {
     public void replay(FrameVisitor visitor) {
         ensureOpen();
         for (int i = 0, n = segments.size(); i < n; i++) {
-            if (!replaySegment(segments.getQuick(i), visitor)) {
+            Segment s = segments.getQuick(i);
+            // Skip segments whose disk file we tried (and failed) to remove
+            // on a previous trim. Their frames were acked by the server —
+            // re-shipping them on the new connection would produce silent
+            // duplicate writes.
+            if (s.removePending) {
+                continue;
+            }
+            if (!replaySegment(s, visitor)) {
                 return;
             }
         }
@@ -307,19 +335,54 @@ public final class SegmentLog implements QuietCloseable {
                 continue;
             }
             if (s.lastSeq() <= ackedSeq) {
+                // Close the fd up front: even if remove fails and the segment
+                // stays in the list, we won't read from it again — replay()
+                // skips removePending segments and append() never targets a
+                // sealed one. Holding the fd would just leak a descriptor.
                 if (s.fd != -1) {
                     ff.close(s.fd);
                     s.fd = -1;
                 }
+                boolean removed;
                 if (s.pathPtrNative != 0) {
-                    ff.remove(s.pathPtrNative);
-                    ff.freeNativePath(s.pathPtrNative);
-                    s.pathPtrNative = 0;
+                    removed = ff.remove(s.pathPtrNative);
                 } else {
                     // Recovery case: rotate's allocNativePath OOMed and left
                     // pathPtrNative=0. Fall back to the String form, which
                     // does its own one-shot encode/free internally.
-                    ff.remove(s.path);
+                    removed = ff.remove(s.path);
+                }
+                if (!removed) {
+                    // remove() failed (Windows sharing-violation under AV,
+                    // transient NFS error, ESTALE, etc.). DO NOT decrement
+                    // bytesOnDiskCache or free pathPtrNative — the file is
+                    // still on disk. Keep the segment in the in-memory list
+                    // so:
+                    //   (a) bytesOnDisk() keeps reporting the truth and the
+                    //       sf_max_total_bytes cap stays enforceable;
+                    //   (b) the next trim() retries the remove (the
+                    //       lastSeq() <= ackedSeq predicate still holds for
+                    //       cumulative ACKs);
+                    //   (c) replay() skips it via the removePending flag so
+                    //       already-acked frames don't re-ship to the new
+                    //       server on reconnect.
+                    if (!s.removePending) {
+                        LOG.warn("trim: remove() failed for sealed segment, "
+                                + "will retry on next trim [path={}, baseSeq={}, "
+                                + "lastSeq={}, writePos={}]",
+                                s.path, s.baseSeq, s.lastSeq(), s.writePos);
+                    }
+                    s.removePending = true;
+                    segments.setQuick(writeIdx++, s);
+                    continue;
+                }
+                if (s.removePending) {
+                    LOG.info("trim: retry succeeded for previously-failed "
+                            + "remove [path={}, baseSeq={}]", s.path, s.baseSeq);
+                }
+                if (s.pathPtrNative != 0) {
+                    ff.freeNativePath(s.pathPtrNative);
+                    s.pathPtrNative = 0;
                 }
                 bytesOnDiskCache -= s.writePos;
             } else {
@@ -372,6 +435,25 @@ public final class SegmentLog implements QuietCloseable {
             if (s.fd != -1) {
                 ff.close(s.fd);
                 s.fd = -1;
+            }
+            // Last-chance retry for segments whose mid-session remove() failed
+            // (e.g. Windows sharing-violation that has since cleared, transient
+            // NFS error that has resolved). Without this, an orphan .sfs file
+            // would persist on disk and the next process start would
+            // rediscover it via scanDirectory and replay its already-acked
+            // frames to the new server — silent duplicate writes.
+            if (s.removePending) {
+                boolean removed = s.pathPtrNative != 0
+                        ? ff.remove(s.pathPtrNative)
+                        : ff.remove(s.path);
+                if (removed) {
+                    s.removePending = false;
+                } else {
+                    LOG.warn("close: remove() still failing for orphaned segment "
+                            + "[path={}, baseSeq={}] — file will be rediscovered "
+                            + "on next start and re-replay its already-acked "
+                            + "frames to the new server", s.path, s.baseSeq);
+                }
             }
             if (s.pathPtrNative != 0) {
                 ff.freeNativePath(s.pathPtrNative);
@@ -850,6 +932,15 @@ public final class SegmentLog implements QuietCloseable {
         long pathPtrNative;
         int fd = -1;
         boolean sealed;
+        // Trim attempted to delete this segment but ff.remove returned false
+        // (e.g. Windows sharing-violation, transient NFS error). The .sfs
+        // file is still on disk; the next trim() will retry the remove.
+        // While true, the segment stays in the in-memory list so:
+        //   (a) bytesOnDisk() keeps counting it (sf_max_total_bytes stays
+        //       enforceable),
+        //   (b) replay() skips it (its frames were already acked — must not
+        //       re-ship to the new server).
+        boolean removePending;
 
         long lastSeq() {
             return sealed ? lastSeqOnDisk : (baseSeq + frameCount - 1);

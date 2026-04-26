@@ -924,10 +924,27 @@ public class WebSocketSendQueue implements QuietCloseable {
         }
         long oldest = segmentLog.oldestSeq();
         fsnAtZero = oldest >= 0 ? oldest : segmentLog.nextSeq();
+        // Clear the stale reconnectRequested flag BEFORE replay, otherwise
+        // replay's window-wait spin would exit immediately on the new
+        // connection (it checks !reconnectRequested as a bail-out signal).
+        // failConnection in onClose / onError will set it again if the new
+        // connection also fails.
+        reconnectRequested = false;
         try {
             replayPersistedFrames();
         } catch (Throwable t) {
             LOG.warn("SF replay after reconnect failed: {}", t.getMessage());
+            return false;
+        }
+        // replayPersistedFrames swallows internal failures by calling
+        // failConnection(non-fatal), which sets reconnectRequested=true and
+        // returns normally. Without this check the caller would clear
+        // reconnectRequested and proceed as if replay succeeded — the
+        // failure would be silently lost. Surface it so the I/O loop backs
+        // off and retries.
+        if (reconnectRequested) {
+            LOG.warn("SF replay aborted mid-stream (reconnect requested) — "
+                    + "treating reconnect cycle as failed");
             return false;
         }
         LOG.info("SF reconnect complete");
@@ -959,13 +976,35 @@ public class WebSocketSendQueue implements QuietCloseable {
                             "SF replay FSN drift: fsn=" + fsn + " expected=" + (fsnAtZero + wireSeq));
                 }
                 if (inFlightWindow != null) {
-                    while (running && !inFlightWindow.hasWindowSpace()) {
-                        if (client.isConnected()) {
-                            tryReceiveAcks();
-                        }
+                    // Wait for window space, but bail out as soon as the
+                    // connection is gone or the I/O thread has been told to
+                    // reconnect. Without these guards the loop would spin
+                    // forever once the server drops mid-replay: a closed
+                    // socket can never produce ACKs, so hasWindowSpace stays
+                    // false; the outer state machine never gets to call
+                    // doReconnectCycle because we're stuck in this lambda;
+                    // and flush()/close() block on the I/O thread that will
+                    // never make progress until the user signals shutdown.
+                    while (running
+                            && !inFlightWindow.hasWindowSpace()
+                            && !reconnectRequested
+                            && client.isConnected()) {
+                        tryReceiveAcks();
                         Thread.onSpinWait();
                     }
-                    if (!running) {
+                    if (!running || reconnectRequested || !client.isConnected()) {
+                        // Either shutdown was requested, the connection died
+                        // (so any further sends will fail anyway), or the
+                        // failure handler has already requested a reconnect.
+                        // Stop replaying and let the outer state machine
+                        // drive the next attempt. Mark reconnectRequested so
+                        // doReconnectCycle's post-replay check returns false
+                        // and the caller backs off and retries.
+                        if (running && !reconnectRequested && !client.isConnected()) {
+                            failConnection(new LineSenderException(
+                                    "Connection lost mid-replay (window full, no ACKs possible)"),
+                                    false);
+                        }
                         return false;
                     }
                     if (!inFlightWindow.tryAddInFlight(wireSeq)) {
@@ -1249,7 +1288,29 @@ public class WebSocketSendQueue implements QuietCloseable {
                 if (segmentLog != null) {
                     // Translate wire seq → FSN. Cumulative ack of wire seq N means
                     // every FSN up to fsnAtZero+N has been applied server-side.
-                    segmentLog.trim(fsnAtZero + sequence);
+                    //
+                    // Clamp sequence at the highest wire seq the client has actually
+                    // sent on this connection (= nextBatchSequence - 1). Without this,
+                    // a misbehaving / replayed / malformed server ACK with a sequence
+                    // beyond what we sent would feed a fictitious lastSeq into
+                    // SegmentLog.trim, which would then force-rotate the active
+                    // segment and unlink every sealed segment whose lastSeq <= the
+                    // bogus value — including frames mid-replay that the new server
+                    // has never seen. Permanent silent data loss.
+                    //
+                    // This mirrors the cap that InFlightWindow.acknowledgeUpTo
+                    // already applies at line 144; the SF trim path was missing the
+                    // symmetric guard.
+                    long highestSent = nextBatchSequence - 1;
+                    if (highestSent >= 0) {
+                        long capped = Math.min(sequence, highestSent);
+                        if (capped < sequence) {
+                            LOG.warn("server ACK sequence {} exceeds highest sent "
+                                    + "wire seq {} — clamping SF trim to prevent "
+                                    + "silent data loss", sequence, highestSent);
+                        }
+                        segmentLog.trim(fsnAtZero + capped);
+                    }
                 }
                 for (int i = 0, n = response.getTableEntryCount(); i < n; i++) {
                     advanceSeqTxn(committedSeqTxns, response.getTableName(i), response.getTableSeqTxn(i));

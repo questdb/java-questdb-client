@@ -890,6 +890,423 @@ public class SegmentLogTest {
         });
     }
 
+    /**
+     * Red test for bug C1 — partial-rotate failure deadlocks subsequent small appends.
+     * <p>
+     * When {@code rotate()} fails between the rename succeeding and the new
+     * {@code allocNativePath(sealedPath)} call, {@code active} is left
+     * pointing at a segment whose {@code sealed=true}, {@code fd=-1}, and
+     * {@code writePos} is below (but close to) {@code maxBytesPerSegment}.
+     * The companion test
+     * {@link #testRotateOomLeavesSegmentInRecoverableSealedState()} proves
+     * {@code trim()} can still reclaim that segment. This test proves the
+     * dual hazard: a subsequent small {@code append()} that fits under the
+     * cap bypasses the rotate trigger at line 197 and falls through to
+     * {@code ff.write(active.fd=-1, ...)}, which returns -1 and trips the
+     * short-write branch at line 211. That branch throws
+     * {@link SfDiskFullException} — a recoverable backpressure signal — for
+     * a permanent {@code fd=-1} fault.
+     * <p>
+     * In production the I/O thread classifies {@link SfDiskFullException} as
+     * recoverable (see {@code WebSocketSendQueue.retryStalled} at
+     * {@code WebSocketSendQueue.java:1046}) and parks the batch in
+     * {@code stalledBuffer}, retrying every loop iteration. The retry will
+     * never succeed — {@code fd=-1} is permanent. {@code processingCount}
+     * stays {@code > 0} and the user thread blocks in {@code flush()}
+     * forever. <b>Silent deadlock.</b>
+     * <p>
+     * Required behaviour: any {@code append()} after a partial-rotate failure
+     * must throw a fatal {@link SfException} (not the disk-full subclass) so
+     * the I/O thread treats it as terminal and surfaces the error to the
+     * caller instead of looping. The simplest fix is a guard at the top of
+     * {@code append()}: {@code if (active.sealed || active.fd < 0) throw new
+     * SfException(...);}
+     */
+    @Test
+    public void testRotateOomThenSmallAppendThrowsFatalNotDiskFull() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            FdTrackingFacade tracker = new FdTrackingFacade();
+            // Cap is sized so:
+            //   first append (payload=16, total=24) fills writePos to
+            //     HEADER_SIZE(24) + 24 = 48 — segment not yet at cap (64),
+            //   second append (payload=24, total=32) overflows
+            //     (48 + 32 = 80 > 64), forcing rotate, and
+            //   third append (payload=8, total=16) fits exactly
+            //     (48 + 16 = 64, NOT > 64), bypassing the rotate trigger
+            //     so the fall-through to ff.write(fd=-1) is reached.
+            final long maxBytes = 64;
+            final int payload1 = 16;
+            final int payload2 = 24;
+            final int payloadSmall = 8;
+
+            long buf1 = Unsafe.malloc(payload1, MemoryTag.NATIVE_DEFAULT);
+            long buf2 = Unsafe.malloc(payload2, MemoryTag.NATIVE_DEFAULT);
+            long bufSmall = Unsafe.malloc(payloadSmall, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payload1; i++) {
+                    Unsafe.getUnsafe().putByte(buf1 + i, (byte) i);
+                }
+                for (int i = 0; i < payload2; i++) {
+                    Unsafe.getUnsafe().putByte(buf2 + i, (byte) (i + 0x40));
+                }
+                for (int i = 0; i < payloadSmall; i++) {
+                    Unsafe.getUnsafe().putByte(bufSmall + i, (byte) (i + 0x80));
+                }
+
+                SegmentLog log = SegmentLog.open(tmpDir, tracker, maxBytes, 1024, false);
+                try {
+                    long s0 = log.append(buf1, payload1);
+                    assertEquals(0L, s0);
+
+                    // Arm the OOM at the rotate's allocNativePath(sealedPath).
+                    tracker.failNextSealedAllocNativePath = true;
+                    try {
+                        log.append(buf2, payload2);
+                        fail("expected OOM during rotate's allocNativePath(sealedPath)");
+                    } catch (Throwable expected) {
+                        String msg = expected.getMessage() == null ? "" : expected.getMessage();
+                        String causeMsg = expected.getCause() == null
+                                || expected.getCause().getMessage() == null
+                                ? "" : expected.getCause().getMessage();
+                        assertTrue("wrong failure: " + expected,
+                                msg.contains("simulated") || msg.contains("OOM")
+                                        || causeMsg.contains("simulated") || causeMsg.contains("OOM"));
+                    }
+
+                    // Active is now: sealed=true, fd=-1, writePos=48 (< cap=64).
+                    // A small append that fits under the cap bypasses the
+                    // rotate trigger and falls through to ff.write(fd=-1).
+                    // Required: fatal SfException so the I/O thread terminates
+                    // the connection. Bug: SfDiskFullException is thrown
+                    // because ff.write returns -1 (EBADF), which the I/O
+                    // thread treats as recoverable backpressure → infinite
+                    // retry loop → user-thread deadlock.
+                    try {
+                        log.append(bufSmall, payloadSmall);
+                        fail("expected SfException after rotate OOM left active "
+                                + "with sealed=true, fd=-1");
+                    } catch (SfDiskFullException dfe) {
+                        fail("BUG C1: small append after partial-rotate failure threw "
+                                + "recoverable SfDiskFullException, but the SegmentLog "
+                                + "is permanently broken (fd=-1). The I/O thread "
+                                + "classifies disk-full as backpressure and retries "
+                                + "forever → user-thread deadlock in flush(). Should "
+                                + "throw fatal SfException. Got: " + dfe.getMessage());
+                    } catch (SfException expected) {
+                        // ok — fatal exception correctly surfaced. The I/O
+                        // thread will terminate the connection.
+                    }
+                } finally {
+                    log.close();
+                }
+            } finally {
+                Unsafe.free(buf1, payload1, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(buf2, payload2, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(bufSmall, payloadSmall, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Red test for the trim-after-remove-failure bug.
+     * <p>
+     * {@code SegmentLog.trimSealedSegments} discards the boolean return value
+     * from {@code ff.remove(...)}. When {@code remove} fails (Windows
+     * sharing-violation under antivirus, transient NFS errors, etc.) the
+     * code still:
+     * <ol>
+     *   <li>frees the cached {@code pathPtrNative}</li>
+     *   <li>decrements {@code bytesOnDiskCache}</li>
+     *   <li>drops the segment from the in-memory {@code segments} list</li>
+     * </ol>
+     * even though the {@code .sfs} file remains on disk. Two failure modes
+     * follow:
+     * <ul>
+     *   <li><b>disk-cap accounting drift</b>: {@code bytesOnDisk()}
+     *       underreports actual usage; the {@code sf_max_total_bytes}
+     *       backpressure check ({@link SegmentLog#append}) lets writes
+     *       through past the configured cap.</li>
+     *   <li><b>silent duplicate writes on restart</b>: the next process
+     *       start's {@code scanDirectory} rediscovers the orphan
+     *       {@code .sfs} file, treats it as a legitimate sealed segment
+     *       awaiting replay, and ships its already-acked frames to the
+     *       new server on reconnect.</li>
+     * </ul>
+     * <p>
+     * Required behaviour: a failed {@code remove} must keep the segment in
+     * the in-memory model — at minimum, {@code bytesOnDiskCache} must not be
+     * decremented, and a future {@code trim} call must retry the remove. The
+     * segment must also be excluded from {@code replay} so already-acked
+     * frames do not re-ship to the new server.
+     */
+    @Test
+    public void testTrimRemoveFailureMustNotForgetSealedSegment() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            RemoveFailingFacade ff = new RemoveFailingFacade();
+            // maxBytes=64. payload=8, frame total=16. HEADER=24. Two frames
+            // fit: 24+16+16 = 56 ≤ 64. The third frame (24+16+16+16=72 > 64)
+            // forces a rotation, leaving segment 0 sealed (writePos=56,
+            // baseSeq=0, lastSeq=1) and segment 1 active.
+            final long maxBytes = 64;
+            final long totalCap = 1024;
+            final int payload = 8;
+
+            long buf = Unsafe.malloc(payload, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payload; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, (byte) i);
+                }
+
+                try (SegmentLog log = SegmentLog.open(tmpDir, ff, maxBytes, totalCap, false)) {
+                    long s0 = log.append(buf, payload);
+                    long s1 = log.append(buf, payload);
+                    long s2 = log.append(buf, payload);
+                    assertEquals(0L, s0);
+                    assertEquals(1L, s1);
+                    assertEquals(2L, s2);
+                    assertEquals("segment 0 sealed, segment 1 active",
+                            2, log.segmentCount());
+
+                    long realDiskBeforeTrim = realDiskUsage(tmpDir);
+                    Assert.assertTrue("setup: real on-disk usage > 0",
+                            realDiskBeforeTrim > 0);
+                    assertEquals("setup: bytesOnDisk matches reality before trim",
+                            realDiskBeforeTrim, log.bytesOnDisk());
+
+                    // Arm the failure: every subsequent remove() returns false
+                    // without touching the filesystem. This simulates the
+                    // Windows sharing-violation case where the file stays
+                    // present even though we asked the kernel to delete it.
+                    ff.failAllRemoves = true;
+
+                    // Trim every frame in segment 0. Without the fault this
+                    // would unlink the sealed file; with the fault, the file
+                    // remains on disk and (with the fix) the in-memory model
+                    // keeps tracking it.
+                    log.trim(1L);
+
+                    long realDiskAfterFailedTrim = realDiskUsage(tmpDir);
+                    long claimedAfterFailedTrim = log.bytesOnDisk();
+
+                    // Failure mode #1 (accounting): bytesOnDisk must NOT
+                    // underreport while the segment is still on disk —
+                    // otherwise the sf_max_total_bytes cap silently stops
+                    // being a real cap.
+                    assertEquals("real on-disk usage unchanged because remove() failed",
+                            realDiskBeforeTrim, realDiskAfterFailedTrim);
+                    if (claimedAfterFailedTrim < realDiskAfterFailedTrim) {
+                        fail("BUG: bytesOnDisk()=" + claimedAfterFailedTrim
+                                + " underreports actual on-disk usage="
+                                + realDiskAfterFailedTrim
+                                + " — trim() forgot the sealed segment despite "
+                                + "remove() returning false. The "
+                                + "sf_max_total_bytes cap can no longer be "
+                                + "enforced.");
+                    }
+
+                    // Failure mode #2 (duplicate writes): replay() must skip
+                    // segments whose remove failed — their frames were acked,
+                    // so re-shipping them to the next server connection would
+                    // produce silent duplicate writes. Count how many frames
+                    // replay would visit; with the fix only segment 1's
+                    // single unacked frame should be visited.
+                    int[] replayedFrames = {0};
+                    log.replay((seq, addr, len) -> {
+                        replayedFrames[0]++;
+                        return true;
+                    });
+                    if (replayedFrames[0] > 1) {
+                        fail("BUG: replay() visited " + replayedFrames[0]
+                                + " frames; only the unacked frame in segment 1 "
+                                + "should have been visited. The remove-failed "
+                                + "segment 0 holds 2 already-acked frames that "
+                                + "must NOT re-ship to the new server.");
+                    }
+                    assertEquals("replay must visit segment 1's single unacked frame",
+                            1, replayedFrames[0]);
+
+                    // Failure mode #3 (no retry): the next trim() must retry
+                    // the failed remove. Disarm the fault and call trim again
+                    // — segment 0's file should now be deleted, in-memory
+                    // state cleared, accounting reduced.
+                    ff.failAllRemoves = false;
+                    log.trim(1L);
+
+                    long realDiskAfterRetry = realDiskUsage(tmpDir);
+                    long claimedAfterRetry = log.bytesOnDisk();
+                    assertEquals("retry trim() must successfully remove segment 0's file",
+                            realDiskAfterRetry, claimedAfterRetry);
+                    Assert.assertTrue("retry trim() must reduce real disk usage",
+                            realDiskAfterRetry < realDiskBeforeTrim);
+                    assertEquals("only the active segment 1 remains in the list",
+                            1, log.segmentCount());
+                }
+
+                // After clean close, no orphan .sfs file should remain on
+                // disk (the close-time retry, combined with the mid-session
+                // retry above, deleted it).
+                long find = Files.findFirst(tmpDir);
+                if (find != 0) {
+                    try {
+                        int rc = 1;
+                        while (rc > 0) {
+                            String name = Files.utf8ToString(Files.findName(find));
+                            if (name != null && name.endsWith(".sfs")) {
+                                fail("orphan .sfs file remains after clean close: "
+                                        + name);
+                            }
+                            rc = Files.findNext(find);
+                        }
+                    } finally {
+                        Files.findClose(find);
+                    }
+                }
+            } finally {
+                Unsafe.free(buf, payload, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /** Sums the byte length of every .sfs/.sfa file in {@code dir}. */
+    private static long realDiskUsage(String dir) {
+        long sum = 0;
+        long find = Files.findFirst(dir);
+        if (find != 0) {
+            try {
+                int rc = 1;
+                while (rc > 0) {
+                    String name = Files.utf8ToString(Files.findName(find));
+                    if (name != null && (name.endsWith(".sfs") || name.endsWith(".sfa"))) {
+                        long len = Files.length(dir + "/" + name);
+                        if (len > 0) {
+                            sum += len;
+                        }
+                    }
+                    rc = Files.findNext(find);
+                }
+            } finally {
+                Files.findClose(find);
+            }
+        }
+        return sum;
+    }
+
+    /** Delegates everything to {@link FilesFacade#INSTANCE}; fails {@code remove} when armed. */
+    private static class RemoveFailingFacade implements FilesFacade {
+        volatile boolean failAllRemoves;
+
+        @Override
+        public long allocNativePath(String path) {
+            return FilesFacade.INSTANCE.allocNativePath(path);
+        }
+
+        @Override
+        public int close(int fd) {
+            return FilesFacade.INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return FilesFacade.INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            FilesFacade.INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return FilesFacade.INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return FilesFacade.INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return FilesFacade.INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return FilesFacade.INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            return FilesFacade.INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return FilesFacade.INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return FilesFacade.INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return FilesFacade.INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            return FilesFacade.INSTANCE.openCleanRW(path, size);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return FilesFacade.INSTANCE.openRW(path);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            if (failAllRemoves) {
+                return false;
+            }
+            return FilesFacade.INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            if (failAllRemoves) {
+                return false;
+            }
+            return FilesFacade.INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return FilesFacade.INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return FilesFacade.INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            return FilesFacade.INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
     @Test
     public void testCreateActiveDoesNotLeakFdOnFsyncFailure() throws Exception {
         TestUtils.assertMemoryLeak(() -> {

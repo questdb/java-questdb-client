@@ -1968,6 +1968,16 @@ public class QwpWebSocketSender implements Sender {
     private void resetSchemaStateForNewConnection() {
         maxSentSchemaId = -1;
         nextSchemaId = 0;
+        // The new server has an empty symbol dictionary. The encoder's
+        // delta-dictionary range is computed as
+        //   deltaStart = maxSentSymbolId + 1
+        //   deltaCount = max(0, currentBatchMaxSymbolId - maxSentSymbolId)
+        // so a non-reset watermark would skip every symbol id <= the old
+        // server's confirmed max, leaving column refs into a dictionary the
+        // new server has never seen. Reset both so the next batch ships a
+        // delta starting at id 0 covering every referenced symbol.
+        maxSentSymbolId = -1;
+        currentBatchMaxSymbolId = -1;
 
         ObjList<CharSequence> keys = tableBuffers.keys();
         for (int i = 0, n = keys.size(); i < n; i++) {

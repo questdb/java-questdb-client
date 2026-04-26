@@ -1152,6 +1152,434 @@ public class SfIntegrationTest {
         }
     }
 
+    /**
+     * Red test for the symbol-watermark reconnect bug.
+     * <p>
+     * After SF reconnect, {@link QwpWebSocketSender#performReconnect()} flips
+     * {@code schemaResetNeeded} so the next encode pass calls
+     * {@code resetSchemaStateForNewConnection()}. That helper resets the
+     * schema-id state ({@code maxSentSchemaId}, {@code nextSchemaId}, per-table
+     * schema ids) — but it does <b>not</b> reset
+     * {@code maxSentSymbolId}/{@code currentBatchMaxSymbolId}.
+     * <p>
+     * The encoder uses {@code maxSentSymbolId} as the "confirmed by server"
+     * watermark for the symbol-delta dictionary
+     * (see {@code QwpWebSocketEncoder.beginMessage}):
+     * <pre>
+     *   deltaStart = confirmedMaxId + 1;
+     *   deltaCount = max(0, batchMaxId - confirmedMaxId);
+     * </pre>
+     * After a reconnect the new server has zero symbol mappings, but the
+     * client still believes the old server's high-water mark applies. The
+     * first post-reconnect batch ships a delta dictionary that excludes every
+     * symbol id ≤ the stale {@code maxSentSymbolId}; subsequent column
+     * payloads then reference dictionary ids the new server has never seen,
+     * producing silent mis-decoding (or PARSE_ERROR if the wire ref happens
+     * to fall outside the empty range).
+     * <p>
+     * Required behaviour: the post-reconnect batch's delta dictionary must
+     * include every symbol id the batch references, starting from id 0,
+     * because the new server starts with an empty dictionary.
+     */
+    @Test(timeout = 60_000)
+    public void testReconnectResetsSymbolWatermark() throws Exception {
+        int port = TEST_PORT + 11;
+        AckThenCloseAndCaptureHandler handler = new AckThenCloseAndCaptureHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            try (SegmentLog log = SegmentLog.open(sfDir, 1L << 20);
+                 QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                         "localhost", port,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                         8)) {
+                sender.setSegmentLog(log);
+
+                // Batch 1 introduces the symbol "alpha" (gets global id 0).
+                // After ack lands and SF trims, maxSentSymbolId becomes 0.
+                sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                sender.flush();
+
+                // Wait until batch 1 is on the wire AND its ack has trimmed
+                // SF back to the empty-active baseline (proves
+                // maxSentSymbolId was advanced to 0). The I/O thread is now
+                // IDLE; the server-side close that follows the ack is sitting
+                // in the client's TCP buffer, undetected, until the next
+                // user-thread send wakes the I/O thread.
+                long deadline = System.currentTimeMillis() + 30_000;
+                while (System.currentTimeMillis() < deadline
+                        && (handler.frames.size() < 1
+                                || log.bytesOnDisk() > SegmentLog.HEADER_SIZE)) {
+                    Thread.sleep(20);
+                }
+                Assert.assertTrue("batch 1 received", handler.frames.size() >= 1);
+                Assert.assertEquals("SF trimmed after batch 1 acked",
+                        SegmentLog.HEADER_SIZE, log.bytesOnDisk());
+
+                // Give the server-side close (handler sleeps 20ms post-ack)
+                // time to propagate to the client TCP buffer so the I/O
+                // thread's next send fails immediately and triggers reconnect.
+                Thread.sleep(200);
+
+                // Batch 2 reuses "alpha" — already in the global dictionary
+                // at id 0. With the bug, the encoder treats id 0 as "already
+                // confirmed by the server" because maxSentSymbolId is still 0,
+                // so the symbol-delta dictionary in batch 2 is empty. With the
+                // fix, resetSchemaStateForNewConnection() reset
+                // maxSentSymbolId to -1 and the encoder ships id 0 ("alpha")
+                // in the delta so the new server can decode the column refs.
+                sender.table("foo").symbol("s", "alpha").longColumn("v", 2L).atNow();
+                sender.flush();
+
+                // Wait for batch 2 to arrive on conn 2. The I/O thread sends
+                // it on conn 1 (which fails — close is in the TCP buffer),
+                // detects the failure, reconnects, and replays batch 2 from
+                // SF on conn 2. The captured frame is the post-reconnect one.
+                while (System.currentTimeMillis() < deadline
+                        && (handler.frames.size() < 2 || handler.connections.get() < 2)) {
+                    Thread.sleep(20);
+                }
+                Assert.assertTrue("batch 2 received, frames=" + handler.frames.size(),
+                        handler.frames.size() >= 2);
+                Assert.assertTrue("reconnect happened, connections=" + handler.connections.get(),
+                        handler.connections.get() >= 2);
+            }
+        }
+
+        // Parse batch 2's delta-dictionary header. Wire layout:
+        //   bytes 0..3   "QWP1"
+        //   byte  4      version
+        //   byte  5      flags (FLAG_DELTA_SYMBOL_DICT bit always set in async mode)
+        //   bytes 6..7   tableCount (LE u16)
+        //   bytes 8..11  payloadLength (LE u32)
+        //   byte  12+    payload starts:
+        //                  varint deltaStart
+        //                  varint deltaCount
+        //                  deltaCount * (varint utf8Len, utf8Len bytes)
+        //                  ...column data...
+        // Last captured frame is the post-reconnect one. If batch 2's first
+        // send happened to land on conn 1 before the reconnect-trigger fired,
+        // the SF replay will have re-shipped the same encoded bytes on conn 2,
+        // which is what we want to inspect.
+        byte[] frame2 = handler.frames.get(handler.frames.size() - 1);
+        Assert.assertTrue("frame too short: " + frame2.length, frame2.length > 14);
+        long[] startCursor = readUnsignedVarint(frame2, 12);
+        long deltaStart = startCursor[0];
+        long[] countCursor = readUnsignedVarint(frame2, (int) startCursor[1]);
+        long deltaCount = countCursor[0];
+
+        // BUG: deltaStart=1, deltaCount=0 — empty dictionary even though
+        // batch references symbol id 0 which the new server has never seen.
+        // FIX: deltaStart=0, deltaCount=1 — re-publishes "alpha" with id 0.
+        if (deltaCount == 0) {
+            Assert.fail("BUG: post-reconnect batch shipped an empty symbol-delta "
+                    + "dictionary (deltaStart=" + deltaStart + ", deltaCount=0), "
+                    + "but the new server has never seen any symbols. "
+                    + "performReconnect()/resetSchemaStateForNewConnection() must "
+                    + "reset maxSentSymbolId so the post-reconnect batch's delta "
+                    + "dictionary covers every referenced id starting from 0.");
+        }
+        Assert.assertEquals("delta dictionary must start from id 0 because the "
+                        + "new server has an empty dictionary",
+                0L, deltaStart);
+        Assert.assertEquals("delta dictionary must contain exactly one symbol (\"alpha\")",
+                1L, deltaCount);
+
+        // Sanity: the bytes immediately after the deltaCount varint must be
+        // the length-prefixed UTF-8 encoding of "alpha".
+        int symbolStart = (int) countCursor[1];
+        long[] strLenCursor = readUnsignedVarint(frame2, symbolStart);
+        Assert.assertEquals("\"alpha\" length", 5L, strLenCursor[0]);
+        int utf8Start = (int) strLenCursor[1];
+        byte[] expected = "alpha".getBytes(StandardCharsets.UTF_8);
+        for (int i = 0; i < expected.length; i++) {
+            Assert.assertEquals("\"alpha\" byte " + i, expected[i], frame2[utf8Start + i]);
+        }
+    }
+
+    /**
+     * Red test for the future-ACK trim bug.
+     * <p>
+     * {@code InFlightWindow.acknowledgeUpTo} caps incoming server sequence
+     * numbers at {@code highestSent} so a bogus future-ACK cannot mark
+     * unsent batches as acknowledged. {@code ResponseHandler.onBinaryMessage}
+     * (in the same class) feeds the <b>raw, uncapped</b> server sequence
+     * into {@code segmentLog.trim(fsnAtZero + sequence)} — there is no
+     * symmetric clamp on the SF trim path. A buggy/misbehaving/replayed
+     * server ACK with a sequence beyond what the client has sent drives
+     * {@code SegmentLog.trim} past every real {@code lastSeq}, deleting
+     * every sealed segment and force-rotating-then-deleting the active —
+     * including frames that the server has never seen and never
+     * acknowledged.
+     * <p>
+     * Concrete failure: a previous session left N unsent frames on disk;
+     * on reconnect, replay starts. After the server receives only the first
+     * frame and emits a malformed/replayed ACK with a huge sequence, the
+     * client deletes frames 1..N-1 from disk before they are sent.
+     * Permanent silent data loss.
+     * <p>
+     * Required behaviour: the trim sequence must be clamped to
+     * {@code nextBatchSequence - 1} (the highest wire seq actually sent on
+     * this connection) before being passed to {@link SegmentLog#trim}.
+     */
+    @Test(timeout = 60_000)
+    public void testFutureAckMustNotTrimUnsentSfData() throws Exception {
+        // Pre-populate SF with twenty frames simulating a previous session's
+        // unsent backlog. We need substantially more frames than the in-flight
+        // window so the bogus ACK arrives mid-replay (i.e., before every frame
+        // has been sent on the wire) — that's the only configuration in which
+        // capping the trim sequence at highestSent has a different effect from
+        // trimming at the raw bogus sequence.
+        final int frameCount = 20;
+        final byte[][] frames = new byte[frameCount][];
+        for (int i = 0; i < frameCount; i++) {
+            frames[i] = new byte[]{(byte) (0xA0 | (i & 0x0F)), (byte) i, 0x42, 0x43, 0x44};
+        }
+        try (SegmentLog log = SegmentLog.open(sfDir, 1L << 20)) {
+            for (byte[] f : frames) {
+                long buf = Unsafe.malloc(f.length, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    for (int i = 0; i < f.length; i++) {
+                        Unsafe.getUnsafe().putByte(buf + i, f[i]);
+                    }
+                    log.append(buf, f.length);
+                } finally {
+                    Unsafe.free(buf, f.length, MemoryTag.NATIVE_DEFAULT);
+                }
+            }
+            log.fsync();
+        }
+
+        // Sanity: SF holds exactly the five pre-populated frames.
+        assertReplayCount(sfDir, frameCount);
+
+        int port = TEST_PORT + 12;
+        FutureAckThenSilentHandler handler = new FutureAckThenSilentHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            try (SegmentLog log = SegmentLog.open(sfDir, 1L << 20);
+                 QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                         "localhost", port,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                         8 /* in-flight window — smaller than frame count */)) {
+                sender.setSegmentLog(log);
+
+                // Opening the I/O thread triggers replay of the SF backlog.
+                // With window=8 and 20 frames, the I/O thread sends 8 frames
+                // and then blocks on tryReceiveAcks waiting for window space.
+                // The server replies to the first frame with a malformed ACK
+                // (seq=999_999) — at that moment highestSent==7, so capping
+                // the trim sequence at 7 leaves the active segment's
+                // lastSeq=19 untouched. Without the cap the active is
+                // force-rotated and every persisted frame is unlinked.
+                //
+                // flush() with no pending rows still calls ensureConnected();
+                // we deliberately do NOT enqueue a user batch because the
+                // post-bogus-ACK reconnect spin would otherwise block close
+                // (sendQueue.flush() waits for pendingBuffer to drain, and
+                // the I/O thread is stuck spinning on a closed connection
+                // until close() sets running=false).
+                sender.flush();
+
+                // Wait for the bogus ACK to have been dispatched. The
+                // I/O thread will then consume it and either keep the SF
+                // intact (with the fix) or wipe it (with the bug).
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (System.currentTimeMillis() < deadline
+                        && (!handler.bogusAckSent || handler.framesReceived.get() < 8)) {
+                    Thread.sleep(10);
+                }
+                Assert.assertTrue("bogus ACK dispatched", handler.bogusAckSent);
+
+                // Let the I/O thread consume the bogus ACK and run trim.
+                Thread.sleep(300);
+            }
+        }
+
+        // The server confirmed at most the first replayed frame, so the vast
+        // majority of pre-populated frames must still be on disk. Use a
+        // conservative threshold (3/4 of the original) so the test isn't
+        // brittle to small timing variations in how many frames the I/O
+        // thread shipped before consuming the bogus ACK.
+        int survivors = countReplayableFrames(sfDir);
+        int minSurvivors = (frameCount * 3) / 4;
+        if (survivors < minSurvivors) {
+            Assert.fail("BUG: SegmentLog dropped " + (frameCount - survivors)
+                    + " of " + frameCount + " pre-populated frames after the "
+                    + "server emitted a malformed future-ACK (seq=999_999) "
+                    + "early in the replay. With at most 8 frames in flight at "
+                    + "the time of the bogus ACK, the server confirmed nothing "
+                    + "beyond frame 0, so at least " + minSurvivors + " frames "
+                    + "must still be on disk for the next session to replay. "
+                    + "Found " + survivors + " on disk. The trim path in "
+                    + "WebSocketSendQueue.ResponseHandler.onBinaryMessage must "
+                    + "clamp the server sequence to nextBatchSequence-1 before "
+                    + "calling segmentLog.trim, mirroring the cap in "
+                    + "InFlightWindow.acknowledgeUpTo.");
+        }
+    }
+
+    /**
+     * Red test for the replay-spin-hang bug.
+     * <p>
+     * {@code replayPersistedFrames} fills the in-flight window during replay
+     * and then enters a spin loop waiting for ACKs to free space:
+     * <pre>
+     *   while (running &amp;&amp; !inFlightWindow.hasWindowSpace()) {
+     *       if (client.isConnected()) tryReceiveAcks();
+     *       Thread.onSpinWait();
+     *   }
+     * </pre>
+     * The {@code if (client.isConnected())} guard means: once the connection
+     * dies (peer reset, server crash, mid-replay close), {@code tryReceiveAcks}
+     * is never called again. The window can't drain. The spin loop never
+     * exits. The I/O thread is stuck inside {@code replayPersistedFrames}
+     * inside {@code doReconnectCycle} inside {@code ioLoop}, so the outer
+     * reconnect state machine never gets to re-run, and {@code flush()} /
+     * {@code close()} block indefinitely (until the user signals close,
+     * which finally sets {@code running=false}).
+     * <p>
+     * Worse still, even when the first spin iteration successfully reads a
+     * server close frame and {@code failConnection} sets
+     * {@code reconnectRequested=true}, the spin loop ignores that flag —
+     * it only looks at {@code running} and {@code hasWindowSpace}.
+     * <p>
+     * Required behaviour: when the connection dies (or
+     * {@code reconnectRequested} is set) during the in-replay window-wait,
+     * the spin must exit so the outer state machine can drive a reconnect.
+     */
+    @Test(timeout = 30_000)
+    public void testReplayMustNotHangWhenConnectionDropsMidReplay() throws Exception {
+        // Pre-populate SF with more frames than the in-flight window so the
+        // I/O thread enters the window-wait spin during replay.
+        final int frameCount = 20;
+        final byte[][] frames = new byte[frameCount][];
+        for (int i = 0; i < frameCount; i++) {
+            frames[i] = new byte[]{(byte) (0xC0 | (i & 0x0F)), (byte) i, 0x55, 0x66, 0x77};
+        }
+        try (SegmentLog log = SegmentLog.open(sfDir, 1L << 20)) {
+            for (byte[] f : frames) {
+                long buf = Unsafe.malloc(f.length, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    for (int i = 0; i < f.length; i++) {
+                        Unsafe.getUnsafe().putByte(buf + i, f[i]);
+                    }
+                    log.append(buf, f.length);
+                } finally {
+                    Unsafe.free(buf, f.length, MemoryTag.NATIVE_DEFAULT);
+                }
+            }
+            log.fsync();
+        }
+
+        int port = TEST_PORT + 13;
+        CloseAfterFirstFrameThenNormalAckHandler handler =
+                new CloseAfterFirstFrameThenNormalAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue("server start", server.awaitStart(5, TimeUnit.SECONDS));
+
+            try (SegmentLog log = SegmentLog.open(sfDir, 1L << 20);
+                 QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                         "localhost", port,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                         8 /* in-flight window — smaller than frame count */)) {
+                sender.setSegmentLog(log);
+
+                // Triggers ensureConnected → I/O thread starts → replay starts.
+                // Replay sends frames 0..7, fills the window, enters spin.
+                // Server received frame 0, closes. Subsequent spin iterations
+                // see isConnected==false and never call tryReceiveAcks.
+                sender.flush();
+
+                // Wait for the server to have received the first frame and
+                // to have closed connection 1.
+                long deadline = System.currentTimeMillis() + 15_000;
+                while (System.currentTimeMillis() < deadline
+                        && handler.framesReceived.get() < 1) {
+                    Thread.sleep(10);
+                }
+                Assert.assertTrue("server received the first replayed frame",
+                        handler.framesReceived.get() >= 1);
+
+                // The I/O thread MUST detect the dropped connection and
+                // re-enter the reconnect state machine within a reasonable
+                // window. With the bug, the spin loop never breaks out of
+                // the window-wait; no second connection ever arrives.
+                while (System.currentTimeMillis() < deadline
+                        && handler.connectionsAccepted.get() < 2) {
+                    Thread.sleep(20);
+                }
+                if (handler.connectionsAccepted.get() < 2) {
+                    Assert.fail("BUG: replay spin loop did not detect the "
+                            + "mid-replay connection drop. The I/O thread "
+                            + "is stuck in replayPersistedFrames's "
+                            + "window-wait spin (running=true, "
+                            + "isConnected=false, hasWindowSpace=false), "
+                            + "preventing the outer state machine from "
+                            + "running another doReconnectCycle. "
+                            + "framesReceived=" + handler.framesReceived.get()
+                            + ", connectionsAccepted="
+                            + handler.connectionsAccepted.get()
+                            + ". The spin must also exit on "
+                            + "!client.isConnected() or "
+                            + "reconnectRequested.");
+                }
+            }
+        }
+    }
+
+    /** Asserts that opening {@code dir} as a SegmentLog replays exactly {@code expected} frames. */
+    private static void assertReplayCount(String dir, int expected) {
+        int[] count = {0};
+        try (SegmentLog log = SegmentLog.open(dir, 1L << 20)) {
+            log.replay((seq, addr, len) -> {
+                count[0]++;
+                return true;
+            });
+        }
+        Assert.assertEquals("expected " + expected + " replayable frames in "
+                + dir + ", saw " + count[0], expected, count[0]);
+    }
+
+    /** Counts the number of frames the next replay would visit. */
+    private static int countReplayableFrames(String dir) {
+        int[] count = {0};
+        try (SegmentLog log = SegmentLog.open(dir, 1L << 20)) {
+            log.replay((seq, addr, len) -> {
+                count[0]++;
+                return true;
+            });
+        }
+        return count[0];
+    }
+
+    /** Reads an unsigned LEB128 varint from {@code data} starting at {@code pos}. */
+    private static long[] readUnsignedVarint(byte[] data, int pos) {
+        long value = 0;
+        int shift = 0;
+        while (true) {
+            byte b = data[pos++];
+            value |= ((long) (b & 0x7F)) << shift;
+            if ((b & 0x80) == 0) {
+                return new long[]{value, pos};
+            }
+            shift += 7;
+            if (shift > 63) {
+                throw new IllegalStateException("varint too long");
+            }
+        }
+    }
+
     private static void rmDir(String dir) {
         if (dir == null || !Files.exists(dir)) return;
         long find = Files.findFirst(dir);
@@ -1302,6 +1730,123 @@ public class SfIntegrationTest {
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             // intentionally silent
+        }
+    }
+
+    /**
+     * Connection 1: receives the first frame, sleeps briefly, closes the
+     * connection without acking anything. Connection 2+: acks every frame
+     * normally. Used to drive the mid-replay socket-drop path in the
+     * replay-spin-hang test.
+     */
+    private static class CloseAfterFirstFrameThenNormalAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        final AtomicLong framesReceived = new AtomicLong(0);
+        final AtomicLong connectionsAccepted = new AtomicLong(0);
+        private final java.util.IdentityHashMap<TestWebSocketServer.ClientHandler, ConnState> perConn =
+                new java.util.IdentityHashMap<>();
+        private final AtomicLong nextSeq = new AtomicLong(0);
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            ConnState state;
+            synchronized (perConn) {
+                state = perConn.get(client);
+                if (state == null) {
+                    state = new ConnState();
+                    state.connIdx = connectionsAccepted.incrementAndGet();
+                    perConn.put(client, state);
+                }
+            }
+            framesReceived.incrementAndGet();
+            int idxOnConn = state.frameIdx++;
+            if (state.connIdx == 1 && idxOnConn == 0) {
+                try {
+                    Thread.sleep(20);
+                    client.close();
+                } catch (Exception ignored) {
+                }
+                return;
+            }
+            if (state.connIdx >= 2) {
+                try {
+                    client.sendBinary(EchoSeqAckHandler.buildAck(nextSeq.getAndIncrement()));
+                } catch (IOException ignored) {
+                }
+            }
+        }
+
+        private static class ConnState {
+            long connIdx;
+            int frameIdx;
+        }
+    }
+
+    /**
+     * On the first incoming binary message, sends a malformed ACK with a
+     * sequence far beyond anything the client could have sent. Stays open
+     * (silent) thereafter — does not ack subsequent frames and does not
+     * close. The I/O thread will eventually fill its window, spin until
+     * the test closes the sender (running=false breaks the spin).
+     */
+    private static class FutureAckThenSilentHandler implements TestWebSocketServer.WebSocketServerHandler {
+        final AtomicLong framesReceived = new AtomicLong(0);
+        volatile boolean bogusAckSent;
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long n = framesReceived.incrementAndGet();
+            if (n == 1) {
+                try {
+                    client.sendBinary(EchoSeqAckHandler.buildAck(999_999L));
+                    bogusAckSent = true;
+                } catch (IOException ignored) {
+                }
+            }
+            // n > 1: silent receive; do not ack and do not close.
+        }
+    }
+
+    /**
+     * Captures every binary frame across all connections, acks each one, then
+     * closes the connection so the client must reconnect for the next batch.
+     * Used by the symbol-watermark reconnect test which needs the
+     * post-reconnect batch's wire bytes to inspect its symbol-delta
+     * dictionary.
+     */
+    private static class AckThenCloseAndCaptureHandler implements TestWebSocketServer.WebSocketServerHandler {
+        final java.util.List<byte[]> frames = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        final AtomicLong connections = new AtomicLong(0);
+        private final java.util.IdentityHashMap<TestWebSocketServer.ClientHandler, int[]> perConn =
+                new java.util.IdentityHashMap<>();
+        private final AtomicLong nextSeq = new AtomicLong(0);
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            int[] count;
+            synchronized (perConn) {
+                count = perConn.get(client);
+                if (count == null) {
+                    count = new int[]{0};
+                    perConn.put(client, count);
+                    connections.incrementAndGet();
+                }
+            }
+            frames.add(data.clone());
+            int idx = count[0]++;
+            try {
+                client.sendBinary(EchoSeqAckHandler.buildAck(nextSeq.getAndIncrement()));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            if (idx == 0) {
+                // Brief sleep so the ack reaches the client before close, then
+                // tear down the connection to force a reconnect on the next batch.
+                try {
+                    Thread.sleep(20);
+                    client.close();
+                } catch (Exception ignored) {
+                }
+            }
         }
     }
 
