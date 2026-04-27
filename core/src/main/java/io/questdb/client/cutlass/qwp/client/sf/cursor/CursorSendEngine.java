@@ -290,6 +290,11 @@ public final class CursorSendEngine implements QuietCloseable {
         return ring.firstSealed();
     }
 
+    /** Pass-through to {@link SegmentRing#findSegmentContaining(long)}. */
+    public MmapSegment findSegmentContaining(long fsn) {
+        return ring.findSegmentContaining(fsn);
+    }
+
     /** Configured per-segment size in bytes. */
     public long segmentSizeBytes() {
         return segmentSizeBytes;

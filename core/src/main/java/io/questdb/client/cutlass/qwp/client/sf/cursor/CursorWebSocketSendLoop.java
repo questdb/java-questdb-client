@@ -73,20 +73,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
 
-    private final WebSocketClient client;
     private final AtomicLong consecutiveSendErrors = new AtomicLong();
     private final CursorSendEngine engine;
-    // fsnAtZero: FSN that wireSeq=0 maps to on this connection. For a fresh
-    // connection starting from a fresh engine (no recovery), this is 0.
-    // Once recovery / reconnect lands (PR2), this is set to the first
-    // unacked FSN at connect time so wire-seq math stays aligned.
-    private final long fsnAtZero;
     private final long parkNanos;
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
     private final AtomicLong totalAcks = new AtomicLong();
     private final AtomicLong totalFramesSent = new AtomicLong();
+    private final AtomicLong totalReconnects = new AtomicLong();
+    // Optional reconnect plumbing. If both are non-null, a wire failure
+    // triggers a reconnect attempt instead of a terminal fail(). The factory
+    // produces a fresh, connected+upgraded WebSocketClient; the listener is
+    // notified after the wire state has been reset so the producer thread
+    // can bump its connectionGeneration.
+    private final ReconnectFactory reconnectFactory;
+    private final ReconnectListener reconnectListener;
+    private WebSocketClient client;
+    // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
+    // a fresh connection, this is 0. After a reconnect, it's set to
+    // engine.ackedFsn() + 1 — the first frame we replay maps to wireSeq=0
+    // on the new connection so server-side ACK math stays aligned.
+    private long fsnAtZero;
     // sendingSegment: the segment we're currently consuming bytes from. Starts
     // at engine.activeSegment(); advances to newer sealed segments / the new
     // active as the producer rotates.
@@ -100,11 +108,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private Thread ioThread;
 
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine) {
-        this(client, engine, 0L, DEFAULT_PARK_NANOS);
+        this(client, engine, 0L, DEFAULT_PARK_NANOS, null, null);
     }
 
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos) {
+        this(client, engine, fsnAtZero, parkNanos, null, null);
+    }
+
+    /**
+     * Full constructor with reconnect plumbing. When {@code reconnectFactory}
+     * and {@code reconnectListener} are both non-null, the I/O thread treats
+     * wire failures (send/receive errors, server-initiated close) as
+     * recoverable: it calls the factory to obtain a fresh connected client,
+     * resets wire state, repositions its replay cursor at
+     * {@code engine.ackedFsn() + 1}, and notifies the listener so the
+     * producer can bump its {@code connectionGeneration}. Either being null
+     * disables reconnect (legacy behavior — single failure is terminal).
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   ReconnectListener reconnectListener) {
         if (client == null || engine == null) {
             throw new IllegalArgumentException("client and engine must be non-null");
         }
@@ -112,6 +137,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.engine = engine;
         this.fsnAtZero = fsnAtZero;
         this.parkNanos = parkNanos;
+        this.reconnectFactory = reconnectFactory;
+        this.reconnectListener = reconnectListener;
+    }
+
+    /**
+     * Factory used by the I/O loop to build a fresh, connected, upgraded
+     * {@link WebSocketClient} after a wire failure. Implementations close
+     * the old client (if needed), build a new one with the same auth/TLS
+     * config, connect, perform the WebSocket upgrade, and return it ready
+     * to send. Throw on a terminal failure (auth rejection, etc.) — the
+     * I/O loop will treat the throw as fatal.
+     */
+    @FunctionalInterface
+    public interface ReconnectFactory {
+        WebSocketClient reconnect() throws Exception;
+    }
+
+    /**
+     * Notified after a successful reconnect — wire state has been reset and
+     * the cursor repositioned for replay. Implementations typically bump a
+     * {@code connectionGeneration} counter the producer thread reads so
+     * the next encode emits full schema definitions instead of refs.
+     */
+    @FunctionalInterface
+    public interface ReconnectListener {
+        void onReconnect();
     }
 
     /**
@@ -151,6 +202,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     public long getTotalFramesSent() {
         return totalFramesSent.get();
+    }
+
+    public long getTotalReconnects() {
+        return totalReconnects.get();
     }
 
     public synchronized void start() {
@@ -201,12 +256,92 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return liveActive;
     }
 
+    /**
+     * Surface a wire failure. With reconnect plumbing wired (factory +
+     * listener both non-null), tries one reconnect first; success returns
+     * silently and the I/O loop continues with reset wire state. Failure
+     * (or no reconnect plumbing) records the error and stops the loop.
+     * <p>
+     * Backoff / per-outage time cap / auth-failure detection land in the
+     * follow-up commit; this commit proves the mechanics with a single
+     * attempt.
+     */
     private void fail(Throwable t) {
+        if (reconnectFactory != null && reconnectListener != null && running) {
+            LOG.warn("cursor I/O loop wire failure, attempting reconnect: {}", t.getMessage());
+            try {
+                WebSocketClient newClient = reconnectFactory.reconnect();
+                if (newClient != null) {
+                    swapClient(newClient);
+                    totalReconnects.incrementAndGet();
+                    reconnectListener.onReconnect();
+                    LOG.info("cursor I/O loop reconnected; replaying from FSN {}", fsnAtZero);
+                    return;
+                }
+            } catch (Throwable reconnectError) {
+                LOG.error("cursor I/O loop reconnect failed: {}", reconnectError.getMessage(),
+                        reconnectError);
+                t = new LineSenderException(
+                        "cursor I/O loop wire failure followed by reconnect failure: "
+                                + reconnectError.getMessage(), reconnectError);
+            }
+        }
         if (lastError == null) {
             lastError = t;
         }
         running = false;
         LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
+    }
+
+    /**
+     * Reset wire state for a fresh connection: install the new client,
+     * realign {@code fsnAtZero} to the next unacked FSN, restart wire
+     * sequencing from 0, and reposition the cursor so the next
+     * {@link #trySendOne} call replays the first unacked frame.
+     */
+    private void swapClient(WebSocketClient newClient) {
+        WebSocketClient old = this.client;
+        this.client = newClient;
+        if (old != null) {
+            try {
+                old.close();
+            } catch (Throwable ignored) {
+                // best-effort
+            }
+        }
+        long replayStart = engine.ackedFsn() + 1L;
+        this.fsnAtZero = replayStart;
+        this.nextWireSeq = 0L;
+        this.consecutiveSendErrors.set(0L);
+        positionCursorAt(replayStart);
+    }
+
+    /**
+     * Walk the engine's segments to find the one containing {@code targetFsn},
+     * and set {@code sendOffset} to the byte offset of that frame within it.
+     * If {@code targetFsn} is past everything published, park at the live
+     * active segment's published offset (caller will wait for new bytes).
+     */
+    private void positionCursorAt(long targetFsn) {
+        MmapSegment seg = engine.findSegmentContaining(targetFsn);
+        if (seg == null) {
+            // targetFsn is at or past publishedFsn — nothing to replay.
+            // Resume from the active segment's tip; producer may add more.
+            sendingSegment = engine.activeSegment();
+            sendOffset = sendingSegment.publishedOffset();
+            return;
+        }
+        sendingSegment = seg;
+        // Walk frame-by-frame from HEADER_SIZE until we land on targetFsn.
+        long offset = MmapSegment.HEADER_SIZE;
+        long fsn = seg.baseSeq();
+        long base = seg.address();
+        while (fsn < targetFsn) {
+            int payloadLen = Unsafe.getUnsafe().getInt(base + offset + 4);
+            offset += MmapSegment.FRAME_HEADER_SIZE + payloadLen;
+            fsn++;
+        }
+        sendOffset = offset;
     }
 
     private void ioLoop() {

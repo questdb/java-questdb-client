@@ -444,6 +444,35 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * Returns the segment whose published frame range covers {@code fsn}, or
+     * {@code null} if no segment currently holds it (e.g. the FSN is past
+     * {@code publishedFsn} or has been trimmed). Used by the reconnect path
+     * to position the I/O thread's cursor at the first unacked frame for
+     * replay.
+     * <p>
+     * Walks sealed first (oldest → newest) then the active. The sealed list
+     * is small enough — and reconnects are rare enough — that the linear
+     * scan cost doesn't matter.
+     */
+    public synchronized MmapSegment findSegmentContaining(long fsn) {
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            MmapSegment s = sealedSegments.get(i);
+            long base = s.baseSeq();
+            if (fsn >= base && fsn < base + s.frameCount()) {
+                return s;
+            }
+        }
+        MmapSegment a = active;
+        if (a != null) {
+            long base = a.baseSeq();
+            if (fsn >= base && fsn < base + a.frameCount()) {
+                return a;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Segment manager pre-creates the next segment and parks it here. The
      * producer consumes the spare on its next rotation. Throws if a spare
      * is already installed (the manager should have polled {@link #needsHotSpare}

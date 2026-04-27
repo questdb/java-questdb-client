@@ -1314,25 +1314,14 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine == null) {
             throw new LineSenderException("cursor engine must be attached before connect");
         }
-        if (tlsConfig != null) {
-            client = WebSocketClientFactory.newTlsInstance(tlsConfig);
-        } else {
-            client = WebSocketClientFactory.newPlainTextInstance();
-        }
-        try {
-            client.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
-            client.setQwpClientId(QwpConstants.CLIENT_ID);
-            client.setQwpRequestDurableAck(requestDurableAck);
-            client.connect(host, port);
-            client.upgrade(WRITE_PATH, authorizationHeader);
-        } catch (Exception e) {
-            client.close();
-            client = null;
-            throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
-        }
+        client = buildAndConnect();
 
         try {
-            cursorSendLoop = new CursorWebSocketSendLoop(client, cursorEngine);
+            cursorSendLoop = new CursorWebSocketSendLoop(
+                    client, cursorEngine,
+                    0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                    this::buildAndConnect,
+                    this::onWireReconnect);
             cursorSendLoop.start();
         } catch (Throwable t) {
             client.close();
@@ -1359,6 +1348,47 @@ public class QwpWebSocketSender implements Sender {
         connected = true;
         LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
                 host, port, inFlightWindowSize, client.getServerQwpVersion());
+    }
+
+    /**
+     * Build and connect a fresh WebSocket client using the sender's
+     * persistent config (host/port/TLS/auth/durable-ack flag). Used both
+     * for the initial connect and as the reconnect factory passed to the
+     * cursor I/O loop. Throws {@link LineSenderException} on any failure
+     * — the I/O loop's reconnect path treats a throw as fatal for that
+     * attempt (and, in the follow-up commit, schedules a backoff retry
+     * within the per-outage time cap).
+     */
+    private WebSocketClient buildAndConnect() {
+        WebSocketClient newClient;
+        if (tlsConfig != null) {
+            newClient = WebSocketClientFactory.newTlsInstance(tlsConfig);
+        } else {
+            newClient = WebSocketClientFactory.newPlainTextInstance();
+        }
+        try {
+            newClient.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
+            newClient.setQwpClientId(QwpConstants.CLIENT_ID);
+            newClient.setQwpRequestDurableAck(requestDurableAck);
+            newClient.connect(host, port);
+            newClient.upgrade(WRITE_PATH, authorizationHeader);
+        } catch (Exception e) {
+            newClient.close();
+            throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
+        }
+        return newClient;
+    }
+
+    /**
+     * Called by the cursor I/O loop after a successful reconnect. The wire
+     * state has been reset and the cursor repositioned for replay; we bump
+     * connectionGeneration so the producer thread's next encode treats the
+     * connection as fresh (full schema definitions, not refs the new server
+     * has never seen). Single-writer (the I/O thread invokes this), so a
+     * plain volatile increment is safe.
+     */
+    private void onWireReconnect() {
+        connectionGeneration++;
     }
 
     private void ensureNoInProgressRow() {
