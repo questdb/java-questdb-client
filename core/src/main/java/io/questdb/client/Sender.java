@@ -681,8 +681,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private SfDurability sfDurability = SfDurability.MEMORY;
         // close() drain timeout. Default applied at build() time. 0 or -1
         // means "fast close" (skip the drain entirely); any positive value
-        // bounds the wait for ackedFsn to catch up to publishedFsn.
-        private long closeFlushTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        // bounds the wait for ackedFsn to catch up to publishedFsn. Uses
+        // its own sentinel because -1 is a documented user-facing value
+        // and would otherwise collide with PARAMETER_NOT_SET_EXPLICITLY.
+        private static final long CLOSE_FLUSH_TIMEOUT_NOT_SET = Long.MIN_VALUE;
+        private long closeFlushTimeoutMillis = CLOSE_FLUSH_TIMEOUT_NOT_SET;
         // Reconnect policy. Defaults applied at build() time. Per-outage
         // time cap (default 300_000), initial backoff (default 100), and
         // max backoff (default 5_000) for the cursor I/O loop's exponential
@@ -1036,7 +1039,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
                         ? Math.max(defaultMaxTotal, actualSfMaxBytes * 2)
                         : sfMaxTotalBytes;
-                long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY
+                long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == CLOSE_FLUSH_TIMEOUT_NOT_SET
                         ? DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS
                         : closeFlushTimeoutMillis;
                 long actualReconnectMaxDurationMillis =
@@ -1919,20 +1922,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Opt in to scanning {@code <sf_dir>/*} at startup for sibling slots
-         * that hold unacked data left behind by a crashed sender or a
-         * different sender_id. Default {@code false}. WebSocket only;
+         * Opt in to adopting sibling slots under {@code <sf_dir>/*} at
+         * startup that hold unacked data left behind by a crashed sender or
+         * a different sender_id. Default {@code false}. WebSocket only;
          * requires {@code sf_dir} to be set.
          * <p>
-         * The scan is read-only — slots flagged with the {@code .failed}
-         * sentinel are skipped (manual reset required), and the foreground
-         * sender's own slot is never reported.
+         * On startup, after the foreground sender has acquired its own slot
+         * lock, the scan walks every sibling slot directory and dispatches a
+         * background drainer for each candidate orphan. Each drainer takes
+         * the slot's exclusive lock, replays the slot's unacked frames over
+         * its own WebSocket connection to the same target, and unlinks the
+         * slot once fully drained. Concurrency is capped by
+         * {@link #maxBackgroundDrainers(int)} (default {@code 4}).
          * <p>
-         * <b>Status:</b> the scan + visibility (via logs) lands in this
-         * release; the background drainer runtime that actually empties
-         * orphan slots is a follow-up. Setting {@code drain_orphans=true}
-         * today logs the count and paths of orphans found at startup so
-         * users can monitor + manually drain pending slots.
+         * Slots flagged with the {@code .failed} sentinel are skipped
+         * (manual reset required), and the foreground sender's own slot is
+         * never adopted.
          */
         public LineSenderBuilder drainOrphans(boolean enabled) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {

@@ -98,14 +98,20 @@ public class ConnectionGenerationTest {
     @Test
     public void testGenerationIsOneAfterDiskRecovery() throws Exception {
         int port = TEST_PORT + 2;
-        AckHandler handler = new AckHandler();
+        // Silent server: receives binary frames but never ACKs. Session 1
+        // closes with unacked data on disk — that's the realistic recovery
+        // scenario. (A clean shutdown with everything ACK'd is now treated
+        // as a fully-drained slot and the .sfa files are unlinked on close;
+        // recovery in that case correctly sees an empty slot.)
+        SilentHandler handler = new SilentHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            // Session 1: write something, close — leaves *.sfa files behind.
+            // Session 1: write something, close fast (skip drain so the
+            // unacked frames stay on disk).
             CursorSendEngine engine1 = freshEngine(sfDir);
-            try (QwpWebSocketSender sender = connectSender(port, engine1)) {
+            try (QwpWebSocketSender sender = connectSender(port, engine1, 0L)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
             }
@@ -115,7 +121,7 @@ public class ConnectionGenerationTest {
             CursorSendEngine engine2 = freshEngine(sfDir);
             Assert.assertTrue("engine should report disk recovery",
                     engine2.wasRecoveredFromDisk());
-            try (QwpWebSocketSender sender = connectSender(port, engine2)) {
+            try (QwpWebSocketSender sender = connectSender(port, engine2, 0L)) {
                 Assert.assertEquals("recovered engine must bump generation",
                         1L, sender.getConnectionGenerationForTest());
             }
@@ -175,6 +181,19 @@ public class ConnectionGenerationTest {
                 false, engine);
     }
 
+    private QwpWebSocketSender connectSender(int port, CursorSendEngine engine,
+                                             long closeFlushTimeoutMillis) {
+        return QwpWebSocketSender.connect(
+                "localhost", port, null,
+                QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
+                QwpWebSocketSender.DEFAULT_AUTO_FLUSH_BYTES,
+                QwpWebSocketSender.DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
+                QwpWebSocketSender.DEFAULT_IN_FLIGHT_WINDOW_SIZE,
+                null,
+                QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                false, engine, closeFlushTimeoutMillis);
+    }
+
     private static CursorSendEngine freshEngine(String dir) {
         return new CursorSendEngine(dir, 4L * 1024 * 1024);
     }
@@ -197,6 +216,14 @@ public class ConnectionGenerationTest {
             }
         }
         Files.remove(dir);
+    }
+
+    /** Receives binary frames but never ACKs — used for unacked-data-on-disk scenarios. */
+    private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            // intentionally empty
+        }
     }
 
     /** Acks every binary frame so the sender doesn't hang. */

@@ -30,6 +30,8 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * One mmap-backed SF segment file. The user thread (the single producer)
@@ -63,6 +65,7 @@ public final class MmapSegment implements QuietCloseable {
     public static final int FRAME_HEADER_SIZE = 8;   // u32 crc + u32 payloadLen
     public static final int HEADER_SIZE = 24;
     public static final byte VERSION = 1;
+    private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
 
     private final String path;
     private final long sizeBytes;
@@ -90,10 +93,16 @@ public final class MmapSegment implements QuietCloseable {
     // because the consumer must see writes in publication order — once the
     // producer bumps publishedCursor, every byte before it is fully written.
     private volatile long publishedCursor;
+    // Bytes between the last valid frame and the file end that look like an
+    // attempted-but-invalid frame write (non-zero bytes at the bail-out
+    // position). Zero for fresh segments and for cleanly partially-filled
+    // segments (uninitialised tail). Set only by openExisting; visible to
+    // recovery callers for diagnostics. Final after construction.
+    private final long tornTailBytes;
 
     private MmapSegment(String path, int fd, long mmapAddress, long sizeBytes,
                         long baseSeq, long initialCursor, long frameCount,
-                        boolean memoryBacked) {
+                        boolean memoryBacked, long tornTailBytes) {
         this.path = path;
         this.fd = fd;
         this.mmapAddress = mmapAddress;
@@ -103,6 +112,7 @@ public final class MmapSegment implements QuietCloseable {
         this.publishedCursor = initialCursor;
         this.frameCount = frameCount;
         this.memoryBacked = memoryBacked;
+        this.tornTailBytes = tornTailBytes;
     }
 
     /**
@@ -134,7 +144,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(path, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false);
+            return new MmapSegment(path, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
@@ -167,7 +177,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0);
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(null, -1, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, true);
+            return new MmapSegment(null, -1, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, true, 0L);
         } catch (Throwable t) {
             Unsafe.free(addr, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             throw t;
@@ -181,6 +191,14 @@ public final class MmapSegment implements QuietCloseable {
      * end) is treated as a torn tail; both cursors are positioned at the
      * start of that frame. Returns the segment ready for further appends.
      * Throws {@link MmapSegmentException} on header validation failure.
+     * <p>
+     * If recovery observes a torn tail (the bytes at the bail-out position
+     * are non-zero, indicating an attempted-but-failed frame write rather
+     * than clean unwritten space), a {@code WARN} is emitted with the byte
+     * count and the bytes are exposed via {@link #tornTailBytes()} so
+     * operators can detect silent truncation from corruption or partial
+     * writes. Clean partial fills (writer never attempted to write past the
+     * last valid frame) do not log and report {@code 0}.
      */
     public static MmapSegment openExisting(String path) {
         long fileSize = Files.length(path);
@@ -209,7 +227,16 @@ public final class MmapSegment implements QuietCloseable {
             long baseSeq = Unsafe.getUnsafe().getLong(addr + 8);
             long lastGood = scanFrames(addr, fileSize);
             long count = countFrames(addr, lastGood);
-            return new MmapSegment(path, fd, addr, fileSize, baseSeq, lastGood, count, false);
+            long tornTail = detectTornTail(addr, lastGood, fileSize);
+            if (tornTail > 0) {
+                LOG.warn("SF segment {}: torn tail of {} bytes at offset {} "
+                                + "(file size {}, frames recovered {}). "
+                                + "Recovery will overwrite this region on next append; "
+                                + "frames past the tear (if any) are discarded. "
+                                + "Investigate disk health or unexpected writer crash.",
+                        path, tornTail, lastGood, fileSize, count);
+            }
+            return new MmapSegment(path, fd, addr, fileSize, baseSeq, lastGood, count, false, tornTail);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
@@ -356,6 +383,18 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Bytes between the last valid frame and the file end that look like an
+     * attempted-but-invalid frame write — set by {@link #openExisting} when
+     * recovery observes non-zero bytes past the bail-out point. {@code 0} for
+     * fresh segments, memory-backed segments, and cleanly partially-filled
+     * recovered segments. Operators / tests can read this to tell silent
+     * truncation (corruption) from a normal partial fill (no incident).
+     */
+    public long tornTailBytes() {
+        return tornTailBytes;
+    }
+
+    /**
      * Forward scan that returns the offset just past the last frame whose
      * CRC verifies. A torn-tail frame (declared length runs past EOF, or
      * CRC mismatch) leaves both cursors at the start of that frame; the
@@ -382,6 +421,32 @@ public final class MmapSegment implements QuietCloseable {
             pos += FRAME_HEADER_SIZE + payloadLen;
         }
         return pos;
+    }
+
+    /**
+     * Distinguishes "torn tail" (writer attempted a write past the last valid
+     * frame and failed — partial write, mid-stream corruption, bit rot) from
+     * clean unwritten space (manager-allocated segment with zero-filled tail).
+     * Returns the byte count from {@code lastGood} to {@code fileSize} when
+     * the bytes at the bail-out frame header are non-zero, else {@code 0}.
+     * <p>
+     * Heuristic but robust for the common cases: {@link #create} truncates the
+     * file to size, leaving the tail zero-filled; the writer only writes
+     * non-zero bytes via {@link #tryAppend}, which writes the CRC and length
+     * fields together. So a non-zero byte at the failed-frame position
+     * implies an attempted write — exactly the case operators want flagged.
+     */
+    private static long detectTornTail(long addr, long lastGood, long fileSize) {
+        if (lastGood >= fileSize) {
+            return 0L;
+        }
+        long probe = Math.min(FRAME_HEADER_SIZE, fileSize - lastGood);
+        for (long i = 0; i < probe; i++) {
+            if (Unsafe.getUnsafe().getByte(addr + lastGood + i) != 0) {
+                return fileSize - lastGood;
+            }
+        }
+        return 0L;
     }
 
     /**

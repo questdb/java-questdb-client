@@ -71,10 +71,10 @@ public final class SegmentManager implements QuietCloseable {
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
     // Total bytes currently allocated across every segment owned by every
-    // registered ring (active + sealed + hot-spare). Manager-thread only —
-    // incremented when a spare is created, decremented when trim removes a
-    // segment. No lock needed because both operations happen on the manager
-    // thread inside serviceRing().
+    // registered ring (active + sealed + hot-spare). Mutated by the manager
+    // thread on provision/trim and by register/deregister callers under
+    // {@link #lock}; the lock covers both paths so the counter stays
+    // consistent across registration boundaries.
     private long totalBytes;
     private long lastDiskFullLogNs;
     private volatile boolean running;
@@ -94,21 +94,21 @@ public final class SegmentManager implements QuietCloseable {
      * @param segmentSizeBytes per-segment file size in bytes
      * @param pollNanos how often the worker polls each registered ring;
      *                  default {@link #DEFAULT_POLL_NANOS}
-     * @param maxTotalBytes upper bound on total bytes the manager will
-     *                      provision. When provisioning a hot spare would
+     * @param maxTotalBytes upper bound on total bytes the manager tracks
+     *                      across all registered rings — counts every segment
+     *                      the ring owns (initial active + sealed + hot
+     *                      spare), including bytes already on disk at
+     *                      register-time (e.g. after recovery or orphan
+     *                      adoption). When provisioning a hot spare would
      *                      exceed this, the manager skips the install — the
      *                      requesting ring stays in the
      *                      {@link SegmentRing#BACKPRESSURE_NO_SPARE} state
      *                      until ACK-driven trim frees space. Pass
-     *                      {@link #UNLIMITED_TOTAL_BYTES} to disable.
-     *                      <b>Approximation:</b> the cap counts only segments
-     *                      the manager itself provisioned. Each ring's
-     *                      initial active segment (created by the engine
-     *                      before the ring was registered) is "free" for
-     *                      cap purposes — so the effective on-disk cap is
-     *                      {@code maxTotalBytes + (rings × segmentSizeBytes)}.
-     *                      A 1-segment slop is acceptable for the cap's role
-     *                      (preventing runaway growth).
+     *                      {@link #UNLIMITED_TOTAL_BYTES} to disable. Must be
+     *                      at least one {@code segmentSizeBytes}; a sensible
+     *                      lower bound for a single ring is
+     *                      {@code 2 × segmentSizeBytes} so the manager can
+     *                      hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
         if (segmentSizeBytes < MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1) {
@@ -148,6 +148,14 @@ public final class SegmentManager implements QuietCloseable {
         synchronized (lock) {
             for (int i = 0, n = rings.size(); i < n; i++) {
                 if (rings.get(i).ring == ring) {
+                    // Reverse the ring's contribution to totalBytes —
+                    // mirrors the seed in register(). Any spares the
+                    // manager provisioned during the ring's lifetime
+                    // are also part of totalSegmentBytes() now, so a
+                    // single subtraction covers both the initial seed
+                    // and the net manager activity (provisions minus
+                    // trims) for this ring.
+                    totalBytes -= ring.totalSegmentBytes();
                     rings.remove(i);
                     return;
                 }
@@ -169,6 +177,13 @@ public final class SegmentManager implements QuietCloseable {
     public void register(SegmentRing ring, String dir) {
         synchronized (lock) {
             rings.add(new RingEntry(ring, dir));
+            // Account for bytes the ring already owns when it joins. A
+            // recovered ring (post-restart, orphan adoption) can come up
+            // at-or-above the cap; without this seed, totalBytes stays
+            // at 0 and the per-tick cap check at serviceRing would let
+            // the manager keep provisioning new spares on top of the
+            // recovered set, effectively doubling the documented cap.
+            totalBytes += ring.totalSegmentBytes();
             // Skip the file-generation counter past whatever's already on
             // disk in this slot. Without this, on recovery the manager
             // would mint a new spare at sf-0000000000000000.sfa — and
@@ -253,14 +268,21 @@ public final class SegmentManager implements QuietCloseable {
         //    doesn't drown the log.
         boolean memoryMode = e.dir == null;
         if (e.ring.needsHotSpare()) {
-            if (totalBytes + segmentSizeBytes > maxTotalBytes) {
+            // Snapshot totalBytes under lock — register/deregister can mutate
+            // it from caller threads. Heavy provisioning I/O happens outside
+            // the lock; the post-install commit re-acquires it.
+            long observedTotal;
+            synchronized (lock) {
+                observedTotal = totalBytes;
+            }
+            if (observedTotal + segmentSizeBytes > maxTotalBytes) {
                 long now = System.nanoTime();
                 if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
                     LOG.warn("SF {}: cannot provision spare in {} "
                                     + "(totalBytes={}, cap={}, segmentSize={}). "
                                     + "Producer is backpressured until ACK-driven trim frees space.",
                             memoryMode ? "memory cap reached" : "disk-full",
-                            memoryMode ? "<memory>" : e.dir, totalBytes, maxTotalBytes, segmentSizeBytes);
+                            memoryMode ? "<memory>" : e.dir, observedTotal, maxTotalBytes, segmentSizeBytes);
                     lastDiskFullLogNs = now;
                 }
             } else {
@@ -280,7 +302,9 @@ public final class SegmentManager implements QuietCloseable {
                     }
                     try {
                         e.ring.installHotSpare(spare);
-                        totalBytes += segmentSizeBytes;
+                        synchronized (lock) {
+                            totalBytes += segmentSizeBytes;
+                        }
                     } catch (Throwable t) {
                         spare.close();
                         if (path != null) {
@@ -309,7 +333,9 @@ public final class SegmentManager implements QuietCloseable {
                     if (path != null && !Files.remove(path)) {
                         LOG.warn("Failed to unlink trimmed segment {}", path);
                     }
-                    totalBytes -= sz;
+                    synchronized (lock) {
+                        totalBytes -= sz;
+                    }
                 } catch (Throwable t) {
                     LOG.warn("Failed to trim segment {}", path == null ? "<memory>" : path, t);
                 }

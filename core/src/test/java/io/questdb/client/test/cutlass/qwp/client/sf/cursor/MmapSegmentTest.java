@@ -172,6 +172,83 @@ public class MmapSegmentTest {
     }
 
     @Test
+    public void testRecoverySignalsTornTailWithByteCount() {
+        // Recovery must distinguish "writer attempted a frame past lastGood
+        // and failed" (torn tail — possible corruption / partial write) from
+        // a clean partial fill (no incident, just unwritten space).
+        // Pre-fix: silent truncation with no diagnostic.
+        String path = tmpDir + "/seg-torn-signal.sfa";
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        long lastGood;
+        try {
+            try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                for (int i = 0; i < 3; i++) {
+                    fillPattern(buf, 16, i);
+                    seg.tryAppend(buf, 16);
+                }
+                lastGood = seg.publishedOffset();
+                // Inject a non-zero attempted-frame signature past the last
+                // valid frame: a CRC and length that don't validate. This
+                // mirrors a partial write or in-place corruption.
+                long addr = seg.address();
+                Unsafe.getUnsafe().putInt(addr + lastGood, 0xCAFEBABE);
+                Unsafe.getUnsafe().putInt(addr + lastGood + 4, 16);
+                seg.msync();
+            }
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                assertEquals("scan must stop at last good frame", lastGood, seg.publishedOffset());
+                assertTrue("torn tail must be reported as nonzero so operators see "
+                                + "silent truncation; got " + seg.tornTailBytes(),
+                        seg.tornTailBytes() > 0);
+                assertEquals("torn-tail count must be the byte gap to file end",
+                        4096L - lastGood, seg.tornTailBytes());
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testRecoveryDoesNotFlagCleanPartialFill() {
+        // Counterpart to the torn-tail test: a writer that wrote N valid
+        // frames and stopped (clean) leaves an all-zero tail. Recovery must
+        // NOT cry wolf — tornTailBytes should be 0 so log noise stays
+        // proportional to actual incidents.
+        String path = tmpDir + "/seg-clean-tail.sfa";
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                for (int i = 0; i < 3; i++) {
+                    fillPattern(buf, 16, i);
+                    seg.tryAppend(buf, 16);
+                }
+                seg.msync();
+            }
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                assertEquals("clean partial fill must report zero torn tail",
+                        0L, seg.tornTailBytes());
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testRecoveryDoesNotFlagFreshUnusedSegment() {
+        // A manager-allocated hot-spare that the writer never touched: the
+        // file has just the header and an all-zero body. Recovery must not
+        // emit a torn-tail signal here either.
+        String path = tmpDir + "/seg-fresh.sfa";
+        try (MmapSegment seg = MmapSegment.create(path, 42L, 4096)) {
+            seg.msync();
+        }
+        try (MmapSegment seg = MmapSegment.openExisting(path)) {
+            assertEquals("fresh-but-unused segment must report zero torn tail",
+                    0L, seg.tornTailBytes());
+        }
+    }
+
+    @Test
     public void testFullSegmentRejectsFurtherAppends() {
         String path = tmpDir + "/seg-full.sfa";
         // Just enough room for header + exactly one 100-byte payload.

@@ -97,6 +97,13 @@ public final class SegmentRing implements QuietCloseable {
     private boolean wakeupRequestedForActive;
     private long nextSeq;
     private volatile long publishedFsn = -1L;
+    // Set to true by close(); checked by installHotSpare under the ring's
+    // monitor to reject spares that arrive after the ring has been torn
+    // down. Without this, a manager's serviceRing tick that snapshotted
+    // the ring before deregister could create a fresh MmapSegment, then
+    // call installHotSpare on a closed ring (whose hotSpare was just
+    // zeroed by close()) — the spare's mmap + fd would never be reclaimed.
+    private boolean closed;
 
     /**
      * Creates a ring with the given segment cap and an already-prepared
@@ -161,9 +168,13 @@ public final class SegmentRing implements QuietCloseable {
                         // carry the provisional baseSeq=0 and frameCount=0,
                         // which would otherwise collide with the real
                         // baseSeq=0 segment and trip the contiguity check
-                        // below. No data to recover; close + skip.
+                        // below. No data to recover; close and unlink.
+                        // Without the unlink the file persists across crash
+                        // cycles and the disk leak compounds with every
+                        // unclean shutdown.
                         if (seg.frameCount() == 0) {
                             seg.close();
+                            Files.remove(path);
                         } else {
                             opened.add(seg);
                         }
@@ -182,24 +193,16 @@ public final class SegmentRing implements QuietCloseable {
         if (opened.size() == 0) {
             return null;
         }
-        // Sort by baseSeq ascending. ObjList lacks sort; do a simple selection
-        // sort — typical recovery is < 100 segments, O(n^2) is fine.
-        for (int i = 0, n = opened.size(); i < n; i++) {
-            int minIdx = i;
-            long minBase = opened.get(i).baseSeq();
-            for (int j = i + 1; j < n; j++) {
-                long b = opened.get(j).baseSeq();
-                if (b < minBase) {
-                    minBase = b;
-                    minIdx = j;
-                }
-            }
-            if (minIdx != i) {
-                MmapSegment tmp = opened.get(i);
-                opened.setQuick(i, opened.get(minIdx));
-                opened.setQuick(minIdx, tmp);
-            }
-        }
+        // Sort by baseSeq ascending. Worst-case segment count is
+        // sf_max_total_bytes / sf_max_bytes — at the documented ceiling
+        // (1 TiB / 64 MiB) that is ~16K entries, where an O(N²) sort spends
+        // multiple seconds in compares + shifts before the I/O thread can
+        // start. In-place quicksort with median-of-three pivot keeps the
+        // no-allocation discipline of the surrounding code; median-of-three
+        // is required because readdir on many filesystems returns entries
+        // in lexicographic (== baseSeq-hex) order and a naive first-element
+        // pivot would degrade back to O(N²) on exactly that common case.
+        sortByBaseSeq(opened, 0, opened.size());
         // Sanity: the recovered segments must form a contiguous FSN range.
         // Detect gaps so a partial-write/manual-deletion mishap doesn't
         // silently produce duplicate or missing FSNs after recovery.
@@ -317,7 +320,14 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
+        // Marking closed BEFORE freeing fields ensures any concurrent
+        // installHotSpare (waiting on this monitor) will observe closed
+        // when it acquires the lock and reject the spare cleanly. The
+        // monitor also serializes against drainTrimmable / nextSealedAfter
+        // / firstSealed / findSegmentContaining, so they don't iterate
+        // half-freed state.
+        closed = true;
         if (active != null) {
             active.close();
             active = null;
@@ -476,9 +486,15 @@ public final class SegmentRing implements QuietCloseable {
      * Segment manager pre-creates the next segment and parks it here. The
      * producer consumes the spare on its next rotation. Throws if a spare
      * is already installed (the manager should have polled {@link #needsHotSpare}
-     * first; double-install is a programming error).
+     * first; double-install is a programming error), or if the ring has
+     * been closed since the manager started provisioning the spare. The
+     * latter is a benign race — the manager's catch block already closes
+     * the unused spare and unlinks its file.
      */
-    public void installHotSpare(MmapSegment spare) {
+    public synchronized void installHotSpare(MmapSegment spare) {
+        if (closed) {
+            throw new IllegalStateException("ring closed");
+        }
         if (hotSpare != null) {
             throw new IllegalStateException("hot spare already installed");
         }
@@ -490,6 +506,26 @@ public final class SegmentRing implements QuietCloseable {
 
     public long maxBytesPerSegment() {
         return maxBytesPerSegment;
+    }
+
+    /**
+     * Total mmap'd bytes the ring currently owns: active + hot spare (if
+     * installed) + every sealed segment. Used by {@code SegmentManager}
+     * to seed its {@code totalBytes} accounting at register time and to
+     * reverse the contribution at deregister time. Synchronized against
+     * rotation so we never read a half-resized sealed list.
+     */
+    public synchronized long totalSegmentBytes() {
+        long total = 0L;
+        MmapSegment a = active;
+        if (a != null) total += a.sizeBytes();
+        MmapSegment hs = hotSpare;
+        if (hs != null) total += hs.sizeBytes();
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            MmapSegment s = sealedSegments.get(i);
+            if (s != null) total += s.sizeBytes();
+        }
+        return total;
     }
 
     /**
@@ -526,5 +562,58 @@ public final class SegmentRing implements QuietCloseable {
      */
     public long publishedFsn() {
         return publishedFsn;
+    }
+
+    /**
+     * In-place quicksort over {@code list[lo, hi)} keyed by ascending
+     * {@code baseSeq}. Median-of-three pivot avoids the pathological O(N²)
+     * on already-sorted input that lexicographic readdir produces (our
+     * filenames are zero-padded hex of {@code baseSeq}). Recursion depth is
+     * bounded by ~2 log₂(N) — for the documented 16K-segment ceiling, well
+     * under the JVM default stack.
+     */
+    private static void sortByBaseSeq(ObjList<MmapSegment> list, int lo, int hi) {
+        while (hi - lo > 1) {
+            int mid = (lo + hi) >>> 1;
+            long a = list.get(lo).baseSeq();
+            long b = list.get(mid).baseSeq();
+            long c = list.get(hi - 1).baseSeq();
+            // Median of {a, b, c} → pivot index.
+            int pivotIdx;
+            if (Long.compareUnsigned(a, b) < 0) {
+                if (Long.compareUnsigned(b, c) < 0) pivotIdx = mid;
+                else if (Long.compareUnsigned(a, c) < 0) pivotIdx = hi - 1;
+                else pivotIdx = lo;
+            } else {
+                if (Long.compareUnsigned(a, c) < 0) pivotIdx = lo;
+                else if (Long.compareUnsigned(b, c) < 0) pivotIdx = hi - 1;
+                else pivotIdx = mid;
+            }
+            long pivot = list.get(pivotIdx).baseSeq();
+            swap(list, pivotIdx, hi - 1);
+            int store = lo;
+            for (int i = lo; i < hi - 1; i++) {
+                if (Long.compareUnsigned(list.get(i).baseSeq(), pivot) < 0) {
+                    swap(list, i, store++);
+                }
+            }
+            swap(list, store, hi - 1);
+            // Recurse on the smaller partition; loop on the larger to keep
+            // recursion depth bounded by log₂(N).
+            if (store - lo < hi - store - 1) {
+                sortByBaseSeq(list, lo, store);
+                lo = store + 1;
+            } else {
+                sortByBaseSeq(list, store + 1, hi);
+                hi = store;
+            }
+        }
+    }
+
+    private static void swap(ObjList<MmapSegment> list, int i, int j) {
+        if (i == j) return;
+        MmapSegment tmp = list.get(i);
+        list.setQuick(i, list.get(j));
+        list.setQuick(j, tmp);
     }
 }

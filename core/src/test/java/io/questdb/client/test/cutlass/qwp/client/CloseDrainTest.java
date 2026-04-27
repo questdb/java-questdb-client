@@ -106,6 +106,40 @@ public class CloseDrainTest {
     }
 
     @Test
+    public void testCloseFastWhenTimeoutIsMinusOne() throws Exception {
+        // Documented contract: close_flush_timeout_millis=-1 opts out of the
+        // drain (fast close), same as 0. See LineSenderBuilder#closeFlushTimeoutMillis
+        // Javadoc — "Set to 0 or -1 to opt out — close() will not wait at all".
+        //
+        // Currently fails because -1 collides with the PARAMETER_NOT_SET_EXPLICITLY
+        // sentinel in LineSenderBuilder, so the build path silently substitutes
+        // DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS (5000ms) and close() blocks for the
+        // full ACK delay instead of returning fast.
+        int port = TEST_PORT + 4;
+        long ackDelayMs = 1500;
+        DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + port
+                    + ";close_flush_timeout_millis=-1;";
+            long elapsedMs;
+            try (Sender sender = Sender.fromConfig(cfg)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                long t0 = System.nanoTime();
+                sender.close();
+                elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+            }
+            Assert.assertTrue(
+                    "close() with timeout=-1 took " + elapsedMs + "ms — "
+                            + "the documented -1 opt-out is being silently overridden by the default",
+                    elapsedMs < ackDelayMs / 2);
+        }
+    }
+
+    @Test
     public void testCloseDrainTimesOutWhenAcksNeverArrive() throws Exception {
         // Server that buffers frames silently and never ACKs. close() must
         // return after roughly the configured timeout — not hang forever

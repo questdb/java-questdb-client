@@ -156,28 +156,30 @@ public class SegmentManagerTest {
     public void testMaxTotalBytesCapBlocksProvisioningUntilTrimFrees() throws Exception {
         long segSize = MmapSegment.HEADER_SIZE
                 + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-        // Cap = exactly 2 manager-provisioned segments. The engine's initial
-        // active is "free" per the cap's documented approximation.
-        long cap = 2 * segSize;
+        // Cap = 3 segments total. The ring's initial active counts toward
+        // the cap (counted at register-time), so this leaves headroom for
+        // exactly 2 manager-provisioned spares before backpressure kicks in.
+        long cap = 3 * segSize;
         MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
         long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
         try (SegmentRing ring = new SegmentRing(seg0, segSize);
              SegmentManager mgr = new SegmentManager(segSize, 200_000L, cap)) {
             mgr.start();
+            // register seeds totalBytes = 1*segSize (initial active).
             mgr.register(ring, tmpDir);
 
-            // Manager provisions spare 1 → counter = 1*segSize.
+            // Manager provisions spare 1 → totalBytes = 2*segSize.
             assertTrue(waitFor(() -> !ring.needsHotSpare(), 2000));
             // Fill initial (becomes sealed), rotate to spare 1.
             ring.appendOrFsn(buf, 64);
             ring.appendOrFsn(buf, 64);
             ring.appendOrFsn(buf, 64); // forces rotation
-            // Manager provisions spare 2 → counter = 2*segSize. At cap.
+            // Manager provisions spare 2 → totalBytes = 3*segSize. At cap.
             assertTrue(waitFor(() -> !ring.needsHotSpare(), 2000));
             // Fill spare 1 (becomes sealed), rotate to spare 2.
             ring.appendOrFsn(buf, 64);
             ring.appendOrFsn(buf, 64); // forces rotation again
-            // Manager would provision spare 3 → would be 3*segSize > cap. Refused.
+            // Manager would provision spare 3 → would be 4*segSize > cap. Refused.
             // The ring should sit in needsHotSpare=true indefinitely.
             // Verify: after ample time, still no spare.
             Thread.sleep(150);

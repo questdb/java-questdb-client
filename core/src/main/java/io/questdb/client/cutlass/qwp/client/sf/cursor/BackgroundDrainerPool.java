@@ -32,6 +32,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Bounded thread pool that runs {@link BackgroundDrainer} tasks. One pool
@@ -51,11 +52,24 @@ public final class BackgroundDrainerPool implements QuietCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainerPool.class);
     private static final long CLOSE_GRACE_MILLIS = 3_000L;
+    // CAS gate. Single AtomicInteger packs the closed flag (sign bit) and
+    // the in-flight submit count (low 31 bits):
+    //   state >= 0       → open, value is the in-flight submit count
+    //   state < 0        → closed bit set, low bits still track in-flight
+    //                      count waiting to drain
+    // submit() CASes state+1 only if state >= 0; close() CASes the CLOSED
+    // bit on, then waits for state to reach exactly CLOSED_BIT (no
+    // in-flight). This eliminates the "submit reads closed=false then
+    // close shuts the executor down" race window: the closed-bit CAS
+    // contends with the increment CAS on the same atomic, so submit
+    // either lands before close (and close waits for it to finish) or
+    // sees the closed bit and throws.
+    private static final int CLOSED_BIT = Integer.MIN_VALUE;
+    private final AtomicInteger state = new AtomicInteger();
 
     private final ExecutorService executor;
     private final CopyOnWriteArrayList<BackgroundDrainer> active = new CopyOnWriteArrayList<>();
     private final int maxConcurrent;
-    private volatile boolean closed;
 
     public BackgroundDrainerPool(int maxConcurrent) {
         if (maxConcurrent <= 0) {
@@ -77,19 +91,42 @@ public final class BackgroundDrainerPool implements QuietCloseable {
      * Submits a drainer for background execution. The pool tracks it so
      * {@link #close} can request a stop. Safe to call any number of
      * times; excess submissions queue inside the pool's executor.
+     * <p>
+     * Reserves a "submit slot" on the {@link #state} CAS gate first; if
+     * the closed bit is already set, throws immediately. Otherwise the
+     * gate guarantees {@code close()} cannot shut the executor down until
+     * after we release the slot, so {@code executor.submit} always lands.
      */
     public void submit(BackgroundDrainer drainer) {
-        if (closed) {
-            throw new IllegalStateException("pool closed");
+        // Reserve a slot on the gate. Spin on CAS until either we win
+        // (state was non-negative) or we observe the closed bit.
+        for (;;) {
+            int s = state.get();
+            if (s < 0) {
+                throw new IllegalStateException("pool closed");
+            }
+            if (state.compareAndSet(s, s + 1)) break;
         }
-        active.add(drainer);
-        executor.submit(() -> {
-            try {
-                drainer.run();
-            } finally {
+        boolean accepted = false;
+        try {
+            active.add(drainer);
+            executor.submit(() -> {
+                try {
+                    drainer.run();
+                } finally {
+                    active.remove(drainer);
+                }
+            });
+            accepted = true;
+        } finally {
+            if (!accepted) {
                 active.remove(drainer);
             }
-        });
+            // Release our slot. Decrement is safe regardless of the
+            // closed bit's state — the bit lives in position 31 and
+            // only the low 31 bits move.
+            state.decrementAndGet();
+        }
     }
 
     /**
@@ -103,8 +140,21 @@ public final class BackgroundDrainerPool implements QuietCloseable {
 
     @Override
     public void close() {
-        if (closed) return;
-        closed = true;
+        // Set the closed bit. CAS-loop because the in-flight count can be
+        // changing under us. Subsequent submit() calls will fail their
+        // CAS check (state < 0) and throw.
+        for (;;) {
+            int s = state.get();
+            if (s < 0) return; // already closed (idempotent)
+            if (state.compareAndSet(s, s | CLOSED_BIT)) break;
+        }
+        // Wait for in-flight submits to release their slots — i.e. for
+        // state to drain to exactly CLOSED_BIT (no low bits set). This
+        // ensures every submit's executor.submit has already returned
+        // before we shut the executor down.
+        while (state.get() != CLOSED_BIT) {
+            Thread.onSpinWait();
+        }
         for (BackgroundDrainer d : active) {
             d.requestStop();
         }

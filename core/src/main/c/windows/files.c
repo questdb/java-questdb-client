@@ -145,14 +145,34 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openCleanRW0
     return fd;
 }
 
+/* ReadFile/WriteFile take a DWORD (uint32) byte count, but the JNI signature
+ * exposes a jlong. A direct (DWORD) cast silently truncates the high 32 bits,
+ * which means a 4 GiB request becomes a 0-byte transfer — the worst kind of
+ * silent failure. Clamp to MAXDWORD so any oversized request is served as a
+ * short transfer (matching POSIX semantics on the share/files.c side); the
+ * Java caller already loops on the return value. Reject negative len up front
+ * so it doesn't get reinterpreted as a huge unsigned DWORD. */
+static inline DWORD clamp_len(jlong len) {
+    if (len > (jlong) MAXDWORD) {
+        return MAXDWORD;
+    }
+    return (DWORD) len;
+}
+
 JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_read
         (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len, jlong offset) {
+    if (len < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        SaveLastError();
+        return -1;
+    }
+    if (len == 0) return 0;
     OVERLAPPED ov;
     memset(&ov, 0, sizeof(ov));
     ov.Offset = (DWORD) (offset & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD) (offset >> 32);
     DWORD got = 0;
-    if (!ReadFile(FD_TO_HANDLE(fd), (LPVOID) (uintptr_t) addr, (DWORD) len, &got, &ov)) {
+    if (!ReadFile(FD_TO_HANDLE(fd), (LPVOID) (uintptr_t) addr, clamp_len(len), &got, &ov)) {
         DWORD err = GetLastError();
         if (err == ERROR_HANDLE_EOF) {
             return 0;
@@ -165,12 +185,18 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_read
 
 JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_write
         (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len, jlong offset) {
+    if (len < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        SaveLastError();
+        return -1;
+    }
+    if (len == 0) return 0;
     OVERLAPPED ov;
     memset(&ov, 0, sizeof(ov));
     ov.Offset = (DWORD) (offset & 0xFFFFFFFF);
     ov.OffsetHigh = (DWORD) (offset >> 32);
     DWORD wrote = 0;
-    if (!WriteFile(FD_TO_HANDLE(fd), (LPCVOID) (uintptr_t) addr, (DWORD) len, &wrote, &ov)) {
+    if (!WriteFile(FD_TO_HANDLE(fd), (LPCVOID) (uintptr_t) addr, clamp_len(len), &wrote, &ov)) {
         SaveLastError();
         return -1;
     }
@@ -179,8 +205,14 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_write
 
 JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_append
         (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len) {
+    if (len < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        SaveLastError();
+        return -1;
+    }
+    if (len == 0) return 0;
     DWORD wrote = 0;
-    if (!WriteFile(FD_TO_HANDLE(fd), (LPCVOID) (uintptr_t) addr, (DWORD) len, &wrote, NULL)) {
+    if (!WriteFile(FD_TO_HANDLE(fd), (LPCVOID) (uintptr_t) addr, clamp_len(len), &wrote, NULL)) {
         SaveLastError();
         return -1;
     }

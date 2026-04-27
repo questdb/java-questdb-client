@@ -879,17 +879,30 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Flushes buffered rows and waits until the server acknowledges all submitted
-     * WebSocket batches.
+     * Encodes pending rows into the cursor engine and returns once the data
+     * is published into the engine — in-RAM for memory mode, on-disk for
+     * store-and-forward mode. {@code flush()} does <b>not</b> wait for the
+     * server to acknowledge the batches; ACKs arrive asynchronously and the
+     * background I/O loop trims acked frames out of the engine independently.
      * <p>
-     * If a WebSocket send, receive, ACK timeout, server error ACK, invalid ACK,
-     * or server close is observed after the connection has been established, the
-     * sender enters a terminal failed state. The first failure is retained and
-     * subsequent public operations rethrow the same {@link LineSenderException}.
-     * Create a new sender to resume sending.
+     * If the engine's cursor ring is at the {@code sf_max_total_bytes} cap,
+     * {@code flush()} blocks while the I/O loop drains acked frames and
+     * frees space, up to {@code sf_append_deadline_millis} (default 30 s);
+     * on deadline expiry, this method throws.
+     * <p>
+     * For close-time drain semantics — waiting for the server to ACK
+     * everything published before shutting the I/O loop down — use
+     * {@link io.questdb.client.Sender.LineSenderBuilder#closeFlushTimeoutMillis(long)}.
+     * <p>
+     * If a WebSocket send, receive, ACK timeout, server error ACK, invalid
+     * ACK, or server close is observed after the connection has been
+     * established, the sender enters a terminal failed state. The first
+     * failure is retained and subsequent public operations rethrow the same
+     * {@link LineSenderException}. Create a new sender to resume sending.
      *
-     * @throws LineSenderException if the sender is closed, a row is still in
-     *                             progress, connection setup fails, or a terminal
+     * @throws LineSenderException if the sender is closed, a row is still
+     *                             in progress, connection setup fails, the
+     *                             engine cap deadline expires, or a terminal
      *                             WebSocket failure is observed
      */
     @Override
@@ -1444,6 +1457,16 @@ public class QwpWebSocketSender implements Sender {
             // that originally recorded the failure.
             error.fillInStackTrace();
             throw error;
+        }
+        // Poll the cursor I/O loop's lastError too. Without this, a fatal
+        // wire / server-rejection error recorded by the I/O thread would
+        // only surface on the next flush() / close() — every row-level
+        // method (table, longColumn, atNow, etc.) routes through
+        // checkNotClosed → checkConnectionError, so failing to poll here
+        // means callers can keep accumulating rows long after the sender
+        // is already broken.
+        if (cursorSendLoop != null) {
+            cursorSendLoop.checkError();
         }
     }
 

@@ -228,13 +228,38 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @Override
     public void close() {
         running = false;
-        if (ioThread != null) {
-            try {
-                shutdownLatch.await();
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
+        Thread t = ioThread;
+        if (t != null) {
+            // Only await the shutdown latch if the I/O thread actually ran.
+            // If start() failed after assigning ioThread but before t.start()
+            // succeeded (e.g. native stack OOM), ioLoop never ran and its
+            // finally{shutdownLatch.countDown()} never fired — awaiting here
+            // would block forever. isAlive()==false also covers the normal
+            // post-exit case where the latch is already counted down.
+            if (t.isAlive()) {
+                try {
+                    shutdownLatch.await();
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
             }
             ioThread = null;
+        }
+        // Close the current client. After a reconnect, swapClient has
+        // replaced the original (and closed it); the owner only retains
+        // the stale pre-reconnect reference. Without closing the live
+        // client here, its native socket and fds leak past sender.close()
+        // every time the loop reconnected at least once. close() is
+        // idempotent, so the owner's duplicate close on its stale
+        // reference is still safe.
+        WebSocketClient c = client;
+        if (c != null) {
+            try {
+                c.close();
+            } catch (Throwable ignored) {
+                // best-effort
+            }
+            client = null;
         }
     }
 
@@ -278,9 +303,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // actually reaches the wire — without it, start() would skip
         // straight to the active and orphan everything in sealed.
         positionCursorForStart();
-        ioThread = new Thread(this::ioLoop, "qdb-cursor-ws-io");
-        ioThread.setDaemon(true);
-        ioThread.start();
+        Thread t = new Thread(this::ioLoop, "qdb-cursor-ws-io");
+        t.setDaemon(true);
+        try {
+            t.start();
+        } catch (Throwable th) {
+            // Thread.start() failed (e.g. native stack alloc OOM). ioLoop
+            // never ran, so its finally{shutdownLatch.countDown()} never
+            // fires. Release the latch and reset state so a subsequent
+            // close() doesn't block on a thread that doesn't exist.
+            running = false;
+            shutdownLatch.countDown();
+            throw th;
+        }
+        // Commit ioThread only after t.start() succeeded — otherwise close()
+        // would observe a non-null ioThread for a thread that never ran.
+        ioThread = t;
     }
 
     /**
@@ -715,8 +753,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 engine.acknowledge(fsnAtZero + capped);
                 totalAcks.incrementAndGet();
             } else {
-                fail(new LineSenderException(
-                        "server reported error for wire seq " + wireSeq));
+                // Application-layer rejection by the server (e.g.
+                // STATUS_SCHEMA_MISMATCH, STATUS_PARSE_ERROR). The bytes
+                // on disk are the bytes the server rejected — reconnecting
+                // and replaying them cannot fix the rejection, it just
+                // burns CPU and reconnect attempts forever (each successful
+                // reconnect resets the per-outage budget). Mark the loop
+                // terminal directly via recordFatal so the next user-thread
+                // API call surfaces the rejection, instead of routing
+                // through fail() which would enter the reconnect retry
+                // loop. Wire-level failures (sendBinary throw, server
+                // close, parse-fail of the response payload) still go
+                // through fail() — those CAN be fixed by reconnecting.
+                recordFatal(new LineSenderException(
+                        "server rejected wire seq " + wireSeq
+                                + " (status=" + response.getStatusName()
+                                + ") — terminal, sender will not replay"));
             }
         }
     }

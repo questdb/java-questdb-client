@@ -430,6 +430,71 @@ public class SegmentRingTest {
         }
     }
 
+    /**
+     * Open-time sort regression: at the documented {@code sf_max_total_bytes
+     * / sf_max_bytes} ceiling (~16K segments) an O(N²) sort over the
+     * recovered segments burns multi-second wall time before the I/O thread
+     * can start. The previous selection-sort implementation regressed an
+     * earlier perf fix on the legacy {@code SegmentLog} path; this test
+     * guards the cursor path against the same regression.
+     * <p>
+     * Constructs N=2048 valid one-frame segments with names assigned in
+     * lexicographic order — the exact pattern {@code readdir} produces on
+     * many filesystems (and the worst case for a naive first-element pivot).
+     * Recovers, asserts contiguous baseSeq ordering and total frame count,
+     * and bounds wall time at 5 s. With the median-of-three quicksort the
+     * test completes in well under a second; an O(N²) regression at this
+     * scale climbs back into multi-second territory.
+     */
+    @Test
+    public void testLargeSegmentCountReopensInOrder() {
+        final int n = 2048;
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < 16; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) i);
+            }
+            // Lexicographic 5-digit zero-padded prefix → readdir on most
+            // filesystems returns entries in ascending baseSeq order, the
+            // worst case for naive quicksort pivots.
+            for (int i = 0; i < n; i++) {
+                String name = String.format("sf-%05d.sfa", i);
+                long segSize = MmapSegment.HEADER_SIZE
+                        + MmapSegment.FRAME_HEADER_SIZE + 16;
+                MmapSegment seg = MmapSegment.create(tmpDir + "/" + name, i, segSize);
+                try {
+                    assertTrue("setup append " + i, seg.tryAppend(buf, 16) >= 0);
+                } finally {
+                    seg.close();
+                }
+            }
+
+            long startMs = System.currentTimeMillis();
+            try (SegmentRing ring = SegmentRing.openExisting(tmpDir,
+                    MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 16)) {
+                long elapsed = System.currentTimeMillis() - startMs;
+                assertNotNull("recovery must produce a ring", ring);
+                // After recovery, the ring's nextSeqHint is one past the
+                // last frame on disk. With one frame per segment numbered
+                // 0..n-1, that's exactly n.
+                assertEquals("recovered ring must see all " + n + " frames in order",
+                        n, ring.nextSeqHint());
+                // publishedFsn = n - 1 (last frame visible).
+                assertEquals(n - 1, ring.publishedFsn());
+                // 5s is comfortably above the quicksort path (sub-second on
+                // any modern machine) and well below the seconds-of-CPU the
+                // production-ceiling O(N²) regression would produce. Tight
+                // enough to fire if the algorithm regresses, loose enough
+                // to survive a slow CI runner.
+                assertTrue("recovery took " + elapsed + " ms (expected < 5000); "
+                                + "regression suggests the segment sort is back to O(N²)",
+                        elapsed < 5_000);
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     private static void fillPattern(long addr, int len, int seed) {
         for (int i = 0; i < len; i++) {
             Unsafe.getUnsafe().putByte(addr + i, (byte) (seed * 31 + i + 17));

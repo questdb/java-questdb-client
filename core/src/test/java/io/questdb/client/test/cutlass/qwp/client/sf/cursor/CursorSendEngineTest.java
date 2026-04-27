@@ -140,14 +140,14 @@ public class CursorSendEngineTest {
 
     @Test
     public void testAppendBlockingThrowsOnDeadlineExpiryUnderCap() throws Exception {
-        // Cap counts manager-provisioned segments only (the initial active is
-        // "free" per SegmentManager's documented approximation). With cap =
-        // 2*segSize and segSize fitting 2 frames, the producer can land
+        // Cap counts every segment the ring owns (initial active + sealed +
+        // hot spare), including bytes already on disk at register-time. With
+        // cap = 3*segSize and segSize fitting 2 frames, the producer can land
         // initial (2) + spare1 (2) + spare2 (2) = 6 frames. The 7th rotation
         // needs a spare3 that the cap forbids → backpressure → deadline.
         long segSize = MmapSegment.HEADER_SIZE
                 + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-        long cap = 2 * segSize;
+        long cap = 3 * segSize;
         long shortDeadlineNanos = 200_000_000L; // 200 ms
         long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
         try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize, cap, shortDeadlineNanos)) {

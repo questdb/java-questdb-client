@@ -156,6 +156,12 @@ public final class CursorSendEngine implements QuietCloseable {
         this.ownsManager = ownsManager;
         this.appendDeadlineNanos = appendDeadlineNanos;
 
+        // Track the ring locally until every step succeeds — only commit it
+        // to this.ring at the very end. If anything between ring allocation
+        // and manager.register throws, the catch block closes the local
+        // reference instead of orphaning the mmap'd segments + fds.
+        SegmentRing ringInProgress = null;
+        boolean managerStarted = false;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
@@ -165,7 +171,7 @@ public final class CursorSendEngine implements QuietCloseable {
                     : SegmentRing.openExisting(sfDir, segmentSizeBytes);
             this.recoveredFromDisk = recovered != null;
             if (recovered != null) {
-                this.ring = recovered;
+                ringInProgress = recovered;
                 // Seed ackedFsn to one below the lowest segment's baseSeq.
                 // We don't know what was actually acked before the prior
                 // session crashed, but anything trimmed off the ring's
@@ -192,7 +198,7 @@ public final class CursorSendEngine implements QuietCloseable {
                     initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
                 }
                 try {
-                    this.ring = new SegmentRing(initial, segmentSizeBytes);
+                    ringInProgress = new SegmentRing(initial, segmentSizeBytes);
                 } catch (Throwable t) {
                     initial.close();
                     if (initialPath != null) {
@@ -204,11 +210,28 @@ public final class CursorSendEngine implements QuietCloseable {
 
             if (ownsManager) {
                 manager.start();
+                managerStarted = true;
             }
-            manager.register(ring, sfDir);
+            manager.register(ringInProgress, sfDir);
+            // All construction succeeded — commit the ring reference.
+            this.ring = ringInProgress;
         } catch (Throwable t) {
-            // Recovery / ring init failed — release the slot lock so a
-            // subsequent retry (or another sender) isn't locked out.
+            // Order: ring first (releases mmap/fd), then manager (joins
+            // worker thread, but only if we started it AND we own it),
+            // then slot lock. Each in its own try/catch so a single
+            // failure doesn't strand later cleanups.
+            if (ringInProgress != null) {
+                try {
+                    ringInProgress.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (ownsManager && managerStarted) {
+                try {
+                    manager.close();
+                } catch (Throwable ignored) {
+                }
+            }
             if (acquiredLock != null) {
                 try {
                     acquiredLock.close();
@@ -273,17 +296,61 @@ public final class CursorSendEngine implements QuietCloseable {
     public void close() {
         if (closed) return;
         closed = true;
+        // Capture drain state BEFORE closing the ring — once the ring is
+        // closed, its accessors aren't safe to read. The active segment is
+        // never trimmed by drainTrimmable (only sealed segments are), so
+        // when everything published has been acked we have to unlink the
+        // residual .sfa files here. Without this, the next sender (or a
+        // drainer adopting this slot) would replay already-acked data
+        // against potentially-fresh server state — duplicate writes when
+        // the server has no dedup state for those messageSequences.
+        // Memory mode has no files to unlink.
+        boolean fullyDrained = sfDir != null
+                && ring.publishedFsn() >= 0
+                && ring.ackedFsn() >= ring.publishedFsn();
         manager.deregister(ring);
         if (ownsManager) {
             manager.close();
         }
         ring.close();
+        if (fullyDrained) {
+            unlinkAllSegmentFiles(sfDir);
+        }
         if (slotLock != null) {
             try {
                 slotLock.close();
             } catch (Throwable ignored) {
                 // best-effort; flock is also released by kernel on process exit
             }
+        }
+    }
+
+    /**
+     * Unlinks every {@code .sfa} file under {@code dir}. Called only on
+     * clean shutdown when the ring confirms every published FSN has been
+     * acked — at that moment the slot has no recoverable work and the
+     * files are pure noise that would mislead the next sender's recovery.
+     * Best-effort: logs and continues on failures, since we're already on
+     * the close path.
+     */
+    private static void unlinkAllSegmentFiles(String dir) {
+        if (!io.questdb.client.std.Files.exists(dir)) return;
+        long find = io.questdb.client.std.Files.findFirst(dir);
+        if (find == 0) return;
+        try {
+            int rc = 1;
+            while (rc > 0) {
+                String name = io.questdb.client.std.Files.utf8ToString(
+                        io.questdb.client.std.Files.findName(find));
+                rc = io.questdb.client.std.Files.findNext(find);
+                if (name == null || !name.endsWith(".sfa")) continue;
+                String path = dir + "/" + name;
+                if (!io.questdb.client.std.Files.remove(path)) {
+                    LOG.warn("Failed to unlink fully-acked segment {} on close", path);
+                }
+            }
+        } finally {
+            io.questdb.client.std.Files.findClose(find);
         }
     }
 
