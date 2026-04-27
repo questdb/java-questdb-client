@@ -172,6 +172,10 @@ public class QwpWebSocketSender implements Sender {
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS;
+    // false → startup connect failure is immediately terminal (default).
+    // true  → startup connect goes through the same retry-with-backoff
+    //         loop as in-flight reconnect; auth failures still terminal.
+    private boolean initialConnectRetry = false;
     // Single volatile counter, single writer (the wire-side actor that
     // performs reconnect; for now: ensureConnected during recovery).
     // Bumped on every successful reconnect AND on initial recovery from
@@ -353,6 +357,38 @@ public class QwpWebSocketSender implements Sender {
             long reconnectInitialBackoffMillis,
             long reconnectMaxBackoffMillis
     ) {
+        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                false);
+    }
+
+    /**
+     * Master connect overload — also accepts {@code initialConnectRetry}.
+     * When true, the initial connect goes through the same retry loop as
+     * in-flight reconnect (backoff + cap + auth-terminal). When false
+     * (default), a startup connect failure is immediately terminal.
+     */
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            boolean initialConnectRetry
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -364,6 +400,7 @@ public class QwpWebSocketSender implements Sender {
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
+            sender.initialConnectRetry = initialConnectRetry;
             if (cursorEngine != null) {
                 sender.setCursorEngine(cursorEngine, true);
             }
@@ -920,6 +957,32 @@ public class QwpWebSocketSender implements Sender {
         return connectionGeneration;
     }
 
+    /**
+     * Number of reconnect attempts the cursor I/O loop has issued —
+     * succeeded plus failed. Diverges from {@link #getTotalReconnectsSucceeded}
+     * when the server is flapping. Returns 0 if no I/O loop is running.
+     */
+    public long getTotalReconnectAttempts() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalReconnectAttempts();
+    }
+
+    /** Number of successful reconnects. Returns 0 if no I/O loop is running. */
+    public long getTotalReconnectsSucceeded() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalReconnects();
+    }
+
+    /**
+     * Frames re-sent on the post-reconnect catch-up window — i.e. frames
+     * whose FSN was already on the wire before the drop. Useful for
+     * verifying replay actually re-emitted the unacked tail.
+     */
+    public long getTotalFramesReplayed() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalFramesReplayed();
+    }
+
     /** Test accessor: highest schema ID confirmed sent on the current connection. */
     @TestOnly
     public int getMaxSentSchemaIdForTest() {
@@ -1357,7 +1420,16 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine == null) {
             throw new LineSenderException("cursor engine must be attached before connect");
         }
-        client = buildAndConnect();
+        if (initialConnectRetry) {
+            client = CursorWebSocketSendLoop.connectWithRetry(
+                    this::buildAndConnect,
+                    reconnectMaxDurationMillis,
+                    reconnectInitialBackoffMillis,
+                    reconnectMaxBackoffMillis,
+                    "initial connect");
+        } else {
+            client = buildAndConnect();
+        }
 
         try {
             cursorSendLoop = new CursorWebSocketSendLoop(

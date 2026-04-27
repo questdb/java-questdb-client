@@ -91,6 +91,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final AtomicLong totalAcks = new AtomicLong();
     private final AtomicLong totalFramesSent = new AtomicLong();
     private final AtomicLong totalReconnects = new AtomicLong();
+    // Every iteration of the reconnect loop bumps this — failures and
+    // success alike. Diverges from totalReconnects (success-only) when the
+    // server is flapping. Useful for "is reconnect making progress?"
+    // observability.
+    private final AtomicLong totalReconnectAttempts = new AtomicLong();
+    // Frames sent during the post-reconnect catch-up window — i.e. frames
+    // whose FSN was already published before the wire dropped. A non-zero
+    // value confirms replay is working; a sustained nonzero rate means
+    // the connection is flapping and replay is doing real work each cycle.
+    private final AtomicLong totalFramesReplayed = new AtomicLong();
+    // Set at swapClient time to publishedFsn at that moment; cleared back
+    // to -1 once trySendOne has caught up past it. Used to count replay
+    // frames without a per-frame branch on the steady-state path.
+    private long replayTargetFsn = -1L;
     // Optional reconnect plumbing. If both are non-null, a wire failure
     // triggers a reconnect attempt instead of a terminal fail(). The factory
     // produces a fresh, connected+upgraded WebSocketClient; the listener is
@@ -240,6 +254,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return totalReconnects.get();
     }
 
+    /** Total reconnect attempts (succeeded + failed). */
+    public long getTotalReconnectAttempts() {
+        return totalReconnectAttempts.get();
+    }
+
+    /** Total frames re-sent on the post-reconnect replay window. */
+    public long getTotalFramesReplayed() {
+        return totalFramesReplayed.get();
+    }
+
     public synchronized void start() {
         if (ioThread != null) {
             throw new IllegalStateException("already started");
@@ -316,6 +340,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         Throwable lastReconnectError = initial;
         while (running && System.nanoTime() < deadlineNanos) {
             attempts++;
+            totalReconnectAttempts.incrementAndGet();
             try {
                 WebSocketClient newClient = reconnectFactory.reconnect();
                 if (newClient != null) {
@@ -417,6 +442,81 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Same retry-with-exponential-backoff-and-jitter loop the I/O thread
+     * uses on a wire failure, but reusable from {@code ensureConnected} to
+     * implement {@code initial_connect_retry=true}. Returns the connected
+     * client on success; throws on terminal upgrade error (won't retry) or
+     * budget exhaustion.
+     * <p>
+     * Caller-supplied {@code factory} is invoked once per attempt and
+     * should produce a fresh, connected, upgraded client (or throw). The
+     * lambda is intentionally a {@link ReconnectFactory} so the same
+     * implementation in {@code QwpWebSocketSender.buildAndConnect()} can
+     * serve both startup and reconnect paths verbatim.
+     */
+    public static WebSocketClient connectWithRetry(
+            ReconnectFactory factory,
+            long maxDurationMillis,
+            long initialBackoffMillis,
+            long maxBackoffMillis,
+            String contextLabel
+    ) {
+        long startNanos = System.nanoTime();
+        long deadlineNanos = startNanos + maxDurationMillis * 1_000_000L;
+        long backoffMillis = initialBackoffMillis;
+        int attempts = 0;
+        long lastLogNanos = 0L;
+        Throwable lastError = null;
+        while (System.nanoTime() < deadlineNanos) {
+            attempts++;
+            try {
+                WebSocketClient c = factory.reconnect();
+                if (c != null) {
+                    long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+                    if (attempts > 1) {
+                        LOG.info("{} succeeded after {}ms / {} attempts",
+                                contextLabel, elapsedMs, attempts);
+                    }
+                    return c;
+                }
+            } catch (Throwable e) {
+                if (isTerminalUpgradeError(e)) {
+                    String upgradeMsg = findUpgradeFailureMessage(e);
+                    LOG.error("{} hit terminal upgrade error — won't retry: {}",
+                            contextLabel, upgradeMsg);
+                    throw new LineSenderException(
+                            "WebSocket upgrade failed during " + contextLabel
+                                    + " (won't retry): " + upgradeMsg, e);
+                }
+                lastError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("{} attempt {} failed: {}",
+                            contextLabel, attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
+            }
+            long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+            long sleepMillis = backoffMillis + jitter;
+            long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
+            if (remainingMillis <= 0) {
+                break;
+            }
+            if (sleepMillis > remainingMillis) {
+                sleepMillis = remainingMillis;
+            }
+            LockSupport.parkNanos(sleepMillis * 1_000_000L);
+            backoffMillis = Math.min(backoffMillis * 2, maxBackoffMillis);
+        }
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        String lastMsg = lastError == null ? "no attempts made" : lastError.getMessage();
+        throw new LineSenderException(
+                contextLabel + " failed after " + elapsedMs + "ms / "
+                        + attempts + " attempts: " + lastMsg,
+                lastError);
+    }
+
+    /**
      * Reset wire state for a fresh connection: install the new client,
      * realign {@code fsnAtZero} to the next unacked FSN, restart wire
      * sequencing from 0, and reposition the cursor so the next
@@ -436,6 +536,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
         this.consecutiveSendErrors.set(0L);
+        // Snapshot publishedFsn at swap time — frames at FSN ≤ this value
+        // were already on the wire before the drop and will be replayed.
+        // trySendOne increments totalFramesReplayed for each one, then
+        // resets replayTargetFsn to -1 once we cross the boundary.
+        long pubAtSwap = engine.publishedFsn();
+        this.replayTargetFsn = pubAtSwap >= replayStart ? pubAtSwap : -1L;
         positionCursorAt(replayStart);
     }
 
@@ -533,8 +639,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false;
         }
         sendOffset = frameEnd;
+        long fsnSent = fsnAtZero + nextWireSeq;
         nextWireSeq++;
         totalFramesSent.incrementAndGet();
+        if (replayTargetFsn >= 0) {
+            totalFramesReplayed.incrementAndGet();
+            if (fsnSent >= replayTargetFsn) {
+                replayTargetFsn = -1L; // catch-up complete
+            }
+        }
         consecutiveSendErrors.set(0);
         return true;
     }

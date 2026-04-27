@@ -690,6 +690,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long reconnectInitialBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long reconnectMaxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        // When true, the initial connect goes through the same
+        // backoff/cap/auth-terminal retry path as reconnect. Default false:
+        // a misconfigured host or down server should fail fast at startup,
+        // not after the cap. Auth failures stay terminal even with retry on.
+        private boolean initialConnectRetry = false;
+        // Per-append deadline for SF appendBlocking spin-then-throw. Used to
+        // be a hardcoded 30s constant; expose so tight-SLA users can lower
+        // and offline-tolerant users can raise.
+        private long sfAppendDeadlineMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -1056,9 +1065,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     slotPath = sfDir + "/" + senderId;
                 }
+                long actualSfAppendDeadlineNanos =
+                        sfAppendDeadlineMillis == PARAMETER_NOT_SET_EXPLICITLY
+                                ? CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS
+                                : sfAppendDeadlineMillis * 1_000_000L;
                 CursorSendEngine cursorEngine = new CursorSendEngine(
                         slotPath, actualSfMaxBytes,
-                        actualSfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+                        actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
                 try {
                     return QwpWebSocketSender.connect(
                             hosts.getQuick(0),
@@ -1075,7 +1088,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualCloseFlushTimeoutMillis,
                             actualReconnectMaxDurationMillis,
                             actualReconnectInitialBackoffMillis,
-                            actualReconnectMaxBackoffMillis
+                            actualReconnectMaxBackoffMillis,
+                            initialConnectRetry
                     );
                 } catch (Throwable t) {
                     try {
@@ -1839,6 +1853,41 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Opt in to retrying the initial connect with the same backoff /
+         * cap / auth-terminal policy as in-flight reconnect. Default
+         * {@code false}: a startup connect failure throws immediately,
+         * which is what most users want — a misconfigured host shouldn't
+         * sit retrying for 5 minutes. Set true if your deployment expects
+         * the server to come up shortly after the sender. Auth failures
+         * (HTTP 401/403/non-101) stay terminal in either mode.
+         */
+        public LineSenderBuilder initialConnectRetry(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
+            }
+            this.initialConnectRetry = enabled;
+            return this;
+        }
+
+        /**
+         * Per-call deadline for {@code Sender.flush()} spinning on a full
+         * cursor segment ring waiting for ACKs to drain space. Default
+         * 30 s. Lower for fail-fast services that prefer surfacing
+         * backpressure as an error; raise for offline-tolerant pipelines
+         * that should ride out long server pauses.
+         */
+        public LineSenderBuilder sfAppendDeadlineMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("sf_append_deadline_millis is only supported for WebSocket transport");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("sf_append_deadline_millis must be > 0: ").put(millis);
+            }
+            this.sfAppendDeadlineMillis = millis;
+            return this;
+        }
+
+        /**
          * Selects the durability contract for SF appends and flushes. See
          * {@link SfDurability} for the value semantics.
          * <p>
@@ -2390,6 +2439,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "reconnect_initial_backoff_millis");
                     reconnectInitialBackoffMillis(parseLongValue(sink, "reconnect_initial_backoff_millis"));
+                } else if (Chars.equals("initial_connect_retry", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "initial_connect_retry");
+                    if (Chars.equalsIgnoreCase("on", sink) || Chars.equalsIgnoreCase("true", sink)) {
+                        initialConnectRetry(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink) || Chars.equalsIgnoreCase("false", sink)) {
+                        initialConnectRetry(false);
+                    } else {
+                        throw new LineSenderException("invalid initial_connect_retry [value=").put(sink).put(", allowed-values=[on, off, true, false]]");
+                    }
+                } else if (Chars.equals("sf_append_deadline_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_append_deadline_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_append_deadline_millis");
+                    sfAppendDeadlineMillis(parseLongValue(sink, "sf_append_deadline_millis"));
                 } else if (Chars.equals("reconnect_max_backoff_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_backoff_millis is only supported for WebSocket transport");
