@@ -1569,7 +1569,15 @@ public class QwpWebSocketSender implements Sender {
                 lastSeenGeneration = genBefore;
             }
             int currBatchMaxSchemaId = maxSentSchemaId;
-            encoder.beginMessage(tableCount, globalSymbolDictionary, maxSentSymbolId, currentBatchMaxSymbolId);
+            // Cursor SF requires every on-disk frame to be self-sufficient
+            // — its schema definition must travel with the row data, not
+            // as a back-reference to an ID the server may not have seen
+            // (orphan-slot drainers and post-reconnect replay both deliver
+            // recorded frames to fresh server connections). So always emit
+            // the full symbol-dict delta from id=0, and always send the
+            // full schema definition for each table — never a ref.
+            encoder.beginMessage(tableCount, globalSymbolDictionary,
+                    /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
             for (int i = 0, n = keys.size(); i < n; i++) {
                 CharSequence tableName = keys.getQuick(i);
                 if (tableName == null) {
@@ -1588,13 +1596,13 @@ public class QwpWebSocketSender implements Sender {
                     tableBuffer.setSchemaId(nextSchemaId++);
                 }
                 currBatchMaxSchemaId = Math.max(currBatchMaxSchemaId, tableBuffer.getSchemaId());
-                boolean useSchemaRef = tableBuffer.getSchemaId() <= maxSentSchemaId;
 
                 if (LOG.isDebugEnabled()) {
-                    LOG.debug("Encoding table [name={}, rows={}, maxSentSymbolId={}, batchMaxId={}, useSchemaRef={}]", tableName, tableBuffer.getRowCount(), maxSentSymbolId, currentBatchMaxSymbolId, useSchemaRef);
+                    LOG.debug("Encoding table [name={}, rows={}, batchMaxId={}, useSchemaRef=false (cursor SF)]",
+                            tableName, tableBuffer.getRowCount(), currentBatchMaxSymbolId);
                 }
 
-                encoder.addTable(tableBuffer, useSchemaRef);
+                encoder.addTable(tableBuffer, /*useSchemaRef=*/ false);
             }
             messageSize = encoder.finishMessage();
             buffer = encoder.getBuffer();

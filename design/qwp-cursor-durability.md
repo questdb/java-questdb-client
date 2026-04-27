@@ -143,6 +143,9 @@ Each new knob also gets a `LineSenderBuilder` setter.
 - Server's dedup window must be ≥ a sender's `sf_max_total_bytes` worth of FSNs (else replay = double-write under sustained outage + full cap).
 - Coordination/testing of the recovery + dedup contract is **outside this repo's scope**.
 
+## Self-sufficient frames (locked 2026-04-27)
+Every frame written through the cursor SF path **must carry its full schema definition and the complete symbol-dictionary delta from id 0**. No schema-by-id refs, no incremental delta-dicts. The bytes survive process restart and replay against fresh server connections (post-reconnect, post-restart, drainer adopting an orphan slot) — frames with refs to IDs the new server has never seen are unrecoverable. Costs more bytes per batch; pays for replay correctness across every recovery path. Producer-side `maxSentSchemaId` / `maxSentSymbolId` retention is treated as a no-op for the cursor path; the encode call always passes `confirmedMaxId=-1` and `useSchemaRef=false`.
+
 ## Decisions locked
 1. ✅ flush() never waits for ACK (ACKs are async).
 2. ✅ Reconnect cap is per-outage time-based, default 300s.
@@ -157,6 +160,7 @@ Each new knob also gets a `LineSenderBuilder` setter.
 11. ✅ Logging: WARN on outage entry/exit-attempt, INFO on reconnect success, ERROR on budget exhaustion; throttled.
 12. ✅ Counters and orphan-drainer visibility on `QwpWebSocketSender` (WS-only).
 13. ✅ No automatic cleanup of empty slot dirs — preserve goal of data-loss reduction.
+14. ✅ Frames on disk are self-sufficient — every frame carries its full schema + full symbol-dict delta from id 0; refs forbidden.
 
 ## Open
 None. Ready to implement.
