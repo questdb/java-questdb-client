@@ -238,6 +238,99 @@ public class SfFromConfigTest {
     }
 
     @Test
+    public void testSenderIdCreatesNamedSlotUnderSfDir() throws Exception {
+        // sender_id="primary" => slot dir <sfDir>/primary; the engine writes
+        // its segments and lock there, leaving sibling slot dirs untouched.
+        int port = TEST_PORT + 11;
+        AckHandler handler = new AckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String config = "ws::addr=localhost:" + port
+                    + ";sf_dir=" + sfDir + ";sender_id=primary;";
+            try (Sender sender = Sender.fromConfig(config)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+            }
+            Assert.assertTrue("named slot dir created",
+                    Files.exists(sfDir + "/primary"));
+            Assert.assertTrue("lock file dropped in slot",
+                    Files.exists(sfDir + "/primary/.lock"));
+        }
+    }
+
+    @Test
+    public void testTwoSendersSameSlotIdCollideOnLock() throws Exception {
+        // Multi-sender setups MUST set distinct sender_id values when they
+        // share a group root. The second open with a colliding id must
+        // refuse to start — silently allowing it would interleave FSN
+        // sequences on disk and corrupt recovery.
+        int port = TEST_PORT + 12;
+        AckHandler handler = new AckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String config = "ws::addr=localhost:" + port
+                    + ";sf_dir=" + sfDir + ";";
+            try (Sender first = Sender.fromConfig(config)) {
+                first.table("foo").longColumn("v", 1L).atNow();
+                first.flush();
+                try (Sender ignored = Sender.fromConfig(config)) {
+                    Assert.fail("expected slot lock contention");
+                } catch (Exception expected) {
+                    String msg = expected.getMessage();
+                    Assert.assertTrue(
+                            "error must mention contention: " + msg,
+                            msg != null && msg.contains("already in use"));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testTwoSendersDistinctSlotIdsCoexist() throws Exception {
+        // Two senders against the same group root with distinct sender_id
+        // values are independent slots — both must start cleanly.
+        int port = TEST_PORT + 13;
+        AckHandler handler = new AckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfgA = "ws::addr=localhost:" + port
+                    + ";sf_dir=" + sfDir + ";sender_id=a;";
+            String cfgB = "ws::addr=localhost:" + port
+                    + ";sf_dir=" + sfDir + ";sender_id=b;";
+            try (Sender a = Sender.fromConfig(cfgA);
+                 Sender b = Sender.fromConfig(cfgB)) {
+                a.table("foo").longColumn("v", 1L).atNow();
+                b.table("foo").longColumn("v", 2L).atNow();
+                a.flush();
+                b.flush();
+            }
+            Assert.assertTrue(Files.exists(sfDir + "/a/.lock"));
+            Assert.assertTrue(Files.exists(sfDir + "/b/.lock"));
+        }
+    }
+
+    @Test
+    public void testSenderIdInvalidCharRejected() {
+        // The id is used verbatim as a directory name — only safe charset
+        // is accepted. A path separator would let the user escape the group
+        // root, which is exactly what the slot model exists to prevent.
+        String config = "ws::addr=localhost:1;sf_dir=" + sfDir
+                + ";sender_id=bad/id;";
+        try (Sender ignored = Sender.fromConfig(config)) {
+            Assert.fail("expected invalid sender_id rejection");
+        } catch (LineSenderException expected) {
+            Assert.assertTrue(expected.getMessage(),
+                    expected.getMessage().contains("sender_id"));
+        }
+    }
+
+    @Test
     public void testSfMaxBytesInvalidSizeSuffixRejected() {
         String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";sf_max_bytes=64x;";
         try (Sender ignored = Sender.fromConfig(config)) {
@@ -257,7 +350,13 @@ public class SfFromConfigTest {
                 while (rc > 0) {
                     String name = Files.utf8ToString(Files.findName(find));
                     if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        Files.remove(dir + "/" + name);
+                        String child = dir + "/" + name;
+                        // Files.remove can't drop non-empty dirs, so try
+                        // recursive cleanup first; remove() then succeeds
+                        // for either a file or an emptied directory.
+                        if (!Files.remove(child)) {
+                            rmDir(child);
+                        }
                     }
                     rc = Files.findNext(find);
                 }

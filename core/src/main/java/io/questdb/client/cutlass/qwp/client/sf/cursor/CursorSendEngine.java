@@ -72,6 +72,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // case close() also stops the manager. When the manager is shared across
     // many engines (one per Sender), the caller owns and closes it.
     private final boolean ownsManager;
+    // Held for the engine's lifetime in disk mode. {@code null} in memory
+    // mode (no slot, no lock). Released by {@link #close()}; the kernel
+    // also drops it on hard process exit.
+    private final SlotLock slotLock;
     private final SegmentRing ring;
     private final long segmentSizeBytes;
     private final long appendDeadlineNanos;
@@ -133,56 +137,70 @@ public final class CursorSendEngine implements QuietCloseable {
         // sfDir != null  → store-and-forward mode. Segments are mmap'd files
         //                  under sfDir, recoverable across sender restarts.
         boolean memoryMode = sfDir == null;
+        SlotLock acquiredLock = null;
         if (!memoryMode) {
             if (sfDir.isEmpty()) {
                 throw new IllegalArgumentException("sfDir must not be empty");
             }
-            if (!Files.exists(sfDir)) {
-                int rc = Files.mkdir(sfDir, 0755);
-                if (rc != 0) {
-                    throw new IllegalStateException("could not create sf_dir: " + sfDir + " rc=" + rc);
-                }
-            }
+            // Acquire the slot lock BEFORE we touch any *.sfa files. Two
+            // engines pointed at the same slot would otherwise race on
+            // recovery and create overlapping FSN ranges. SlotLock.acquire
+            // also creates the slot dir if it doesn't exist yet — no
+            // separate mkdir step needed here.
+            acquiredLock = SlotLock.acquire(sfDir);
         }
+        this.slotLock = acquiredLock;
         this.sfDir = sfDir;
         this.segmentSizeBytes = segmentSizeBytes;
         this.manager = manager;
         this.ownsManager = ownsManager;
         this.appendDeadlineNanos = appendDeadlineNanos;
 
-        // Disk mode: try to recover any *.sfa files left behind by a prior
-        // session before deciding to start fresh. Without this the engine
-        // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
-        // already on disk and corrupting ACK translation, trim, and replay.
-        SegmentRing recovered = memoryMode ? null
-                : SegmentRing.openExisting(sfDir, segmentSizeBytes);
-        this.recoveredFromDisk = recovered != null;
-        if (recovered != null) {
-            this.ring = recovered;
-        } else {
-            MmapSegment initial;
-            String initialPath = null;
-            if (memoryMode) {
-                initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
+        try {
+            // Disk mode: try to recover any *.sfa files left behind by a prior
+            // session before deciding to start fresh. Without this the engine
+            // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
+            // already on disk and corrupting ACK translation, trim, and replay.
+            SegmentRing recovered = memoryMode ? null
+                    : SegmentRing.openExisting(sfDir, segmentSizeBytes);
+            this.recoveredFromDisk = recovered != null;
+            if (recovered != null) {
+                this.ring = recovered;
             } else {
-                initialPath = sfDir + "/sf-initial.sfa";
-                initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
-            }
-            try {
-                this.ring = new SegmentRing(initial, segmentSizeBytes);
-            } catch (Throwable t) {
-                initial.close();
-                if (initialPath != null) {
-                    Files.remove(initialPath);
+                MmapSegment initial;
+                String initialPath = null;
+                if (memoryMode) {
+                    initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
+                } else {
+                    initialPath = sfDir + "/sf-initial.sfa";
+                    initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
                 }
-                throw t;
+                try {
+                    this.ring = new SegmentRing(initial, segmentSizeBytes);
+                } catch (Throwable t) {
+                    initial.close();
+                    if (initialPath != null) {
+                        Files.remove(initialPath);
+                    }
+                    throw t;
+                }
             }
-        }
 
-        if (ownsManager) {
-            manager.start();
+            if (ownsManager) {
+                manager.start();
+            }
+            manager.register(ring, sfDir);
+        } catch (Throwable t) {
+            // Recovery / ring init failed — release the slot lock so a
+            // subsequent retry (or another sender) isn't locked out.
+            if (acquiredLock != null) {
+                try {
+                    acquiredLock.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            throw t;
         }
-        manager.register(ring, sfDir);
     }
 
     /**
@@ -244,6 +262,13 @@ public final class CursorSendEngine implements QuietCloseable {
             manager.close();
         }
         ring.close();
+        if (slotLock != null) {
+            try {
+                slotLock.close();
+            } catch (Throwable ignored) {
+                // best-effort; flock is also released by kernel on process exit
+            }
+        }
     }
 
     /**

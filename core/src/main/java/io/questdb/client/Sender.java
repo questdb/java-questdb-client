@@ -667,6 +667,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // there is no separate on/off flag (presence of the directory is the switch).
         // null sfDir → memory-only async ingest (same lock-free architecture, no disk).
         private String sfDir;
+        // Slot identity within sfDir. Each sender owns <sfDir>/<senderId>/ and
+        // takes an advisory exclusive lock there. Default "default" is fine for
+        // single-sender deployments; multi-sender setups must set this explicitly
+        // or the second sender will fail with "sf slot already in use".
+        private static final String DEFAULT_SENDER_ID = "default";
+        private String senderId = DEFAULT_SENDER_ID;
         private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
         // Durability contract for SF append/flush. Today only MEMORY is
@@ -1028,8 +1034,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                 ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS
                                 : reconnectMaxBackoffMillis;
 
+                // sfDir is the parent (group root); the actual slot lives
+                // under sfDir/senderId. This is what the engine sees — the
+                // slot lock and segment files all live one level deeper than
+                // the user-supplied path. Memory mode skips this composition
+                // (slotPath stays null).
+                //
+                // The slot ctor inside CursorSendEngine creates the slot
+                // directory itself, but Files.mkdir is non-recursive — so we
+                // must ensure the parent group root exists first.
+                String slotPath;
+                if (sfDir == null) {
+                    slotPath = null;
+                } else {
+                    if (!io.questdb.client.std.Files.exists(sfDir)) {
+                        int rc = io.questdb.client.std.Files.mkdir(sfDir, 0755);
+                        if (rc != 0) {
+                            throw new LineSenderException(
+                                    "could not create sf_dir: " + sfDir + " rc=" + rc);
+                        }
+                    }
+                    slotPath = sfDir + "/" + senderId;
+                }
                 CursorSendEngine cursorEngine = new CursorSendEngine(
-                        sfDir, actualSfMaxBytes,
+                        slotPath, actualSfMaxBytes,
                         actualSfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
                 try {
                     return QwpWebSocketSender.connect(
@@ -1661,6 +1689,45 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Names this sender's slot inside the SF group root (see
+         * {@link #storeAndForwardDir(String)}). The actual on-disk slot is
+         * {@code <sf_dir>/<sender_id>/}, locked exclusively for the sender's
+         * lifetime via {@code flock}. Default is {@code "default"}.
+         * <p>
+         * Multi-sender deployments writing to the same group root MUST set
+         * this to a distinct value per sender; the second sender to start
+         * with a colliding id fails fast with "sf slot already in use".
+         * <p>
+         * Allowed characters: letters, digits, {@code _ -}. No path
+         * separators, no {@code .}, no spaces — the id is used verbatim as
+         * a directory name.
+         */
+        public LineSenderBuilder senderId(String id) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("sender_id is only supported for WebSocket transport");
+            }
+            validateSenderId(id);
+            this.senderId = id;
+            return this;
+        }
+
+        private static void validateSenderId(String id) {
+            if (id == null || id.isEmpty()) {
+                throw new LineSenderException("sender_id must not be empty");
+            }
+            for (int i = 0, n = id.length(); i < n; i++) {
+                char c = id.charAt(i);
+                boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                        || (c >= '0' && c <= '9') || c == '_' || c == '-';
+                if (!ok) {
+                    throw new LineSenderException(
+                            "sender_id contains invalid character: '" + c
+                                    + "' (allowed: letters, digits, _ -)");
+                }
+            }
+        }
+
+        /**
          * Maximum bytes per segment file before rotation. Defaults to
          * {@code DEFAULT_SEGMENT_BYTES}
          * (64 MiB). Smaller segments mean faster trim of acked data; larger
@@ -2281,6 +2348,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "sf_dir");
                     storeAndForwardDir(sink.toString());
+                } else if (Chars.equals("sender_id", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sender_id is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sender_id");
+                    senderId(sink.toString());
                 } else if (Chars.equals("sf_max_bytes", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sf_max_bytes is only supported for WebSocket transport");
