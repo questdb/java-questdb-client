@@ -166,6 +166,22 @@ public final class CursorSendEngine implements QuietCloseable {
             this.recoveredFromDisk = recovered != null;
             if (recovered != null) {
                 this.ring = recovered;
+                // Seed ackedFsn to one below the lowest segment's baseSeq.
+                // We don't know what was actually acked before the prior
+                // session crashed, but anything trimmed off the ring's
+                // bottom must have been acked (trim is ack-driven). Without
+                // this seed, ackedFsn stays at -1 and the I/O loop's
+                // start-time positioning would walk to FSN 0 — which may
+                // not exist on disk if earlier segments have been trimmed,
+                // causing it to fall through to the active segment's tip
+                // and skip the unacked sealed segments entirely.
+                MmapSegment first = recovered.firstSealed();
+                long lowestBase = first != null
+                        ? first.baseSeq()
+                        : recovered.getActive().baseSeq();
+                if (lowestBase > 0) {
+                    recovered.acknowledge(lowestBase - 1);
+                }
             } else {
                 MmapSegment initial;
                 String initialPath = null;

@@ -269,10 +269,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             throw new IllegalStateException("already started");
         }
         running = true;
-        sendingSegment = engine.activeSegment();
+        // Position the cursor at the first unsent FSN before spinning the
+        // I/O thread. For a fresh sender, ackedFsn=-1 → start at FSN 0,
+        // which lands on the (empty) initial active — same as the prior
+        // hardcoded "sendingSegment = engine.activeSegment()". For a
+        // recovered sender with sealed segments holding unsent data, this
+        // walks back to the lowest unacked frame so sealed-segment data
+        // actually reaches the wire — without it, start() would skip
+        // straight to the active and orphan everything in sealed.
+        positionCursorForStart();
         ioThread = new Thread(this::ioLoop, "qdb-cursor-ws-io");
         ioThread.setDaemon(true);
         ioThread.start();
+    }
+
+    /**
+     * Sets {@code fsnAtZero}, {@code nextWireSeq}, and the cursor
+     * (sendingSegment + sendOffset) to the first unsent FSN. Visible for
+     * tests so they can assert correct positioning without spinning a
+     * real I/O thread + WebSocket.
+     */
+    void positionCursorForStart() {
+        long replayStart = engine.ackedFsn() + 1L;
+        this.fsnAtZero = replayStart;
+        this.nextWireSeq = 0L;
+        positionCursorAt(replayStart);
     }
 
     /**

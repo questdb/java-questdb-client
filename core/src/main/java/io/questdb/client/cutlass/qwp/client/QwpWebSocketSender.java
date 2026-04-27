@@ -973,6 +973,18 @@ public class QwpWebSocketSender implements Sender {
         return l == null ? 0L : l.getTotalReconnects();
     }
 
+    /** Total binary frames the cursor I/O loop has issued to the wire. */
+    public long getTotalFramesSent() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalFramesSent();
+    }
+
+    /** Total binary frames whose ACKs have been received and applied. */
+    public long getTotalAcks() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalAcks();
+    }
+
     /**
      * Frames re-sent on the post-reconnect catch-up window — i.e. frames
      * whose FSN was already on the wire before the drop. Useful for

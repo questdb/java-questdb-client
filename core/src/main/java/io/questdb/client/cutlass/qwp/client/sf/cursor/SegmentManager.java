@@ -169,8 +169,55 @@ public final class SegmentManager implements QuietCloseable {
     public void register(SegmentRing ring, String dir) {
         synchronized (lock) {
             rings.add(new RingEntry(ring, dir));
+            // Skip the file-generation counter past whatever's already on
+            // disk in this slot. Without this, on recovery the manager
+            // would mint a new spare at sf-0000000000000000.sfa — and
+            // openCleanRW would truncate the user's existing active file
+            // out from under the I/O loop, scrambling the in-flight mmap.
+            // Memory-mode rings have no dir; nothing to scan there.
+            if (dir != null) {
+                long minNext = scanMaxGeneration(dir) + 1L;
+                while (true) {
+                    long cur = fileGeneration.get();
+                    if (cur >= minNext) break;
+                    if (fileGeneration.compareAndSet(cur, minNext)) break;
+                }
+            }
         }
         ring.setManagerWakeup(this::wakeWorker);
+    }
+
+    /**
+     * Returns the highest hex-encoded generation across {@code sf-<gen>.sfa}
+     * files in {@code dir}, or {@code -1} if none exist. Skips files that
+     * don't match the pattern (e.g. the legacy {@code sf-initial.sfa}).
+     */
+    private static long scanMaxGeneration(String dir) {
+        long max = -1L;
+        if (!Files.exists(dir)) return max;
+        long find = Files.findFirst(dir);
+        if (find == 0) return max;
+        try {
+            int rc = 1;
+            while (rc > 0) {
+                String name = Files.utf8ToString(Files.findName(find));
+                rc = Files.findNext(find);
+                if (name == null || !name.startsWith("sf-") || !name.endsWith(".sfa")) {
+                    continue;
+                }
+                String hex = name.substring(3, name.length() - 4);
+                if (hex.length() != 16) continue;
+                try {
+                    long gen = Long.parseUnsignedLong(hex, 16);
+                    if (gen > max) max = gen;
+                } catch (NumberFormatException ignored) {
+                    // sf-initial.sfa or non-hex — skip
+                }
+            }
+        } finally {
+            Files.findClose(find);
+        }
+        return max;
     }
 
     /**
