@@ -176,6 +176,11 @@ public class QwpWebSocketSender implements Sender {
     // true  → startup connect goes through the same retry-with-backoff
     //         loop as in-flight reconnect; auth failures still terminal.
     private boolean initialConnectRetry = false;
+    // Orphan-slot drainer pool. Non-null only when the builder requested
+    // drain_orphans=true AND we have a slot path to scan against. Closed
+    // alongside the cursor send loop in close().
+    private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool
+            drainerPool;
     // Single volatile counter, single writer (the wire-side actor that
     // performs reconnect; for now: ensureConnected during recovery).
     // Bumped on every successful reconnect AND on initial recovery from
@@ -641,6 +646,17 @@ public class QwpWebSocketSender implements Sender {
                     LOG.error("Error closing cursor send loop: {}", String.valueOf(e));
                 }
             }
+            // Drainer pool runs after the foreground I/O loop is wound
+            // down — drainers don't share state with the foreground, so
+            // ordering doesn't matter for correctness, just predictable
+            // shutdown.
+            if (drainerPool != null) {
+                try {
+                    drainerPool.close();
+                } catch (Throwable e) {
+                    LOG.error("Error closing drainer pool: {}", String.valueOf(e));
+                }
+            }
 
             // Always free resources the I/O thread never touches:
             // encoder and table buffers are user-thread-only.
@@ -983,6 +999,52 @@ public class QwpWebSocketSender implements Sender {
     public long getTotalAcks() {
         CursorWebSocketSendLoop l = cursorSendLoop;
         return l == null ? 0L : l.getTotalAcks();
+    }
+
+    /**
+     * Starts orphan drainers for the given list of slot paths. Each path
+     * gets its own drainer thread, capped at {@code maxBackgroundDrainers}
+     * concurrent. Drainers run until the slot is fully drained or a
+     * terminal error occurs (then they drop a {@code .failed} sentinel).
+     * <p>
+     * Should be called once, immediately after {@code connect()} returns.
+     * Subsequent calls add more drainers to the same pool.
+     */
+    public synchronized void startOrphanDrainers(
+            io.questdb.client.std.ObjList<String> orphanSlotPaths,
+            int maxBackgroundDrainers,
+            long segmentSizeBytes,
+            long sfMaxTotalBytes
+    ) {
+        if (orphanSlotPaths == null || orphanSlotPaths.size() == 0
+                || maxBackgroundDrainers <= 0) {
+            return;
+        }
+        if (drainerPool == null) {
+            drainerPool = new io.questdb.client.cutlass.qwp.client.sf.cursor
+                    .BackgroundDrainerPool(maxBackgroundDrainers);
+        }
+        for (int i = 0, n = orphanSlotPaths.size(); i < n; i++) {
+            String slot = orphanSlotPaths.get(i);
+            io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
+                    new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
+                            slot, segmentSizeBytes, sfMaxTotalBytes,
+                            this::buildAndConnect,
+                            reconnectMaxDurationMillis,
+                            reconnectInitialBackoffMillis,
+                            reconnectMaxBackoffMillis);
+            drainerPool.submit(drainer);
+        }
+    }
+
+    /**
+     * Snapshot of drainers the foreground sender has dispatched. Useful
+     * for monitoring orphan-drain progress without parsing logs.
+     */
+    public java.util.List<io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer>
+            getBackgroundDrainers() {
+        if (drainerPool == null) return java.util.Collections.emptyList();
+        return drainerPool.snapshot();
     }
 
     /**

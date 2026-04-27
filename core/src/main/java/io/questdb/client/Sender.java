@@ -1073,25 +1073,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         }
                     }
                     slotPath = sfDir + "/" + senderId;
-                    // Orphan scan runs BEFORE we open our own slot — keeps
-                    // the scan's "exclude my slot" filter conceptually
-                    // simple. If the user opted in, log what we found so
-                    // they have visibility on pending drain candidates
-                    // until the drainer runtime lands.
-                    if (drainOrphans) {
-                        io.questdb.client.std.ObjList<String> orphans =
-                                io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner
-                                        .scan(sfDir, senderId);
-                        if (orphans.size() > 0) {
-                            org.slf4j.LoggerFactory.getLogger(LineSenderBuilder.class)
-                                    .info("found {} orphan slot(s) under {} (drainer "
-                                                    + "runtime not yet implemented; "
-                                                    + "max_background_drainers={}); "
-                                                    + "first paths: {}",
-                                            orphans.size(), sfDir, maxBackgroundDrainers,
-                                            sample(orphans, 3));
-                        }
-                    }
                 }
                 long actualSfAppendDeadlineNanos =
                         sfAppendDeadlineMillis == PARAMETER_NOT_SET_EXPLICITLY
@@ -1101,7 +1082,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         slotPath, actualSfMaxBytes,
                         actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
                 try {
-                    return QwpWebSocketSender.connect(
+                    QwpWebSocketSender connected = QwpWebSocketSender.connect(
                             hosts.getQuick(0),
                             ports.getQuick(0),
                             wsTlsConfig,
@@ -1119,6 +1100,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualReconnectMaxBackoffMillis,
                             initialConnectRetry
                     );
+                    // Once the foreground sender is up, dispatch drainers
+                    // for any sibling orphan slots. Scan AFTER we acquire
+                    // our own slot lock so we never accidentally try to
+                    // adopt our own data; the OrphanScanner.scan filter
+                    // also excludes our sender_id.
+                    if (drainOrphans && sfDir != null) {
+                        io.questdb.client.std.ObjList<String> orphans =
+                                io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner
+                                        .scan(sfDir, senderId);
+                        if (orphans.size() > 0) {
+                            org.slf4j.LoggerFactory.getLogger(LineSenderBuilder.class)
+                                    .info("dispatching drainers for {} orphan slot(s) under {} "
+                                                    + "(max_background_drainers={})",
+                                            orphans.size(), sfDir, maxBackgroundDrainers);
+                            connected.startOrphanDrainers(
+                                    orphans,
+                                    maxBackgroundDrainers,
+                                    actualSfMaxBytes,
+                                    actualSfMaxTotalBytes);
+                        }
+                    }
+                    return connected;
                 } catch (Throwable t) {
                     try {
                         cursorEngine.close();
@@ -1751,19 +1754,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             validateSenderId(id);
             this.senderId = id;
             return this;
-        }
-
-        private static String sample(io.questdb.client.std.ObjList<String> list, int n) {
-            int take = Math.min(n, list.size());
-            StringBuilder sb = new StringBuilder("[");
-            for (int i = 0; i < take; i++) {
-                if (i > 0) sb.append(", ");
-                sb.append(list.get(i));
-            }
-            if (list.size() > take) {
-                sb.append(", ...(").append(list.size() - take).append(" more)");
-            }
-            return sb.append("]").toString();
         }
 
         private static void validateSenderId(String id) {
