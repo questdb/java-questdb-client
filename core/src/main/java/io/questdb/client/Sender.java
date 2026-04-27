@@ -699,6 +699,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // be a hardcoded 30s constant; expose so tight-SLA users can lower
         // and offline-tolerant users can raise.
         private long sfAppendDeadlineMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        // Orphan adoption: when true, the foreground sender scans
+        // <sf_dir>/*/ at startup for sibling slots that hold unacked data
+        // and reports them. Default false. Spec calls for spawning
+        // background drainers to actually empty those slots; the drainer
+        // runtime lands in a follow-up commit. For now we surface the
+        // count via logging so users can confirm orphans are being seen.
+        private boolean drainOrphans = false;
+        private int maxBackgroundDrainers = DEFAULT_MAX_BACKGROUND_DRAINERS;
+        private static final int DEFAULT_MAX_BACKGROUND_DRAINERS = 4;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -1064,6 +1073,25 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         }
                     }
                     slotPath = sfDir + "/" + senderId;
+                    // Orphan scan runs BEFORE we open our own slot — keeps
+                    // the scan's "exclude my slot" filter conceptually
+                    // simple. If the user opted in, log what we found so
+                    // they have visibility on pending drain candidates
+                    // until the drainer runtime lands.
+                    if (drainOrphans) {
+                        io.questdb.client.std.ObjList<String> orphans =
+                                io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner
+                                        .scan(sfDir, senderId);
+                        if (orphans.size() > 0) {
+                            org.slf4j.LoggerFactory.getLogger(LineSenderBuilder.class)
+                                    .info("found {} orphan slot(s) under {} (drainer "
+                                                    + "runtime not yet implemented; "
+                                                    + "max_background_drainers={}); "
+                                                    + "first paths: {}",
+                                            orphans.size(), sfDir, maxBackgroundDrainers,
+                                            sample(orphans, 3));
+                        }
+                    }
                 }
                 long actualSfAppendDeadlineNanos =
                         sfAppendDeadlineMillis == PARAMETER_NOT_SET_EXPLICITLY
@@ -1725,6 +1753,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
+        private static String sample(io.questdb.client.std.ObjList<String> list, int n) {
+            int take = Math.min(n, list.size());
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < take; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(list.get(i));
+            }
+            if (list.size() > take) {
+                sb.append(", ...(").append(list.size() - take).append(" more)");
+            }
+            return sb.append("]").toString();
+        }
+
         private static void validateSenderId(String id) {
             if (id == null || id.isEmpty()) {
                 throw new LineSenderException("sender_id must not be empty");
@@ -1884,6 +1925,48 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("sf_append_deadline_millis must be > 0: ").put(millis);
             }
             this.sfAppendDeadlineMillis = millis;
+            return this;
+        }
+
+        /**
+         * Opt in to scanning {@code <sf_dir>/*} at startup for sibling slots
+         * that hold unacked data left behind by a crashed sender or a
+         * different sender_id. Default {@code false}. WebSocket only;
+         * requires {@code sf_dir} to be set.
+         * <p>
+         * The scan is read-only — slots flagged with the {@code .failed}
+         * sentinel are skipped (manual reset required), and the foreground
+         * sender's own slot is never reported.
+         * <p>
+         * <b>Status:</b> the scan + visibility (via logs) lands in this
+         * release; the background drainer runtime that actually empties
+         * orphan slots is a follow-up. Setting {@code drain_orphans=true}
+         * today logs the count and paths of orphans found at startup so
+         * users can monitor + manually drain pending slots.
+         */
+        public LineSenderBuilder drainOrphans(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("drain_orphans is only supported for WebSocket transport");
+            }
+            this.drainOrphans = enabled;
+            return this;
+        }
+
+        /**
+         * Cap on concurrent background drainer threads when
+         * {@link #drainOrphans(boolean)} is on. Default {@code 4}. Each
+         * drainer carries one segment-manager thread + one I/O thread +
+         * one socket, so users running many senders per JVM should set
+         * this low.
+         */
+        public LineSenderBuilder maxBackgroundDrainers(int n) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("max_background_drainers is only supported for WebSocket transport");
+            }
+            if (n < 0) {
+                throw new LineSenderException("max_background_drainers must be >= 0: ").put(n);
+            }
+            this.maxBackgroundDrainers = n;
             return this;
         }
 
@@ -2457,6 +2540,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "sf_append_deadline_millis");
                     sfAppendDeadlineMillis(parseLongValue(sink, "sf_append_deadline_millis"));
+                } else if (Chars.equals("drain_orphans", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("drain_orphans is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "drain_orphans");
+                    if (Chars.equalsIgnoreCase("on", sink) || Chars.equalsIgnoreCase("true", sink)) {
+                        drainOrphans(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink) || Chars.equalsIgnoreCase("false", sink)) {
+                        drainOrphans(false);
+                    } else {
+                        throw new LineSenderException("invalid drain_orphans [value=").put(sink).put(", allowed-values=[on, off, true, false]]");
+                    }
+                } else if (Chars.equals("max_background_drainers", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("max_background_drainers is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "max_background_drainers");
+                    maxBackgroundDrainers(parseIntValue(sink, "max_background_drainers"));
                 } else if (Chars.equals("reconnect_max_backoff_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_backoff_millis is only supported for WebSocket transport");
