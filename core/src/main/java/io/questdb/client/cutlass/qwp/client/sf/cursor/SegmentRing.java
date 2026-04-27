@@ -154,7 +154,19 @@ public final class SegmentRing implements QuietCloseable {
                 if (name != null && name.endsWith(".sfa") && !".".equals(name) && !"..".equals(name)) {
                     String path = sfDir + "/" + name;
                     try {
-                        opened.add(MmapSegment.openExisting(path));
+                        MmapSegment seg = MmapSegment.openExisting(path);
+                        // Filter out empty leftovers — typically hot-spare
+                        // segments the manager pre-allocated for a prior
+                        // session that never got rotated into active. They
+                        // carry the provisional baseSeq=0 and frameCount=0,
+                        // which would otherwise collide with the real
+                        // baseSeq=0 segment and trip the contiguity check
+                        // below. No data to recover; close + skip.
+                        if (seg.frameCount() == 0) {
+                            seg.close();
+                        } else {
+                            opened.add(seg);
+                        }
                     } catch (MmapSegmentException ignored) {
                         // Stray file with the .sfa extension but bad header /
                         // unreadable: skip rather than fail the recovery.

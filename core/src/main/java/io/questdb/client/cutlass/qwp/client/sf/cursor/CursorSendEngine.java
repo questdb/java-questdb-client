@@ -75,6 +75,12 @@ public final class CursorSendEngine implements QuietCloseable {
     private final SegmentRing ring;
     private final long segmentSizeBytes;
     private final long appendDeadlineNanos;
+    // True when the constructor recovered an existing on-disk slot rather
+    // than starting fresh. Read by QwpWebSocketSender during connect to
+    // decide whether to bump connectionGeneration so the first batch
+    // re-publishes schema definitions (the server has no memory of FSNs
+    // we recovered from disk).
+    private final boolean recoveredFromDisk;
     // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
     // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
     // for the manager (or for ACKs) — not one per spin-park. Producer-thread
@@ -150,6 +156,7 @@ public final class CursorSendEngine implements QuietCloseable {
         // already on disk and corrupting ACK translation, trim, and replay.
         SegmentRing recovered = memoryMode ? null
                 : SegmentRing.openExisting(sfDir, segmentSizeBytes);
+        this.recoveredFromDisk = recovered != null;
         if (recovered != null) {
             this.ring = recovered;
         } else {
@@ -237,6 +244,17 @@ public final class CursorSendEngine implements QuietCloseable {
             manager.close();
         }
         ring.close();
+    }
+
+    /**
+     * True when this engine opened against a pre-existing on-disk slot
+     * (i.e. {@code SegmentRing.openExisting} returned a non-null ring at
+     * construction). Memory-mode engines and fresh-disk engines return
+     * false. Used by the sender to decide whether to mark schema state as
+     * needing a reset before the first send.
+     */
+    public boolean wasRecoveredFromDisk() {
+        return recoveredFromDisk;
     }
 
     /** I/O thread accessor: highest FSN whose frame is fully written. */
