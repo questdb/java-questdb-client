@@ -34,6 +34,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
@@ -71,6 +72,14 @@ import java.util.concurrent.locks.LockSupport;
 public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
+    /** Default per-outage reconnect time cap (5 min). */
+    public static final long DEFAULT_RECONNECT_MAX_DURATION_MILLIS = 300_000L;
+    /** Default initial reconnect backoff (100 ms). */
+    public static final long DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS = 100L;
+    /** Default reconnect max backoff (5 s). */
+    public static final long DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS = 5_000L;
+    /** Throttle "reconnect attempt N failed" WARN logs to one per 5 s. */
+    private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
 
     private final AtomicLong consecutiveSendErrors = new AtomicLong();
@@ -89,6 +98,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // can bump its connectionGeneration.
     private final ReconnectFactory reconnectFactory;
     private final ReconnectListener reconnectListener;
+    private final long reconnectMaxDurationMillis;
+    private final long reconnectInitialBackoffMillis;
+    private final long reconnectMaxBackoffMillis;
     private WebSocketClient client;
     // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
     // a fresh connection, this is 0. After a reconnect, it's set to
@@ -130,6 +142,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
                                    ReconnectListener reconnectListener) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory, reconnectListener,
+                DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
+                DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS,
+                DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS);
+    }
+
+    /**
+     * Full constructor with explicit reconnect-policy knobs. Used by the
+     * builder when the user has overridden the defaults.
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   ReconnectListener reconnectListener,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis) {
         if (client == null || engine == null) {
             throw new IllegalArgumentException("client and engine must be non-null");
         }
@@ -139,6 +168,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.parkNanos = parkNanos;
         this.reconnectFactory = reconnectFactory;
         this.reconnectListener = reconnectListener;
+        this.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
+        this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
+        this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
     }
 
     /**
@@ -258,39 +290,130 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Surface a wire failure. With reconnect plumbing wired (factory +
-     * listener both non-null), tries one reconnect first; success returns
-     * silently and the I/O loop continues with reset wire state. Failure
-     * (or no reconnect plumbing) records the error and stops the loop.
+     * listener both non-null), enters the per-outage retry loop:
+     * exponential backoff with jitter, time-capped at
+     * {@code reconnectMaxDurationMillis}, terminal on auth/upgrade
+     * rejections (so the budget isn't burned on errors that won't fix
+     * themselves). On the first successful reconnect within the budget,
+     * the I/O loop resumes with reset wire state and replays from
+     * {@code engine.ackedFsn() + 1}.
      * <p>
-     * Backoff / per-outage time cap / auth-failure detection land in the
-     * follow-up commit; this commit proves the mechanics with a single
-     * attempt.
+     * Without reconnect plumbing, the failure is immediately terminal
+     * (legacy behavior).
      */
-    private void fail(Throwable t) {
-        if (reconnectFactory != null && reconnectListener != null && running) {
-            LOG.warn("cursor I/O loop wire failure, attempting reconnect: {}", t.getMessage());
+    private void fail(Throwable initial) {
+        if (reconnectFactory == null || reconnectListener == null || !running) {
+            recordFatal(initial);
+            return;
+        }
+        LOG.warn("cursor I/O loop wire failure, entering reconnect loop: {}",
+                initial.getMessage());
+        long outageStartNanos = System.nanoTime();
+        long deadlineNanos = outageStartNanos + reconnectMaxDurationMillis * 1_000_000L;
+        long backoffMillis = reconnectInitialBackoffMillis;
+        int attempts = 0;
+        long lastLogNanos = 0L;
+        Throwable lastReconnectError = initial;
+        while (running && System.nanoTime() < deadlineNanos) {
+            attempts++;
             try {
                 WebSocketClient newClient = reconnectFactory.reconnect();
                 if (newClient != null) {
                     swapClient(newClient);
                     totalReconnects.incrementAndGet();
                     reconnectListener.onReconnect();
-                    LOG.info("cursor I/O loop reconnected; replaying from FSN {}", fsnAtZero);
+                    long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
+                    LOG.info("cursor I/O loop reconnected after {}ms, {} attempts; "
+                                    + "replaying from FSN {}",
+                            elapsedMs, attempts, fsnAtZero);
                     return;
                 }
-            } catch (Throwable reconnectError) {
-                LOG.error("cursor I/O loop reconnect failed: {}", reconnectError.getMessage(),
-                        reconnectError);
-                t = new LineSenderException(
-                        "cursor I/O loop wire failure followed by reconnect failure: "
-                                + reconnectError.getMessage(), reconnectError);
+            } catch (Throwable e) {
+                if (isTerminalUpgradeError(e)) {
+                    String upgradeMsg = findUpgradeFailureMessage(e);
+                    LOG.error("terminal upgrade error during reconnect — won't retry: {}",
+                            upgradeMsg);
+                    recordFatal(new LineSenderException(
+                            "WebSocket upgrade failed during reconnect (won't retry): "
+                                    + upgradeMsg, e));
+                    return;
+                }
+                lastReconnectError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("reconnect attempt {} failed: {}", attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
+            }
+            // Backoff with jitter: sleep [backoff, 2*backoff). Cap the
+            // sleep at the remaining budget so we don't oversleep past
+            // the deadline.
+            if (running) {
+                long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+                long sleepMillis = backoffMillis + jitter;
+                long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
+                if (remainingMillis <= 0) {
+                    break;
+                }
+                if (sleepMillis > remainingMillis) {
+                    sleepMillis = remainingMillis;
+                }
+                LockSupport.parkNanos(sleepMillis * 1_000_000L);
+                backoffMillis = Math.min(backoffMillis * 2, reconnectMaxBackoffMillis);
             }
         }
+        long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
+        LOG.error("cursor I/O loop giving up reconnecting after {}ms, {} attempts; "
+                        + "last error: {}",
+                elapsedMs, attempts, lastReconnectError.getMessage());
+        recordFatal(new LineSenderException(
+                "reconnect failed after " + elapsedMs + "ms / " + attempts + " attempts: "
+                        + lastReconnectError.getMessage(), lastReconnectError));
+    }
+
+    /**
+     * Mark the loop as fatally failed. Caller has decided no reconnect
+     * is possible (or it ran out of budget) — record the error so
+     * {@link #checkError} can surface it to the producer thread, then
+     * stop the loop.
+     */
+    private void recordFatal(Throwable t) {
         if (lastError == null) {
             lastError = t;
         }
         running = false;
         LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
+    }
+
+    /**
+     * True when the given throwable indicates a server-side reject that
+     * won't fix itself on retry. Today this is detected by message
+     * sniffing: WebSocket upgrade failures with a non-101 HTTP status
+     * (401 unauthorized, 403 forbidden, 426 upgrade-required, etc.)
+     * indicate auth or version mismatch — retrying just delays the user
+     * seeing the misconfig. Other failures (TCP refused, IO error during
+     * handshake) are treated as transient.
+     */
+    private static boolean isTerminalUpgradeError(Throwable t) {
+        return findUpgradeFailureMessage(t) != null;
+    }
+
+    /**
+     * Walks the cause chain looking for the WebSocketClient's
+     * "WebSocket upgrade failed:" sentinel and returns its message, or
+     * {@code null} if not present. The upgrade failure is thrown deep
+     * inside WebSocketClient and gets wrapped by the connect path before
+     * reaching us — so we have to look past the outermost wrapper.
+     */
+    private static String findUpgradeFailureMessage(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            String msg = cur.getMessage();
+            if (msg != null && msg.contains("WebSocket upgrade failed:")) {
+                return msg;
+            }
+            if (cur.getCause() == cur) break;
+        }
+        return null;
     }
 
     /**

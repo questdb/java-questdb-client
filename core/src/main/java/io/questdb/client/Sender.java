@@ -37,6 +37,7 @@ import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
 import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
@@ -676,6 +677,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // means "fast close" (skip the drain entirely); any positive value
         // bounds the wait for ackedFsn to catch up to publishedFsn.
         private long closeFlushTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        // Reconnect policy. Defaults applied at build() time. Per-outage
+        // time cap (default 300_000), initial backoff (default 100), and
+        // max backoff (default 5_000) for the cursor I/O loop's exponential
+        // retry-with-jitter loop.
+        private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private long reconnectInitialBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private long reconnectMaxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -1007,6 +1015,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY
                         ? DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS
                         : closeFlushTimeoutMillis;
+                long actualReconnectMaxDurationMillis =
+                        reconnectMaxDurationMillis == PARAMETER_NOT_SET_EXPLICITLY
+                                ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS
+                                : reconnectMaxDurationMillis;
+                long actualReconnectInitialBackoffMillis =
+                        reconnectInitialBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
+                                ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS
+                                : reconnectInitialBackoffMillis;
+                long actualReconnectMaxBackoffMillis =
+                        reconnectMaxBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
+                                ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS
+                                : reconnectMaxBackoffMillis;
 
                 CursorSendEngine cursorEngine = new CursorSendEngine(
                         sfDir, actualSfMaxBytes,
@@ -1024,7 +1044,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualMaxSchemasPerConnection,
                             requestDurableAck,
                             cursorEngine,
-                            actualCloseFlushTimeoutMillis
+                            actualCloseFlushTimeoutMillis,
+                            actualReconnectMaxDurationMillis,
+                            actualReconnectInitialBackoffMillis,
+                            actualReconnectMaxBackoffMillis
                     );
                 } catch (Throwable t) {
                     try {
@@ -1695,6 +1718,60 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Per-outage cap on the cursor I/O loop's reconnect retry budget.
+         * Once a wire failure occurs, the loop retries with exponential
+         * backoff until either reconnect succeeds (timer resets) or this
+         * many millis elapse since the first failure of this outage —
+         * whichever comes first. On budget exhaustion, the next user
+         * thread API call throws.
+         * <p>
+         * Default {@code 300_000} (5 minutes). Lower for fail-fast services;
+         * higher for tolerating long maintenance windows. WebSocket only.
+         */
+        public LineSenderBuilder reconnectMaxDurationMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
+            }
+            if (millis < 0) {
+                throw new LineSenderException("reconnect_max_duration_millis must be >= 0: ").put(millis);
+            }
+            this.reconnectMaxDurationMillis = millis;
+            return this;
+        }
+
+        /**
+         * Initial reconnect backoff in millis. Doubled (with jitter) each
+         * failed attempt, capped at {@link #reconnectMaxBackoffMillis(long)}.
+         * Default {@code 100}. WebSocket only.
+         */
+        public LineSenderBuilder reconnectInitialBackoffMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("reconnect_initial_backoff_millis is only supported for WebSocket transport");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("reconnect_initial_backoff_millis must be > 0: ").put(millis);
+            }
+            this.reconnectInitialBackoffMillis = millis;
+            return this;
+        }
+
+        /**
+         * Max reconnect backoff in millis. Caps the exponential growth so
+         * a long outage doesn't end up sleeping minutes between attempts.
+         * Default {@code 5_000} (5 s). WebSocket only.
+         */
+        public LineSenderBuilder reconnectMaxBackoffMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("reconnect_max_backoff_millis is only supported for WebSocket transport");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("reconnect_max_backoff_millis must be > 0: ").put(millis);
+            }
+            this.reconnectMaxBackoffMillis = millis;
+            return this;
+        }
+
+        /**
          * Selects the durability contract for SF appends and flushes. See
          * {@link SfDurability} for the value semantics.
          * <p>
@@ -2228,6 +2305,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "close_flush_timeout_millis");
                     closeFlushTimeoutMillis(parseLongValue(sink, "close_flush_timeout_millis"));
+                } else if (Chars.equals("reconnect_max_duration_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "reconnect_max_duration_millis");
+                    reconnectMaxDurationMillis(parseLongValue(sink, "reconnect_max_duration_millis"));
+                } else if (Chars.equals("reconnect_initial_backoff_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("reconnect_initial_backoff_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "reconnect_initial_backoff_millis");
+                    reconnectInitialBackoffMillis(parseLongValue(sink, "reconnect_initial_backoff_millis"));
+                } else if (Chars.equals("reconnect_max_backoff_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("reconnect_max_backoff_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "reconnect_max_backoff_millis");
+                    reconnectMaxBackoffMillis(parseLongValue(sink, "reconnect_max_backoff_millis"));
                 } else if (Chars.equals("max_datagram_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");
                     int mds = parseIntValue(sink, "max_datagram_size");

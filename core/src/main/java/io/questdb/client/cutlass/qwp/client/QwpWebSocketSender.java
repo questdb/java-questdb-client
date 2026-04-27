@@ -164,6 +164,14 @@ public class QwpWebSocketSender implements Sender {
     // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
     // up to this many millis for ackedFsn to catch up to publishedFsn.
     private long closeFlushTimeoutMillis = 5_000L;
+    // Reconnect policy. Defaults match CursorWebSocketSendLoop's per-spec
+    // values; Sender.build can override via the new connect overload.
+    private long reconnectMaxDurationMillis =
+            CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
+    private long reconnectInitialBackoffMillis =
+            CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
+    private long reconnectMaxBackoffMillis =
+            CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS;
     // Single volatile counter, single writer (the wire-side actor that
     // performs reconnect; for now: ensureConnected during recovery).
     // Bumped on every successful reconnect AND on initial recovery from
@@ -313,6 +321,38 @@ public class QwpWebSocketSender implements Sender {
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis
     ) {
+        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis,
+                CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS);
+    }
+
+    /**
+     * Master connect overload — exposes every cursor-pipeline knob the
+     * builder can set. The reconnect-policy parameters bound the I/O
+     * loop's per-outage retry behavior (see
+     * {@link CursorWebSocketSendLoop} javadoc).
+     */
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -321,6 +361,9 @@ public class QwpWebSocketSender implements Sender {
         try {
             sender.requestDurableAck = requestDurableAck;
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
+            sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
+            sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
+            sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
             if (cursorEngine != null) {
                 sender.setCursorEngine(cursorEngine, true);
             }
@@ -1321,7 +1364,10 @@ public class QwpWebSocketSender implements Sender {
                     client, cursorEngine,
                     0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     this::buildAndConnect,
-                    this::onWireReconnect);
+                    this::onWireReconnect,
+                    reconnectMaxDurationMillis,
+                    reconnectInitialBackoffMillis,
+                    reconnectMaxBackoffMillis);
             cursorSendLoop.start();
         } catch (Throwable t) {
             client.close();
