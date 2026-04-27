@@ -658,6 +658,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // never approaches it. SF mode = 10 GiB (2560 segments at default
         // size). Users can lower this on space-constrained hosts.
         private static final long DEFAULT_MAX_BYTES_SF = 10L * 1024 * 1024 * 1024;
+        // Default close() drain timeout: block up to 5s waiting for the
+        // server to ACK everything published into the engine before
+        // shutting down the I/O loop.
+        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = 5_000L;
         // Store-and-forward (WebSocket only). SF is enabled iff sfDir is non-null —
         // there is no separate on/off flag (presence of the directory is the switch).
         // null sfDir → memory-only async ingest (same lock-free architecture, no disk).
@@ -668,6 +672,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // implemented; FLUSH and APPEND are deferred follow-ups (cursor needs
         // to learn fsync first).
         private SfDurability sfDurability = SfDurability.MEMORY;
+        // close() drain timeout. Default applied at build() time. 0 or -1
+        // means "fast close" (skip the drain entirely); any positive value
+        // bounds the wait for ackedFsn to catch up to publishedFsn.
+        private long closeFlushTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -996,6 +1004,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
                         ? Math.max(defaultMaxTotal, actualSfMaxBytes * 2)
                         : sfMaxTotalBytes;
+                long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY
+                        ? DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS
+                        : closeFlushTimeoutMillis;
 
                 CursorSendEngine cursorEngine = new CursorSendEngine(
                         sfDir, actualSfMaxBytes,
@@ -1012,7 +1023,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             wsAuthHeader,
                             actualMaxSchemasPerConnection,
                             requestDurableAck,
-                            cursorEngine
+                            cursorEngine,
+                            actualCloseFlushTimeoutMillis
                     );
                 } catch (Throwable t) {
                     try {
@@ -1663,6 +1675,26 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * close() drain timeout in milliseconds. The sender's {@code close()}
+         * method blocks up to this many millis waiting for the server to ACK
+         * every batch already published into the engine before shutting down
+         * the I/O loop. Default {@code 5000}.
+         * <p>
+         * Set to {@code 0} or {@code -1} to opt out — close() will not wait
+         * at all (fast close). Pending data is then lost in memory mode and
+         * recovered by the next sender in SF mode.
+         * <p>
+         * WebSocket transport only.
+         */
+        public LineSenderBuilder closeFlushTimeoutMillis(long timeoutMillis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("close_flush_timeout_millis is only supported for WebSocket transport");
+            }
+            this.closeFlushTimeoutMillis = timeoutMillis;
+            return this;
+        }
+
+        /**
          * Selects the durability contract for SF appends and flushes. See
          * {@link SfDurability} for the value semantics.
          * <p>
@@ -2190,6 +2222,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "sf_durability");
                     storeAndForwardDurability(parseDurabilityValue(sink));
+                } else if (Chars.equals("close_flush_timeout_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("close_flush_timeout_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "close_flush_timeout_millis");
+                    closeFlushTimeoutMillis(parseLongValue(sink, "close_flush_timeout_millis"));
                 } else if (Chars.equals("max_datagram_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");
                     int mds = parseIntValue(sink, "max_datagram_size");

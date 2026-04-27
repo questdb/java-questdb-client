@@ -160,6 +160,10 @@ public class QwpWebSocketSender implements Sender {
     private CursorSendEngine cursorEngine;
     private boolean ownsCursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
+    // close() drain timeout in millis. Default applied at construction.
+    // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
+    // up to this many millis for ackedFsn to catch up to publishedFsn.
+    private long closeFlushTimeoutMillis = 5_000L;
 
     private QwpWebSocketSender(
             String host,
@@ -268,6 +272,31 @@ public class QwpWebSocketSender implements Sender {
             boolean requestDurableAck,
             CursorSendEngine cursorEngine
     ) {
+        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection,
+                requestDurableAck, cursorEngine, 5_000L);
+    }
+
+    /**
+     * Connect overload that also configures the {@code close()} drain
+     * timeout. {@code 0} or {@code -1} disables the drain (fast close);
+     * any positive value bounds the wait for {@code ackedFsn} to catch
+     * up to {@code publishedFsn} during {@code close()}.
+     */
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -275,6 +304,7 @@ public class QwpWebSocketSender implements Sender {
         );
         try {
             sender.requestDurableAck = requestDurableAck;
+            sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
             if (cursorEngine != null) {
                 sender.setCursorEngine(cursorEngine, true);
             }
@@ -485,16 +515,21 @@ public class QwpWebSocketSender implements Sender {
                 // up — close() is also called from createForTesting() teardown
                 // and from connect() rollback paths where one or both may be null.
                 if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
-                    // Flush user-thread state (accumulated rows -> microbatch ->
-                    // engine append). The cursor engine append is durable
-                    // (on-disk in SF mode, in-RAM in memory mode); we don't
-                    // wait for the cursor I/O loop to acknowledge — the data
-                    // is already past the in-flight handoff.
+                    // 1) Flush user-thread state into the engine (encoded
+                    //    rows → mmap'd / malloc'd ring). After this, the
+                    //    cursor engine's publishedFsn reflects the final
+                    //    target the I/O loop must drive ackedFsn up to.
                     flushPendingRows();
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
                     cursorSendLoop.checkError();
+                    // 2) Bounded drain: block until the server has ACK'd
+                    //    everything we just published, or until the
+                    //    configured timeout elapses. closeFlushTimeoutMillis
+                    //    <= 0 opts out (fast close, may lose memory-mode
+                    //    data on JVM exit).
+                    drainOnClose();
                 }
             } catch (Exception e) {
                 LOG.error("Error during close: {}", String.valueOf(e));
@@ -1414,6 +1449,33 @@ public class QwpWebSocketSender implements Sender {
             if (tableBuffer != null) {
                 tableBuffer.setSchemaId(-1);
             }
+        }
+    }
+
+    /**
+     * Bounded drain on close: block until {@code ackedFsn >= publishedFsn}
+     * or until {@code closeFlushTimeoutMillis} elapses. {@code <= 0} skips
+     * the drain (fast close). On timeout, log a WARN and proceed with
+     * shutdown — pending data is lost in memory mode and recovered by
+     * the next sender in SF mode.
+     */
+    private void drainOnClose() {
+        if (closeFlushTimeoutMillis <= 0L) {
+            return;
+        }
+        long target = cursorEngine.publishedFsn();
+        if (cursorEngine.ackedFsn() >= target) {
+            return;
+        }
+        long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
+        while (cursorEngine.ackedFsn() < target) {
+            cursorSendLoop.checkError();
+            if (System.nanoTime() >= deadlineNanos) {
+                LOG.warn("close() drain timed out after {}ms [target={} acked={}] — pending data may be lost",
+                        closeFlushTimeoutMillis, target, cursorEngine.ackedFsn());
+                return;
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }
     }
 
