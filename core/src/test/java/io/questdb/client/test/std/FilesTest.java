@@ -60,7 +60,7 @@ public class FilesTest {
             return;
         }
         long find = Files.findFirst(tmpDir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {

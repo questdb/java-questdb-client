@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -57,7 +58,7 @@ public class MmapSegmentTest {
             return;
         }
         long find = Files.findFirst(tmpDir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {
@@ -75,251 +76,269 @@ public class MmapSegmentTest {
     }
 
     @Test
-    public void testCreateAppendCloseReopenScansAllFrames() {
-        String path = tmpDir + "/seg-create.sfa";
-        long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-        try {
-            // Append 100 distinct payloads of 32 bytes each.
-            try (MmapSegment seg = MmapSegment.create(path, 42L, 64 * 1024)) {
-                assertEquals(42L, seg.baseSeq());
-                assertEquals(MmapSegment.HEADER_SIZE, seg.publishedOffset());
-                for (int i = 0; i < 100; i++) {
-                    fillPattern(buf, 32, i);
-                    long offset = seg.tryAppend(buf, 32);
-                    assertNotEquals("frame " + i + " should fit", -1L, offset);
+    public void testCreateAppendCloseReopenScansAllFrames() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-create.sfa";
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Append 100 distinct payloads of 32 bytes each.
+                try (MmapSegment seg = MmapSegment.create(path, 42L, 64 * 1024)) {
+                    assertEquals(42L, seg.baseSeq());
+                    assertEquals(MmapSegment.HEADER_SIZE, seg.publishedOffset());
+                    for (int i = 0; i < 100; i++) {
+                        fillPattern(buf, 32, i);
+                        long offset = seg.tryAppend(buf, 32);
+                        assertNotEquals("frame " + i + " should fit", -1L, offset);
+                    }
+                    long expectedEnd = MmapSegment.HEADER_SIZE
+                            + 100L * (MmapSegment.FRAME_HEADER_SIZE + 32);
+                    assertEquals(expectedEnd, seg.publishedOffset());
                 }
-                long expectedEnd = MmapSegment.HEADER_SIZE
-                        + 100L * (MmapSegment.FRAME_HEADER_SIZE + 32);
-                assertEquals(expectedEnd, seg.publishedOffset());
-            }
 
-            // Re-open: scan must land at exactly the same offset.
-            try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                assertEquals(42L, seg.baseSeq());
-                long expectedEnd = MmapSegment.HEADER_SIZE
-                        + 100L * (MmapSegment.FRAME_HEADER_SIZE + 32);
-                assertEquals(expectedEnd, seg.publishedOffset());
+                // Re-open: scan must land at exactly the same offset.
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals(42L, seg.baseSeq());
+                    long expectedEnd = MmapSegment.HEADER_SIZE
+                            + 100L * (MmapSegment.FRAME_HEADER_SIZE + 32);
+                    assertEquals(expectedEnd, seg.publishedOffset());
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
-        } finally {
-            Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     @Test
-    public void testTornTailIsRecoveredCleanly() {
-        String path = tmpDir + "/seg-torn.sfa";
-        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
-        long expectedEnd;
-        try {
-            try (MmapSegment seg = MmapSegment.create(path, 7L, 64 * 1024)) {
-                for (int i = 0; i < 5; i++) {
-                    fillPattern(buf, 16, i);
+    public void testTornTailIsRecoveredCleanly() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-torn.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            long expectedEnd;
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 7L, 64 * 1024)) {
+                    for (int i = 0; i < 5; i++) {
+                        fillPattern(buf, 16, i);
+                        seg.tryAppend(buf, 16);
+                    }
+                    expectedEnd = seg.publishedOffset();
+                    // Now corrupt what would be the start of the next frame:
+                    // write a plausible-looking 4-byte length followed by some bytes,
+                    // but no matching CRC. Recovery scan should detect this and
+                    // stop at expectedEnd (the start of the bad frame).
+                    long addr = seg.address();
+                    Unsafe.getUnsafe().putInt(addr + expectedEnd, 0xCAFEBABE);   // garbage CRC
+                    Unsafe.getUnsafe().putInt(addr + expectedEnd + 4, 32);        // declared length
+                    // Don't bother filling the body — CRC mismatch alone defeats it.
+                    seg.msync(); // make sure pages flushed before reopen reads them
+                }
+
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("scan must stop at the torn frame's start", expectedEnd,
+                            seg.publishedOffset());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testTornTailFromNegativeOrOversizedLengthAlsoRecovered() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-bad-len.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            long expectedEnd;
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 9L, 4096)) {
+                    fillPattern(buf, 16, 1);
                     seg.tryAppend(buf, 16);
+                    expectedEnd = seg.publishedOffset();
+                    long addr = seg.address();
+                    // Negative length — defensive scan must reject this.
+                    Unsafe.getUnsafe().putInt(addr + expectedEnd, 0);
+                    Unsafe.getUnsafe().putInt(addr + expectedEnd + 4, -1);
+                    seg.msync();
                 }
-                expectedEnd = seg.publishedOffset();
-                // Now corrupt what would be the start of the next frame:
-                // write a plausible-looking 4-byte length followed by some bytes,
-                // but no matching CRC. Recovery scan should detect this and
-                // stop at expectedEnd (the start of the bad frame).
-                long addr = seg.address();
-                Unsafe.getUnsafe().putInt(addr + expectedEnd, 0xCAFEBABE);   // garbage CRC
-                Unsafe.getUnsafe().putInt(addr + expectedEnd + 4, 32);        // declared length
-                // Don't bother filling the body — CRC mismatch alone defeats it.
-                seg.msync(); // make sure pages flushed before reopen reads them
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals(expectedEnd, seg.publishedOffset());
+                }
+                // Now an absurdly oversized length that would run past EOF.
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    long addr = seg.address();
+                    Unsafe.getUnsafe().putInt(addr + expectedEnd, 0);
+                    Unsafe.getUnsafe().putInt(addr + expectedEnd + 4, Integer.MAX_VALUE);
+                    seg.msync();
+                }
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals(expectedEnd, seg.publishedOffset());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
-
-            try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                assertEquals("scan must stop at the torn frame's start", expectedEnd,
-                        seg.publishedOffset());
-            }
-        } finally {
-            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     @Test
-    public void testTornTailFromNegativeOrOversizedLengthAlsoRecovered() {
-        String path = tmpDir + "/seg-bad-len.sfa";
-        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
-        long expectedEnd;
-        try {
-            try (MmapSegment seg = MmapSegment.create(path, 9L, 4096)) {
-                fillPattern(buf, 16, 1);
-                seg.tryAppend(buf, 16);
-                expectedEnd = seg.publishedOffset();
-                long addr = seg.address();
-                // Negative length — defensive scan must reject this.
-                Unsafe.getUnsafe().putInt(addr + expectedEnd, 0);
-                Unsafe.getUnsafe().putInt(addr + expectedEnd + 4, -1);
-                seg.msync();
+    public void testRecoverySignalsTornTailWithByteCount() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Recovery must distinguish "writer attempted a frame past lastGood
+            // and failed" (torn tail — possible corruption / partial write) from
+            // a clean partial fill (no incident, just unwritten space).
+            // Pre-fix: silent truncation with no diagnostic.
+            String path = tmpDir + "/seg-torn-signal.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            long lastGood;
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                    for (int i = 0; i < 3; i++) {
+                        fillPattern(buf, 16, i);
+                        seg.tryAppend(buf, 16);
+                    }
+                    lastGood = seg.publishedOffset();
+                    // Inject a non-zero attempted-frame signature past the last
+                    // valid frame: a CRC and length that don't validate. This
+                    // mirrors a partial write or in-place corruption.
+                    long addr = seg.address();
+                    Unsafe.getUnsafe().putInt(addr + lastGood, 0xCAFEBABE);
+                    Unsafe.getUnsafe().putInt(addr + lastGood + 4, 16);
+                    seg.msync();
+                }
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("scan must stop at last good frame", lastGood, seg.publishedOffset());
+                    assertTrue("torn tail must be reported as nonzero so operators see "
+                                    + "silent truncation; got " + seg.tornTailBytes(),
+                            seg.tornTailBytes() > 0);
+                    assertEquals("torn-tail count must be the byte gap to file end",
+                            4096L - lastGood, seg.tornTailBytes());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
-            try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                assertEquals(expectedEnd, seg.publishedOffset());
-            }
-            // Now an absurdly oversized length that would run past EOF.
-            try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                long addr = seg.address();
-                Unsafe.getUnsafe().putInt(addr + expectedEnd, 0);
-                Unsafe.getUnsafe().putInt(addr + expectedEnd + 4, Integer.MAX_VALUE);
-                seg.msync();
-            }
-            try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                assertEquals(expectedEnd, seg.publishedOffset());
-            }
-        } finally {
-            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     @Test
-    public void testRecoverySignalsTornTailWithByteCount() {
-        // Recovery must distinguish "writer attempted a frame past lastGood
-        // and failed" (torn tail — possible corruption / partial write) from
-        // a clean partial fill (no incident, just unwritten space).
-        // Pre-fix: silent truncation with no diagnostic.
-        String path = tmpDir + "/seg-torn-signal.sfa";
-        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
-        long lastGood;
-        try {
-            try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
-                for (int i = 0; i < 3; i++) {
-                    fillPattern(buf, 16, i);
-                    seg.tryAppend(buf, 16);
+    public void testRecoveryDoesNotFlagCleanPartialFill() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Counterpart to the torn-tail test: a writer that wrote N valid
+            // frames and stopped (clean) leaves an all-zero tail. Recovery must
+            // NOT cry wolf — tornTailBytes should be 0 so log noise stays
+            // proportional to actual incidents.
+            String path = tmpDir + "/seg-clean-tail.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                    for (int i = 0; i < 3; i++) {
+                        fillPattern(buf, 16, i);
+                        seg.tryAppend(buf, 16);
+                    }
+                    seg.msync();
                 }
-                lastGood = seg.publishedOffset();
-                // Inject a non-zero attempted-frame signature past the last
-                // valid frame: a CRC and length that don't validate. This
-                // mirrors a partial write or in-place corruption.
-                long addr = seg.address();
-                Unsafe.getUnsafe().putInt(addr + lastGood, 0xCAFEBABE);
-                Unsafe.getUnsafe().putInt(addr + lastGood + 4, 16);
-                seg.msync();
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("clean partial fill must report zero torn tail",
+                            0L, seg.tornTailBytes());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
-            try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                assertEquals("scan must stop at last good frame", lastGood, seg.publishedOffset());
-                assertTrue("torn tail must be reported as nonzero so operators see "
-                                + "silent truncation; got " + seg.tornTailBytes(),
-                        seg.tornTailBytes() > 0);
-                assertEquals("torn-tail count must be the byte gap to file end",
-                        4096L - lastGood, seg.tornTailBytes());
-            }
-        } finally {
-            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     @Test
-    public void testRecoveryDoesNotFlagCleanPartialFill() {
-        // Counterpart to the torn-tail test: a writer that wrote N valid
-        // frames and stopped (clean) leaves an all-zero tail. Recovery must
-        // NOT cry wolf — tornTailBytes should be 0 so log noise stays
-        // proportional to actual incidents.
-        String path = tmpDir + "/seg-clean-tail.sfa";
-        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
-        try {
-            try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
-                for (int i = 0; i < 3; i++) {
-                    fillPattern(buf, 16, i);
-                    seg.tryAppend(buf, 16);
-                }
+    public void testRecoveryDoesNotFlagFreshUnusedSegment() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // A manager-allocated hot-spare that the writer never touched: the
+            // file has just the header and an all-zero body. Recovery must not
+            // emit a torn-tail signal here either.
+            String path = tmpDir + "/seg-fresh.sfa";
+            try (MmapSegment seg = MmapSegment.create(path, 42L, 4096)) {
                 seg.msync();
             }
             try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                assertEquals("clean partial fill must report zero torn tail",
+                assertEquals("fresh-but-unused segment must report zero torn tail",
                         0L, seg.tornTailBytes());
             }
-        } finally {
-            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     @Test
-    public void testRecoveryDoesNotFlagFreshUnusedSegment() {
-        // A manager-allocated hot-spare that the writer never touched: the
-        // file has just the header and an all-zero body. Recovery must not
-        // emit a torn-tail signal here either.
-        String path = tmpDir + "/seg-fresh.sfa";
-        try (MmapSegment seg = MmapSegment.create(path, 42L, 4096)) {
-            seg.msync();
-        }
-        try (MmapSegment seg = MmapSegment.openExisting(path)) {
-            assertEquals("fresh-but-unused segment must report zero torn tail",
-                    0L, seg.tornTailBytes());
-        }
-    }
-
-    @Test
-    public void testFullSegmentRejectsFurtherAppends() {
-        String path = tmpDir + "/seg-full.sfa";
-        // Just enough room for header + exactly one 100-byte payload.
-        long sizeBytes = MmapSegment.HEADER_SIZE
-                + MmapSegment.FRAME_HEADER_SIZE + 100;
-        long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
-        try {
-            try (MmapSegment seg = MmapSegment.create(path, 0L, sizeBytes)) {
-                fillPattern(buf, 100, 0);
-                long ok = seg.tryAppend(buf, 100);
-                assertEquals("first append should fit at offset HEADER_SIZE",
-                        MmapSegment.HEADER_SIZE, ok);
-                assertTrue("segment should now be full", seg.isFull());
-                assertEquals("a second append must be rejected",
-                        -1L, seg.tryAppend(buf, 100));
-                assertEquals("an even-1-byte append must be rejected",
-                        -1L, seg.tryAppend(buf, 1));
+    public void testFullSegmentRejectsFurtherAppends() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-full.sfa";
+            // Just enough room for header + exactly one 100-byte payload.
+            long sizeBytes = MmapSegment.HEADER_SIZE
+                    + MmapSegment.FRAME_HEADER_SIZE + 100;
+            long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, sizeBytes)) {
+                    fillPattern(buf, 100, 0);
+                    long ok = seg.tryAppend(buf, 100);
+                    assertEquals("first append should fit at offset HEADER_SIZE",
+                            MmapSegment.HEADER_SIZE, ok);
+                    assertTrue("segment should now be full", seg.isFull());
+                    assertEquals("a second append must be rejected",
+                            -1L, seg.tryAppend(buf, 100));
+                    assertEquals("an even-1-byte append must be rejected",
+                            -1L, seg.tryAppend(buf, 1));
+                }
+            } finally {
+                Unsafe.free(buf, 100, MemoryTag.NATIVE_DEFAULT);
             }
-        } finally {
-            Unsafe.free(buf, 100, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     @Test
-    public void testOpenExistingRejectsCorruptHeader() {
-        String path = tmpDir + "/seg-bad-magic.sfa";
-        // Build a file with the right size but the wrong magic.
-        int fd = Files.openCleanRW(path, MmapSegment.HEADER_SIZE);
-        long bufHdr = Unsafe.malloc(MmapSegment.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
-        try {
-            Unsafe.getUnsafe().putInt(bufHdr, 0xBAD0FACE);
-            for (int i = 4; i < MmapSegment.HEADER_SIZE; i++) {
-                Unsafe.getUnsafe().putByte(bufHdr + i, (byte) 0);
+    public void testOpenExistingRejectsCorruptHeader() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-bad-magic.sfa";
+            // Build a file with the right size but the wrong magic.
+            int fd = Files.openCleanRW(path, MmapSegment.HEADER_SIZE);
+            long bufHdr = Unsafe.malloc(MmapSegment.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().putInt(bufHdr, 0xBAD0FACE);
+                for (int i = 4; i < MmapSegment.HEADER_SIZE; i++) {
+                    Unsafe.getUnsafe().putByte(bufHdr + i, (byte) 0);
+                }
+                assertEquals(MmapSegment.HEADER_SIZE,
+                        Files.write(fd, bufHdr, MmapSegment.HEADER_SIZE, 0));
+                Files.fsync(fd);
+                Files.close(fd);
+            } finally {
+                Unsafe.free(bufHdr, MmapSegment.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
             }
-            assertEquals(MmapSegment.HEADER_SIZE,
-                    Files.write(fd, bufHdr, MmapSegment.HEADER_SIZE, 0));
-            Files.fsync(fd);
-            Files.close(fd);
-        } finally {
-            Unsafe.free(bufHdr, MmapSegment.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
-        }
 
-        try {
-            MmapSegment.openExisting(path).close();
-            fail("openExisting should reject bad magic");
-        } catch (MmapSegmentException expected) {
-            assertTrue(expected.getMessage(), expected.getMessage().contains("bad magic"));
-        }
+            try {
+                MmapSegment.openExisting(path).close();
+                fail("openExisting should reject bad magic");
+            } catch (MmapSegmentException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("bad magic"));
+            }
+        });
     }
 
     @Test
-    public void testCapacityRemainingAccountsForFrameEnvelope() {
-        String path = tmpDir + "/seg-cap.sfa";
-        long size = MmapSegment.HEADER_SIZE
-                + MmapSegment.FRAME_HEADER_SIZE + 50
-                + MmapSegment.FRAME_HEADER_SIZE + 50;
-        long buf = Unsafe.malloc(50, MemoryTag.NATIVE_DEFAULT);
-        try {
-            try (MmapSegment seg = MmapSegment.create(path, 0L, size)) {
-                // Initial: room for two 50-byte payloads (each with an 8-byte envelope).
-                long firstCap = seg.capacityRemaining();
-                assertTrue(firstCap >= 50);
-                // After one append, exactly one more 50-byte payload fits.
-                seg.tryAppend(buf, 50);
-                assertTrue(seg.capacityRemaining() >= 50);
-                seg.tryAppend(buf, 50);
-                assertEquals(0, seg.capacityRemaining());
+    public void testCapacityRemainingAccountsForFrameEnvelope() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-cap.sfa";
+            long size = MmapSegment.HEADER_SIZE
+                    + MmapSegment.FRAME_HEADER_SIZE + 50
+                    + MmapSegment.FRAME_HEADER_SIZE + 50;
+            long buf = Unsafe.malloc(50, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, size)) {
+                    // Initial: room for two 50-byte payloads (each with an 8-byte envelope).
+                    long firstCap = seg.capacityRemaining();
+                    assertTrue(firstCap >= 50);
+                    // After one append, exactly one more 50-byte payload fits.
+                    seg.tryAppend(buf, 50);
+                    assertTrue(seg.capacityRemaining() >= 50);
+                    seg.tryAppend(buf, 50);
+                    assertEquals(0, seg.capacityRemaining());
+                }
+            } finally {
+                Unsafe.free(buf, 50, MemoryTag.NATIVE_DEFAULT);
             }
-        } finally {
-            Unsafe.free(buf, 50, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     private static void fillPattern(long addr, int len, int seed) {

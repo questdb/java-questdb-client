@@ -50,10 +50,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * The cursor I/O loop used to treat any wire failure as terminal — first
  * disconnect = sender broken, every subsequent batch threw. Reconnect
  * machinery now handles transient drops: detect, build a fresh client
- * via the registered factory, reset wire state, reposition the replay
- * cursor at {@code engine.ackedFsn() + 1}, and notify the producer thread
- * (via {@code connectionGeneration} bump) so the next encode emits full
- * schema definitions.
+ * via the registered factory, reset wire state, and reposition the replay
+ * cursor at {@code engine.ackedFsn() + 1}. Cursor frames are self-sufficient
+ * (every frame carries full schema + full symbol-dict delta), so post-reconnect
+ * replay needs no producer-side schema-reset signal.
  * <p>
  * This commit covers the mechanics with a single-attempt retry; backoff,
  * per-outage time cap, and auth-failure detection follow.

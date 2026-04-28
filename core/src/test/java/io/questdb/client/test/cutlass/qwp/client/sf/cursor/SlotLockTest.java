@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -55,62 +56,70 @@ public class SlotLockTest {
     }
 
     @Test
-    public void testAcquireCreatesSlotDirAndLockFile() {
-        String slot = parentDir + "/alpha";
-        try (SlotLock lock = SlotLock.acquire(slot)) {
-            assertTrue("slot dir created", Files.exists(slot));
-            assertTrue(".lock file created", Files.exists(slot + "/.lock"));
-            assertEquals(slot, lock.slotDir());
-        }
-    }
-
-    @Test
-    public void testSecondAcquireFailsOnLockContention() {
-        String slot = parentDir + "/contended";
-        try (SlotLock first = SlotLock.acquire(slot)) {
-            try (SlotLock ignored = SlotLock.acquire(slot)) {
-                fail("expected slot contention to throw");
-            } catch (IllegalStateException expected) {
-                String msg = expected.getMessage();
-                assertTrue("error must mention contention: " + msg,
-                        msg.contains("already in use"));
-                assertTrue("error must include slot path: " + msg,
-                        msg.contains(slot));
-                // Holder PID must be in the diagnostic — that's the whole
-                // point of writing PID into the lock file.
-                assertTrue("error must mention pid: " + msg,
-                        msg.contains("pid="));
+    public void testAcquireCreatesSlotDirAndLockFile() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/alpha";
+            try (SlotLock lock = SlotLock.acquire(slot)) {
+                assertTrue("slot dir created", Files.exists(slot));
+                assertTrue(".lock file created", Files.exists(slot + "/.lock"));
+                assertEquals(slot, lock.slotDir());
             }
-        }
+        });
     }
 
     @Test
-    public void testCloseReleasesLock() {
-        String slot = parentDir + "/release";
-        try (SlotLock first = SlotLock.acquire(slot)) {
-            // explicit no-op; close happens via try-with-resources
-        }
-        // After release, a fresh acquire should succeed.
-        try (SlotLock again = SlotLock.acquire(slot)) {
-            assertEquals(slot, again.slotDir());
-        }
+    public void testSecondAcquireFailsOnLockContention() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/contended";
+            try (SlotLock first = SlotLock.acquire(slot)) {
+                try (SlotLock ignored = SlotLock.acquire(slot)) {
+                    fail("expected slot contention to throw");
+                } catch (IllegalStateException expected) {
+                    String msg = expected.getMessage();
+                    assertTrue("error must mention contention: " + msg,
+                            msg.contains("already in use"));
+                    assertTrue("error must include slot path: " + msg,
+                            msg.contains(slot));
+                    // Holder PID must be in the diagnostic — that's the whole
+                    // point of writing PID into the lock file.
+                    assertTrue("error must mention pid: " + msg,
+                            msg.contains("pid="));
+                }
+            }
+        });
     }
 
     @Test
-    public void testTwoDifferentSlotsCoexist() {
-        String slotA = parentDir + "/a";
-        String slotB = parentDir + "/b";
-        try (SlotLock la = SlotLock.acquire(slotA);
-             SlotLock lb = SlotLock.acquire(slotB)) {
-            assertEquals(slotA, la.slotDir());
-            assertEquals(slotB, lb.slotDir());
-        }
+    public void testCloseReleasesLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/release";
+            try (SlotLock first = SlotLock.acquire(slot)) {
+                // explicit no-op; close happens via try-with-resources
+            }
+            // After release, a fresh acquire should succeed.
+            try (SlotLock again = SlotLock.acquire(slot)) {
+                assertEquals(slot, again.slotDir());
+            }
+        });
+    }
+
+    @Test
+    public void testTwoDifferentSlotsCoexist() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slotA = parentDir + "/a";
+            String slotB = parentDir + "/b";
+            try (SlotLock la = SlotLock.acquire(slotA);
+                 SlotLock lb = SlotLock.acquire(slotB)) {
+                assertEquals(slotA, la.slotDir());
+                assertEquals(slotB, lb.slotDir());
+            }
+        });
     }
 
     private static void rmDir(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {
@@ -136,7 +145,7 @@ public class SlotLockTest {
     private static boolean isDir(String path) {
         // Cheap heuristic: directories have a readable findFirst handle.
         long find = Files.findFirst(path);
-        if (find == 0) return false;
+        if (find <= 0) return false;
         Files.findClose(find);
         return true;
     }

@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -80,59 +81,61 @@ public class SegmentManagerCloseRaceTest {
 
     @Test
     public void testManagerDoesNotInstallSpareIntoClosedRing() throws Exception {
-        // Aggressive 1us poll so the worker is almost always running
-        // serviceRing — maximizes overlap with concurrent deregister/close.
-        SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000L,
-                Long.MAX_VALUE);
-        manager.start();
+        TestUtils.assertMemoryLeak(() -> {
+            // Aggressive 1us poll so the worker is almost always running
+            // serviceRing — maximizes overlap with concurrent deregister/close.
+            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000L,
+                    Long.MAX_VALUE);
+            manager.start();
 
-        SegmentRing[] rings = new SegmentRing[ITERATIONS];
-        String[] slots = new String[ITERATIONS];
-        try {
+            SegmentRing[] rings = new SegmentRing[ITERATIONS];
+            String[] slots = new String[ITERATIONS];
+            try {
+                for (int i = 0; i < ITERATIONS; i++) {
+                    String slot = tmpDir + "/slot-" + i;
+                    Assert.assertEquals(0, Files.mkdir(slot, 0755));
+                    slots[i] = slot;
+                    MmapSegment initial = MmapSegment.create(
+                            slot + "/sf-initial.sfa", 0L, SEGMENT_SIZE);
+                    rings[i] = new SegmentRing(initial, SEGMENT_SIZE);
+                    manager.register(rings[i], slot);
+                    // Immediately deregister + close. The manager may be mid-
+                    // serviceRing for this very ring, having already created a
+                    // spare and not yet installed it — that's the race window.
+                    manager.deregister(rings[i]);
+                    rings[i].close();
+                }
+            } finally {
+                // join the worker so any in-flight serviceRing finishes
+                // BEFORE we inspect the rings — otherwise a later install
+                // could escape detection.
+                manager.close();
+            }
+
+            Field hotSpareField = SegmentRing.class.getDeclaredField("hotSpare");
+            hotSpareField.setAccessible(true);
+
+            int leaked = 0;
             for (int i = 0; i < ITERATIONS; i++) {
-                String slot = tmpDir + "/slot-" + i;
-                Assert.assertEquals(0, Files.mkdir(slot, 0755));
-                slots[i] = slot;
-                MmapSegment initial = MmapSegment.create(
-                        slot + "/sf-initial.sfa", 0L, SEGMENT_SIZE);
-                rings[i] = new SegmentRing(initial, SEGMENT_SIZE);
-                manager.register(rings[i], slot);
-                // Immediately deregister + close. The manager may be mid-
-                // serviceRing for this very ring, having already created a
-                // spare and not yet installed it — that's the race window.
-                manager.deregister(rings[i]);
-                rings[i].close();
+                Object hs = hotSpareField.get(rings[i]);
+                if (hs != null) {
+                    leaked++;
+                    // Don't leak in the test: close the survivor.
+                    ((MmapSegment) hs).close();
+                }
             }
-        } finally {
-            // join the worker so any in-flight serviceRing finishes
-            // BEFORE we inspect the rings — otherwise a later install
-            // could escape detection.
-            manager.close();
-        }
 
-        Field hotSpareField = SegmentRing.class.getDeclaredField("hotSpare");
-        hotSpareField.setAccessible(true);
-
-        int leaked = 0;
-        for (int i = 0; i < ITERATIONS; i++) {
-            Object hs = hotSpareField.get(rings[i]);
-            if (hs != null) {
-                leaked++;
-                // Don't leak in the test: close the survivor.
-                ((MmapSegment) hs).close();
-            }
-        }
-
-        Assert.assertEquals(
-                "SegmentManager installed hot spares into closed rings — "
-                        + "spare mmap/fd permanently leaked",
-                0, leaked);
+            Assert.assertEquals(
+                    "SegmentManager installed hot spares into closed rings — "
+                            + "spare mmap/fd permanently leaked",
+                    0, leaked);
+        });
     }
 
     private static void cleanupRecursively(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);
-        if (find == 0) return;
+        if (find <= 0) return;
         try {
             int rc = 1;
             while (rc > 0) {

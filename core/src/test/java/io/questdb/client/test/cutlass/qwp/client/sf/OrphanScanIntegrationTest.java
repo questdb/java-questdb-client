@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -67,85 +68,89 @@ public class OrphanScanIntegrationTest {
 
     @Test
     public void testScanFindsOrphanFromPriorSenderUnderSameGroupRoot() throws Exception {
-        // First sender uses sender_id=ghost. We give it data + flush, but
-        // close the server BEFORE acks land — so the slot retains
-        // unacked .sfa files when the sender shuts down. Then the same
-        // slot should be reported as an orphan when a second sender opens
-        // with sender_id=primary and drain_orphans=true.
-        int port = TEST_PORT + 1;
+        TestUtils.assertMemoryLeak(() -> {
+            // First sender uses sender_id=ghost. We give it data + flush, but
+            // close the server BEFORE acks land — so the slot retains
+            // unacked .sfa files when the sender shuts down. Then the same
+            // slot should be reported as an orphan when a second sender opens
+            // with sender_id=primary and drain_orphans=true.
+            int port = TEST_PORT + 1;
 
-        // Phase 1: ghost writes + closes; never acked.
-        TestWebSocketServer ghostServer = new TestWebSocketServer(port, new SilentHandler());
-        try {
-            ghostServer.start();
-            Assert.assertTrue(ghostServer.awaitStart(5, TimeUnit.SECONDS));
-
-            String ghostCfg = "ws::addr=localhost:" + port
-                    + ";sf_dir=" + sfDir + ";sender_id=ghost;close_flush_timeout_millis=0;";
-            try (Sender ghost = Sender.fromConfig(ghostCfg)) {
-                ghost.table("foo").longColumn("v", 7L).atNow();
-                ghost.flush();
-                // No wait for ACK — close right away; close_flush_timeout=0
-                // means we don't drain.
-            }
-        } finally {
+            // Phase 1: ghost writes + closes; never acked.
+            TestWebSocketServer ghostServer = new TestWebSocketServer(port, new SilentHandler());
             try {
-                ghostServer.close();
-            } catch (Exception ignored) {
-                // best-effort
-            }
-        }
-        // Independent verification: the scanner sees the ghost slot.
-        ObjList<String> seen = OrphanScanner.scan(sfDir, "primary");
-        Assert.assertEquals("ghost slot must be a candidate orphan", 1, seen.size());
-        Assert.assertEquals(sfDir + "/ghost", seen.get(0));
+                ghostServer.start();
+                Assert.assertTrue(ghostServer.awaitStart(5, TimeUnit.SECONDS));
 
-        // Phase 2: open the primary sender with drain_orphans=true. We
-        // can't directly assert the log output in this test, but the
-        // call must not throw, and the primary's own slot must NOT
-        // appear in a fresh scan (sender_id-filtered).
-        TestWebSocketServer primaryServer = new TestWebSocketServer(port + 1000, new AckHandler());
-        try {
-            primaryServer.start();
-            Assert.assertTrue(primaryServer.awaitStart(5, TimeUnit.SECONDS));
-
-            String primaryCfg = "ws::addr=localhost:" + (port + 1000)
-                    + ";sf_dir=" + sfDir
-                    + ";sender_id=primary"
-                    + ";drain_orphans=true;";
-            try (Sender primary = Sender.fromConfig(primaryCfg)) {
-                primary.table("foo").longColumn("v", 8L).atNow();
-                primary.flush();
+                String ghostCfg = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir + ";sender_id=ghost;close_flush_timeout_millis=0;";
+                try (Sender ghost = Sender.fromConfig(ghostCfg)) {
+                    ghost.table("foo").longColumn("v", 7L).atNow();
+                    ghost.flush();
+                    // No wait for ACK — close right away; close_flush_timeout=0
+                    // means we don't drain.
+                }
+            } finally {
+                try {
+                    ghostServer.close();
+                } catch (Exception ignored) {
+                    // best-effort
+                }
             }
-            // Primary's slot now exists too; scanner with primary
-            // excluded must still return the ghost (and nothing else
-            // among the two slots).
-            ObjList<String> postRun = OrphanScanner.scan(sfDir, "primary");
-            Assert.assertEquals("only ghost should appear; primary excluded",
-                    1, postRun.size());
-            Assert.assertEquals(sfDir + "/ghost", postRun.get(0));
-        } finally {
+            // Independent verification: the scanner sees the ghost slot.
+            ObjList<String> seen = OrphanScanner.scan(sfDir, "primary");
+            Assert.assertEquals("ghost slot must be a candidate orphan", 1, seen.size());
+            Assert.assertEquals(sfDir + "/ghost", seen.get(0));
+
+            // Phase 2: open the primary sender with drain_orphans=true. We
+            // can't directly assert the log output in this test, but the
+            // call must not throw, and the primary's own slot must NOT
+            // appear in a fresh scan (sender_id-filtered).
+            TestWebSocketServer primaryServer = new TestWebSocketServer(port + 1000, new AckHandler());
             try {
-                primaryServer.close();
-            } catch (Exception ignored) {
-                // best-effort
+                primaryServer.start();
+                Assert.assertTrue(primaryServer.awaitStart(5, TimeUnit.SECONDS));
+
+                String primaryCfg = "ws::addr=localhost:" + (port + 1000)
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=primary"
+                        + ";drain_orphans=true;";
+                try (Sender primary = Sender.fromConfig(primaryCfg)) {
+                    primary.table("foo").longColumn("v", 8L).atNow();
+                    primary.flush();
+                }
+                // Primary's slot now exists too; scanner with primary
+                // excluded must still return the ghost (and nothing else
+                // among the two slots).
+                ObjList<String> postRun = OrphanScanner.scan(sfDir, "primary");
+                Assert.assertEquals("only ghost should appear; primary excluded",
+                        1, postRun.size());
+                Assert.assertEquals(sfDir + "/ghost", postRun.get(0));
+            } finally {
+                try {
+                    primaryServer.close();
+                } catch (Exception ignored) {
+                    // best-effort
+                }
             }
-        }
+        });
     }
 
     @Test
-    public void testFailedSentinelHidesOrphanFromScan() {
-        // Manually construct an orphan slot, then drop a .failed sentinel.
-        // The scan must hide it — automation has already given up on this
-        // slot and a human needs to act before it gets touched again.
-        Assert.assertEquals(0, Files.mkdir(sfDir, 0755));
-        String orphan = sfDir + "/manual";
-        Assert.assertEquals(0, Files.mkdir(orphan, 0755));
-        touchFile(orphan + "/sf-0001.sfa");
+    public void testFailedSentinelHidesOrphanFromScan() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Manually construct an orphan slot, then drop a .failed sentinel.
+            // The scan must hide it — automation has already given up on this
+            // slot and a human needs to act before it gets touched again.
+            Assert.assertEquals(0, Files.mkdir(sfDir, 0755));
+            String orphan = sfDir + "/manual";
+            Assert.assertEquals(0, Files.mkdir(orphan, 0755));
+            touchFile(orphan + "/sf-0001.sfa");
 
-        Assert.assertEquals(1, OrphanScanner.scan(sfDir, "x").size());
-        OrphanScanner.markFailed(orphan, "operator-induced");
-        Assert.assertEquals(0, OrphanScanner.scan(sfDir, "x").size());
+            Assert.assertEquals(1, OrphanScanner.scan(sfDir, "x").size());
+            OrphanScanner.markFailed(orphan, "operator-induced");
+            Assert.assertEquals(0, OrphanScanner.scan(sfDir, "x").size());
+        });
     }
 
     private static void touchFile(String path) {
@@ -188,7 +193,7 @@ public class OrphanScanIntegrationTest {
     private static void rmDirRec(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {

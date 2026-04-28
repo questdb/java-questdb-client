@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -71,131 +72,135 @@ public class BackgroundDrainerEndToEndTest {
 
     @Test
     public void testDrainerEmptiesOrphanSlotAgainstAckServer() throws Exception {
-        int port1 = TEST_PORT + 1;
-        // Phase 1: ghost sender against silent server. 30 frames; close fast.
-        try (TestWebSocketServer silent = new TestWebSocketServer(port1, new SilentHandler())) {
-            silent.start();
-            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+        TestUtils.assertMemoryLeak(() -> {
+            int port1 = TEST_PORT + 1;
+            // Phase 1: ghost sender against silent server. 30 frames; close fast.
+            try (TestWebSocketServer silent = new TestWebSocketServer(port1, new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
 
-            String cfg1 = "ws::addr=localhost:" + port1
-                    + ";sf_dir=" + sfDir
-                    + ";sender_id=ghost"
-                    + ";close_flush_timeout_millis=0;";
-            try (Sender g = Sender.fromConfig(cfg1)) {
-                for (int i = 0; i < 30; i++) {
-                    g.table("foo").longColumn("v", (long) i).atNow();
-                    g.flush();
+                String cfg1 = "ws::addr=localhost:" + port1
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=ghost"
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender g = Sender.fromConfig(cfg1)) {
+                    for (int i = 0; i < 30; i++) {
+                        g.table("foo").longColumn("v", (long) i).atNow();
+                        g.flush();
+                    }
                 }
             }
-        }
-        // Sanity: ghost slot exists with data and no .failed sentinel.
-        Assert.assertEquals("ghost slot must be a candidate orphan",
-                1, OrphanScanner.scan(sfDir, "primary").size());
+            // Sanity: ghost slot exists with data and no .failed sentinel.
+            Assert.assertEquals("ghost slot must be a candidate orphan",
+                    1, OrphanScanner.scan(sfDir, "primary").size());
 
-        // Phase 2: foreground sender against ack server, with drain_orphans=on.
-        int port2 = port1 + 100;
-        AckHandler ack = new AckHandler();
-        try (TestWebSocketServer good = new TestWebSocketServer(port2, ack)) {
-            good.start();
-            Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+            // Phase 2: foreground sender against ack server, with drain_orphans=on.
+            int port2 = port1 + 100;
+            AckHandler ack = new AckHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(port2, ack)) {
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
 
-            String cfg2 = "ws::addr=localhost:" + port2
-                    + ";sf_dir=" + sfDir
-                    + ";sender_id=primary"
-                    + ";drain_orphans=true"
-                    + ";max_background_drainers=2;";
-            try (Sender foreground = Sender.fromConfig(cfg2)) {
-                // Drainer runs in the background. Wait for the ghost slot
-                // to drain through. 30 distinct rows expected at the ack
-                // server (drainer's contribution; the foreground sender
-                // doesn't append).
-                long deadline = System.currentTimeMillis() + 10_000;
-                while (System.currentTimeMillis() < deadline
-                        && ack.distinctPayloadHashes.size() < 30) {
-                    Thread.sleep(50);
+                String cfg2 = "ws::addr=localhost:" + port2
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=primary"
+                        + ";drain_orphans=true"
+                        + ";max_background_drainers=2;";
+                try (Sender foreground = Sender.fromConfig(cfg2)) {
+                    // Drainer runs in the background. Wait for the ghost slot
+                    // to drain through. 30 distinct rows expected at the ack
+                    // server (drainer's contribution; the foreground sender
+                    // doesn't append).
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline
+                            && ack.distinctPayloadHashes.size() < 30) {
+                        Thread.sleep(50);
+                    }
+                    Assert.assertEquals(
+                            "drainer must replay every ghost-slot row to the ack server",
+                            30, ack.distinctPayloadHashes.size());
+                    // No .failed sentinel on success.
+                    Assert.assertFalse(
+                            "no .failed sentinel expected on a successful drain",
+                            Files.exists(sfDir + "/ghost/"
+                                    + OrphanScanner.FAILED_SENTINEL_NAME));
+                    // Sealed segments should have been trimmed during the
+                    // drain. The active segment remains by design (it's not
+                    // trimmable — the spec preserves empty slot dirs). What
+                    // matters is that the slot now holds zero frames worth of
+                    // unacked data, which we already confirmed via the
+                    // distinct-payload assertion above.
                 }
-                Assert.assertEquals(
-                        "drainer must replay every ghost-slot row to the ack server",
-                        30, ack.distinctPayloadHashes.size());
-                // No .failed sentinel on success.
-                Assert.assertFalse(
-                        "no .failed sentinel expected on a successful drain",
-                        Files.exists(sfDir + "/ghost/"
-                                + OrphanScanner.FAILED_SENTINEL_NAME));
-                // Sealed segments should have been trimmed during the
-                // drain. The active segment remains by design (it's not
-                // trimmable — the spec preserves empty slot dirs). What
-                // matters is that the slot now holds zero frames worth of
-                // unacked data, which we already confirmed via the
-                // distinct-payload assertion above.
             }
-        }
+        });
     }
 
     @Test
     public void testDrainerLeavesFailedSentinelOnTerminalError() throws Exception {
-        // Drainer can't connect → exhausts its budget → drops .failed.
-        int port1 = TEST_PORT + 7;
-        try (TestWebSocketServer silent = new TestWebSocketServer(port1, new SilentHandler())) {
-            silent.start();
-            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
-            String cfg1 = "ws::addr=localhost:" + port1
-                    + ";sf_dir=" + sfDir
-                    + ";sender_id=ghost"
-                    + ";close_flush_timeout_millis=0;";
-            try (Sender g = Sender.fromConfig(cfg1)) {
-                g.table("foo").longColumn("v", 1L).atNow();
-                g.flush();
+        TestUtils.assertMemoryLeak(() -> {
+            // Drainer can't connect → exhausts its budget → drops .failed.
+            int port1 = TEST_PORT + 7;
+            try (TestWebSocketServer silent = new TestWebSocketServer(port1, new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg1 = "ws::addr=localhost:" + port1
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=ghost"
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender g = Sender.fromConfig(cfg1)) {
+                    g.table("foo").longColumn("v", 1L).atNow();
+                    g.flush();
+                }
             }
-        }
 
-        // Foreground points at a port that's never up. The drainer's
-        // own connection attempts will all fail. With a tight cap, the
-        // drainer should give up and drop .failed.
-        // The foreground sender does need to start successfully, so we
-        // give it its own working server on a different port.
-        int port2 = port1 + 100;
-        int unreachablePort = port1 + 200;
-        AckHandler fgAck = new AckHandler();
-        try (TestWebSocketServer fgServer = new TestWebSocketServer(port2, fgAck)) {
-            fgServer.start();
-            Assert.assertTrue(fgServer.awaitStart(5, TimeUnit.SECONDS));
-            // Sender targets fgServer; drainer would inherit the same
-            // host/port via clientFactory. Both go to fgServer, which
-            // ACKs. So this scenario actually drains successfully — not
-            // what we want.
-            //
-            // Skip the unreachable path for now (would need per-drainer
-            // connection params, beyond this test's scope). Instead,
-            // synthesize a .failed sentinel directly to verify the
-            // scanner-skip pathway end-to-end.
-            OrphanScanner.markFailed(sfDir + "/ghost", "manually-induced");
-            Assert.assertEquals("scanner must skip .failed slots",
-                    0, OrphanScanner.scan(sfDir, "primary").size());
+            // Foreground points at a port that's never up. The drainer's
+            // own connection attempts will all fail. With a tight cap, the
+            // drainer should give up and drop .failed.
+            // The foreground sender does need to start successfully, so we
+            // give it its own working server on a different port.
+            int port2 = port1 + 100;
+            int unreachablePort = port1 + 200;
+            AckHandler fgAck = new AckHandler();
+            try (TestWebSocketServer fgServer = new TestWebSocketServer(port2, fgAck)) {
+                fgServer.start();
+                Assert.assertTrue(fgServer.awaitStart(5, TimeUnit.SECONDS));
+                // Sender targets fgServer; drainer would inherit the same
+                // host/port via clientFactory. Both go to fgServer, which
+                // ACKs. So this scenario actually drains successfully — not
+                // what we want.
+                //
+                // Skip the unreachable path for now (would need per-drainer
+                // connection params, beyond this test's scope). Instead,
+                // synthesize a .failed sentinel directly to verify the
+                // scanner-skip pathway end-to-end.
+                OrphanScanner.markFailed(sfDir + "/ghost", "manually-induced");
+                Assert.assertEquals("scanner must skip .failed slots",
+                        0, OrphanScanner.scan(sfDir, "primary").size());
 
-            String cfg2 = "ws::addr=localhost:" + port2
-                    + ";sf_dir=" + sfDir
-                    + ";sender_id=primary"
-                    + ";drain_orphans=true;";
-            try (Sender ignored = Sender.fromConfig(cfg2)) {
-                // sender came up cleanly; no drainers were dispatched
-                // (orphan list was empty after .failed skip).
+                String cfg2 = "ws::addr=localhost:" + port2
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=primary"
+                        + ";drain_orphans=true;";
+                try (Sender ignored = Sender.fromConfig(cfg2)) {
+                    // sender came up cleanly; no drainers were dispatched
+                    // (orphan list was empty after .failed skip).
+                }
+                // .failed sentinel still in place.
+                Assert.assertTrue(
+                        "operator-set .failed sentinel must persist across foreground runs",
+                        Files.exists(sfDir + "/ghost/"
+                                + OrphanScanner.FAILED_SENTINEL_NAME));
             }
-            // .failed sentinel still in place.
-            Assert.assertTrue(
-                    "operator-set .failed sentinel must persist across foreground runs",
-                    Files.exists(sfDir + "/ghost/"
-                            + OrphanScanner.FAILED_SENTINEL_NAME));
-        }
-        // Suppress unused-port warning until this test grows the
-        // unreachable-drainer scenario.
-        Assert.assertTrue(unreachablePort > 0);
+            // Suppress unused-port warning until this test grows the
+            // unreachable-drainer scenario.
+            Assert.assertTrue(unreachablePort > 0);
+        });
     }
 
     private static int countSegmentFiles(String dir) {
         if (!Files.exists(dir)) return 0;
         long find = Files.findFirst(dir);
-        if (find == 0) return 0;
+        if (find <= 0) return 0;
         int n = 0;
         try {
             int rc = 1;
@@ -213,7 +218,7 @@ public class BackgroundDrainerEndToEndTest {
     private static void rmDirRec(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {

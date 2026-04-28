@@ -141,7 +141,7 @@ public class RecoveryReplayTest {
     private static int countSegmentFiles(String dir) {
         if (!Files.exists(dir)) return 0;
         long find = Files.findFirst(dir);
-        if (find == 0) return 0;
+        if (find <= 0) return 0;
         int n = 0;
         try {
             int rc = 1;
@@ -166,7 +166,7 @@ public class RecoveryReplayTest {
     private static int countPopulatedSegmentFiles(String dir) {
         if (!Files.exists(dir)) return 0;
         long find = Files.findFirst(dir);
-        if (find == 0) return 0;
+        if (find <= 0) return 0;
         int n = 0;
         try {
             int rc = 1;
@@ -203,7 +203,7 @@ public class RecoveryReplayTest {
     private static void rmDirRec(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {

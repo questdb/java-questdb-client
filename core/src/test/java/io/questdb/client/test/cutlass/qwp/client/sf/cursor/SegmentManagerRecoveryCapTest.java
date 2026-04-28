@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -67,46 +68,48 @@ public class SegmentManagerRecoveryCapTest {
 
     @Test
     public void testManagerHonorsCapAgainstRecoveredSegmentsOnRegister() throws Exception {
-        // Cap = exactly 3 segments. Pre-fill the slot with 3 populated
-        // segments — that fills the cap on disk before any manager
-        // activity. The manager must observe the cap is full and refuse
-        // to provision additional spares. Pre-fix: it ignores the
-        // recovered bytes and provisions another segment, taking real
-        // disk usage to 4 × SEGMENT_SIZE — past the cap.
-        long cap = 3 * SEGMENT_SIZE;
-        prepopulate(slotDir, 3);
+        TestUtils.assertMemoryLeak(() -> {
+            // Cap = exactly 3 segments. Pre-fill the slot with 3 populated
+            // segments — that fills the cap on disk before any manager
+            // activity. The manager must observe the cap is full and refuse
+            // to provision additional spares. Pre-fix: it ignores the
+            // recovered bytes and provisions another segment, taking real
+            // disk usage to 4 × SEGMENT_SIZE — past the cap.
+            long cap = 3 * SEGMENT_SIZE;
+            prepopulate(slotDir, 3);
 
-        // Sanity: on-disk state matches expectation.
-        Assert.assertEquals("setup precondition: 3 .sfa files on disk",
-                3, countSfaFiles(slotDir));
+            // Sanity: on-disk state matches expectation.
+            Assert.assertEquals("setup precondition: 3 .sfa files on disk",
+                    3, countSfaFiles(slotDir));
 
-        SegmentRing ring = SegmentRing.openExisting(slotDir, SEGMENT_SIZE);
-        Assert.assertNotNull("recovery should produce a ring", ring);
+            SegmentRing ring = SegmentRing.openExisting(slotDir, SEGMENT_SIZE);
+            Assert.assertNotNull("recovery should produce a ring", ring);
 
-        SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000_000L /* 1ms */, cap);
-        manager.start();
-        try {
-            manager.register(ring, slotDir);
-            // Give the manager several ticks. With the bug, it provisions
-            // because totalBytes stays at 0 even though the ring already
-            // owns 3 × SEGMENT_SIZE.
-            Thread.sleep(100);
-        } finally {
-            // Stop the manager before counting to avoid races with the
-            // worker thread mid-provision.
-            manager.close();
-        }
+            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000_000L /* 1ms */, cap);
+            manager.start();
+            try {
+                manager.register(ring, slotDir);
+                // Give the manager several ticks. With the bug, it provisions
+                // because totalBytes stays at 0 even though the ring already
+                // owns 3 × SEGMENT_SIZE.
+                Thread.sleep(100);
+            } finally {
+                // Stop the manager before counting to avoid races with the
+                // worker thread mid-provision.
+                manager.close();
+            }
 
-        int sfaAfter = countSfaFiles(slotDir);
-        Assert.assertEquals(
-                "manager must respect sf_max_total_bytes against recovered "
-                        + "on-disk state — pre-fix register ignored the bytes "
-                        + "the recovered ring already owns and over-provisioned "
-                        + "past the cap. Saw " + sfaAfter + " .sfa files; "
-                        + "expected the original 3 (cap full).",
-                3, sfaAfter);
+            int sfaAfter = countSfaFiles(slotDir);
+            Assert.assertEquals(
+                    "manager must respect sf_max_total_bytes against recovered "
+                            + "on-disk state — pre-fix register ignored the bytes "
+                            + "the recovered ring already owns and over-provisioned "
+                            + "past the cap. Saw " + sfaAfter + " .sfa files; "
+                            + "expected the original 3 (cap full).",
+                    3, sfaAfter);
 
-        ring.close();
+            ring.close();
+        });
     }
 
     /**
@@ -141,7 +144,7 @@ public class SegmentManagerRecoveryCapTest {
     private static int countSfaFiles(String dir) {
         if (!Files.exists(dir)) return 0;
         long find = Files.findFirst(dir);
-        if (find == 0) return 0;
+        if (find <= 0) return 0;
         int n = 0;
         try {
             int rc = 1;
@@ -159,7 +162,7 @@ public class SegmentManagerRecoveryCapTest {
     private static void rmDirRec(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {

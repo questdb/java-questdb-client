@@ -26,7 +26,9 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -59,29 +61,48 @@ public class BackgroundDrainerPoolRaceTest {
 
     @Test
     public void testSubmitDoesNotLeakOrThrowRejectedDuringClose() throws Exception {
-        int leakedTotal = 0;
-        int rejectedTotal = 0;
-        int illegalStateTotal = 0;
+        TestUtils.assertMemoryLeak(() -> {
+            int leakedTotal = 0;
+            int rejectedTotal = 0;
+            int illegalStateTotal = 0;
 
-        for (int iter = 0; iter < ITERATIONS; iter++) {
-            BackgroundDrainerPool pool = new BackgroundDrainerPool(2);
-            // One drainer per submitter so each thread has its own identity
-            // and we can count leaks deterministically.
-            BackgroundDrainer[] drainers = new BackgroundDrainer[SUBMITTERS_PER_ITER];
-            for (int i = 0; i < SUBMITTERS_PER_ITER; i++) {
-                drainers[i] = (BackgroundDrainer) Unsafe.getUnsafe()
-                        .allocateInstance(BackgroundDrainer.class);
-            }
+            for (int iter = 0; iter < ITERATIONS; iter++) {
+                BackgroundDrainerPool pool = new BackgroundDrainerPool(2);
+                // One drainer per submitter so each thread has its own identity
+                // and we can count leaks deterministically.
+                BackgroundDrainer[] drainers = new BackgroundDrainer[SUBMITTERS_PER_ITER];
+                for (int i = 0; i < SUBMITTERS_PER_ITER; i++) {
+                    drainers[i] = (BackgroundDrainer) Unsafe.getUnsafe()
+                            .allocateInstance(BackgroundDrainer.class);
+                }
 
-            CountDownLatch ready = new CountDownLatch(SUBMITTERS_PER_ITER + 1);
-            CountDownLatch go = new CountDownLatch(1);
-            AtomicInteger rejected = new AtomicInteger();
-            AtomicInteger illegalState = new AtomicInteger();
+                CountDownLatch ready = new CountDownLatch(SUBMITTERS_PER_ITER + 1);
+                CountDownLatch go = new CountDownLatch(1);
+                AtomicInteger rejected = new AtomicInteger();
+                AtomicInteger illegalState = new AtomicInteger();
 
-            Thread[] submitters = new Thread[SUBMITTERS_PER_ITER];
-            for (int i = 0; i < SUBMITTERS_PER_ITER; i++) {
-                final BackgroundDrainer d = drainers[i];
-                submitters[i] = new Thread(() -> {
+                Thread[] submitters = new Thread[SUBMITTERS_PER_ITER];
+                for (int i = 0; i < SUBMITTERS_PER_ITER; i++) {
+                    final BackgroundDrainer d = drainers[i];
+                    submitters[i] = new Thread(() -> {
+                        ready.countDown();
+                        try {
+                            go.await();
+                        } catch (InterruptedException ignored) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        try {
+                            pool.submit(d);
+                        } catch (RejectedExecutionException e) {
+                            rejected.incrementAndGet();
+                        } catch (IllegalStateException e) {
+                            illegalState.incrementAndGet();
+                        } catch (Throwable ignored) {
+                        }
+                    }, "submitter-" + iter + "-" + i);
+                }
+                Thread closer = new Thread(() -> {
                     ready.countDown();
                     try {
                         go.await();
@@ -89,63 +110,51 @@ public class BackgroundDrainerPoolRaceTest {
                         Thread.currentThread().interrupt();
                         return;
                     }
-                    try {
-                        pool.submit(d);
-                    } catch (RejectedExecutionException e) {
-                        rejected.incrementAndGet();
-                    } catch (IllegalStateException e) {
-                        illegalState.incrementAndGet();
-                    } catch (Throwable ignored) {
+                    pool.close();
+                }, "closer-" + iter);
+
+                for (Thread s : submitters) s.start();
+                closer.start();
+                ready.await();
+                go.countDown();
+
+                for (Thread s : submitters) s.join(5_000L);
+                closer.join(10_000L);
+
+                // After close returns, in-flight executor tasks have either run
+                // their finally{active.remove} or been rejected (the bug). Count
+                // any drainer still in active as a leak.
+                ObjList<BackgroundDrainer> snap = pool.snapshot();
+                for (BackgroundDrainer d : drainers) {
+                    for (int i = 0, n = snap.size(); i < n; i++) {
+                        if (snap.getQuick(i) == d) {
+                            leakedTotal++;
+                            break;
+                        }
                     }
-                }, "submitter-" + iter + "-" + i);
-            }
-            Thread closer = new Thread(() -> {
-                ready.countDown();
-                try {
-                    go.await();
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                    return;
                 }
-                pool.close();
-            }, "closer-" + iter);
-
-            for (Thread s : submitters) s.start();
-            closer.start();
-            ready.await();
-            go.countDown();
-
-            for (Thread s : submitters) s.join(5_000L);
-            closer.join(10_000L);
-
-            // After close returns, in-flight executor tasks have either run
-            // their finally{active.remove} or been rejected (the bug). Count
-            // any drainer still in active as a leak.
-            List<BackgroundDrainer> snap = pool.snapshot();
-            for (BackgroundDrainer d : drainers) {
-                if (snap.contains(d)) leakedTotal++;
+                rejectedTotal += rejected.get();
+                illegalStateTotal += illegalState.get();
             }
-            rejectedTotal += rejected.get();
-            illegalStateTotal += illegalState.get();
-        }
 
-        // Expected post-fix: zero leaks, zero RejectedExecutionException
-        // surfaced to the caller. IllegalStateException is acceptable —
-        // submit() seeing closed=true after the user already called close()
-        // is a legitimate caller error.
-        List<String> failures = new ArrayList<>();
-        if (leakedTotal > 0) {
-            failures.add("drainers leaked in active[] after race: " + leakedTotal
-                    + " (out of " + (ITERATIONS * SUBMITTERS_PER_ITER) + " submissions)");
-        }
-        if (rejectedTotal > 0) {
-            failures.add("submit() threw RejectedExecutionException to the caller: "
-                    + rejectedTotal + " — race exposed wrong exception type "
-                    + "(should be IllegalStateException or success)");
-        }
-        if (!failures.isEmpty()) {
-            failures.add("(IllegalStateException count for context: " + illegalStateTotal + ")");
-            Assert.fail(String.join("; ", failures));
-        }
+            // Expected post-fix: zero leaks, zero RejectedExecutionException
+            // surfaced to the caller. IllegalStateException is acceptable —
+            // submit() seeing closed=true after the user already called close()
+            // is a legitimate caller error.
+            List<String> failures = new ArrayList<>();
+            if (leakedTotal > 0) {
+                failures.add("drainers leaked in active[] after race: " + leakedTotal
+                        + " (out of " + (ITERATIONS * SUBMITTERS_PER_ITER) + " submissions)");
+            }
+            if (rejectedTotal > 0) {
+                failures.add("submit() threw RejectedExecutionException to the caller: "
+                        + rejectedTotal + " — race exposed wrong exception type "
+                        + "(should be IllegalStateException or success)");
+            }
+            if (!failures.isEmpty()) {
+                failures.add("(IllegalStateException count for context: " + illegalStateTotal + ")");
+                Assert.fail(String.join("; ", failures));
+            }
+        });
     }
 }

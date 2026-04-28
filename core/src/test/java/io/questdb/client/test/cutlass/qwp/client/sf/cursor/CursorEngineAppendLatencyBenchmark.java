@@ -207,7 +207,7 @@ public final class CursorEngineAppendLatencyBenchmark {
     private static void rmTree(String dir) {
         if (dir == null || !Files.exists(dir)) return;
         long find = Files.findFirst(dir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {

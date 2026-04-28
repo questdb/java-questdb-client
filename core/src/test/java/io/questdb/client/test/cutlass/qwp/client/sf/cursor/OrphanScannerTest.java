@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -54,97 +55,113 @@ public class OrphanScannerTest {
     }
 
     @Test
-    public void testEmptyGroupRootHasNoOrphans() {
-        ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
-        assertEquals(0, orphans.size());
+    public void testEmptyGroupRootHasNoOrphans() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
+            assertEquals(0, orphans.size());
+        });
     }
 
     @Test
-    public void testMissingGroupRootReturnsEmpty() {
-        // Spec: scanner is read-only; a non-existent dir is "no orphans",
-        // not an error. Lets startup proceed cleanly when the group root
-        // hasn't been created yet by any sender.
-        ObjList<String> orphans = OrphanScanner.scan(
-                sfDir + "/never-created", "default");
-        assertEquals(0, orphans.size());
+    public void testMissingGroupRootReturnsEmpty() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Spec: scanner is read-only; a non-existent dir is "no orphans",
+            // not an error. Lets startup proceed cleanly when the group root
+            // hasn't been created yet by any sender.
+            ObjList<String> orphans = OrphanScanner.scan(
+                    sfDir + "/never-created", "default");
+            assertEquals(0, orphans.size());
+        });
     }
 
     @Test
-    public void testSlotWithSfaIsAnOrphan() {
-        String slot = sfDir + "/orphan-a";
-        assertEquals(0, Files.mkdir(slot, 0755));
-        touchFile(slot + "/sf-0001.sfa");
-
-        ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
-        assertEquals(1, orphans.size());
-        assertEquals(slot, orphans.get(0));
-    }
-
-    @Test
-    public void testEmptySlotDirIsNotAnOrphan() {
-        // Per spec, empty slot dirs are cheap and stay forever — they
-        // aren't candidates for drain because there's nothing to drain.
-        String slot = sfDir + "/empty";
-        assertEquals(0, Files.mkdir(slot, 0755));
-
-        ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
-        assertEquals(0, orphans.size());
-    }
-
-    @Test
-    public void testSlotWithFailedSentinelIsSkipped() {
-        // .failed = "human required, automation backed off". Scanner
-        // must not treat such slots as orphans, even if they have data.
-        String slot = sfDir + "/failed";
-        assertEquals(0, Files.mkdir(slot, 0755));
-        touchFile(slot + "/sf-0001.sfa");
-        OrphanScanner.markFailed(slot, "test-induced");
-        assertTrue("sentinel exists",
-                Files.exists(slot + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
-
-        ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
-        assertEquals(0, orphans.size());
-    }
-
-    @Test
-    public void testExcludeSlotNameSkipsCallersOwnSlot() {
-        // The foreground sender's own slot must not appear as an orphan
-        // (it isn't one — the sender is actively using it).
-        String mineSlot = sfDir + "/mine";
-        String otherSlot = sfDir + "/other";
-        assertEquals(0, Files.mkdir(mineSlot, 0755));
-        assertEquals(0, Files.mkdir(otherSlot, 0755));
-        touchFile(mineSlot + "/sf-0001.sfa");
-        touchFile(otherSlot + "/sf-0001.sfa");
-
-        ObjList<String> orphans = OrphanScanner.scan(sfDir, "mine");
-        assertEquals(1, orphans.size());
-        assertEquals(otherSlot, orphans.get(0));
-    }
-
-    @Test
-    public void testMultipleOrphansReturned() {
-        for (String name : new String[]{"a", "b", "c"}) {
-            String slot = sfDir + "/" + name;
+    public void testSlotWithSfaIsAnOrphan() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = sfDir + "/orphan-a";
             assertEquals(0, Files.mkdir(slot, 0755));
             touchFile(slot + "/sf-0001.sfa");
-        }
-        ObjList<String> orphans = OrphanScanner.scan(sfDir, "exclude-me");
-        assertEquals(3, orphans.size());
+
+            ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
+            assertEquals(1, orphans.size());
+            assertEquals(slot, orphans.get(0));
+        });
     }
 
     @Test
-    public void testIsCandidateOrphanDirect() {
-        String slot = sfDir + "/probe";
-        assertEquals(0, Files.mkdir(slot, 0755));
-        assertFalse("empty slot is not a candidate",
-                OrphanScanner.isCandidateOrphan(slot));
-        touchFile(slot + "/sf-0001.sfa");
-        assertTrue("slot with sfa is a candidate",
-                OrphanScanner.isCandidateOrphan(slot));
-        OrphanScanner.markFailed(slot, "x");
-        assertFalse("slot with .failed is not a candidate",
-                OrphanScanner.isCandidateOrphan(slot));
+    public void testEmptySlotDirIsNotAnOrphan() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Per spec, empty slot dirs are cheap and stay forever — they
+            // aren't candidates for drain because there's nothing to drain.
+            String slot = sfDir + "/empty";
+            assertEquals(0, Files.mkdir(slot, 0755));
+
+            ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
+            assertEquals(0, orphans.size());
+        });
+    }
+
+    @Test
+    public void testSlotWithFailedSentinelIsSkipped() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // .failed = "human required, automation backed off". Scanner
+            // must not treat such slots as orphans, even if they have data.
+            String slot = sfDir + "/failed";
+            assertEquals(0, Files.mkdir(slot, 0755));
+            touchFile(slot + "/sf-0001.sfa");
+            OrphanScanner.markFailed(slot, "test-induced");
+            assertTrue("sentinel exists",
+                    Files.exists(slot + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+
+            ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
+            assertEquals(0, orphans.size());
+        });
+    }
+
+    @Test
+    public void testExcludeSlotNameSkipsCallersOwnSlot() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The foreground sender's own slot must not appear as an orphan
+            // (it isn't one — the sender is actively using it).
+            String mineSlot = sfDir + "/mine";
+            String otherSlot = sfDir + "/other";
+            assertEquals(0, Files.mkdir(mineSlot, 0755));
+            assertEquals(0, Files.mkdir(otherSlot, 0755));
+            touchFile(mineSlot + "/sf-0001.sfa");
+            touchFile(otherSlot + "/sf-0001.sfa");
+
+            ObjList<String> orphans = OrphanScanner.scan(sfDir, "mine");
+            assertEquals(1, orphans.size());
+            assertEquals(otherSlot, orphans.get(0));
+        });
+    }
+
+    @Test
+    public void testMultipleOrphansReturned() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            for (String name : new String[]{"a", "b", "c"}) {
+                String slot = sfDir + "/" + name;
+                assertEquals(0, Files.mkdir(slot, 0755));
+                touchFile(slot + "/sf-0001.sfa");
+            }
+            ObjList<String> orphans = OrphanScanner.scan(sfDir, "exclude-me");
+            assertEquals(3, orphans.size());
+        });
+    }
+
+    @Test
+    public void testIsCandidateOrphanDirect() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = sfDir + "/probe";
+            assertEquals(0, Files.mkdir(slot, 0755));
+            assertFalse("empty slot is not a candidate",
+                    OrphanScanner.isCandidateOrphan(slot));
+            touchFile(slot + "/sf-0001.sfa");
+            assertTrue("slot with sfa is a candidate",
+                    OrphanScanner.isCandidateOrphan(slot));
+            OrphanScanner.markFailed(slot, "x");
+            assertFalse("slot with .failed is not a candidate",
+                    OrphanScanner.isCandidateOrphan(slot));
+        });
     }
 
     private static void touchFile(String path) {
@@ -155,7 +172,7 @@ public class OrphanScannerTest {
     private static void rmDirRec(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {

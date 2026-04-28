@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -56,7 +57,7 @@ public class CursorSendEngineTest {
     public void tearDown() {
         if (tmpDir == null) return;
         long find = Files.findFirst(tmpDir);
-        if (find != 0) {
+        if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {
@@ -74,175 +75,189 @@ public class CursorSendEngineTest {
     }
 
     @Test
-    public void testAppendBlockingNeverFailsUnderManagerSupply() {
-        long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-        try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
-            for (int i = 0; i < 200; i++) {
-                Unsafe.getUnsafe().putInt(buf, i);
-                long fsn = engine.appendBlocking(buf, 64);
-                assertEquals(i, fsn);
+    public void testAppendBlockingNeverFailsUnderManagerSupply() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                for (int i = 0; i < 200; i++) {
+                    Unsafe.getUnsafe().putInt(buf, i);
+                    long fsn = engine.appendBlocking(buf, 64);
+                    assertEquals(i, fsn);
+                }
+                assertEquals(199, engine.publishedFsn());
+                assertNotNull("active segment is always non-null", engine.activeSegment());
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
-            assertEquals(199, engine.publishedFsn());
-            assertNotNull("active segment is always non-null", engine.activeSegment());
-        } finally {
-            Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     @Test
-    public void testAppendOrFsnReturnsBackpressureWhenSpareUnavailable() {
-        // Run with a deliberately stalled manager: poll cadence so slow
-        // it never installs a spare in the test window. The first segment
-        // fills, then appendOrFsn returns BACKPRESSURE_NO_SPARE.
-        long segSize = MmapSegment.HEADER_SIZE
-                + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-        long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-        try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-            // Fill the active deterministically (this is the initial segment;
-            // manager hasn't had a chance to provision a spare yet on a fast box,
-            // so we use a short spin deadline so the test runs quickly).
-            long deadline = System.nanoTime();
-            engine.appendOrFsn(buf, 64, deadline);
-            engine.appendOrFsn(buf, 64, deadline);
-            // Third append: active is full, spare may or may not be ready
-            // depending on race with manager. With a zero-deadline spin we
-            // get either the FSN (if manager beat us) or backpressure.
-            long fsn = engine.appendOrFsn(buf, 64, deadline);
-            assertTrue("unexpected fsn=" + fsn, fsn == 2L || fsn == -1L);
-        } finally {
-            Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-        }
+    public void testAppendOrFsnReturnsBackpressureWhenSpareUnavailable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Run with a deliberately stalled manager: poll cadence so slow
+            // it never installs a spare in the test window. The first segment
+            // fills, then appendOrFsn returns BACKPRESSURE_NO_SPARE.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                // Fill the active deterministically (this is the initial segment;
+                // manager hasn't had a chance to provision a spare yet on a fast box,
+                // so we use a short spin deadline so the test runs quickly).
+                long deadline = System.nanoTime();
+                engine.appendOrFsn(buf, 64, deadline);
+                engine.appendOrFsn(buf, 64, deadline);
+                // Third append: active is full, spare may or may not be ready
+                // depending on race with manager. With a zero-deadline spin we
+                // get either the FSN (if manager beat us) or backpressure.
+                long fsn = engine.appendOrFsn(buf, 64, deadline);
+                assertTrue("unexpected fsn=" + fsn, fsn == 2L || fsn == -1L);
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
     }
 
     @Test
-    public void testAcknowledgePropagatesToRing() {
-        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
-        try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
-            engine.appendBlocking(buf, 16);
-            engine.appendBlocking(buf, 16);
-            engine.appendBlocking(buf, 16);
-            engine.acknowledge(2L);
-            assertEquals(2L, engine.ackedFsn());
-            // Regression — should be ignored.
-            engine.acknowledge(0L);
-            assertEquals(2L, engine.ackedFsn());
-        } finally {
-            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
-        }
+    public void testAcknowledgePropagatesToRing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                engine.appendBlocking(buf, 16);
+                engine.appendBlocking(buf, 16);
+                engine.appendBlocking(buf, 16);
+                engine.acknowledge(2L);
+                assertEquals(2L, engine.ackedFsn());
+                // Regression — should be ignored.
+                engine.acknowledge(0L);
+                assertEquals(2L, engine.ackedFsn());
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
     }
 
     @Test
-    public void testCloseIsIdempotent() {
-        CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096);
-        engine.close();
-        engine.close();
+    public void testCloseIsIdempotent() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096);
+            engine.close();
+            engine.close();
+        });
     }
 
     @Test
     public void testAppendBlockingThrowsOnDeadlineExpiryUnderCap() throws Exception {
-        // Cap counts every segment the ring owns (initial active + sealed +
-        // hot spare), including bytes already on disk at register-time. With
-        // cap = 3*segSize and segSize fitting 2 frames, the producer can land
-        // initial (2) + spare1 (2) + spare2 (2) = 6 frames. The 7th rotation
-        // needs a spare3 that the cap forbids → backpressure → deadline.
-        long segSize = MmapSegment.HEADER_SIZE
-                + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-        long cap = 3 * segSize;
-        long shortDeadlineNanos = 200_000_000L; // 200 ms
-        long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-        try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize, cap, shortDeadlineNanos)) {
-            for (int i = 0; i < 6; i++) {
-                long fsn = engine.appendBlocking(buf, 64);
-                assertEquals(i, fsn);
-            }
-            // Next append must wait for a third spare that the cap won't allow.
-            long t0 = System.nanoTime();
-            try {
-                engine.appendBlocking(buf, 64);
-                fail("expected backpressure deadline exception");
-            } catch (LineSenderException expected) {
-                long elapsed = System.nanoTime() - t0;
-                assertTrue("threw too early: " + elapsed + "ns",
-                        elapsed >= shortDeadlineNanos);
-                assertTrue("message must mention backpressure: " + expected.getMessage(),
-                        expected.getMessage().contains("backpressured"));
-            }
-            // Counter must record the stall.
-            assertTrue("stall counter must increment: " + engine.getTotalBackpressureStalls(),
-                    engine.getTotalBackpressureStalls() >= 1);
-        } finally {
-            Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-        }
-    }
-
-    @Test
-    public void testRestartIntoNonEmptySfDirContinuesFsnSequence() {
-        // Red regression: restart against a populated SF dir must derive the
-        // new active's baseSeq from the highest sealed segment on disk, not
-        // hardcode 0. Previously CursorSendEngine always created a fresh
-        // sf-initial.sfa at baseSeq=0, so the second session's FSNs collided
-        // with frames the first session had already durably persisted.
-        long segSize = MmapSegment.HEADER_SIZE
-                + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-        int totalFrames = 5;
-        long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-        try {
-            // Session 1: write totalFrames, leaving the dir populated with
-            // sealed segments + a (partially-filled) active at the end.
-            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-                for (int i = 0; i < totalFrames; i++) {
+        TestUtils.assertMemoryLeak(() -> {
+            // Cap counts every segment the ring owns (initial active + sealed +
+            // hot spare), including bytes already on disk at register-time. With
+            // cap = 3*segSize and segSize fitting 2 frames, the producer can land
+            // initial (2) + spare1 (2) + spare2 (2) = 6 frames. The 7th rotation
+            // needs a spare3 that the cap forbids → backpressure → deadline.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long cap = 3 * segSize;
+            long shortDeadlineNanos = 200_000_000L; // 200 ms
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize, cap, shortDeadlineNanos)) {
+                for (int i = 0; i < 6; i++) {
                     long fsn = engine.appendBlocking(buf, 64);
                     assertEquals(i, fsn);
                 }
-                assertEquals(totalFrames - 1, engine.publishedFsn());
-            }
-            // Confirm the dir really has *.sfa files left over — otherwise
-            // the test would pass for the wrong reason (empty dir == no bug).
-            long find = Files.findFirst(tmpDir);
-            assertTrue("findFirst() must succeed on populated tmpDir", find != 0);
-            int sfaCount = 0;
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && name.endsWith(".sfa")) sfaCount++;
-                    rc = Files.findNext(find);
+                // Next append must wait for a third spare that the cap won't allow.
+                long t0 = System.nanoTime();
+                try {
+                    engine.appendBlocking(buf, 64);
+                    fail("expected backpressure deadline exception");
+                } catch (LineSenderException expected) {
+                    long elapsed = System.nanoTime() - t0;
+                    assertTrue("threw too early: " + elapsed + "ns",
+                            elapsed >= shortDeadlineNanos);
+                    assertTrue("message must mention backpressure: " + expected.getMessage(),
+                            expected.getMessage().contains("backpressured"));
                 }
+                // Counter must record the stall.
+                assertTrue("stall counter must increment: " + engine.getTotalBackpressureStalls(),
+                        engine.getTotalBackpressureStalls() >= 1);
             } finally {
-                Files.findClose(find);
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
-            assertTrue("session 1 must leave .sfa files behind: count=" + sfaCount,
-                    sfaCount >= 1);
-
-            // Session 2: open the same dir. The next FSN must continue from
-            // where session 1 left off, NOT restart at 0. Today this assertion
-            // fails because the engine constructs a fresh ring at baseSeq=0
-            // and ignores the on-disk segments.
-            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-                long fsn = engine.appendBlocking(buf, 64);
-                assertEquals("FSN must continue, not restart — overlapping "
-                                + "FSNs would corrupt ACK translation, trim, and replay",
-                        totalFrames, fsn);
-            }
-        } finally {
-            Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
     }
 
     @Test
-    public void testMemoryModeSkipsDirAndStillWorks() {
-        // sfDir == null → memory-only ring. No files, no mkdir, no path.
-        long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-        try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
-            assertEquals(null, engine.sfDir());
-            for (int i = 0; i < 16; i++) {
-                long fsn = engine.appendBlocking(buf, 32);
-                assertEquals(i, fsn);
+    public void testRestartIntoNonEmptySfDirContinuesFsnSequence() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Red regression: restart against a populated SF dir must derive the
+            // new active's baseSeq from the highest sealed segment on disk, not
+            // hardcode 0. Previously CursorSendEngine always created a fresh
+            // sf-initial.sfa at baseSeq=0, so the second session's FSNs collided
+            // with frames the first session had already durably persisted.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            int totalFrames = 5;
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Session 1: write totalFrames, leaving the dir populated with
+                // sealed segments + a (partially-filled) active at the end.
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    for (int i = 0; i < totalFrames; i++) {
+                        long fsn = engine.appendBlocking(buf, 64);
+                        assertEquals(i, fsn);
+                    }
+                    assertEquals(totalFrames - 1, engine.publishedFsn());
+                }
+                // Confirm the dir really has *.sfa files left over — otherwise
+                // the test would pass for the wrong reason (empty dir == no bug).
+                long find = Files.findFirst(tmpDir);
+                assertTrue("findFirst() must succeed on populated tmpDir", find > 0);
+                int sfaCount = 0;
+                try {
+                    int rc = 1;
+                    while (rc > 0) {
+                        String name = Files.utf8ToString(Files.findName(find));
+                        if (name != null && name.endsWith(".sfa")) sfaCount++;
+                        rc = Files.findNext(find);
+                    }
+                } finally {
+                    Files.findClose(find);
+                }
+                assertTrue("session 1 must leave .sfa files behind: count=" + sfaCount,
+                        sfaCount >= 1);
+
+                // Session 2: open the same dir. The next FSN must continue from
+                // where session 1 left off, NOT restart at 0. Today this assertion
+                // fails because the engine constructs a fresh ring at baseSeq=0
+                // and ignores the on-disk segments.
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    long fsn = engine.appendBlocking(buf, 64);
+                    assertEquals("FSN must continue, not restart — overlapping "
+                                    + "FSNs would corrupt ACK translation, trim, and replay",
+                            totalFrames, fsn);
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
-            // Active segment must be a memory-backed MmapSegment (path == null).
-            assertEquals(null, engine.activeSegment().path());
-        } finally {
-            Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
-        }
+        });
+    }
+
+    @Test
+    public void testMemoryModeSkipsDirAndStillWorks() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // sfDir == null → memory-only ring. No files, no mkdir, no path.
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
+                assertEquals(null, engine.sfDir());
+                for (int i = 0; i < 16; i++) {
+                    long fsn = engine.appendBlocking(buf, 32);
+                    assertEquals(i, fsn);
+                }
+                // Active segment must be a memory-backed MmapSegment (path == null).
+                assertEquals(null, engine.activeSegment().path());
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
     }
 }

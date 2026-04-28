@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -60,69 +61,71 @@ public class CursorWebSocketSendLoopReconnectLeakTest {
 
     @Test
     public void testCloseClosesLivePostReconnectClient() throws Exception {
-        int port = TEST_PORT + 1;
-        DisconnectAfterFirstAckHandler handler = new DisconnectAfterFirstAckHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        TestUtils.assertMemoryLeak(() -> {
+            int port = TEST_PORT + 1;
+            DisconnectAfterFirstAckHandler handler = new DisconnectAfterFirstAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            String cfg = "ws::addr=localhost:" + port + ";";
-            Sender sender = Sender.fromConfig(cfg);
-            WebSocketClient liveClient;
-            try {
-                // Batch 1: server ACKs and immediately disconnects. The
-                // I/O loop sees the wire failure, runs through reconnect,
-                // calls swapClient(newClient). After this the loop's
-                // private client field points at the new socket; the
-                // sender's client field still points at the (closed) old one.
-                sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
+                String cfg = "ws::addr=localhost:" + port + ";";
+                Sender sender = Sender.fromConfig(cfg);
+                WebSocketClient liveClient;
+                try {
+                    // Batch 1: server ACKs and immediately disconnects. The
+                    // I/O loop sees the wire failure, runs through reconnect,
+                    // calls swapClient(newClient). After this the loop's
+                    // private client field points at the new socket; the
+                    // sender's client field still points at the (closed) old one.
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
 
-                // Wait for the loop to register a successful reconnect.
-                // The handler can't count a "connection" until it sees a
-                // binary frame, and the I/O loop has nothing to replay
-                // post-ACK — so use the loop's own counter instead.
-                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
-                long deadline = System.currentTimeMillis() + 5_000L;
-                while (System.currentTimeMillis() < deadline
-                        && wss.getTotalReconnectsSucceeded() < 1) {
-                    Thread.sleep(20);
+                    // Wait for the loop to register a successful reconnect.
+                    // The handler can't count a "connection" until it sees a
+                    // binary frame, and the I/O loop has nothing to replay
+                    // post-ACK — so use the loop's own counter instead.
+                    QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                    long deadline = System.currentTimeMillis() + 5_000L;
+                    while (System.currentTimeMillis() < deadline
+                            && wss.getTotalReconnectsSucceeded() < 1) {
+                        Thread.sleep(20);
+                    }
+                    Assert.assertTrue(
+                            "precondition: reconnect must happen — saw "
+                                    + wss.getTotalReconnectsSucceeded()
+                                    + " successful reconnects",
+                            wss.getTotalReconnectsSucceeded() >= 1);
+
+                    // Reach into the loop to capture the live client BEFORE we
+                    // call sender.close() — that's the reference we want to
+                    // verify gets closed.
+                    CursorWebSocketSendLoop loop = readField(
+                            sender, "cursorSendLoop", CursorWebSocketSendLoop.class);
+                    Assert.assertNotNull("loop should be wired up", loop);
+                    liveClient = readField(loop, "client", WebSocketClient.class);
+                    Assert.assertNotNull(
+                            "live client should still be installed in the loop",
+                            liveClient);
+                    // Sanity: the live client should be in a connected state
+                    // before close. (If it isn't, the test setup is wrong.)
+                    Assert.assertTrue(
+                            "precondition: live post-reconnect client should be "
+                                    + "connected before sender.close()",
+                            liveClient.isConnected());
+                } finally {
+                    sender.close();
                 }
-                Assert.assertTrue(
-                        "precondition: reconnect must happen — saw "
-                                + wss.getTotalReconnectsSucceeded()
-                                + " successful reconnects",
-                        wss.getTotalReconnectsSucceeded() >= 1);
 
-                // Reach into the loop to capture the live client BEFORE we
-                // call sender.close() — that's the reference we want to
-                // verify gets closed.
-                CursorWebSocketSendLoop loop = readField(
-                        sender, "cursorSendLoop", CursorWebSocketSendLoop.class);
-                Assert.assertNotNull("loop should be wired up", loop);
-                liveClient = readField(loop, "client", WebSocketClient.class);
-                Assert.assertNotNull(
-                        "live client should still be installed in the loop",
-                        liveClient);
-                // Sanity: the live client should be in a connected state
-                // before close. (If it isn't, the test setup is wrong.)
-                Assert.assertTrue(
-                        "precondition: live post-reconnect client should be "
-                                + "connected before sender.close()",
+                // Post-fix: loop.close closed the current client. Pre-fix:
+                // sender.close only closed its STALE reference (the original
+                // pre-reconnect client), the live one was orphaned.
+                Assert.assertFalse(
+                        "live post-reconnect client must be closed by loop.close() "
+                                + "— otherwise its native socket / fds leak past "
+                                + "sender.close()",
                         liveClient.isConnected());
-            } finally {
-                sender.close();
             }
-
-            // Post-fix: loop.close closed the current client. Pre-fix:
-            // sender.close only closed its STALE reference (the original
-            // pre-reconnect client), the live one was orphaned.
-            Assert.assertFalse(
-                    "live post-reconnect client must be closed by loop.close() "
-                            + "— otherwise its native socket / fds leak past "
-                            + "sender.close()",
-                    liveClient.isConnected());
-        }
+        });
     }
 
     private static <T> T readField(Object target, String name, Class<T> type) throws Exception {
