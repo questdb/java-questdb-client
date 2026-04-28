@@ -150,6 +150,14 @@ public final class MmapSegment implements QuietCloseable {
                 Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
             }
             Files.close(fd);
+            // openCleanRW already truncated the file to sizeBytes — if mmap
+            // (or the header writes) failed, leaving it on disk leaks a
+            // sf_max_bytes-sized empty file every time. Under disk-full
+            // pressure with the manager polling, hundreds can accumulate.
+            // Best-effort: if the unlink itself fails, the original mmap
+            // failure is the more useful one to surface.
+            //noinspection ResultOfMethodCallIgnored
+            Files.remove(path);
             throw t;
         }
     }
@@ -225,6 +233,17 @@ public final class MmapSegment implements QuietCloseable {
                 throw new MmapSegmentException("unsupported version in " + path + ": " + version);
             }
             long baseSeq = Unsafe.getUnsafe().getLong(addr + 8);
+            // FSNs are non-negative by construction (see SegmentRing).
+            // A negative baseSeq on disk means bit-rot or a malicious file —
+            // refuse the segment so SegmentRing.openExisting's narrow catch
+            // skips it like any other unreadable .sfa rather than feeding
+            // the bad value into Long.compareUnsigned-based contiguity
+            // checks (which would place the segment last in baseSeq order
+            // and trip the FSN-gap throw, taking the whole recovery down).
+            if (baseSeq < 0L) {
+                throw new MmapSegmentException(
+                        "bad baseSeq in " + path + ": " + baseSeq);
+            }
             long lastGood = scanFrames(addr, fileSize);
             long count = countFrames(addr, lastGood);
             long tornTail = detectTornTail(addr, lastGood, fileSize);

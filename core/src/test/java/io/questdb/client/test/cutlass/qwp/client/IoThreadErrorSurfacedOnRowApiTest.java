@@ -53,6 +53,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * Public API methods must surface I/O thread failures on the very next
  * call so the caller sees the failure as close as possible to its root
  * cause, not at an arbitrary later point.
+ * <p>
+ * Note: the fixture uses {@link WebSocketResponse#STATUS_PARSE_ERROR}
+ * (HALT-policy). Only HALT records a terminal error;
+ * {@code STATUS_SCHEMA_MISMATCH} maps to DROP_AND_CONTINUE per spec and
+ * the loop keeps running, so the test's "next call throws" contract is
+ * specifically the HALT contract.
  */
 public class IoThreadErrorSurfacedOnRowApiTest {
 
@@ -116,7 +122,7 @@ public class IoThreadErrorSurfacedOnRowApiTest {
         }
     }
 
-    /** Returns STATUS_SCHEMA_MISMATCH for every received frame. */
+    /** Returns STATUS_PARSE_ERROR (HALT-policy) for every received frame. */
     private static class ErrorAckHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final AtomicLong nextSeq = new AtomicLong();
 
@@ -131,10 +137,10 @@ public class IoThreadErrorSurfacedOnRowApiTest {
 
         // status u8 | seq u64 | msgLen u16 | msg UTF-8
         private static byte[] buildErrorAck(long seq) {
-            byte[] msg = "schema mismatch".getBytes(StandardCharsets.UTF_8);
+            byte[] msg = "parse error".getBytes(StandardCharsets.UTF_8);
             byte[] buf = new byte[1 + 8 + 2 + msg.length];
             ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
-            bb.put(WebSocketResponse.STATUS_SCHEMA_MISMATCH);
+            bb.put(WebSocketResponse.STATUS_PARSE_ERROR);
             bb.putLong(seq);
             bb.putShort((short) msg.length);
             bb.put(msg);

@@ -25,6 +25,27 @@
 #include <jni.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <assert.h>
+
+/*
+ * Slice-by-8 fold below assumes a little-endian byte order: the
+ * __builtin_memcpy of the first 4 bytes into a uint32_t is XORed against
+ * `crc` and then sliced as crc & 0xff / (crc >> 8) & 0xff / (crc >> 16) &
+ * 0xff / (crc >> 24) & 0xff. On big-endian (s390x, ppc64be) this would
+ * shift the bytes through the wrong tables and silently produce wrong
+ * CRCs — which on the SF path would manifest as data-loss-after-recovery
+ * because a bit-correct frame would still fail the integrity check.
+ *
+ * QuestDB's shipped binaries are all little-endian (linux/macOS x86_64
+ * and aarch64, Windows x86_64), so this is a forward-looking guard rather
+ * than a runtime fix. Using the static-assertion form failing the build
+ * is the right answer; we do not want a compile-time-best-effort fallback
+ * to a portable byte-by-byte path that miscompiles silently.
+ */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+               "CRC32C slice-by-8 requires little-endian byte order");
+#endif
 
 /*
  * CRC-32C (Castagnoli) software implementation, reflected — slice-by-8.

@@ -163,85 +163,126 @@ public final class SegmentRing implements QuietCloseable {
         if (find == 0) {
             return null;
         }
+        // Outer try-catch: anything escaping the recovery body — IOOBE from
+        // ObjList growth, OOM from native mmap during MmapSegment.openExisting,
+        // unforeseen RuntimeException from the contiguity check, etc. — must
+        // not leave fds + mmaps owned by `opened` orphaned. Close every
+        // recovered segment and rethrow so the engine surfaces the failure.
         try {
-            int rc = 1;
-            while (rc > 0) {
-                String name = Files.utf8ToString(Files.findName(find));
-                if (name != null && name.endsWith(".sfa") && !".".equals(name) && !"..".equals(name)) {
-                    String path = sfDir + "/" + name;
-                    try {
-                        MmapSegment seg = MmapSegment.openExisting(path);
-                        // Filter out empty leftovers — typically hot-spare
-                        // segments the manager pre-allocated for a prior
-                        // session that never got rotated into active. They
-                        // carry the provisional baseSeq=0 and frameCount=0,
-                        // which would otherwise collide with the real
-                        // baseSeq=0 segment and trip the contiguity check
-                        // below. No data to recover; close and unlink.
-                        // Without the unlink the file persists across crash
-                        // cycles and the disk leak compounds with every
-                        // unclean shutdown.
-                        if (seg.frameCount() == 0) {
-                            seg.close();
-                            Files.remove(path);
-                        } else {
-                            opened.add(seg);
+            try {
+                int rc = 1;
+                while (rc > 0) {
+                    String name = Files.utf8ToString(Files.findName(find));
+                    if (name != null && name.endsWith(".sfa") && !".".equals(name) && !"..".equals(name)) {
+                        String path = sfDir + "/" + name;
+                        try {
+                            MmapSegment seg = MmapSegment.openExisting(path);
+                            // Filter out empty leftovers — typically hot-spare
+                            // segments the manager pre-allocated for a prior
+                            // session that never got rotated into active. They
+                            // carry the provisional baseSeq=0 and frameCount=0,
+                            // which would otherwise collide with the real
+                            // baseSeq=0 segment and trip the contiguity check
+                            // below. No data to recover; close and unlink.
+                            // Without the unlink the file persists across crash
+                            // cycles and the disk leak compounds with every
+                            // unclean shutdown.
+                            //
+                            // CAUTION: only unlink when the file is genuinely
+                            // empty past the header. If frame[0] failed CRC
+                            // (bit-rot, partial-page-write at crash, etc.) but
+                            // valid frames followed, scanFrames returns
+                            // lastGood=HEADER_SIZE and frameCount=0 — yet
+                            // tornTailBytes is non-zero. Treating that as
+                            // "empty hot-spare" would silently destroy every
+                            // surviving frame. Quarantine to <path>.corrupt
+                            // instead so a postmortem can recover what's left.
+                            if (seg.frameCount() == 0) {
+                                long torn = seg.tornTailBytes();
+                                seg.close();
+                                if (torn > 0) {
+                                    Files.rename(path, path + ".corrupt");
+                                } else {
+                                    Files.remove(path);
+                                }
+                            } else {
+                                opened.add(seg);
+                            }
+                        } catch (Throwable t) {
+                            // Per-file errors must NOT abort the whole
+                            // recovery. The narrow MmapSegmentException case
+                            // is a stray .sfa with a bad header / unreadable
+                            // file (skip with log). Anything else (OOM from
+                            // mmap, IOOBE from a malformed scan) is also
+                            // best handled by skipping this one file —
+                            // bringing down recovery would lose every
+                            // sibling segment too. Surfacing via a WARN gives
+                            // operators a paper trail.
+                            LOG.warn("openExisting: skipping {} — {}", path, t.toString());
                         }
-                    } catch (MmapSegmentException ignored) {
-                        // Stray file with the .sfa extension but bad header /
-                        // unreadable: skip rather than fail the recovery.
-                        // Logging is the engine's responsibility — SegmentRing
-                        // doesn't have a logger of its own.
                     }
+                    rc = Files.findNext(find);
                 }
-                rc = Files.findNext(find);
+            } finally {
+                Files.findClose(find);
             }
-        } finally {
-            Files.findClose(find);
-        }
-        if (opened.size() == 0) {
-            return null;
-        }
-        // Sort by baseSeq ascending. Worst-case segment count is
-        // sf_max_total_bytes / sf_max_bytes — at the documented ceiling
-        // (1 TiB / 64 MiB) that is ~16K entries, where an O(N²) sort spends
-        // multiple seconds in compares + shifts before the I/O thread can
-        // start. In-place quicksort with median-of-three pivot keeps the
-        // no-allocation discipline of the surrounding code; median-of-three
-        // is required because readdir on many filesystems returns entries
-        // in lexicographic (== baseSeq-hex) order and a naive first-element
-        // pivot would degrade back to O(N²) on exactly that common case.
-        sortByBaseSeq(opened, 0, opened.size());
-        // Sanity: the recovered segments must form a contiguous FSN range.
-        // Detect gaps so a partial-write/manual-deletion mishap doesn't
-        // silently produce duplicate or missing FSNs after recovery.
-        for (int i = 1, n = opened.size(); i < n; i++) {
-            MmapSegment prev = opened.get(i - 1);
-            MmapSegment curr = opened.get(i);
-            long expected = prev.baseSeq() + prev.frameCount();
-            if (curr.baseSeq() != expected) {
-                // Close everything we've opened so the file handles don't leak.
-                for (int j = 0; j < n; j++) opened.get(j).close();
-                throw new MmapSegmentException(
-                        "FSN gap in recovered segments: prev baseSeq=" + prev.baseSeq()
-                                + " frameCount=" + prev.frameCount()
-                                + " expected next baseSeq=" + expected
-                                + " but got " + curr.baseSeq());
+            if (opened.size() == 0) {
+                return null;
             }
+            // Sort by baseSeq ascending. Worst-case segment count is
+            // sf_max_total_bytes / sf_max_bytes — at the documented ceiling
+            // (1 TiB / 64 MiB) that is ~16K entries, where an O(N²) sort spends
+            // multiple seconds in compares + shifts before the I/O thread can
+            // start. In-place quicksort with median-of-three pivot keeps the
+            // no-allocation discipline of the surrounding code; median-of-three
+            // is required because readdir on many filesystems returns entries
+            // in lexicographic (== baseSeq-hex) order and a naive first-element
+            // pivot would degrade back to O(N²) on exactly that common case.
+            sortByBaseSeq(opened, 0, opened.size());
+            // Sanity: the recovered segments must form a contiguous FSN range.
+            // Detect gaps so a partial-write/manual-deletion mishap doesn't
+            // silently produce duplicate or missing FSNs after recovery.
+            for (int i = 1, n = opened.size(); i < n; i++) {
+                MmapSegment prev = opened.get(i - 1);
+                MmapSegment curr = opened.get(i);
+                long expected = prev.baseSeq() + prev.frameCount();
+                if (curr.baseSeq() != expected) {
+                    throw new MmapSegmentException(
+                            "FSN gap in recovered segments: prev baseSeq=" + prev.baseSeq()
+                                    + " frameCount=" + prev.frameCount()
+                                    + " expected next baseSeq=" + expected
+                                    + " but got " + curr.baseSeq());
+                }
+            }
+            // The newest segment becomes the active. Even if it's full, that's OK:
+            // the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager
+            // installs a hot spare, the producer rotates. Same fast path as a
+            // mid-life ring.
+            int last = opened.size() - 1;
+            MmapSegment active = opened.get(last);
+            opened.remove(last);
+            SegmentRing ring = new SegmentRing(active, maxBytesPerSegment);
+            // Older segments become sealed in baseSeq order.
+            for (int i = 0, n = opened.size(); i < n; i++) {
+                ring.sealedSegments.add(opened.get(i));
+            }
+            return ring;
+        } catch (Throwable t) {
+            // Close every recovered MmapSegment that's still in `opened`.
+            // After the success path, `opened` no longer contains the active
+            // segment (removed above), but the sealed segments transferred to
+            // ring.sealedSegments are still owned by the ring once it's
+            // returned — so this catch only fires before the return statement.
+            for (int i = 0, n = opened.size(); i < n; i++) {
+                try {
+                    opened.get(i).close();
+                } catch (Throwable closeErr) {
+                    LOG.warn("openExisting: error closing recovered segment during cleanup",
+                            closeErr);
+                }
+            }
+            throw t;
         }
-        // The newest segment becomes the active. Even if it's full, that's OK:
-        // the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager
-        // installs a hot spare, the producer rotates. Same fast path as a
-        // mid-life ring.
-        int last = opened.size() - 1;
-        MmapSegment active = opened.get(last);
-        opened.remove(last);
-        SegmentRing ring = new SegmentRing(active, maxBytesPerSegment);
-        // Older segments become sealed in baseSeq order.
-        for (int i = 0, n = opened.size(); i < n; i++) {
-            ring.sealedSegments.add(opened.get(i));
-        }
-        return ring;
     }
 
     /**
@@ -257,8 +298,18 @@ public final class SegmentRing implements QuietCloseable {
      * is cumulative — the server has confirmed every FSN up to and including
      * this value. Idempotent: a second call with the same or smaller value is
      * a no-op.
+     * <p>
+     * Defense-in-depth: clamp at {@link #publishedFsn} so a malformed/poisoned
+     * server NACK with a bogus wireSeq cannot move {@code ackedFsn} past what
+     * the producer has actually written. If we didn't clamp, the segment
+     * manager could trim segments the I/O thread is still iterating and SEGV
+     * the JVM on the next {@code Unsafe.getInt} of an unmapped region.
      */
     public void acknowledge(long seq) {
+        long pub = publishedFsn;
+        if (seq > pub) {
+            seq = pub;
+        }
         if (seq > ackedFsn) {
             ackedFsn = seq;
         }

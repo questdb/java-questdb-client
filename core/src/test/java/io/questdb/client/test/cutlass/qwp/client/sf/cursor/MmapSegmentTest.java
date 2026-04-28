@@ -262,6 +262,74 @@ public class MmapSegmentTest {
     }
 
     @Test
+    public void testFirstFrameCrcCorruptionFlagsTornTailAndPreservesFile() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Existing torn-tail tests cover the case where N >= 1 valid
+            // frames are followed by garbage. None cover frame[0] itself
+            // being corrupt — yet a single bit-flip on the CRC of frame[0]
+            // at rest (bit-rot, partial-page-write at crash) is the
+            // worst-case data-loss trigger: scanFrames bails at HEADER_SIZE
+            // and frameCount drops to 0, even though valid frames still
+            // sit on disk past the corrupt header.
+            //
+            // Contract: tornTailBytes() must be non-zero (because non-zero
+            // bytes exist past the last good frame), and openExisting
+            // must NOT delete the file. SegmentRing relies on the
+            // tornTailBytes signal to distinguish "empty hot-spare" from
+            // "valid data behind a corrupt frame[0]" and quarantine the
+            // latter.
+            String path = tmpDir + "/seg-frame0-corrupt.sfa";
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Write three legitimate frames so there's something the
+                // recovery path could lose.
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                    for (int i = 0; i < 3; i++) {
+                        fillPattern(buf, 32, i);
+                        seg.tryAppend(buf, 32);
+                    }
+                    assertEquals(3L, seg.frameCount());
+                    seg.msync();
+                }
+
+                // Flip a bit in the CRC of frame[0]. Frame[0]'s CRC sits at
+                // offset HEADER_SIZE in the file (FRAME_HEADER_SIZE layout
+                // is u32 crc | u32 payloadLen). Overwriting all 4 bytes
+                // with 0xDEADBEEF is statistically guaranteed to mismatch
+                // any real CRC.
+                int fd = Files.openRW(path);
+                assertTrue("openRW must succeed", fd >= 0);
+                long badCrcBuf = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    Unsafe.getUnsafe().putInt(badCrcBuf, 0xDEADBEEF);
+                    Files.write(fd, badCrcBuf, 4, MmapSegment.HEADER_SIZE);
+                } finally {
+                    Unsafe.free(badCrcBuf, 4, MemoryTag.NATIVE_DEFAULT);
+                    Files.close(fd);
+                }
+                assertTrue("file must still exist after CRC clobber",
+                        Files.exists(path));
+
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("scanFrames must bail at the corrupt frame[0]",
+                            0L, seg.frameCount());
+                    assertEquals("publishedOffset must rewind to the header end",
+                            MmapSegment.HEADER_SIZE, seg.publishedOffset());
+                    assertTrue(
+                            "tornTailBytes must signal non-zero so SegmentRing "
+                                    + "can distinguish a corrupt-data segment from an empty "
+                                    + "hot-spare leftover; got " + seg.tornTailBytes(),
+                            seg.tornTailBytes() > 0L);
+                }
+                assertTrue("openExisting must not unlink the corrupt file",
+                        Files.exists(path));
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testFullSegmentRejectsFurtherAppends() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/seg-full.sfa";

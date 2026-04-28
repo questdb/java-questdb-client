@@ -335,11 +335,20 @@ public final class SegmentManager implements QuietCloseable {
                     LOG.warn("Failed to provision hot spare in {} (will retry next tick)",
                             memoryMode ? "<memory>" : e.dir, t);
                 }
-                if (!installed && spare != null) {
-                    try {
-                        spare.close();
-                    } catch (Throwable ignored) {
+                if (!installed) {
+                    if (spare != null) {
+                        try {
+                            spare.close();
+                        } catch (Throwable ignored) {
+                        }
                     }
+                    // Remove the file even when spare is null (i.e. when
+                    // MmapSegment.create itself threw): MmapSegment.create's
+                    // catch already best-effort removes, but if anything
+                    // before mmap (e.g. an exception thrown by the JVM
+                    // between openCleanRW and the try block) leaves a file
+                    // on disk, this is the second-line defense. Repeated
+                    // unlink on an already-removed path is a harmless no-op.
                     if (path != null) {
                         Files.remove(path);
                     }

@@ -94,6 +94,15 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openCleanRW0
 
 JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_read
         (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len, jlong offset) {
+    // Reject negative len explicitly: jlong is signed but pread takes a
+    // size_t. Without this guard the cast wraps a small negative value
+    // into an enormous unsigned read length and the kernel may either
+    // SEGV on the address space or scribble far past the caller's buffer.
+    // The Win32 path already does this; matching here.
+    if (len < 0) {
+        errno = EINVAL;
+        return -1;
+    }
     ssize_t res;
     RESTARTABLE(pread((int) fd, (void *) (uintptr_t) addr, (size_t) len, (off_t) offset), res);
     return (jlong) res;
@@ -101,6 +110,10 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_read
 
 JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_write
         (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len, jlong offset) {
+    if (len < 0) {
+        errno = EINVAL;
+        return -1;
+    }
     ssize_t res;
     RESTARTABLE(pwrite((int) fd, (const void *) (uintptr_t) addr, (size_t) len, (off_t) offset), res);
     return (jlong) res;
@@ -108,6 +121,10 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_write
 
 JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_append
         (JNIEnv *e, jclass cl, jint fd, jlong addr, jlong len) {
+    if (len < 0) {
+        errno = EINVAL;
+        return -1;
+    }
     ssize_t res;
     RESTARTABLE(write((int) fd, (const void *) (uintptr_t) addr, (size_t) len), res);
     return (jlong) res;

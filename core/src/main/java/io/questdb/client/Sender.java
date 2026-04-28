@@ -1091,11 +1091,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 CursorSendEngine cursorEngine = new CursorSendEngine(
                         slotPath, actualSfMaxBytes,
                         actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
+                int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
+                        ? errorInboxCapacity
+                        : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
+                QwpWebSocketSender connected;
                 try {
-                    int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
-                            ? errorInboxCapacity
-                            : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
-                    QwpWebSocketSender connected = QwpWebSocketSender.connect(
+                    connected = QwpWebSocketSender.connect(
                             hosts.getQuick(0),
                             ports.getQuick(0),
                             wsTlsConfig,
@@ -1115,6 +1116,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             errorHandler,
                             actualErrorInboxCapacity
                     );
+                } catch (Throwable t) {
+                    // connect() failed before ownership of cursorEngine
+                    // transferred — close it ourselves.
+                    try {
+                        cursorEngine.close();
+                    } catch (Throwable ignored) {
+                        // best-effort
+                    }
+                    throw t;
+                }
+                // connect() succeeded — `connected` now owns cursorEngine
+                // via setCursorEngine(engine, true). From here on, ANY
+                // failure must close `connected` (which closes the engine
+                // through ownsCursorEngine), not cursorEngine directly:
+                // closing the engine alone would leak the I/O thread,
+                // dispatcher daemon, drainer pool, microbatch buffers and
+                // WebSocketClient inside the abandoned `connected`.
+                try {
                     // Once the foreground sender is up, dispatch drainers
                     // for any sibling orphan slots. Scan AFTER we acquire
                     // our own slot lock so we never accidentally try to
@@ -1139,7 +1158,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     return connected;
                 } catch (Throwable t) {
                     try {
-                        cursorEngine.close();
+                        connected.close();
                     } catch (Throwable ignored) {
                         // best-effort
                     }

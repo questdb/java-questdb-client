@@ -336,10 +336,25 @@ public class SegmentRingTest {
     @Test
     public void testAcknowledgeIsMonotonic() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
+            // Contract: acknowledge() advances ackedFsn but never lets it
+            // regress AND never lets it run past publishedFsn (defense-in-
+            // depth against malformed server NACKs). To exercise the
+            // monotonicity logic we must first publish enough frames to
+            // give the cursor headroom; otherwise every ack would be
+            // clamped to -1 (nothing published) and the monotonicity check
+            // would test the clamp instead of the regression rule.
             long buf = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
             try {
                 MmapSegment seg = MmapSegment.create(tmpDir + "/m.sfa", 0, 8192);
                 try (SegmentRing ring = new SegmentRing(seg, 8192)) {
+                    // Publish 201 frames so FSNs 0..200 exist on the ring.
+                    for (int i = 0; i <= 200; i++) {
+                        Unsafe.getUnsafe().putLong(buf, i);
+                        long fsn = ring.appendOrFsn(buf, 8);
+                        assertEquals((long) i, fsn);
+                    }
+                    assertEquals(200L, ring.publishedFsn());
+
                     ring.acknowledge(100);
                     assertEquals(100, ring.ackedFsn());
                     ring.acknowledge(50);   // regression — ignored

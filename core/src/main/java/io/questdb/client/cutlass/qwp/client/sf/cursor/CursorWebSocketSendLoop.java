@@ -434,8 +434,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             System.nanoTime()
                     );
                     totalServerErrors.incrementAndGet();
-                    dispatchError(err);
+                    // recordFatal MUST run before dispatchError: the spec
+                    // requires signal.terminalError to be latched BEFORE the
+                    // handler is invoked, so a handler that synchronously
+                    // probes getLastTerminalError() (or calls flush()) sees
+                    // the typed error rather than null.
                     recordFatal(new LineSenderServerException(err), err);
+                    dispatchError(err);
                     return;
                 }
                 lastReconnectError = e;
@@ -481,8 +486,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 System.nanoTime()
         );
         totalServerErrors.incrementAndGet();
-        dispatchError(err);
+        // recordFatal MUST run before dispatchError so the producer-observable
+        // terminal error is latched before the handler is invoked.
         recordFatal(new LineSenderServerException(err), err);
+        dispatchError(err);
     }
 
     /**
@@ -788,8 +795,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         System.nanoTime()
                 );
                 totalServerErrors.incrementAndGet();
-                dispatchError(err);
+                // recordFatal MUST run before dispatchError so the producer-
+                // observable terminal error is latched before the handler is
+                // invoked.
                 recordFatal(new LineSenderServerException(err), err);
+                dispatchError(err);
                 return;
             }
             fail(new LineSenderException(
@@ -837,7 +847,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             byte status = response.getStatus();
             SenderError.Category category = classify(status);
             SenderError.Policy policy = defaultPolicyFor(category);
-            long fsn = fsnAtZero + Math.max(0L, wireSeq);
+            // Same sanity clamp as the success branch above: do not trust a
+            // rejection wireSeq beyond what we've actually sent. Without this
+            // clamp the DROP path advances ackedFsn past publishedFsn, which
+            // makes the segment manager trim sealed segments the I/O thread
+            // is still reading — and the next Unsafe.getInt SEGVs the JVM.
+            long highestSent = nextWireSeq - 1L;
+            long cappedSeq = Math.max(0L, Math.min(wireSeq, highestSent));
+            if (cappedSeq < wireSeq) {
+                LOG.warn("server NACK wire seq {} exceeds highest sent {} — clamping",
+                        wireSeq, highestSent);
+            }
+            long fsn = fsnAtZero + cappedSeq;
             // Best-effort table attribution: the parser populates
             // response.tableNames on error frames the same way it does on
             // STATUS_OK. If exactly one table was named, surface it; if
@@ -857,27 +878,26 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     System.nanoTime()
             );
             totalServerErrors.incrementAndGet();
-            // Async-deliver to the user handler regardless of policy. HALT
-            // also surfaces synchronously via the producer-thread typed throw
-            // below; DROP is observable ONLY via the async path, so the
-            // dispatcher is the user's only chance to dead-letter the data.
-            dispatchError(err);
 
             if (policy == SenderError.Policy.HALT) {
-                // Terminal: stash the typed payload, raise a typed exception
-                // through the existing recordFatal -> checkError -> producer
-                // throw path. Bytes on disk are the bytes the server
-                // rejected; reconnect/replay cannot fix them.
+                // Terminal: stash the typed payload BEFORE dispatching to the
+                // handler. The spec requires signal.terminalError to be latched
+                // before the handler is invoked so a handler that synchronously
+                // probes getLastTerminalError() (or calls flush()) sees the
+                // typed error rather than null. Bytes on disk are the bytes
+                // the server rejected; reconnect/replay cannot fix them.
                 recordFatal(new LineSenderServerException(err), err);
+                dispatchError(err);
             } else {
                 // DROP_AND_CONTINUE: advance ackedFsn past the rejected span
                 // so the loop drains subsequent batches. The data is dropped
                 // from the SF disk store via the existing trim path; the
-                // dispatch above is the user's only handle to dead-letter.
+                // dispatch is the user's only handle to dead-letter.
                 LOG.warn("server rejected wire seq {} (category={}, status=0x{}) — dropping batch and continuing",
                         wireSeq, category, Integer.toHexString(status & 0xFF));
                 engine.acknowledge(fsn);
                 totalAcks.incrementAndGet();
+                dispatchError(err);
             }
         }
     }
