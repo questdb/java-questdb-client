@@ -264,14 +264,33 @@ public final class Files {
      * Begins iterating directory entries of {@code path}. Returns an opaque
      * native handle to be paired with {@link #findName(long)},
      * {@link #findType(long)}, {@link #findNext(long)}, and finally released
-     * by {@link #findClose(long)}. Returns 0 if the directory could not be
-     * opened (caller can use {@code errno} to distinguish; 0 also occurs on
-     * an empty directory, in which case there is nothing to iterate).
+     * by {@link #findClose(long)}.
      * <p>
+     * Return-value contract:
+     * <ul>
+     *   <li>{@code > 0}: handle to iterator with at least one entry buffered
+     *       (POSIX/Win32 directories always have at least {@code .} and
+     *       {@code ..}).</li>
+     *   <li>{@code -1}: opendir / FindFirstFile failed — directory does not
+     *       exist, no read permission, transient error, etc. The caller
+     *       should NOT pass this value to {@link #findClose}, {@link #findName},
+     *       {@link #findNext}, or {@link #findType}. Distinguishing this from
+     *       a "real empty" success matters for recovery code paths that would
+     *       otherwise silently treat an inaccessible directory as containing
+     *       no entries to restore.</li>
+     *   <li>{@code 0}: directory exists and was successfully enumerated but
+     *       returned zero entries. POSIX/Win32 cannot in practice produce this
+     *       (the special entries are always present); kept as a defensive
+     *       case for unusual filesystems.</li>
+     * </ul>
      * Typical usage:
      * <pre>{@code
      * long find = Files.findFirst(dir);
-     * if (find == 0) return;
+     * if (find < 0) {
+     *     LOG.warn("could not enumerate {}", dir);
+     *     return;
+     * }
+     * if (find == 0) return; // directory empty (rare)
      * try {
      *     int rc = 1;
      *     while (rc > 0) {
@@ -288,7 +307,12 @@ public final class Files {
     public static long findFirst(String path) {
         long ptr = pathPtr(path);
         try {
-            return findFirst0(ptr);
+            long h = findFirst0(ptr);
+            // Native returns 0 on opendir/readdir failure. POSIX/Win32 dirs
+            // that exist always contain ./.., so 0 in practice always means
+            // "could not enumerate". Surface as -1 so callers can warn rather
+            // than silently treat an inaccessible directory as empty.
+            return h == 0 ? -1L : h;
         } finally {
             freePathPtr(ptr);
         }

@@ -26,11 +26,11 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 /**
  * Hard failure of the MmapSegment layer — bad header, mmap rejection, file
- * too short for header, etc. Distinct from {@code SfDiskFullException} which
- * is "this segment is full but the system is otherwise healthy"; an
- * MmapSegmentException means the segment is unusable.
+ * too short for header, etc. Indicates the segment is unusable, not that
+ * the disk is full (the latter surfaces as backpressure on the producer
+ * via {@link io.questdb.client.cutlass.qwp.client.LineSenderException}).
  */
-public class MmapSegmentException extends RuntimeException {
+public final class MmapSegmentException extends RuntimeException {
     public MmapSegmentException(String message) {
         super(message);
     }

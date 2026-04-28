@@ -41,9 +41,7 @@ import org.slf4j.LoggerFactory;
  * coordination, and {@code publishedCursor} is the publish barrier — the
  * I/O thread MUST NOT read any byte at offset {@code >= publishedOffset()}.
  * <p>
- * On-disk layout matches {@link io.questdb.client.cutlass.qwp.client.sf.SegmentLog}
- * so a segment written by the cursor engine can be replayed by the legacy
- * code path on next start (and vice versa). Header and frame format:
+ * On-disk layout — header and frame format:
  * <pre>
  *   [u32 magic 'SF01'] [u8 ver=1] [u8 flags=0] [u16 reserved=0]
  *   [u64 baseSeq]       [u64 createdMicros]                       24-byte header
@@ -83,11 +81,13 @@ public final class MmapSegment implements QuietCloseable {
     // baseSeq the new active will need.
     private long baseSeq;
     private int fd;
-    // frameCount: number of frames successfully appended (single writer = the
-    // producer; SegmentRing reads it after sealing the segment, by which point
-    // no further writes will land). Lifecycle gives us happens-before; no
-    // volatile needed.
-    private long frameCount;
+    // frameCount: number of frames successfully appended. Single writer (the
+    // producer thread in tryAppend); read cross-thread by the I/O thread via
+    // SegmentRing.findSegmentContaining and SegmentRing.appendOrFsn-time
+    // computations on the active segment. The ring's synchronized accessors
+    // give one-sided fencing only — the writer is NOT synchronized on the
+    // ring monitor. volatile is the cheapest correct fix.
+    private volatile long frameCount;
     private long mmapAddress;
     // publishedCursor: written by producer, read by consumer (I/O thread). Volatile
     // because the consumer must see writes in publication order — once the
@@ -352,8 +352,8 @@ public final class MmapSegment implements QuietCloseable {
         if (offset + total > sizeBytes) {
             return -1L;
         }
-        // CRC over the (payloadLen, payload) pair — same window the legacy
-        // SegmentLog uses, so a recovery scan validates either format identically.
+        // CRC32C over the (payloadLen, payload) pair. Recovery scans validate
+        // each frame by recomputing this CRC over the on-disk bytes.
         long lenAddr = mmapAddress + offset + 4;
         Unsafe.getUnsafe().putInt(lenAddr, payloadLen);
         if (payloadLen > 0) {

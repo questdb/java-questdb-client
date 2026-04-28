@@ -26,6 +26,8 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Reads the SF group root and reports sibling slots that look like they
@@ -54,6 +56,8 @@ import io.questdb.client.std.ObjList;
  */
 public final class OrphanScanner {
 
+    private static final Logger LOG = LoggerFactory.getLogger(OrphanScanner.class);
+
     /** Name of the sentinel that disqualifies a slot from auto-drain. */
     public static final String FAILED_SENTINEL_NAME = ".failed";
 
@@ -76,6 +80,11 @@ public final class OrphanScanner {
             return orphans;
         }
         long find = Files.findFirst(sfDir);
+        if (find < 0) {
+            LOG.warn("orphan scan could not enumerate {} — treating as no orphans, "
+                    + "but this may indicate a permission or transient error", sfDir);
+            return orphans;
+        }
         if (find == 0) {
             return orphans;
         }
@@ -154,6 +163,10 @@ public final class OrphanScanner {
 
     private static boolean hasAnySegmentFile(String slotPath) {
         long find = Files.findFirst(slotPath);
+        if (find < 0) {
+            LOG.warn("could not enumerate slot {} when checking for segment files", slotPath);
+            return false;
+        }
         if (find == 0) {
             return false;
         }

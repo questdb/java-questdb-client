@@ -27,6 +27,8 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Chain of {@link MmapSegment}s presented to the user thread as one logical
@@ -54,6 +56,8 @@ import io.questdb.client.std.QuietCloseable;
  * far enough that the segment manager can recycle a sealed segment.
  */
 public final class SegmentRing implements QuietCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
 
     /** Sentinel: append failed because no hot spare was available to rotate into. */
     public static final long BACKPRESSURE_NO_SPARE = -1L;
@@ -151,6 +155,11 @@ public final class SegmentRing implements QuietCloseable {
         }
         ObjList<MmapSegment> opened = new ObjList<>();
         long find = Files.findFirst(sfDir);
+        if (find < 0) {
+            LOG.warn("openExisting could not enumerate {} — treating as empty, "
+                    + "but this may indicate a permission or transient error", sfDir);
+            return null;
+        }
         if (find == 0) {
             return null;
         }

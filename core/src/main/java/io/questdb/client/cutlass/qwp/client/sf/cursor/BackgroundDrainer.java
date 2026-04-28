@@ -159,11 +159,7 @@ public final class BackgroundDrainer implements Runnable {
             loop = new CursorWebSocketSendLoop(
                     client, engine,
                     0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
-                    clientFactory, () -> {
-                /* Drainer has no producer state to reset. The send loop
-                 * still bumps its own internal generation on reconnect; we
-                 * don't need to react to it. */
-            },
+                    clientFactory,
                     reconnectMaxDurationMillis,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis);

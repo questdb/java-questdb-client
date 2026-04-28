@@ -181,22 +181,6 @@ public class QwpWebSocketSender implements Sender {
     // alongside the cursor send loop in close().
     private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool
             drainerPool;
-    // Single volatile counter, single writer (the wire-side actor that
-    // performs reconnect; for now: ensureConnected during recovery).
-    // Bumped on every successful reconnect AND on initial recovery from
-    // disk. Producer thread reads it inside flushPendingRows to decide
-    // whether to reset schema state (the new server has no memory of the
-    // old connection's schema IDs) and to detect the encode-mid-reconnect
-    // race. See design/qwp-cursor-durability.md "Schema state on reconnect".
-    private volatile long connectionGeneration;
-    // Producer-thread-only mirror of the last connectionGeneration value
-    // we encoded against. When connectionGeneration > lastSeenGeneration,
-    // the producer must reset schema state before the next encode.
-    private long lastSeenGeneration;
-    // Bound on the encode-retry loop in flushPendingRows. Reconnect
-    // firing 10x faster than the producer can encode a single batch is
-    // pathological — surface a hard error rather than spin.
-    private static final int MAX_SCHEMA_RACE_RETRIES = 10;
 
     private QwpWebSocketSender(
             String host,
@@ -968,25 +952,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Test hook: simulate a wire-side reconnect by bumping the
-     * connectionGeneration counter. The next call into {@code flushPendingRows}
-     * will detect the divergence and reset schema state. Production wire
-     * code will call this from the I/O loop's reconnect path; tests use
-     * it to exercise the schema-reset machinery without spinning up a
-     * reconnect scenario.
-     */
-    @TestOnly
-    public void bumpConnectionGenerationForTest() {
-        connectionGeneration++;
-    }
-
-    /** Test accessor for the volatile generation counter. */
-    @TestOnly
-    public long getConnectionGenerationForTest() {
-        return connectionGeneration;
-    }
-
-    /**
      * Number of reconnect attempts the cursor I/O loop has issued —
      * succeeded plus failed. Diverges from {@link #getTotalReconnectsSucceeded}
      * when the server is flapping. Returns 0 if no I/O loop is running.
@@ -1054,9 +1019,9 @@ public class QwpWebSocketSender implements Sender {
      * Snapshot of drainers the foreground sender has dispatched. Useful
      * for monitoring orphan-drain progress without parsing logs.
      */
-    public java.util.List<io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer>
+    public io.questdb.client.std.ObjList<io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer>
             getBackgroundDrainers() {
-        if (drainerPool == null) return java.util.Collections.emptyList();
+        if (drainerPool == null) return new io.questdb.client.std.ObjList<>(0);
         return drainerPool.snapshot();
     }
 
@@ -1533,7 +1498,6 @@ public class QwpWebSocketSender implements Sender {
                     client, cursorEngine,
                     0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     this::buildAndConnect,
-                    this::onWireReconnect,
                     reconnectMaxDurationMillis,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis);
@@ -1547,17 +1511,10 @@ public class QwpWebSocketSender implements Sender {
 
         encoder.setVersion((byte) client.getServerQwpVersion());
         // Server starts fresh on each connection — discard any schema IDs
-        // retained from prior state.
+        // retained from prior state. Cursor frames are self-sufficient (every
+        // frame carries full schema + full symbol-dict delta from id 0), so
+        // post-reconnect replay needs no producer-side schema-reset signal.
         resetSchemaStateForNewConnection();
-        // If the cursor engine recovered an existing on-disk slot, the
-        // recovered FSNs were never seen by *this* server connection. Bump
-        // connectionGeneration so flushPendingRows treats the next batch as
-        // post-reconnect (full schema definitions, not refs). lastSeenGeneration
-        // stays at 0 — the divergence is what signals "reset needed" in the
-        // producer's retry loop.
-        if (cursorEngine != null && cursorEngine.wasRecoveredFromDisk()) {
-            connectionGeneration = 1L;
-        }
         connectionError.set(null);
 
         connected = true;
@@ -1592,18 +1549,6 @@ public class QwpWebSocketSender implements Sender {
             throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
         }
         return newClient;
-    }
-
-    /**
-     * Called by the cursor I/O loop after a successful reconnect. The wire
-     * state has been reset and the cursor repositioned for replay; we bump
-     * connectionGeneration so the producer thread's next encode treats the
-     * connection as fresh (full schema definitions, not refs the new server
-     * has never seen). Single-writer (the I/O thread invokes this), so a
-     * plain volatile increment is safe.
-     */
-    private void onWireReconnect() {
-        connectionGeneration++;
     }
 
     private void ensureNoInProgressRow() {
@@ -1645,80 +1590,46 @@ public class QwpWebSocketSender implements Sender {
         }
 
         ensureActiveBufferReady();
-        // Encode-mid-reconnect race retry loop. The wire-side actor (today
-        // the recovery startup; soon the I/O loop's reconnect path) bumps
-        // connectionGeneration after resetting wire state. If a bump fires
-        // while we're encoding, the bytes we're about to emit may carry
-        // schema-ID refs the new server has never assigned — the server
-        // would reject the batch and we'd lose data. Detect by sampling
-        // gen before encode and re-sampling after finishMessage; if it
-        // changed, discard the encoded bytes (table buffers are NOT yet
-        // reset, so source rows are intact) and retry. Bounded so
-        // reconnect-faster-than-encode surfaces a hard error.
-        int batchMaxSchemaId;
-        int messageSize;
-        QwpBufferWriter buffer;
-        int retries = 0;
-        while (true) {
-            long genBefore = connectionGeneration;
-            if (genBefore != lastSeenGeneration) {
-                resetSchemaStateForNewConnection();
-                lastSeenGeneration = genBefore;
+        // Cursor SF requires every on-disk frame to be self-sufficient
+        // — its schema definition must travel with the row data, not
+        // as a back-reference to an ID the server may not have seen
+        // (orphan-slot drainers and post-reconnect replay both deliver
+        // recorded frames to fresh server connections). So always emit
+        // the full symbol-dict delta from id=0, and always send the
+        // full schema definition for each table — never a ref. With
+        // self-sufficient frames there's no encode-vs-reconnect race
+        // to defend against: the bytes are valid against any server.
+        int batchMaxSchemaId = maxSentSchemaId;
+        encoder.beginMessage(tableCount, globalSymbolDictionary,
+                /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
             }
-            int currBatchMaxSchemaId = maxSentSchemaId;
-            // Cursor SF requires every on-disk frame to be self-sufficient
-            // — its schema definition must travel with the row data, not
-            // as a back-reference to an ID the server may not have seen
-            // (orphan-slot drainers and post-reconnect replay both deliver
-            // recorded frames to fresh server connections). So always emit
-            // the full symbol-dict delta from id=0, and always send the
-            // full schema definition for each table — never a ref.
-            encoder.beginMessage(tableCount, globalSymbolDictionary,
-                    /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
-            for (int i = 0, n = keys.size(); i < n; i++) {
-                CharSequence tableName = keys.getQuick(i);
-                if (tableName == null) {
-                    continue;
-                }
-                QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-                if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                    continue;
-                }
-
-                if (tableBuffer.getSchemaId() < 0) {
-                    if (nextSchemaId >= maxSchemasPerConnection) {
-                        throw new LineSenderException("maximum schemas per connection exceeded")
-                                .put("[maxSchemasPerConnection=").put(maxSchemasPerConnection).put(']');
-                    }
-                    tableBuffer.setSchemaId(nextSchemaId++);
-                }
-                currBatchMaxSchemaId = Math.max(currBatchMaxSchemaId, tableBuffer.getSchemaId());
-
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("Encoding table [name={}, rows={}, batchMaxId={}, useSchemaRef=false (cursor SF)]",
-                            tableName, tableBuffer.getRowCount(), currentBatchMaxSymbolId);
-                }
-
-                encoder.addTable(tableBuffer, /*useSchemaRef=*/ false);
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                continue;
             }
-            messageSize = encoder.finishMessage();
-            buffer = encoder.getBuffer();
 
-            // Race detection: did the wire actor bump gen during encode?
-            if (connectionGeneration == genBefore) {
-                batchMaxSchemaId = currBatchMaxSchemaId;
-                break;
+            if (tableBuffer.getSchemaId() < 0) {
+                if (nextSchemaId >= maxSchemasPerConnection) {
+                    throw new LineSenderException("maximum schemas per connection exceeded")
+                            .put("[maxSchemasPerConnection=").put(maxSchemasPerConnection).put(']');
+                }
+                tableBuffer.setSchemaId(nextSchemaId++);
             }
-            if (++retries >= MAX_SCHEMA_RACE_RETRIES) {
-                throw new LineSenderException(
-                        "schema-reset race exceeded retry limit [" + MAX_SCHEMA_RACE_RETRIES
-                                + "] — wire reconnects are firing faster than the user thread "
-                                + "can encode a single batch");
-            }
+            batchMaxSchemaId = Math.max(batchMaxSchemaId, tableBuffer.getSchemaId());
+
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Schema-reset race detected mid-encode; retrying [attempt={}]", retries);
+                LOG.debug("Encoding table [name={}, rows={}, batchMaxId={}, useSchemaRef=false (cursor SF)]",
+                        tableName, tableBuffer.getRowCount(), currentBatchMaxSymbolId);
             }
+
+            encoder.addTable(tableBuffer, /*useSchemaRef=*/ false);
         }
+        int messageSize = encoder.finishMessage();
+        QwpBufferWriter buffer = encoder.getBuffer();
 
         activeBuffer.ensureCapacity(messageSize);
         activeBuffer.write(buffer.getBufferPtr(), messageSize);

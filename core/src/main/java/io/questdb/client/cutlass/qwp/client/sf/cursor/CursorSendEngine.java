@@ -31,13 +31,11 @@ import java.util.concurrent.locks.LockSupport;
 
 /**
  * Facade that bundles a {@link SegmentRing} with a {@link SegmentManager} and
- * exposes the user-facing API that a wire-send loop will call into. This is
- * the integration point a future {@code QwpWebSocketSender} variant will use
- * in place of the legacy {@code SegmentLog} + {@code WebSocketSendQueue}
- * coupling — keeping the SF append work on the user thread (where it belongs)
- * and the segment lifecycle work on the manager thread (where it belongs).
+ * exposes the user-facing API the wire-send loop calls into. Keeps SF append
+ * work on the user thread (where it belongs) and segment lifecycle work on
+ * the manager thread (where it belongs).
  * <p>
- * <b>What this class is responsible for:</b>
+ * <b>Responsibilities:</b>
  * <ul>
  *   <li>Owning the ring + manager lifecycle (open / close / startup recovery).</li>
  *   <li>Providing a user-thread append path that handles backpressure
@@ -46,14 +44,8 @@ import java.util.concurrent.locks.LockSupport;
  *       {@link #activeSegment}, {@link #sealedSegments}.</li>
  *   <li>Routing server ACKs to the ring for trim.</li>
  * </ul>
- * <b>What this class is NOT yet responsible for (deferred follow-up):</b>
+ * <b>Not in scope:</b>
  * <ul>
- *   <li>Actually being wired into {@code QwpWebSocketSender}. Today the
- *       sender uses {@code WebSocketSendQueue + SegmentLog}; replacing those
- *       requires rewriting the I/O loop / ACK protocol / reconnect path.
- *       That's tracked separately.</li>
- *   <li>Recovery of segment ring from an existing {@code sf_dir} on startup.
- *       For now the engine starts fresh.</li>
  *   <li>Multi-producer support. Single producer (one user thread) only.</li>
  * </ul>
  */
@@ -80,10 +72,10 @@ public final class CursorSendEngine implements QuietCloseable {
     private final long segmentSizeBytes;
     private final long appendDeadlineNanos;
     // True when the constructor recovered an existing on-disk slot rather
-    // than starting fresh. Read by QwpWebSocketSender during connect to
-    // decide whether to bump connectionGeneration so the first batch
-    // re-publishes schema definitions (the server has no memory of FSNs
-    // we recovered from disk).
+    // than starting fresh. Diagnostic accessor for tests and observability;
+    // cursor frames are self-sufficient (every frame carries full schema +
+    // full symbol-dict delta), so producer-side schema reset on recovery
+    // is not required.
     private final boolean recoveredFromDisk;
     // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
     // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
@@ -94,7 +86,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // Producer-thread-only: timestamp of the last "we're backpressured" log
     // line, used to throttle. Plain long is fine.
     private long lastBackpressureLogNs;
-    private boolean closed;
+    // close() is publicly callable from any thread (Sender.close from a user
+    // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
+    // close() makes the check-and-set atomic and gives readers a fence.
+    private volatile boolean closed;
 
     /**
      * Creates an engine with a private, non-shared {@link SegmentManager},
@@ -293,7 +288,7 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (closed) return;
         closed = true;
         // Capture drain state BEFORE closing the ring — once the ring is
@@ -305,22 +300,37 @@ public final class CursorSendEngine implements QuietCloseable {
         // against potentially-fresh server state — duplicate writes when
         // the server has no dedup state for those messageSequences.
         // Memory mode has no files to unlink.
-        boolean fullyDrained = sfDir != null
-                && ring.publishedFsn() >= 0
-                && ring.ackedFsn() >= ring.publishedFsn();
-        manager.deregister(ring);
-        if (ownsManager) {
-            manager.close();
-        }
-        ring.close();
-        if (fullyDrained) {
-            unlinkAllSegmentFiles(sfDir);
-        }
-        if (slotLock != null) {
-            try {
-                slotLock.close();
-            } catch (Throwable ignored) {
-                // best-effort; flock is also released by kernel on process exit
+        // The whole close sequence runs under try/finally so the slot lock
+        // is ALWAYS released, even if manager/ring close or unlink throws —
+        // otherwise a kernel-held flock outlives the engine and the next
+        // sender for the same slot collides on a lock the dead engine
+        // never released.
+        try {
+            // "Fully drained" includes BOTH the obvious case (every published
+            // FSN has been acked) AND the never-published case (publishedFsn
+            // < 0). The latter matters because a drainer adopting an empty
+            // orphan slot — segments filtered as empty by recovery, engine
+            // recreates a fresh sf-initial.sfa — would otherwise leave that
+            // fresh empty file behind, the next scanner finds it, adopts the
+            // slot again, and the cycle repeats forever (M6).
+            boolean fullyDrained = sfDir != null
+                    && (ring.publishedFsn() < 0
+                            || ring.ackedFsn() >= ring.publishedFsn());
+            manager.deregister(ring);
+            if (ownsManager) {
+                manager.close();
+            }
+            ring.close();
+            if (fullyDrained) {
+                unlinkAllSegmentFiles(sfDir);
+            }
+        } finally {
+            if (slotLock != null) {
+                try {
+                    slotLock.close();
+                } catch (Throwable ignored) {
+                    // best-effort; flock is also released by kernel on process exit
+                }
             }
         }
     }
@@ -336,6 +346,11 @@ public final class CursorSendEngine implements QuietCloseable {
     private static void unlinkAllSegmentFiles(String dir) {
         if (!io.questdb.client.std.Files.exists(dir)) return;
         long find = io.questdb.client.std.Files.findFirst(dir);
+        if (find < 0) {
+            LOG.warn("close-time unlink could not enumerate {}; "
+                    + "any residual sf-*.sfa files will be picked up by the next recovery", dir);
+            return;
+        }
         if (find == 0) return;
         try {
             int rc = 1;

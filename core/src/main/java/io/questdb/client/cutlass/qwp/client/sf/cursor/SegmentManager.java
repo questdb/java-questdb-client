@@ -211,6 +211,11 @@ public final class SegmentManager implements QuietCloseable {
         long max = -1L;
         if (!Files.exists(dir)) return max;
         long find = Files.findFirst(dir);
+        if (find < 0) {
+            LOG.warn("scanMaxGeneration could not enumerate {}; "
+                    + "next spare may collide with an existing on-disk segment", dir);
+            return max;
+        }
         if (find == 0) return max;
         try {
             int rc = 1;
@@ -286,35 +291,58 @@ public final class SegmentManager implements QuietCloseable {
                     lastDiskFullLogNs = now;
                 }
             } else {
+                MmapSegment spare = null;
+                String path = null;
+                boolean installed = false;
                 try {
                     // baseSeq is provisional — SegmentRing.appendOrFsn calls
                     // rebaseSeq() at rotation time to pin the real value. We
                     // pass the manager's best guess (nextSeqHint at this
                     // instant), which is fine since it's overwritten anyway.
-                    MmapSegment spare;
-                    String path;
                     if (memoryMode) {
                         spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
-                        path = null;
                     } else {
                         path = nextSparePath(e.dir);
                         spare = MmapSegment.create(path, e.ring.nextSeqHint(), segmentSizeBytes);
                     }
-                    try {
-                        e.ring.installHotSpare(spare);
-                        synchronized (lock) {
+                    // Install + commit atomically under the manager lock.
+                    // If `e.ring` was deregistered between the snapshot
+                    // above and now, abandoning the spare here is the only
+                    // way to keep totalBytes consistent: deregister already
+                    // subtracted ring.totalSegmentBytes() (without the
+                    // spare, since it wasn't installed yet) so a commit at
+                    // this point would inflate totalBytes by one segment
+                    // with no future subtractor. By holding `lock` across
+                    // installHotSpare AND the += commit AND the still-
+                    // registered check, deregister is forced to either
+                    // observe the spare in the ring (and subtract it) or
+                    // run before installation (so no install happens).
+                    synchronized (lock) {
+                        boolean stillRegistered = false;
+                        for (int i = 0, n = rings.size(); i < n; i++) {
+                            if (rings.get(i) == e) {
+                                stillRegistered = true;
+                                break;
+                            }
+                        }
+                        if (stillRegistered) {
+                            e.ring.installHotSpare(spare);
                             totalBytes += segmentSizeBytes;
+                            installed = true;
                         }
-                    } catch (Throwable t) {
-                        spare.close();
-                        if (path != null) {
-                            Files.remove(path);
-                        }
-                        throw t;
                     }
                 } catch (Throwable t) {
                     LOG.warn("Failed to provision hot spare in {} (will retry next tick)",
                             memoryMode ? "<memory>" : e.dir, t);
+                }
+                if (!installed && spare != null) {
+                    try {
+                        spare.close();
+                    } catch (Throwable ignored) {
+                    }
+                    if (path != null) {
+                        Files.remove(path);
+                    }
                 }
             }
         }
@@ -347,9 +375,8 @@ public final class SegmentManager implements QuietCloseable {
      * Spare files are named with a JVM-wide monotonic generation counter
      * rather than a baseSeq-derived name, because the spare's baseSeq is
      * provisional at create time (SegmentRing.appendOrFsn rebases it at
-     * rotation). Pattern: {@code <dir>/sf-<gen:016x>.sfa}. A recovery
-     * scanner (cursor engine or legacy SegmentLog) discovers segments by
-     * extension + header magic, not by name, so this is fine.
+     * rotation). Pattern: {@code <dir>/sf-<gen:016x>.sfa}. Recovery
+     * discovers segments by extension + header magic, not by filename.
      */
     private String nextSparePath(String dir) {
         return dir + "/sf-" + String.format("%016x", fileGeneration.getAndIncrement()) + ".sfa";

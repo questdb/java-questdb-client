@@ -39,8 +39,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * The cursor-engine equivalent of {@code WebSocketSendQueue}'s I/O loop.
- * Owns one I/O thread that:
+ * The cursor-engine I/O loop. Owns one I/O thread that:
  * <ol>
  *   <li>Polls {@link CursorSendEngine#publishedFsn()} and walks newly-published
  *       frames from the engine's segments, sending each as one WebSocket
@@ -49,23 +48,16 @@ import java.util.concurrent.locks.LockSupport;
  *       cumulative wire sequence {@code N}, calls
  *       {@code engine.acknowledge(fsnAtZero + N)} so the segment manager
  *       can trim fully-acked segments.</li>
+ *   <li>On wire failure, runs the configured reconnect policy: backoff
+ *       with jitter up to {@code reconnect_max_duration_millis}, with
+ *       auth-style failures (401/403/non-101 upgrade reject) treated as
+ *       terminal. On reconnect success, repositions the cursor at
+ *       {@code ackedFsn+1} and replays.</li>
  * </ol>
- * No locks. The producer thread (user) writes into the engine; this thread
- * reads. {@code engine.publishedFsn()} is the volatile publish barrier.
+ * No locks on the steady-state path. The producer thread (user) writes
+ * into the engine; this thread reads. {@code engine.publishedFsn()} is
+ * the volatile publish barrier.
  * <p>
- * <b>PR1 scope (deliberately minimal):</b>
- * <ul>
- *   <li>Happy-path send + ACK round-trip only.</li>
- *   <li>No ping/pong, no fsync requests, no per-table seqTxn tracking
- *       (the legacy {@code WebSocketSendQueue} has all of these — port
- *       them as PR2 once latency wins are confirmed).</li>
- *   <li>No reconnect / replay — a connection failure is fatal; the user
- *       must construct a new sender. Replay-on-reconnect needs to walk
- *       segments from {@code ackedFsn+1} forward and is the next PR.</li>
- *   <li>Single-connection only (no failover); WebSocketClient is provided
- *       and assumed to be already connected.</li>
- *   <li>Engine starts fresh (no on-disk recovery into the wire path).</li>
- * </ul>
  * Errors are reported via {@link #getLastError()}; the I/O thread sets it
  * and exits. Producers polling {@link #checkError()} surface the failure.
  */
@@ -105,13 +97,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // to -1 once trySendOne has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
     private long replayTargetFsn = -1L;
-    // Optional reconnect plumbing. If both are non-null, a wire failure
-    // triggers a reconnect attempt instead of a terminal fail(). The factory
-    // produces a fresh, connected+upgraded WebSocketClient; the listener is
-    // notified after the wire state has been reset so the producer thread
-    // can bump its connectionGeneration.
+    // Optional reconnect plumbing. When non-null, a wire failure triggers a
+    // reconnect attempt instead of a terminal fail(). The factory produces a
+    // fresh, connected+upgraded WebSocketClient.
     private final ReconnectFactory reconnectFactory;
-    private final ReconnectListener reconnectListener;
     private final long reconnectMaxDurationMillis;
     private final long reconnectInitialBackoffMillis;
     private final long reconnectMaxBackoffMillis;
@@ -134,29 +123,26 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private Thread ioThread;
 
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine) {
-        this(client, engine, 0L, DEFAULT_PARK_NANOS, null, null);
+        this(client, engine, 0L, DEFAULT_PARK_NANOS, null);
     }
 
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos) {
-        this(client, engine, fsnAtZero, parkNanos, null, null);
+        this(client, engine, fsnAtZero, parkNanos, null);
     }
 
     /**
      * Full constructor with reconnect plumbing. When {@code reconnectFactory}
-     * and {@code reconnectListener} are both non-null, the I/O thread treats
-     * wire failures (send/receive errors, server-initiated close) as
-     * recoverable: it calls the factory to obtain a fresh connected client,
-     * resets wire state, repositions its replay cursor at
-     * {@code engine.ackedFsn() + 1}, and notifies the listener so the
-     * producer can bump its {@code connectionGeneration}. Either being null
-     * disables reconnect (legacy behavior — single failure is terminal).
+     * is non-null, the I/O thread treats wire failures (send/receive errors,
+     * server-initiated close) as recoverable: it calls the factory to obtain
+     * a fresh connected client, resets wire state, and repositions its replay
+     * cursor at {@code engine.ackedFsn() + 1}. A null factory disables
+     * reconnect (legacy behavior — single failure is terminal).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory,
-                                   ReconnectListener reconnectListener) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory, reconnectListener,
+                                   ReconnectFactory reconnectFactory) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
                 DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS,
                 DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS);
@@ -169,7 +155,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   ReconnectListener reconnectListener,
                                    long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis) {
@@ -181,7 +166,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.fsnAtZero = fsnAtZero;
         this.parkNanos = parkNanos;
         this.reconnectFactory = reconnectFactory;
-        this.reconnectListener = reconnectListener;
         this.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
@@ -201,17 +185,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Notified after a successful reconnect — wire state has been reset and
-     * the cursor repositioned for replay. Implementations typically bump a
-     * {@code connectionGeneration} counter the producer thread reads so
-     * the next encode emits full schema definitions instead of refs.
-     */
-    @FunctionalInterface
-    public interface ReconnectListener {
-        void onReconnect();
-    }
-
-    /**
      * Surfaces any error the I/O thread recorded. Called by the producer
      * thread (typically from inside its append wrapper) so failures don't
      * stay silent. Idempotent; once an error is set the loop has already
@@ -226,7 +199,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
+        // Synchronized on the same monitor as start(): a close() racing a
+        // slow start() would otherwise read ioThread==null and skip the
+        // latch await, while the I/O thread is mid-sendBinary. Holding the
+        // monitor across the whole close path forces close() to either run
+        // entirely before start() commits ioThread (in which case running
+        // is false and start's ioLoop will exit immediately) or entirely
+        // after — the latch await is only skipped when the loop never ran.
         running = false;
         Thread t = ioThread;
         if (t != null) {
@@ -385,7 +365,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * (legacy behavior).
      */
     private void fail(Throwable initial) {
-        if (reconnectFactory == null || reconnectListener == null || !running) {
+        if (reconnectFactory == null || !running) {
             recordFatal(initial);
             return;
         }
@@ -405,7 +385,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (newClient != null) {
                     swapClient(newClient);
                     totalReconnects.incrementAndGet();
-                    reconnectListener.onReconnect();
                     long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
                     LOG.info("cursor I/O loop reconnected after {}ms, {} attempts; "
                                     + "replaying from FSN {}",

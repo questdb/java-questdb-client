@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -134,8 +135,12 @@ public final class BackgroundDrainerPool implements QuietCloseable {
      * finished moments ago — the cleanup race is intentionally lax.
      * Useful for visibility / status accessors.
      */
-    public java.util.List<BackgroundDrainer> snapshot() {
-        return new java.util.ArrayList<>(active);
+    public ObjList<BackgroundDrainer> snapshot() {
+        ObjList<BackgroundDrainer> result = new ObjList<>(active.size());
+        for (BackgroundDrainer d : active) {
+            result.add(d);
+        }
+        return result;
     }
 
     @Override
