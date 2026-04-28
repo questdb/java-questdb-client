@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -24,12 +24,16 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.LineSenderServerException;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,6 +85,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
     private final AtomicLong totalAcks = new AtomicLong();
+    // Total non-OK / non-DURABLE_ACK frames received from the server, classified
+    // by category. Includes both DROP_AND_CONTINUE and HALT outcomes — i.e. every
+    // server-side rejection observed regardless of how the loop reacted.
+    private final AtomicLong totalServerErrors = new AtomicLong();
     private final AtomicLong totalFramesSent = new AtomicLong();
     private final AtomicLong totalReconnects = new AtomicLong();
     // Every iteration of the reconnect loop bumps this — failures and
@@ -104,6 +112,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final long reconnectMaxDurationMillis;
     private final long reconnectInitialBackoffMillis;
     private final long reconnectMaxBackoffMillis;
+    // Optional: when non-null, every server-rejection error (DROP and HALT
+    // alike) is offered to the dispatcher for async delivery to the user's
+    // handler. Null disables async delivery entirely; the producer-side
+    // typed-throw path is unaffected.
+    private SenderErrorDispatcher errorDispatcher;
     private WebSocketClient client;
     // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
     // a fresh connection, this is 0. After a reconnect, it's set to
@@ -120,37 +133,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long nextWireSeq;
     private volatile boolean running;
     private volatile Throwable lastError;
+    // Typed payload sibling to lastError. Set when recordFatal is called with
+    // a SenderError (HALT-policy server rejection or terminal protocol violation);
+    // remains null for wire-level fatals (reconnect-budget exhaustion, etc).
+    // Read by QwpWebSocketSender.getLastTerminalError() for ops visibility.
+    private volatile SenderError lastTerminalServerError;
     private Thread ioThread;
 
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine) {
-        this(client, engine, 0L, DEFAULT_PARK_NANOS, null);
-    }
-
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos) {
-        this(client, engine, fsnAtZero, parkNanos, null);
-    }
-
     /**
-     * Full constructor with reconnect plumbing. When {@code reconnectFactory}
-     * is non-null, the I/O thread treats wire failures (send/receive errors,
-     * server-initiated close) as recoverable: it calls the factory to obtain
-     * a fresh connected client, resets wire state, and repositions its replay
-     * cursor at {@code engine.ackedFsn() + 1}. A null factory disables
-     * reconnect (legacy behavior — single failure is terminal).
-     */
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
-                                   long fsnAtZero, long parkNanos,
-                                   ReconnectFactory reconnectFactory) {
-        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
-                DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS,
-                DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS);
-    }
-
-    /**
-     * Full constructor with explicit reconnect-policy knobs. Used by the
-     * builder when the user has overridden the defaults.
+     * Full constructor with explicit reconnect-policy knobs. When
+     * {@code reconnectFactory} is non-null, the I/O thread treats wire
+     * failures (send/receive errors, server-initiated close) as recoverable:
+     * it calls the factory to obtain a fresh connected client, resets wire
+     * state, and repositions its replay cursor at
+     * {@code engine.ackedFsn() + 1}. A null factory disables reconnect
+     * (single failure is terminal).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -247,8 +244,35 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return lastError;
     }
 
+    /**
+     * Snapshot of the typed server-rejection payload for the latched terminal error,
+     * or {@code null} if the loop has not latched a server-rejection terminal (or has
+     * latched only a wire-level failure with no SenderError associated).
+     */
+    public SenderError getLastTerminalServerError() {
+        return lastTerminalServerError;
+    }
+
     public long getTotalAcks() {
         return totalAcks.get();
+    }
+
+    /**
+     * Total server-side rejection frames observed since the loop started. Counts both
+     * DROP_AND_CONTINUE and HALT outcomes — every non-OK frame the server sent that
+     * the client classified as a {@link SenderError}.
+     */
+    public long getTotalServerErrors() {
+        return totalServerErrors.get();
+    }
+
+    /**
+     * Plug an async-delivery sink for {@link SenderError} notifications.
+     * Idempotent — set once before {@link #start()}; later reassignment is
+     * permitted but races between dispatchers are the caller's problem.
+     */
+    public void setErrorDispatcher(SenderErrorDispatcher dispatcher) {
+        this.errorDispatcher = dispatcher;
     }
 
     public long getTotalFramesSent() {
@@ -396,9 +420,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     String upgradeMsg = findUpgradeFailureMessage(e);
                     LOG.error("terminal upgrade error during reconnect — won't retry: {}",
                             upgradeMsg);
-                    recordFatal(new LineSenderException(
-                            "WebSocket upgrade failed during reconnect (won't retry): "
-                                    + upgradeMsg, e));
+                    long fromFsn = engine.ackedFsn() + 1L;
+                    long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                    SenderError err = new SenderError(
+                            SenderError.Category.SECURITY_ERROR,
+                            SenderError.Policy.HALT,
+                            SenderError.NO_STATUS_BYTE,
+                            "ws-upgrade-failed: " + upgradeMsg,
+                            SenderError.NO_MESSAGE_SEQUENCE,
+                            fromFsn,
+                            toFsn,
+                            null,
+                            System.nanoTime()
+                    );
+                    totalServerErrors.incrementAndGet();
+                    dispatchError(err);
+                    recordFatal(new LineSenderServerException(err), err);
                     return;
                 }
                 lastReconnectError = e;
@@ -429,9 +466,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         LOG.error("cursor I/O loop giving up reconnecting after {}ms, {} attempts; "
                         + "last error: {}",
                 elapsedMs, attempts, lastReconnectError.getMessage());
-        recordFatal(new LineSenderException(
-                "reconnect failed after " + elapsedMs + "ms / " + attempts + " attempts: "
-                        + lastReconnectError.getMessage(), lastReconnectError));
+        long fromFsn = engine.ackedFsn() + 1L;
+        long toFsn = Math.max(fromFsn, engine.publishedFsn());
+        SenderError err = new SenderError(
+                SenderError.Category.PROTOCOL_VIOLATION,
+                SenderError.Policy.HALT,
+                SenderError.NO_STATUS_BYTE,
+                "reconnect-budget-exhausted: " + elapsedMs + "ms / " + attempts
+                        + " attempts; last error: " + lastReconnectError.getMessage(),
+                SenderError.NO_MESSAGE_SEQUENCE,
+                fromFsn,
+                toFsn,
+                null,
+                System.nanoTime()
+        );
+        totalServerErrors.incrementAndGet();
+        dispatchError(err);
+        recordFatal(new LineSenderServerException(err), err);
     }
 
     /**
@@ -441,8 +492,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * stop the loop.
      */
     private void recordFatal(Throwable t) {
+        recordFatal(t, null);
+    }
+
+    /**
+     * Server-rejection-aware variant. Stashes a typed {@link SenderError} alongside
+     * the throwable so {@code QwpWebSocketSender.getLastTerminalError()} can surface
+     * the structured payload for ops/observability. Idempotent — only the first
+     * failure latches.
+     */
+    private void recordFatal(Throwable t, SenderError serverError) {
         if (lastError == null) {
             lastError = t;
+            lastTerminalServerError = serverError;
         }
         running = false;
         LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
@@ -614,11 +676,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private void ioLoop() {
         try {
             while (running) {
-                boolean didWork = false;
+                boolean didWork = trySendOne();
                 // 1. Try to send next frame(s).
-                if (trySendOne()) {
-                    didWork = true;
-                }
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
                     didWork = true;
@@ -706,7 +765,35 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final class ResponseHandler implements WebSocketFrameHandler {
         @Override
         public void onClose(int code, String reason) {
-            fail(new LineSenderException("WebSocket closed by server: code=" + code + " reason=" + reason));
+            // Terminal close codes signal the server has rejected the wire
+            // bytes themselves — reconnecting and replaying the same bytes
+            // produces the same close. Stash a typed PROTOCOL_VIOLATION
+            // SenderError and halt directly. Reconnect-eligible codes
+            // (NORMAL_CLOSURE, GOING_AWAY, ABNORMAL_CLOSURE, etc.) still go
+            // through fail() so the reconnect retry loop can handle them.
+            if (isTerminalCloseCode(code)) {
+                long fromFsn = engine.ackedFsn() + 1L;
+                long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                String msg = "ws-close[" + code + " " + WebSocketCloseCode.describe(code)
+                        + "]: " + reason;
+                SenderError err = new SenderError(
+                        SenderError.Category.PROTOCOL_VIOLATION,
+                        SenderError.Policy.HALT,
+                        SenderError.NO_STATUS_BYTE,
+                        msg,
+                        SenderError.NO_MESSAGE_SEQUENCE,
+                        fromFsn,
+                        toFsn,
+                        null,
+                        System.nanoTime()
+                );
+                totalServerErrors.incrementAndGet();
+                dispatchError(err);
+                recordFatal(new LineSenderServerException(err), err);
+                return;
+            }
+            fail(new LineSenderException(
+                    "WebSocket closed by server: code=" + code + " reason=" + reason));
         }
 
         @Override
@@ -731,24 +818,143 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
                 engine.acknowledge(fsnAtZero + capped);
                 totalAcks.incrementAndGet();
-            } else {
-                // Application-layer rejection by the server (e.g.
-                // STATUS_SCHEMA_MISMATCH, STATUS_PARSE_ERROR). The bytes
-                // on disk are the bytes the server rejected — reconnecting
-                // and replaying them cannot fix the rejection, it just
-                // burns CPU and reconnect attempts forever (each successful
-                // reconnect resets the per-outage budget). Mark the loop
-                // terminal directly via recordFatal so the next user-thread
-                // API call surfaces the rejection, instead of routing
-                // through fail() which would enter the reconnect retry
-                // loop. Wire-level failures (sendBinary throw, server
-                // close, parse-fail of the response payload) still go
-                // through fail() — those CAN be fixed by reconnecting.
-                recordFatal(new LineSenderException(
-                        "server rejected wire seq " + wireSeq
-                                + " (status=" + response.getStatusName()
-                                + ") — terminal, sender will not replay"));
+                return;
             }
+            if (response.isDurableAck()) {
+                // Per-table fsync confirmation. Cursor SF doesn't currently
+                // surface durable-ack progress to the producer, but receiving
+                // one is not an error — silently ignore.
+                return;
+            }
+            // Application-layer rejection by the server. Classify by status
+            // byte → SenderError.Category, resolve policy (default mapping
+            // for now; user-override resolution lands in a later commit),
+            // dispatch.
+            handleServerRejection(wireSeq);
+        }
+
+        private void handleServerRejection(long wireSeq) {
+            byte status = response.getStatus();
+            SenderError.Category category = classify(status);
+            SenderError.Policy policy = defaultPolicyFor(category);
+            long fsn = fsnAtZero + Math.max(0L, wireSeq);
+            // Best-effort table attribution: the parser populates
+            // response.tableNames on error frames the same way it does on
+            // STATUS_OK. If exactly one table was named, surface it; if
+            // zero or many, leave null (multi-table batch or unattributable).
+            String tableName = response.getTableEntryCount() == 1
+                    ? response.getTableName(0)
+                    : null;
+            SenderError err = new SenderError(
+                    category,
+                    policy,
+                    status & 0xFF,
+                    response.getErrorMessage(),
+                    wireSeq,
+                    fsn,
+                    fsn,
+                    tableName,
+                    System.nanoTime()
+            );
+            totalServerErrors.incrementAndGet();
+            // Async-deliver to the user handler regardless of policy. HALT
+            // also surfaces synchronously via the producer-thread typed throw
+            // below; DROP is observable ONLY via the async path, so the
+            // dispatcher is the user's only chance to dead-letter the data.
+            dispatchError(err);
+
+            if (policy == SenderError.Policy.HALT) {
+                // Terminal: stash the typed payload, raise a typed exception
+                // through the existing recordFatal -> checkError -> producer
+                // throw path. Bytes on disk are the bytes the server
+                // rejected; reconnect/replay cannot fix them.
+                recordFatal(new LineSenderServerException(err), err);
+            } else {
+                // DROP_AND_CONTINUE: advance ackedFsn past the rejected span
+                // so the loop drains subsequent batches. The data is dropped
+                // from the SF disk store via the existing trim path; the
+                // dispatch above is the user's only handle to dead-letter.
+                LOG.warn("server rejected wire seq {} (category={}, status=0x{}) — dropping batch and continuing",
+                        wireSeq, category, Integer.toHexString(status & 0xFF));
+                engine.acknowledge(fsn);
+                totalAcks.incrementAndGet();
+            }
+        }
+    }
+
+    /**
+     * True if a WebSocket close code signals an unrecoverable protocol-layer
+     * violation: replaying the same bytes will produce the same close. Reserved
+     * codes that "MUST NOT be sent in a Close frame" (1004/1005/1006/1015) are
+     * intentionally not classified as terminal here — when they arrive in
+     * practice they signal abnormal disconnect rather than the server's
+     * reasoned rejection of payload bytes, so reconnect is the right reaction.
+     * Exposed for unit tests.
+     */
+    @TestOnly
+    public static boolean isTerminalCloseCode(int code) {
+        switch (code) {
+            case WebSocketCloseCode.PROTOCOL_ERROR:
+            case WebSocketCloseCode.UNSUPPORTED_DATA:
+            case WebSocketCloseCode.INVALID_PAYLOAD_DATA:
+            case WebSocketCloseCode.POLICY_VIOLATION:
+            case WebSocketCloseCode.MESSAGE_TOO_BIG:
+            case WebSocketCloseCode.MANDATORY_EXTENSION:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Send {@code err} to the async-delivery dispatcher if one is configured.
+     * Producer-side typed throw (HALT) goes through {@code recordFatal} +
+     * {@code checkError} regardless — this is purely the async observer path.
+     */
+    private void dispatchError(SenderError err) {
+        SenderErrorDispatcher d = errorDispatcher;
+        if (d != null) {
+            d.offer(err);
+        }
+    }
+
+    /** Maps a server status byte to a {@link SenderError.Category}. Exposed for unit tests. */
+    @TestOnly
+    public static SenderError.Category classify(byte status) {
+        switch (status) {
+            case WebSocketResponse.STATUS_SCHEMA_MISMATCH:
+                return SenderError.Category.SCHEMA_MISMATCH;
+            case WebSocketResponse.STATUS_PARSE_ERROR:
+                return SenderError.Category.PARSE_ERROR;
+            case WebSocketResponse.STATUS_INTERNAL_ERROR:
+                return SenderError.Category.INTERNAL_ERROR;
+            case WebSocketResponse.STATUS_SECURITY_ERROR:
+                return SenderError.Category.SECURITY_ERROR;
+            case WebSocketResponse.STATUS_WRITE_ERROR:
+                return SenderError.Category.WRITE_ERROR;
+            default:
+                return SenderError.Category.UNKNOWN;
+        }
+    }
+
+    /**
+     * Default policy per spec § "Default category → policy". User overrides
+     * (builder + connect-string) plug in here in a later commit; today this is
+     * the only resolver. Exposed for unit tests.
+     */
+    @TestOnly
+    public static SenderError.Policy defaultPolicyFor(SenderError.Category category) {
+        switch (category) {
+            case SCHEMA_MISMATCH:
+            case WRITE_ERROR:
+                return SenderError.Policy.DROP_AND_CONTINUE;
+            case PARSE_ERROR:
+            case INTERNAL_ERROR:
+            case SECURITY_ERROR:
+            case PROTOCOL_VIOLATION:
+            case UNKNOWN:
+            default:
+                return SenderError.Policy.HALT;
         }
     }
 }

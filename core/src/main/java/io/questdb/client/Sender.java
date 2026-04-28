@@ -45,6 +45,7 @@ import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.Files;
 import io.questdb.client.std.IntList;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
@@ -711,6 +712,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private boolean drainOrphans = false;
         private int maxBackgroundDrainers = DEFAULT_MAX_BACKGROUND_DRAINERS;
         private static final int DEFAULT_MAX_BACKGROUND_DRAINERS = 4;
+        // Optional user-supplied async error handler. When null, the sender
+        // uses DefaultSenderErrorHandler.INSTANCE (loud-not-silent log).
+        private io.questdb.client.SenderErrorHandler errorHandler;
+        // Bounded inbox capacity for the async error dispatcher.
+        // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
+        private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -1068,8 +1075,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (sfDir == null) {
                     slotPath = null;
                 } else {
-                    if (!io.questdb.client.std.Files.exists(sfDir)) {
-                        int rc = io.questdb.client.std.Files.mkdir(sfDir, 0755);
+                    if (!Files.exists(sfDir)) {
+                        int rc = Files.mkdir(sfDir, 0755);
                         if (rc != 0) {
                             throw new LineSenderException(
                                     "could not create sf_dir: " + sfDir + " rc=" + rc);
@@ -1085,6 +1092,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         slotPath, actualSfMaxBytes,
                         actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
                 try {
+                    int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
+                            ? errorInboxCapacity
+                            : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
                     QwpWebSocketSender connected = QwpWebSocketSender.connect(
                             hosts.getQuick(0),
                             ports.getQuick(0),
@@ -1101,7 +1111,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualReconnectMaxDurationMillis,
                             actualReconnectInitialBackoffMillis,
                             actualReconnectMaxBackoffMillis,
-                            initialConnectRetry
+                            initialConnectRetry,
+                            errorHandler,
+                            actualErrorInboxCapacity
                     );
                     // Once the foreground sender is up, dispatch drainers
                     // for any sibling orphan slots. Scan AFTER we acquire
@@ -1697,6 +1709,47 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
             }
             this.requestDurableAck = enabled;
+            return this;
+        }
+
+        /**
+         * Sets the async error handler invoked for every server-side rejection.
+         * The handler runs on a dedicated daemon dispatcher thread, never on the
+         * I/O thread or producer thread. Slow handlers do not stall publishing;
+         * if the bounded inbox fills up, surplus notifications are dropped
+         * (visible via {@code QwpWebSocketSender.getDroppedErrorNotifications()}).
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param handler the handler; {@code null} resets to the loud-not-silent default
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder errorHandler(io.questdb.client.SenderErrorHandler handler) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("error_handler is only supported for WebSocket transport");
+            }
+            this.errorHandler = handler;
+            return this;
+        }
+
+        /**
+         * Sets the bounded inbox capacity used by the async error dispatcher.
+         * When the inbox fills up, additional notifications are dropped and
+         * counted. Default 256.
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param capacity must be {@code >= 1}
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder errorInboxCapacity(int capacity) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("error_inbox_capacity is only supported for WebSocket transport");
+            }
+            if (capacity < 1) {
+                throw new LineSenderException("error_inbox_capacity must be >= 1, was " + capacity);
+            }
+            this.errorInboxCapacity = capacity;
             return this;
         }
 
@@ -2553,6 +2606,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "max_background_drainers");
                     maxBackgroundDrainers(parseIntValue(sink, "max_background_drainers"));
+                } else if (Chars.equals("error_inbox_capacity", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("error_inbox_capacity is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "error_inbox_capacity");
+                    errorInboxCapacity(parseIntValue(sink, "error_inbox_capacity"));
                 } else if (Chars.equals("reconnect_max_backoff_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_backoff_millis is only supported for WebSocket transport");

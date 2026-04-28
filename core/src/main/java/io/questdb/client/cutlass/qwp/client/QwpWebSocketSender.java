@@ -26,15 +26,19 @@ package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
+import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
-import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.CharSequenceObjHashMap;
@@ -132,7 +136,7 @@ public class QwpWebSocketSender implements Sender {
     private MicrobatchBuffer activeBuffer;
     // Double-buffering for async I/O
     private MicrobatchBuffer buffer0;
-    private MicrobatchBuffer buffer1;
+    private final MicrobatchBuffer buffer1;
     // Cached column references to avoid repeated hashmap lookups
     private QwpTableBuffer.ColumnBuffer cachedTimestampColumn;
     private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
@@ -160,6 +164,12 @@ public class QwpWebSocketSender implements Sender {
     private CursorSendEngine cursorEngine;
     private boolean ownsCursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
+    // Async-delivery sink for SenderError notifications. Default-constructed
+    // here with the loud-not-silent default handler; a builder hook can swap
+    // this before connect() runs.
+    private SenderErrorHandler errorHandler = DefaultSenderErrorHandler.INSTANCE;
+    private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
+    private SenderErrorDispatcher errorDispatcher;
     // close() drain timeout in millis. Default applied at construction.
     // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
     // up to this many millis for ackedFsn to catch up to publishedFsn.
@@ -378,6 +388,39 @@ public class QwpWebSocketSender implements Sender {
             long reconnectMaxBackoffMillis,
             boolean initialConnectRetry
     ) {
+        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectRetry, null, SenderErrorDispatcher.DEFAULT_CAPACITY);
+    }
+
+    /**
+     * Connect overload with the SenderError dispatcher knobs. {@code errorHandler}
+     * may be null to use the loud-not-silent default; {@code errorInboxCapacity}
+     * must be {@code >= 1}.
+     */
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            boolean initialConnectRetry,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -390,6 +433,10 @@ public class QwpWebSocketSender implements Sender {
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
             sender.initialConnectRetry = initialConnectRetry;
+            if (errorHandler != null) {
+                sender.setErrorHandler(errorHandler);
+            }
+            sender.setErrorInboxCapacity(errorInboxCapacity);
             if (cursorEngine != null) {
                 sender.setCursorEngine(cursorEngine, true);
             }
@@ -683,6 +730,17 @@ public class QwpWebSocketSender implements Sender {
                 ownsCursorEngine = false;
             }
 
+            // Shutdown order: dispatcher last, after the I/O loop has stopped
+            // producing into it. close() drains pending entries with a short
+            // deadline so any final errors land in the user's handler.
+            if (errorDispatcher != null) {
+                try {
+                    errorDispatcher.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing error dispatcher: {}", String.valueOf(t));
+                }
+            }
+
             LOG.info("QwpWebSocketSender closed");
         }
     }
@@ -891,6 +949,22 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public void flush() {
+        flushAndGetSequence();
+    }
+
+    /**
+     * Same as {@link #flush()} but returns the highest FSN published into the
+     * cursor engine by this call. Producer-side correlation handle: the user
+     * logs {@code (returnedFsn, domainContext)} alongside the data, then joins
+     * to the {@link SenderError#getFromFsn()} / {@link SenderError#getToFsn()}
+     * span when an async error is delivered.
+     *
+     * <p>Returns {@code -1} when nothing was published (no active buffer with
+     * data). The legacy {@link #flush()} discards this value.
+     *
+     * @return highest FSN published into the engine, or {@code -1} if no data
+     */
+    public long flushAndGetSequence() {
         checkNotClosed();
         ensureNoInProgressRow();
         ensureConnected();
@@ -905,6 +979,7 @@ public class QwpWebSocketSender implements Sender {
         }
         cursorSendLoop.checkError();
         checkConnectionError();
+        return cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
     }
 
     /**
@@ -980,6 +1055,68 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Snapshot of the typed payload for the latched terminal server-rejection error,
+     * or {@code null} if the I/O loop has not latched a server-rejection terminal
+     * (initial state, or only a wire-level failure has been latched). Read-only —
+     * intended for ops dashboards and post-mortem inspection.
+     */
+    public SenderError getLastTerminalError() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? null : l.getLastTerminalServerError();
+    }
+
+    /**
+     * Total errors observed by the I/O loop (DROP and HALT combined).
+     * Diverges from {@link #getDroppedErrorNotifications()} which counts only
+     * notifications dropped due to inbox overflow.
+     */
+    public long getTotalServerErrors() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalServerErrors();
+    }
+
+    /**
+     * Errors lost because the user handler was too slow to drain the bounded
+     * inbox. Non-zero means the handler is misbehaving or the server is
+     * dumping rejections faster than the handler can absorb. Visible to ops.
+     */
+    public long getDroppedErrorNotifications() {
+        SenderErrorDispatcher d = errorDispatcher;
+        return d == null ? 0L : d.getDroppedNotifications();
+    }
+
+    /**
+     * Errors successfully delivered to the user handler since startup. Counts
+     * delivery attempts including those where the handler threw — exceptions
+     * are caught and logged, but the delivery still happened.
+     */
+    public long getTotalErrorNotificationsDelivered() {
+        SenderErrorDispatcher d = errorDispatcher;
+        return d == null ? 0L : d.getTotalDelivered();
+    }
+
+    /**
+     * Configure the user-supplied error handler. Must be called before
+     * {@code connect()}; later changes have no effect because the dispatcher
+     * binds the handler at startup. Pass {@code null} to revert to the
+     * loud-not-silent default.
+     */
+    public void setErrorHandler(SenderErrorHandler handler) {
+        this.errorHandler = handler != null ? handler : DefaultSenderErrorHandler.INSTANCE;
+    }
+
+    /**
+     * Configure the bounded inbox capacity used by the dispatcher. Must be
+     * called before {@code connect()}; later changes have no effect.
+     */
+    public void setErrorInboxCapacity(int capacity) {
+        if (capacity < 1) {
+            throw new IllegalArgumentException("errorInboxCapacity must be >= 1, was " + capacity);
+        }
+        this.errorInboxCapacity = capacity;
+    }
+
+    /**
      * Starts orphan drainers for the given list of slot paths. Each path
      * gets its own drainer thread, capped at {@code maxBackgroundDrainers}
      * concurrent. Drainers run until the slot is fully drained or a
@@ -1019,9 +1156,9 @@ public class QwpWebSocketSender implements Sender {
      * Snapshot of drainers the foreground sender has dispatched. Useful
      * for monitoring orphan-drain progress without parsing logs.
      */
-    public io.questdb.client.std.ObjList<io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer>
+    public ObjList<BackgroundDrainer>
             getBackgroundDrainers() {
-        if (drainerPool == null) return new io.questdb.client.std.ObjList<>(0);
+        if (drainerPool == null) return new ObjList<>(0);
         return drainerPool.snapshot();
     }
 
@@ -1501,6 +1638,14 @@ public class QwpWebSocketSender implements Sender {
                     reconnectMaxDurationMillis,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis);
+            // Plug the async-delivery sink before start() so the I/O thread
+            // never observes a null dispatcher between recordFatal and
+            // notification — the test for null in dispatchError handles
+            // even unconfigured paths, but starting wired is cleaner.
+            if (errorDispatcher == null) {
+                errorDispatcher = new SenderErrorDispatcher(errorHandler, errorInboxCapacity);
+            }
+            cursorSendLoop.setErrorDispatcher(errorDispatcher);
             cursorSendLoop.start();
         } catch (Throwable t) {
             client.close();
