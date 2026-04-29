@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -119,7 +120,8 @@ public class ReconnectTest {
                     + ";reconnect_initial_backoff_millis=10"
                     + ";reconnect_max_backoff_millis=50"
                     + ";close_flush_timeout_millis=0;";
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
 
@@ -151,6 +153,13 @@ public class ReconnectTest {
                         msg.contains("reconnect failed")
                                 || msg.contains("I/O thread failed")
                                 || msg.contains("Failed to connect"));
+            } finally {
+                // close() rethrows the latched terminal reconnect-cap error
+                // (commit 052f6ee). Already observed and asserted above.
+                try {
+                    sender.close();
+                } catch (LineSenderException ignored) {
+                }
             }
         } finally {
             try {
@@ -177,7 +186,8 @@ public class ReconnectTest {
             String cfg = "ws::addr=localhost:" + port
                     + ";reconnect_max_duration_millis=10000"
                     + ";close_flush_timeout_millis=0;";
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
                 // Wait for first connection to ACK + close
@@ -209,6 +219,13 @@ public class ReconnectTest {
                         msg.contains("WebSocket upgrade failed")
                                 || msg.contains("I/O thread failed")
                                 || msg.contains("401"));
+            } finally {
+                // close() rethrows the latched terminal upgrade error
+                // (commit 052f6ee). Already observed and asserted above.
+                try {
+                    sender.close();
+                } catch (LineSenderException ignored) {
+                }
             }
         }
     }

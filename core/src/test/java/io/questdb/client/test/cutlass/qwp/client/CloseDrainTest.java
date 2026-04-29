@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -142,8 +143,8 @@ public class CloseDrainTest {
     @Test
     public void testCloseDrainTimesOutWhenAcksNeverArrive() throws Exception {
         // Server that buffers frames silently and never ACKs. close() must
-        // return after roughly the configured timeout — not hang forever
-        // and not return immediately.
+        // throw a drain-timeout LineSenderException after roughly the
+        // configured timeout — not hang forever and not return immediately.
         int port = TEST_PORT + 3;
         long timeoutMs = 500;
         SilentHandler handler = new SilentHandler();
@@ -154,12 +155,21 @@ public class CloseDrainTest {
             String cfg = "ws::addr=localhost:" + port
                     + ";close_flush_timeout_millis=" + timeoutMs + ";";
             long elapsedMs;
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
                 long t0 = System.nanoTime();
-                sender.close();
+                try {
+                    sender.close();
+                    Assert.fail("close() should have thrown a drain-timeout error");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue("expected drain-timeout message, got: " + e.getMessage(),
+                            e.getMessage().contains("drain timed out"));
+                }
                 elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+            } finally {
+                sender.close(); // idempotent — closed flag is set on first call
             }
             Assert.assertTrue("close() returned too early: " + elapsedMs + "ms",
                     elapsedMs >= timeoutMs);

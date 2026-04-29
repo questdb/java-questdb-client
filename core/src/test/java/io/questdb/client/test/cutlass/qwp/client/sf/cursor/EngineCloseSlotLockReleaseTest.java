@@ -25,6 +25,8 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.tools.TestUtils;
@@ -119,16 +121,35 @@ public class EngineCloseSlotLockReleaseTest {
             // Sabotage: zero out ring so engine.close() NPEs before reaching
             // the slotLock cleanup. Any close-path exception (manager.close,
             // ring.close, unlinkAllSegmentFiles) lands in the same place.
+            //
+            // Capture the ring + manager references first so we can free
+            // their native resources ourselves after the sabotage — engine.close()
+            // can no longer reach ring.close() / manager.close() once we null
+            // the ring field, and assertMemoryLeak (+ the manager's worker
+            // thread) would otherwise trip.
             Field ringField = CursorSendEngine.class.getDeclaredField("ring");
             ringField.setAccessible(true);
+            SegmentRing capturedRing = (SegmentRing) ringField.get(engine);
+
+            Field managerField = CursorSendEngine.class.getDeclaredField("manager");
+            managerField.setAccessible(true);
+            SegmentManager capturedManager = (SegmentManager) managerField.get(engine);
+
             ringField.set(engine, null);
 
             try {
                 engine.close();
             } catch (Throwable t) {
-                // Expected — close() walks ring.close() and trips an NPE.
+                // Expected — close() walks ring.publishedFsn() and trips an NPE.
                 // The fix must release slotLock anyway, in finally.
             }
+
+            // Manually release the ring + manager resources that engine.close()
+            // skipped because of the NPE. The slotLock contract is the only
+            // thing the test is verifying; the rest of the close-path resources
+            // are an artifact of the sabotage.
+            capturedRing.close();
+            capturedManager.close();
 
             // The user-visible test: can a fresh SlotLock acquire the
             // same slot? If the original lock fd is still held, the

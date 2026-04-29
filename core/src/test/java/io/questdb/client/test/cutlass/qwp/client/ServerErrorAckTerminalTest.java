@@ -82,7 +82,8 @@ public class ServerErrorAckTerminalTest {
                     + ";reconnect_max_backoff_millis=50"
                     + ";";
 
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
 
@@ -125,6 +126,14 @@ public class ServerErrorAckTerminalTest {
                         thrown.getMessage() != null
                                 && (thrown.getMessage().contains("rejected")
                                     || thrown.getMessage().contains("error")));
+            } finally {
+                // close() rethrows the latched terminal server-rejection error
+                // (commit 052f6ee). Swallow it here — the test has already
+                // observed and asserted on that error via flush() above.
+                try {
+                    sender.close();
+                } catch (LineSenderException ignored) {
+                }
             }
         }
     }
