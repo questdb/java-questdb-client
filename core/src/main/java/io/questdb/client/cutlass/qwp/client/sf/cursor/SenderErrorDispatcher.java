@@ -215,12 +215,16 @@ public final class SenderErrorDispatcher implements QuietCloseable {
                 // Closed-check at the loop head will catch the rest.
                 continue;
             }
+            // Increment before invoking the handler: observers using a
+            // CountDownLatch in the handler must be able to read the
+            // updated counter once their latch fires. With the increment
+            // after, the handler-released observer races the dispatcher
+            // and can see totalDelivered short by one.
+            totalDelivered.incrementAndGet();
             try {
                 handler.onError(err);
             } catch (Throwable t) {
                 LOG.error("SenderErrorHandler threw on {}: {}", err, t.getMessage(), t);
-            } finally {
-                totalDelivered.incrementAndGet();
             }
         }
     }
