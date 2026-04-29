@@ -560,6 +560,45 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * Blocks until {@code ackedFsn() >= targetFsn}, or until {@code timeoutMillis}
+     * elapses. Polls the cursor engine on a 50us park; surfaces I/O loop errors
+     * synchronously via {@code cursorSendLoop.checkError()}.
+     * <p>
+     * Useful for tests and user code that need to confirm a specific publish
+     * has been server-acknowledged. Pair with {@link #flushAndGetSequence()} to
+     * obtain {@code targetFsn}.
+     *
+     * @param targetFsn     FSN to wait for; typically {@link #flushAndGetSequence()}'s return value
+     * @param timeoutMillis upper bound on the wait; {@code <= 0} returns immediately
+     * @return {@code true} if {@code ackedFsn() >= targetFsn} on return, {@code false} on timeout
+     * @throws LineSenderException if the I/O loop has latched a terminal error
+     */
+    public boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
+        checkNotClosed();
+        if (cursorEngine == null) {
+            return targetFsn < 0L;
+        }
+        if (cursorEngine.ackedFsn() >= targetFsn) {
+            return true;
+        }
+        if (timeoutMillis <= 0L) {
+            return false;
+        }
+        long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
+        while (cursorEngine.ackedFsn() < targetFsn) {
+            if (cursorSendLoop != null) {
+                cursorSendLoop.checkError();
+            }
+            checkConnectionError();
+            if (System.nanoTime() >= deadlineNanos) {
+                return false;
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+        }
+        return true;
+    }
+
     @Override
     public QwpWebSocketSender boolColumn(CharSequence columnName, boolean value) {
         checkNotClosed();
@@ -641,6 +680,12 @@ public class QwpWebSocketSender implements Sender {
         if (!closed) {
             closed = true;
             boolean ioThreadStopped = true;
+            // Captures the first error from the flush/drain path so it can be
+            // rethrown after all cleanup is done. Silently swallowing it here
+            // would hide latched terminal SenderError HALTs (server-side
+            // rejections like MESSAGE_TOO_BIG, SCHEMA_MISMATCH HALT) from
+            // users who only call close() and never call flush() afterwards.
+            Throwable terminalError = null;
 
             try {
                 // Only drain when both the engine and the I/O loop are wired
@@ -663,8 +708,8 @@ public class QwpWebSocketSender implements Sender {
                     //    data on JVM exit).
                     drainOnClose();
                 }
-            } catch (Exception e) {
-                LOG.error("Error during close: {}", String.valueOf(e));
+            } catch (Throwable t) {
+                terminalError = t;
             }
 
             // Shut down the I/O thread before closing the socket or buffers
@@ -705,6 +750,7 @@ public class QwpWebSocketSender implements Sender {
                 // The I/O thread may still be using the socket and microbatch
                 // buffers. Freeing them would risk SIGSEGV.
                 LOG.error("I/O thread is still running, leaking WebSocket client and microbatch buffers");
+                rethrowTerminal(terminalError);
                 return;
             }
 
@@ -742,6 +788,8 @@ public class QwpWebSocketSender implements Sender {
             }
 
             LOG.info("QwpWebSocketSender closed");
+
+            rethrowTerminal(terminalError);
         }
     }
 
@@ -980,6 +1028,18 @@ public class QwpWebSocketSender implements Sender {
         cursorSendLoop.checkError();
         checkConnectionError();
         return cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+    }
+
+    /**
+     * Highest FSN that has been server-acknowledged (or skipped past on a
+     * {@link SenderError.Policy#DROP_AND_CONTINUE} rejection). {@code -1} if
+     * the I/O loop has not yet started or no batch has been published.
+     * <p>
+     * Snapshot accessor — for a bounded wait, use
+     * {@link #awaitAckedFsn(long, long)}.
+     */
+    public long getAckedFsn() {
+        return cursorEngine != null ? cursorEngine.ackedFsn() : -1L;
     }
 
     /**
@@ -1856,9 +1916,12 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Bounded drain on close: block until {@code ackedFsn >= publishedFsn}
      * or until {@code closeFlushTimeoutMillis} elapses. {@code <= 0} skips
-     * the drain (fast close). On timeout, log a WARN and proceed with
-     * shutdown — pending data is lost in memory mode and recovered by
-     * the next sender in SF mode.
+     * the drain (fast close). On timeout, throw a {@link LineSenderException}
+     * so the caller cannot silently lose data — close() collects the
+     * exception, finishes shutdown, and rethrows it from close() itself.
+     * SF-mode users can recover the unacked tail by reopening a sender on
+     * the same SF directory; memory-mode users have no recovery path and
+     * must treat this as fatal.
      */
     private void drainOnClose() {
         if (closeFlushTimeoutMillis <= 0L) {
@@ -1872,12 +1935,35 @@ public class QwpWebSocketSender implements Sender {
         while (cursorEngine.ackedFsn() < target) {
             cursorSendLoop.checkError();
             if (System.nanoTime() >= deadlineNanos) {
+                long acked = cursorEngine.ackedFsn();
                 LOG.warn("close() drain timed out after {}ms [target={} acked={}] — pending data may be lost",
-                        closeFlushTimeoutMillis, target, cursorEngine.ackedFsn());
-                return;
+                        closeFlushTimeoutMillis, target, acked);
+                throw new LineSenderException("close() drain timed out after ")
+                        .put(closeFlushTimeoutMillis).put(" ms [publishedFsn=")
+                        .put(target).put(", ackedFsn=").put(acked)
+                        .put("] - server did not acknowledge ")
+                        .put(target - acked)
+                        .put(" pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)");
             }
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }
+    }
+
+    private static void rethrowTerminal(Throwable t) {
+        if (t == null) {
+            return;
+        }
+        if (t instanceof RuntimeException) {
+            throw (RuntimeException) t;
+        }
+        if (t instanceof Error) {
+            throw (Error) t;
+        }
+        // Wrap any checked Throwable so close() stays declared without a
+        // throws clause. flush/drain only ever raises RuntimeException
+        // subclasses today, but defending against future changes here is
+        // cheaper than chasing a leaked checked throw later.
+        throw new LineSenderException("close failed: " + t);
     }
 
     private void rollbackRow() {
