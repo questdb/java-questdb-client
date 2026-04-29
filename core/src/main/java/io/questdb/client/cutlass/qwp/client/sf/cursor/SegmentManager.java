@@ -78,7 +78,10 @@ public final class SegmentManager implements QuietCloseable {
     private long totalBytes;
     private long lastDiskFullLogNs;
     private volatile boolean running;
-    private Thread workerThread;
+    // volatile because wakeWorker() reads workerThread without holding the
+    // monitor; the synchronized start()/close() pair handles the
+    // start-vs-close ordering.
+    private volatile Thread workerThread;
 
     public SegmentManager(long segmentSizeBytes) {
         this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES);
@@ -125,7 +128,7 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         running = false;
         if (workerThread != null) {
             LockSupport.unpark(workerThread);

@@ -587,6 +587,13 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine == null) {
             return targetFsn < 0L;
         }
+        // Surface latched I/O errors before any early-return path, so a
+        // caller polling with timeoutMillis <= 0 to drive their own loop
+        // sees the terminal throw instead of an indefinite "not yet".
+        if (cursorSendLoop != null) {
+            cursorSendLoop.checkError();
+        }
+        checkConnectionError();
         if (cursorEngine.ackedFsn() >= targetFsn) {
             return true;
         }
@@ -688,11 +695,12 @@ public class QwpWebSocketSender implements Sender {
         if (!closed) {
             closed = true;
             boolean ioThreadStopped = true;
-            // Captures the first error from the flush/drain path so it can be
-            // rethrown after all cleanup is done. Silently swallowing it here
-            // would hide latched terminal SenderError HALTs (server-side
-            // rejections like MESSAGE_TOO_BIG, SCHEMA_MISMATCH HALT) from
-            // users who only call close() and never call flush() afterwards.
+            // Captures the first error from the flush/drain path AND any
+            // secondary errors from cleanup steps (added via addSuppressed).
+            // Silently swallowing any of these would hide latched terminal
+            // SenderError HALTs (server-side rejections like MESSAGE_TOO_BIG,
+            // SCHEMA_MISMATCH HALT) from users who only call close() and
+            // never call flush() afterwards.
             Throwable terminalError = null;
 
             try {
@@ -725,9 +733,10 @@ public class QwpWebSocketSender implements Sender {
             if (cursorSendLoop != null) {
                 try {
                     cursorSendLoop.close();
-                } catch (Exception e) {
+                } catch (Throwable e) {
                     ioThreadStopped = false;
                     LOG.error("Error closing cursor send loop: {}", String.valueOf(e));
+                    terminalError = captureCloseError(terminalError, e);
                 }
             }
             // Drainer pool runs after the foreground I/O loop is wound
@@ -739,20 +748,26 @@ public class QwpWebSocketSender implements Sender {
                     drainerPool.close();
                 } catch (Throwable e) {
                     LOG.error("Error closing drainer pool: {}", String.valueOf(e));
+                    terminalError = captureCloseError(terminalError, e);
                 }
             }
 
             // Always free resources the I/O thread never touches:
             // encoder and table buffers are user-thread-only.
-            encoder.close();
-            ObjList<CharSequence> keys = tableBuffers.keys();
-            for (int i = 0, n = keys.size(); i < n; i++) {
-                CharSequence key = keys.getQuick(i);
-                if (key != null) {
-                    Misc.free(tableBuffers.get(key));
+            try {
+                encoder.close();
+                ObjList<CharSequence> keys = tableBuffers.keys();
+                for (int i = 0, n = keys.size(); i < n; i++) {
+                    CharSequence key = keys.getQuick(i);
+                    if (key != null) {
+                        Misc.free(tableBuffers.get(key));
+                    }
                 }
+                tableBuffers.clear();
+            } catch (Throwable t) {
+                LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
+                terminalError = captureCloseError(terminalError, t);
             }
-            tableBuffers.clear();
 
             if (!ioThreadStopped) {
                 // The I/O thread may still be using the socket and microbatch
@@ -763,14 +778,29 @@ public class QwpWebSocketSender implements Sender {
             }
 
             if (buffer0 != null) {
-                buffer0.close();
+                try {
+                    buffer0.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing buffer0: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
             }
             if (buffer1 != null) {
-                buffer1.close();
+                try {
+                    buffer1.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing buffer1: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
             }
 
             if (client != null) {
-                client.close();
+                try {
+                    client.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing WebSocket client: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
                 client = null;
             }
 
@@ -779,6 +809,7 @@ public class QwpWebSocketSender implements Sender {
                     cursorEngine.close();
                 } catch (Throwable t) {
                     LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
                 }
                 cursorEngine = null;
                 ownsCursorEngine = false;
@@ -792,6 +823,7 @@ public class QwpWebSocketSender implements Sender {
                     errorDispatcher.close();
                 } catch (Throwable t) {
                     LOG.error("Error closing error dispatcher: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
                 }
             }
 
@@ -1998,6 +2030,16 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    private static Throwable captureCloseError(Throwable terminalError, Throwable t) {
+        if (terminalError == null) {
+            return t;
+        }
+        if (terminalError != t) {
+            terminalError.addSuppressed(t);
+        }
+        return terminalError;
+    }
+
     private static void rethrowTerminal(Throwable t) {
         if (t == null) {
             return;
@@ -2011,8 +2053,9 @@ public class QwpWebSocketSender implements Sender {
         // Wrap any checked Throwable so close() stays declared without a
         // throws clause. flush/drain only ever raises RuntimeException
         // subclasses today, but defending against future changes here is
-        // cheaper than chasing a leaked checked throw later.
-        throw new LineSenderException("close failed: " + t);
+        // cheaper than chasing a leaked checked throw later. Pass the
+        // original as cause so the stack trace and chained causes survive.
+        throw new LineSenderException("close failed: " + t.getMessage(), t);
     }
 
     private void rollbackRow() {
