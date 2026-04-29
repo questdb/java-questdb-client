@@ -182,10 +182,15 @@ public class QwpWebSocketSender implements Sender {
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS;
-    // false → startup connect failure is immediately terminal (default).
-    // true  → startup connect goes through the same retry-with-backoff
+    // OFF   → startup connect failure is immediately terminal (default).
+    // SYNC  → startup connect goes through the same retry-with-backoff
     //         loop as in-flight reconnect; auth failures still terminal.
-    private boolean initialConnectRetry = false;
+    // ASYNC → user thread does not connect at all. The I/O thread runs
+    //         the same retry loop in the background; terminal failures
+    //         (auth/upgrade reject, budget exhaustion) are delivered
+    //         to the SenderError dispatcher rather than thrown from the
+    //         constructor.
+    private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
     // Orphan-slot drainer pool. Non-null only when the builder requested
     // drain_orphans=true AND we have a slot path to scan against. Closed
     // alongside the cursor send loop in close().
@@ -361,14 +366,15 @@ public class QwpWebSocketSender implements Sender {
                 maxSchemasPerConnection, requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                false);
+                Sender.InitialConnectMode.OFF);
     }
 
     /**
-     * Master connect overload — also accepts {@code initialConnectRetry}.
-     * When true, the initial connect goes through the same retry loop as
-     * in-flight reconnect (backoff + cap + auth-terminal). When false
-     * (default), a startup connect failure is immediately terminal.
+     * Master connect overload — also accepts {@code initialConnectMode}.
+     * See {@link Sender.InitialConnectMode} for the value semantics:
+     * {@code OFF} fails fast (default), {@code SYNC} retries on the user
+     * thread up to the reconnect cap, {@code ASYNC} returns immediately
+     * and lets the I/O thread retry in the background.
      */
     public static QwpWebSocketSender connect(
             String host,
@@ -386,14 +392,14 @@ public class QwpWebSocketSender implements Sender {
             long reconnectMaxDurationMillis,
             long reconnectInitialBackoffMillis,
             long reconnectMaxBackoffMillis,
-            boolean initialConnectRetry
+            Sender.InitialConnectMode initialConnectMode
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
                 maxSchemasPerConnection, requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                initialConnectRetry, null, SenderErrorDispatcher.DEFAULT_CAPACITY);
+                initialConnectMode, null, SenderErrorDispatcher.DEFAULT_CAPACITY);
     }
 
     /**
@@ -417,7 +423,7 @@ public class QwpWebSocketSender implements Sender {
             long reconnectMaxDurationMillis,
             long reconnectInitialBackoffMillis,
             long reconnectMaxBackoffMillis,
-            boolean initialConnectRetry,
+            Sender.InitialConnectMode initialConnectMode,
             SenderErrorHandler errorHandler,
             int errorInboxCapacity
     ) {
@@ -432,7 +438,9 @@ public class QwpWebSocketSender implements Sender {
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
-            sender.initialConnectRetry = initialConnectRetry;
+            sender.initialConnectMode = initialConnectMode == null
+                    ? Sender.InitialConnectMode.OFF
+                    : initialConnectMode;
             if (errorHandler != null) {
                 sender.setErrorHandler(errorHandler);
             }
@@ -1584,6 +1592,20 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    /**
+     * True iff this sender has at least once installed a live (connected
+     * + upgraded) WebSocket. Sticky — once true, stays true even after a
+     * subsequent disconnect. Lets a {@link SenderErrorHandler}
+     * disambiguate a "never reached the server" budget exhaustion (likely
+     * a config typo or firewall block) from a "lost connection after we
+     * were up" failure (likely transient). Returns {@code false} if no
+     * I/O loop is running.
+     */
+    public boolean wasEverConnected() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l != null && l.hasEverConnected();
+    }
+
     private void atMicros(long timestampMicros) {
         // Add designated timestamp column (empty name for designated timestamp)
         // Use cached reference to avoid hashmap lookup per row
@@ -1679,15 +1701,30 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine == null) {
             throw new LineSenderException("cursor engine must be attached before connect");
         }
-        if (initialConnectRetry) {
-            client = CursorWebSocketSendLoop.connectWithRetry(
-                    this::buildAndConnect,
-                    reconnectMaxDurationMillis,
-                    reconnectInitialBackoffMillis,
-                    reconnectMaxBackoffMillis,
-                    "initial connect");
-        } else {
-            client = buildAndConnect();
+        switch (initialConnectMode) {
+            case SYNC:
+                client = CursorWebSocketSendLoop.connectWithRetry(
+                        this::buildAndConnect,
+                        reconnectMaxDurationMillis,
+                        reconnectInitialBackoffMillis,
+                        reconnectMaxBackoffMillis,
+                        "initial connect");
+                break;
+            case ASYNC:
+                // Defer the actual connect to the I/O thread. The user thread
+                // returns immediately; rows accumulate in the cursor SF engine.
+                // Encoder stays at its default (V1 — the only supported wire
+                // version today). When v2+ ships, frames written before the
+                // first successful connect will commit to V1 because cursor
+                // segments are immutable. Auth/upgrade rejects and budget
+                // exhaustion are surfaced via the error inbox by the I/O
+                // thread, not thrown here.
+                client = null;
+                break;
+            case OFF:
+            default:
+                client = buildAndConnect();
+                break;
         }
 
         try {
@@ -1708,13 +1745,27 @@ public class QwpWebSocketSender implements Sender {
             cursorSendLoop.setErrorDispatcher(errorDispatcher);
             cursorSendLoop.start();
         } catch (Throwable t) {
-            client.close();
-            client = null;
+            if (client != null) {
+                client.close();
+                client = null;
+            }
             throw new LineSenderException(
                     "Failed to start cursor I/O thread for " + host + ":" + port, t);
         }
 
-        encoder.setVersion((byte) client.getServerQwpVersion());
+        if (client != null) {
+            encoder.setVersion((byte) client.getServerQwpVersion());
+            LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
+                    host, port, inFlightWindowSize, client.getServerQwpVersion());
+        } else {
+            // Async mode: I/O thread will drive the connect. Encoder uses
+            // its default version (V1). Schema state still gets reset for
+            // consistency with the sync path; the post-connect replay path
+            // does not need a producer-side reset signal because every
+            // cursor frame is self-sufficient.
+            LOG.info("Async initial connect deferred to I/O thread [host={}, port={}, windowSize={}]",
+                    host, port, inFlightWindowSize);
+        }
         // Server starts fresh on each connection — discard any schema IDs
         // retained from prior state. Cursor frames are self-sufficient (every
         // frame carries full schema + full symbol-dict delta from id 0), so
@@ -1723,8 +1774,6 @@ public class QwpWebSocketSender implements Sender {
         connectionError.set(null);
 
         connected = true;
-        LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
-                host, port, inFlightWindowSize, client.getServerQwpVersion());
     }
 
     /**

@@ -569,6 +569,36 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         APPEND
     }
 
+    /**
+     * Initial-connect behavior for the WebSocket cursor SF transport.
+     * <ul>
+     *   <li>{@link #OFF} — single attempt on the user thread; a startup
+     *       failure throws immediately. Default; correct for fail-fast
+     *       deployments where a misconfigured host should not stall app
+     *       startup.</li>
+     *   <li>{@link #SYNC} — same retry loop the in-flight reconnect path
+     *       uses, but it runs on the user thread inside {@code fromConfig}.
+     *       Blocks up to {@code reconnect_max_duration_millis}. Auth/upgrade
+     *       failures stay terminal. Useful when the server is expected to
+     *       come up shortly after the producer and the producer is willing
+     *       to wait.</li>
+     *   <li>{@link #ASYNC} — {@code fromConfig} returns immediately with an
+     *       unconnected sender; the I/O thread runs the same retry loop in
+     *       the background. The user thread can call {@code at()} /
+     *       {@code flush()} immediately; rows accumulate in the cursor SF
+     *       engine until the wire is up. A connect-budget exhaustion or a
+     *       terminal upgrade failure is delivered to the async error inbox
+     *       as a {@link io.questdb.client.SenderError} (no synchronous
+     *       throw on the user call site). Wire {@code error_handler=...}
+     *       to observe these.</li>
+     * </ul>
+     */
+    enum InitialConnectMode {
+        OFF,
+        SYNC,
+        ASYNC
+    }
+
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
@@ -694,11 +724,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long reconnectInitialBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long reconnectMaxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        // When true, the initial connect goes through the same
-        // backoff/cap/auth-terminal retry path as reconnect. Default false:
-        // a misconfigured host or down server should fail fast at startup,
-        // not after the cap. Auth failures stay terminal even with retry on.
-        private boolean initialConnectRetry = false;
+        // Drives the initial-connect strategy. OFF is fail-fast (default).
+        // SYNC retries on the user thread up to the reconnect cap. ASYNC
+        // returns immediately and lets the I/O thread retry in the
+        // background, surfacing terminal failures via the error inbox.
+        private InitialConnectMode initialConnectMode = InitialConnectMode.OFF;
         // Per-append deadline for SF appendBlocking spin-then-throw. Used to
         // be a hardcoded 30s constant; expose so tight-SLA users can lower
         // and offline-tolerant users can raise.
@@ -1112,7 +1142,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualReconnectMaxDurationMillis,
                             actualReconnectInitialBackoffMillis,
                             actualReconnectMaxBackoffMillis,
-                            initialConnectRetry,
+                            initialConnectMode,
                             errorHandler,
                             actualErrorInboxCapacity
                     );
@@ -1966,12 +1996,34 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * sit retrying for 5 minutes. Set true if your deployment expects
          * the server to come up shortly after the sender. Auth failures
          * (HTTP 401/403/non-101) stay terminal in either mode.
+         * <p>
+         * For non-blocking startup (the producer thread returns immediately
+         * and the I/O thread retries in the background), use
+         * {@link #initialConnectMode(InitialConnectMode)} with
+         * {@link InitialConnectMode#ASYNC}.
          */
         public LineSenderBuilder initialConnectRetry(boolean enabled) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
             }
-            this.initialConnectRetry = enabled;
+            this.initialConnectMode = enabled ? InitialConnectMode.SYNC : InitialConnectMode.OFF;
+            return this;
+        }
+
+        /**
+         * Three-way control over initial-connect behavior — see
+         * {@link InitialConnectMode} for the value semantics. WebSocket
+         * transport only. Replaces {@link #initialConnectRetry(boolean)}
+         * for users who want the {@link InitialConnectMode#ASYNC} mode.
+         */
+        public LineSenderBuilder initialConnectMode(InitialConnectMode mode) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("initial_connect_mode is only supported for WebSocket transport");
+            }
+            if (mode == null) {
+                throw new LineSenderException("initial_connect_mode cannot be null");
+            }
+            this.initialConnectMode = mode;
             return this;
         }
 
@@ -2594,12 +2646,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
                     }
                     pos = getValue(configurationString, pos, sink, "initial_connect_retry");
-                    if (Chars.equalsIgnoreCase("on", sink) || Chars.equalsIgnoreCase("true", sink)) {
-                        initialConnectRetry(true);
+                    if (Chars.equalsIgnoreCase("on", sink) || Chars.equalsIgnoreCase("true", sink)
+                            || Chars.equalsIgnoreCase("sync", sink)) {
+                        initialConnectMode(InitialConnectMode.SYNC);
                     } else if (Chars.equalsIgnoreCase("off", sink) || Chars.equalsIgnoreCase("false", sink)) {
-                        initialConnectRetry(false);
+                        initialConnectMode(InitialConnectMode.OFF);
+                    } else if (Chars.equalsIgnoreCase("async", sink)) {
+                        initialConnectMode(InitialConnectMode.ASYNC);
                     } else {
-                        throw new LineSenderException("invalid initial_connect_retry [value=").put(sink).put(", allowed-values=[on, off, true, false]]");
+                        throw new LineSenderException("invalid initial_connect_retry [value=").put(sink).put(", allowed-values=[on, off, true, false, sync, async]]");
                     }
                 } else if (Chars.equals("sf_append_deadline_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {

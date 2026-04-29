@@ -138,6 +138,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // remains null for wire-level fatals (reconnect-budget exhaustion, etc).
     // Read by QwpWebSocketSender.getLastTerminalError() for ops visibility.
     private volatile SenderError lastTerminalServerError;
+    // Sticky flag: false until the very first time a live client is installed
+    // (either via the constructor in SYNC/OFF mode or via swapClient on a
+    // successful connect attempt in any mode). Once true, stays true. Used to
+    // distinguish "never reached the server" budget exhaustion (looks like a
+    // config typo or firewall block) from "lost connection after we were
+    // up" (looks transient).
+    private volatile boolean hasEverConnected;
     private Thread ioThread;
 
     /**
@@ -148,6 +155,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * state, and repositions its replay cursor at
      * {@code engine.ackedFsn() + 1}. A null factory disables reconnect
      * (single failure is terminal).
+     * <p>
+     * {@code client} may be {@code null} only if {@code reconnectFactory}
+     * is non-null — this is the async-initial-connect path: the I/O thread
+     * runs the same retry loop on its first iteration to obtain a live
+     * client, and a terminal failure (auth/upgrade reject or budget
+     * exhaustion) is delivered through the dispatcher rather than thrown
+     * to the constructor's caller.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -155,8 +169,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis) {
-        if (client == null || engine == null) {
-            throw new IllegalArgumentException("client and engine must be non-null");
+        if (engine == null) {
+            throw new IllegalArgumentException("engine must be non-null");
+        }
+        if (client == null && reconnectFactory == null) {
+            throw new IllegalArgumentException(
+                    "client and reconnectFactory cannot both be null");
         }
         this.client = client;
         this.engine = engine;
@@ -166,6 +184,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
+        // SYNC/OFF startup hands a live client to the constructor, so we
+        // already know we reached the server at least once. ASYNC startup
+        // hands null and lets the I/O thread connect — hasEverConnected
+        // stays false until swapClient sees its first success.
+        this.hasEverConnected = client != null;
     }
 
     /**
@@ -251,6 +274,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public SenderError getLastTerminalServerError() {
         return lastTerminalServerError;
+    }
+
+    /**
+     * True iff the I/O loop has at least once installed a live (connected
+     * + upgraded) WebSocket client. Sticky — once true, stays true even
+     * after a subsequent disconnect. Lets a {@code SenderErrorHandler}
+     * disambiguate a "never reached the server" budget exhaustion (likely
+     * a config typo or firewall block) from a "lost connection after we
+     * were up" failure (likely transient).
+     */
+    public boolean hasEverConnected() {
+        return hasEverConnected;
     }
 
     public long getTotalAcks() {
@@ -389,12 +424,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * (legacy behavior).
      */
     private void fail(Throwable initial) {
+        connectLoop(initial, "reconnect");
+    }
+
+    /**
+     * Shared per-outage retry loop. Used by {@link #fail(Throwable)} for
+     * mid-flight wire failures (phase="reconnect") and by
+     * {@link #attemptInitialConnect()} for the async-initial-connect path
+     * (phase="initial connect"). The phase string only affects log lines
+     * and the {@link SenderError} message — control flow is identical.
+     */
+    private void connectLoop(Throwable initial, String phase) {
         if (reconnectFactory == null || !running) {
             recordFatal(initial);
             return;
         }
-        LOG.warn("cursor I/O loop wire failure, entering reconnect loop: {}",
-                initial.getMessage());
+        LOG.warn("cursor I/O loop entering {} loop: {}",
+                phase, initial.getMessage());
         long outageStartNanos = System.nanoTime();
         long deadlineNanos = outageStartNanos + reconnectMaxDurationMillis * 1_000_000L;
         long backoffMillis = reconnectInitialBackoffMillis;
@@ -410,16 +456,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     swapClient(newClient);
                     totalReconnects.incrementAndGet();
                     long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
-                    LOG.info("cursor I/O loop reconnected after {}ms, {} attempts; "
+                    LOG.info("cursor I/O loop {} succeeded after {}ms, {} attempts; "
                                     + "replaying from FSN {}",
-                            elapsedMs, attempts, fsnAtZero);
+                            phase, elapsedMs, attempts, fsnAtZero);
                     return;
                 }
             } catch (Throwable e) {
                 if (isTerminalUpgradeError(e)) {
                     String upgradeMsg = findUpgradeFailureMessage(e);
-                    LOG.error("terminal upgrade error during reconnect — won't retry: {}",
-                            upgradeMsg);
+                    LOG.error("terminal upgrade error during {} -- won't retry: {}",
+                            phase, upgradeMsg);
                     long fromFsn = engine.ackedFsn() + 1L;
                     long toFsn = Math.max(fromFsn, engine.publishedFsn());
                     SenderError err = new SenderError(
@@ -446,7 +492,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 lastReconnectError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
-                    LOG.warn("reconnect attempt {} failed: {}", attempts, e.getMessage());
+                    LOG.warn("{} attempt {} failed: {}", phase, attempts, e.getMessage());
                     lastLogNanos = now;
                 }
             }
@@ -468,17 +514,35 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
         }
         long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
-        LOG.error("cursor I/O loop giving up reconnecting after {}ms, {} attempts; "
-                        + "last error: {}",
-                elapsedMs, attempts, lastReconnectError.getMessage());
+        String lastMsg = lastReconnectError == null ? "no attempts made"
+                : lastReconnectError.getMessage();
+        LOG.error("cursor I/O loop giving up {} after {}ms, {} attempts; last error: {}",
+                phase, elapsedMs, attempts, lastMsg);
         long fromFsn = engine.ackedFsn() + 1L;
         long toFsn = Math.max(fromFsn, engine.publishedFsn());
+        // Disambiguate by what the sender saw on the wire: if we never got
+        // a successful upgrade, the user is most likely looking at a config
+        // problem (typo in addr, wrong port, firewall, server not deployed
+        // yet); if we connected at least once and then exhausted the budget,
+        // it's a transient connectivity issue (server down, network flap).
+        // Tag and free-text hint encode the same signal so both grep-the-logs
+        // and read-the-message users get it without parsing.
+        String connectivityTag;
+        String connectivityHint;
+        if (hasEverConnected) {
+            connectivityTag = "connection-lost-budget-exhausted";
+            connectivityHint = "server unreachable since last connect (transient)";
+        } else {
+            connectivityTag = "never-connected-budget-exhausted";
+            connectivityHint = "never reached the server (check addr/port/firewall)";
+        }
         SenderError err = new SenderError(
                 SenderError.Category.PROTOCOL_VIOLATION,
                 SenderError.Policy.HALT,
                 SenderError.NO_STATUS_BYTE,
-                "reconnect-budget-exhausted: " + elapsedMs + "ms / " + attempts
-                        + " attempts; last error: " + lastReconnectError.getMessage(),
+                connectivityTag + ": " + elapsedMs + "ms / " + attempts
+                        + " attempts; " + connectivityHint
+                        + "; last error: " + lastMsg,
                 SenderError.NO_MESSAGE_SEQUENCE,
                 fromFsn,
                 toFsn,
@@ -490,6 +554,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // terminal error is latched before the handler is invoked.
         recordFatal(new LineSenderServerException(err), err);
         dispatchError(err);
+    }
+
+    /**
+     * Drives the very first connect attempt on the I/O thread, used in the
+     * async-initial-connect mode (constructed with {@code client == null}).
+     * Reuses the same retry+backoff machinery as {@link #fail(Throwable)} —
+     * a terminal upgrade reject or budget exhaustion is delivered through
+     * the dispatcher, not thrown to the producer.
+     */
+    private void attemptInitialConnect() {
+        connectLoop(new LineSenderException(
+                "async initial connect deferred to I/O thread"),
+                "initial connect");
     }
 
     /**
@@ -632,6 +709,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private void swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
         this.client = newClient;
+        // Sticky: once the wire is up, we've reached the server at least
+        // once for this sender's lifetime. Used downstream to classify a
+        // subsequent budget exhaustion as transient vs config-likely.
+        this.hasEverConnected = true;
         if (old != null) {
             try {
                 old.close();
@@ -682,6 +763,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     private void ioLoop() {
         try {
+            // Async-initial-connect path: ctor accepted a null client because
+            // a reconnect factory is wired. Drive the very first connect on
+            // this thread so the producer thread never blocks on it.
+            // attemptInitialConnect either sets `client` (success) or records
+            // a terminal failure and clears `running` (auth/upgrade reject or
+            // budget exhaustion). Either way, the main loop below sees the
+            // outcome via the `running` and `client` fields.
+            if (client == null && running) {
+                attemptInitialConnect();
+            }
             while (running) {
                 boolean didWork = trySendOne();
                 // 1. Try to send next frame(s).
