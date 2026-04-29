@@ -119,13 +119,16 @@ public class OrphanScanIntegrationTest {
                     primary.table("foo").longColumn("v", 8L).atNow();
                     primary.flush();
                 }
-                // Primary's slot now exists too; scanner with primary
-                // excluded must still return the ghost (and nothing else
-                // among the two slots).
+                // With drain_orphans=true, the background drainer pool adopts
+                // the ghost slot, replays its unacked frames against the now-
+                // ACKing primaryServer, and removes the drained slot dir.
+                // Primary's own slot drains cleanly on close() and is filtered
+                // out by sender_id. Net: scanner sees neither.
                 ObjList<String> postRun = OrphanScanner.scan(sfDir, "primary");
-                Assert.assertEquals("only ghost should appear; primary excluded",
-                        1, postRun.size());
-                Assert.assertEquals(sfDir + "/ghost", postRun.get(0));
+                Assert.assertEquals(
+                        "drain_orphans=true should have drained + removed the "
+                                + "ghost slot; primary's own slot is sender_id-filtered",
+                        0, postRun.size());
             } finally {
                 try {
                     primaryServer.close();

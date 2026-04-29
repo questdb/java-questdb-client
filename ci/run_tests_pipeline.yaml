@@ -84,7 +84,16 @@ stages:
                 maven | "$(Agent.OS)"
               path: $(HOME)/.m2/repository
             displayName: "Cache Maven repository"
-          - script: git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
+          - bash: |
+              BRANCH="${SYSTEM_PULLREQUEST_SOURCEBRANCH:-$BUILD_SOURCEBRANCHNAME}"
+              BRANCH="${BRANCH#refs/heads/}"
+              if git ls-remote --exit-code --heads https://github.com/questdb/questdb.git "$BRANCH" >/dev/null 2>&1; then
+                echo "Cloning matching questdb branch: $BRANCH"
+                git clone --depth 1 --branch "$BRANCH" https://github.com/questdb/questdb.git ./questdb
+              else
+                echo "No matching questdb branch '$BRANCH', falling back to master"
+                git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
+              fi
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Update client version"
