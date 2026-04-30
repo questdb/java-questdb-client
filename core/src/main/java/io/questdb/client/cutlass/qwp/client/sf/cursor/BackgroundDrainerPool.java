@@ -52,7 +52,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class BackgroundDrainerPool implements QuietCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainerPool.class);
-    private static final long CLOSE_GRACE_MILLIS = 3_000L;
+    // Time we let drainers finish their drain naturally before signaling
+    // stop. awaitTermination returns as soon as the last drainer exits,
+    // so this only matters when something is genuinely stuck.
+    private static final long GRACEFUL_DRAIN_MILLIS = 2_500L;
+    // After signaling stop, give drainers a brief window to unwind cleanly
+    // (release slot lock, close engine) before forcing shutdownNow.
+    private static final long STOP_GRACE_MILLIS = 500L;
     // CAS gate. Single AtomicInteger packs the closed flag (sign bit) and
     // the in-flight submit count (low 31 bits):
     //   state >= 0       → open, value is the in-flight submit count
@@ -160,16 +166,25 @@ public final class BackgroundDrainerPool implements QuietCloseable {
         while (state.get() != CLOSED_BIT) {
             Thread.onSpinWait();
         }
-        for (BackgroundDrainer d : active) {
-            d.requestStop();
-        }
+        // Reject new tasks but let in-flight drainers finish their drain
+        // naturally. Without this grace window a drainer that's seconds
+        // away from acked >= target gets requestStop()'d and exits as
+        // STOPPED — its engine.close() then sees fullyDrained=false and
+        // leaves the slot's .sfa files behind, defeating drain_orphans.
         executor.shutdown();
         try {
-            if (!executor.awaitTermination(CLOSE_GRACE_MILLIS, TimeUnit.MILLISECONDS)) {
-                LOG.warn("drainer pool did not finish in {}ms; "
-                                + "remaining drainers will exit on their own",
-                        CLOSE_GRACE_MILLIS);
-                executor.shutdownNow();
+            if (!executor.awaitTermination(GRACEFUL_DRAIN_MILLIS, TimeUnit.MILLISECONDS)) {
+                LOG.warn("orphan drainers still running after {}ms — signaling stop",
+                        GRACEFUL_DRAIN_MILLIS);
+                for (BackgroundDrainer d : active) {
+                    d.requestStop();
+                }
+                if (!executor.awaitTermination(STOP_GRACE_MILLIS, TimeUnit.MILLISECONDS)) {
+                    LOG.warn("drainer pool did not exit in {}ms after stop; "
+                                    + "remaining drainers will exit on their own",
+                            STOP_GRACE_MILLIS);
+                    executor.shutdownNow();
+                }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

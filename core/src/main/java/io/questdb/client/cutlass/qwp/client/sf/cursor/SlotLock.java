@@ -34,15 +34,18 @@ import java.nio.charset.StandardCharsets;
 /**
  * Advisory exclusive lock for a single SF slot directory.
  * <p>
- * One {@code .lock} file per slot, held via {@code flock} for the entire
- * lifetime of the engine that owns the slot. The lock is automatically
- * released when the fd is closed — including on hard process exit, since
- * the kernel cleans up flocks for terminated processes (see flock(2)).
+ * One {@code .lock} file per slot, held via {@code flock}/{@code LockFileEx}
+ * for the entire lifetime of the engine that owns the slot. The lock is
+ * automatically released when the fd is closed — including on hard process
+ * exit, since the kernel cleans up file locks for terminated processes.
  * <p>
- * The lock file's payload is the holder's PID, written at acquisition
- * time. A failed acquisition reads it back so the error message can name
- * the offending process — turning a vague "slot in use" into actionable
- * diagnostics.
+ * The holder's PID is written to a sibling {@code .lock.pid} file at
+ * acquisition time. A failed acquisition reads it back so the error message
+ * can name the offending process — turning a vague "slot in use" into
+ * actionable diagnostics. The PID lives in a separate file because Windows'
+ * {@code LockFileEx} is a mandatory range lock: while the {@code .lock}
+ * file is held, a second handle cannot read its bytes, so we couldn't
+ * recover the holder's PID from the lock file itself.
  * <p>
  * Two senders pointing at the same slot dir is the multi-writer footgun
  * the slot model exists to prevent: their FSN sequences would interleave
@@ -53,6 +56,7 @@ import java.nio.charset.StandardCharsets;
 public final class SlotLock implements QuietCloseable {
 
     private static final String LOCK_FILE_NAME = ".lock";
+    private static final String LOCK_PID_FILE_NAME = ".lock.pid";
     private final String slotDir;
     private final String lockPath;
     private int fd;
@@ -83,6 +87,7 @@ public final class SlotLock implements QuietCloseable {
             }
         }
         String lockPath = slotDir + "/" + LOCK_FILE_NAME;
+        String pidPath = slotDir + "/" + LOCK_PID_FILE_NAME;
         int fd = Files.openRW(lockPath);
         if (fd < 0) {
             throw new IllegalStateException(
@@ -92,12 +97,12 @@ public final class SlotLock implements QuietCloseable {
         try {
             int rc = Files.lock(fd);
             if (rc != 0) {
-                String holder = readHolder(lockPath);
+                String holder = readHolder(pidPath);
                 throw new IllegalStateException(
                         "sf slot already in use by another process [slot="
                                 + slotDir + ", holder=" + holder + "]");
             }
-            writePid(fd);
+            writePid(pidPath);
             ok = true;
             return new SlotLock(slotDir, lockPath, fd);
         } finally {
@@ -114,17 +119,18 @@ public final class SlotLock implements QuietCloseable {
 
     @Override
     public void close() {
-        // Closing the fd releases the flock. We do NOT remove the file —
-        // a stale .lock with the previous PID is harmless (next acquirer
-        // can flock it just fine, and overwrites the PID on success).
+        // Closing the fd releases the lock. We do NOT remove the .lock
+        // file or the .lock.pid sidecar — a stale PID is harmless (next
+        // acquirer overwrites .lock.pid on success).
         if (fd >= 0) {
             Files.close(fd);
             fd = -1;
         }
     }
 
-    private static String readHolder(String lockPath) {
-        int rfd = Files.openRO(lockPath);
+    private static String readHolder(String pidPath) {
+        if (!Files.exists(pidPath)) return "unknown";
+        int rfd = Files.openRO(pidPath);
         if (rfd < 0) return "unknown";
         try {
             long fileLen = Files.length(rfd);
@@ -147,7 +153,7 @@ public final class SlotLock implements QuietCloseable {
         }
     }
 
-    private static void writePid(int fd) {
+    private static void writePid(String pidPath) {
         long pid;
         try {
             pid = ProcessHandle.current().pid();
@@ -155,16 +161,25 @@ public final class SlotLock implements QuietCloseable {
             // Diagnostic-only — never block lock acquisition on it.
             pid = -1L;
         }
-        byte[] payload = (pid + "\n").getBytes(StandardCharsets.UTF_8);
-        Files.truncate(fd, 0L);
-        long addr = Unsafe.malloc(payload.length, MemoryTag.NATIVE_DEFAULT);
+        int wfd = Files.openRW(pidPath);
+        if (wfd < 0) {
+            // Diagnostic-only — never block lock acquisition on it.
+            return;
+        }
         try {
-            for (int i = 0; i < payload.length; i++) {
-                Unsafe.getUnsafe().putByte(addr + i, payload[i]);
+            Files.truncate(wfd, 0L);
+            byte[] payload = (pid + "\n").getBytes(StandardCharsets.UTF_8);
+            long addr = Unsafe.malloc(payload.length, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < payload.length; i++) {
+                    Unsafe.getUnsafe().putByte(addr + i, payload[i]);
+                }
+                Files.write(wfd, addr, payload.length, 0L);
+            } finally {
+                Unsafe.free(addr, payload.length, MemoryTag.NATIVE_DEFAULT);
             }
-            Files.write(fd, addr, payload.length, 0L);
         } finally {
-            Unsafe.free(addr, payload.length, MemoryTag.NATIVE_DEFAULT);
+            Files.close(wfd);
         }
     }
 }

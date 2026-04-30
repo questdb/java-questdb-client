@@ -591,7 +591,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             lastTerminalServerError = serverError;
         }
         running = false;
-        LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
+        if (serverError != null) {
+            LOG.error("Cursor I/O loop failure: {}", t.getMessage());
+        } else {
+            LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
+        }
     }
 
     /**
