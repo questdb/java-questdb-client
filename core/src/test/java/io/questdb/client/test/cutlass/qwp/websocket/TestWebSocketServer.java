@@ -75,11 +75,10 @@ public class TestWebSocketServer implements Closeable {
     public void close() {
         running.set(false);
 
-        for (ClientHandler client : clients) {
-            client.close();
-        }
-        clients.clear();
-
+        // Close the listener first. Clients reach for reconnects the moment we
+        // close their sockets below — if the listener is still up, those
+        // reconnects succeed and the new connections are never tracked here,
+        // leaving them alive past close().
         if (serverSocket != null) {
             try {
                 serverSocket.close();
@@ -87,6 +86,11 @@ public class TestWebSocketServer implements Closeable {
                 // ignore
             }
         }
+
+        for (ClientHandler client : clients) {
+            client.close();
+        }
+        clients.clear();
 
         if (acceptThread != null) {
             try {

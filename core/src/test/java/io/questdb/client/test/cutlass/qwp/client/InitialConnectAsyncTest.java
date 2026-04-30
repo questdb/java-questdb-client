@@ -56,7 +56,7 @@ public class InitialConnectAsyncTest {
     private static final int TEST_PORT = 19_800 + (int) (System.nanoTime() % 100);
 
     @Test
-    public void testAsyncReturnsImmediatelyWithNoServer() throws Exception {
+    public void testAsyncReturnsImmediatelyWithNoServer() {
         // No server. With async mode, fromConfig must return fast — the
         // I/O thread will keep retrying in the background until cap, but
         // the producer is unblocked. A 60s cap would normally hang
@@ -84,15 +84,14 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
-    public void testAsyncDeliversBufferedRowsWhenServerArrivesLate() throws Exception {
+    public void testAsyncDeliversBufferedRowsWhenServerArrivesLate() {
         // Sender opens before the server is listening. Frames are
         // appended to the cursor SF engine on the producer thread. The
         // I/O thread retries connect in the background; once the server
         // comes up, the buffered frame is sent and ACKed.
         int port = TEST_PORT + 2;
         AckHandler handler = new AckHandler();
-        TestWebSocketServer server = new TestWebSocketServer(port, handler);
-        try {
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             String cfg = "ws::addr=localhost:" + port
                     + ";initial_connect_retry=async"
                     + ";reconnect_max_duration_millis=10000"
@@ -130,17 +129,13 @@ public class InitialConnectAsyncTest {
                         "wasEverConnected() must flip to true after the I/O thread connects",
                         ((QwpWebSocketSender) sender).wasEverConnected());
             }
-        } finally {
-            try {
-                server.close();
-            } catch (Exception ignored) {
-                // already closed
-            }
+        } catch (Exception ignored) {
+            // already closed
         }
     }
 
     @Test
-    public void testWasEverConnectedTrueImmediatelyInSyncMode() throws Exception {
+    public void testWasEverConnectedTrueImmediatelyInSyncMode() {
         // Default (OFF) and SYNC modes both connect on the user thread
         // before fromConfig returns. wasEverConnected() must therefore
         // already be true the instant the sender becomes visible to the
@@ -148,8 +143,7 @@ public class InitialConnectAsyncTest {
         // those modes, so misclassifying a budget exhaustion as
         // never-connected is impossible.
         int port = TEST_PORT + 6;
-        TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler());
-        try {
+        try (TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler())) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));
             String cfg = "ws::addr=localhost:" + port
@@ -159,12 +153,8 @@ public class InitialConnectAsyncTest {
                         "wasEverConnected() must be true immediately in OFF/SYNC mode",
                         ((QwpWebSocketSender) sender).wasEverConnected());
             }
-        } finally {
-            try {
-                server.close();
-            } catch (Exception ignored) {
-                // already closed
-            }
+        } catch (Exception ignored) {
+            // already closed
         }
     }
 
@@ -220,7 +210,7 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
-    public void testConnectionLostBudgetExhaustionTagsDifferently() throws Exception {
+    public void testConnectionLostBudgetExhaustionTagsDifferently() {
         // Server is up at first (initial connect succeeds + ACKs one
         // batch), then we tear it down. The I/O loop tries to reconnect,
         // every attempt hits TCP refused, and the budget exhausts.
@@ -229,8 +219,7 @@ public class InitialConnectAsyncTest {
         // must report wasEverConnected()==true.
         int port = TEST_PORT + 5;
         AckHandler handler = new AckHandler();
-        TestWebSocketServer server = new TestWebSocketServer(port, handler);
-        try {
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));
 
@@ -289,12 +278,8 @@ public class InitialConnectAsyncTest {
             } finally {
                 assertCloseRethrowsTerminal(sender, "connection-lost-budget-exhausted");
             }
-        } finally {
-            try {
-                server.close();
-            } catch (Exception ignored) {
-                // already closed
-            }
+        } catch (Exception ignored) {
+            // already closed
         }
     }
 
