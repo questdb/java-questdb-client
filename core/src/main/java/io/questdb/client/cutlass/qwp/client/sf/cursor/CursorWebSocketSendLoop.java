@@ -31,12 +31,14 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
+import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayDeque;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
@@ -79,8 +81,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
 
     private final AtomicLong consecutiveSendErrors = new AtomicLong();
+    // Per-table cumulative durable-upload watermarks, populated only when
+    // durableAckMode is true. Updated from STATUS_DURABLE_ACK frame entries
+    // (each entry is monotonically non-decreasing per spec). Reset on every
+    // reconnect because the new connection's cumulative state is re-emitted
+    // by the server -- holding stale watermarks across the wire boundary
+    // would falsely advance trim before re-confirmation.
+    private final CharSequenceLongHashMap durableTableWatermarks = new CharSequenceLongHashMap();
     private final CursorSendEngine engine;
     private final long parkNanos;
+    // FIFO of OK-acked batches awaiting durable-upload confirmation. Used only
+    // when durableAckMode is true. Each entry binds a wireSeq to the per-table
+    // (name, seqTxn) pairs the server reported on the OK frame. The queue is
+    // drained from the head every time a STATUS_DURABLE_ACK frame advances
+    // any watermark; an entry pops when every (name, seqTxn) it carries is
+    // covered by durableTableWatermarks. Bounded in practice by the SF on-disk
+    // cap: once the producer hits sf_max_bytes it blocks, which caps how far
+    // the durable watermark can lag behind the OK watermark.
+    private final ArrayDeque<PendingDurableEntry> pendingDurable = new ArrayDeque<>();
+    private final ArrayDeque<PendingDurableEntry> pendingDurablePool = new ArrayDeque<>();
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
@@ -117,6 +136,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // handler. Null disables async delivery entirely; the producer-side
     // typed-throw path is unaffected.
     private SenderErrorDispatcher errorDispatcher;
+    // When true, OK frames do NOT advance engine.acknowledge -- only
+    // STATUS_DURABLE_ACK frames do. The OK frame's wireSeq is stashed in
+    // pendingDurable along with its per-table seqTxns, and trim only advances
+    // when a durable-ack covers every batch up to some wireSeq. When false
+    // (default), the loop trims on OK as it always has and ignores any
+    // STATUS_DURABLE_ACK frames that might still arrive (logs a warning).
+    private final boolean durableAckMode;
+    // Counters for observability of the durable-ack path. Both are zero
+    // when durableAckMode is false.
+    private final AtomicLong totalDurableAcks = new AtomicLong();
+    private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
     private WebSocketClient client;
     // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
     // a fresh connection, this is 0. After a reconnect, it's set to
@@ -169,6 +199,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, false);
+    }
+
+    /**
+     * Same as the seven-arg constructor but with explicit control over
+     * durable-ack-driven trim. {@code durableAckMode = true} switches the loop
+     * to trim only on {@link WebSocketResponse#STATUS_DURABLE_ACK} frames; OK
+     * frames are queued until their per-table seqTxns are covered by a durable
+     * watermark. The default (false) preserves the historical OK-driven trim
+     * and ignores any durable-ack frames that arrive (logging a warning, since
+     * a server should not emit them when the client did not opt in).
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode) {
         if (engine == null) {
             throw new IllegalArgumentException("engine must be non-null");
         }
@@ -184,6 +235,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
+        this.durableAckMode = durableAckMode;
         // SYNC/OFF startup hands a live client to the constructor, so we
         // already know we reached the server at least once. ASYNC startup
         // hands null and lets the I/O thread connect — hasEverConnected
@@ -734,7 +786,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // resets replayTargetFsn to -1 once we cross the boundary.
         long pubAtSwap = engine.publishedFsn();
         this.replayTargetFsn = pubAtSwap >= replayStart ? pubAtSwap : -1L;
+        // Drop any durable-ack tracking from the previous connection. The
+        // new connection will re-OK every replayed batch and the server
+        // re-emits cumulative durable-ack watermarks from scratch, so
+        // carrying stale state across the wire boundary would either
+        // double-trim or starve the queue.
+        clearDurableAckTracking();
         positionCursorAt(replayStart);
+    }
+
+    private void clearDurableAckTracking() {
+        if (!durableAckMode) {
+            return;
+        }
+        while (!pendingDurable.isEmpty()) {
+            releasePendingEntry(pendingDurable.pollFirst());
+        }
+        durableTableWatermarks.clear();
     }
 
     /**
@@ -921,14 +989,37 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     LOG.warn("server ACK wire seq {} exceeds highest sent {} — clamping",
                             wireSeq, highestSent);
                 }
-                engine.acknowledge(fsnAtZero + capped);
                 totalAcks.incrementAndGet();
+                if (durableAckMode) {
+                    // Durable mode: stash the (wireSeq, table_seqTxns) tuple
+                    // and wait for STATUS_DURABLE_ACK to release it. Empty
+                    // OK frames (tableCount=0) are trivially durable per
+                    // spec, but they still chain behind any earlier
+                    // non-empty entries -- the queue keeps wireSeq order.
+                    // Drain on enqueue too: when a durable-ack arrived ahead
+                    // of an empty / already-covered OK, the queued entry
+                    // would otherwise wait for the next durable-ack to
+                    // drain. Calling drain here is O(coverage) and keeps
+                    // ackedFsn current with no extra wire round-trip.
+                    enqueuePendingOk(capped);
+                    drainPendingDurable();
+                    return;
+                }
+                engine.acknowledge(fsnAtZero + capped);
                 return;
             }
             if (response.isDurableAck()) {
-                // Per-table fsync confirmation. Cursor SF doesn't currently
-                // surface durable-ack progress to the producer, but receiving
-                // one is not an error — silently ignore.
+                if (!durableAckMode) {
+                    // Spec contract: servers must not emit STATUS_DURABLE_ACK
+                    // unless the client opted in. Treat as a server bug and
+                    // log it once -- ignoring is safer than failing the
+                    // connection over what is, in the worst case, a stray
+                    // informational frame.
+                    LOG.warn("received STATUS_DURABLE_ACK frame without opt-in -- ignoring");
+                    return;
+                }
+                totalDurableAcks.incrementAndGet();
+                applyDurableAck();
                 return;
             }
             // Application-layer rejection by the server. Classify by status
@@ -988,10 +1079,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // so the loop drains subsequent batches. The data is dropped
                 // from the SF disk store via the existing trim path; the
                 // dispatch is the user's only handle to dead-letter.
-                LOG.warn("server rejected wire seq {} (category={}, status=0x{}) — dropping batch and continuing",
+                LOG.warn("server rejected wire seq {} (category={}, status=0x{}) -- dropping batch and continuing",
                         wireSeq, category, Integer.toHexString(status & 0xFF));
-                engine.acknowledge(fsn);
                 totalAcks.incrementAndGet();
+                if (durableAckMode) {
+                    // A rejected batch never reaches the WAL, so the server
+                    // will not emit a durable-ack for it. Stash an empty
+                    // entry so the queue still advances past it, but only
+                    // after every preceding OK'd batch is durable -- trimming
+                    // past unfilled durable slots would corrupt SF semantics.
+                    enqueuePendingOk(cappedSeq);
+                    drainPendingDurable();
+                } else {
+                    engine.acknowledge(fsn);
+                }
                 dispatchError(err);
             }
         }
@@ -1019,6 +1120,110 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             default:
                 return false;
         }
+    }
+
+    /**
+     * Total {@code STATUS_DURABLE_ACK} frames received since the loop started.
+     * Always 0 when {@code durableAckMode} is false. Useful for confirming
+     * the server is actually emitting durable acks under load.
+     */
+    public long getTotalDurableAcks() {
+        return totalDurableAcks.get();
+    }
+
+    /**
+     * Total times a durable-ack frame caused {@link CursorSendEngine#acknowledge}
+     * to advance. Always 0 when {@code durableAckMode} is false. A non-zero
+     * value bounded below {@code getTotalDurableAcks} is normal -- many
+     * durable-acks land on watermarks that don't yet cover any pending
+     * entries (e.g. one of two tables has caught up but the other has not).
+     */
+    public long getTotalDurableTrimAdvances() {
+        return totalDurableTrimAdvances.get();
+    }
+
+    /** True when this loop drives trim from durable-ack frames. Diagnostic only. */
+    public boolean isDurableAckMode() {
+        return durableAckMode;
+    }
+
+    private PendingDurableEntry acquirePendingEntry() {
+        PendingDurableEntry e = pendingDurablePool.pollFirst();
+        return e != null ? e : new PendingDurableEntry();
+    }
+
+    private void applyDurableAck() {
+        // Update per-table watermarks from the inbound frame, taking the
+        // max so a reordered or older cumulative frame can't move a watermark
+        // backwards. Then walk the head of pendingDurable, popping every
+        // entry whose tables are all covered. The map's NO_ENTRY_VALUE
+        // sentinel is -1L; valid seqTxns are non-negative, so the guard
+        // doubles as an "absent" check.
+        int n = response.getTableEntryCount();
+        for (int i = 0; i < n; i++) {
+            String name = response.getTableName(i);
+            long seqTxn = response.getTableSeqTxn(i);
+            long current = durableTableWatermarks.get(name);
+            if (seqTxn > current) {
+                durableTableWatermarks.put(name, seqTxn);
+            }
+        }
+        drainPendingDurable();
+    }
+
+    /**
+     * Stash a wireSeq + per-table seqTxns from the current OK / NACK frame
+     * for later durable-ack confirmation. {@link #response} must hold the
+     * OK or rejection frame at call time. NACK frames carry no per-table
+     * entries, so they enqueue as trivially-durable empty placeholders.
+     */
+    private void enqueuePendingOk(long wireSeq) {
+        PendingDurableEntry e = acquirePendingEntry();
+        e.wireSeq = wireSeq;
+        int n = response.getTableEntryCount();
+        e.ensureCapacity(n);
+        for (int i = 0; i < n; i++) {
+            e.tableNames[i] = response.getTableName(i);
+            e.seqTxns[i] = response.getTableSeqTxn(i);
+        }
+        e.tableCount = n;
+        pendingDurable.addLast(e);
+    }
+
+    /**
+     * Pop every head entry whose tables are all covered by the durable
+     * watermarks and call {@link CursorSendEngine#acknowledge} once with
+     * the highest popped wireSeq. Trivially-durable entries (tableCount=0,
+     * from empty-WAL OK frames or NACK frames) pop unconditionally.
+     */
+    private void drainPendingDurable() {
+        long highest = Long.MIN_VALUE;
+        while (!pendingDurable.isEmpty()) {
+            PendingDurableEntry head = pendingDurable.peekFirst();
+            if (!head.isDurableUnder(durableTableWatermarks)) {
+                break;
+            }
+            highest = head.wireSeq;
+            releasePendingEntry(pendingDurable.pollFirst());
+        }
+        if (highest != Long.MIN_VALUE) {
+            engine.acknowledge(fsnAtZero + highest);
+            totalDurableTrimAdvances.incrementAndGet();
+        }
+    }
+
+    private void releasePendingEntry(PendingDurableEntry e) {
+        if (e == null) return;
+        e.tableCount = 0;
+        // Null out name references so released entries don't pin Strings
+        // alive across reconnects. Length is small, so the loop cost is
+        // negligible compared to the indirect tenuring savings.
+        if (e.tableNames != null) {
+            for (int i = 0; i < e.tableNames.length; i++) {
+                e.tableNames[i] = null;
+            }
+        }
+        pendingDurablePool.addFirst(e);
     }
 
     /**
@@ -1070,6 +1275,41 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             case UNKNOWN:
             default:
                 return SenderError.Policy.HALT;
+        }
+    }
+
+    /**
+     * One slot in the pendingDurable FIFO. Holds a wireSeq plus the per-table
+     * (name, seqTxn) pairs from its OK frame. Empty entries (tableCount = 0)
+     * represent batches that committed nothing to a WAL table -- spec defines
+     * them as trivially durable as soon as preceding entries are durable.
+     * <p>
+     * Reused via the loop's pendingDurablePool to keep steady-state allocation
+     * confined to capacity growth.
+     */
+    private static final class PendingDurableEntry {
+        long[] seqTxns;
+        int tableCount;
+        String[] tableNames;
+        long wireSeq;
+
+        void ensureCapacity(int n) {
+            if (tableNames == null || tableNames.length < n) {
+                int newCap = Math.max(n, tableNames == null ? 4 : tableNames.length * 2);
+                tableNames = new String[newCap];
+                seqTxns = new long[newCap];
+            }
+        }
+
+        boolean isDurableUnder(CharSequenceLongHashMap watermarks) {
+            for (int i = 0; i < tableCount; i++) {
+                // NO_ENTRY_VALUE is -1L; valid seqTxns are non-negative, so
+                // a single comparison covers both "absent" and "behind".
+                if (watermarks.get(tableNames[i]) < seqTxns[i]) {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 }

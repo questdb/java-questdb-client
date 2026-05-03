@@ -55,6 +55,7 @@ public class TestWebSocketServer implements Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(TestWebSocketServer.class);
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private final List<ClientHandler> clients = new CopyOnWriteArrayList<>();
+    private final boolean emitDurableAckHeader;
     private final WebSocketServerHandler handler;
     private final int port;
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -63,8 +64,21 @@ public class TestWebSocketServer implements Closeable {
     private ServerSocket serverSocket;
 
     public TestWebSocketServer(int port, WebSocketServerHandler handler) {
+        this(port, handler, false);
+    }
+
+    /**
+     * @param emitDurableAckHeader when true, the 101 upgrade response includes
+     *                             {@code X-QWP-Durable-Ack: enabled} so opted-in
+     *                             clients (request_durable_ack=on) accept the
+     *                             handshake. Set false to simulate an OSS server
+     *                             that silently ignores the request and force
+     *                             the client's early-fail check.
+     */
+    public TestWebSocketServer(int port, WebSocketServerHandler handler, boolean emitDurableAckHeader) {
         this.port = port;
         this.handler = handler;
+        this.emitDurableAckHeader = emitDurableAckHeader;
     }
 
     public boolean awaitStart(long timeout, TimeUnit unit) throws InterruptedException {
@@ -311,12 +325,16 @@ public class TestWebSocketServer implements Closeable {
 
             String acceptKey = computeAcceptKey(key);
 
-            String response = "HTTP/1.1 101 Switching Protocols\r\n" +
-                    "Upgrade: websocket\r\n" +
-                    "Connection: Upgrade\r\n" +
-                    "Sec-WebSocket-Accept: " + acceptKey + "\r\n" +
-                    "\r\n";
-            out.write(response.getBytes(StandardCharsets.US_ASCII));
+            StringBuilder sb = new StringBuilder()
+                    .append("HTTP/1.1 101 Switching Protocols\r\n")
+                    .append("Upgrade: websocket\r\n")
+                    .append("Connection: Upgrade\r\n")
+                    .append("Sec-WebSocket-Accept: ").append(acceptKey).append("\r\n");
+            if (emitDurableAckHeader) {
+                sb.append("X-QWP-Durable-Ack: enabled\r\n");
+            }
+            sb.append("\r\n");
+            out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
             out.flush();
 
             return true;

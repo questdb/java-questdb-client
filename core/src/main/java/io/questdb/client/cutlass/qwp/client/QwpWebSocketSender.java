@@ -1766,7 +1766,8 @@ public class QwpWebSocketSender implements Sender {
                     this::buildAndConnect,
                     reconnectMaxDurationMillis,
                     reconnectInitialBackoffMillis,
-                    reconnectMaxBackoffMillis);
+                    reconnectMaxBackoffMillis,
+                    requestDurableAck);
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles
@@ -1833,6 +1834,20 @@ public class QwpWebSocketSender implements Sender {
         } catch (Exception e) {
             newClient.close();
             throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
+        }
+        // Fail at connect when the user opted into durable acks but landed on
+        // a server that did not echo the X-QWP-Durable-Ack: enabled confirmation.
+        // Without this check, store-and-forward would never receive trim signals
+        // and the on-disk store would grow unbounded -- silent storage exhaustion
+        // is a worse outcome than a loud connect-time failure.
+        if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
+            newClient.close();
+            throw new LineSenderException(
+                    "server does not support durable ack [host=" + host + ", port=" + port
+                            + "]. The client opted in via request_durable_ack=on but the server "
+                            + "did not echo X-QWP-Durable-Ack: enabled in the upgrade response. "
+                            + "Either disable request_durable_ack or connect to a server with "
+                            + "primary replication configured.");
         }
         return newClient;
     }

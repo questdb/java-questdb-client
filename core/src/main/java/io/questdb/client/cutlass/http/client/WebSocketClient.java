@@ -75,6 +75,8 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int PARSE_INCOMPLETE = 0;
     private static final int PARSE_NEED_MORE = -1;
     private static final int PARSE_OK = 1;
+    private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
+    private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -124,6 +126,12 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int recvBufSize;
     private int recvPos;      // Write position
     private int recvReadPos;  // Read position
+    // Set during upgrade response validation when the server echoed
+    // X-QWP-Durable-Ack: enabled. Tells the sender it landed on a server that
+    // will actually emit STATUS_DURABLE_ACK frames, so its store-and-forward
+    // path can rely on durable-ack-driven trim. Absence (after opting in via
+    // setQwpRequestDurableAck) is the early-fail signal.
+    private boolean serverDurableAckEnabled;
     private int serverQwpVersion = 1;
     private boolean upgraded;
 
@@ -293,6 +301,16 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public boolean isConnected() {
         return upgraded && !closed && !socket.isClosed();
+    }
+
+    /**
+     * Returns true when the server echoed X-QWP-Durable-Ack: enabled in the
+     * 101 upgrade response. Meaningful only after {@link #upgrade} returns;
+     * always false when the client did not opt in via
+     * {@link #setQwpRequestDurableAck}.
+     */
+    public boolean isServerDurableAckEnabled() {
+        return serverDurableAckEnabled;
     }
 
     /**
@@ -587,6 +605,23 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return true;
+    }
+
+    private static boolean extractDurableAckEnabled(String response) {
+        int headerLen = QWP_DURABLE_ACK_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QWP_DURABLE_ACK_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                return value.equalsIgnoreCase(QWP_DURABLE_ACK_ENABLED_VALUE);
+            }
+        }
+        return false;
     }
 
     private static int extractQwpVersion(String response) {
@@ -1017,6 +1052,13 @@ public abstract class WebSocketClient implements QuietCloseable {
 
         // Extract X-QWP-Version (optional, defaults to 1 if absent)
         serverQwpVersion = extractQwpVersion(response);
+
+        // Extract X-QWP-Durable-Ack confirmation (optional, absent on servers
+        // without primary replication or when the client did not opt in).
+        // Only meaningful when qwpRequestDurableAck is true; the sender
+        // checks this value to fail at connect rather than silently
+        // missing trim signals.
+        serverDurableAckEnabled = extractDurableAckEnabled(response);
     }
 
     protected void dieWaiting(int n) {
