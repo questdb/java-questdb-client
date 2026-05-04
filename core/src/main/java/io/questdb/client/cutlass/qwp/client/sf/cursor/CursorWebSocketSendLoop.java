@@ -39,6 +39,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
@@ -136,6 +137,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // handler. Null disables async delivery entirely; the producer-side
     // typed-throw path is unaffected.
     private SenderErrorDispatcher errorDispatcher;
+    private SenderProgressDispatcher progressDispatcher;
     // When true, OK frames do NOT advance engine.acknowledge -- only
     // STATUS_DURABLE_ACK frames do. The OK frame's wireSeq is stashed in
     // pendingDurable along with its per-table seqTxns, and trim only advances
@@ -362,6 +364,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.errorDispatcher = dispatcher;
     }
 
+    /**
+     * Plug an async-delivery sink for ack-watermark advances. Same lifecycle
+     * contract as {@link #setErrorDispatcher} — set once before
+     * {@link #start()}.
+     */
+    public void setProgressDispatcher(SenderProgressDispatcher dispatcher) {
+        this.progressDispatcher = dispatcher;
+    }
+
     public long getTotalFramesSent() {
         return totalFramesSent.get();
     }
@@ -566,8 +577,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
         }
         long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
-        String lastMsg = lastReconnectError == null ? "no attempts made"
-                : lastReconnectError.getMessage();
+        String lastMsg = lastReconnectError.getMessage();
         LOG.error("cursor I/O loop giving up {} after {}ms, {} attempts; last error: {}",
                 phase, elapsedMs, attempts, lastMsg);
         long fromFsn = engine.ackedFsn() + 1L;
@@ -1005,7 +1015,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     drainPendingDurable();
                     return;
                 }
-                engine.acknowledge(fsnAtZero + capped);
+                if (engine.acknowledge(fsnAtZero + capped)) {
+                    dispatchProgress(fsnAtZero + capped);
+                }
                 return;
             }
             if (response.isDurableAck()) {
@@ -1090,8 +1102,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // past unfilled durable slots would corrupt SF semantics.
                     enqueuePendingOk(cappedSeq);
                     drainPendingDurable();
-                } else {
-                    engine.acknowledge(fsn);
+                } else if (engine.acknowledge(fsn)) {
+                    // DROP_AND_CONTINUE on the non-durable path advanced the
+                    // watermark past the rejected FSN; observers waiting on
+                    // a target FSN should see that advance, even though it
+                    // represents a drop rather than a successful commit.
+                    dispatchProgress(fsn);
                 }
                 dispatchError(err);
             }
@@ -1207,7 +1223,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         if (highest != Long.MIN_VALUE) {
-            engine.acknowledge(fsnAtZero + highest);
+            long fsn = fsnAtZero + highest;
+            if (engine.acknowledge(fsn)) {
+                dispatchProgress(fsn);
+            }
             totalDurableTrimAdvances.incrementAndGet();
         }
     }
@@ -1219,9 +1238,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // alive across reconnects. Length is small, so the loop cost is
         // negligible compared to the indirect tenuring savings.
         if (e.tableNames != null) {
-            for (int i = 0; i < e.tableNames.length; i++) {
-                e.tableNames[i] = null;
-            }
+            Arrays.fill(e.tableNames, null);
         }
         pendingDurablePool.addFirst(e);
     }
@@ -1235,6 +1252,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         SenderErrorDispatcher d = errorDispatcher;
         if (d != null) {
             d.offer(err);
+        }
+    }
+
+    /**
+     * Notify the progress dispatcher that the ack watermark advanced to
+     * {@code ackedFsn}. Caller must already have observed the advance via
+     * {@link CursorSendEngine#acknowledge}'s boolean return; this method
+     * does no further filtering.
+     */
+    private void dispatchProgress(long ackedFsn) {
+        SenderProgressDispatcher d = progressDispatcher;
+        if (d != null) {
+            d.offer(ackedFsn);
         }
     }
 

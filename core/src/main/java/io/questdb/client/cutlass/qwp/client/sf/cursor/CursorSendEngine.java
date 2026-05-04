@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 
 import java.util.concurrent.locks.LockSupport;
@@ -51,45 +52,48 @@ import java.util.concurrent.locks.LockSupport;
  */
 public final class CursorSendEngine implements QuietCloseable {
 
-    /** Default deadline for {@link #appendBlocking}: 30 seconds. */
-    public static final long DEFAULT_APPEND_DEADLINE_NANOS = 30_000_000_000L;
-    /** Throttle the "producer is backpressured" WARN log to at most once per this interval. */
+    /**
+     * Throttle the "producer is backpressured" WARN log to at most once per this interval.
+     */
     public static final long BACKPRESSURE_LOG_THROTTLE_NANOS = 5_000_000_000L; // 5 s
+    /**
+     * Default deadline for {@link #appendBlocking}: 30 seconds.
+     */
+    public static final long DEFAULT_APPEND_DEADLINE_NANOS = 30_000_000_000L;
     private static final org.slf4j.Logger LOG =
             org.slf4j.LoggerFactory.getLogger(CursorSendEngine.class);
-
-    private final String sfDir;
-    private final SegmentManager manager;
-    // We own the manager iff the user constructed us with no manager — in that
-    // case close() also stops the manager. When the manager is shared across
-    // many engines (one per Sender), the caller owns and closes it.
-    private final boolean ownsManager;
-    // Held for the engine's lifetime in disk mode. {@code null} in memory
-    // mode (no slot, no lock). Released by {@link #close()}; the kernel
-    // also drops it on hard process exit.
-    private final SlotLock slotLock;
-    private final SegmentRing ring;
-    private final long segmentSizeBytes;
     private final long appendDeadlineNanos;
-    // True when the constructor recovered an existing on-disk slot rather
-    // than starting fresh. Diagnostic accessor for tests and observability;
-    // cursor frames are self-sufficient (every frame carries full schema +
-    // full symbol-dict delta), so producer-side schema reset on recovery
-    // is not required.
-    private final boolean recoveredFromDisk;
     // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
     // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
     // for the manager (or for ACKs) — not one per spin-park. Producer-thread
     // writer; volatile because the user may sample it from any thread.
     private final java.util.concurrent.atomic.AtomicLong backpressureStallCount =
             new java.util.concurrent.atomic.AtomicLong();
-    // Producer-thread-only: timestamp of the last "we're backpressured" log
-    // line, used to throttle. Plain long is fine.
-    private long lastBackpressureLogNs;
+    private final SegmentManager manager;
+    // We own the manager iff the user constructed us with no manager — in that
+    // case close() also stops the manager. When the manager is shared across
+    // many engines (one per Sender), the caller owns and closes it.
+    private final boolean ownsManager;
+    // True when the constructor recovered an existing on-disk slot rather
+    // than starting fresh. Diagnostic accessor for tests and observability;
+    // cursor frames are self-sufficient (every frame carries full schema +
+    // full symbol-dict delta), so producer-side schema reset on recovery
+    // is not required.
+    private final boolean recoveredFromDisk;
+    private final SegmentRing ring;
+    private final long segmentSizeBytes;
+    private final String sfDir;
+    // Held for the engine's lifetime in disk mode. {@code null} in memory
+    // mode (no slot, no lock). Released by {@link #close()}; the kernel
+    // also drops it on hard process exit.
+    private final SlotLock slotLock;
     // close() is publicly callable from any thread (Sender.close from a user
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
     private volatile boolean closed;
+    // Producer-thread-only: timestamp of the last "we're backpressured" log
+    // line, used to throttle. Plain long is fine.
+    private long lastBackpressureLogNs;
 
     /**
      * Creates an engine with a private, non-shared {@link SegmentManager},
@@ -238,22 +242,78 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Records a server ACK for cumulative FSN {@code seq}. Triggers
-     * background trim of any sealed segments whose every frame is now
-     * acknowledged. Idempotent and monotonic.
+     * I/O thread accessor: highest FSN safe to send.
      */
-    public void acknowledge(long seq) {
-        ring.acknowledge(seq);
-    }
-
-    /** I/O thread accessor: highest FSN safe to send. */
     public long ackedFsn() {
         return ring.ackedFsn();
     }
 
-    /** I/O thread accessor: the current active mmap'd segment. */
+    /**
+     * Records a server ACK for cumulative FSN {@code seq}. Triggers
+     * background trim of any sealed segments whose every frame is now
+     * acknowledged. Idempotent and monotonic.
+     *
+     * @return {@code true} if the ack watermark actually advanced;
+     * {@code false} on a no-op (idempotent re-ack or value clamped
+     * at publishedFsn).
+     */
+    public boolean acknowledge(long seq) {
+        return ring.acknowledge(seq);
+    }
+
+    /**
+     * I/O thread accessor: the current active mmap'd segment.
+     */
     public MmapSegment activeSegment() {
         return ring.getActive();
+    }
+
+    /**
+     * Append the payload, blocking up to {@link #appendDeadlineNanos} when
+     * the cursor ring is at its memory/disk cap and waiting for ACK-driven
+     * trim to free space. Returns the assigned FSN on success.
+     * <p>
+     * Backpressure is surfaced two ways:
+     * <ul>
+     *   <li>{@link #getTotalBackpressureStalls()} counter — incremented once
+     *       per blocking-call that had to wait for the manager.</li>
+     *   <li>WARN log throttled to one line per
+     *       {@link #BACKPRESSURE_LOG_THROTTLE_NANOS} of sustained
+     *       backpressure, so ops can correlate slow flushes to the cap.</li>
+     * </ul>
+     * Throws {@link io.questdb.client.cutlass.line.LineSenderException} when
+     * the deadline expires — silent unbounded blocking would mask "wire path
+     * is wedged" failures (server down, slow disk, etc.) from the user.
+     */
+    public long appendBlocking(long payloadAddr, int payloadLen) {
+        long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
+        if (fsn >= 0) return fsn;
+        if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
+            throw new MmapSegmentException("payload too large for segment");
+        }
+        // First miss → record one stall (not one per spin) and start the
+        // deadline clock.
+        backpressureStallCount.incrementAndGet();
+        long deadlineNs = System.nanoTime() + appendDeadlineNanos;
+        while (true) {
+            long now = System.nanoTime();
+            if (now >= deadlineNs) {
+                throw new io.questdb.client.cutlass.line.LineSenderException(
+                        "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
+                        .put(" ms — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)");
+            }
+            if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
+                lastBackpressureLogNs = now;
+                LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O drain — will throw after {} ms",
+                        backpressureStallCount.get(), appendDeadlineNanos / 1_000_000L);
+            }
+            LockSupport.parkNanos(50_000L); // 50 µs
+            fsn = ring.appendOrFsn(payloadAddr, payloadLen);
+            if (fsn >= 0) return fsn;
+            if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
+                throw new MmapSegmentException("payload too large for segment");
+            }
+        }
     }
 
     /**
@@ -315,7 +375,7 @@ public final class CursorSendEngine implements QuietCloseable {
             // slot again, and the cycle repeats forever (M6).
             boolean fullyDrained = sfDir != null
                     && (ring.publishedFsn() < 0
-                            || ring.ackedFsn() >= ring.publishedFsn());
+                    || ring.ackedFsn() >= ring.publishedFsn());
             manager.deregister(ring);
             if (ownsManager) {
                 manager.close();
@@ -333,6 +393,84 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
             }
         }
+    }
+
+    /**
+     * Pass-through to {@link SegmentRing#findSegmentContaining(long)}.
+     */
+    public MmapSegment findSegmentContaining(long fsn) {
+        return ring.findSegmentContaining(fsn);
+    }
+
+    /**
+     * Pass-through to {@link SegmentRing#firstSealed()}.
+     */
+    public MmapSegment firstSealed() {
+        return ring.firstSealed();
+    }
+
+    /**
+     * Number of times {@link #appendBlocking} hit
+     * {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
+     * had to wait for the segment manager (or for ACKs) to free space.
+     * One increment per blocking-call, not per spin-park. Cumulative.
+     */
+    public long getTotalBackpressureStalls() {
+        return backpressureStallCount.get();
+    }
+
+    /**
+     * Pass-through to {@link SegmentRing#nextSealedAfter(MmapSegment)}.
+     */
+    public MmapSegment nextSealedAfter(MmapSegment current) {
+        return ring.nextSealedAfter(current);
+    }
+
+    /**
+     * I/O thread accessor: highest FSN whose frame is fully written.
+     */
+    public long publishedFsn() {
+        return ring.publishedFsn();
+    }
+
+    /**
+     * I/O thread accessor: sealed segments waiting to drain. Direct view —
+     * NOT thread-safe under producer-thread rotation. The I/O loop should
+     * use {@link #sealedSegmentsSnapshot(MmapSegment[])} instead.
+     */
+    public ObjList<MmapSegment> sealedSegments() {
+        return ring.getSealedSegments();
+    }
+
+    /**
+     * Thread-safe snapshot pass-through to
+     * {@link SegmentRing#snapshotSealedSegments(MmapSegment[])}. Returns
+     * the count copied, or -1 if the buffer is too small.
+     */
+    public int sealedSegmentsSnapshot(MmapSegment[] target) {
+        return ring.snapshotSealedSegments(target);
+    }
+
+    /**
+     * Configured per-segment size in bytes.
+     */
+    public long segmentSizeBytes() {
+        return segmentSizeBytes;
+    }
+
+    public String sfDir() {
+        return sfDir;
+    }
+
+    /**
+     * True when this engine opened against a pre-existing on-disk slot
+     * (i.e. {@code SegmentRing.openExisting} returned a non-null ring at
+     * construction). Memory-mode engines and fresh-disk engines return
+     * false. Used by the sender to decide whether to mark schema state as
+     * needing a reset before the first send.
+     */
+    public boolean wasRecoveredFromDisk() {
+        return recoveredFromDisk;
     }
 
     /**
@@ -367,121 +505,5 @@ public final class CursorSendEngine implements QuietCloseable {
         } finally {
             io.questdb.client.std.Files.findClose(find);
         }
-    }
-
-    /**
-     * True when this engine opened against a pre-existing on-disk slot
-     * (i.e. {@code SegmentRing.openExisting} returned a non-null ring at
-     * construction). Memory-mode engines and fresh-disk engines return
-     * false. Used by the sender to decide whether to mark schema state as
-     * needing a reset before the first send.
-     */
-    public boolean wasRecoveredFromDisk() {
-        return recoveredFromDisk;
-    }
-
-    /** I/O thread accessor: highest FSN whose frame is fully written. */
-    public long publishedFsn() {
-        return ring.publishedFsn();
-    }
-
-    /**
-     * I/O thread accessor: sealed segments waiting to drain. Direct view —
-     * NOT thread-safe under producer-thread rotation. The I/O loop should
-     * use {@link #sealedSegmentsSnapshot(MmapSegment[])} instead.
-     */
-    public io.questdb.client.std.ObjList<MmapSegment> sealedSegments() {
-        return ring.getSealedSegments();
-    }
-
-    /**
-     * Thread-safe snapshot pass-through to
-     * {@link SegmentRing#snapshotSealedSegments(MmapSegment[])}. Returns
-     * the count copied, or -1 if the buffer is too small.
-     */
-    public int sealedSegmentsSnapshot(MmapSegment[] target) {
-        return ring.snapshotSealedSegments(target);
-    }
-
-    /** Pass-through to {@link SegmentRing#nextSealedAfter(MmapSegment)}. */
-    public MmapSegment nextSealedAfter(MmapSegment current) {
-        return ring.nextSealedAfter(current);
-    }
-
-    /** Pass-through to {@link SegmentRing#firstSealed()}. */
-    public MmapSegment firstSealed() {
-        return ring.firstSealed();
-    }
-
-    /** Pass-through to {@link SegmentRing#findSegmentContaining(long)}. */
-    public MmapSegment findSegmentContaining(long fsn) {
-        return ring.findSegmentContaining(fsn);
-    }
-
-    /** Configured per-segment size in bytes. */
-    public long segmentSizeBytes() {
-        return segmentSizeBytes;
-    }
-
-    public String sfDir() {
-        return sfDir;
-    }
-
-    /**
-     * Append the payload, blocking up to {@link #appendDeadlineNanos} when
-     * the cursor ring is at its memory/disk cap and waiting for ACK-driven
-     * trim to free space. Returns the assigned FSN on success.
-     * <p>
-     * Backpressure is surfaced two ways:
-     * <ul>
-     *   <li>{@link #getTotalBackpressureStalls()} counter — incremented once
-     *       per blocking-call that had to wait for the manager.</li>
-     *   <li>WARN log throttled to one line per
-     *       {@link #BACKPRESSURE_LOG_THROTTLE_NANOS} of sustained
-     *       backpressure, so ops can correlate slow flushes to the cap.</li>
-     * </ul>
-     * Throws {@link io.questdb.client.cutlass.line.LineSenderException} when
-     * the deadline expires — silent unbounded blocking would mask "wire path
-     * is wedged" failures (server down, slow disk, etc.) from the user.
-     */
-    public long appendBlocking(long payloadAddr, int payloadLen) {
-        long fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-        if (fsn >= 0) return fsn;
-        if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
-            throw new MmapSegmentException("payload too large for segment");
-        }
-        // First miss → record one stall (not one per spin) and start the
-        // deadline clock.
-        backpressureStallCount.incrementAndGet();
-        long deadlineNs = System.nanoTime() + appendDeadlineNanos;
-        while (true) {
-            long now = System.nanoTime();
-            if (now >= deadlineNs) {
-                throw new io.questdb.client.cutlass.line.LineSenderException(
-                        "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
-                        .put(" ms — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)");
-            }
-            if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
-                lastBackpressureLogNs = now;
-                LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O drain — will throw after {} ms",
-                        backpressureStallCount.get(), appendDeadlineNanos / 1_000_000L);
-            }
-            LockSupport.parkNanos(50_000L); // 50 µs
-            fsn = ring.appendOrFsn(payloadAddr, payloadLen);
-            if (fsn >= 0) return fsn;
-            if (fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
-                throw new MmapSegmentException("payload too large for segment");
-            }
-        }
-    }
-
-    /**
-     * Number of times {@link #appendBlocking} hit
-     * {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
-     * had to wait for the segment manager (or for ACKs) to free space.
-     * One increment per blocking-call, not per spin-park. Cumulative.
-     */
-    public long getTotalBackpressureStalls() {
-        return backpressureStallCount.get();
     }
 }

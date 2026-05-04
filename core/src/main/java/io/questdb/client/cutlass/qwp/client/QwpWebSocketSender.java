@@ -28,6 +28,7 @@ import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
+import io.questdb.client.SenderProgressHandler;
 import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
@@ -38,7 +39,9 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.CharSequenceObjHashMap;
@@ -120,6 +123,7 @@ public class QwpWebSocketSender implements Sender {
     private final long autoFlushIntervalNanos;
     // Auto-flush configuration
     private final int autoFlushRows;
+    private final MicrobatchBuffer buffer1;
     private final AtomicReference<LineSenderException> connectionError = new AtomicReference<>();
     private final Decimal256 currentDecimal256 = new Decimal256();
     // Encoder for QWP v1 messages
@@ -136,52 +140,39 @@ public class QwpWebSocketSender implements Sender {
     private MicrobatchBuffer activeBuffer;
     // Double-buffering for async I/O
     private MicrobatchBuffer buffer0;
-    private final MicrobatchBuffer buffer1;
     // Cached column references to avoid repeated hashmap lookups
     private QwpTableBuffer.ColumnBuffer cachedTimestampColumn;
     private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
     // WebSocket client (zero-GC native implementation)
     private WebSocketClient client;
+    // close() drain timeout in millis. Default applied at construction.
+    // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
+    // up to this many millis for ackedFsn to catch up to publishedFsn.
+    private long closeFlushTimeoutMillis = 5_000L;
     private boolean closed;
     private boolean connected;
     // Track max global symbol ID used in current batch (for delta calculation)
     private int currentBatchMaxSymbolId = -1;
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
-    private long firstPendingRowTimeNanos;
-    private boolean gorillaEnabled = true;
-    private int maxSentSchemaId = -1;
-    // Track the highest symbol ID sent to server (for delta encoding)
-    // Once sent over TCP, server is guaranteed to receive it (or connection dies)
-    private int maxSentSymbolId = -1;
-    private int nextSchemaId;
-    private long pendingBytes;
-    private int pendingRowCount;
-    private boolean requestDurableAck;
     // Cursor SF engine: the producer (user thread) writes encoded QWP frames
     // into the engine's mmap'd ring; the cursorSendLoop is the I/O thread
     // that walks the ring and sends frames.
     private CursorSendEngine cursorEngine;
-    private boolean ownsCursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
+    // Orphan-slot drainer pool. Non-null only when the builder requested
+    // drain_orphans=true AND we have a slot path to scan against. Closed
+    // alongside the cursor send loop in close().
+    private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool
+            drainerPool;
+    private SenderErrorDispatcher errorDispatcher;
     // Async-delivery sink for SenderError notifications. Default-constructed
     // here with the loud-not-silent default handler; a builder hook can swap
     // this before connect() runs.
     private SenderErrorHandler errorHandler = DefaultSenderErrorHandler.INSTANCE;
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
-    private SenderErrorDispatcher errorDispatcher;
-    // close() drain timeout in millis. Default applied at construction.
-    // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
-    // up to this many millis for ackedFsn to catch up to publishedFsn.
-    private long closeFlushTimeoutMillis = 5_000L;
-    // Reconnect policy. Defaults match CursorWebSocketSendLoop's per-spec
-    // values; Sender.build can override via the new connect overload.
-    private long reconnectMaxDurationMillis =
-            CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
-    private long reconnectInitialBackoffMillis =
-            CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
-    private long reconnectMaxBackoffMillis =
-            CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS;
+    private long firstPendingRowTimeNanos;
+    private boolean gorillaEnabled = true;
     // OFF   → startup connect failure is immediately terminal (default).
     // SYNC  → startup connect goes through the same retry-with-backoff
     //         loop as in-flight reconnect; auth failures still terminal.
@@ -191,11 +182,28 @@ public class QwpWebSocketSender implements Sender {
     //         to the SenderError dispatcher rather than thrown from the
     //         constructor.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
-    // Orphan-slot drainer pool. Non-null only when the builder requested
-    // drain_orphans=true AND we have a slot path to scan against. Closed
-    // alongside the cursor send loop in close().
-    private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool
-            drainerPool;
+    private int maxSentSchemaId = -1;
+    // Track the highest symbol ID sent to server (for delta encoding)
+    // Once sent over TCP, server is guaranteed to receive it (or connection dies)
+    private int maxSentSymbolId = -1;
+    private int nextSchemaId;
+    private boolean ownsCursorEngine;
+    private long pendingBytes;
+    private int pendingRowCount;
+    private SenderProgressDispatcher progressDispatcher;
+    // Async-delivery sink for ack-watermark advances. Default no-op; a
+    // setProgressHandler call before connect() swaps in a real handler.
+    private SenderProgressHandler progressHandler = DefaultSenderProgressHandler.INSTANCE;
+    private int progressInboxCapacity = SenderProgressDispatcher.DEFAULT_CAPACITY;
+    private long reconnectInitialBackoffMillis =
+            CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
+    private long reconnectMaxBackoffMillis =
+            CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS;
+    // Reconnect policy. Defaults match CursorWebSocketSendLoop's per-spec
+    // values; Sender.build can override via the new connect overload.
+    private long reconnectMaxDurationMillis =
+            CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
+    private boolean requestDurableAck;
 
     private QwpWebSocketSender(
             String host,
@@ -709,20 +717,25 @@ public class QwpWebSocketSender implements Sender {
                 // and from connect() rollback paths where one or both may be null.
                 if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
                     // 1) Flush user-thread state into the engine (encoded
-                    //    rows → mmap'd / malloc'd ring). After this, the
+                    //    rows -> mmap'd / malloc'd ring). After this, the
                     //    cursor engine's publishedFsn reflects the final
                     //    target the I/O loop must drive ackedFsn up to.
                     flushPendingRows();
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
-                    cursorSendLoop.checkError();
                     // 2) Bounded drain: block until the server has ACK'd
                     //    everything we just published, or until the
                     //    configured timeout elapses. closeFlushTimeoutMillis
                     //    <= 0 opts out (fast close, may lose memory-mode
-                    //    data on JVM exit).
-                    drainOnClose();
+                    //    data on JVM exit, and skips synchronous propagation
+                    //    of any latched terminal error -- users who opt out
+                    //    are expected to observe outcomes via the async
+                    //    progress/error callbacks instead).
+                    if (closeFlushTimeoutMillis > 0L) {
+                        cursorSendLoop.checkError();
+                        drainOnClose();
+                    }
                 }
             } catch (Throwable t) {
                 terminalError = t;
@@ -823,6 +836,14 @@ public class QwpWebSocketSender implements Sender {
                     errorDispatcher.close();
                 } catch (Throwable t) {
                     LOG.error("Error closing error dispatcher: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
+            }
+            if (progressDispatcher != null) {
+                try {
+                    progressDispatcher.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing progress dispatcher: {}", String.valueOf(t));
                     terminalError = captureCloseError(terminalError, t);
                 }
             }
@@ -1104,6 +1125,63 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Snapshot of drainers the foreground sender has dispatched. Useful
+     * for monitoring orphan-drain progress without parsing logs.
+     */
+    public ObjList<BackgroundDrainer>
+    getBackgroundDrainers() {
+        if (drainerPool == null) return new ObjList<>(0);
+        return drainerPool.snapshot();
+    }
+
+    /**
+     * Errors lost because the user handler was too slow to drain the bounded
+     * inbox. Non-zero means the handler is misbehaving or the server is
+     * dumping rejections faster than the handler can absorb. Visible to ops.
+     */
+    public long getDroppedErrorNotifications() {
+        SenderErrorDispatcher d = errorDispatcher;
+        return d == null ? 0L : d.getDroppedNotifications();
+    }
+
+    /**
+     * Progress notifications dropped due to inbox overflow. Non-zero is
+     * tolerable on this path (the next delivered FSN supersedes any drop)
+     * but signals handler latency for ops dashboards.
+     */
+    public long getDroppedProgressNotifications() {
+        SenderProgressDispatcher d = progressDispatcher;
+        return d == null ? 0L : d.getDroppedNotifications();
+    }
+
+    /**
+     * Snapshot of the typed payload for the latched terminal server-rejection error,
+     * or {@code null} if the I/O loop has not latched a server-rejection terminal
+     * (initial state, or only a wire-level failure has been latched). Read-only —
+     * intended for ops dashboards and post-mortem inspection.
+     */
+    public SenderError getLastTerminalError() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? null : l.getLastTerminalServerError();
+    }
+
+    /**
+     * Test accessor: highest schema ID confirmed sent on the current connection.
+     */
+    @TestOnly
+    public int getMaxSentSchemaIdForTest() {
+        return maxSentSchemaId;
+    }
+
+    /**
+     * Test accessor: highest symbol ID confirmed sent on the current connection.
+     */
+    @TestOnly
+    public int getMaxSentSymbolIdForTest() {
+        return maxSentSymbolId;
+    }
+
+    /**
      * Registers a symbol value in the global dictionary and returns its global ID.
      * Called from {@link QwpTableBuffer.ColumnBuffer#addSymbol(CharSequence)}.
      *
@@ -1126,63 +1204,24 @@ public class QwpWebSocketSender implements Sender {
         return pendingRowCount;
     }
 
+    @TestOnly
+    public QwpTableBuffer getTableBuffer(String tableName) {
+        QwpTableBuffer buffer = tableBuffers.get(tableName);
+        if (buffer == null) {
+            buffer = new QwpTableBuffer(tableName, this);
+            tableBuffers.put(tableName, buffer);
+        }
+        currentTableBuffer = buffer;
+        currentTableName = tableName;
+        return buffer;
+    }
+
     /**
-     * Number of reconnect attempts the cursor I/O loop has issued —
-     * succeeded plus failed. Diverges from {@link #getTotalReconnectsSucceeded}
-     * when the server is flapping. Returns 0 if no I/O loop is running.
+     * Total binary frames whose ACKs have been received and applied.
      */
-    public long getTotalReconnectAttempts() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalReconnectAttempts();
-    }
-
-    /** Number of successful reconnects. Returns 0 if no I/O loop is running. */
-    public long getTotalReconnectsSucceeded() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalReconnects();
-    }
-
-    /** Total binary frames the cursor I/O loop has issued to the wire. */
-    public long getTotalFramesSent() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalFramesSent();
-    }
-
-    /** Total binary frames whose ACKs have been received and applied. */
     public long getTotalAcks() {
         CursorWebSocketSendLoop l = cursorSendLoop;
         return l == null ? 0L : l.getTotalAcks();
-    }
-
-    /**
-     * Snapshot of the typed payload for the latched terminal server-rejection error,
-     * or {@code null} if the I/O loop has not latched a server-rejection terminal
-     * (initial state, or only a wire-level failure has been latched). Read-only —
-     * intended for ops dashboards and post-mortem inspection.
-     */
-    public SenderError getLastTerminalError() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? null : l.getLastTerminalServerError();
-    }
-
-    /**
-     * Total errors observed by the I/O loop (DROP and HALT combined).
-     * Diverges from {@link #getDroppedErrorNotifications()} which counts only
-     * notifications dropped due to inbox overflow.
-     */
-    public long getTotalServerErrors() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalServerErrors();
-    }
-
-    /**
-     * Errors lost because the user handler was too slow to drain the bounded
-     * inbox. Non-zero means the handler is misbehaving or the server is
-     * dumping rejections faster than the handler can absorb. Visible to ops.
-     */
-    public long getDroppedErrorNotifications() {
-        SenderErrorDispatcher d = errorDispatcher;
-        return d == null ? 0L : d.getDroppedNotifications();
     }
 
     /**
@@ -1196,73 +1235,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Configure the user-supplied error handler. Must be called before
-     * {@code connect()}; later changes have no effect because the dispatcher
-     * binds the handler at startup. Pass {@code null} to revert to the
-     * loud-not-silent default.
-     */
-    public void setErrorHandler(SenderErrorHandler handler) {
-        this.errorHandler = handler != null ? handler : DefaultSenderErrorHandler.INSTANCE;
-    }
-
-    /**
-     * Configure the bounded inbox capacity used by the dispatcher. Must be
-     * called before {@code connect()}; later changes have no effect.
-     */
-    public void setErrorInboxCapacity(int capacity) {
-        if (capacity < 1) {
-            throw new IllegalArgumentException("errorInboxCapacity must be >= 1, was " + capacity);
-        }
-        this.errorInboxCapacity = capacity;
-    }
-
-    /**
-     * Starts orphan drainers for the given list of slot paths. Each path
-     * gets its own drainer thread, capped at {@code maxBackgroundDrainers}
-     * concurrent. Drainers run until the slot is fully drained or a
-     * terminal error occurs (then they drop a {@code .failed} sentinel).
-     * <p>
-     * Should be called once, immediately after {@code connect()} returns.
-     * Subsequent calls add more drainers to the same pool.
-     */
-    public synchronized void startOrphanDrainers(
-            io.questdb.client.std.ObjList<String> orphanSlotPaths,
-            int maxBackgroundDrainers,
-            long segmentSizeBytes,
-            long sfMaxTotalBytes
-    ) {
-        if (orphanSlotPaths == null || orphanSlotPaths.size() == 0
-                || maxBackgroundDrainers <= 0) {
-            return;
-        }
-        if (drainerPool == null) {
-            drainerPool = new io.questdb.client.cutlass.qwp.client.sf.cursor
-                    .BackgroundDrainerPool(maxBackgroundDrainers);
-        }
-        for (int i = 0, n = orphanSlotPaths.size(); i < n; i++) {
-            String slot = orphanSlotPaths.get(i);
-            io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
-                    new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
-                            slot, segmentSizeBytes, sfMaxTotalBytes,
-                            this::buildAndConnect,
-                            reconnectMaxDurationMillis,
-                            reconnectInitialBackoffMillis,
-                            reconnectMaxBackoffMillis);
-            drainerPool.submit(drainer);
-        }
-    }
-
-    /**
-     * Snapshot of drainers the foreground sender has dispatched. Useful
-     * for monitoring orphan-drain progress without parsing logs.
-     */
-    public ObjList<BackgroundDrainer>
-            getBackgroundDrainers() {
-        if (drainerPool == null) return new ObjList<>(0);
-        return drainerPool.snapshot();
-    }
-
-    /**
      * Frames re-sent on the post-reconnect catch-up window — i.e. frames
      * whose FSN was already on the wire before the drop. Useful for
      * verifying replay actually re-emitted the unacked tail.
@@ -1272,28 +1244,50 @@ public class QwpWebSocketSender implements Sender {
         return l == null ? 0L : l.getTotalFramesReplayed();
     }
 
-    /** Test accessor: highest schema ID confirmed sent on the current connection. */
-    @TestOnly
-    public int getMaxSentSchemaIdForTest() {
-        return maxSentSchemaId;
+    /**
+     * Total binary frames the cursor I/O loop has issued to the wire.
+     */
+    public long getTotalFramesSent() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalFramesSent();
     }
 
-    /** Test accessor: highest symbol ID confirmed sent on the current connection. */
-    @TestOnly
-    public int getMaxSentSymbolIdForTest() {
-        return maxSentSymbolId;
+    /**
+     * Progress notifications successfully delivered to the user handler.
+     * Strictly increases over the lifetime of a sender; useful as an ops
+     * heartbeat for "is the I/O loop progressing".
+     */
+    public long getTotalProgressNotificationsDelivered() {
+        SenderProgressDispatcher d = progressDispatcher;
+        return d == null ? 0L : d.getTotalDelivered();
     }
 
-    @TestOnly
-    public QwpTableBuffer getTableBuffer(String tableName) {
-        QwpTableBuffer buffer = tableBuffers.get(tableName);
-        if (buffer == null) {
-            buffer = new QwpTableBuffer(tableName, this);
-            tableBuffers.put(tableName, buffer);
-        }
-        currentTableBuffer = buffer;
-        currentTableName = tableName;
-        return buffer;
+    /**
+     * Number of reconnect attempts the cursor I/O loop has issued —
+     * succeeded plus failed. Diverges from {@link #getTotalReconnectsSucceeded}
+     * when the server is flapping. Returns 0 if no I/O loop is running.
+     */
+    public long getTotalReconnectAttempts() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalReconnectAttempts();
+    }
+
+    /**
+     * Number of successful reconnects. Returns 0 if no I/O loop is running.
+     */
+    public long getTotalReconnectsSucceeded() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalReconnects();
+    }
+
+    /**
+     * Total errors observed by the I/O loop (DROP and HALT combined).
+     * Diverges from {@link #getDroppedErrorNotifications()} which counts only
+     * notifications dropped due to inbox overflow.
+     */
+    public long getTotalServerErrors() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalServerErrors();
     }
 
     /**
@@ -1455,14 +1449,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Sets whether to use Gorilla timestamp encoding.
-     */
-    public void setGorillaEnabled(boolean enabled) {
-        this.gorillaEnabled = enabled;
-        this.encoder.setGorillaEnabled(enabled);
-    }
-
-    /**
      * Attach a {@link CursorSendEngine} for store-and-forward. Must be called
      * before the first send.
      */
@@ -1476,6 +1462,72 @@ public class QwpWebSocketSender implements Sender {
         }
         this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;
+    }
+
+    /**
+     * Configure the user-supplied error handler. May be called either before
+     * or after {@code connect()} — when called after, the change propagates
+     * to the live dispatcher and takes effect on the next delivery. Pass
+     * {@code null} to revert to the loud-not-silent default.
+     */
+    public void setErrorHandler(SenderErrorHandler handler) {
+        SenderErrorHandler effective = handler != null ? handler : DefaultSenderErrorHandler.INSTANCE;
+        this.errorHandler = effective;
+        SenderErrorDispatcher d = errorDispatcher;
+        if (d != null) {
+            d.setHandler(effective);
+        }
+    }
+
+    /**
+     * Configure the bounded inbox capacity used by the dispatcher. Must be
+     * called before {@code connect()}; later changes have no effect.
+     */
+    public void setErrorInboxCapacity(int capacity) {
+        if (capacity < 1) {
+            throw new IllegalArgumentException("errorInboxCapacity must be >= 1, was " + capacity);
+        }
+        this.errorInboxCapacity = capacity;
+    }
+
+    /**
+     * Sets whether to use Gorilla timestamp encoding.
+     */
+    public void setGorillaEnabled(boolean enabled) {
+        this.gorillaEnabled = enabled;
+        this.encoder.setGorillaEnabled(enabled);
+    }
+
+    /**
+     * Register an async observer for ack-watermark advances. May be called
+     * either before or after {@code connect()} — post-connect changes
+     * propagate to the live dispatcher and take effect on the next delivery.
+     * Pass {@code null} to revert to the no-op default.
+     *
+     * <p>The handler is invoked on a dedicated daemon dispatcher thread, not
+     * on the I/O thread or the producer thread — slow handlers cannot stall
+     * publishing. Multiple deliveries are permitted across the lifetime of a
+     * sender, with monotonically-increasing FSNs; see
+     * {@link SenderProgressHandler}.
+     */
+    public void setProgressHandler(SenderProgressHandler handler) {
+        SenderProgressHandler effective = handler != null ? handler : DefaultSenderProgressHandler.INSTANCE;
+        this.progressHandler = effective;
+        SenderProgressDispatcher d = progressDispatcher;
+        if (d != null) {
+            d.setHandler(effective);
+        }
+    }
+
+    /**
+     * Configure the bounded inbox capacity for the progress dispatcher. Must
+     * be called before {@code connect()}; later changes have no effect.
+     */
+    public void setProgressInboxCapacity(int capacity) {
+        if (capacity < 1) {
+            throw new IllegalArgumentException("progressInboxCapacity must be >= 1, was " + capacity);
+        }
+        this.progressInboxCapacity = capacity;
     }
 
     /**
@@ -1498,6 +1550,42 @@ public class QwpWebSocketSender implements Sender {
             throw e;
         }
         return this;
+    }
+
+    /**
+     * Starts orphan drainers for the given list of slot paths. Each path
+     * gets its own drainer thread, capped at {@code maxBackgroundDrainers}
+     * concurrent. Drainers run until the slot is fully drained or a
+     * terminal error occurs (then they drop a {@code .failed} sentinel).
+     * <p>
+     * Should be called once, immediately after {@code connect()} returns.
+     * Subsequent calls add more drainers to the same pool.
+     */
+    public synchronized void startOrphanDrainers(
+            io.questdb.client.std.ObjList<String> orphanSlotPaths,
+            int maxBackgroundDrainers,
+            long segmentSizeBytes,
+            long sfMaxTotalBytes
+    ) {
+        if (orphanSlotPaths == null || orphanSlotPaths.size() == 0
+                || maxBackgroundDrainers <= 0) {
+            return;
+        }
+        if (drainerPool == null) {
+            drainerPool = new io.questdb.client.cutlass.qwp.client.sf.cursor
+                    .BackgroundDrainerPool(maxBackgroundDrainers);
+        }
+        for (int i = 0, n = orphanSlotPaths.size(); i < n; i++) {
+            String slot = orphanSlotPaths.get(i);
+            io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
+                    new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
+                            slot, segmentSizeBytes, sfMaxTotalBytes,
+                            this::buildAndConnect,
+                            reconnectMaxDurationMillis,
+                            reconnectInitialBackoffMillis,
+                            reconnectMaxBackoffMillis);
+            drainerPool.submit(drainer);
+        }
     }
 
     @Override
@@ -1638,6 +1726,34 @@ public class QwpWebSocketSender implements Sender {
         return l != null && l.hasEverConnected();
     }
 
+    private static Throwable captureCloseError(Throwable terminalError, Throwable t) {
+        if (terminalError == null) {
+            return t;
+        }
+        if (terminalError != t) {
+            terminalError.addSuppressed(t);
+        }
+        return terminalError;
+    }
+
+    private static void rethrowTerminal(Throwable t) {
+        if (t == null) {
+            return;
+        }
+        if (t instanceof RuntimeException) {
+            throw (RuntimeException) t;
+        }
+        if (t instanceof Error) {
+            throw (Error) t;
+        }
+        // Wrap any checked Throwable so close() stays declared without a
+        // throws clause. flush/drain only ever raises RuntimeException
+        // subclasses today, but defending against future changes here is
+        // cheaper than chasing a leaked checked throw later. Pass the
+        // original as cause so the stack trace and chained causes survive.
+        throw new LineSenderException("close failed: " + t.getMessage(), t);
+    }
+
     private void atMicros(long timestampMicros) {
         // Add designated timestamp column (empty name for designated timestamp)
         // Use cached reference to avoid hashmap lookup per row
@@ -1658,11 +1774,47 @@ public class QwpWebSocketSender implements Sender {
         sendRow();
     }
 
-    private void checkNotClosed() {
-        if (closed) {
-            throw new LineSenderException("Sender is closed");
+    /**
+     * Build and connect a fresh WebSocket client using the sender's
+     * persistent config (host/port/TLS/auth/durable-ack flag). Used both
+     * for the initial connect and as the reconnect factory passed to the
+     * cursor I/O loop. Throws {@link LineSenderException} on any failure
+     * — the I/O loop's reconnect path treats a throw as fatal for that
+     * attempt (and, in the follow-up commit, schedules a backoff retry
+     * within the per-outage time cap).
+     */
+    private WebSocketClient buildAndConnect() {
+        WebSocketClient newClient;
+        if (tlsConfig != null) {
+            newClient = WebSocketClientFactory.newTlsInstance(tlsConfig);
+        } else {
+            newClient = WebSocketClientFactory.newPlainTextInstance();
         }
-        checkConnectionError();
+        try {
+            newClient.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
+            newClient.setQwpClientId(QwpConstants.CLIENT_ID);
+            newClient.setQwpRequestDurableAck(requestDurableAck);
+            newClient.connect(host, port);
+            newClient.upgrade(WRITE_PATH, authorizationHeader);
+        } catch (Exception e) {
+            newClient.close();
+            throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
+        }
+        // Fail at connect when the user opted into durable acks but landed on
+        // a server that did not echo the X-QWP-Durable-Ack: enabled confirmation.
+        // Without this check, store-and-forward would never receive trim signals
+        // and the on-disk store would grow unbounded -- silent storage exhaustion
+        // is a worse outcome than a loud connect-time failure.
+        if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
+            newClient.close();
+            throw new LineSenderException(
+                    "server does not support durable ack [host=" + host + ", port=" + port
+                            + "]. The client opted in via request_durable_ack=on but the server "
+                            + "did not echo X-QWP-Durable-Ack: enabled in the upgrade response. "
+                            + "Either disable request_durable_ack or connect to a server with "
+                            + "primary replication configured.");
+        }
+        return newClient;
     }
 
     private void checkConnectionError() {
@@ -1686,9 +1838,67 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    private void checkNotClosed() {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        checkConnectionError();
+    }
+
     private void checkTableSelected() {
         if (currentTableBuffer == null) {
             throw new LineSenderException("table() must be called before adding columns");
+        }
+    }
+
+    private int countNonEmptyTables(ObjList<CharSequence> keys) {
+        int tableCount = 0;
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
+                tableCount++;
+            }
+        }
+        return tableCount;
+    }
+
+    /**
+     * Bounded drain on close: block until {@code ackedFsn >= publishedFsn}
+     * or until {@code closeFlushTimeoutMillis} elapses. {@code <= 0} skips
+     * the drain (fast close). On timeout, throw a {@link LineSenderException}
+     * so the caller cannot silently lose data — close() collects the
+     * exception, finishes shutdown, and rethrows it from close() itself.
+     * SF-mode users can recover the unacked tail by reopening a sender on
+     * the same SF directory; memory-mode users have no recovery path and
+     * must treat this as fatal.
+     */
+    private void drainOnClose() {
+        if (closeFlushTimeoutMillis <= 0L) {
+            return;
+        }
+        long target = cursorEngine.publishedFsn();
+        if (cursorEngine.ackedFsn() >= target) {
+            return;
+        }
+        long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
+        while (cursorEngine.ackedFsn() < target) {
+            cursorSendLoop.checkError();
+            if (System.nanoTime() >= deadlineNanos) {
+                long acked = cursorEngine.ackedFsn();
+                LOG.warn("close() drain timed out after {}ms [target={} acked={}] — pending data may be lost",
+                        closeFlushTimeoutMillis, target, acked);
+                throw new LineSenderException("close() drain timed out after ")
+                        .put(closeFlushTimeoutMillis).put(" ms [publishedFsn=")
+                        .put(target).put(", ackedFsn=").put(acked)
+                        .put("] - server did not acknowledge ")
+                        .put(target - acked)
+                        .put(" pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)");
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }
     }
 
@@ -1776,6 +1986,14 @@ public class QwpWebSocketSender implements Sender {
                 errorDispatcher = new SenderErrorDispatcher(errorHandler, errorInboxCapacity);
             }
             cursorSendLoop.setErrorDispatcher(errorDispatcher);
+            // Symmetric progress dispatcher: lazy-allocated mirror of the
+            // error path. Wired before start() for the same reason -- the
+            // I/O thread should never observe a null dispatcher between
+            // an ack arrival and the notify call.
+            if (progressDispatcher == null) {
+                progressDispatcher = new SenderProgressDispatcher(progressHandler, progressInboxCapacity);
+            }
+            cursorSendLoop.setProgressDispatcher(progressDispatcher);
             cursorSendLoop.start();
         } catch (Throwable t) {
             if (client != null) {
@@ -1809,49 +2027,6 @@ public class QwpWebSocketSender implements Sender {
         connected = true;
     }
 
-    /**
-     * Build and connect a fresh WebSocket client using the sender's
-     * persistent config (host/port/TLS/auth/durable-ack flag). Used both
-     * for the initial connect and as the reconnect factory passed to the
-     * cursor I/O loop. Throws {@link LineSenderException} on any failure
-     * — the I/O loop's reconnect path treats a throw as fatal for that
-     * attempt (and, in the follow-up commit, schedules a backoff retry
-     * within the per-outage time cap).
-     */
-    private WebSocketClient buildAndConnect() {
-        WebSocketClient newClient;
-        if (tlsConfig != null) {
-            newClient = WebSocketClientFactory.newTlsInstance(tlsConfig);
-        } else {
-            newClient = WebSocketClientFactory.newPlainTextInstance();
-        }
-        try {
-            newClient.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
-            newClient.setQwpClientId(QwpConstants.CLIENT_ID);
-            newClient.setQwpRequestDurableAck(requestDurableAck);
-            newClient.connect(host, port);
-            newClient.upgrade(WRITE_PATH, authorizationHeader);
-        } catch (Exception e) {
-            newClient.close();
-            throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
-        }
-        // Fail at connect when the user opted into durable acks but landed on
-        // a server that did not echo the X-QWP-Durable-Ack: enabled confirmation.
-        // Without this check, store-and-forward would never receive trim signals
-        // and the on-disk store would grow unbounded -- silent storage exhaustion
-        // is a worse outcome than a loud connect-time failure.
-        if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
-            newClient.close();
-            throw new LineSenderException(
-                    "server does not support durable ack [host=" + host + ", port=" + port
-                            + "]. The client opted in via request_durable_ack=on but the server "
-                            + "did not echo X-QWP-Durable-Ack: enabled in the upgrade response. "
-                            + "Either disable request_durable_ack or connect to a server with "
-                            + "primary replication configured.");
-        }
-        return newClient;
-    }
-
     private void ensureNoInProgressRow() {
         if (currentTableBuffer != null && currentTableBuffer.hasInProgressRow()) {
             throw new LineSenderException(
@@ -1859,10 +2034,6 @@ public class QwpWebSocketSender implements Sender {
                             + "Use sender.at(), sender.atNow(), or sender.cancelRow() first."
             );
         }
-    }
-
-    private boolean recordConnectionFailure(LineSenderException error) {
-        return connectionError.compareAndSet(null, error);
     }
 
     /**
@@ -1966,19 +2137,8 @@ public class QwpWebSocketSender implements Sender {
         return pendingBytes;
     }
 
-    private int countNonEmptyTables(ObjList<CharSequence> keys) {
-        int tableCount = 0;
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
-                tableCount++;
-            }
-        }
-        return tableCount;
+    private boolean recordConnectionFailure(LineSenderException error) {
+        return connectionError.compareAndSet(null, error);
     }
 
     private void resetSchemaStateForNewConnection() {
@@ -2007,70 +2167,6 @@ public class QwpWebSocketSender implements Sender {
                 tableBuffer.setSchemaId(-1);
             }
         }
-    }
-
-    /**
-     * Bounded drain on close: block until {@code ackedFsn >= publishedFsn}
-     * or until {@code closeFlushTimeoutMillis} elapses. {@code <= 0} skips
-     * the drain (fast close). On timeout, throw a {@link LineSenderException}
-     * so the caller cannot silently lose data — close() collects the
-     * exception, finishes shutdown, and rethrows it from close() itself.
-     * SF-mode users can recover the unacked tail by reopening a sender on
-     * the same SF directory; memory-mode users have no recovery path and
-     * must treat this as fatal.
-     */
-    private void drainOnClose() {
-        if (closeFlushTimeoutMillis <= 0L) {
-            return;
-        }
-        long target = cursorEngine.publishedFsn();
-        if (cursorEngine.ackedFsn() >= target) {
-            return;
-        }
-        long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
-        while (cursorEngine.ackedFsn() < target) {
-            cursorSendLoop.checkError();
-            if (System.nanoTime() >= deadlineNanos) {
-                long acked = cursorEngine.ackedFsn();
-                LOG.warn("close() drain timed out after {}ms [target={} acked={}] — pending data may be lost",
-                        closeFlushTimeoutMillis, target, acked);
-                throw new LineSenderException("close() drain timed out after ")
-                        .put(closeFlushTimeoutMillis).put(" ms [publishedFsn=")
-                        .put(target).put(", ackedFsn=").put(acked)
-                        .put("] - server did not acknowledge ")
-                        .put(target - acked)
-                        .put(" pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)");
-            }
-            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
-        }
-    }
-
-    private static Throwable captureCloseError(Throwable terminalError, Throwable t) {
-        if (terminalError == null) {
-            return t;
-        }
-        if (terminalError != t) {
-            terminalError.addSuppressed(t);
-        }
-        return terminalError;
-    }
-
-    private static void rethrowTerminal(Throwable t) {
-        if (t == null) {
-            return;
-        }
-        if (t instanceof RuntimeException) {
-            throw (RuntimeException) t;
-        }
-        if (t instanceof Error) {
-            throw (Error) t;
-        }
-        // Wrap any checked Throwable so close() stays declared without a
-        // throws clause. flush/drain only ever raises RuntimeException
-        // subclasses today, but defending against future changes here is
-        // cheaper than chasing a leaked checked throw later. Pass the
-        // original as cause so the stack trace and chained causes survive.
-        throw new LineSenderException("close failed: " + t.getMessage(), t);
     }
 
     private void rollbackRow() {

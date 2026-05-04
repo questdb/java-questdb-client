@@ -535,6 +535,52 @@ public class SegmentRingTest {
         });
     }
 
+    @Test
+    public void testMaxBytesPerSegmentReturnsConfiguredValue() throws Exception {
+        // Direct constructor path: the value passed in must round-trip through
+        // the accessor. SegmentManager seeds its totalBytes accounting from this
+        // (per-ring contribution = active + spare + sealed * maxBytesPerSegment),
+        // so a stale or rounded-down readback would silently mis-size the cap.
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
+            MmapSegment seg = MmapSegment.create(tmpDir + "/seg.sfa", 0, segSize);
+            try (SegmentRing ring = new SegmentRing(seg, segSize)) {
+                assertEquals(segSize, ring.maxBytesPerSegment());
+            }
+        });
+    }
+
+    @Test
+    public void testMaxBytesPerSegmentSurvivesOpenExisting() throws Exception {
+        // Recovery path: openExisting builds the ring from on-disk segments and
+        // forwards the supplied maxBytesPerSegment into the constructor. The
+        // accessor must report what the caller passed, not the file size of any
+        // particular segment (those can legitimately differ when the operator
+        // shrinks segment-size-bytes between sessions).
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment seg = MmapSegment.create(tmpDir + "/sf-00000.sfa", 0, segSize);
+                try {
+                    fillPattern(buf, 32, 0);
+                    assertTrue(seg.tryAppend(buf, 32) >= 0);
+                } finally {
+                    seg.close();
+                }
+
+                try (SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize)) {
+                    assertNotNull(recovered);
+                    assertEquals(segSize, recovered.maxBytesPerSegment());
+                }
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     private static void fillPattern(long addr, int len, int seed) {
         for (int i = 0; i < len; i++) {
             Unsafe.getUnsafe().putByte(addr + i, (byte) (seed * 31 + i + 17));

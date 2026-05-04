@@ -41,6 +41,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Unit tests for the durable-ack-driven trim path in {@link CursorWebSocketSendLoop}.
@@ -300,7 +301,7 @@ public class CursorWebSocketSendLoopDurableAckTest {
 
                 deliverOk(loop, 0, names("trades"), txns(7L));
                 // Inject a SCHEMA_MISMATCH NACK for wireSeq=1 (DROP_AND_CONTINUE).
-                deliverNack(loop, 1, WebSocketResponse.STATUS_SCHEMA_MISMATCH, "bad column");
+                deliverNack(loop, 1, "bad column");
                 deliverOk(loop, 2, names("trades"), txns(9L));
 
                 // No durable-ack yet -> head entry blocks both followers.
@@ -325,7 +326,7 @@ public class CursorWebSocketSendLoopDurableAckTest {
                 appendFrames(engine, 1);
                 CursorWebSocketSendLoop loop = newDurableLoop(engine);
                 setSentCount(loop, 1);
-                deliverNack(loop, 0, WebSocketResponse.STATUS_SCHEMA_MISMATCH, "bad column");
+                deliverNack(loop, 0, "bad column");
                 // NACK in durable mode calls drainPendingDurable directly because
                 // a head NACK is trivially durable with nothing else preceding.
                 assertEquals(0L, engine.ackedFsn());
@@ -363,6 +364,117 @@ public class CursorWebSocketSendLoopDurableAckTest {
                 deliverOk(loop, 0, names("trades"), txns(11L));
                 deliverDurableAck(loop, names("trades"), txns(11L));
                 assertEquals(1L, engine.ackedFsn());
+            }
+        });
+    }
+
+    @Test
+    public void testTotalDurableAcksDefaultModeIgnoresFrame() throws Exception {
+        // Default mode: a stray durable-ack frame is logged-and-dropped before
+        // the counter can increment. Spec: servers must not emit one without
+        // opt-in, but if they do, getTotalDurableAcks() stays at 0.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = newDefaultLoop(engine);
+                setSentCount(loop, 1);
+                deliverDurableAck(loop, names("anything"), txns(99L));
+                assertEquals("default mode never counts durable-acks",
+                        0L, loop.getTotalDurableAcks());
+                assertEquals(0L, loop.getTotalDurableTrimAdvances());
+            }
+        });
+    }
+
+    @Test
+    public void testTotalDurableAcksIncrementsPerFrame() throws Exception {
+        // Each STATUS_DURABLE_ACK frame received bumps the counter by exactly
+        // one, regardless of whether it advances trim. Three frames, two of
+        // which can't possibly cover anything (empty queue) -> still counts 3.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine);
+                setSentCount(loop, 1);
+
+                deliverDurableAck(loop, new String[0], new long[0]);
+                deliverDurableAck(loop, names("trades"), txns(5L));
+                deliverDurableAck(loop, names("orders"), txns(7L));
+
+                assertEquals(3L, loop.getTotalDurableAcks());
+            }
+        });
+    }
+
+    @Test
+    public void testTotalDurableCountersStartAtZero() throws Exception {
+        // Sanity baseline: a freshly-built loop reports zero for both counters
+        // in either mode, before any frames have been delivered.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop defaultLoop = newDefaultLoop(engine);
+                assertEquals(0L, defaultLoop.getTotalDurableAcks());
+                assertEquals(0L, defaultLoop.getTotalDurableTrimAdvances());
+            }
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop durableLoop = newDurableLoop(engine);
+                assertEquals(0L, durableLoop.getTotalDurableAcks());
+                assertEquals(0L, durableLoop.getTotalDurableTrimAdvances());
+            }
+        });
+    }
+
+    @Test
+    public void testTotalDurableTrimAdvancesIncrementsOnEnqueueDrain() throws Exception {
+        // A durable-ack that arrives before any OK only stashes watermarks; the
+        // queue is empty so drainPendingDurable observes nothing to pop and the
+        // trim-advance counter stays at 0. The next OK whose (table, seqTxn)
+        // is already covered drains immediately on enqueue -- THAT path bumps
+        // trimAdvances. End result: durableAcks=1, trimAdvances=1.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine);
+                setSentCount(loop, 1);
+
+                deliverDurableAck(loop, names("trades"), txns(50L));
+                assertEquals(1L, loop.getTotalDurableAcks());
+                assertEquals("empty queue means no trim advance yet",
+                        0L, loop.getTotalDurableTrimAdvances());
+
+                deliverOk(loop, 0, names("trades"), txns(50L));
+                assertEquals(1L, loop.getTotalDurableAcks());
+                assertEquals("on-enqueue drain bumps the trim counter",
+                        1L, loop.getTotalDurableTrimAdvances());
+            }
+        });
+    }
+
+    @Test
+    public void testTotalDurableTrimAdvancesIncrementsOnlyWhenQueueDrains() throws Exception {
+        // Two durable-acks delivered: the first only partially covers the head
+        // entry, so drainPendingDurable returns without popping -> trimAdvances
+        // stays at 0. The second covers the missing table -> one pop ->
+        // trimAdvances increments to 1. Both deliveries count against
+        // durableAcks (2 total), proving trimAdvances <= durableAcks.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine);
+                setSentCount(loop, 1);
+                deliverOk(loop, 0, names("trades", "orders"), txns(10L, 20L));
+
+                deliverDurableAck(loop, names("trades"), txns(10L));
+                assertEquals(1L, loop.getTotalDurableAcks());
+                assertEquals("partial coverage must not advance trim",
+                        0L, loop.getTotalDurableTrimAdvances());
+
+                deliverDurableAck(loop, names("orders"), txns(20L));
+                assertEquals(2L, loop.getTotalDurableAcks());
+                assertEquals("full coverage advances trim once",
+                        1L, loop.getTotalDurableTrimAdvances());
+                assertTrue("trimAdvances must stay bounded by durableAcks",
+                        loop.getTotalDurableTrimAdvances() <= loop.getTotalDurableAcks());
             }
         });
     }
@@ -459,8 +571,8 @@ public class CursorWebSocketSendLoopDurableAckTest {
         }
     }
 
-    private static void deliverNack(CursorWebSocketSendLoop loop, long wireSeq, byte status, String msg) throws Exception {
-        long packed = buildErrorPayload(wireSeq, status, msg);
+    private static void deliverNack(CursorWebSocketSendLoop loop, long wireSeq, String msg) throws Exception {
+        long packed = buildErrorPayload(wireSeq, WebSocketResponse.STATUS_SCHEMA_MISMATCH, msg);
         long ptr = packed & 0xFFFFFFFFFFFFL;
         int size = (int) (packed >>> 48);
         try {

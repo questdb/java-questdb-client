@@ -100,7 +100,7 @@ public final class SegmentRing implements QuietCloseable {
     // single unpark per active.
     private boolean wakeupRequestedForActive;
     private long nextSeq;
-    private volatile long publishedFsn = -1L;
+    private volatile long publishedFsn;
     // Set to true by close(); checked by installHotSpare under the ring's
     // monitor to reject spares that arrive after the ring has been torn
     // down. Without this, a manager's serviceRing tick that snapshotted
@@ -173,7 +173,7 @@ public final class SegmentRing implements QuietCloseable {
                 int rc = 1;
                 while (rc > 0) {
                     String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && name.endsWith(".sfa") && !".".equals(name) && !"..".equals(name)) {
+                    if (name != null && name.endsWith(".sfa")) {
                         String path = sfDir + "/" + name;
                         try {
                             MmapSegment seg = MmapSegment.openExisting(path);
@@ -304,15 +304,23 @@ public final class SegmentRing implements QuietCloseable {
      * the producer has actually written. If we didn't clamp, the segment
      * manager could trim segments the I/O thread is still iterating and SEGV
      * the JVM on the next {@code Unsafe.getInt} of an unmapped region.
+     *
+     * @return {@code true} if the watermark advanced, {@code false} on
+     *         no-op (idempotent re-ack or clamped). Callers wishing to fire
+     *         a one-shot side effect on advance only — e.g. dispatching to a
+     *         {@code SenderProgressHandler} — gate on the return value to
+     *         avoid emitting stale values.
      */
-    public void acknowledge(long seq) {
+    public boolean acknowledge(long seq) {
         long pub = publishedFsn;
         if (seq > pub) {
             seq = pub;
         }
         if (seq > ackedFsn) {
             ackedFsn = seq;
+            return true;
         }
+        return false;
     }
 
     /**

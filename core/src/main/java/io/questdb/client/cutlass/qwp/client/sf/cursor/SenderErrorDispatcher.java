@@ -75,7 +75,12 @@ public final class SenderErrorDispatcher implements QuietCloseable {
             SenderError.NO_STATUS_BYTE, null, SenderError.NO_MESSAGE_SEQUENCE,
             -1L, -1L, null, 0L);
     private final AtomicLong dropped = new AtomicLong();
-    private final SenderErrorHandler handler;
+    // volatile so the user can swap the handler post-connect, mirroring
+    // SenderProgressDispatcher. A final field would make handler config a
+    // strict pre-connect concern; making it dynamic lets builders, tests,
+    // and reconfigurable apps install a new handler at any time without
+    // tearing down the dispatcher thread.
+    private volatile SenderErrorHandler handler;
     private final BlockingQueue<SenderError> inbox;
     // Threads are started lazily under this monitor; takes the same role as
     // SegmentManager.start() — first offer() that observes a null thread
@@ -170,6 +175,14 @@ public final class SenderErrorDispatcher implements QuietCloseable {
      */
     public long getTotalDelivered() {
         return totalDelivered.get();
+    }
+
+    /**
+     * Replace the user-supplied handler. Effective for the next delivery.
+     * Null reverts to the loud-not-silent default.
+     */
+    public void setHandler(SenderErrorHandler handler) {
+        this.handler = handler != null ? handler : DefaultSenderErrorHandler.INSTANCE;
     }
 
     /**
