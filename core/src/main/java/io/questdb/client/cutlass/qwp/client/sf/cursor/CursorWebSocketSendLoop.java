@@ -79,6 +79,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public static final long DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS = 5_000L;
     /** Throttle "reconnect attempt N failed" WARN logs to one per 5 s. */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
+    /**
+     * In durable-ack mode, the server only flushes pending STATUS_DURABLE_ACK
+     * frames in response to inbound recv events (handleBinaryMessage,
+     * handlePing, close). Without inbound traffic from the client, an idle
+     * connection that has finished publishing data never sees the ack frame
+     * even after the WAL upload has completed server-side. The I/O loop
+     * sends a WebSocket PING at this cadence whenever pendingDurable is
+     * non-empty and the loop is otherwise idle, which prods the server to
+     * call flushPendingAck and emit any progress that has accumulated. The
+     * cost is one PING per 200ms per opted-in connection, only while the
+     * client is actually waiting on durable-acks.
+     */
+    private static final long DURABLE_ACK_KEEPALIVE_PING_NANOS = 200_000_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
 
     private final AtomicLong consecutiveSendErrors = new AtomicLong();
@@ -149,6 +162,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // when durableAckMode is false.
     private final AtomicLong totalDurableAcks = new AtomicLong();
     private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
+    // Wall clock of the last keepalive PING the I/O loop sent to prod the
+    // server into flushing durable-ack frames. Zero until the first PING.
+    // See DURABLE_ACK_KEEPALIVE_PING_NANOS for the rationale.
+    private long lastKeepalivePingNanos;
     private WebSocketClient client;
     // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
     // a fresh connection, this is 0. After a reconnect, it's set to
@@ -813,6 +830,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         durableTableWatermarks.clear();
+        // Reset the keepalive throttle so the new connection can prod the
+        // server immediately rather than waiting out the leftover interval
+        // from before the reconnect.
+        lastKeepalivePingNanos = 0L;
     }
 
     /**
@@ -861,6 +882,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // 2. Try to receive ACKs.
                 if (tryReceiveAcks()) {
                     didWork = true;
+                }
+                // 3. In durable-ack mode, prod the server with a keepalive
+                //    PING when there are pending OKs awaiting confirmation
+                //    and we have nothing else to do. The server only flushes
+                //    durable-ack frames on inbound traffic, so an idle
+                //    client otherwise never sees the WAL-upload completion.
+                if (!didWork && running && durableAckMode && !pendingDurable.isEmpty()) {
+                    sendDurableAckKeepaliveIfDue();
                 }
                 if (!didWork && running) {
                     LockSupport.parkNanos(parkNanos);
@@ -939,6 +968,30 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             fail(t);
         }
         return any;
+    }
+
+    /**
+     * Send a WebSocket PING to prod the server into flushing pending
+     * STATUS_DURABLE_ACK frames, but only when the throttle interval has
+     * elapsed since the last keepalive PING. The server's egress code only
+     * runs flushPendingAck on inbound recv events; without this prod, an
+     * idle connection waiting on durable-ack confirmation can sit forever.
+     * <p>
+     * Best-effort: any send failure routes through the standard fail() path
+     * so the reconnect loop can take over. Caller is responsible for the
+     * "do we even need to send" gate (durableAckMode + non-empty pending).
+     */
+    private void sendDurableAckKeepaliveIfDue() {
+        long now = System.nanoTime();
+        if (now - lastKeepalivePingNanos < DURABLE_ACK_KEEPALIVE_PING_NANOS) {
+            return;
+        }
+        lastKeepalivePingNanos = now;
+        try {
+            client.sendPing(1000);
+        } catch (Throwable t) {
+            fail(t);
+        }
     }
 
     /** Inner ACK handler — parses the binary frame, calls engine.acknowledge. */
