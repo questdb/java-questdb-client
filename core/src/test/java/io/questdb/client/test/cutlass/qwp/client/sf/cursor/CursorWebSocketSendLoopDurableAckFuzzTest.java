@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Rnd;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -42,7 +43,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Random;
 
 /**
  * Randomised stress test for the durable-ack-driven trim path. Generates a
@@ -56,7 +56,6 @@ import java.util.Random;
  */
 public class CursorWebSocketSendLoopDurableAckFuzzTest {
 
-    private static final long DEFAULT_SEED = -1L;
     private static final int ITERATIONS = 500;
     private static final int MAX_FRAMES = 64;
     private static final String[] TABLE_POOL = {"trades", "orders", "fills", "positions"};
@@ -92,15 +91,21 @@ public class CursorWebSocketSendLoopDurableAckFuzzTest {
     }
 
     @Test
-    public void testFuzzInvariantHolds() throws Exception {
-        long seed = DEFAULT_SEED == -1L ? System.nanoTime() : DEFAULT_SEED;
-        Random rnd = new Random(seed);
+    public void testFuzzInvariantHolds() {
+        // Capture both seeds so a fuzz failure prints a reproducer the
+        // operator can plug straight back into TestUtils.generateRandom(
+        // null, s0, s1). generateRandom also prints them on its own, but
+        // including them in the AssertionError message keeps the repro
+        // recipe co-located with the failure in CI logs.
+        long s0 = System.nanoTime();
+        long s1 = System.currentTimeMillis();
+        Rnd rnd = TestUtils.generateRandom(null, s0, s1);
         try {
             for (int iter = 0; iter < ITERATIONS; iter++) {
                 runOneIteration(rnd, iter);
             }
         } catch (Throwable t) {
-            throw new AssertionError("fuzz failure with seed=" + seed, t);
+            throw new AssertionError("fuzz failure with seeds=" + s0 + "L," + s1 + "L", t);
         }
     }
 
@@ -167,7 +172,7 @@ public class CursorWebSocketSendLoopDurableAckFuzzTest {
         }
     }
 
-    private static void runOneIteration(Random rnd, int iter) throws Exception {
+    private static void runOneIteration(Rnd rnd, int iter) throws Exception {
         // Pre-build: pick frame count, per-batch tables. Track expected
         // (table, seqTxn) so the fuzz oracle can compute the contiguous
         // durable prefix at any point.
