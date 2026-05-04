@@ -204,6 +204,12 @@ public class QwpWebSocketSender implements Sender {
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private boolean requestDurableAck;
+    // Keepalive PING cadence used by the I/O loop while
+    // request_durable_ack=on AND there are pending durable-ack
+    // confirmations. Default mirrors the loop's spec value; 0 or negative
+    // disables keepalive PINGs entirely.
+    private long durableAckKeepaliveIntervalMillis =
+            CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
 
     private QwpWebSocketSender(
             String host,
@@ -435,6 +441,42 @@ public class QwpWebSocketSender implements Sender {
             SenderErrorHandler errorHandler,
             int errorInboxCapacity
     ) {
+        return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS);
+    }
+
+    /**
+     * Master connect overload — also accepts the keepalive PING cadence
+     * the I/O loop uses while waiting on STATUS_DURABLE_ACK frames.
+     * {@code 0} or negative disables the keepalive entirely (caller takes
+     * responsibility for prodding the server).
+     */
+    public static QwpWebSocketSender connect(
+            String host,
+            int port,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 host, port, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -446,6 +488,7 @@ public class QwpWebSocketSender implements Sender {
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
+            sender.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
             sender.initialConnectMode = initialConnectMode == null
                     ? Sender.InitialConnectMode.OFF
                     : initialConnectMode;
@@ -1977,7 +2020,8 @@ public class QwpWebSocketSender implements Sender {
                     reconnectMaxDurationMillis,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis,
-                    requestDurableAck);
+                    requestDurableAck,
+                    durableAckKeepaliveIntervalMillis);
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles

@@ -80,18 +80,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /** Throttle "reconnect attempt N failed" WARN logs to one per 5 s. */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
     /**
-     * In durable-ack mode, the server only flushes pending STATUS_DURABLE_ACK
-     * frames in response to inbound recv events (handleBinaryMessage,
-     * handlePing, close). Without inbound traffic from the client, an idle
-     * connection that has finished publishing data never sees the ack frame
-     * even after the WAL upload has completed server-side. The I/O loop
-     * sends a WebSocket PING at this cadence whenever pendingDurable is
-     * non-empty and the loop is otherwise idle, which prods the server to
-     * call flushPendingAck and emit any progress that has accumulated. The
-     * cost is one PING per 200ms per opted-in connection, only while the
-     * client is actually waiting on durable-acks.
+     * Default cadence for the keepalive PING the I/O loop emits while
+     * waiting on STATUS_DURABLE_ACK frames. See
+     * {@link #sendDurableAckKeepaliveIfDue()} for the rationale: the OSS
+     * server only flushes pending durable-ack frames on inbound recv
+     * events, so an opted-in idle client has to prod it. {@code 200} ms
+     * trades one PING per 200 ms per idle opted-in connection for
+     * sub-second confirmation latency once the upload completes
+     * server-side. {@code 0} or negative disables the keepalive entirely.
      */
-    private static final long DURABLE_ACK_KEEPALIVE_PING_NANOS = 200_000_000L;
+    public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
 
     private final AtomicLong consecutiveSendErrors = new AtomicLong();
@@ -158,13 +156,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // (default), the loop trims on OK as it always has and ignores any
     // STATUS_DURABLE_ACK frames that might still arrive (logs a warning).
     private final boolean durableAckMode;
+    // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
+    // Zero or negative disables the keepalive entirely.
+    private final long durableAckKeepaliveIntervalNanos;
     // Counters for observability of the durable-ack path. Both are zero
     // when durableAckMode is false.
     private final AtomicLong totalDurableAcks = new AtomicLong();
     private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
     // Wall clock of the last keepalive PING the I/O loop sent to prod the
     // server into flushing durable-ack frames. Zero until the first PING.
-    // See DURABLE_ACK_KEEPALIVE_PING_NANOS for the rationale.
     private long lastKeepalivePingNanos;
     private WebSocketClient client;
     // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
@@ -239,6 +239,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, durableAckMode,
+                DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS);
+    }
+
+    /**
+     * Master constructor — also accepts the cadence at which the I/O loop
+     * sends keepalive PINGs while waiting on STATUS_DURABLE_ACK frames.
+     * Pass {@code 0} or negative to disable keepalive PINGs entirely (the
+     * caller takes responsibility for prodding the server, e.g. by sending
+     * data, or by accepting indefinite waits on idle connections).
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis) {
         if (engine == null) {
             throw new IllegalArgumentException("engine must be non-null");
         }
@@ -255,6 +276,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
         this.durableAckMode = durableAckMode;
+        this.durableAckKeepaliveIntervalNanos = durableAckKeepaliveIntervalMillis > 0
+                ? durableAckKeepaliveIntervalMillis * 1_000_000L
+                : 0L;
         // SYNC/OFF startup hands a live client to the constructor, so we
         // already know we reached the server at least once. ASYNC startup
         // hands null and lets the I/O thread connect — hasEverConnected
@@ -888,7 +912,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 //    and we have nothing else to do. The server only flushes
                 //    durable-ack frames on inbound traffic, so an idle
                 //    client otherwise never sees the WAL-upload completion.
-                if (!didWork && running && durableAckMode && !pendingDurable.isEmpty()) {
+                //    Skipped entirely when the user has disabled the
+                //    keepalive (interval <= 0).
+                if (!didWork && running && durableAckMode
+                        && durableAckKeepaliveIntervalNanos > 0L
+                        && !pendingDurable.isEmpty()) {
                     sendDurableAckKeepaliveIfDue();
                 }
                 if (!didWork && running) {
@@ -983,7 +1011,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private void sendDurableAckKeepaliveIfDue() {
         long now = System.nanoTime();
-        if (now - lastKeepalivePingNanos < DURABLE_ACK_KEEPALIVE_PING_NANOS) {
+        if (now - lastKeepalivePingNanos < durableAckKeepaliveIntervalNanos) {
             return;
         }
         lastKeepalivePingNanos = now;

@@ -290,6 +290,56 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testDurableAckKeepaliveIntervalAcceptedOnWebSocket() {
+        // Positive value, zero (disable), and negative (also disable) all
+        // build cleanly. The setter is just a setter; semantics are validated
+        // at I/O-loop construction time.
+        Assert.assertNotNull(Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .durableAckKeepaliveIntervalMillis(50));
+        Assert.assertNotNull(Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .durableAckKeepaliveIntervalMillis(0));
+        Assert.assertNotNull(Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST)
+                .durableAckKeepaliveIntervalMillis(-1));
+    }
+
+    @Test
+    public void testDurableAckKeepaliveIntervalConfigStringParses() {
+        // Smoke test: the parser accepts the knob, including the disable-by-zero
+        // value, without erroring at config-string construction. The full
+        // end-to-end behaviour (server interaction) is covered by
+        // ReplicationTest in the parent repo, which exercises the default
+        // value. fromConfig() is allowed to throw a LineSenderException at
+        // connect time -- we only assert the parser did not reject the key.
+        try {
+            Sender.fromConfig("ws::addr=127.0.0.1:1;durable_ack_keepalive_interval_millis=50;");
+        } catch (LineSenderException e) {
+            Assert.assertFalse("parser must not reject the key, was: " + e.getMessage(),
+                    e.getMessage().contains("durable_ack_keepalive_interval_millis"));
+        }
+        try {
+            Sender.fromConfig("ws::addr=127.0.0.1:1;durable_ack_keepalive_interval_millis=0;");
+        } catch (LineSenderException e) {
+            Assert.assertFalse("parser must accept zero (disable), was: " + e.getMessage(),
+                    e.getMessage().contains("durable_ack_keepalive_interval_millis"));
+        }
+    }
+
+    @Test
+    public void testDurableAckKeepaliveIntervalNotSupportedForTcp() {
+        // The knob is WebSocket-only; the TCP-protocol path must reject it
+        // loudly so a user who copy-pasted the param into the wrong transport
+        // sees the mismatch immediately rather than silently losing the
+        // intended behaviour.
+        assertThrows("durable_ack_keepalive_interval_millis is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .durableAckKeepaliveIntervalMillis(100));
+    }
+
+    @Test
     public void testFullAsyncConfiguration() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)

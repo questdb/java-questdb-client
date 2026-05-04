@@ -724,6 +724,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long reconnectInitialBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long reconnectMaxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        // Cadence at which the SF cursor I/O loop sends a keepalive PING
+        // while waiting on STATUS_DURABLE_ACK frames. Default applied at
+        // build() time. 0 or negative is a documented "disable" value, so
+        // a Long.MIN_VALUE sentinel keeps it distinguishable from "unset".
+        private static final long DURABLE_ACK_KEEPALIVE_NOT_SET = Long.MIN_VALUE;
+        private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
         // Drives the initial-connect strategy. OFF is fail-fast (default).
         // SYNC retries on the user thread up to the reconnect cap. ASYNC
         // returns immediately and lets the I/O thread retry in the
@@ -1091,6 +1097,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         reconnectMaxBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
                                 ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS
                                 : reconnectMaxBackoffMillis;
+                long actualDurableAckKeepaliveIntervalMillis =
+                        durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
+                                ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
+                                : durableAckKeepaliveIntervalMillis;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1144,7 +1154,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualReconnectMaxBackoffMillis,
                             initialConnectMode,
                             errorHandler,
-                            actualErrorInboxCapacity
+                            actualErrorInboxCapacity,
+                            actualDurableAckKeepaliveIntervalMillis
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -1935,6 +1946,32 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Cadence (in millis) at which the SF cursor I/O loop sends a
+         * keepalive PING while waiting on STATUS_DURABLE_ACK frames. The
+         * server only flushes pending durable-ack frames in response to
+         * inbound recv events, so an idle opted-in client needs to prod
+         * the server periodically. Effective only when
+         * {@link #requestDurableAck(boolean) request_durable_ack=on}.
+         * <p>
+         * Pass {@code 0} or negative to disable keepalive PINGs entirely
+         * — the caller then accepts that durable-ack frames may not
+         * arrive on idle connections (e.g. they are sending data
+         * continuously, or have their own ping driver).
+         * <p>
+         * Default
+         * {@value io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS}
+         * ms. WebSocket transport only.
+         */
+        public LineSenderBuilder durableAckKeepaliveIntervalMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException(
+                        "durable_ack_keepalive_interval_millis is only supported for WebSocket transport");
+            }
+            this.durableAckKeepaliveIntervalMillis = millis;
+            return this;
+        }
+
+        /**
          * Per-outage cap on the cursor I/O loop's reconnect retry budget.
          * Once a wire failure occurs, the loop retries with exponential
          * backoff until either reconnect succeeds (timer resets) or this
@@ -2629,6 +2666,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "close_flush_timeout_millis");
                     closeFlushTimeoutMillis(parseLongValue(sink, "close_flush_timeout_millis"));
+                } else if (Chars.equals("durable_ack_keepalive_interval_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException(
+                                "durable_ack_keepalive_interval_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "durable_ack_keepalive_interval_millis");
+                    durableAckKeepaliveIntervalMillis(parseLongValue(sink, "durable_ack_keepalive_interval_millis"));
                 } else if (Chars.equals("reconnect_max_duration_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
