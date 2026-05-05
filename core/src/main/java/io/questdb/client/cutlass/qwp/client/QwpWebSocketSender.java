@@ -767,16 +767,34 @@ public class QwpWebSocketSender implements Sender {
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
-                    // 2) Bounded drain: block until the server has ACK'd
+                    // 2) Safety-net rethrow: surface a latched terminal error
+                    //    only when no other channel has already delivered it
+                    //    to the user. "Already delivered" means either the
+                    //    producer thread saw it synchronously via
+                    //    flush()/append() (errorSurfacedSynchronously) or the
+                    //    async dispatcher delivered it to a user-installed
+                    //    custom handler at any point in this sender's life
+                    //    (deliveredToCustomHandler). The latter survives a
+                    //    setErrorHandler(null) cleanup in test helpers --
+                    //    once the user has owned an error, close() should
+                    //    not double-signal it. The default no-op logging
+                    //    handler does not count as "delivered to user", so a
+                    //    config-string-only caller still gets the loud
+                    //    rethrow on shutdown.
+                    boolean alreadyDeliveredToCustomHandler = errorDispatcher != null
+                            && errorDispatcher.hasDeliveredToCustomHandler();
+                    if (!alreadyDeliveredToCustomHandler
+                            && cursorSendLoop.hasUnsurfacedError()) {
+                        cursorSendLoop.checkError();
+                    }
+                    // 3) Bounded drain: block until the server has ACK'd
                     //    everything we just published, or until the
                     //    configured timeout elapses. closeFlushTimeoutMillis
                     //    <= 0 opts out (fast close, may lose memory-mode
-                    //    data on JVM exit, and skips synchronous propagation
-                    //    of any latched terminal error -- users who opt out
-                    //    are expected to observe outcomes via the async
-                    //    progress/error callbacks instead).
+                    //    data on JVM exit). Errors still surface via the
+                    //    safety-net checkError() above and via the async
+                    //    error handler.
                     if (closeFlushTimeoutMillis > 0L) {
-                        cursorSendLoop.checkError();
                         drainOnClose();
                     }
                 }

@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -74,6 +75,12 @@ public final class SenderErrorDispatcher implements QuietCloseable {
             SenderError.Category.UNKNOWN, SenderError.Policy.HALT,
             SenderError.NO_STATUS_BYTE, null, SenderError.NO_MESSAGE_SEQUENCE,
             -1L, -1L, null, 0L);
+    // Set the first time the dispatcher delivers an error to a non-default
+    // handler. Stays true even if the user later swaps the handler back to
+    // the default -- the signal is "did the user-installed handler ever see
+    // this stream of errors", consulted by close() to decide whether the
+    // safety-net rethrow is still needed.
+    private final AtomicBoolean deliveredToCustomHandler = new AtomicBoolean();
     private final AtomicLong dropped = new AtomicLong();
     // volatile so the user can swap the handler post-connect, mirroring
     // SenderProgressDispatcher. A final field would make handler config a
@@ -178,6 +185,18 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     }
 
     /**
+     * True if at least one error has been delivered to a user-installed
+     * (non-default) handler since this dispatcher started. Used by
+     * {@code QwpWebSocketSender.close()} to decide whether the safety-net
+     * rethrow is still needed: when this returns true, the user has seen
+     * the error stream through their handler, so close() should not
+     * additionally rethrow.
+     */
+    public boolean hasDeliveredToCustomHandler() {
+        return deliveredToCustomHandler.get();
+    }
+
+    /**
      * Replace the user-supplied handler. Effective for the next delivery.
      * Null reverts to the loud-not-silent default.
      */
@@ -234,8 +253,12 @@ public final class SenderErrorDispatcher implements QuietCloseable {
             // after, the handler-released observer races the dispatcher
             // and can see totalDelivered short by one.
             totalDelivered.incrementAndGet();
+            SenderErrorHandler h = handler;
+            if (h != DefaultSenderErrorHandler.INSTANCE) {
+                deliveredToCustomHandler.set(true);
+            }
             try {
-                handler.onError(err);
+                h.onError(err);
             } catch (Throwable t) {
                 LOG.error("SenderErrorHandler threw on {}: {}", err, t.getMessage(), t);
             }

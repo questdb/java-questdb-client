@@ -182,6 +182,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long nextWireSeq;
     private volatile boolean running;
     private volatile Throwable lastError;
+    // Set by checkError() the first time it actually rethrows lastError to a
+    // synchronous user-thread caller (flush/append/close). close() consults
+    // this to decide whether to rethrow the latched terminal -- if a producer
+    // thread already saw the error from a flush() call, throwing again from
+    // close() would mask any in-flight test assertion or user exception. The
+    // async dispatcher path does NOT set this flag: a user who only watches
+    // the async error inbox still gets a loud failure on shutdown.
+    private volatile boolean errorSurfacedSynchronously;
     // Typed payload sibling to lastError. Set when recordFatal is called with
     // a SenderError (HALT-policy server rejection or terminal protocol violation);
     // remains null for wire-level fatals (reconnect-budget exhaustion, etc).
@@ -308,9 +316,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public void checkError() {
         Throwable e = lastError;
         if (e != null) {
+            errorSurfacedSynchronously = true;
             if (e instanceof LineSenderException) throw (LineSenderException) e;
             throw new LineSenderException("I/O thread failed: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * True when {@link #lastError} is set AND no synchronous user-thread
+     * caller has yet seen it via {@link #checkError()}. close() uses this
+     * to decide whether to rethrow as a safety net: a user who only ever
+     * called close() (e.g. async-initial-connect that never reached the
+     * server) needs to see the error from somewhere; a user who already
+     * caught it from flush() does not.
+     */
+    public boolean hasUnsurfacedError() {
+        return lastError != null && !errorSurfacedSynchronously;
     }
 
     @Override
