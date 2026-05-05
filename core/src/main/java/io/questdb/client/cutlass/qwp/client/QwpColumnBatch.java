@@ -563,7 +563,7 @@ public class QwpColumnBatch {
     /**
      * True if the cell is NULL on the wire.
      * <p>
-     * Note on type-specific sentinels (see {@code docs/QWP_EGRESS_EXTENSION.md} sec 11.5):
+     * Note on type-specific sentinels (see {@code docs/qwp/wire-egress.md} sec 11.5):
      * QuestDB stores NULL as a sentinel value for several types -- {@code Long.MIN_VALUE}
      * for LONG/INT/etc., {@code 0.0.0.0} for IPv4, {@code -1} for GEOHASH, and crucially
      * {@code NaN} for FLOAT and DOUBLE. Egress preserves these conventions: a row carrying
