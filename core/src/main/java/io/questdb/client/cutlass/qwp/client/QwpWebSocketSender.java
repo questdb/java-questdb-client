@@ -1868,8 +1868,14 @@ public class QwpWebSocketSender implements Sender {
         // is a worse outcome than a loud connect-time failure.
         if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
             newClient.close();
+            // The "WebSocket upgrade failed:" prefix is load-bearing: the cursor I/O
+            // loop's isTerminalUpgradeError() sniffs for that exact substring to
+            // classify a connect-time throw as terminal (won't retry). Without the
+            // prefix the loop would treat this misconfig as transient and burn the
+            // full reconnect budget before surfacing it.
             throw new LineSenderException(
-                    "server does not support durable ack [host=" + host + ", port=" + port
+                    "WebSocket upgrade failed: server does not support durable ack [host="
+                            + host + ", port=" + port
                             + "]. The client opted in via request_durable_ack=on but the server "
                             + "did not echo X-QWP-Durable-Ack: enabled in the upgrade response. "
                             + "Either disable request_durable_ack or connect to a server with "
@@ -1950,7 +1956,7 @@ public class QwpWebSocketSender implements Sender {
             cursorSendLoop.checkError();
             if (System.nanoTime() >= deadlineNanos) {
                 long acked = cursorEngine.ackedFsn();
-                LOG.warn("close() drain timed out after {}ms [target={} acked={}] — pending data may be lost",
+                LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost",
                         closeFlushTimeoutMillis, target, acked);
                 throw new LineSenderException("close() drain timed out after ")
                         .put(closeFlushTimeoutMillis).put(" ms [publishedFsn=")

@@ -794,7 +794,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             } catch (Throwable e) {
                 if (isTerminalUpgradeError(e)) {
                     String upgradeMsg = findUpgradeFailureMessage(e);
-                    LOG.error("{} hit terminal upgrade error — won't retry: {}",
+                    LOG.error("{} hit terminal upgrade error, won't retry: {}",
                             contextLabel, upgradeMsg);
                     throw new LineSenderException(
                             "WebSocket upgrade failed during " + contextLabel
@@ -1098,7 +1098,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (highestSent < 0) return; // ACK before any send — ignore
                 long capped = Math.min(wireSeq, highestSent);
                 if (capped < wireSeq) {
-                    LOG.warn("server ACK wire seq {} exceeds highest sent {} — clamping",
+                    LOG.warn("server ACK wire seq {} exceeds highest sent {}, clamping",
                             wireSeq, highestSent);
                 }
                 totalAcks.incrementAndGet();
@@ -1143,6 +1143,45 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             handleServerRejection(wireSeq);
         }
 
+        private void handlePreSendRejection(long wireSeq, byte status,
+                                            SenderError.Category category,
+                                            SenderError.Policy policy) {
+            LOG.warn("server rejection wire seq {} (category={}, status=0x{}) before any send -- skipping ack advance",
+                    wireSeq, category, Integer.toHexString(status & 0xFF));
+            // Use the same [ackedFsn+1, publishedFsn] span the
+            // protocol-violation close path uses (see onClose above): there
+            // is no FSN we can attribute the rejection to, so we report
+            // the unacked range the producer can correlate against.
+            long fromFsn = engine.ackedFsn() + 1L;
+            long toFsn = Math.max(fromFsn, engine.publishedFsn());
+            String tableName = response.getTableEntryCount() == 1
+                    ? response.getTableName(0)
+                    : null;
+            SenderError err = new SenderError(
+                    category,
+                    policy,
+                    status & 0xFF,
+                    response.getErrorMessage(),
+                    wireSeq,
+                    fromFsn,
+                    toFsn,
+                    tableName,
+                    System.nanoTime()
+            );
+            totalServerErrors.incrementAndGet();
+            if (policy == SenderError.Policy.HALT) {
+                // Latch the typed terminal error before invoking the handler
+                // so a synchronous probe of getLastTerminalError() / flush()
+                // from inside the handler observes the typed error. Mirrors
+                // the ordering in the post-send HALT path below.
+                recordFatal(new LineSenderServerException(err), err);
+            }
+            // DROP_AND_CONTINUE: no watermark advance -- there is nothing
+            // sent on this connection to drop. The dispatch is the user's
+            // only handle to the server's complaint.
+            dispatchError(err);
+        }
+
         private void handleServerRejection(long wireSeq) {
             byte status = response.getStatus();
             SenderError.Category category = classify(status);
@@ -1153,9 +1192,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // makes the segment manager trim sealed segments the I/O thread
             // is still reading — and the next Unsafe.getInt SEGVs the JVM.
             long highestSent = nextWireSeq - 1L;
+            if (highestSent < 0L) {
+                // Pre-send rejection: server emitted an error frame before
+                // we sent anything on this connection (typical after a
+                // fresh swapClient — auth failure, server-initiated halt,
+                // etc.). The server-named wireSeq does not correspond to
+                // any frame we sent, so clamping it to 0 and acknowledging
+                // fsnAtZero would silently advance ackedFsn past a real
+                // unsent batch (fsnAtZero == ackedFsn + 1 right after a
+                // swap). Skip the watermark advance entirely; still surface
+                // the error so the user's handler sees it and HALT errors
+                // remain producer-observable.
+                handlePreSendRejection(wireSeq, status, category, policy);
+                return;
+            }
             long cappedSeq = Math.max(0L, Math.min(wireSeq, highestSent));
             if (cappedSeq < wireSeq) {
-                LOG.warn("server NACK wire seq {} exceeds highest sent {} — clamping",
+                LOG.warn("server NACK wire seq {} exceeds highest sent {}, clamping",
                         wireSeq, highestSent);
             }
             long fsn = fsnAtZero + cappedSeq;
