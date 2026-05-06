@@ -30,7 +30,7 @@ package io.questdb.client.cutlass.qwp.client;
  */
 public class QwpProtocolVersionException extends QwpDecodeException {
     public static final QwpProtocolVersionException UNSUPPORTED = new QwpProtocolVersionException(
-            "unsupported QWP version");
+            "unsupported version");
 
     public QwpProtocolVersionException(String message) {
         super(message);

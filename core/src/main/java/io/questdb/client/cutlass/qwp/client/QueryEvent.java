@@ -45,7 +45,7 @@ public class QueryEvent {
      */
     public static final int KIND_TRANSPORT_ERROR = 4;
     /**
-     * Permanent protocol-level disagreement (unsupported QWP version, framing
+     * Permanent protocol-level disagreement (unsupported version, framing
      * corruption that won't recover). {@code execute()} surfaces this directly
      * instead of triggering failover -- version mismatch is cluster-wide and
      * retrying against another endpoint masks the disagreement.

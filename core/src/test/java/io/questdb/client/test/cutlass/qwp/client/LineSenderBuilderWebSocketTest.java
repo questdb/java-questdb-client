@@ -419,6 +419,21 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_dupAddr_explicitThenDefaultPort_fails() {
+        assertBadConfig("ws::addr=a:9000,a;", "duplicated addresses are not allowed");
+    }
+
+    @Test
+    public void testWsConfigString_dupAddr_defaultThenExplicitPort_fails() {
+        assertBadConfig("ws::addr=a,a:9000;", "duplicated addresses are not allowed");
+    }
+
+    @Test
+    public void testWsConfigString_dupAddr_bothDefaultPort_fails() {
+        assertBadConfig("ws::addr=a,a;", "duplicated addresses are not allowed");
+    }
+
+    @Test
     public void testFullAsyncConfiguration() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
