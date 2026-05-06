@@ -36,7 +36,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 
-public class WebSocketClient503RoleHeaderTest {
+public class WebSocketClient421RoleHeaderTest {
 
     @Test(timeout = 10_000)
     public void testReplicaReject() throws Exception {
@@ -49,7 +49,7 @@ public class WebSocketClient503RoleHeaderTest {
     }
 
     @Test(timeout = 10_000)
-    public void testRoleHeaderAbsentOn503_NullCaptured() throws Exception {
+    public void testRoleHeaderAbsentOn421_NullCaptured() throws Exception {
         assertCapturedRole(null, null);
     }
 
@@ -67,7 +67,7 @@ public class WebSocketClient503RoleHeaderTest {
                 int n = s.getInputStream().read(discardBuf);
                 if (n < 0) return;
                 StringBuilder resp = new StringBuilder();
-                resp.append("HTTP/1.1 503 Service Unavailable\r\n");
+                resp.append("HTTP/1.1 421 Misdirected Request\r\n");
                 if (roleHeaderLine != null) resp.append(roleHeaderLine).append("\r\n");
                 resp.append("Content-Length: 0\r\n\r\n");
                 OutputStream os = s.getOutputStream();
@@ -75,7 +75,7 @@ public class WebSocketClient503RoleHeaderTest {
                 os.flush();
             } catch (Exception ignored) {
             }
-        }, "fake-503");
+        }, "fake-421");
         serverThread.setDaemon(true);
         serverThread.start();
 
@@ -84,7 +84,7 @@ public class WebSocketClient503RoleHeaderTest {
             client.connect("127.0.0.1", port);
             try {
                 client.upgrade("/write/v4", null);
-                Assert.fail("expected upgrade to fail with 503");
+                Assert.fail("expected upgrade to fail with 421");
             } catch (HttpClientException ex) {
                 Assert.assertTrue(
                         "expected 'WebSocket upgrade failed:' message, got: " + ex.getMessage(),
