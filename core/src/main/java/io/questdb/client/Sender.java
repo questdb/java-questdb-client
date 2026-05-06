@@ -835,6 +835,93 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
+        private void addAddressEntry(CharSequence src, int start, int end) {
+            int hostStart;
+            int hostEnd;
+            int portStart;
+            if (src.charAt(start) == '[') {
+                int closeBracket = Chars.indexOf(src, start + 1, end, ']');
+                if (closeBracket < 0) {
+                    throw new LineSenderException("missing closing ']' in IPv6 addr entry [address=")
+                            .put(src.subSequence(start, end)).put("]");
+                }
+                hostStart = start + 1;
+                hostEnd = closeBracket;
+                if (closeBracket == end - 1) {
+                    portStart = -1;
+                } else if (src.charAt(closeBracket + 1) != ':') {
+                    throw new LineSenderException("expected ':' after ']' in IPv6 addr entry [address=")
+                            .put(src.subSequence(start, end)).put("]");
+                } else {
+                    portStart = closeBracket + 2;
+                }
+            } else {
+                int firstColon = Chars.indexOf(src, start, end, ':');
+                int lastColon = Chars.indexOf(src, start, end, ':', -1);
+                if (firstColon != lastColon) {
+                    hostStart = start;
+                    hostEnd = end;
+                    portStart = -1;
+                } else if (firstColon < 0) {
+                    hostStart = start;
+                    hostEnd = end;
+                    portStart = -1;
+                } else {
+                    hostStart = start;
+                    hostEnd = firstColon;
+                    portStart = firstColon + 1;
+                }
+            }
+            if (hostStart == hostEnd) {
+                throw new LineSenderException("empty host in addr entry [address=")
+                        .put(src.subSequence(start, end)).put("]");
+            }
+            int parsedPort = -1;
+            if (portStart >= 0) {
+                if (portStart >= end) {
+                    throw new LineSenderException("invalid address, use IPv4 address or a domain name [address=")
+                            .put(src.subSequence(start, end)).put("]");
+                }
+                try {
+                    parsedPort = Numbers.parseInt(src, portStart, end);
+                    if (parsedPort < 1 || parsedPort > 65535) {
+                        throw new LineSenderException("invalid port [port=").put(parsedPort).put("]");
+                    }
+                } catch (NumericException e) {
+                    throw new LineSenderException("cannot parse a port from the address, use IPv4 address or a domain name")
+                            .put(" [address=").put(src.subSequence(start, end)).put("]");
+                }
+            }
+            if (parsedPort != -1) {
+                for (int i = 0, n = hosts.size(); i < n; i++) {
+                    String storedHost = hosts.get(i);
+                    if (charsEqualsRange(storedHost, src, hostStart, hostEnd)) {
+                        if (ports.size() > i && ports.getQuick(i) == parsedPort) {
+                            throw new LineSenderException("duplicated addresses are not allowed [address=")
+                                    .put(src.subSequence(start, end)).put("]");
+                        }
+                    }
+                }
+            }
+            hosts.add(src.subSequence(hostStart, hostEnd).toString());
+            if (parsedPort != -1) {
+                ports.add(parsedPort);
+            }
+        }
+
+        private static boolean charsEqualsRange(CharSequence a, CharSequence b, int bStart, int bEnd) {
+            int len = bEnd - bStart;
+            if (a.length() != len) {
+                return false;
+            }
+            for (int i = 0; i < len; i++) {
+                if (a.charAt(i) != b.charAt(bStart + i)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         /**
          * Advanced TLS configuration. Most users should not need to use this.
          *
@@ -1162,7 +1249,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             errorHandler,
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
-                            authTimeoutMillis
+                            authTimeoutMillis,
+                            gorillaEnabled
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -1174,7 +1262,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     throw t;
                 }
-                connected.setGorillaEnabled(gorillaEnabled);
                 // connect() succeeded — `connected` now owns cursorEngine
                 // via setCursorEngine(engine, true). From here on, ANY
                 // failure must close `connected` (which closes the engine
@@ -1986,10 +2073,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         public LineSenderBuilder authTimeoutMillis(long millis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException(
-                        "auth_timeout is only supported for WebSocket transport");
+                        "auth_timeout_ms is only supported for WebSocket transport");
             }
             if (millis <= 0L) {
-                throw new LineSenderException("auth_timeout must be > 0: ").put(millis);
+                throw new LineSenderException("auth_timeout_ms must be > 0: ").put(millis);
             }
             this.authTimeoutMillis = millis;
             return this;
@@ -2466,13 +2553,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (Chars.equals("addr", sink)) {
                     pos = getValue(configurationString, pos, sink, "address");
-                    address(sink);
-                    if (ports.size() == hosts.size() - 1) {
-                        // not set
-                        port(protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT
-                                : protocol == PROTOCOL_UDP ? DEFAULT_UDP_PORT
-                                : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
-                                : DEFAULT_TCP_PORT);
+                    int defaultPort = protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT
+                            : protocol == PROTOCOL_UDP ? DEFAULT_UDP_PORT
+                            : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
+                            : DEFAULT_TCP_PORT;
+                    int valLen = sink.length();
+                    int entryStart = 0;
+                    for (int i = 0; i <= valLen; i++) {
+                        if (i == valLen || sink.charAt(i) == ',') {
+                            int s = entryStart;
+                            int e = i;
+                            while (s < e && sink.charAt(s) == ' ') s++;
+                            while (e > s && sink.charAt(e - 1) == ' ') e--;
+                            if (s == e) {
+                                throw new LineSenderException("empty addr entry");
+                            }
+                            int portsBefore = ports.size();
+                            addAddressEntry(sink, s, e);
+                            if (ports.size() == portsBefore) {
+                                port(defaultPort);
+                            }
+                            entryStart = i + 1;
+                        }
                     }
                 } else if (Chars.equals("user", sink)) {
                     // deprecated key: user, new key: username
@@ -2698,12 +2800,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "close_flush_timeout_millis");
                     closeFlushTimeoutMillis(parseLongValue(sink, "close_flush_timeout_millis"));
-                } else if (Chars.equals("auth_timeout", sink)) {
+                } else if (Chars.equals("auth_timeout_ms", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("auth_timeout is only supported for WebSocket transport");
+                        throw new LineSenderException("auth_timeout_ms is only supported for WebSocket transport");
                     }
-                    pos = getValue(configurationString, pos, sink, "auth_timeout");
-                    authTimeoutMillis(parseLongValue(sink, "auth_timeout"));
+                    pos = getValue(configurationString, pos, sink, "auth_timeout_ms");
+                    authTimeoutMillis(parseLongValue(sink, "auth_timeout_ms"));
                 } else if (Chars.equals("gorilla", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("gorilla is only supported for WebSocket transport");

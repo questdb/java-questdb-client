@@ -340,6 +340,125 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testAuthTimeoutConfig_acceptsPositive() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;auth_timeout_ms=2500;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testAuthTimeoutConfig_zeroRejected() {
+        assertBadConfig("ws::addr=localhost:9000;auth_timeout_ms=0;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeoutConfig_negativeRejected() {
+        assertBadConfig("ws::addr=localhost:9000;auth_timeout_ms=-50;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeoutConfig_notSupportedForHttp() {
+        assertBadConfig("http::addr=localhost:9000;auth_timeout_ms=1000;",
+                "auth_timeout_ms is only supported for WebSocket transport");
+    }
+
+    @Test
+    public void testAuthTimeoutBuilder_notSupportedForTcp() {
+        assertThrows("auth_timeout_ms is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .authTimeoutMillis(1000));
+    }
+
+    @Test
+    public void testGorillaConfig_acceptsOn() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=on;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testGorillaConfig_acceptsOff() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=off;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testGorillaConfig_acceptsTrue() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=true;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testGorillaConfig_acceptsFalse() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=false;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testGorillaConfig_unknownValueRejected() {
+        assertBadConfig("ws::addr=localhost:9000;gorilla=maybe;",
+                "invalid gorilla [value=maybe");
+    }
+
+    @Test
+    public void testGorillaConfig_notSupportedForHttp() {
+        assertBadConfig("http::addr=localhost:9000;gorilla=on;",
+                "gorilla is only supported for WebSocket transport");
+    }
+
+    @Test
+    public void testGorillaBuilder_notSupportedForTcp() {
+        assertThrows("gorilla is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .gorilla(false));
+    }
+
+    @Test
+    public void testWsConfigString_ipv6Bracketed_withPort() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=[::1]:9000;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_ipv6Bracketed_defaultPort() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=[fe80::1];");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_ipv6BareUnbracketed_defaultPort() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=fe80::1;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_ipv6Mixed_multiHost() {
+        Sender.LineSenderBuilder builder =
+                Sender.builder("ws::addr=[::1]:9000,a:9001,[fe80::2]:9002;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_ipv6Bracketed_missingClose_fails() {
+        assertBadConfig("ws::addr=[::1:9000;", "missing closing ']'");
+    }
+
+    @Test
+    public void testWsConfigString_ipv6Bracketed_junkAfterBracket_fails() {
+        assertBadConfig("ws::addr=[::1]x:9000;", "expected ':' after ']'");
+    }
+
+    @Test
+    public void testWsConfigString_emptyHost_fails() {
+        assertBadConfig("ws::addr=:9000;", "empty host in addr entry");
+    }
+
+    @Test
+    public void testWsConfigString_emptyBracketedHost_fails() {
+        assertBadConfig("ws::addr=[]:9000;", "empty host in addr entry");
+    }
+
+    @Test
     public void testFullAsyncConfiguration() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)

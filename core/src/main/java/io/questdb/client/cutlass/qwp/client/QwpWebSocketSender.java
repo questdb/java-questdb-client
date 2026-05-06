@@ -137,10 +137,8 @@ public class QwpWebSocketSender implements Sender {
     private final GlobalSymbolDictionary globalSymbolDictionary;
     private final List<Endpoint> endpoints;
     private final QwpHostHealthTracker hostTracker;
-    private final String host;
     private final int inFlightWindowSize;
     private final int maxSchemasPerConnection;
-    private final int port;
     private volatile int currentEndpointIdx = -1;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
@@ -236,8 +234,6 @@ public class QwpWebSocketSender implements Sender {
         this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
         this.hostTracker = new QwpHostHealthTracker(this.endpoints.size());
         this.authorizationHeader = authorizationHeader;
-        this.host = this.endpoints.get(0).host;
-        this.port = this.endpoints.get(0).port;
         this.tlsConfig = tlsConfig;
         this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
         this.tableBuffers = new CharSequenceObjHashMap<>();
@@ -498,7 +494,7 @@ public class QwpWebSocketSender implements Sender {
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS);
+                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS, true);
     }
 
     /**
@@ -524,7 +520,8 @@ public class QwpWebSocketSender implements Sender {
             SenderErrorHandler errorHandler,
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
-            long authTimeoutMs
+            long authTimeoutMs,
+            boolean gorillaEnabled
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
@@ -534,6 +531,8 @@ public class QwpWebSocketSender implements Sender {
         try {
             sender.requestDurableAck = requestDurableAck;
             sender.authTimeoutMs = authTimeoutMs;
+            sender.gorillaEnabled = gorillaEnabled;
+            sender.encoder.setGorillaEnabled(gorillaEnabled);
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -1894,7 +1893,7 @@ public class QwpWebSocketSender implements Sender {
      * attempt (and, in the follow-up commit, schedules a backoff retry
      * within the per-outage time cap).
      */
-    private WebSocketClient buildAndConnect() {
+    private synchronized WebSocketClient buildAndConnect() {
         int previousIdx = currentEndpointIdx;
         if (previousIdx >= 0) {
             hostTracker.recordMidStreamFailure(previousIdx);
@@ -2146,22 +2145,25 @@ public class QwpWebSocketSender implements Sender {
                 client.close();
                 client = null;
             }
+            Endpoint ep = currentEndpoint();
             throw new LineSenderException(
-                    "Failed to start cursor I/O thread for " + host + ":" + port, t);
+                    "Failed to start cursor I/O thread for " + ep.host + ":" + ep.port, t);
         }
 
         if (client != null) {
+            Endpoint ep = currentEndpoint();
             encoder.setVersion((byte) client.getServerQwpVersion());
             LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
-                    host, port, inFlightWindowSize, client.getServerQwpVersion());
+                    ep.host, ep.port, inFlightWindowSize, client.getServerQwpVersion());
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
             // its default version (V1). Schema state still gets reset for
             // consistency with the sync path; the post-connect replay path
             // does not need a producer-side reset signal because every
             // cursor frame is self-sufficient.
-            LOG.info("Async initial connect deferred to I/O thread [host={}, port={}, windowSize={}]",
-                    host, port, inFlightWindowSize);
+            Endpoint ep = endpoints.get(0);
+            LOG.info("Async initial connect deferred to I/O thread [host={}, port={}, endpointCount={}, windowSize={}]",
+                    ep.host, ep.port, endpoints.size(), inFlightWindowSize);
         }
         // Server starts fresh on each connection — discard any schema IDs
         // retained from prior state. Cursor frames are self-sufficient (every
@@ -2457,6 +2459,11 @@ public class QwpWebSocketSender implements Sender {
 
     private static List<Endpoint> singleEndpoint(String host, int port) {
         return Collections.singletonList(new Endpoint(host, port));
+    }
+
+    private Endpoint currentEndpoint() {
+        int idx = currentEndpointIdx;
+        return endpoints.get(Math.max(idx, 0));
     }
 
     public static final class Endpoint {

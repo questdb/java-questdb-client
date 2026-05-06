@@ -42,6 +42,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -891,10 +892,9 @@ public class QwpQueryClient implements QuietCloseable {
             if (failoverInitialBackoffMs > 0L) {
                 long base = failoverInitialBackoffMs << Math.min(attempt - 1, 30);
                 long capped = Math.min(base, failoverMaxBackoffMs);
-                long jitter = capped > 0L
-                        ? java.util.concurrent.ThreadLocalRandom.current().nextLong(capped)
+                long delay = capped > 0L
+                        ? ThreadLocalRandom.current().nextLong(capped + 1L)
                         : 0L;
-                long delay = Math.min(capped + jitter, failoverMaxBackoffMs);
                 if (delay > 0L) {
                     try {
                         Thread.sleep(delay);
