@@ -729,7 +729,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // build() time. 0 or negative is a documented "disable" value, so
         // a Long.MIN_VALUE sentinel keeps it distinguishable from "unset".
         private static final long DURABLE_ACK_KEEPALIVE_NOT_SET = Long.MIN_VALUE;
+        private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
+        private boolean gorillaEnabled = true;
         // Drives the initial-connect strategy. OFF is fail-fast (default).
         // SYNC retries on the user thread up to the reconnect cap. ASYNC
         // returns immediately and lets the I/O thread retry in the
@@ -1029,8 +1031,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
 
             if (protocol == PROTOCOL_WEBSOCKET) {
-                if (hosts.size() != 1 || ports.size() != 1) {
-                    throw new LineSenderException("only a single address (host:port) is supported for WebSocket transport");
+                if (hosts.size() < 1 || ports.size() != hosts.size()) {
+                    throw new LineSenderException("WebSocket transport requires at least one host:port pair");
                 }
 
                 int actualAutoFlushRows = autoFlushRows == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_ROWS : autoFlushRows;
@@ -1134,11 +1136,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                         ? errorInboxCapacity
                         : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
+                java.util.List<QwpWebSocketSender.Endpoint> wsEndpoints =
+                        new java.util.ArrayList<>(hosts.size());
+                for (int i = 0, n = hosts.size(); i < n; i++) {
+                    wsEndpoints.add(new QwpWebSocketSender.Endpoint(hosts.getQuick(i), ports.getQuick(i)));
+                }
                 QwpWebSocketSender connected;
                 try {
                     connected = QwpWebSocketSender.connect(
-                            hosts.getQuick(0),
-                            ports.getQuick(0),
+                            wsEndpoints,
                             wsTlsConfig,
                             actualAutoFlushRows,
                             actualAutoFlushBytes,
@@ -1155,7 +1161,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             initialConnectMode,
                             errorHandler,
                             actualErrorInboxCapacity,
-                            actualDurableAckKeepaliveIntervalMillis
+                            actualDurableAckKeepaliveIntervalMillis,
+                            authTimeoutMillis
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -1167,6 +1174,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     throw t;
                 }
+                connected.setGorillaEnabled(gorillaEnabled);
                 // connect() succeeded — `connected` now owns cursorEngine
                 // via setCursorEngine(engine, true). From here on, ANY
                 // failure must close `connected` (which closes the engine
@@ -1972,6 +1980,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Per-endpoint timeout on the WebSocket upgrade response read. Default
+         * {@value QwpWebSocketSender#DEFAULT_AUTH_TIMEOUT_MS} ms.
+         */
+        public LineSenderBuilder authTimeoutMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException(
+                        "auth_timeout is only supported for WebSocket transport");
+            }
+            if (millis <= 0L) {
+                throw new LineSenderException("auth_timeout must be > 0: ").put(millis);
+            }
+            this.authTimeoutMillis = millis;
+            return this;
+        }
+
+        public LineSenderBuilder gorilla(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("gorilla is only supported for WebSocket transport");
+            }
+            this.gorillaEnabled = enabled;
+            return this;
+        }
+
+        /**
          * Per-outage cap on the cursor I/O loop's reconnect retry budget.
          * Once a wire failure occurs, the loop retries with exponential
          * backoff until either reconnect succeeds (timer resets) or this
@@ -2666,6 +2698,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "close_flush_timeout_millis");
                     closeFlushTimeoutMillis(parseLongValue(sink, "close_flush_timeout_millis"));
+                } else if (Chars.equals("auth_timeout", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("auth_timeout is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "auth_timeout");
+                    authTimeoutMillis(parseLongValue(sink, "auth_timeout"));
+                } else if (Chars.equals("gorilla", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("gorilla is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "gorilla");
+                    if (Chars.equals("on", sink) || Chars.equals("true", sink)) {
+                        gorilla(true);
+                    } else if (Chars.equals("off", sink) || Chars.equals("false", sink)) {
+                        gorilla(false);
+                    } else {
+                        throw new LineSenderException("invalid gorilla [value=").put(sink).put(", allowed=[on, off]]");
+                    }
                 } else if (Chars.equals("durable_ack_keepalive_interval_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException(

@@ -530,12 +530,11 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testMultipleAddresses_fails() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST + ":9000")
-                        .address(LOCALHOST + ":9001"),
-                "single address");
+    public void testMultipleAddresses_buildable() {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST + ":9000")
+                .address(LOCALHOST + ":9001");
+        Assert.assertNotNull(builder);
     }
 
     @Test
@@ -715,6 +714,13 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     @Test
     public void testWsConfigString_uppercaseNotSupported() {
         assertBadConfig("WS::addr=localhost:9000;", "invalid schema");
+    }
+
+    @Test
+    public void testWsConfigString_multipleAddresses() {
+        Sender.LineSenderBuilder builder =
+                Sender.builder("ws::addr=a:9000,b:9001,c:9002;");
+        Assert.assertNotNull(builder);
     }
 
     @Test

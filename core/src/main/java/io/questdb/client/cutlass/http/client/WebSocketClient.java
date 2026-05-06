@@ -75,6 +75,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int PARSE_INCOMPLETE = 0;
     private static final int PARSE_NEED_MORE = -1;
     private static final int PARSE_OK = 1;
+    private static final String QUESTDB_ROLE_HEADER_NAME = "X-QuestDB-Role:";
     private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
@@ -133,6 +134,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     // setQwpRequestDurableAck) is the early-fail signal.
     private boolean serverDurableAckEnabled;
     private int serverQwpVersion = 1;
+    private String upgradeRejectRole;
     private boolean upgraded;
 
     public WebSocketClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
@@ -294,6 +296,16 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public int getServerQwpVersion() {
         return serverQwpVersion;
+    }
+
+    /**
+     * If the most recent {@link #upgrade} was rejected with a 503 carrying an
+     * {@code X-QuestDB-Role} header, returns that role (e.g. {@code REPLICA},
+     * {@code PRIMARY_CATCHUP}). Returns null otherwise. Read after a failed
+     * upgrade to classify the rejection by replication role.
+     */
+    public String getUpgradeRejectRole() {
+        return upgradeRejectRole;
     }
 
     /**
@@ -622,6 +634,23 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return false;
+    }
+
+    private static String extractRoleHeader(String response) {
+        int headerLen = QUESTDB_ROLE_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QUESTDB_ROLE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                return value.isEmpty() ? null : value;
+            }
+        }
+        return null;
     }
 
     private static int extractQwpVersion(String response) {
@@ -1031,6 +1060,9 @@ public abstract class WebSocketClient implements QuietCloseable {
         // Check status line
         if (!response.startsWith("HTTP/1.1 101")) {
             String statusLine = response.split("\r\n")[0];
+            if (statusLine.startsWith("HTTP/1.1 503")) {
+                upgradeRejectRole = extractRoleHeader(response);
+            }
             throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);
         }
 

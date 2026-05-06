@@ -30,6 +30,7 @@ import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.SenderProgressHandler;
 import io.questdb.client.cairo.TableUtils;
+import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -59,6 +60,9 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -108,6 +112,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class QwpWebSocketSender implements Sender {
 
+    public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
     public static final int DEFAULT_AUTO_FLUSH_BYTES = 0;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
@@ -130,10 +135,13 @@ public class QwpWebSocketSender implements Sender {
     private final QwpWebSocketEncoder encoder;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
+    private final List<Endpoint> endpoints;
+    private final QwpHostHealthTracker hostTracker;
     private final String host;
     private final int inFlightWindowSize;
     private final int maxSchemasPerConnection;
     private final int port;
+    private volatile int currentEndpointIdx = -1;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
@@ -203,6 +211,7 @@ public class QwpWebSocketSender implements Sender {
     // values; Sender.build can override via the new connect overload.
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
+    private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private boolean requestDurableAck;
     // Keepalive PING cadence used by the I/O loop while
     // request_durable_ack=on AND there are pending durable-ack
@@ -212,8 +221,7 @@ public class QwpWebSocketSender implements Sender {
             CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
 
     private QwpWebSocketSender(
-            String host,
-            int port,
+            List<Endpoint> endpoints,
             ClientTlsConfiguration tlsConfig,
             int autoFlushRows,
             int autoFlushBytes,
@@ -222,9 +230,14 @@ public class QwpWebSocketSender implements Sender {
             String authorizationHeader,
             int maxSchemasPerConnection
     ) {
+        if (endpoints == null || endpoints.isEmpty()) {
+            throw new IllegalArgumentException("endpoints must be non-empty");
+        }
+        this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
+        this.hostTracker = new QwpHostHealthTracker(this.endpoints.size());
         this.authorizationHeader = authorizationHeader;
-        this.host = host;
-        this.port = port;
+        this.host = this.endpoints.get(0).host;
+        this.port = this.endpoints.get(0).port;
         this.tlsConfig = tlsConfig;
         this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
         this.tableBuffers = new CharSequenceObjHashMap<>();
@@ -477,13 +490,50 @@ public class QwpWebSocketSender implements Sender {
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis
     ) {
+        return connect(
+                singleEndpoint(host, port), tlsConfig,
+                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection,
+                requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS);
+    }
+
+    /**
+     * Multi-endpoint variant. {@code endpoints} must be non-empty; the order is the failover
+     * preference (single-primary cluster: walk the list until one accepts the upgrade).
+     */
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
-                host, port, tlsConfig,
+                endpoints, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
         );
         try {
             sender.requestDurableAck = requestDurableAck;
+            sender.authTimeoutMs = authTimeoutMs;
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -524,7 +574,7 @@ public class QwpWebSocketSender implements Sender {
 
     public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize, String authorizationHeader) {
         return new QwpWebSocketSender(
-                host, port, null,
+                singleEndpoint(host, port), null,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
                 inFlightWindowSize, authorizationHeader, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
         );
@@ -570,7 +620,7 @@ public class QwpWebSocketSender implements Sender {
             int maxSchemasPerConnection
     ) {
         return new QwpWebSocketSender(
-                host, port, null,
+                singleEndpoint(host, port), null,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 inFlightWindowSize, null, maxSchemasPerConnection
         );
@@ -1845,43 +1895,71 @@ public class QwpWebSocketSender implements Sender {
      * within the per-outage time cap).
      */
     private WebSocketClient buildAndConnect() {
-        WebSocketClient newClient;
-        if (tlsConfig != null) {
-            newClient = WebSocketClientFactory.newTlsInstance(tlsConfig);
-        } else {
-            newClient = WebSocketClientFactory.newPlainTextInstance();
+        int previousIdx = currentEndpointIdx;
+        if (previousIdx >= 0) {
+            hostTracker.recordMidStreamFailure(previousIdx);
+            currentEndpointIdx = -1;
         }
-        try {
-            newClient.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
-            newClient.setQwpClientId(QwpConstants.CLIENT_ID);
-            newClient.setQwpRequestDurableAck(requestDurableAck);
-            newClient.connect(host, port);
-            newClient.upgrade(WRITE_PATH, authorizationHeader);
-        } catch (Exception e) {
-            newClient.close();
-            throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
+        if (hostTracker.isRoundExhausted()) {
+            hostTracker.beginRound(true);
         }
-        // Fail at connect when the user opted into durable acks but landed on
-        // a server that did not echo the X-QWP-Durable-Ack: enabled confirmation.
-        // Without this check, store-and-forward would never receive trim signals
-        // and the on-disk store would grow unbounded -- silent storage exhaustion
-        // is a worse outcome than a loud connect-time failure.
-        if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
-            newClient.close();
-            // The "WebSocket upgrade failed:" prefix is load-bearing: the cursor I/O
-            // loop's isTerminalUpgradeError() sniffs for that exact substring to
-            // classify a connect-time throw as terminal (won't retry). Without the
-            // prefix the loop would treat this misconfig as transient and burn the
-            // full reconnect budget before surfacing it.
-            throw new LineSenderException(
-                    "WebSocket upgrade failed: server does not support durable ack [host="
-                            + host + ", port=" + port
-                            + "]. The client opted in via request_durable_ack=on but the server "
-                            + "did not echo X-QWP-Durable-Ack: enabled in the upgrade response. "
-                            + "Either disable request_durable_ack or connect to a server with "
-                            + "primary replication configured.");
+        Throwable lastError = null;
+        Endpoint lastEndpoint = null;
+        while (true) {
+            int idx = hostTracker.pickNext();
+            if (idx < 0) break;
+            Endpoint ep = endpoints.get(idx);
+            lastEndpoint = ep;
+            WebSocketClient newClient = tlsConfig != null
+                    ? WebSocketClientFactory.newTlsInstance(tlsConfig)
+                    : WebSocketClientFactory.newPlainTextInstance();
+            try {
+                newClient.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
+                newClient.setQwpClientId(QwpConstants.CLIENT_ID);
+                newClient.setQwpRequestDurableAck(requestDurableAck);
+                newClient.connect(ep.host, ep.port);
+                int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
+                newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
+            } catch (HttpClientException e) {
+                String role = newClient.getUpgradeRejectRole();
+                newClient.close();
+                if (role != null) {
+                    boolean isTransient = QwpIngressRoleRejectedException.ROLE_PRIMARY_CATCHUP.equals(role);
+                    hostTracker.recordRoleReject(idx, isTransient);
+                    QwpIngressRoleRejectedException re = new QwpIngressRoleRejectedException(role, ep.host, ep.port);
+                    re.initCause(e);
+                    lastError = re;
+                    continue;
+                }
+                hostTracker.recordTransportError(idx);
+                lastError = e;
+                continue;
+            } catch (Exception e) {
+                newClient.close();
+                hostTracker.recordTransportError(idx);
+                lastError = e;
+                continue;
+            }
+            if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
+                newClient.close();
+                hostTracker.recordTransportError(idx);
+                throw new LineSenderException(
+                        "WebSocket upgrade failed: server does not support durable ack [host="
+                                + ep.host + ", port=" + ep.port
+                                + "]. The client opted in via request_durable_ack=on but the server "
+                                + "did not echo X-QWP-Durable-Ack: enabled in the upgrade response. "
+                                + "Either disable request_durable_ack or connect to a server with "
+                                + "primary replication configured.");
+            }
+            hostTracker.recordSuccess(idx);
+            currentEndpointIdx = idx;
+            return newClient;
         }
-        return newClient;
+        String summary = lastEndpoint == null
+                ? "no endpoints available"
+                : "all " + endpoints.size() + " endpoint(s) unreachable; last="
+                + lastEndpoint.host + ":" + lastEndpoint.port;
+        throw new LineSenderException("Failed to connect: " + summary, lastError);
     }
 
     private void checkConnectionError() {
@@ -2377,4 +2455,17 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    private static List<Endpoint> singleEndpoint(String host, int port) {
+        return Collections.singletonList(new Endpoint(host, port));
+    }
+
+    public static final class Endpoint {
+        public final String host;
+        public final int port;
+
+        public Endpoint(String host, int port) {
+            this.host = host;
+            this.port = port;
+        }
+    }
 }
