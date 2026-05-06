@@ -535,6 +535,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         events.offer(new QueryEvent().asTransportError(WebSocketResponse.STATUS_INTERNAL_ERROR, message));
     }
 
+    private void emitTerminalProtocolError(String message) {
+        notifyTerminalFailure(message);
+        events.offer(new QueryEvent().asProtocolError(WebSocketResponse.STATUS_INTERNAL_ERROR, message));
+    }
+
     /**
      * Like {@link #emitError} but emits a {@code KIND_TRANSPORT_ERROR} event
      * rather than {@code KIND_ERROR}, and retries until the event is enqueued.
@@ -594,15 +599,17 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // buffer) directly, skipping the previous per-batch memcpy into buf.scratchAddr.
         try {
             decoder.decode(buf, payloadPtr, payloadLen);
-        } catch (QwpDecodeException e) {
-            // Same invariant as releaseBuffer: a slot is always free for a buf
-            // we took out of the pool moments ago. Close-on-failure is a
-            // defensive guard against future refactors breaking that invariant.
+        } catch (QwpProtocolVersionException e) {
             if (!freeBuffers.offer(buf)) {
                 buf.close();
             }
-            // A decode failure leaves the client-side decoder out of step with
-            // the server's byte stream: the next frame cannot be trusted.
+            emitTerminalProtocolError(e.getMessage());
+            currentQueryDone = true;
+            return;
+        } catch (QwpDecodeException e) {
+            if (!freeBuffers.offer(buf)) {
+                buf.close();
+            }
             emitTerminalTransportError("decode failure: " + e.getMessage());
             currentQueryDone = true;
             return;

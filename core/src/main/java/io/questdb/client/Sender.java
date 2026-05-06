@@ -62,7 +62,9 @@ import java.nio.charset.StandardCharsets;
 import java.security.PrivateKey;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -835,55 +837,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
-        private void addAddressEntry(CharSequence src, int start, int end) {
-            int hostStart;
-            int hostEnd;
-            int portStart;
-            if (src.charAt(start) == '[') {
-                int closeBracket = Chars.indexOf(src, start + 1, end, ']');
-                if (closeBracket < 0) {
-                    throw new LineSenderException("missing closing ']' in IPv6 addr entry [address=")
-                            .put(src.subSequence(start, end)).put("]");
-                }
-                hostStart = start + 1;
-                hostEnd = closeBracket;
-                if (closeBracket == end - 1) {
-                    portStart = -1;
-                } else if (src.charAt(closeBracket + 1) != ':') {
-                    throw new LineSenderException("expected ':' after ']' in IPv6 addr entry [address=")
-                            .put(src.subSequence(start, end)).put("]");
-                } else {
-                    portStart = closeBracket + 2;
-                }
-            } else {
-                int firstColon = Chars.indexOf(src, start, end, ':');
-                int lastColon = Chars.indexOf(src, start, end, ':', -1);
-                if (firstColon != lastColon) {
-                    hostStart = start;
-                    hostEnd = end;
-                    portStart = -1;
-                } else if (firstColon < 0) {
-                    hostStart = start;
-                    hostEnd = end;
-                    portStart = -1;
-                } else {
-                    hostStart = start;
-                    hostEnd = firstColon;
-                    portStart = firstColon + 1;
-                }
-            }
-            if (hostStart == hostEnd) {
-                throw new LineSenderException("empty host in addr entry [address=")
+        private void addAddressEntry(CharSequence src, int start, int end, int defaultPort) {
+            int colon = Chars.indexOf(src, start, end, ':');
+            if (colon == end - 1) {
+                throw new LineSenderException("invalid address, use IPv4 address or a domain name [address=")
                         .put(src.subSequence(start, end)).put("]");
             }
+            int hostEnd = colon < 0 ? end : colon;
             int parsedPort = -1;
-            if (portStart >= 0) {
-                if (portStart >= end) {
-                    throw new LineSenderException("invalid address, use IPv4 address or a domain name [address=")
-                            .put(src.subSequence(start, end)).put("]");
-                }
+            if (colon >= 0) {
                 try {
-                    parsedPort = Numbers.parseInt(src, portStart, end);
+                    parsedPort = Numbers.parseInt(src, colon + 1, end);
                     if (parsedPort < 1 || parsedPort > 65535) {
                         throw new LineSenderException("invalid port [port=").put(parsedPort).put("]");
                     }
@@ -892,18 +856,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             .put(" [address=").put(src.subSequence(start, end)).put("]");
                 }
             }
-            if (parsedPort != -1) {
-                for (int i = 0, n = hosts.size(); i < n; i++) {
-                    String storedHost = hosts.get(i);
-                    if (charsEqualsRange(storedHost, src, hostStart, hostEnd)) {
-                        if (ports.size() > i && ports.getQuick(i) == parsedPort) {
-                            throw new LineSenderException("duplicated addresses are not allowed [address=")
-                                    .put(src.subSequence(start, end)).put("]");
-                        }
+            if (hostEnd == start) {
+                throw new LineSenderException("empty host in addr entry [address=")
+                        .put(src.subSequence(start, end)).put("]");
+            }
+            int effectivePort = parsedPort != -1 ? parsedPort : defaultPort;
+            for (int i = 0, n = hosts.size(); i < n; i++) {
+                String storedHost = hosts.get(i);
+                if (charsEqualsRange(storedHost, src, start, hostEnd)) {
+                    if (ports.size() > i && ports.getQuick(i) == effectivePort) {
+                        throw new LineSenderException("duplicated addresses are not allowed [address=")
+                                .put(src.subSequence(start, end)).put("]");
                     }
                 }
             }
-            hosts.add(src.subSequence(hostStart, hostEnd).toString());
+            hosts.add(src.subSequence(start, hostEnd).toString());
             if (parsedPort != -1) {
                 ports.add(parsedPort);
             }
@@ -1223,8 +1190,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                         ? errorInboxCapacity
                         : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
-                java.util.List<QwpWebSocketSender.Endpoint> wsEndpoints =
-                        new java.util.ArrayList<>(hosts.size());
+                List<QwpWebSocketSender.Endpoint> wsEndpoints =
+                        new ArrayList<>(hosts.size());
                 for (int i = 0, n = hosts.size(); i < n; i++) {
                     wsEndpoints.add(new QwpWebSocketSender.Endpoint(hosts.getQuick(i), ports.getQuick(i)));
                 }
@@ -2569,7 +2536,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                 throw new LineSenderException("empty addr entry");
                             }
                             int portsBefore = ports.size();
-                            addAddressEntry(sink, s, e);
+                            addAddressEntry(sink, s, e, defaultPort);
                             if (ports.size() == portsBefore) {
                                 port(defaultPort);
                             }

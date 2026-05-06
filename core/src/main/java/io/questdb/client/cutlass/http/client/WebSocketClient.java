@@ -135,6 +135,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private boolean serverDurableAckEnabled;
     private int serverQwpVersion = 1;
     private String upgradeRejectRole;
+    private int upgradeStatusCode;
     private boolean upgraded;
 
     public WebSocketClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
@@ -299,13 +300,19 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * If the most recent {@link #upgrade} was rejected with a 503 carrying an
-     * {@code X-QuestDB-Role} header, returns that role (e.g. {@code REPLICA},
-     * {@code PRIMARY_CATCHUP}). Returns null otherwise. Read after a failed
-     * upgrade to classify the rejection by replication role.
+     * Role from {@code X-QuestDB-Role} on the most recent rejected upgrade,
+     * or null when no such header was present.
      */
     public String getUpgradeRejectRole() {
         return upgradeRejectRole;
+    }
+
+    /**
+     * HTTP status code from the most recent rejected upgrade, or 0 if no
+     * upgrade rejection has been observed yet.
+     */
+    public int getUpgradeStatusCode() {
+        return upgradeStatusCode;
     }
 
     /**
@@ -516,6 +523,8 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (upgraded) {
             return; // Already upgraded
         }
+        upgradeRejectRole = null;
+        upgradeStatusCode = 0;
 
         // Generate random key
         byte[] keyBytes = new byte[16];
@@ -636,6 +645,18 @@ public abstract class WebSocketClient implements QuietCloseable {
         return false;
     }
 
+    private static int parseStatusCode(String statusLine) {
+        int sp1 = statusLine.indexOf(' ');
+        if (sp1 < 0 || sp1 + 4 > statusLine.length()) return 0;
+        int code = 0;
+        for (int i = sp1 + 1; i < sp1 + 4; i++) {
+            char c = statusLine.charAt(i);
+            if (c < '0' || c > '9') return 0;
+            code = code * 10 + (c - '0');
+        }
+        return code;
+    }
+
     private static String extractRoleHeader(String response) {
         int headerLen = QUESTDB_ROLE_HEADER_NAME.length();
         int responseLen = response.length();
@@ -647,7 +668,7 @@ public abstract class WebSocketClient implements QuietCloseable {
                     lineEnd = responseLen;
                 }
                 String value = response.substring(valueStart, lineEnd).trim();
-                return value.isEmpty() ? null : value;
+                return value.isEmpty() ? null : value.toUpperCase(java.util.Locale.ROOT);
             }
         }
         return null;
@@ -1057,10 +1078,10 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
         String response = new String(responseBytes, StandardCharsets.US_ASCII);
 
-        // Check status line
         if (!response.startsWith("HTTP/1.1 101")) {
             String statusLine = response.split("\r\n")[0];
-            if (statusLine.startsWith("HTTP/1.1 503")) {
+            upgradeStatusCode = parseStatusCode(statusLine);
+            if (upgradeStatusCode == 421) {
                 upgradeRejectRole = extractRoleHeader(response);
             }
             throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);

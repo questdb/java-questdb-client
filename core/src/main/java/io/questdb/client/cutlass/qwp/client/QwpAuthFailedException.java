@@ -1,4 +1,4 @@
-/*+*****************************************************************************
+/*******************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -27,26 +27,20 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 
 /**
- * Raised when the server rejects a {@code /write/v4} WebSocket upgrade with a
- * {@code 421 Misdirected Request} carrying an {@code X-QuestDB-Role} header.
- * Carries the role name so the host-health tracker can classify the endpoint
- * as transiently unavailable ({@code PRIMARY_CATCHUP}) versus structurally
- * unwritable ({@code REPLICA}).
+ * WebSocket upgrade rejected with {@code 401}/{@code 403}/{@code 404}. Terminal
+ * across all configured endpoints: a rejected credential is uniformly rejected
+ * across the cluster, so failing fast keeps server logs clean and surfaces the
+ * configuration error immediately.
  */
-public final class QwpIngressRoleRejectedException extends HttpClientException {
-    public static final String ROLE_PRIMARY = "PRIMARY";
-    public static final String ROLE_PRIMARY_CATCHUP = "PRIMARY_CATCHUP";
-    public static final String ROLE_REPLICA = "REPLICA";
-    public static final String ROLE_STANDALONE = "STANDALONE";
-
+public final class QwpAuthFailedException extends HttpClientException {
     private final String host;
     private final int port;
-    private final String role;
+    private final int statusCode;
 
-    public QwpIngressRoleRejectedException(String role, String host, int port) {
-        super("WebSocket ingress upgrade rejected by role=");
-        put(role).put(" at ").put(host).put(':').put(port);
-        this.role = role;
+    public QwpAuthFailedException(int statusCode, String host, int port) {
+        super("WebSocket upgrade rejected with HTTP ");
+        put(statusCode).put(" for ").put(host).put(':').put(port);
+        this.statusCode = statusCode;
         this.host = host;
         this.port = port;
     }
@@ -59,15 +53,7 @@ public final class QwpIngressRoleRejectedException extends HttpClientException {
         return port;
     }
 
-    public String getRole() {
-        return role;
-    }
-
-    public boolean isTopological() {
-        return ROLE_REPLICA.equals(role);
-    }
-
-    public boolean isTransient() {
-        return ROLE_PRIMARY_CATCHUP.equals(role);
+    public int getStatusCode() {
+        return statusCode;
     }
 }

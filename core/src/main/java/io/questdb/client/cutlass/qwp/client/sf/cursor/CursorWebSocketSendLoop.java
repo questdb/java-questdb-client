@@ -605,14 +605,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             System.nanoTime()
                     );
                     totalServerErrors.incrementAndGet();
-                    // recordFatal MUST run before dispatchError: the spec
-                    // requires signal.terminalError to be latched BEFORE the
-                    // handler is invoked, so a handler that synchronously
-                    // probes getLastTerminalError() (or calls flush()) sees
-                    // the typed error rather than null.
                     recordFatal(new LineSenderServerException(err), err);
                     dispatchError(err);
                     return;
+                }
+                if (isRoleReject(e)) {
+                    backoffMillis = reconnectInitialBackoffMillis;
+                    long roleSleepStart = System.nanoTime();
+                    if (running) {
+                        LockSupport.parkNanos(reconnectInitialBackoffMillis * 1_000_000L);
+                    }
+                    deadlineNanos += System.nanoTime() - roleSleepStart;
+                    lastReconnectError = e;
+                    continue;
                 }
                 lastReconnectError = e;
                 long now = System.nanoTime();
@@ -621,9 +626,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     lastLogNanos = now;
                 }
             }
-            // Backoff with jitter: sleep [backoff, 2*backoff). Cap the
-            // sleep at the remaining budget so we don't oversleep past
-            // the deadline.
             if (running) {
                 long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
                 long sleepMillis = backoffMillis + jitter;
@@ -732,7 +734,26 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * handshake) are treated as transient.
      */
     private static boolean isTerminalUpgradeError(Throwable t) {
+        if (isRoleReject(t)) {
+            return false;
+        }
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof io.questdb.client.cutlass.qwp.client.QwpAuthFailedException) {
+                return true;
+            }
+            if (cur.getCause() == cur) break;
+        }
         return findUpgradeFailureMessage(t) != null;
+    }
+
+    private static boolean isRoleReject(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException) {
+                return true;
+            }
+            if (cur.getCause() == cur) break;
+        }
+        return false;
     }
 
     /**

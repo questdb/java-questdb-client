@@ -414,48 +414,8 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWsConfigString_ipv6Bracketed_withPort() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=[::1]:9000;");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testWsConfigString_ipv6Bracketed_defaultPort() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=[fe80::1];");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testWsConfigString_ipv6BareUnbracketed_defaultPort() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=fe80::1;");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testWsConfigString_ipv6Mixed_multiHost() {
-        Sender.LineSenderBuilder builder =
-                Sender.builder("ws::addr=[::1]:9000,a:9001,[fe80::2]:9002;");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testWsConfigString_ipv6Bracketed_missingClose_fails() {
-        assertBadConfig("ws::addr=[::1:9000;", "missing closing ']'");
-    }
-
-    @Test
-    public void testWsConfigString_ipv6Bracketed_junkAfterBracket_fails() {
-        assertBadConfig("ws::addr=[::1]x:9000;", "expected ':' after ']'");
-    }
-
-    @Test
     public void testWsConfigString_emptyHost_fails() {
         assertBadConfig("ws::addr=:9000;", "empty host in addr entry");
-    }
-
-    @Test
-    public void testWsConfigString_emptyBracketedHost_fails() {
-        assertBadConfig("ws::addr=[]:9000;", "empty host in addr entry");
     }
 
     @Test

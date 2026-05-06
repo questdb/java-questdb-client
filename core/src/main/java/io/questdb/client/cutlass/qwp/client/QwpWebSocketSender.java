@@ -139,7 +139,6 @@ public class QwpWebSocketSender implements Sender {
     private final QwpHostHealthTracker hostTracker;
     private final int inFlightWindowSize;
     private final int maxSchemasPerConnection;
-    private volatile int currentEndpointIdx = -1;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
@@ -155,10 +154,11 @@ public class QwpWebSocketSender implements Sender {
     // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
     // up to this many millis for ackedFsn to catch up to publishedFsn.
     private long closeFlushTimeoutMillis = 5_000L;
-    private boolean closed;
+    private volatile boolean closed;
     private boolean connected;
     // Track max global symbol ID used in current batch (for delta calculation)
     private int currentBatchMaxSymbolId = -1;
+    private volatile int currentEndpointIdx = -1;
     private QwpTableBuffer currentTableBuffer;
     private String currentTableName;
     // Cursor SF engine: the producer (user thread) writes encoded QWP frames
@@ -1903,8 +1903,12 @@ public class QwpWebSocketSender implements Sender {
             hostTracker.beginRound(true);
         }
         Throwable lastError = null;
+        Throwable terminalUpgradeError = null;
         Endpoint lastEndpoint = null;
         while (true) {
+            if (closed) {
+                throw new LineSenderException("sender closed during connect");
+            }
             int idx = hostTracker.pickNext();
             if (idx < 0) break;
             Endpoint ep = endpoints.get(idx);
@@ -1921,6 +1925,7 @@ public class QwpWebSocketSender implements Sender {
                 newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
             } catch (HttpClientException e) {
                 String role = newClient.getUpgradeRejectRole();
+                int status = newClient.getUpgradeStatusCode();
                 newClient.close();
                 if (role != null) {
                     boolean isTransient = QwpIngressRoleRejectedException.ROLE_PRIMARY_CATCHUP.equals(role);
@@ -1930,8 +1935,16 @@ public class QwpWebSocketSender implements Sender {
                     lastError = re;
                     continue;
                 }
+                if (status == 401 || status == 403 || status == 404) {
+                    QwpAuthFailedException ae = new QwpAuthFailedException(status, ep.host, ep.port);
+                    ae.initCause(e);
+                    throw ae;
+                }
                 hostTracker.recordTransportError(idx);
                 lastError = e;
+                if (terminalUpgradeError == null && isUpgradeFailedSentinel(e)) {
+                    terminalUpgradeError = e;
+                }
                 continue;
             } catch (Exception e) {
                 newClient.close();
@@ -1954,11 +1967,21 @@ public class QwpWebSocketSender implements Sender {
             currentEndpointIdx = idx;
             return newClient;
         }
+        if (terminalUpgradeError != null) {
+            throw new LineSenderException(
+                    "Failed to connect: WebSocket upgrade failed across " + endpoints.size() + " endpoint(s)",
+                    terminalUpgradeError);
+        }
         String summary = lastEndpoint == null
                 ? "no endpoints available"
                 : "all " + endpoints.size() + " endpoint(s) unreachable; last="
                 + lastEndpoint.host + ":" + lastEndpoint.port;
         throw new LineSenderException("Failed to connect: " + summary, lastError);
+    }
+
+    private static boolean isUpgradeFailedSentinel(Throwable e) {
+        String msg = e.getMessage();
+        return msg != null && msg.contains("WebSocket upgrade failed:");
     }
 
     private void checkConnectionError() {
@@ -2162,7 +2185,7 @@ public class QwpWebSocketSender implements Sender {
             // does not need a producer-side reset signal because every
             // cursor frame is self-sufficient.
             Endpoint ep = endpoints.get(0);
-            LOG.info("Async initial connect deferred to I/O thread [host={}, port={}, endpointCount={}, windowSize={}]",
+            LOG.info("Async initial connect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}, windowSize={}]",
                     ep.host, ep.port, endpoints.size(), inFlightWindowSize);
         }
         // Server starts fresh on each connection — discard any schema IDs
