@@ -434,6 +434,18 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_addrWithTrailingHostWhitespace_trimmed() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost :9000;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_addrWithLeadingPortWhitespace_trimmed() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost: 9000;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
     public void testFullAsyncConfiguration() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)

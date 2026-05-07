@@ -99,6 +99,17 @@ public class QwpHostHealthTrackerTest {
     }
 
     @Test
+    public void testMidStreamFailure_MarksAttempted() {
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2);
+        t.recordSuccess(0);
+        t.beginRound(false);
+        t.recordMidStreamFailure(0);
+        Assert.assertEquals(1, t.pickNext());
+        t.recordTransportError(1);
+        Assert.assertEquals(-1, t.pickNext());
+    }
+
+    @Test
     public void testMidStreamFailure_NonHealthyUnchanged() {
         QwpHostHealthTracker t = new QwpHostHealthTracker(2);
         t.recordRoleReject(0, false);

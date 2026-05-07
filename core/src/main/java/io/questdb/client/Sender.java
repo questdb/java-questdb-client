@@ -838,10 +838,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put(src.subSequence(start, end)).put("]");
             }
             int hostEnd = colon < 0 ? end : colon;
+            int portStart = colon < 0 ? end : colon + 1;
+            while (hostEnd > start && Character.isWhitespace(src.charAt(hostEnd - 1))) hostEnd--;
+            while (portStart < end && Character.isWhitespace(src.charAt(portStart))) portStart++;
             int parsedPort = -1;
             if (colon >= 0) {
                 try {
-                    parsedPort = Numbers.parseInt(src, colon + 1, end);
+                    parsedPort = Numbers.parseInt(src, portStart, end);
                     if (parsedPort < 1 || parsedPort > 65535) {
                         throw new LineSenderException("invalid port [port=").put(parsedPort).put("]");
                     }

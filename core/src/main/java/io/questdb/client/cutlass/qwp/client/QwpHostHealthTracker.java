@@ -143,14 +143,16 @@ public final class QwpHostHealthTracker {
     }
 
     /**
-     * Demotes a previously-healthy host on send/receive failure so a subsequent
-     * sticky-Healthy reset doesn't preserve it as the priority entry.
+     * Demotes a previously-healthy host on send/receive failure and marks it
+     * attempted in the current round so a subsequent {@link #pickNext()}
+     * inside the same round does not pick it again.
      */
     public void recordMidStreamFailure(int idx) {
         synchronized (lock) {
             if (states[idx] == HostState.HEALTHY) {
                 states[idx] = HostState.TRANSPORT_ERROR;
             }
+            attemptedThisRound[idx] = true;
         }
     }
 

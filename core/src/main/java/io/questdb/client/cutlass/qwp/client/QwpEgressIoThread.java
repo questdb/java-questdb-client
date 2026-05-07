@@ -533,6 +533,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     private void emitTerminalProtocolError(String message) {
         notifyTerminalFailure(message, true);
         events.offer(new QueryEvent().asProtocolError(WebSocketResponse.STATUS_INTERNAL_ERROR, message));
+        shutdown = true;
     }
 
     private void emitTerminalTransportError(String message) {

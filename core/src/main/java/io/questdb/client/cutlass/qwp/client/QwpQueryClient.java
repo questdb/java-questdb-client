@@ -218,7 +218,6 @@ public class QwpQueryClient implements QuietCloseable {
     // payload before it parks, and the client auto-replenishes by the size of
     // each batch as the user releases it.
     private long initialCreditBytes;
-    private String lbStrategy = LB_RANDOM;
     // Volatile so a cancel() call from a thread other than the one that ran
     // connect() sees the published reference (and a concurrent null-out from
     // close() is observed without a stale-reference race). The thread-safety
@@ -233,6 +232,7 @@ public class QwpQueryClient implements QuietCloseable {
     private volatile QwpEgressIoThread ioThread;
     private volatile Thread ioThreadHandle;
     private boolean lastCloseTimedOut;
+    private String lbStrategy = LB_RANDOM;
     // Client preference for server-side per-batch row cap. 0 means "unset",
     // server uses its default. Set via {@code max_batch_rows=N} in the
     // connection string or {@link #withMaxBatchRows}. Smaller values give
@@ -757,6 +757,7 @@ public class QwpQueryClient implements QuietCloseable {
         if (connected) {
             return;
         }
+        lastCloseTimedOut = false;
         if (hostTracker == null) {
             if (LB_RANDOM.equals(lbStrategy) && endpoints.size() > 1) {
                 List<Endpoint> shuffled = new ArrayList<>(endpoints);
@@ -771,15 +772,9 @@ public class QwpQueryClient implements QuietCloseable {
         QwpServerInfo lastObservedMismatch = null;
         boolean sawV1Mismatch = false;
         Throwable lastTransportError = null;
-        boolean retriedAfterReset = false;
         while (true) {
             int i = hostTracker.pickNext();
             if (i < 0) {
-                if (!retriedAfterReset) {
-                    hostTracker.beginRound(true);
-                    retriedAfterReset = true;
-                    continue;
-                }
                 break;
             }
             Endpoint ep = endpoints.get(i);
@@ -820,6 +815,7 @@ public class QwpQueryClient implements QuietCloseable {
                 cleanupFailedConnect();
                 continue;
             }
+            spawnIoThread();
             hostTracker.recordSuccess(i);
             currentEndpointIndex = i;
             connected = true;
@@ -1120,9 +1116,11 @@ public class QwpQueryClient implements QuietCloseable {
      * Configures the exponential backoff applied between failover reconnect
      * attempts. {@code initialMs} is the delay before the first retry (the
      * second overall execute attempt); each subsequent retry doubles the
-     * delay up to {@code maxMs}. A zero {@code initialMs} disables backoff
-     * entirely -- retries fire back to back, which is fine for fast LAN
-     * clusters but risks hammering a struggling one during a real outage.
+     * delay up to {@code maxMs}. Setting either {@code initialMs} or
+     * {@code maxMs} to 0 disables backoff entirely -- retries fire back to
+     * back, bounded only by {@link #withFailoverMaxAttempts} and
+     * {@link #withFailoverMaxDuration}. Fine for fast LAN clusters, but
+     * risks hammering a struggling one during a real outage.
      * Defaults: initial {@value #DEFAULT_FAILOVER_INITIAL_BACKOFF_MS} ms,
      * max {@value #DEFAULT_FAILOVER_MAX_BACKOFF_MS} ms.
      */
@@ -1377,7 +1375,7 @@ public class QwpQueryClient implements QuietCloseable {
                         host = entry;
                         port = DEFAULT_WS_PORT;
                     } else {
-                        host = entry.substring(0, colon);
+                        host = entry.substring(0, colon).trim();
                         port = parsePort(entry.substring(colon + 1), entry);
                     }
                 }
@@ -1551,7 +1549,9 @@ public class QwpQueryClient implements QuietCloseable {
         if (!"raw".equals(compressionPreference)) {
             probeZstdAvailable();
         }
+    }
 
+    private void spawnIoThread() {
         // Wire a fresh generation-scoped listener into this I/O thread. Each
         // listener owns its own terminal-failure latch, so even if a dying
         // I/O thread slips a late onTerminalFailure callback past the orphan
@@ -1675,32 +1675,37 @@ public class QwpQueryClient implements QuietCloseable {
      * the caller doesn't inherit a half-open socket.
      */
     private void probeZstdAvailable() {
-        long dctx;
+        long dctx = 0;
         try {
-            dctx = Zstd.createDCtx();
-        } catch (UnsatisfiedLinkError e) {
-            LOG.error("zstd JNI symbols missing from libquestdb; aborting connect", e);
-            if (webSocketClient != null) {
-                webSocketClient.close();
-                webSocketClient = null;
+            try {
+                dctx = Zstd.createDCtx();
+            } catch (UnsatisfiedLinkError e) {
+                LOG.error("zstd JNI symbols missing from libquestdb; aborting connect", e);
+                if (webSocketClient != null) {
+                    webSocketClient.close();
+                    webSocketClient = null;
+                }
+                throw new HttpClientException("this client build does not support zstd compression -- "
+                        + "libquestdb was built without the zstd submodule. Rebuild the native library "
+                        + "with 'git submodule update --init --recursive' and 'cmake --build', or set "
+                        + "compression=raw on the connection string to skip the probe. "
+                        + "[cause=" + e.getMessage() + "]");
             }
-            throw new HttpClientException("this client build does not support zstd compression -- "
-                    + "libquestdb was built without the zstd submodule. Rebuild the native library "
-                    + "with 'git submodule update --init --recursive' and 'cmake --build', or set "
-                    + "compression=raw on the connection string to skip the probe. "
-                    + "[cause=" + e.getMessage() + "]");
-        }
-        if (dctx == 0) {
-            LOG.error("zstd createDCtx returned 0 (native allocation failure); aborting connect");
-            if (webSocketClient != null) {
-                webSocketClient.close();
-                webSocketClient = null;
+            if (dctx == 0) {
+                LOG.error("zstd createDCtx returned 0 (native allocation failure); aborting connect");
+                if (webSocketClient != null) {
+                    webSocketClient.close();
+                    webSocketClient = null;
+                }
+                throw new HttpClientException("zstd decompression context allocation failed; "
+                        + "cannot accept compressed batches. Set compression=raw on the connection "
+                        + "string to disable compression, or retry once memory pressure subsides.");
             }
-            throw new HttpClientException("zstd decompression context allocation failed; "
-                    + "cannot accept compressed batches. Set compression=raw on the connection "
-                    + "string to disable compression, or retry once memory pressure subsides.");
+        } finally {
+            if (dctx != 0) {
+                Zstd.freeDCtx(dctx);
+            }
         }
-        Zstd.freeDCtx(dctx);
     }
 
     private QwpServerInfo receiveServerInfoSync() {
@@ -1730,15 +1735,14 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Walks the endpoint list starting at the entry right after the one that
-     * just failed, wrapping around so every <em>other</em> endpoint gets a
-     * try. The failed endpoint itself is deliberately <strong>not</strong>
-     * retried: a transport failure is likely to repeat immediately on the same
-     * socket ({@code PeerDisconnectedException} from a server that's still
-     * accepting new connections but torn the old one down, for example), and
-     * a retry would just burn an attempt. The outer {@link #execute} loop
-     * can revisit the failed endpoint on a subsequent failover attempt if
-     * every other endpoint is also unreachable.
+     * Walks the endpoint list by tracker priority (HEALTHY → UNKNOWN →
+     * TRANSIENT_REJECT → TRANSPORT_ERROR → TOPOLOGY_REJECT). The mid-stream
+     * failed endpoint was demoted by {@link QwpHostHealthTracker#recordMidStreamFailure}
+     * before this method is entered, so in multi-host configurations a different
+     * endpoint is preferred; with a single configured endpoint the same host is
+     * the only option. After the first round exhausts, classifications other
+     * than HEALTHY are forgotten and the list is walked once more so a long-lived
+     * client recovers from topology changes.
      * <p>
      * On success, leaves the client in the same state {@link #connect()}
      * produces: {@code connected=true}, {@code ioThread} spawned,
@@ -1747,6 +1751,7 @@ public class QwpQueryClient implements QuietCloseable {
      */
     private void reconnectViaTracker() {
         int total = endpoints.size();
+        lastCloseTimedOut = false;
         hostTracker.beginRound(false);
         QwpServerInfo lastMismatch = null;
         boolean sawV1Mismatch = false;
@@ -1793,6 +1798,7 @@ public class QwpQueryClient implements QuietCloseable {
                 cleanupFailedConnect();
                 continue;
             }
+            spawnIoThread();
             hostTracker.recordSuccess(i);
             currentEndpointIndex = i;
             connected = true;

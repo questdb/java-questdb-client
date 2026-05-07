@@ -143,6 +143,7 @@ public class QwpWebSocketSender implements Sender {
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
     private MicrobatchBuffer activeBuffer;
+    private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     // Double-buffering for async I/O
     private MicrobatchBuffer buffer0;
     // Cached column references to avoid repeated hashmap lookups
@@ -171,6 +172,12 @@ public class QwpWebSocketSender implements Sender {
     // alongside the cursor send loop in close().
     private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool
             drainerPool;
+    // Keepalive PING cadence used by the I/O loop while
+    // request_durable_ack=on AND there are pending durable-ack
+    // confirmations. Default mirrors the loop's spec value; 0 or negative
+    // disables keepalive PINGs entirely.
+    private long durableAckKeepaliveIntervalMillis =
+            CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
     private SenderErrorDispatcher errorDispatcher;
     // Async-delivery sink for SenderError notifications. Default-constructed
     // here with the loud-not-silent default handler; a builder hook can swap
@@ -209,14 +216,7 @@ public class QwpWebSocketSender implements Sender {
     // values; Sender.build can override via the new connect overload.
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
-    private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private boolean requestDurableAck;
-    // Keepalive PING cadence used by the I/O loop while
-    // request_durable_ack=on AND there are pending durable-ack
-    // confirmations. Default mirrors the loop's spec value; 0 or negative
-    // disables keepalive PINGs entirely.
-    private long durableAckKeepaliveIntervalMillis =
-            CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
 
     private QwpWebSocketSender(
             List<Endpoint> endpoints,
@@ -1888,8 +1888,8 @@ public class QwpWebSocketSender implements Sender {
      * Returns a {@link CursorWebSocketSendLoop.ReconnectFactory} that, on each
      * call, performs the multi-endpoint walk and returns a freshly connected
      * {@link WebSocketClient}. Each factory holds private "previously-bound
-     * endpoint" state, so foreground and drainer reconnects do not corrupt
-     * each other's host-tracker priorities.
+     * endpoint" state for mid-stream-failure attribution; the host tracker
+     * itself is shared across factories.
      */
     public CursorWebSocketSendLoop.ReconnectFactory newReconnectFactory() {
         return new ReconnectSupplier();
@@ -1957,7 +1957,7 @@ public class QwpWebSocketSender implements Sender {
             }
             if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
                 newClient.close();
-                hostTracker.recordTransportError(idx);
+                hostTracker.recordRoleReject(idx, false);
                 LineSenderException ackErr = new LineSenderException(
                         "WebSocket upgrade failed: server does not support durable ack [host=")
                         .put(ep.host).put(", port=").put(ep.port)
