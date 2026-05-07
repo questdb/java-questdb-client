@@ -54,18 +54,30 @@ public interface QwpSubscriptionHandler {
     /**
      * Server is forwarding the row delta committed at {@code txn}.
      * <p>
-     * The callback is invoked synchronously while the receive thread holds
-     * the wire bytes pinned in the receive buffer; the body pointer
-     * ({@code bodyAddr}) is only valid for the duration of the call.
-     * Implementations that need to retain row data must copy the bytes out.
+     * The {@link QwpColumnBatch} passed in is a column-major decoded view of
+     * the txn's rows: {@code batch.getRowCount()},
+     * {@code batch.getColumnCount()}, {@code batch.getString(col, row)},
+     * {@code batch.getDoubleValue(col, row)}, {@code batch.getSymbol(col,
+     * row)}, etc. The view is valid only for the duration of this callback -
+     * its column pointers reference the receive-buffer bytes the IO thread
+     * is about to overwrite. Copy any values you need to retain.
+     * <p>
+     * Multi-chunk delivery: if a single txn's row count exceeds the
+     * per-batch row cap (default 16,384, configurable via
+     * {@link QwpSubscribeClient.Builder#withMaxBatchRows(int)}) the server
+     * splits it across multiple {@code SUBSCRIBE_BATCH} frames sharing the
+     * same {@code txn} value but with monotonically-increasing
+     * {@code batch.batchSeq()}. A consumer that wants per-txn atomicity can
+     * buffer until {@code txn} changes; consumers that treat each chunk as
+     * an independent slab of rows see no observable difference from the
+     * single-chunk case.
      *
-     * @param txn       the sequencer txn this batch corresponds to
-     * @param batchSeq  per-subscription monotonic batch sequence number
-     * @param bodyAddr  native pointer to the delta-section + table-block
-     *                  bytes that follow the per-batch prelude
-     * @param bodyLen   length of {@code bodyAddr}'s region in bytes
+     * @param txn   the sequencer txn this batch corresponds to (or partial
+     *              chunk of)
+     * @param batch column-major view of the rows in this chunk; valid until
+     *              this method returns
      */
-    void onBatch(long txn, long batchSeq, long bodyAddr, int bodyLen);
+    void onBatch(long txn, QwpColumnBatch batch);
 
     /**
      * Server has terminated the subscription. {@code reason} is one of the

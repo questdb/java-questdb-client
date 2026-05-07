@@ -58,6 +58,15 @@ public class QwpBatchBuffer implements QuietCloseable {
         this.scratchAddr = Unsafe.malloc(initialCapacity, MemoryTag.NATIVE_DEFAULT);
     }
 
+    /**
+     * Exposes the decoded batch view this buffer's pool feeds. Same instance
+     * across all decode calls; valid only between a {@link
+     * QwpResultBatchDecoder} decode call and the next reuse of this buffer.
+     */
+    public QwpColumnBatch getBatch() {
+        return batch;
+    }
+
     @Override
     public void close() {
         if (scratchAddr != 0) {

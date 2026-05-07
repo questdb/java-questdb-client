@@ -222,6 +222,119 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         decodePayload(buffer, payloadPtr, payloadLen);
     }
 
+    /**
+     * Body-only decode for callers that have already stripped a non-RESULT_BATCH
+     * prelude from a frame whose body shares the
+     * {@code [optional zstd]([delta_section] table_block)} layout. The Enterprise
+     * SUBSCRIBE_BATCH frame uses this exact body shape but with its own prelude
+     * (msg_kind 0x1B, sub_id, batch_seq, txn) - the caller parses those, then
+     * passes the remaining bytes here so it can hand the user a populated
+     * {@link QwpColumnBatch} without re-implementing the (substantial) body
+     * decoder.
+     * <p>
+     * <b>Argument contract.</b>
+     * <ul>
+     *   <li>{@code bodyStart} / {@code bodyLimit} delimit the bytes between the
+     *       prelude and the end of the message payload. The decoder consumes
+     *       exactly that range; nothing before {@code bodyStart} is touched.</li>
+     *   <li>{@code flags} is the QWP message-header flags byte the caller already
+     *       parsed. {@link io.questdb.client.cutlass.qwp.protocol.QwpConstants#FLAG_DELTA_SYMBOL_DICT}
+     *       and {@link io.questdb.client.cutlass.qwp.protocol.QwpConstants#FLAG_GORILLA}
+     *       are mandatory for SUBSCRIBE_BATCH; {@link io.questdb.client.cutlass.qwp.protocol.QwpConstants#FLAG_ZSTD}
+     *       toggles the optional zstd wrapper around the body.</li>
+     *   <li>{@code correlationId} and {@code batchSeq} are stored on the produced
+     *       batch view via {@link QwpColumnBatch#requestId()} and
+     *       {@link QwpColumnBatch#batchSeq()}. The decoder is agnostic to what
+     *       correlationId means: query callers pass requestId, subscribe callers
+     *       pass sub_id.</li>
+     *   <li>{@code payloadAddr} / {@code payloadLen} are recorded on the batch
+     *       view for {@link QwpColumnBatch#payloadAddr()} /
+     *       {@link QwpColumnBatch#payloadLimit()} accounting; they default to the
+     *       body bounds when the caller has no broader frame to point at.</li>
+     * </ul>
+     */
+    public void decodeAfterPrelude(
+            QwpBatchBuffer buffer,
+            long bodyStart,
+            long bodyLimit,
+            byte flags,
+            long correlationId,
+            long batchSeq,
+            long payloadAddr,
+            int payloadLen
+    ) throws QwpDecodeException {
+        decodeBody(buffer, bodyStart, bodyLimit, flags, correlationId, batchSeq, payloadAddr, payloadLen);
+    }
+
+    /**
+     * Registers a schema definition that arrived ahead of any RESULT_BATCH /
+     * SUBSCRIBE_BATCH that references it. The Enterprise SUBSCRIBE_ACK frame
+     * ships the table's full schema in its body so subsequent
+     * SUBSCRIBE_BATCH frames can use {@code SCHEMA_MODE_REFERENCE} from the
+     * very first row. The OSS query path inlines its first batch's schema
+     * via {@code SCHEMA_MODE_FULL}, which the body parser handles natively;
+     * this method exists for callers that need to seed the schema from a
+     * different frame type.
+     * <p>
+     * Wire layout consumed: {@code mode(1, must be SCHEMA_MODE_FULL) +
+     * schema_id(varint) + columns_until_limit (per-column: name_len(varint)
+     * + name_bytes + wire_type(1))}. The byte range
+     * {@code [schemaPayloadAddr, schemaPayloadLimit)} must end exactly at
+     * the last column's wire-type byte; trailing bytes are rejected.
+     */
+    public void registerSchemaFull(long schemaPayloadAddr, long schemaPayloadLimit) throws QwpDecodeException {
+        if (schemaPayloadAddr >= schemaPayloadLimit) {
+            throw new QwpDecodeException("schema payload empty");
+        }
+        long p = schemaPayloadAddr;
+        byte mode = Unsafe.getUnsafe().getByte(p++);
+        if (mode != QwpConstants.SCHEMA_MODE_FULL) {
+            throw new QwpDecodeException("expected SCHEMA_MODE_FULL (0x00), got 0x"
+                    + Integer.toHexString(mode & 0xFF));
+        }
+        decodeVarint(p, schemaPayloadLimit);
+        if (varintValue < 0 || varintValue >= MAX_SCHEMAS_PER_CONNECTION) {
+            throw new QwpDecodeException("schema_id out of range: " + varintValue);
+        }
+        int schemaId = (int) varintValue;
+        p = varintPos;
+
+        // Walk columns until limit, counting first so we can right-size the
+        // schema slot in one shot. Two-pass keeps the slot's column-info
+        // refs stable for the populate pass without needing dynamic re-grow.
+        int columnCount = 0;
+        long scan = p;
+        while (scan < schemaPayloadLimit) {
+            decodeVarint(scan, schemaPayloadLimit);
+            if (varintValue < 0 || varintValue > QwpConstants.MAX_COLUMN_NAME_LENGTH) {
+                throw new QwpDecodeException("column name length out of range: " + varintValue);
+            }
+            int colNameLen = (int) varintValue;
+            scan = varintPos + colNameLen + 1; // name + 1-byte wire type
+            if (scan > schemaPayloadLimit) {
+                throw new QwpDecodeException("truncated column def");
+            }
+            columnCount++;
+            if (columnCount > QwpConstants.MAX_COLUMNS_PER_TABLE) {
+                throw new QwpDecodeException("schema column count exceeds " + QwpConstants.MAX_COLUMNS_PER_TABLE);
+            }
+        }
+        if (scan != schemaPayloadLimit) {
+            throw new QwpDecodeException("schema payload trailing bytes");
+        }
+
+        ObjList<QwpEgressColumnInfo> columns = ensureSchemaSlot(schemaId, columnCount);
+        for (int i = 0; i < columnCount; i++) {
+            decodeVarint(p, schemaPayloadLimit);
+            int colNameLen = (int) varintValue;
+            p = varintPos;
+            String colName = readColumnName(p, colNameLen);
+            p += colNameLen;
+            byte wireType = Unsafe.getUnsafe().getByte(p++);
+            columns.getQuick(i).of(colName, wireType);
+        }
+    }
+
     // Pool helpers
 
     private static long advanceFixed(QwpColumnLayout layout, long p, long limit, int sizeBytes) throws QwpDecodeException {
@@ -301,8 +414,6 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             throw new QwpDecodeException("unsupported version " + (version & 0xFF));
         }
         byte flags = Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS);
-        deltaMode = (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0;
-        gorillaMode = (flags & QwpConstants.FLAG_GORILLA) != 0;
         long p = payload + QwpConstants.HEADER_SIZE;
         long limit = payload + payloadLen;
 
@@ -317,6 +428,33 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         long batchSeq = varintValue;
         p = varintPos;
 
+        // Hand off to the body decoder. Same shape as the SUBSCRIBE_BATCH
+        // path uses via {@link #decodeAfterPrelude}.
+        decodeBody(buffer, p, limit, flags, requestId, batchSeq, payload, payloadLen);
+    }
+
+    /**
+     * Body decode shared by RESULT_BATCH ({@link #decodePayload}) and
+     * SUBSCRIBE_BATCH ({@link #decodeAfterPrelude}). Caller must have already
+     * validated the message header and consumed any frame-specific prelude;
+     * {@code bodyStart}/{@code bodyLimit} delimit the (optionally
+     * zstd-wrapped) {@code [delta_section] table_block} bytes.
+     */
+    private void decodeBody(
+            QwpBatchBuffer buffer,
+            long bodyStart,
+            long bodyLimit,
+            byte flags,
+            long correlationId,
+            long batchSeq,
+            long payloadAddr,
+            int payloadLen
+    ) throws QwpDecodeException {
+        deltaMode = (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0;
+        gorillaMode = (flags & QwpConstants.FLAG_GORILLA) != 0;
+        long p = bodyStart;
+        long limit = bodyLimit;
+
         // Zstd-compressed body: the region from here to {@code limit} is a
         // single zstd frame covering the delta section + table block. Decode
         // into the decoder-owned scratch buffer and rebind {@code p} /
@@ -326,7 +464,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         // callers ({@code batch.payloadLimit() - batch.payloadAddr()}) report
         // the uncompressed-equivalent body size rather than an arbitrary
         // pointer delta between two native allocations.
-        long batchViewAddr = payload;
+        long batchViewAddr = payloadAddr;
         if ((flags & QwpConstants.FLAG_ZSTD) != 0) {
             long srcLen = limit - p;
             if (dctx == 0) {
@@ -485,7 +623,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         }
 
         // Reset batch view and parse columns into per-column layouts owned by the buffer.
-        resetBatch(buffer, requestId, batchSeq, rowCount, columnCount, columns, batchViewAddr, limit);
+        resetBatch(buffer, correlationId, batchSeq, rowCount, columnCount, columns, batchViewAddr, limit);
         for (int ci = 0; ci < columnCount; ci++) {
             QwpColumnLayout layout = borrowLayout(buffer.layoutPool, ci);
             layout.clear();

@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Misc;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 
@@ -57,7 +58,14 @@ import java.util.Map;
  *     client.connect();
  *     QwpSubscription sub = client.subscribe("trades", new QwpSubscriptionHandler() {
  *         public void onAck(long startTxn, int schemaId) { ... }
- *         public void onBatch(long txn, long seq, long bodyAddr, int bodyLen) { ... }
+ *         public void onBatch(long txn, QwpColumnBatch batch) {
+ *             for (int row = 0; row &lt; batch.getRowCount(); row++) {
+ *                 String sym = batch.getSymbol(0, row);
+ *                 double price = batch.getDoubleValue(1, row);
+ *                 long ts = batch.getLongValue(2, row);
+ *                 // ... process the row ...
+ *             }
+ *         }
  *         public void onEnd(byte reason, long lastTxn, String message) { ... }
  *     });
  *     while (sub.isActive()) {
@@ -79,6 +87,21 @@ public class QwpSubscribeClient implements QuietCloseable {
     public static final int DEFAULT_WS_PORT = 9000;
     private static final int DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
     private static final int SCRATCH_CAP = 8_192;
+    /**
+     * Reusable decoded-batch view shared across every subscription on this
+     * client. Single-threaded usage means we can pool one buffer and let
+     * {@link #handleBatch} hand the same instance to whichever sub's
+     * handler is firing - the {@link QwpColumnBatch} contract is "valid
+     * until the callback returns" so no two callbacks see overlapping
+     * lifetimes.
+     */
+    private final QwpBatchBuffer batchBuffer = new QwpBatchBuffer(SCRATCH_CAP);
+    /**
+     * Connection-scoped row decoder. Holds the symbol-dictionary heap and
+     * the schema registry that subsequent SUBSCRIBE_BATCH frames reference;
+     * a CACHE_RESET wipes both via {@link QwpResultBatchDecoder#applyCacheReset(byte)}.
+     */
+    private final QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
     private final FrameDispatcher dispatcher = new FrameDispatcher();
     private final CharSequence host;
     private final int port;
@@ -138,6 +161,8 @@ public class QwpSubscribeClient implements QuietCloseable {
         } catch (Throwable ignored) {
         }
         Unsafe.free(scratchAddr, SCRATCH_CAP, MemoryTag.NATIVE_DEFAULT);
+        Misc.free(decoder);
+        Misc.free(batchBuffer);
     }
 
     /**
@@ -434,6 +459,7 @@ public class QwpSubscribeClient implements QuietCloseable {
             if (payloadLen < QwpConstants.HEADER_SIZE + 1) {
                 return;
             }
+            byte flags = Unsafe.getUnsafe().getByte(payloadAddr + QwpConstants.HEADER_OFFSET_FLAGS);
             byte msgKind = Unsafe.getUnsafe().getByte(payloadAddr + QwpConstants.HEADER_SIZE);
             long bodyAddr = payloadAddr + QwpConstants.HEADER_SIZE + 1;
             int bodyLen = payloadLen - QwpConstants.HEADER_SIZE - 1;
@@ -442,15 +468,18 @@ public class QwpSubscribeClient implements QuietCloseable {
                     handleAck(bodyAddr, bodyLen);
                     return;
                 case QwpSubscribeMsgKind.SUBSCRIBE_BATCH:
-                    handleBatch(bodyAddr, bodyLen);
+                    handleBatch(payloadAddr, payloadLen, flags, bodyAddr, bodyLen);
                     return;
                 case QwpSubscribeMsgKind.SUBSCRIPTION_END:
                     handleEnd(bodyAddr, bodyLen);
                     return;
+                case QwpEgressMsgKind.CACHE_RESET:
+                    handleCacheReset(bodyAddr, bodyLen);
+                    return;
                 default:
-                    // Other server-to-client frames (RESULT_BATCH, SERVER_INFO,
-                    // CACHE_RESET) are not relevant to the subscribe client; the
-                    // WAL-tail use case never asks for them.
+                    // Other server-to-client frames (RESULT_BATCH, SERVER_INFO)
+                    // are not relevant to the subscribe client; the WAL-tail
+                    // use case never asks for them.
             }
         }
 
@@ -468,32 +497,81 @@ public class QwpSubscribeClient implements QuietCloseable {
         }
 
         private void handleAck(long bodyAddr, int bodyLen) {
-            // sub_id(8) + start_txn(8) + schema_id(4) + schema...
+            // sub_id(8) + start_txn(8) + schema_id(4) + schema_full
             if (bodyLen < 20) return;
             long subId = Unsafe.getUnsafe().getLong(bodyAddr);
             long startTxn = Unsafe.getUnsafe().getLong(bodyAddr + 8);
             int schemaId = Unsafe.getUnsafe().getInt(bodyAddr + 16);
             QwpSubscriptionImpl sub = subscriptions.get(subId);
             if (sub == null) return;
+            // Seed the decoder's connection-scoped schema registry with the
+            // table's columns BEFORE the first SUBSCRIBE_BATCH lands. Subscribe
+            // batches reference the schema by id (mode 0x01) on every frame -
+            // the decoder rejects an unknown id, so we have to register it
+            // here from the ACK body's full schema section. registerSchemaFull
+            // expects the bytes to end at the last column's wire-type byte
+            // exactly, which matches QwpEgressSchemaWriter.writeFull's output.
+            try {
+                decoder.registerSchemaFull(bodyAddr + 20, bodyAddr + bodyLen);
+            } catch (QwpDecodeException e) {
+                sub.active = false;
+                sub.endReason = QwpSubscribeMsgKind.SUB_END_ERROR;
+                sub.handler.onEnd(QwpSubscribeMsgKind.SUB_END_ERROR, 0L,
+                        "schema decode failure: " + e.getMessage());
+                throw new HttpClientException("subscribe-ack schema decode failed: " + e.getMessage());
+            }
             sub.startTxn = startTxn;
             sub.schemaId = schemaId;
             sub.acked = true;
             sub.handler.onAck(startTxn, schemaId);
         }
 
-        private void handleBatch(long bodyAddr, int bodyLen) {
-            // sub_id(8) + batch_seq(varint) + txn(u64) + ...rest...
+        private void handleBatch(long payloadAddr, int payloadLen, byte flags, long bodyAddr, int bodyLen) {
+            // Per-batch prelude: sub_id(8) + batch_seq(varint) + txn(u64).
+            // Anything past txn is the (optionally zstd-wrapped) delta_section
+            // + table_block, which the OSS QwpResultBatchDecoder knows how to
+            // decode via decodeAfterPrelude.
             if (bodyLen < 16) return;
             long subId = Unsafe.getUnsafe().getLong(bodyAddr);
             QwpSubscriptionImpl sub = subscriptions.get(subId);
             if (sub == null) return;
-            long after = readVarint(bodyAddr + 8, bodyAddr + bodyLen, varintScratch);
+            long bodyLimit = bodyAddr + bodyLen;
+            long after = readVarint(bodyAddr + 8, bodyLimit, varintScratch);
             long batchSeq = varintScratch[0];
+            if (after + 8 > bodyLimit) return;
             long txn = Unsafe.getUnsafe().getLong(after);
-            long restAddr = after + 8;
-            int restLen = (int) (bodyAddr + bodyLen - restAddr);
+            long rowsStart = after + 8;
             sub.lastTxn = txn;
-            sub.handler.onBatch(txn, batchSeq, restAddr, restLen);
+            try {
+                decoder.decodeAfterPrelude(
+                        batchBuffer,
+                        rowsStart,
+                        bodyLimit,
+                        flags,
+                        subId,
+                        batchSeq,
+                        payloadAddr,
+                        payloadLen
+                );
+            } catch (QwpDecodeException e) {
+                // The decoder is now out of step with the server's byte
+                // stream; further frames cannot be trusted. Synthesise an
+                // END for this sub and let the connection close.
+                sub.active = false;
+                sub.endReason = QwpSubscribeMsgKind.SUB_END_ERROR;
+                sub.handler.onEnd(QwpSubscribeMsgKind.SUB_END_ERROR, sub.lastTxn,
+                        "decode failure: " + e.getMessage());
+                throw new HttpClientException("subscribe batch decode failed: " + e.getMessage());
+            }
+            sub.handler.onBatch(txn, batchBuffer.batch);
+        }
+
+        private void handleCacheReset(long bodyAddr, int bodyLen) {
+            // CACHE_RESET body: reset_mask(u8). Bit 0 = SYMBOL dict, bit 1 =
+            // schema cache. We delegate to the decoder since it owns both.
+            if (bodyLen < 1) return;
+            byte mask = Unsafe.getUnsafe().getByte(bodyAddr);
+            decoder.applyCacheReset(mask);
         }
 
         private void handleEnd(long bodyAddr, int bodyLen) {
