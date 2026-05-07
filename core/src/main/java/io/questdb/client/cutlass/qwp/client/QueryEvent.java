@@ -89,16 +89,16 @@ public class QueryEvent {
         return this;
     }
 
-    public QueryEvent asTransportError(byte status, String message) {
-        this.kind = KIND_TRANSPORT_ERROR;
+    public QueryEvent asProtocolError(byte status, String message) {
+        this.kind = KIND_PROTOCOL_ERROR;
         this.buffer = null;
         this.errorStatus = status;
         this.errorMessage = message;
         return this;
     }
 
-    public QueryEvent asProtocolError(byte status, String message) {
-        this.kind = KIND_PROTOCOL_ERROR;
+    public QueryEvent asTransportError(byte status, String message) {
+        this.kind = KIND_TRANSPORT_ERROR;
         this.buffer = null;
         this.errorStatus = status;
         this.errorMessage = message;

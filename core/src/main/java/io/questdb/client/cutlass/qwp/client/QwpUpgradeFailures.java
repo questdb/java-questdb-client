@@ -25,36 +25,32 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.http.client.HttpClientException;
+import io.questdb.client.cutlass.http.client.WebSocketClient;
 
-/**
- * WebSocket upgrade rejected with {@code 401} or {@code 403}. Terminal across all
- * configured endpoints: a rejected credential is uniformly rejected across the
- * cluster, so failing fast surfaces the configuration error immediately. Path
- * mismatches ({@code 404}) are NOT routed through this exception because a single
- * misconfigured node mid-deploy can return 404 while peers are healthy.
- */
-public final class QwpAuthFailedException extends HttpClientException {
-    private final String host;
-    private final int port;
-    private final int statusCode;
-
-    public QwpAuthFailedException(int statusCode, String host, int port) {
-        super("WebSocket upgrade rejected with HTTP ");
-        put(statusCode).put(" for ").put(host).put(':').put(port);
-        this.statusCode = statusCode;
-        this.host = host;
-        this.port = port;
+final class QwpUpgradeFailures {
+    private QwpUpgradeFailures() {
     }
 
-    public String getHost() {
-        return host;
-    }
-
-    public int getPort() {
-        return port;
-    }
-
-    public int getStatusCode() {
-        return statusCode;
+    /**
+     * Inspects {@code client}'s rejected-upgrade state and returns a typed
+     * exception if the failure is classifiable as a role reject ({@code 421} +
+     * {@code X-QuestDB-Role}) or a credential failure ({@code 401}/{@code 403}).
+     * Falls through to {@code ex} for any other status, including {@code 404}
+     * (per-endpoint path mismatch) and unknown codes.
+     */
+    static HttpClientException classify(WebSocketClient client, String host, int port, HttpClientException ex) {
+        String role = client.getUpgradeRejectRole();
+        if (role != null) {
+            QwpIngressRoleRejectedException re = new QwpIngressRoleRejectedException(role, host, port);
+            re.initCause(ex);
+            return re;
+        }
+        int status = client.getUpgradeStatusCode();
+        if (status == 401 || status == 403) {
+            QwpAuthFailedException ae = new QwpAuthFailedException(status, host, port);
+            ae.initCause(ex);
+            return ae;
+        }
+        return ex;
     }
 }

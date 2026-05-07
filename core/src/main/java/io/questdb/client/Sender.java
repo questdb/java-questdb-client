@@ -627,6 +627,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // We want to fail-fast even when an explicitly configured options happens to be same value as the default value,
         // because this still indicates a user error and silently ignoring it could lead to hard-to-debug issues.
         private static final int PARAMETER_NOT_SET_EXPLICITLY = -1;
+        private static final int PORT_NOT_SET = -1;
         private static final int PROTOCOL_HTTP = 1;
         private static final int PROTOCOL_TCP = 0;
         private static final int PROTOCOL_UDP = 3;
@@ -809,30 +810,23 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 hostSansPort = address.toString();
             }
 
-            // best effort dup detection, we might have incomplete information at this point,
-            // for example port or protocol might not be configured yet. so we are conservative
-            // and only detect dups when we have full information about the address
             if (parsedPort != -1) {
-                // we have a port, so we can do a full dup check
                 for (int i = 0, n = hosts.size(); i < n; i++) {
                     String storedHost = hosts.get(i);
                     if (Chars.equals(storedHost, hostSansPort)) {
-                        // given host is already configured, let's see if the port is the same
-                        if (ports.size() > i) {
-                            // ok, the previous address had a port explicitly configured, let's see if it's the same
-                            if (ports.getQuick(i) == parsedPort) {
-                                throw new LineSenderException("duplicated addresses are not allowed ")
-                                        .put("[address=").put(address).put("]");
-                            }
+                        if (ports.size() > i && ports.getQuick(i) == parsedPort) {
+                            throw new LineSenderException("duplicated addresses are not allowed ")
+                                    .put("[address=").put(address).put("]");
                         }
                     }
                 }
-
-            }
-            this.hosts.add(hostSansPort);
-            if (parsedPort != -1) {
-                // port was specified in the address, so we use it
+                while (ports.size() < hosts.size()) {
+                    ports.add(PORT_NOT_SET);
+                }
+                this.hosts.add(hostSansPort);
                 this.ports.add(parsedPort);
+            } else {
+                this.hosts.add(hostSansPort);
             }
             return this;
         }
@@ -864,16 +858,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             for (int i = 0, n = hosts.size(); i < n; i++) {
                 String storedHost = hosts.get(i);
                 if (charsEqualsRange(storedHost, src, start, hostEnd)) {
-                    if (ports.size() > i && ports.getQuick(i) == effectivePort) {
+                    int storedEffectivePort = ports.size() > i && ports.getQuick(i) != PORT_NOT_SET
+                            ? ports.getQuick(i) : defaultPort;
+                    if (storedEffectivePort == effectivePort) {
                         throw new LineSenderException("duplicated addresses are not allowed [address=")
                                 .put(src.subSequence(start, end)).put("]");
                     }
                 }
             }
-            hosts.add(src.subSequence(start, hostEnd).toString());
-            if (parsedPort != -1) {
-                ports.add(parsedPort);
+            while (ports.size() < hosts.size()) {
+                ports.add(PORT_NOT_SET);
             }
+            hosts.add(src.subSequence(start, hostEnd).toString());
+            ports.add(parsedPort != -1 ? parsedPort : PORT_NOT_SET);
         }
 
         private static boolean charsEqualsRange(CharSequence a, CharSequence b, int bStart, int bEnd) {
@@ -2416,6 +2413,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 defaultPort = DEFAULT_TCP_PORT;
             }
             int hostsCount = Math.max(hosts.size(), 1);
+            for (int i = 0, n = ports.size(); i < n; i++) {
+                if (ports.getQuick(i) == PORT_NOT_SET) {
+                    ports.set(i, defaultPort);
+                }
+            }
             while (ports.size() < hostsCount) {
                 ports.add(defaultPort);
             }
@@ -2538,11 +2540,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             if (s == e) {
                                 throw new LineSenderException("empty addr entry");
                             }
-                            int portsBefore = ports.size();
                             addAddressEntry(sink, s, e, defaultPort);
-                            if (ports.size() == portsBefore) {
-                                port(defaultPort);
-                            }
                             entryStart = i + 1;
                         }
                     }
@@ -2934,6 +2932,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (hosts.size() != ports.size()) {
                 throw new LineSenderException("mismatch between number of hosts and number of ports");
+            }
+            for (int i = 0, n = hosts.size(); i < n; i++) {
+                String host = hosts.get(i);
+                int port = ports.getQuick(i);
+                for (int j = i + 1; j < n; j++) {
+                    if (ports.getQuick(j) == port && Chars.equals(host, hosts.get(j))) {
+                        throw new LineSenderException("duplicated addresses are not allowed [address=")
+                                .put(host).put(':').put(port).put("]");
+                    }
+                }
             }
             if (!tlsEnabled && trustStorePath != null) {
                 throw new LineSenderException("custom trust store configured, but TLS was not enabled ")

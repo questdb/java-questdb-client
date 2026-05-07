@@ -648,9 +648,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static int parseStatusCode(String statusLine) {
         int sp1 = statusLine.indexOf(' ');
         if (sp1 < 0 || sp1 + 4 > statusLine.length()) return 0;
-        char afterCode = statusLine.charAt(sp1 + 4);
-        if (afterCode != ' ' && afterCode != '\r' && afterCode != '\n') {
-            return 0;
+        if (sp1 + 4 < statusLine.length()) {
+            char afterCode = statusLine.charAt(sp1 + 4);
+            if (afterCode != ' ' && afterCode != '\r' && afterCode != '\n') {
+                return 0;
+            }
         }
         int code = 0;
         for (int i = sp1 + 1; i < sp1 + 4; i++) {

@@ -1671,7 +1671,7 @@ public class QwpWebSocketSender implements Sender {
      * Should be called once, immediately after {@code connect()} returns.
      * Subsequent calls add more drainers to the same pool.
      */
-    public void startOrphanDrainers(
+    public synchronized void startOrphanDrainers(
             io.questdb.client.std.ObjList<String> orphanSlotPaths,
             int maxBackgroundDrainers,
             long segmentSizeBytes,
@@ -1690,7 +1690,7 @@ public class QwpWebSocketSender implements Sender {
             io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
                     new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
                             slot, segmentSizeBytes, sfMaxTotalBytes,
-                            this::buildAndConnect,
+                            newReconnectFactory(),
                             reconnectMaxDurationMillis,
                             reconnectInitialBackoffMillis,
                             reconnectMaxBackoffMillis);
@@ -1885,19 +1885,30 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Build and connect a fresh WebSocket client using the sender's
-     * persistent config (host/port/TLS/auth/durable-ack flag). Used both
-     * for the initial connect and as the reconnect factory passed to the
-     * cursor I/O loop. Throws {@link LineSenderException} on any failure
-     * — the I/O loop's reconnect path treats a throw as fatal for that
-     * attempt (and, in the follow-up commit, schedules a backoff retry
-     * within the per-outage time cap).
+     * Returns a {@link CursorWebSocketSendLoop.ReconnectFactory} that, on each
+     * call, performs the multi-endpoint walk and returns a freshly connected
+     * {@link WebSocketClient}. Each factory holds private "previously-bound
+     * endpoint" state, so foreground and drainer reconnects do not corrupt
+     * each other's host-tracker priorities.
      */
-    private synchronized WebSocketClient buildAndConnect() {
-        int previousIdx = currentEndpointIdx;
+    public CursorWebSocketSendLoop.ReconnectFactory newReconnectFactory() {
+        return new ReconnectSupplier();
+    }
+
+    private final class ReconnectSupplier implements CursorWebSocketSendLoop.ReconnectFactory {
+        private int previousIdx = -1;
+
+        @Override
+        public WebSocketClient reconnect() {
+            return buildAndConnect(this);
+        }
+    }
+
+    private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
+        int previousIdx = ctx.previousIdx;
         if (previousIdx >= 0) {
             hostTracker.recordMidStreamFailure(previousIdx);
-            currentEndpointIdx = -1;
+            ctx.previousIdx = -1;
         }
         if (hostTracker.isRoundExhausted()) {
             hostTracker.beginRound(true);
@@ -1924,27 +1935,19 @@ public class QwpWebSocketSender implements Sender {
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
                 newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
             } catch (HttpClientException e) {
-                String role = newClient.getUpgradeRejectRole();
-                int status = newClient.getUpgradeStatusCode();
+                HttpClientException classified = QwpUpgradeFailures.classify(newClient, ep.host, ep.port, e);
                 newClient.close();
-                if (role != null) {
-                    boolean isTransient = QwpIngressRoleRejectedException.ROLE_PRIMARY_CATCHUP.equalsIgnoreCase(role);
-                    hostTracker.recordRoleReject(idx, isTransient);
-                    QwpIngressRoleRejectedException re = new QwpIngressRoleRejectedException(role, ep.host, ep.port);
-                    re.initCause(e);
+                if (classified instanceof QwpIngressRoleRejectedException) {
+                    QwpIngressRoleRejectedException re = (QwpIngressRoleRejectedException) classified;
+                    hostTracker.recordRoleReject(idx, re.isTransient());
                     lastError = re;
                     continue;
                 }
-                if (status == 401 || status == 403) {
-                    QwpAuthFailedException ae = new QwpAuthFailedException(status, ep.host, ep.port);
-                    ae.initCause(e);
-                    throw ae;
+                if (classified instanceof QwpAuthFailedException) {
+                    throw (QwpAuthFailedException) classified;
                 }
                 hostTracker.recordTransportError(idx);
-                lastError = e;
-                if (terminalUpgradeError == null && isUpgradeFailedSentinel(e)) {
-                    terminalUpgradeError = e;
-                }
+                lastError = classified;
                 continue;
             } catch (Exception e) {
                 newClient.close();
@@ -1969,6 +1972,7 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             }
             hostTracker.recordSuccess(idx);
+            ctx.previousIdx = idx;
             currentEndpointIdx = idx;
             return newClient;
         }
@@ -1992,11 +1996,6 @@ public class QwpWebSocketSender implements Sender {
                     .put(lastEndpoint.host).put(':').put(lastEndpoint.port);
         }
         throw ex;
-    }
-
-    private static boolean isUpgradeFailedSentinel(Throwable e) {
-        String msg = e.getMessage();
-        return msg != null && msg.contains("WebSocket upgrade failed:");
     }
 
     private void checkConnectionError() {
@@ -2125,10 +2124,11 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine == null) {
             throw new LineSenderException("cursor engine must be attached before connect");
         }
+        CursorWebSocketSendLoop.ReconnectFactory reconnectFactory = newReconnectFactory();
         switch (initialConnectMode) {
             case SYNC:
                 client = CursorWebSocketSendLoop.connectWithRetry(
-                        this::buildAndConnect,
+                        reconnectFactory,
                         reconnectMaxDurationMillis,
                         reconnectInitialBackoffMillis,
                         reconnectMaxBackoffMillis,
@@ -2147,7 +2147,13 @@ public class QwpWebSocketSender implements Sender {
                 break;
             case OFF:
             default:
-                client = buildAndConnect();
+                try {
+                    client = reconnectFactory.reconnect();
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new LineSenderException(e).put("Failed to connect");
+                }
                 break;
         }
 
@@ -2155,7 +2161,7 @@ public class QwpWebSocketSender implements Sender {
             cursorSendLoop = new CursorWebSocketSendLoop(
                     client, cursorEngine,
                     0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
-                    this::buildAndConnect,
+                    reconnectFactory,
                     reconnectMaxDurationMillis,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis,
