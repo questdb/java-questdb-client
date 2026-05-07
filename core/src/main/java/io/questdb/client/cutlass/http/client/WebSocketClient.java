@@ -648,6 +648,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static int parseStatusCode(String statusLine) {
         int sp1 = statusLine.indexOf(' ');
         if (sp1 < 0 || sp1 + 4 > statusLine.length()) return 0;
+        char afterCode = statusLine.charAt(sp1 + 4);
+        if (afterCode != ' ' && afterCode != '\r' && afterCode != '\n') {
+            return 0;
+        }
         int code = 0;
         for (int i = sp1 + 1; i < sp1 + 4; i++) {
             char c = statusLine.charAt(i);
@@ -660,16 +664,19 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static String extractRoleHeader(String response) {
         int headerLen = QUESTDB_ROLE_HEADER_NAME.length();
         int responseLen = response.length();
-        for (int i = 0; i <= responseLen - headerLen; i++) {
-            if (response.regionMatches(true, i, QUESTDB_ROLE_HEADER_NAME, 0, headerLen)) {
-                int valueStart = i + headerLen;
+        int lineStart = response.indexOf("\r\n");
+        while (lineStart >= 0 && lineStart + 2 + headerLen <= responseLen) {
+            int hStart = lineStart + 2;
+            if (response.regionMatches(true, hStart, QUESTDB_ROLE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = hStart + headerLen;
                 int lineEnd = response.indexOf('\r', valueStart);
                 if (lineEnd < 0) {
                     lineEnd = responseLen;
                 }
                 String value = response.substring(valueStart, lineEnd).trim();
-                return value.isEmpty() ? null : value.toUpperCase(java.util.Locale.ROOT);
+                return value.isEmpty() ? null : value;
             }
+            lineStart = response.indexOf("\r\n", hStart);
         }
         return null;
     }

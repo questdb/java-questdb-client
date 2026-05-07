@@ -1085,7 +1085,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
 
             if (protocol == PROTOCOL_WEBSOCKET) {
-                if (hosts.size() < 1 || ports.size() != hosts.size()) {
+                if (hosts.size() < 1) {
                     throw new LineSenderException("WebSocket transport requires at least one host:port pair");
                 }
 
@@ -2405,16 +2405,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (maximumBufferCapacity == PARAMETER_NOT_SET_EXPLICITLY) {
                 maximumBufferCapacity = protocol == PROTOCOL_HTTP ? DEFAULT_MAXIMUM_BUFFER_CAPACITY : bufferCapacity;
             }
-            if (ports.size() == 0) {
-                if (protocol == PROTOCOL_HTTP) {
-                    ports.add(DEFAULT_HTTP_PORT);
-                } else if (protocol == PROTOCOL_UDP) {
-                    ports.add(DEFAULT_UDP_PORT);
-                } else if (protocol == PROTOCOL_WEBSOCKET) {
-                    ports.add(DEFAULT_WEBSOCKET_PORT);
-                } else {
-                    ports.add(DEFAULT_TCP_PORT);
-                }
+            int defaultPort;
+            if (protocol == PROTOCOL_HTTP) {
+                defaultPort = DEFAULT_HTTP_PORT;
+            } else if (protocol == PROTOCOL_UDP) {
+                defaultPort = DEFAULT_UDP_PORT;
+            } else if (protocol == PROTOCOL_WEBSOCKET) {
+                defaultPort = DEFAULT_WEBSOCKET_PORT;
+            } else {
+                defaultPort = DEFAULT_TCP_PORT;
+            }
+            int hostsCount = Math.max(hosts.size(), 1);
+            while (ports.size() < hostsCount) {
+                ports.add(defaultPort);
             }
             if (tlsValidationMode == null) {
                 tlsValidationMode = TlsValidationMode.DEFAULT;
@@ -2530,8 +2533,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         if (i == valLen || sink.charAt(i) == ',') {
                             int s = entryStart;
                             int e = i;
-                            while (s < e && sink.charAt(s) == ' ') s++;
-                            while (e > s && sink.charAt(e - 1) == ' ') e--;
+                            while (s < e && Character.isWhitespace(sink.charAt(s))) s++;
+                            while (e > s && Character.isWhitespace(sink.charAt(e - 1))) e--;
                             if (s == e) {
                                 throw new LineSenderException("empty addr entry");
                             }

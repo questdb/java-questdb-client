@@ -27,10 +27,11 @@ package io.questdb.client.cutlass.qwp.client;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 
 /**
- * WebSocket upgrade rejected with {@code 401}/{@code 403}/{@code 404}. Terminal
- * across all configured endpoints: a rejected credential is uniformly rejected
- * across the cluster, so failing fast keeps server logs clean and surfaces the
- * configuration error immediately.
+ * WebSocket upgrade rejected with {@code 401} or {@code 403}. Terminal across all
+ * configured endpoints: a rejected credential is uniformly rejected across the
+ * cluster, so failing fast surfaces the configuration error immediately. Path
+ * mismatches ({@code 404}) are NOT routed through this exception because a single
+ * misconfigured node mid-deploy can return 404 while peers are healthy.
  */
 public final class QwpAuthFailedException extends HttpClientException {
     private final String host;

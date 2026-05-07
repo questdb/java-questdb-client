@@ -1671,7 +1671,7 @@ public class QwpWebSocketSender implements Sender {
      * Should be called once, immediately after {@code connect()} returns.
      * Subsequent calls add more drainers to the same pool.
      */
-    public synchronized void startOrphanDrainers(
+    public void startOrphanDrainers(
             io.questdb.client.std.ObjList<String> orphanSlotPaths,
             int maxBackgroundDrainers,
             long segmentSizeBytes,
@@ -1928,14 +1928,14 @@ public class QwpWebSocketSender implements Sender {
                 int status = newClient.getUpgradeStatusCode();
                 newClient.close();
                 if (role != null) {
-                    boolean isTransient = QwpIngressRoleRejectedException.ROLE_PRIMARY_CATCHUP.equals(role);
+                    boolean isTransient = QwpIngressRoleRejectedException.ROLE_PRIMARY_CATCHUP.equalsIgnoreCase(role);
                     hostTracker.recordRoleReject(idx, isTransient);
                     QwpIngressRoleRejectedException re = new QwpIngressRoleRejectedException(role, ep.host, ep.port);
                     re.initCause(e);
                     lastError = re;
                     continue;
                 }
-                if (status == 401 || status == 403 || status == 404) {
+                if (status == 401 || status == 403) {
                     QwpAuthFailedException ae = new QwpAuthFailedException(status, ep.host, ep.port);
                     ae.initCause(e);
                     throw ae;
@@ -1955,28 +1955,43 @@ public class QwpWebSocketSender implements Sender {
             if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
                 newClient.close();
                 hostTracker.recordTransportError(idx);
-                throw new LineSenderException(
-                        "WebSocket upgrade failed: server does not support durable ack [host="
-                                + ep.host + ", port=" + ep.port
-                                + "]. The client opted in via request_durable_ack=on but the server "
+                LineSenderException ackErr = new LineSenderException(
+                        "WebSocket upgrade failed: server does not support durable ack [host=")
+                        .put(ep.host).put(", port=").put(ep.port)
+                        .put("]. The client opted in via request_durable_ack=on but the server "
                                 + "did not echo X-QWP-Durable-Ack: enabled in the upgrade response. "
                                 + "Either disable request_durable_ack or connect to a server with "
                                 + "primary replication configured.");
+                if (terminalUpgradeError == null) {
+                    terminalUpgradeError = ackErr;
+                }
+                lastError = ackErr;
+                continue;
             }
             hostTracker.recordSuccess(idx);
             currentEndpointIdx = idx;
             return newClient;
         }
         if (terminalUpgradeError != null) {
-            throw new LineSenderException(
-                    "Failed to connect: WebSocket upgrade failed across " + endpoints.size() + " endpoint(s)",
-                    terminalUpgradeError);
+            LineSenderException ex = new LineSenderException(terminalUpgradeError);
+            ex.put("Failed to connect: WebSocket upgrade failed across ")
+                    .put(endpoints.size()).put(" endpoint(s); cause: ")
+                    .put(terminalUpgradeError.getMessage());
+            throw ex;
         }
-        String summary = lastEndpoint == null
-                ? "no endpoints available"
-                : "all " + endpoints.size() + " endpoint(s) unreachable; last="
-                + lastEndpoint.host + ":" + lastEndpoint.port;
-        throw new LineSenderException("Failed to connect: " + summary, lastError);
+        LineSenderException ex = new LineSenderException(lastError);
+        ex.put("Failed to connect: ");
+        if (lastEndpoint == null) {
+            ex.put("no endpoints available");
+        } else if (lastError instanceof QwpIngressRoleRejectedException) {
+            ex.put("all ").put(endpoints.size())
+                    .put(" endpoint(s) rejected the upgrade by role; last=")
+                    .put(lastEndpoint.host).put(':').put(lastEndpoint.port);
+        } else {
+            ex.put("all ").put(endpoints.size()).put(" endpoint(s) unreachable; last=")
+                    .put(lastEndpoint.host).put(':').put(lastEndpoint.port);
+        }
+        throw ex;
     }
 
     private static boolean isUpgradeFailedSentinel(Throwable e) {
@@ -2169,15 +2184,23 @@ public class QwpWebSocketSender implements Sender {
                 client = null;
             }
             Endpoint ep = currentEndpoint();
-            throw new LineSenderException(
-                    "Failed to start cursor I/O thread for " + ep.host + ":" + ep.port, t);
+            LineSenderException ex = new LineSenderException(t);
+            ex.put("Failed to start cursor I/O thread for ");
+            if (ep == null) {
+                ex.put("<unbound>");
+            } else {
+                ex.put(ep.host).put(':').put(ep.port);
+            }
+            throw ex;
         }
 
         if (client != null) {
             Endpoint ep = currentEndpoint();
+            String host = ep == null ? "<unbound>" : ep.host;
+            int port = ep == null ? -1 : ep.port;
             encoder.setVersion((byte) client.getServerQwpVersion());
             LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
-                    ep.host, ep.port, inFlightWindowSize, client.getServerQwpVersion());
+                    host, port, inFlightWindowSize, client.getServerQwpVersion());
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
             // its default version (V1). Schema state still gets reset for
@@ -2486,7 +2509,7 @@ public class QwpWebSocketSender implements Sender {
 
     private Endpoint currentEndpoint() {
         int idx = currentEndpointIdx;
-        return endpoints.get(Math.max(idx, 0));
+        return idx < 0 ? null : endpoints.get(idx);
     }
 
     public static final class Endpoint {

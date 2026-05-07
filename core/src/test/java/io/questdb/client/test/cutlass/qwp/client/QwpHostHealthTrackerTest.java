@@ -153,4 +153,18 @@ public class QwpHostHealthTrackerTest {
         t.beginRound(true);
         Assert.assertEquals(1, t.pickNext());     // sticky-Healthy
     }
+
+    @Test
+    public void testStickyHealthyPicksMostRecentSuccess_NotHighestIndex() {
+        // Two hosts simultaneously HEALTHY (consecutive recordSuccess without
+        // intervening demotion). beginRound(true) must keep the most recently
+        // successful entry, not the highest index.
+        QwpHostHealthTracker t = new QwpHostHealthTracker(3);
+        t.recordSuccess(2);
+        t.recordSuccess(0);
+        t.beginRound(true);
+        Assert.assertEquals(QwpHostHealthTracker.HostState.HEALTHY, t.getState(0));
+        Assert.assertEquals(QwpHostHealthTracker.HostState.UNKNOWN, t.getState(2));
+        Assert.assertEquals(0, t.pickNext());
+    }
 }

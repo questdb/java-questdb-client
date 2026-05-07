@@ -632,6 +632,42 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testMultipleAddresses_noPorts_buildPastValidation() {
+        // configureDefaults() must pad ports so hosts.size == ports.size for
+        // multi-host builders that omit explicit ports. The build() then fails
+        // on connection (no server), NOT on the "host:port pair" validation.
+        try {
+            Sender.builder(Sender.Transport.WEBSOCKET)
+                    .address("127.0.0.1")
+                    .address("127.0.0.2")
+                    .build()
+                    .close();
+            Assert.fail("expected build to fail with connection error");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertFalse(
+                    "build failed on host/port count validation: " + msg,
+                    msg.contains("host:port pair") || msg.contains("host/port count mismatch"));
+        }
+    }
+
+    @Test
+    public void testMixedPortAddresses_unevenCounts_rejected() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST + ":9000")
+                        .address(LOCALHOST + ":9001")
+                        .port(9099),
+                "mismatch between number of hosts and number of ports");
+    }
+
+    @Test
+    public void testWsConfigString_sameHostDifferentPorts_passes() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=a:9000,a:9001;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
     public void testNoAddress_fails() {
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET),

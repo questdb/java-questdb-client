@@ -24,15 +24,22 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.std.Misc;
+import io.questdb.client.std.str.StringSink;
+
 /**
  * Server negotiated a QWP version outside {@code [VERSION_1, MAX_SUPPORTED_VERSION]}.
  * Terminal: version negotiation is cluster-wide, so failover masks the disagreement.
  */
 public class QwpProtocolVersionException extends QwpDecodeException {
-    public static final QwpProtocolVersionException UNSUPPORTED = new QwpProtocolVersionException(
-            "unsupported version");
 
     public QwpProtocolVersionException(String message) {
         super(message);
+    }
+
+    public static QwpProtocolVersionException unsupported(int version) {
+        StringSink sink = Misc.getThreadLocalSink();
+        sink.put("unsupported version ").put(version);
+        return new QwpProtocolVersionException(sink.toString());
     }
 }

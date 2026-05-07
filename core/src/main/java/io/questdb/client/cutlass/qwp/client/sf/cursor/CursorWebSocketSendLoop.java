@@ -202,7 +202,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // config typo or firewall block) from "lost connection after we were
     // up" (looks transient).
     private volatile boolean hasEverConnected;
-    private Thread ioThread;
+    private volatile Thread ioThread;
 
     /**
      * Full constructor with explicit reconnect-policy knobs. When
@@ -346,6 +346,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         running = false;
         Thread t = ioThread;
         if (t != null) {
+            LockSupport.unpark(t);
             // Only await the shutdown latch if the I/O thread actually ran.
             // If start() failed after assigning ioThread but before t.start()
             // succeeded (e.g. native stack OOM), ioLoop never ran and its
@@ -611,12 +612,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
                 if (isRoleReject(e)) {
                     backoffMillis = reconnectInitialBackoffMillis;
-                    long roleSleepStart = System.nanoTime();
-                    if (running) {
-                        LockSupport.parkNanos(reconnectInitialBackoffMillis * 1_000_000L);
-                    }
-                    deadlineNanos += System.nanoTime() - roleSleepStart;
                     lastReconnectError = e;
+                    if (running) {
+                        long remainingNanos = deadlineNanos - System.nanoTime();
+                        if (remainingNanos <= 0L) {
+                            break;
+                        }
+                        long parkNanos = Math.min(reconnectInitialBackoffMillis * 1_000_000L, remainingNanos);
+                        LockSupport.parkNanos(parkNanos);
+                    }
                     continue;
                 }
                 lastReconnectError = e;

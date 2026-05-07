@@ -746,13 +746,19 @@ public class QwpQueryClient implements QuietCloseable {
      * endpoints unreachable" (the latter surfaces as a plain
      * {@link HttpClientException}).
      */
-    public void connect() {
+    public synchronized void connect() {
+        if (closedFlag.get()) {
+            throw new IllegalStateException("QwpQueryClient is closed");
+        }
         if (connected) {
             return;
         }
         if (hostTracker == null) {
             if (LB_RANDOM.equals(lbStrategy) && endpoints.size() > 1) {
-                Collections.shuffle(endpoints, ThreadLocalRandom.current());
+                List<Endpoint> shuffled = new ArrayList<>(endpoints);
+                Collections.shuffle(shuffled, ThreadLocalRandom.current());
+                endpoints.clear();
+                endpoints.addAll(shuffled);
             }
             hostTracker = new QwpHostHealthTracker(endpoints.size());
         } else {
@@ -761,9 +767,15 @@ public class QwpQueryClient implements QuietCloseable {
         QwpServerInfo lastObservedMismatch = null;
         boolean sawV1Mismatch = false;
         Throwable lastTransportError = null;
+        boolean retriedAfterReset = false;
         while (true) {
             int i = hostTracker.pickNext();
             if (i < 0) {
+                if (!retriedAfterReset) {
+                    hostTracker.beginRound(true);
+                    retriedAfterReset = true;
+                    continue;
+                }
                 break;
             }
             Endpoint ep = endpoints.get(i);
@@ -873,13 +885,25 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     private void executeImpl(String sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+        if (closedFlag.get()) {
+            throw new IllegalStateException("QwpQueryClient is closed");
+        }
         if (!connected) {
             throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
         }
         hostTracker.beginRound(false);
-        long failoverDeadlineMs = failoverMaxDurationMs > 0L
-                ? System.currentTimeMillis() + failoverMaxDurationMs
-                : Long.MAX_VALUE;
+        long failoverDeadlineNanos;
+        if (failoverMaxDurationMs > 0L) {
+            long durationNanos = failoverMaxDurationMs > Long.MAX_VALUE / 1_000_000L
+                    ? Long.MAX_VALUE
+                    : failoverMaxDurationMs * 1_000_000L;
+            long start = System.nanoTime();
+            failoverDeadlineNanos = start + durationNanos < start
+                    ? Long.MAX_VALUE
+                    : start + durationNanos;
+        } else {
+            failoverDeadlineNanos = Long.MAX_VALUE;
+        }
         int attempt = 0;
         while (true) {
             attempt++;
@@ -892,7 +916,7 @@ public class QwpQueryClient implements QuietCloseable {
                 handler.onError(probe.interceptedStatus, probe.interceptedMessage);
                 return;
             }
-            if (attempt >= failoverMaxAttempts || System.currentTimeMillis() >= failoverDeadlineMs) {
+            if (attempt >= failoverMaxAttempts || System.nanoTime() >= failoverDeadlineNanos) {
                 int failovers = Math.max(0, attempt - 1);
                 handler.onError(probe.interceptedStatus,
                         "transport failure after " + attempt + " execute attempt"
@@ -910,11 +934,12 @@ public class QwpQueryClient implements QuietCloseable {
             connected = false;
             if (failoverInitialBackoffMs > 0L) {
                 long base = failoverInitialBackoffMs << Math.min(attempt - 1, 30);
+                if (base < 0L) base = failoverMaxBackoffMs;
                 long capped = Math.min(base, failoverMaxBackoffMs);
                 long delay = capped > 0L
                         ? ThreadLocalRandom.current().nextLong(capped)
                         : 0L;
-                long remaining = failoverDeadlineMs - System.currentTimeMillis();
+                long remaining = (failoverDeadlineNanos - System.nanoTime()) / 1_000_000L;
                 if (remaining <= 0L) {
                     int failovers = Math.max(0, attempt - 1);
                     handler.onError(probe.interceptedStatus,
@@ -1491,7 +1516,7 @@ public class QwpQueryClient implements QuietCloseable {
                 throw re;
             }
             int status = webSocketClient.getUpgradeStatusCode();
-            if (status == 401 || status == 403 || status == 404) {
+            if (status == 401 || status == 403) {
                 QwpAuthFailedException ae = new QwpAuthFailedException(status, ep.host, ep.port);
                 ae.initCause(ex);
                 throw ae;
@@ -1741,9 +1766,15 @@ public class QwpQueryClient implements QuietCloseable {
         QwpServerInfo lastMismatch = null;
         boolean sawV1Mismatch = false;
         Throwable lastError = null;
+        boolean retriedAfterReset = false;
         while (true) {
             int i = hostTracker.pickNext();
             if (i < 0) {
+                if (!retriedAfterReset) {
+                    hostTracker.beginRound(true);
+                    retriedAfterReset = true;
+                    continue;
+                }
                 break;
             }
             Endpoint ep = endpoints.get(i);

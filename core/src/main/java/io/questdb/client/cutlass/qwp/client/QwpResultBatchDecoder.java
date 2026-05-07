@@ -298,7 +298,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         }
         byte version = Unsafe.getUnsafe().getByte(payload + 4);
         if (version < QwpConstants.VERSION_1 || version > QwpConstants.MAX_SUPPORTED_VERSION) {
-            throw QwpProtocolVersionException.UNSUPPORTED;
+            throw QwpProtocolVersionException.unsupported(version & 0xFF);
         }
         byte flags = Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS);
         deltaMode = (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0;

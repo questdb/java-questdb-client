@@ -58,6 +58,61 @@ public class WebSocketClient421RoleHeaderTest {
         assertCapturedRole("REPLICA", "x-questdb-role: REPLICA");
     }
 
+    @Test(timeout = 10_000)
+    public void testRoleValuePreservesCase() throws Exception {
+        // Parser must NOT uppercase the value -- predicates compare case-insensitive.
+        assertCapturedRole("replica", "X-QuestDB-Role: replica");
+    }
+
+    @Test(timeout = 10_000)
+    public void testRoleValueTrailingWhitespaceTrimmed() throws Exception {
+        assertCapturedRole("REPLICA", "X-QuestDB-Role:   REPLICA   ");
+    }
+
+    @Test(timeout = 10_000)
+    public void testRoleValueEmpty_NullCaptured() throws Exception {
+        assertCapturedRole(null, "X-QuestDB-Role: ");
+    }
+
+    @Test(timeout = 10_000)
+    public void testHeaderMatchAnchoredAtLineStart() throws Exception {
+        // A response body or another header value containing the literal
+        // "X-QuestDB-Role:" must NOT be picked up by the parser. The custom
+        // header line below appears as a non-header value -- only headers at
+        // CRLF boundaries should match.
+        ServerSocket listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+        int port = listener.getLocalPort();
+        Thread serverThread = new Thread(() -> {
+            try (Socket s = listener.accept()) {
+                byte[] discardBuf = new byte[8192];
+                int n = s.getInputStream().read(discardBuf);
+                if (n < 0) return;
+                String resp = "HTTP/1.1 421 Misdirected Request\r\n"
+                        + "X-Echoed-Header: X-QuestDB-Role: REPLICA\r\n"
+                        + "Content-Length: 0\r\n\r\n";
+                OutputStream os = s.getOutputStream();
+                os.write(resp.getBytes(StandardCharsets.US_ASCII));
+                os.flush();
+            } catch (Exception ignored) {
+            }
+        }, "fake-421-smuggle");
+        serverThread.setDaemon(true);
+        serverThread.start();
+        try (WebSocketClient client = WebSocketClientFactory.newPlainTextInstance()) {
+            client.setQwpMaxVersion(1);
+            client.connect("127.0.0.1", port);
+            try {
+                client.upgrade("/write/v4", null);
+                Assert.fail("expected upgrade to fail");
+            } catch (HttpClientException ex) {
+                Assert.assertNull(client.getUpgradeRejectRole());
+            }
+        } finally {
+            listener.close();
+            serverThread.join(500);
+        }
+    }
+
     private static void assertCapturedRole(String expected, String roleHeaderLine) throws Exception {
         ServerSocket listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
         int port = listener.getLocalPort();

@@ -31,6 +31,11 @@ package io.questdb.client.cutlass.qwp.client;
  * Within a round, {@link #pickNext()} returns the highest-priority host that
  * has not yet been attempted; the caller advances the round via
  * {@link #beginRound(boolean)}.
+ * <p>
+ * Each method is internally synchronized, but pickNext + recordX is not atomic
+ * across the pair. Callers must externally serialize a pick → record sequence
+ * (the QWP clients do this via the sender's {@code synchronized buildAndConnect}
+ * and the query client's documented one-execute-at-a-time contract).
  */
 public final class QwpHostHealthTracker {
     public enum HostState {
@@ -51,8 +56,10 @@ public final class QwpHostHealthTracker {
 
     private final boolean[] attemptedThisRound;
     private final int hostCount;
+    private final long[] lastSuccessEpoch;
     private final Object lock = new Object();
     private final HostState[] states;
+    private long successEpoch;
 
     public QwpHostHealthTracker(int hostCount) {
         if (hostCount <= 0) {
@@ -61,6 +68,7 @@ public final class QwpHostHealthTracker {
         this.hostCount = hostCount;
         this.states = new HostState[hostCount];
         this.attemptedThisRound = new boolean[hostCount];
+        this.lastSuccessEpoch = new long[hostCount];
         for (int i = 0; i < hostCount; i++) {
             states[i] = HostState.UNKNOWN;
         }
@@ -68,16 +76,19 @@ public final class QwpHostHealthTracker {
 
     /**
      * Resets attempted flags. With {@code forgetClassifications}, every host
-     * except the last-known {@link HostState#HEALTHY} entry is reset to
-     * {@link HostState#UNKNOWN}; the sticky-Healthy keeps the last successful
-     * host first in line on the next round.
+     * except the most-recently-successful {@link HostState#HEALTHY} entry is
+     * reset to {@link HostState#UNKNOWN}; the sticky-Healthy keeps the last
+     * successful host first in line on the next round. Recency uses the
+     * {@code recordSuccess} epoch counter, not array order.
      */
     public void beginRound(boolean forgetClassifications) {
         synchronized (lock) {
             int stickyIndex = -1;
             if (forgetClassifications) {
+                long bestEpoch = -1L;
                 for (int i = 0; i < hostCount; i++) {
-                    if (states[i] == HostState.HEALTHY) {
+                    if (states[i] == HostState.HEALTHY && lastSuccessEpoch[i] > bestEpoch) {
+                        bestEpoch = lastSuccessEpoch[i];
                         stickyIndex = i;
                     }
                 }
@@ -114,7 +125,9 @@ public final class QwpHostHealthTracker {
 
     /**
      * Returns the highest-priority host not yet attempted this round, or -1
-     * when the round is exhausted.
+     * when the round is exhausted. The caller is expected to be externally
+     * serialized (see class doc): the returned index is intended to be paired
+     * with a follow-up {@code recordX(idx)} on the same logical thread.
      */
     public int pickNext() {
         synchronized (lock) {
@@ -152,6 +165,7 @@ public final class QwpHostHealthTracker {
         synchronized (lock) {
             states[idx] = HostState.HEALTHY;
             attemptedThisRound[idx] = true;
+            lastSuccessEpoch[idx] = ++successEpoch;
         }
     }
 

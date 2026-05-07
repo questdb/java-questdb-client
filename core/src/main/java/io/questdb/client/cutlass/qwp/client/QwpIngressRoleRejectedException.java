@@ -64,10 +64,10 @@ public final class QwpIngressRoleRejectedException extends HttpClientException {
     }
 
     public boolean isTopological() {
-        return ROLE_REPLICA.equals(role);
+        return ROLE_REPLICA.equalsIgnoreCase(role);
     }
 
     public boolean isTransient() {
-        return ROLE_PRIMARY_CATCHUP.equals(role);
+        return ROLE_PRIMARY_CATCHUP.equalsIgnoreCase(role);
     }
 }
