@@ -512,43 +512,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Builder class to construct a new instance of a Sender.
-     * <br>
-     * Example usage for HTTP transport:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-     *  .address("localhost:9000")
-     *  .build()) {
-     *      sender.table(tableName).column("value", 42).atNow();
-     *      sender.flush();
-     *  }
-     * }</pre>
-     * <br>
-     * Example usage for HTTP transport and TLS:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-     *  .address("localhost:9000")
-     *  .enableTls()
-     *  .build()) {
-     *    sender.table(tableName).column("value", 42).atNow();
-     *    sender.flush();
-     *   }
-     * }</pre>
-     * <br>
-     * Example usage for TCP transport and TLS:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.TCP)
-     *  .address("localhost:9000")
-     *  .enableTls()
-     *  .build()) {
-     *    sender.table(tableName).column("value", 42).atNow();
-     *    sender.flush();
-     *   }
-     * }</pre>
-     *
-     * @see Sender#fromConfig(CharSequence) for creating a Sender directly from a configuration String
-     */
-    /**
      * Durability contract for the store-and-forward write path. Selects when
      * the SF segment file is fsynced; trades latency / throughput for
      * crash-survival of unacked frames.
@@ -599,6 +562,43 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         ASYNC
     }
 
+    /**
+     * Builder class to construct a new instance of a Sender.
+     * <br>
+     * Example usage for HTTP transport:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+     *  .address("localhost:9000")
+     *  .build()) {
+     *      sender.table(tableName).column("value", 42).atNow();
+     *      sender.flush();
+     *  }
+     * }</pre>
+     * <br>
+     * Example usage for HTTP transport and TLS:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+     *  .address("localhost:9000")
+     *  .enableTls()
+     *  .build()) {
+     *    sender.table(tableName).column("value", 42).atNow();
+     *    sender.flush();
+     *   }
+     * }</pre>
+     * <br>
+     * Example usage for TCP transport and TLS:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.TCP)
+     *  .address("localhost:9000")
+     *  .enableTls()
+     *  .build()) {
+     *    sender.table(tableName).column("value", 42).atNow();
+     *    sender.flush();
+     *   }
+     * }</pre>
+     *
+     * @see Sender#fromConfig(CharSequence) for creating a Sender directly from a configuration String
+     */
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
@@ -631,6 +631,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_WEBSOCKET = 2;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
+        // Per-host upgrade timeout for ws:: / wss:: senders (.NET spec §4.1).
+        // Default 15s; bounds each WebSocket handshake. Worst-case construct
+        // time on a fully unreachable cluster = authTimeoutMillis × addresses.
+        private int authTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
@@ -865,6 +869,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Per-host WebSocket upgrade timeout (ms). Bounds each
+         * {@code /write/v4} handshake so a single hung host can't burn
+         * the entire reconnect budget. Default 15s. Worst-case
+         * constructor blocking on a fully unreachable cluster equals
+         * {@code authTimeoutMillis × addresses}. WebSocket transport only.
+         * <p>
+         * Mirrors the {@code auth_timeout} key from .NET QWP ingress
+         * spec §4.1.
+         */
+        public LineSenderBuilder authTimeoutMillis(int millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("auth_timeout is only supported for WebSocket transport");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("auth_timeout must be positive")
+                        .put(" [millis=").put(millis).put("]");
+            }
+            this.authTimeoutMillis = millis;
+            return this;
+        }
+
+        /**
          * Set the maximum number of bytes per batch before auto-flushing.
          * <br>
          * This is only used when communicating over WebSocket transport.
@@ -1029,10 +1055,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
 
             if (protocol == PROTOCOL_WEBSOCKET) {
-                if (hosts.size() != 1 || ports.size() != 1) {
-                    throw new LineSenderException("only a single address (host:port) is supported for WebSocket transport");
-                }
-
                 int actualAutoFlushRows = autoFlushRows == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_ROWS : autoFlushRows;
                 int actualAutoFlushBytes = autoFlushBytes == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_BYTES : autoFlushBytes;
                 long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
@@ -1064,6 +1086,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (actualInFlightWindowSize <= 1) {
                     throw new LineSenderException(
                             "WebSocket transport requires async mode (in_flight_window > 1)");
+                }
+                // .NET spec §3.5: initial_connect_retry on/sync/async requires
+                // sf_dir. Memory-mode senders lose all in-flight rows on
+                // disconnect, so retrying through a long reconnect budget
+                // gives the user the misleading impression that data is
+                // safe; force them to opt into SF to get the durable
+                // semantics that match the retry behavior.
+                if (initialConnectMode != InitialConnectMode.OFF && sfDir == null) {
+                    throw new LineSenderException(
+                            "initial_connect_retry=" + initialConnectMode.name().toLowerCase()
+                                    + " requires sf_dir (memory-mode senders cannot durably "
+                                    + "retry across reconnects); set sf_dir=... or use "
+                                    + "initial_connect_retry=off");
                 }
                 if (sfDurability != SfDurability.MEMORY) {
                     throw new LineSenderException(
@@ -1101,6 +1136,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
                                 ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
                                 : durableAckKeepaliveIntervalMillis;
+                int actualAuthTimeoutMillis = authTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY
+                        ? QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MILLIS
+                        : authTimeoutMillis;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1137,8 +1175,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 QwpWebSocketSender connected;
                 try {
                     connected = QwpWebSocketSender.connect(
-                            hosts.getQuick(0),
-                            ports.getQuick(0),
+                            hosts,
+                            ports,
                             wsTlsConfig,
                             actualAutoFlushRows,
                             actualAutoFlushBytes,
@@ -1155,7 +1193,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             initialConnectMode,
                             errorHandler,
                             actualErrorInboxCapacity,
-                            actualDurableAckKeepaliveIntervalMillis
+                            actualDurableAckKeepaliveIntervalMillis,
+                            actualAuthTimeoutMillis
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -2255,7 +2294,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // parseLong only takes a full CharSequence. The suffix-trimming
             // path is parser-time (called once per connect string), so a
             // tiny per-call substring allocation is acceptable.
-            CharSequence digits = end == len ? (CharSequence) value : value.toString().substring(0, end);
+            CharSequence digits = end == len ? value : value.toString().substring(0, end);
             try {
                 long n = Numbers.parseLong(digits);
                 // Overflow check on multiply.
@@ -2673,6 +2712,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "durable_ack_keepalive_interval_millis");
                     durableAckKeepaliveIntervalMillis(parseLongValue(sink, "durable_ack_keepalive_interval_millis"));
+                } else if (Chars.equals("auth_timeout", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("auth_timeout is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "auth_timeout");
+                    authTimeoutMillis(parseIntValue(sink, "auth_timeout"));
                 } else if (Chars.equals("reconnect_max_duration_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");

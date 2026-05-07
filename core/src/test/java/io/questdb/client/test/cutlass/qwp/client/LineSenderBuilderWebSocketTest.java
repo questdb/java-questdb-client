@@ -314,13 +314,13 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // value. fromConfig() is allowed to throw a LineSenderException at
         // connect time -- we only assert the parser did not reject the key.
         try {
-            Sender.fromConfig("ws::addr=127.0.0.1:1;durable_ack_keepalive_interval_millis=50;");
+            Sender.fromConfig("ws::addr=127.0.0.1:1;durable_ack_keepalive_interval_millis=50;").close();
         } catch (LineSenderException e) {
             Assert.assertFalse("parser must not reject the key, was: " + e.getMessage(),
                     e.getMessage().contains("durable_ack_keepalive_interval_millis"));
         }
         try {
-            Sender.fromConfig("ws::addr=127.0.0.1:1;durable_ack_keepalive_interval_millis=0;");
+            Sender.fromConfig("ws::addr=127.0.0.1:1;durable_ack_keepalive_interval_millis=0;").close();
         } catch (LineSenderException e) {
             Assert.assertFalse("parser must accept zero (disable), was: " + e.getMessage(),
                     e.getMessage().contains("durable_ack_keepalive_interval_millis"));
@@ -530,12 +530,37 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testMultipleAddresses_fails() {
-        assertThrowsAny(
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST + ":9000")
-                        .address(LOCALHOST + ":9001"),
-                "single address");
+    public void testMultipleAddressesAccepted() throws Exception {
+        // Multi-host failover is supported on the WebSocket transport since
+        // the X-QuestDB-Role rotation hook landed. The builder should accept
+        // any positive number of addresses without an early reject.
+        // build() still fails on connect (no server is listening on the
+        // probed ephemeral ports) but the failure mode must NOT be a
+        // builder-level rejection of multi-host configuration.
+        // Use ephemeral ports captured-and-released so the test is not
+        // accidentally skipped by a real local service binding 9000/9001.
+        int p1, p2;
+        try (java.net.ServerSocket s1 = new java.net.ServerSocket(0);
+             java.net.ServerSocket s2 = new java.net.ServerSocket(0)) {
+            p1 = s1.getLocalPort();
+            p2 = s2.getLocalPort();
+        }
+        try (Sender ignored = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST + ":" + p1)
+                .address(LOCALHOST + ":" + p2)
+                .build()) {
+            Assert.fail("expected connect failure (no listener), but build() returned a sender");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage() == null ? "" : e.getMessage();
+            Assert.assertFalse(
+                    "multi-address must no longer be rejected at builder level: " + msg,
+                    msg.contains("single address"));
+            // Off-mode single-pass walk wraps the per-host failure in a
+            // "failed after walking N host(s)" message.
+            Assert.assertTrue("expected a connect failure: " + msg,
+                    msg.contains("Failed to connect")
+                            || msg.contains("walked"));
+        }
     }
 
     @Test

@@ -61,6 +61,16 @@ public class TestWebSocketServer implements Closeable {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final CountDownLatch startLatch = new CountDownLatch(1);
     private Thread acceptThread;
+    // X-QuestDB-Role value to emit on handshake responses. null = omit the
+    // header (legacy behavior for tests written before role-aware failover).
+    // The server emits the header on both the 101 success path and (when
+    // rejectingRole != null) the 421 misdirected-request path.
+    private volatile String advertisedRole;
+    // When non-null the next handshake responds with HTTP 421 Misdirected
+    // Request + X-QuestDB-Role: <rejectingRole>, mimicking a server whose
+    // QwpServerInfoProvider reports REPLICA / PRIMARY_CATCHUP. Set after
+    // construction via setRejectWithRole().
+    private volatile String rejectingRole;
     private ServerSocket serverSocket;
 
     public TestWebSocketServer(int port, WebSocketServerHandler handler) {
@@ -76,9 +86,22 @@ public class TestWebSocketServer implements Closeable {
      *                             the client's early-fail check.
      */
     public TestWebSocketServer(int port, WebSocketServerHandler handler, boolean emitDurableAckHeader) {
+        this(port, handler, emitDurableAckHeader, null);
+    }
+
+    /**
+     * @param advertisedRole when non-null, the value of the {@code X-QuestDB-Role}
+     *                       response header on the 101 handshake — used to test
+     *                       that the client accepts {@code PRIMARY} / {@code STANDALONE}
+     *                       handshakes. Pass {@code null} for legacy handshakes
+     *                       without the header.
+     */
+    public TestWebSocketServer(int port, WebSocketServerHandler handler,
+                               boolean emitDurableAckHeader, String advertisedRole) {
         this.port = port;
         this.handler = handler;
         this.emitDurableAckHeader = emitDurableAckHeader;
+        this.advertisedRole = advertisedRole;
     }
 
     public boolean awaitStart(long timeout, TimeUnit unit) throws InterruptedException {
@@ -113,6 +136,22 @@ public class TestWebSocketServer implements Closeable {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    /** Replaces the advertised role for subsequent handshakes (live update). */
+    public void setAdvertisedRole(String role) {
+        this.advertisedRole = role;
+    }
+
+    /**
+     * Configure the server to reject the next handshake with HTTP 421 +
+     * {@code X-QuestDB-Role: <role>}. Pass {@code null} to clear and resume
+     * normal 101 upgrades. The setting applies to every new connection
+     * until cleared, so tests can simulate a permanent replica or a node
+     * that becomes primary mid-test.
+     */
+    public void setRejectWithRole(String role) {
+        this.rejectingRole = role;
     }
 
     public void start() throws IOException {
@@ -323,6 +362,25 @@ public class TestWebSocketServer implements Closeable {
                 return false;
             }
 
+            // Role-aware reject path: emit a 421 Misdirected Request +
+            // X-QuestDB-Role: <role> response so the client treats this
+            // node as REPLICA / PRIMARY_CATCHUP and rotates to the next
+            // configured address. Mirrors what QwpWebSocketUpgradeProcessor
+            // does on a server whose QwpServerInfoProvider reports a
+            // non-writable role.
+            String reject = rejectingRole;
+            if (reject != null) {
+                StringBuilder sb = new StringBuilder()
+                        .append("HTTP/1.1 421 Misdirected Request\r\n")
+                        .append("Connection: close\r\n")
+                        .append("Content-Length: 0\r\n")
+                        .append("X-QuestDB-Role: ").append(reject).append("\r\n")
+                        .append("\r\n");
+                out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                return false;
+            }
+
             String acceptKey = computeAcceptKey(key);
 
             StringBuilder sb = new StringBuilder()
@@ -332,6 +390,10 @@ public class TestWebSocketServer implements Closeable {
                     .append("Sec-WebSocket-Accept: ").append(acceptKey).append("\r\n");
             if (emitDurableAckHeader) {
                 sb.append("X-QWP-Durable-Ack: enabled\r\n");
+            }
+            String role = advertisedRole;
+            if (role != null) {
+                sb.append("X-QuestDB-Role: ").append(role).append("\r\n");
             }
             sb.append("\r\n");
             out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));

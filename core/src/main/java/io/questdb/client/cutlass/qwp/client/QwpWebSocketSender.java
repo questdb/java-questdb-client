@@ -32,6 +32,7 @@ import io.questdb.client.SenderProgressHandler;
 import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -49,6 +50,7 @@ import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.IntList;
 import io.questdb.client.std.Misc;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
@@ -108,6 +110,12 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class QwpWebSocketSender implements Sender {
 
+    /**
+     * Default per-host WebSocket upgrade timeout (ms). Mirrors the
+     * .NET QWP ingress spec §4.1 default; bounds each {@code /write/v4}
+     * handshake so a hung host can't burn the entire reconnect budget.
+     */
+    public static final int DEFAULT_AUTH_TIMEOUT_MILLIS = 15_000;
     public static final int DEFAULT_AUTO_FLUSH_BYTES = 0;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
@@ -118,6 +126,10 @@ public class QwpWebSocketSender implements Sender {
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
     private static final int MAX_TABLE_NAME_LENGTH = 127;
     private static final String WRITE_PATH = "/write/v4";
+    // Per-host upgrade timeout (.NET spec §4.1). Bounds each
+    // WebSocketClient.upgrade() call so a hung host can't burn the
+    // entire reconnect budget. Defaults to DEFAULT_AUTH_TIMEOUT_MILLIS.
+    private final int authTimeoutMillis;
     private final String authorizationHeader;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
@@ -130,10 +142,19 @@ public class QwpWebSocketSender implements Sender {
     private final QwpWebSocketEncoder encoder;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
-    private final String host;
+    // Per-host health classification + priority-ordered picker (.NET spec
+    // §1.2). Built once per sender, lives across reconnects: every
+    // buildAndConnect() consults pickNext(), records the outcome, and
+    // advances the round when exhausted. Replaces the simple round-robin
+    // rotation that used to live on currentAddressIndex.
+    private final HostHealthTracker hostHealthTracker;
+    // Multi-host failover. hosts and ports are parallel arrays of size N >= 1.
+    // The tracker decides which index to try next; currentAddressIndex
+    // mirrors that decision for log/error messages.
+    private final ObjList<String> hosts;
     private final int inFlightWindowSize;
     private final int maxSchemasPerConnection;
-    private final int port;
+    private final IntList ports;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
@@ -151,6 +172,11 @@ public class QwpWebSocketSender implements Sender {
     private long closeFlushTimeoutMillis = 5_000L;
     private boolean closed;
     private boolean connected;
+    // Index of the host buildAndConnect() last attempted (success or
+    // failure). Used for log/diagnostic messages. The authoritative pick
+    // logic lives in {@link #hostHealthTracker} — this field merely
+    // reflects the most recent decision.
+    private int currentAddressIndex;
     // Track max global symbol ID used in current batch (for delta calculation)
     private int currentBatchMaxSymbolId = -1;
     private QwpTableBuffer currentTableBuffer;
@@ -165,6 +191,12 @@ public class QwpWebSocketSender implements Sender {
     // alongside the cursor send loop in close().
     private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool
             drainerPool;
+    // Keepalive PING cadence used by the I/O loop while
+    // request_durable_ack=on AND there are pending durable-ack
+    // confirmations. Default mirrors the loop's spec value; 0 or negative
+    // disables keepalive PINGs entirely.
+    private long durableAckKeepaliveIntervalMillis =
+            CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
     private SenderErrorDispatcher errorDispatcher;
     // Async-delivery sink for SenderError notifications. Default-constructed
     // here with the loud-not-silent default handler; a builder hook can swap
@@ -204,12 +236,6 @@ public class QwpWebSocketSender implements Sender {
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private boolean requestDurableAck;
-    // Keepalive PING cadence used by the I/O loop while
-    // request_durable_ack=on AND there are pending durable-ack
-    // confirmations. Default mirrors the loop's spec value; 0 or negative
-    // disables keepalive PINGs entirely.
-    private long durableAckKeepaliveIntervalMillis =
-            CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
 
     private QwpWebSocketSender(
             String host,
@@ -222,9 +248,38 @@ public class QwpWebSocketSender implements Sender {
             String authorizationHeader,
             int maxSchemasPerConnection
     ) {
+        this(singletonHostList(host), singletonPortList(port), tlsConfig,
+                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection,
+                DEFAULT_AUTH_TIMEOUT_MILLIS);
+    }
+
+    private QwpWebSocketSender(
+            ObjList<String> hosts,
+            IntList ports,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            int authTimeoutMillis
+    ) {
+        if (hosts == null || ports == null || hosts.size() == 0 || hosts.size() != ports.size()) {
+            throw new LineSenderException(
+                    "QwpWebSocketSender requires at least one address and parallel hosts/ports lists");
+        }
+        if (authTimeoutMillis <= 0) {
+            throw new LineSenderException("auth_timeout must be positive [millis=")
+                    .put(authTimeoutMillis).put("]");
+        }
         this.authorizationHeader = authorizationHeader;
-        this.host = host;
-        this.port = port;
+        this.authTimeoutMillis = authTimeoutMillis;
+        this.hosts = hosts;
+        this.ports = ports;
+        this.currentAddressIndex = 0;
+        this.hostHealthTracker = new HostHealthTracker(hosts.size());
         this.tlsConfig = tlsConfig;
         this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
         this.tableBuffers = new CharSequenceObjHashMap<>();
@@ -477,10 +532,86 @@ public class QwpWebSocketSender implements Sender {
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis
     ) {
-        QwpWebSocketSender sender = new QwpWebSocketSender(
-                host, port, tlsConfig,
+        return connect(singletonHostList(host), singletonPortList(port), tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection,
+                requestDurableAck, cursorEngine, closeFlushTimeoutMillis,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, initialConnectMode, errorHandler,
+                errorInboxCapacity, durableAckKeepaliveIntervalMillis);
+    }
+
+    /**
+     * Multi-host master connect overload. {@code hosts} and {@code ports}
+     * must be parallel non-empty lists; the sender connects to the first
+     * address and rotates round-robin through the rest on connect/upgrade
+     * failure (TCP refused, IO error, 421 role-mismatch). Within the
+     * configured reconnect budget, every attempt that hits a non-PRIMARY
+     * role surfaces as {@link QwpRoleMismatchException}; transport
+     * failures surface as {@link LineSenderException}.
+     */
+    public static QwpWebSocketSender connect(
+            ObjList<String> hosts,
+            IntList ports,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis
+    ) {
+        return connect(hosts, ports, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MILLIS);
+    }
+
+    /**
+     * Multi-host master connect overload — also accepts the per-host
+     * {@code auth_timeout} that bounds each WebSocket upgrade handshake
+     * (.NET spec §4.1).
+     */
+    public static QwpWebSocketSender connect(
+            ObjList<String> hosts,
+            IntList ports,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            int inFlightWindowSize,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            int authTimeoutMillis
+    ) {
+        QwpWebSocketSender sender = new QwpWebSocketSender(
+                hosts, ports, tlsConfig,
+                autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
+                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection,
+                authTimeoutMillis
         );
         try {
             sender.requestDurableAck = requestDurableAck;
@@ -1189,8 +1320,7 @@ public class QwpWebSocketSender implements Sender {
      * Snapshot of drainers the foreground sender has dispatched. Useful
      * for monitoring orphan-drain progress without parsing logs.
      */
-    public ObjList<BackgroundDrainer>
-    getBackgroundDrainers() {
+    public ObjList<BackgroundDrainer> getBackgroundDrainers() {
         if (drainerPool == null) return new ObjList<>(0);
         return drainerPool.snapshot();
     }
@@ -1815,6 +1945,18 @@ public class QwpWebSocketSender implements Sender {
         throw new LineSenderException("close failed: " + t.getMessage(), t);
     }
 
+    private static ObjList<String> singletonHostList(String host) {
+        ObjList<String> list = new ObjList<>(1);
+        list.add(host);
+        return list;
+    }
+
+    private static IntList singletonPortList(int port) {
+        IntList list = new IntList(1);
+        list.add(port);
+        return list;
+    }
+
     private void atMicros(long timestampMicros) {
         // Add designated timestamp column (empty name for designated timestamp)
         // Use cached reference to avoid hashmap lookup per row
@@ -1845,6 +1987,34 @@ public class QwpWebSocketSender implements Sender {
      * within the per-outage time cap).
      */
     private WebSocketClient buildAndConnect() {
+        // Mid-stream demotion (.NET spec §1.2 RecordMidStreamFailure):
+        // if a previous attempt left a host in HEALTHY state and we're
+        // back here, that host's connection has just dropped — demote
+        // it to TRANSPORT_ERROR so it falls in priority next round.
+        // recordMidStreamFailure is a no-op when no HEALTHY host exists.
+        for (int i = 0, n = hosts.size(); i < n; i++) {
+            if (hostHealthTracker.stateOf(i) == HostHealthTracker.State.HEALTHY) {
+                hostHealthTracker.recordMidStreamFailure(i);
+                break;
+            }
+        }
+        int idx = hostHealthTracker.pickNext();
+        if (idx < 0) {
+            // Round exhausted — start a fresh round and let previously-
+            // failed hosts re-evaluate (.NET spec §3.2). Sticky-healthy
+            // semantics preserved by passing forgetClassifications=true.
+            hostHealthTracker.beginRound(true);
+            idx = hostHealthTracker.pickNext();
+            if (idx < 0) {
+                // Defensive: should never happen — a fresh round always
+                // produces an UNKNOWN entry for at least one host.
+                throw new LineSenderException(
+                        "host health tracker has no candidate after beginRound");
+            }
+        }
+        currentAddressIndex = idx;
+        String host = hosts.getQuick(idx);
+        int port = ports.getQuick(idx);
         WebSocketClient newClient;
         if (tlsConfig != null) {
             newClient = WebSocketClientFactory.newTlsInstance(tlsConfig);
@@ -1856,23 +2026,53 @@ public class QwpWebSocketSender implements Sender {
             newClient.setQwpClientId(QwpConstants.CLIENT_ID);
             newClient.setQwpRequestDurableAck(requestDurableAck);
             newClient.connect(host, port);
-            newClient.upgrade(WRITE_PATH, authorizationHeader);
+            // Per-host upgrade timeout (.NET spec §4.1). Bounds the
+            // /write/v4 handshake so a half-open peer can't burn the
+            // entire reconnect budget.
+            newClient.upgrade(WRITE_PATH, authTimeoutMillis, authorizationHeader);
         } catch (Exception e) {
             newClient.close();
-            throw new LineSenderException("Failed to connect to " + host + ":" + port, e);
+            // Classify the failure into the tracker's state machine
+            // (.NET spec §1.3). 421 + role drives priority on the next
+            // round; transport errors get their own tier; auth/version
+            // failures pass through and get caught as terminal further
+            // up the stack via isTerminalUpgradeError.
+            if (e instanceof WebSocketUpgradeException) {
+                WebSocketUpgradeException ue = (WebSocketUpgradeException) e;
+                if (ue.isRoleMismatch()) {
+                    hostHealthTracker.recordRoleReject(idx, ue.isTransientRoleReject());
+                } else {
+                    hostHealthTracker.recordTransportError(idx);
+                }
+            } else {
+                hostHealthTracker.recordTransportError(idx);
+            }
+            String roleHint = "";
+            if (e instanceof WebSocketUpgradeException) {
+                String role = ((WebSocketUpgradeException) e).getServerRole();
+                if (role != null) {
+                    roleHint = " [serverRole=" + role + "]";
+                }
+            }
+            throw new LineSenderException(
+                    "Failed to connect to " + host + ":" + port + roleHint, e);
         }
         // Fail at connect when the user opted into durable acks but landed on
         // a server that did not echo the X-QWP-Durable-Ack: enabled confirmation.
         // Without this check, store-and-forward would never receive trim signals
         // and the on-disk store would grow unbounded -- silent storage exhaustion
-        // is a worse outcome than a loud connect-time failure.
+        // is a worse outcome than a loud connect-time failure. Do NOT rotate:
+        // durable-ack support is a cluster-wide server config, so the next
+        // host would reject for the same reason.
         if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
             newClient.close();
-            // The "WebSocket upgrade failed:" prefix is load-bearing: the cursor I/O
-            // loop's isTerminalUpgradeError() sniffs for that exact substring to
-            // classify a connect-time throw as terminal (won't retry). Without the
-            // prefix the loop would treat this misconfig as transient and burn the
-            // full reconnect budget before surfacing it.
+            // Classify as transport error so the tracker doesn't stick on
+            // the durable-ack-blind host. The "WebSocket upgrade failed:"
+            // prefix is load-bearing: the cursor I/O loop's
+            // isTerminalUpgradeError() sniffs for that exact substring to
+            // classify the connect-time throw as terminal so the reconnect
+            // budget isn't burned on a structural misconfig.
+            hostHealthTracker.recordTransportError(idx);
             throw new LineSenderException(
                     "WebSocket upgrade failed: server does not support durable ack [host="
                             + host + ", port=" + port
@@ -1881,6 +2081,7 @@ public class QwpWebSocketSender implements Sender {
                             + "Either disable request_durable_ack or connect to a server with "
                             + "primary replication configured.");
         }
+        hostHealthTracker.recordSuccess(idx);
         return newClient;
     }
 
@@ -2017,7 +2218,8 @@ public class QwpWebSocketSender implements Sender {
                         reconnectMaxDurationMillis,
                         reconnectInitialBackoffMillis,
                         reconnectMaxBackoffMillis,
-                        "initial connect");
+                        "initial connect",
+                        () -> !hostHealthTracker.isRoundExhausted());
                 break;
             case ASYNC:
                 // Defer the actual connect to the I/O thread. The user thread
@@ -2032,7 +2234,15 @@ public class QwpWebSocketSender implements Sender {
                 break;
             case OFF:
             default:
-                client = buildAndConnect();
+                // Single-pass walk: try every configured host once with no
+                // inter-host backoff, then fail terminally on round
+                // exhaustion (.NET spec §3.5 off-mode behavior). With a
+                // single-host config this collapses to one attempt, matching
+                // legacy behavior.
+                client = CursorWebSocketSendLoop.connectSinglePass(
+                        this::buildAndConnect,
+                        hosts.size(),
+                        "initial connect");
                 break;
         }
 
@@ -2046,6 +2256,11 @@ public class QwpWebSocketSender implements Sender {
                     reconnectMaxBackoffMillis,
                     requestDurableAck,
                     durableAckKeepaliveIntervalMillis);
+            // Wire the skip-backoff predicate so mid-stream reconnects walk
+            // the full address list without backoff before paying the
+            // doubling delay (.NET spec §3.4).
+            cursorSendLoop.setSkipBackoffPredicate(
+                    () -> !hostHealthTracker.isRoundExhausted());
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles
@@ -2069,21 +2284,27 @@ public class QwpWebSocketSender implements Sender {
                 client = null;
             }
             throw new LineSenderException(
-                    "Failed to start cursor I/O thread for " + host + ":" + port, t);
+                    "Failed to start cursor I/O thread for "
+                            + hosts.getQuick(currentAddressIndex)
+                            + ":" + ports.getQuick(currentAddressIndex), t);
         }
 
         if (client != null) {
             encoder.setVersion((byte) client.getServerQwpVersion());
-            LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
-                    host, port, inFlightWindowSize, client.getServerQwpVersion());
+            LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}, serverRole={}]",
+                    hosts.getQuick(currentAddressIndex),
+                    ports.getQuick(currentAddressIndex),
+                    inFlightWindowSize,
+                    client.getServerQwpVersion(),
+                    client.getServerRole());
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
             // its default version (V1). Schema state still gets reset for
             // consistency with the sync path; the post-connect replay path
             // does not need a producer-side reset signal because every
             // cursor frame is self-sufficient.
-            LOG.info("Async initial connect deferred to I/O thread [host={}, port={}, windowSize={}]",
-                    host, port, inFlightWindowSize);
+            LOG.info("Async initial connect deferred to I/O thread [hosts={}, windowSize={}]",
+                    hosts, inFlightWindowSize);
         }
         // Server starts fresh on each connection — discard any schema IDs
         // retained from prior state. Cursor frames are self-sufficient (every

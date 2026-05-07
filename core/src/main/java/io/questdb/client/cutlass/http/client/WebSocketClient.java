@@ -75,6 +75,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int PARSE_INCOMPLETE = 0;
     private static final int PARSE_NEED_MORE = -1;
     private static final int PARSE_OK = 1;
+    private static final String QUESTDB_ROLE_HEADER_NAME = "X-QuestDB-Role:";
     private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
@@ -133,6 +134,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     // setQwpRequestDurableAck) is the early-fail signal.
     private boolean serverDurableAckEnabled;
     private int serverQwpVersion = 1;
+    // Set during upgrade response validation from the X-QuestDB-Role header
+    // on every server response (101 success and 421 role-mismatch alike).
+    // Null when the server omitted the header (legacy build or non-QWP path).
+    private String serverRole;
     private boolean upgraded;
 
     public WebSocketClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
@@ -294,6 +299,17 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public int getServerQwpVersion() {
         return serverQwpVersion;
+    }
+
+    /**
+     * Returns the server's replication role as advertised in the
+     * {@code X-QuestDB-Role} header during the upgrade handshake, or
+     * {@code null} when the server omitted the header. Possible values:
+     * {@code STANDALONE}, {@code PRIMARY}, {@code REPLICA},
+     * {@code PRIMARY_CATCHUP}, {@code UNKNOWN}.
+     */
+    public String getServerRole() {
+        return serverRole;
     }
 
     /**
@@ -622,6 +638,40 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return false;
+    }
+
+    private static int parseStatusCode(String response) {
+        // "HTTP/1.1 NNN ..." — find the first space, then read three ASCII digits.
+        int sp = response.indexOf(' ');
+        if (sp < 0 || sp + 4 > response.length()) {
+            return WebSocketUpgradeException.STATUS_NONE;
+        }
+        int code = 0;
+        for (int i = sp + 1; i < sp + 4; i++) {
+            char c = response.charAt(i);
+            if (c < '0' || c > '9') {
+                return WebSocketUpgradeException.STATUS_NONE;
+            }
+            code = code * 10 + (c - '0');
+        }
+        return code;
+    }
+
+    private static String extractServerRole(String response) {
+        int headerLen = QUESTDB_ROLE_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QUESTDB_ROLE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                return value.isEmpty() ? null : value;
+            }
+        }
+        return null;
     }
 
     private static int extractQwpVersion(String response) {
@@ -1028,10 +1078,22 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
         String response = new String(responseBytes, StandardCharsets.US_ASCII);
 
-        // Check status line
+        // Parse the X-QuestDB-Role header off any response (101 success or
+        // 421 role-mismatch), so callers that walk a multi-host list can
+        // log/diagnose which role the unsuitable node reported.
+        serverRole = extractServerRole(response);
+
+        // Check status line. Parse the numeric status code so callers can
+        // distinguish a transient role-mismatch (421) from a terminal upgrade
+        // rejection (401, 403, 426) without sniffing the message text.
         if (!response.startsWith("HTTP/1.1 101")) {
-            String statusLine = response.split("\r\n")[0];
-            throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);
+            int lineEnd = response.indexOf('\r');
+            String statusLine = lineEnd < 0 ? response : response.substring(0, lineEnd);
+            int statusCode = parseStatusCode(response);
+            throw new WebSocketUpgradeException(
+                    statusCode,
+                    serverRole,
+                    "WebSocket upgrade failed: " + statusLine);
         }
 
         // Verify Upgrade: websocket (case-insensitive value per RFC 6455 Section 4.1)

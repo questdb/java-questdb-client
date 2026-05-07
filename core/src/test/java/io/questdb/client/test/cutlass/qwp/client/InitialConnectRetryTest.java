@@ -43,6 +43,35 @@ public class InitialConnectRetryTest {
 
     private static final int TEST_PORT = 19_700 + (int) (System.nanoTime() % 100);
 
+    /**
+     * Temp sf_dir for retry-mode tests. Per spec §3.5,
+     * initial_connect_retry on/sync/async requires sf_dir — memory-mode
+     * senders cannot durably retry across reconnects.
+     */
+    private static String makeSfDir() {
+        return java.nio.file.Paths.get(
+                System.getProperty("java.io.tmpdir"),
+                "qdb-init-retry-" + System.nanoTime()).toString();
+    }
+
+    private static void rmDirRecursive(String path) {
+        try {
+            java.nio.file.Path p = java.nio.file.Paths.get(path);
+            if (!java.nio.file.Files.exists(p)) return;
+            java.nio.file.Files.walk(p)
+                    .sorted(java.util.Comparator.reverseOrder())
+                    .forEach(f -> {
+                        try {
+                            java.nio.file.Files.deleteIfExists(f);
+                        } catch (IOException ignored) {
+                            // best-effort
+                        }
+                    });
+        } catch (IOException ignored) {
+            // best-effort
+        }
+    }
+
     @Test
     public void testWithRetryGivesUpAfterCap() {
         // No server. With retry on, fromConfig must run the retry loop and
@@ -51,18 +80,24 @@ public class InitialConnectRetryTest {
         // honoring is observable through that message — we don't need a
         // wall-clock check.
         int port = TEST_PORT + 3;
-        String cfg = "ws::addr=127.0.0.1:" + port
-                + ";initial_connect_retry=true"
-                + ";reconnect_max_duration_millis=400"
-                + ";reconnect_initial_backoff_millis=10"
-                + ";reconnect_max_backoff_millis=50;";
-        try (Sender ignored = Sender.fromConfig(cfg)) {
-            Assert.fail("expected give-up after cap");
-        } catch (Exception expected) {
-            String msg = expected.getMessage();
-            Assert.assertNotNull("error must have a message", msg);
-            Assert.assertTrue("error must come from the retry loop: " + msg,
-                    msg.contains("initial connect") && msg.contains("attempts"));
+        String sfDir = makeSfDir();
+        try {
+            String cfg = "ws::addr=127.0.0.1:" + port
+                    + ";sf_dir=" + sfDir
+                    + ";initial_connect_retry=true"
+                    + ";reconnect_max_duration_millis=400"
+                    + ";reconnect_initial_backoff_millis=10"
+                    + ";reconnect_max_backoff_millis=50;";
+            try (Sender ignored = Sender.fromConfig(cfg)) {
+                Assert.fail("expected give-up after cap");
+            } catch (Exception expected) {
+                String msg = expected.getMessage();
+                Assert.assertNotNull("error must have a message", msg);
+                Assert.assertTrue("error must come from the retry loop: " + msg,
+                        msg.contains("initial connect") && msg.contains("attempts"));
+            }
+        } finally {
+            rmDirRecursive(sfDir);
         }
     }
 
@@ -85,8 +120,10 @@ public class InitialConnectRetryTest {
         }, "delayed-server-start");
         starter.setDaemon(true);
         starter.start();
+        String sfDir = makeSfDir();
         try {
             String cfg = "ws::addr=127.0.0.1:" + port
+                    + ";sf_dir=" + sfDir
                     + ";initial_connect_retry=true"
                     + ";reconnect_max_duration_millis=5000"
                     + ";reconnect_initial_backoff_millis=50"
@@ -102,6 +139,7 @@ public class InitialConnectRetryTest {
             } catch (Exception ignored) {
                 // already closed
             }
+            rmDirRecursive(sfDir);
         }
     }
 

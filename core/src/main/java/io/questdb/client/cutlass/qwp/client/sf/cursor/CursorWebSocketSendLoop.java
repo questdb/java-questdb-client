@@ -28,7 +28,10 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -44,6 +47,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
 
 /**
  * The cursor-engine I/O loop. Owns one I/O thread that:
@@ -149,6 +153,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // typed-throw path is unaffected.
     private SenderErrorDispatcher errorDispatcher;
     private SenderProgressDispatcher progressDispatcher;
+    // (.NET spec §3.4) When non-null and returning true, the per-attempt
+    // reconnect backoff sleep is skipped. Wired by QwpWebSocketSender to
+    // `() -> !hostHealthTracker.isRoundExhausted()` so the I/O thread
+    // walks the full address list before paying the doubling delay.
+    private BooleanSupplier skipBackoffPredicate;
     // When true, OK frames do NOT advance engine.acknowledge -- only
     // STATUS_DURABLE_ACK frames do. The OK frame's wireSeq is stashed in
     // pendingDurable along with its per-table seqTxns, and trim only advances
@@ -435,6 +444,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.progressDispatcher = dispatcher;
     }
 
+    /**
+     * Wires the skip-backoff predicate (.NET spec §3.4). When the predicate
+     * returns {@code true} after a reconnect attempt fails, the loop skips
+     * the per-attempt backoff sleep and proceeds immediately to the next
+     * factory call. {@link QwpWebSocketSender} sets this to
+     * {@code () -> !hostHealthTracker.isRoundExhausted()} so the I/O
+     * thread walks the full address list without backoff before paying
+     * the doubling delay. Pass {@code null} to disable.
+     */
+    public void setSkipBackoffPredicate(BooleanSupplier predicate) {
+        this.skipBackoffPredicate = predicate;
+    }
+
     public long getTotalFramesSent() {
         return totalFramesSent.get();
     }
@@ -621,12 +643,29 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     lastLogNanos = now;
                 }
             }
-            // Backoff with jitter: sleep [backoff, 2*backoff). Cap the
-            // sleep at the remaining budget so we don't oversleep past
-            // the deadline.
+            // (.NET spec §3.4) Three sleep paths:
+            //   - skipBackoffPredicate true → no sleep, advance to next host
+            //     (used while there are still untried hosts in the round).
+            //   - role-reject (421)        → InitialBackoff only; do NOT
+            //     advance the doubling counter, so the outage budget caps
+            //     a stuck PRIMARY_CATCHUP cluster but each attempt sleeps
+            //     a short, fixed amount.
+            //   - other failures          → standard exponential backoff
+            //     with [backoff, 2*backoff) jitter.
             if (running) {
-                long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
-                long sleepMillis = backoffMillis + jitter;
+                boolean skipBackoff = skipBackoffPredicate != null && skipBackoffPredicate.getAsBoolean();
+                boolean isRoleReject = findRoleMismatch(lastReconnectError) != null;
+                long sleepMillis;
+                if (skipBackoff) {
+                    sleepMillis = 0L;
+                } else if (isRoleReject) {
+                    sleepMillis = reconnectInitialBackoffMillis;
+                    // backoffMillis intentionally NOT advanced.
+                } else {
+                    long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+                    sleepMillis = backoffMillis + jitter;
+                    backoffMillis = Math.min(backoffMillis * 2, reconnectMaxBackoffMillis);
+                }
                 long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
                 if (remainingMillis <= 0) {
                     break;
@@ -634,8 +673,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (sleepMillis > remainingMillis) {
                     sleepMillis = remainingMillis;
                 }
-                LockSupport.parkNanos(sleepMillis * 1_000_000L);
-                backoffMillis = Math.min(backoffMillis * 2, reconnectMaxBackoffMillis);
+                if (sleepMillis > 0) {
+                    LockSupport.parkNanos(sleepMillis * 1_000_000L);
+                }
             }
         }
         long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
@@ -648,12 +688,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // a successful upgrade, the user is most likely looking at a config
         // problem (typo in addr, wrong port, firewall, server not deployed
         // yet); if we connected at least once and then exhausted the budget,
-        // it's a transient connectivity issue (server down, network flap).
-        // Tag and free-text hint encode the same signal so both grep-the-logs
-        // and read-the-message users get it without parsing.
+        // it's a transient connectivity issue (server down, network flap);
+        // and if every attempt hit a non-writable role, it's a failover
+        // window in progress. Tag and free-text hint encode the same signal
+        // so both grep-the-logs and read-the-message users get it without
+        // parsing.
+        WebSocketUpgradeException roleMismatch = findRoleMismatch(lastReconnectError);
         String connectivityTag;
         String connectivityHint;
-        if (hasEverConnected) {
+        if (roleMismatch != null) {
+            connectivityTag = "no-primary-budget-exhausted";
+            connectivityHint = "no PRIMARY among configured addresses (last seen role="
+                    + roleMismatch.getServerRole() + "); waiting for failover";
+        } else if (hasEverConnected) {
             connectivityTag = "connection-lost-budget-exhausted";
             connectivityHint = "server unreachable since last connect (transient)";
         } else {
@@ -724,15 +771,50 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * True when the given throwable indicates a server-side reject that
-     * won't fix itself on retry. Today this is detected by message
-     * sniffing: WebSocket upgrade failures with a non-101 HTTP status
-     * (401 unauthorized, 403 forbidden, 426 upgrade-required, etc.)
-     * indicate auth or version mismatch — retrying just delays the user
-     * seeing the misconfig. Other failures (TCP refused, IO error during
-     * handshake) are treated as transient.
+     * won't fix itself on retry. WebSocket upgrade failures with a non-101
+     * HTTP status (401 unauthorized, 403 forbidden, 426 upgrade-required,
+     * etc.) indicate auth or version mismatch — retrying just delays the
+     * user seeing the misconfig. Other failures (TCP refused, IO error
+     * during handshake) are treated as transient.
+     * <p>
+     * 421 Misdirected Request is explicitly NOT terminal: it signals the
+     * server is a REPLICA / PRIMARY_CATCHUP, and the next connect attempt
+     * should rotate to a different host (or wait for a primary to be
+     * elected).
      */
     private static boolean isTerminalUpgradeError(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof WebSocketUpgradeException) {
+                return !((WebSocketUpgradeException) cur).isRoleMismatch();
+            }
+            if (cur.getCause() == cur) {
+                break;
+            }
+        }
+        // Legacy fallback: WebSocketClient used to throw a plain
+        // HttpClientException with a "WebSocket upgrade failed:" prefix.
+        // Recognize that too so older builds and intermediate wrappers
+        // still classify correctly.
         return findUpgradeFailureMessage(t) != null;
+    }
+
+    /**
+     * Walks the cause chain looking for a {@link WebSocketUpgradeException}
+     * that represents a role mismatch (status 421). Returns the typed
+     * exception so callers can surface the server role to the user, or
+     * {@code null} if no role-mismatch is on the chain.
+     */
+    private static WebSocketUpgradeException findRoleMismatch(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof WebSocketUpgradeException
+                    && ((WebSocketUpgradeException) cur).isRoleMismatch()) {
+                return (WebSocketUpgradeException) cur;
+            }
+            if (cur.getCause() == cur) {
+                break;
+            }
+        }
+        return null;
     }
 
     /**
@@ -754,6 +836,83 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Single-pass walk of the configured address list. Used by
+     * {@code initial_connect_retry=off} to mirror the .NET spec §3.5
+     * off-mode behavior: try each host once with no inter-host backoff,
+     * then fail terminally if every host rejected.
+     * <p>
+     * Each call to {@code factory.reconnect()} is expected to advance the
+     * sender's internal {@code currentAddressIndex} on failure (see
+     * {@code QwpWebSocketSender.buildAndConnect}); over {@code maxAttempts}
+     * iterations the loop covers every configured host exactly once.
+     * <p>
+     * Outcomes:
+     * <ul>
+     *   <li>Success → return the connected client.</li>
+     *   <li>{@link #isTerminalUpgradeError(Throwable)} true (auth / version)
+     *       → re-throw immediately. Auth/version are per-cluster, not
+     *       per-host, so further walking is pointless.</li>
+     *   <li>Every attempt was a role mismatch → throw
+     *       {@link QwpRoleMismatchException} so callers distinguish
+     *       "no PRIMARY in the configured pool" from "everyone unreachable".</li>
+     *   <li>Otherwise → throw {@link LineSenderException} wrapping the last
+     *       failure.</li>
+     * </ul>
+     */
+    public static WebSocketClient connectSinglePass(
+            ReconnectFactory factory,
+            int maxAttempts,
+            String contextLabel
+    ) {
+        if (maxAttempts <= 0) {
+            throw new LineSenderException(contextLabel + " requires at least one configured address");
+        }
+        Throwable lastError = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                WebSocketClient c = factory.reconnect();
+                if (c != null) {
+                    if (attempt > 1) {
+                        LOG.info("{} succeeded on attempt {}/{} (single-pass walk)",
+                                contextLabel, attempt, maxAttempts);
+                    }
+                    return c;
+                }
+            } catch (Throwable e) {
+                if (isTerminalUpgradeError(e)) {
+                    String upgradeMsg = findUpgradeFailureMessage(e);
+                    LOG.error("{} hit terminal upgrade error on attempt {}/{}, halting walk: {}",
+                            contextLabel, attempt, maxAttempts, upgradeMsg);
+                    throw new LineSenderException(
+                            "WebSocket upgrade failed during " + contextLabel
+                                    + " (won't retry): " + upgradeMsg, e);
+                }
+                lastError = e;
+                LOG.warn("{} attempt {}/{} failed: {}",
+                        contextLabel, attempt, maxAttempts, e.getMessage());
+            }
+        }
+        WebSocketUpgradeException roleMismatch = lastError == null ? null : findRoleMismatch(lastError);
+        if (roleMismatch != null) {
+            QwpRoleMismatchException ex = new QwpRoleMismatchException(
+                    "PRIMARY",
+                    null,
+                    contextLabel + " walked " + maxAttempts
+                            + " host(s); no PRIMARY among configured addresses; "
+                            + "last seen role=" + roleMismatch.getServerRole());
+            // Preserve the typed upgrade exception on the cause chain so
+            // diagnostic helpers can recover the parsed status code / role.
+            ex.initCause(lastError);
+            throw ex;
+        }
+        String lastMsg = lastError == null ? "no attempts made" : lastError.getMessage();
+        throw new LineSenderException(
+                contextLabel + " failed after walking " + maxAttempts
+                        + " host(s) (single-pass): " + lastMsg,
+                lastError);
+    }
+
+    /**
      * Same retry-with-exponential-backoff-and-jitter loop the I/O thread
      * uses on a wire failure, but reusable from {@code ensureConnected} to
      * implement {@code initial_connect_retry=true}. Returns the connected
@@ -772,6 +931,33 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             long initialBackoffMillis,
             long maxBackoffMillis,
             String contextLabel
+    ) {
+        return connectWithRetry(factory, maxDurationMillis, initialBackoffMillis,
+                maxBackoffMillis, contextLabel, null);
+    }
+
+    /**
+     * Same as the 5-arg overload but also accepts a
+     * {@code skipBackoffPredicate}. When non-null and returning {@code true}
+     * after a failed attempt, the loop skips the per-attempt backoff
+     * sleep and proceeds immediately to the next factory call. Wired to
+     * {@code () -> !tracker.isRoundExhausted()} so the engine walks the
+     * full address list without backoff before paying the doubling delay
+     * (.NET spec §3.4 skipBackoffPredicate).
+     * <p>
+     * Role-reject failures (421) take a separate sub-branch: the per-attempt
+     * backoff resets to {@code initialBackoffMillis} (no doubling) but the
+     * outage start clock is preserved, so {@code maxDurationMillis} still
+     * bounds how long the loop will tolerate a stuck PRIMARY_CATCHUP cluster
+     * (.NET spec §3.4 backoff.ResetAttempt() semantics).
+     */
+    public static WebSocketClient connectWithRetry(
+            ReconnectFactory factory,
+            long maxDurationMillis,
+            long initialBackoffMillis,
+            long maxBackoffMillis,
+            String contextLabel,
+            BooleanSupplier skipBackoffPredicate
     ) {
         long startNanos = System.nanoTime();
         long deadlineNanos = startNanos + maxDurationMillis * 1_000_000L;
@@ -808,8 +994,29 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     lastLogNanos = now;
                 }
             }
-            long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
-            long sleepMillis = backoffMillis + jitter;
+            // (.NET spec §3.4) Three sleep paths:
+            //   - skipBackoffPredicate true  → no sleep, try the next host
+            //     immediately. Wired to !tracker.isRoundExhausted() so the
+            //     full address list gets walked before the doubling delay.
+            //   - role-reject (421)          → InitialBackoff only, do not
+            //     advance the doubling counter (preserves outage clock).
+            //   - other failures             → standard exponential backoff
+            //     with jitter.
+            boolean skipBackoff = skipBackoffPredicate != null && skipBackoffPredicate.getAsBoolean();
+            boolean isRoleReject = lastError != null && findRoleMismatch(lastError) != null;
+            long sleepMillis;
+            if (skipBackoff) {
+                sleepMillis = 0L;
+            } else if (isRoleReject) {
+                sleepMillis = initialBackoffMillis;
+                // backoffMillis intentionally NOT advanced — role-reject
+                // sleeps are bounded by maxDurationMillis, not by exponential
+                // doubling.
+            } else {
+                long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+                sleepMillis = backoffMillis + jitter;
+                backoffMillis = Math.min(backoffMillis * 2, maxBackoffMillis);
+            }
             long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
             if (remainingMillis <= 0) {
                 break;
@@ -817,11 +1024,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (sleepMillis > remainingMillis) {
                 sleepMillis = remainingMillis;
             }
-            LockSupport.parkNanos(sleepMillis * 1_000_000L);
-            backoffMillis = Math.min(backoffMillis * 2, maxBackoffMillis);
+            if (sleepMillis > 0) {
+                LockSupport.parkNanos(sleepMillis * 1_000_000L);
+            }
         }
         long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
         String lastMsg = lastError == null ? "no attempts made" : lastError.getMessage();
+        WebSocketUpgradeException roleMismatch = lastError == null ? null : findRoleMismatch(lastError);
+        if (roleMismatch != null) {
+            // Every attempt within the budget hit a server that wasn't
+            // primary. Surface this distinctly from a plain transport
+            // failure so callers can wait for a failover and retry rather
+            // than treat it as a hard misconfiguration.
+            QwpRoleMismatchException ex = new QwpRoleMismatchException(
+                    "PRIMARY",
+                    null,
+                    contextLabel + " failed after " + elapsedMs + "ms / "
+                            + attempts + " attempts: no PRIMARY among configured addresses; "
+                            + "last seen role=" + roleMismatch.getServerRole());
+            ex.initCause(lastError);
+            throw ex;
+        }
         throw new LineSenderException(
                 contextLabel + " failed after " + elapsedMs + "ms / "
                         + attempts + " attempts: " + lastMsg,
