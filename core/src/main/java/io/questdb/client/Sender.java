@@ -631,7 +631,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_WEBSOCKET = 2;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
-        // Per-host upgrade timeout for ws:: / wss:: senders (.NET spec §4.1).
+        // Per-host upgrade timeout for ws:: / wss:: senders (failover.md §1.1, auth_timeout_ms).
         // Default 15s; bounds each WebSocket handshake. Worst-case construct
         // time on a fully unreachable cluster = authTimeoutMillis × addresses.
         private int authTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1087,7 +1087,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     throw new LineSenderException(
                             "WebSocket transport requires async mode (in_flight_window > 1)");
                 }
-                // .NET spec §3.5: initial_connect_retry on/sync/async requires
+                // failover.md §1.2: initial_connect_retry on/sync/async requires
                 // sf_dir. Memory-mode senders lose all in-flight rows on
                 // disconnect, so retrying through a long reconnect budget
                 // gives the user the misleading impression that data is

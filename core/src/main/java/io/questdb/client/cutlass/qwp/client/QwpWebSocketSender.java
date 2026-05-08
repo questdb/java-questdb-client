@@ -126,9 +126,9 @@ public class QwpWebSocketSender implements Sender {
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
     private static final int MAX_TABLE_NAME_LENGTH = 127;
     private static final String WRITE_PATH = "/write/v4";
-    // Per-host upgrade timeout (.NET spec §4.1). Bounds each
-    // WebSocketClient.upgrade() call so a hung host can't burn the
-    // entire reconnect budget. Defaults to DEFAULT_AUTH_TIMEOUT_MILLIS.
+    // Per-host upgrade timeout (failover.md §1.1, auth_timeout_ms).
+    // Bounds each WebSocketClient.upgrade() call so a hung host can't
+    // burn the entire reconnect budget. Defaults to DEFAULT_AUTH_TIMEOUT_MILLIS.
     private final int authTimeoutMillis;
     private final String authorizationHeader;
     private final int autoFlushBytes;
@@ -140,17 +140,21 @@ public class QwpWebSocketSender implements Sender {
     private final Decimal256 currentDecimal256 = new Decimal256();
     // Encoder for QWP v1 messages
     private final QwpWebSocketEncoder encoder;
+    // Foreground reconnect factory shared between initial connect
+    // (sync/off) and the cursor I/O loop's mid-stream reconnects. Holds
+    // the foreground caller's previousIdx slot per failover spec §2.3.
+    // Each background drainer constructs its own HostWalkFactory so
+    // concurrent reconnects against the shared tracker can't demote each
+    // other's just-bound endpoints.
+    private final HostWalkFactory foregroundReconnectFactory = new HostWalkFactory();
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
-    // Per-host health classification + priority-ordered picker (.NET spec
-    // §1.2). Built once per sender, lives across reconnects: every
-    // buildAndConnect() consults pickNext(), records the outcome, and
-    // advances the round when exhausted. Replaces the simple round-robin
-    // rotation that used to live on currentAddressIndex.
+    // Per-host health classification + priority-ordered picker (failover
+    // spec §2). Built once per sender, lives across reconnects: every
+    // HostWalkFactory.reconnect() consults pickNext(), records the
+    // outcome, and advances the round when exhausted.
     private final HostHealthTracker hostHealthTracker;
     // Multi-host failover. hosts and ports are parallel arrays of size N >= 1.
-    // The tracker decides which index to try next; currentAddressIndex
-    // mirrors that decision for log/error messages.
     private final ObjList<String> hosts;
     private final int inFlightWindowSize;
     private final int maxSchemasPerConnection;
@@ -172,11 +176,6 @@ public class QwpWebSocketSender implements Sender {
     private long closeFlushTimeoutMillis = 5_000L;
     private boolean closed;
     private boolean connected;
-    // Index of the host buildAndConnect() last attempted (success or
-    // failure). Used for log/diagnostic messages. The authoritative pick
-    // logic lives in {@link #hostHealthTracker} — this field merely
-    // reflects the most recent decision.
-    private int currentAddressIndex;
     // Track max global symbol ID used in current batch (for delta calculation)
     private int currentBatchMaxSymbolId = -1;
     private QwpTableBuffer currentTableBuffer;
@@ -278,7 +277,6 @@ public class QwpWebSocketSender implements Sender {
         this.authTimeoutMillis = authTimeoutMillis;
         this.hosts = hosts;
         this.ports = ports;
-        this.currentAddressIndex = 0;
         this.hostHealthTracker = new HostHealthTracker(hosts.size());
         this.tlsConfig = tlsConfig;
         this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
@@ -1768,10 +1766,14 @@ public class QwpWebSocketSender implements Sender {
         }
         for (int i = 0, n = orphanSlotPaths.size(); i < n; i++) {
             String slot = orphanSlotPaths.get(i);
+            // Per failover spec §2.3: each concurrent reconnect loop owns
+            // its own previousIdx. A drainer that demoted the foreground's
+            // just-bound HEALTHY endpoint (or vice versa) would corrupt
+            // the shared tracker, so every drainer gets its own factory.
             io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
                     new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
                             slot, segmentSizeBytes, sfMaxTotalBytes,
-                            this::buildAndConnect,
+                            new HostWalkFactory(),
                             reconnectMaxDurationMillis,
                             reconnectInitialBackoffMillis,
                             reconnectMaxBackoffMillis);
@@ -1977,42 +1979,49 @@ public class QwpWebSocketSender implements Sender {
         sendRow();
     }
 
+    private void checkConnectionError() {
+        LineSenderException error = connectionError.get();
+        if (error != null) {
+            // Refresh the stack so subsequent public API calls point at the
+            // call that observed the terminal sender state, not the I/O thread
+            // that originally recorded the failure.
+            error.fillInStackTrace();
+            throw error;
+        }
+        // Poll the cursor I/O loop's lastError too. Without this, a fatal
+        // wire / server-rejection error recorded by the I/O thread would
+        // only surface on the next flush() / close() — every row-level
+        // method (table, longColumn, atNow, etc.) routes through
+        // checkNotClosed → checkConnectionError, so failing to poll here
+        // means callers can keep accumulating rows long after the sender
+        // is already broken.
+        if (cursorSendLoop != null) {
+            cursorSendLoop.checkError();
+        }
+    }
+
+    private void checkNotClosed() {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        checkConnectionError();
+    }
+
+    private void checkTableSelected() {
+        if (currentTableBuffer == null) {
+            throw new LineSenderException("table() must be called before adding columns");
+        }
+    }
+
     /**
-     * Build and connect a fresh WebSocket client using the sender's
-     * persistent config (host/port/TLS/auth/durable-ack flag). Used both
-     * for the initial connect and as the reconnect factory passed to the
-     * cursor I/O loop. Throws {@link LineSenderException} on any failure
-     * — the I/O loop's reconnect path treats a throw as fatal for that
-     * attempt (and, in the follow-up commit, schedules a backoff retry
-     * within the per-outage time cap).
+     * Build and connect to the host at {@code idx} using the sender's
+     * persistent config (TLS / auth / durable-ack flag). Records the
+     * outcome on {@link #hostHealthTracker} (success / role-reject /
+     * transport-error) and throws {@link LineSenderException} on
+     * failure. The pick + round-walk lives in {@link HostWalkFactory},
+     * which calls this for the chosen index.
      */
-    private WebSocketClient buildAndConnect() {
-        // Mid-stream demotion (.NET spec §1.2 RecordMidStreamFailure):
-        // if a previous attempt left a host in HEALTHY state and we're
-        // back here, that host's connection has just dropped — demote
-        // it to TRANSPORT_ERROR so it falls in priority next round.
-        // recordMidStreamFailure is a no-op when no HEALTHY host exists.
-        for (int i = 0, n = hosts.size(); i < n; i++) {
-            if (hostHealthTracker.stateOf(i) == HostHealthTracker.State.HEALTHY) {
-                hostHealthTracker.recordMidStreamFailure(i);
-                break;
-            }
-        }
-        int idx = hostHealthTracker.pickNext();
-        if (idx < 0) {
-            // Round exhausted — start a fresh round and let previously-
-            // failed hosts re-evaluate (.NET spec §3.2). Sticky-healthy
-            // semantics preserved by passing forgetClassifications=true.
-            hostHealthTracker.beginRound(true);
-            idx = hostHealthTracker.pickNext();
-            if (idx < 0) {
-                // Defensive: should never happen — a fresh round always
-                // produces an UNKNOWN entry for at least one host.
-                throw new LineSenderException(
-                        "host health tracker has no candidate after beginRound");
-            }
-        }
-        currentAddressIndex = idx;
+    private WebSocketClient connectToHost(int idx) {
         String host = hosts.getQuick(idx);
         int port = ports.getQuick(idx);
         WebSocketClient newClient;
@@ -2026,17 +2035,17 @@ public class QwpWebSocketSender implements Sender {
             newClient.setQwpClientId(QwpConstants.CLIENT_ID);
             newClient.setQwpRequestDurableAck(requestDurableAck);
             newClient.connect(host, port);
-            // Per-host upgrade timeout (.NET spec §4.1). Bounds the
-            // /write/v4 handshake so a half-open peer can't burn the
-            // entire reconnect budget.
+            // Per-host upgrade timeout (failover.md §1.1, auth_timeout_ms).
+            // Bounds the /write/v4 handshake so a half-open peer can't
+            // burn the entire reconnect budget.
             newClient.upgrade(WRITE_PATH, authTimeoutMillis, authorizationHeader);
         } catch (Exception e) {
             newClient.close();
             // Classify the failure into the tracker's state machine
-            // (.NET spec §1.3). 421 + role drives priority on the next
-            // round; transport errors get their own tier; auth/version
-            // failures pass through and get caught as terminal further
-            // up the stack via isTerminalUpgradeError.
+            // (failover.md §6 error classification). 421 + role drives
+            // priority on the next round; transport errors get their own
+            // tier; auth/version failures pass through and get caught as
+            // terminal further up the stack via isTerminalUpgradeError.
             if (e instanceof WebSocketUpgradeException) {
                 WebSocketUpgradeException ue = (WebSocketUpgradeException) e;
                 if (ue.isRoleMismatch()) {
@@ -2112,40 +2121,6 @@ public class QwpWebSocketSender implements Sender {
         }
         hostHealthTracker.recordSuccess(idx);
         return newClient;
-    }
-
-    private void checkConnectionError() {
-        LineSenderException error = connectionError.get();
-        if (error != null) {
-            // Refresh the stack so subsequent public API calls point at the
-            // call that observed the terminal sender state, not the I/O thread
-            // that originally recorded the failure.
-            error.fillInStackTrace();
-            throw error;
-        }
-        // Poll the cursor I/O loop's lastError too. Without this, a fatal
-        // wire / server-rejection error recorded by the I/O thread would
-        // only surface on the next flush() / close() — every row-level
-        // method (table, longColumn, atNow, etc.) routes through
-        // checkNotClosed → checkConnectionError, so failing to poll here
-        // means callers can keep accumulating rows long after the sender
-        // is already broken.
-        if (cursorSendLoop != null) {
-            cursorSendLoop.checkError();
-        }
-    }
-
-    private void checkNotClosed() {
-        if (closed) {
-            throw new LineSenderException("Sender is closed");
-        }
-        checkConnectionError();
-    }
-
-    private void checkTableSelected() {
-        if (currentTableBuffer == null) {
-            throw new LineSenderException("table() must be called before adding columns");
-        }
     }
 
     private int countNonEmptyTables(ObjList<CharSequence> keys) {
@@ -2240,10 +2215,14 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine == null) {
             throw new LineSenderException("cursor engine must be attached before connect");
         }
+        // Same factory instance for the foreground initial connect AND
+        // the cursor send loop's mid-stream reconnects, so previousIdx
+        // bound during initial connect carries through to the first
+        // mid-stream demote (failover spec §2.3 / §4.2 ordering).
         switch (initialConnectMode) {
             case SYNC:
                 client = CursorWebSocketSendLoop.connectWithRetry(
-                        this::buildAndConnect,
+                        foregroundReconnectFactory,
                         reconnectMaxDurationMillis,
                         reconnectInitialBackoffMillis,
                         reconnectMaxBackoffMillis,
@@ -2265,11 +2244,11 @@ public class QwpWebSocketSender implements Sender {
             default:
                 // Single-pass walk: try every configured host once with no
                 // inter-host backoff, then fail terminally on round
-                // exhaustion (.NET spec §3.5 off-mode behavior). With a
-                // single-host config this collapses to one attempt, matching
-                // legacy behavior.
+                // exhaustion (failover.md §1.2/§4.2, initial_connect_retry=off).
+                // With a single-host config this collapses to one attempt,
+                // matching legacy behavior.
                 client = CursorWebSocketSendLoop.connectSinglePass(
-                        this::buildAndConnect,
+                        foregroundReconnectFactory,
                         hosts.size(),
                         "initial connect");
                 break;
@@ -2279,7 +2258,7 @@ public class QwpWebSocketSender implements Sender {
             cursorSendLoop = new CursorWebSocketSendLoop(
                     client, cursorEngine,
                     0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
-                    this::buildAndConnect,
+                    foregroundReconnectFactory,
                     reconnectMaxDurationMillis,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis,
@@ -2287,7 +2266,7 @@ public class QwpWebSocketSender implements Sender {
                     durableAckKeepaliveIntervalMillis);
             // Wire the skip-backoff predicate so mid-stream reconnects walk
             // the full address list without backoff before paying the
-            // doubling delay (.NET spec §3.4).
+            // doubling delay (failover.md §4.2, skip-backoff-within-round).
             cursorSendLoop.setSkipBackoffPredicate(
                     () -> !hostHealthTracker.isRoundExhausted());
             // Plug the async-delivery sink before start() so the I/O thread
@@ -2312,17 +2291,20 @@ public class QwpWebSocketSender implements Sender {
                 client.close();
                 client = null;
             }
+            int boundIdx = foregroundReconnectFactory.lastBoundIdx();
+            String boundHost = boundIdx >= 0 ? hosts.getQuick(boundIdx) : "<unknown>";
+            String boundPort = boundIdx >= 0 ? Integer.toString(ports.getQuick(boundIdx)) : "?";
             throw new LineSenderException(
                     "Failed to start cursor I/O thread for "
-                            + hosts.getQuick(currentAddressIndex)
-                            + ":" + ports.getQuick(currentAddressIndex), t);
+                            + boundHost + ":" + boundPort, t);
         }
 
         if (client != null) {
+            int boundIdx = foregroundReconnectFactory.lastBoundIdx();
             encoder.setVersion((byte) client.getServerQwpVersion());
             LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}, serverRole={}]",
-                    hosts.getQuick(currentAddressIndex),
-                    ports.getQuick(currentAddressIndex),
+                    hosts.getQuick(boundIdx),
+                    ports.getQuick(boundIdx),
                     inFlightWindowSize,
                     client.getServerQwpVersion(),
                     client.getServerRole());
@@ -2627,4 +2609,60 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * Per-caller reconnect factory: each foreground / drainer loop owns
+     * its own instance so {@code previousIdx} is private to the loop
+     * (failover spec §2.3). On every {@link #reconnect()} call:
+     * <ol>
+     *   <li>If a host was bound on the previous successful call, demote it
+     *       via {@link HostHealthTracker#recordMidStreamFailure(int)} —
+     *       the wire failure that brought us back here proved the prior
+     *       HEALTHY classification stale. The demote runs BEFORE the next
+     *       {@code pickNext} so sticky-healthy can't preserve the just-
+     *       failed host as priority pick (failover spec §2.3
+     *       "Mid-stream demote before round reset").</li>
+     *   <li>Pick a host. On round exhaustion, call
+     *       {@link HostHealthTracker#beginRound(boolean) beginRound(true)}
+     *       once and pick again.</li>
+     *   <li>Build / connect / upgrade. On terminal failure, throw without
+     *       updating {@code previousIdx}.</li>
+     *   <li>On success, record the host as bound; the next call's demote
+     *       targets it.</li>
+     * </ol>
+     */
+    private final class HostWalkFactory implements CursorWebSocketSendLoop.ReconnectFactory {
+
+        private int previousIdx = -1;
+
+        public int lastBoundIdx() {
+            return previousIdx;
+        }
+
+        @Override
+        public WebSocketClient reconnect() {
+            if (previousIdx >= 0) {
+                hostHealthTracker.recordMidStreamFailure(previousIdx);
+                previousIdx = -1;
+            }
+            int idx = hostHealthTracker.pickNext();
+            if (idx < 0) {
+                // Round exhausted — start a fresh round and let
+                // previously-failed hosts re-evaluate. Sticky-healthy
+                // semantics preserved by passing
+                // forgetClassifications=true (failover spec §2.1).
+                hostHealthTracker.beginRound(true);
+                idx = hostHealthTracker.pickNext();
+                if (idx < 0) {
+                    // Defensive: should never happen — a fresh round
+                    // always produces an UNKNOWN entry for at least one
+                    // host.
+                    throw new LineSenderException(
+                            "host health tracker has no candidate after beginRound");
+                }
+            }
+            WebSocketClient newClient = connectToHost(idx);
+            previousIdx = idx;
+            return newClient;
+        }
+    }
 }

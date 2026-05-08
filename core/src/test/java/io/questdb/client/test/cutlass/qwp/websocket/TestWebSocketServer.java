@@ -71,6 +71,12 @@ public class TestWebSocketServer implements Closeable {
     // QwpServerInfoProvider reports REPLICA / PRIMARY_CATCHUP. Set after
     // construction via setRejectWithRole().
     private volatile String rejectingRole;
+    private volatile int rejectingStatusCode;
+    // When > 0, the next handshake responds with this status code + the
+    // reason phrase from {@link #rejectingStatusReason}. Used to simulate
+    // 401, 403, 404, 426, 503, etc. that the failover loop should
+    // classify per failover.md §6.
+    private volatile String rejectingStatusReason;
     private ServerSocket serverSocket;
 
     public TestWebSocketServer(int port, WebSocketServerHandler handler) {
@@ -138,7 +144,9 @@ public class TestWebSocketServer implements Closeable {
         }
     }
 
-    /** Replaces the advertised role for subsequent handshakes (live update). */
+    /**
+     * Replaces the advertised role for subsequent handshakes (live update).
+     */
     public void setAdvertisedRole(String role) {
         this.advertisedRole = role;
     }
@@ -152,6 +160,17 @@ public class TestWebSocketServer implements Closeable {
      */
     public void setRejectWithRole(String role) {
         this.rejectingRole = role;
+    }
+
+    /**
+     * Configure the server to reject the next handshake with an arbitrary
+     * HTTP status code (e.g. 401, 403, 404, 426, 503). Pass {@code 0} to
+     * clear and resume normal 101 upgrades. Tests use this to drive the
+     * client's terminal-vs-transient classification per failover.md §6.
+     */
+    public void setRejectWithStatus(int statusCode, String reasonPhrase) {
+        this.rejectingStatusCode = statusCode;
+        this.rejectingStatusReason = reasonPhrase;
     }
 
     public void start() throws IOException {
@@ -362,6 +381,20 @@ public class TestWebSocketServer implements Closeable {
                 return false;
             }
 
+            // Arbitrary-status reject path: tests use setRejectWithStatus
+            // to drive the failover loop's terminal-vs-transient
+            // classification (failover.md §6).
+            int customStatus = rejectingStatusCode;
+            if (customStatus > 0) {
+                String reason = rejectingStatusReason != null ? rejectingStatusReason : "";
+                String sb = "HTTP/1.1 " + customStatus + ' ' + reason + "\r\n" +
+                        "Connection: close\r\n" +
+                        "Content-Length: 0\r\n" +
+                        "\r\n";
+                out.write(sb.getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                return false;
+            }
             // Role-aware reject path: emit a 421 Misdirected Request +
             // X-QuestDB-Role: <role> response so the client treats this
             // node as REPLICA / PRIMARY_CATCHUP and rotates to the next
@@ -370,13 +403,12 @@ public class TestWebSocketServer implements Closeable {
             // non-writable role.
             String reject = rejectingRole;
             if (reject != null) {
-                StringBuilder sb = new StringBuilder()
-                        .append("HTTP/1.1 421 Misdirected Request\r\n")
-                        .append("Connection: close\r\n")
-                        .append("Content-Length: 0\r\n")
-                        .append("X-QuestDB-Role: ").append(reject).append("\r\n")
-                        .append("\r\n");
-                out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
+                String sb = "HTTP/1.1 421 Misdirected Request\r\n" +
+                        "Connection: close\r\n" +
+                        "Content-Length: 0\r\n" +
+                        "X-QuestDB-Role: " + reject + "\r\n" +
+                        "\r\n";
+                out.write(sb.getBytes(StandardCharsets.US_ASCII));
                 out.flush();
                 return false;
             }

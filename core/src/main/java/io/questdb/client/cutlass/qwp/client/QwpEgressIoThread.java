@@ -739,9 +739,19 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         events.offer(new QueryEvent().asError(WebSocketResponse.STATUS_INTERNAL_ERROR, "QwpQueryClient closed"));
     }
 
-    @FunctionalInterface
     public interface TerminalFailureListener {
         void onTerminalFailure(byte status, String message);
+
+        /**
+         * Latches a terminal failure together with a hint to {@code execute()}
+         * that the spec classifies the failure as bypassing failover
+         * (failover.md §6 Terminal: AuthError, ProtocolVersionError,
+         * server status reject). Default delegates to the legacy
+         * single-arg overload so existing callers keep working.
+         */
+        default void onTerminalFailure(byte status, String message, boolean bypassFailover) {
+            onTerminalFailure(status, message);
+        }
     }
 
     private static final class QueryRequest {

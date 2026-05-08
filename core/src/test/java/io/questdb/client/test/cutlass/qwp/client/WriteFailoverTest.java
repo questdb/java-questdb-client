@@ -58,13 +58,69 @@ public class WriteFailoverTest {
     private static final int BASE_PORT = 19_700 + (int) (System.nanoTime() % 100);
 
     @Test
-    public void testOffModeSinglePassWalkFindsPrimary() throws Exception {
-        // .NET spec §3.5: with initial_connect_retry=off (the default),
-        // the engine still walks the full address list once with NO
-        // inter-host backoff; only after every host has been tried does
-        // it fail terminally. Java's prior off-mode tried hosts[0] alone.
-        int port1 = BASE_PORT + 60;
-        int port2 = BASE_PORT + 61;
+    public void testAuthTimeoutBoundsHungUpgrade() throws Exception {
+        // Per spec, auth_timeout_ms bounds each WebSocket upgrade. A
+        // server that accepts the TCP connection but never sends a 101
+        // response should NOT burn the entire reconnect budget on a
+        // single host — the upgrade times out per-host, the sender
+        // moves on. Use a no-op listener that just accepts and parks.
+        int hangPort;
+        int goodPort;
+        try (java.net.ServerSocket hangListener = new java.net.ServerSocket(0)) {
+            hangPort = hangListener.getLocalPort();
+            // Park accepted sockets so the WebSocket upgrade never gets
+            // a 101 response. Daemon thread so the JVM can exit.
+            Thread acceptor = new Thread(() -> {
+                try {
+                    while (!hangListener.isClosed()) {
+                        java.net.Socket s = hangListener.accept();
+                        // Hold the socket open without writing anything.
+                        // Test cleanup closes the listener to release.
+                        s.setSoTimeout(60_000);
+                    }
+                } catch (IOException ignored) {
+                    // listener closed
+                }
+            }, "hang-acceptor");
+            acceptor.setDaemon(true);
+            acceptor.start();
+
+            AckHandler ack = new AckHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(BASE_PORT + 81, ack, false, "PRIMARY")) {
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                goodPort = BASE_PORT + 81;
+
+                long t0 = System.nanoTime();
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + hangPort)
+                        .address("localhost:" + goodPort)
+                        .authTimeoutMillis(500)
+                        .build()) {
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> ack.totalBinary.get() >= 1, 5_000);
+                }
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+                // hangPort exhausts auth_timeout_ms (500ms) then we move to
+                // goodPort and connect. Should be well under the legacy
+                // default-15s timeout; allow generous slack for CI.
+                Assert.assertTrue(
+                        "expected auth_timeout_ms to bound the hang (~500ms) but elapsed=" + elapsedMs + "ms",
+                        elapsedMs < 5_000L);
+            }
+        } catch (IOException ignored) {
+            // best-effort
+        }
+    }
+
+    @Test
+    public void testFailoverPastReplicaToPrimary() throws Exception {
+        // Two servers: server1 always rejects with 421 + REPLICA, server2
+        // accepts with 101 + PRIMARY. The sender's connect path must walk
+        // past server1 and land on server2 within the reconnect budget.
+        int port1 = BASE_PORT + 10;
+        int port2 = BASE_PORT + 11;
         AckHandler ack = new AckHandler();
         TestWebSocketServer replica = new TestWebSocketServer(port1, ack);
         replica.setRejectWithRole("REPLICA");
@@ -75,7 +131,8 @@ public class WriteFailoverTest {
             Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));
             Assert.assertTrue(primary.awaitStart(5, TimeUnit.SECONDS));
 
-            // No initialConnectMode call — exercise the default (OFF).
+            // Off-mode (default) walks every host once with no inter-host
+            // backoff. Multi-host failover doesn't need SYNC/sf_dir.
             try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
                     .address("localhost:" + port1)
                     .address("localhost:" + port2)
@@ -87,6 +144,50 @@ public class WriteFailoverTest {
         } finally {
             replica.close();
             primary.close();
+        }
+    }
+
+    @Test
+    public void testFailoverPromotedReplicaJoinsRotation() throws Exception {
+        // Failover during a real failover window: server1 starts as REPLICA
+        // (rejects), server2 starts as PRIMARY (accepts). Mid-test, server1
+        // is promoted (clear the reject) and we verify the sender stays on
+        // server2 — currentAddressIndex stickiness means we don't rotate
+        // off a healthy primary just because another node became writable.
+        int port1 = BASE_PORT + 50;
+        int port2 = BASE_PORT + 51;
+        AckHandler ack = new AckHandler();
+        TestWebSocketServer s1 = new TestWebSocketServer(port1, ack);
+        s1.setRejectWithRole("REPLICA");
+        TestWebSocketServer s2 = new TestWebSocketServer(port2, ack, false, "PRIMARY");
+        try {
+            s1.start();
+            s2.start();
+            Assert.assertTrue(s1.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(s2.awaitStart(5, TimeUnit.SECONDS));
+
+            try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                    .address("localhost:" + port1)
+                    .address("localhost:" + port2)
+                    .build()) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                waitFor(() -> ack.totalBinary.get() >= 1, 5_000);
+
+                // Promote server1 (no longer rejects). Sender should stay
+                // on server2 because the primary it landed on is still
+                // healthy — rotation only happens on failure.
+                s1.setRejectWithRole(null);
+                s1.setAdvertisedRole("PRIMARY");
+
+                long beforeBatch2 = ack.totalBinary.get();
+                sender.table("foo").longColumn("v", 2L).atNow();
+                sender.flush();
+                waitFor(() -> ack.totalBinary.get() > beforeBatch2, 5_000);
+            }
+        } finally {
+            s1.close();
+            s2.close();
         }
     }
 
@@ -127,12 +228,14 @@ public class WriteFailoverTest {
     }
 
     @Test
-    public void testFailoverPastReplicaToPrimary() throws Exception {
-        // Two servers: server1 always rejects with 421 + REPLICA, server2
-        // accepts with 101 + PRIMARY. The sender's connect path must walk
-        // past server1 and land on server2 within the reconnect budget.
-        int port1 = BASE_PORT + 10;
-        int port2 = BASE_PORT + 11;
+    public void testOffModeSinglePassWalkFindsPrimary() throws Exception {
+        // failover.md §1.2/§4.2: with initial_connect_retry=off (the
+        // default), the engine still walks the full address list once
+        // with NO inter-host backoff; only after every host has been
+        // tried does it fail terminally. Java's prior off-mode tried
+        // hosts[0] alone.
+        int port1 = BASE_PORT + 60;
+        int port2 = BASE_PORT + 61;
         AckHandler ack = new AckHandler();
         TestWebSocketServer replica = new TestWebSocketServer(port1, ack);
         replica.setRejectWithRole("REPLICA");
@@ -143,8 +246,7 @@ public class WriteFailoverTest {
             Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));
             Assert.assertTrue(primary.awaitStart(5, TimeUnit.SECONDS));
 
-            // Off-mode (default) walks every host once with no inter-host
-            // backoff. Multi-host failover doesn't need SYNC/sf_dir.
+            // No initialConnectMode call — exercise the default (OFF).
             try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
                     .address("localhost:" + port1)
                     .address("localhost:" + port2)
@@ -213,8 +315,7 @@ public class WriteFailoverTest {
         // nodes are writable.
         int port = BASE_PORT + 30;
         AckHandler ack = new AckHandler();
-        TestWebSocketServer standalone = new TestWebSocketServer(port, ack, false, "STANDALONE");
-        try {
+        try (TestWebSocketServer standalone = new TestWebSocketServer(port, ack, false, "STANDALONE")) {
             standalone.start();
             Assert.assertTrue(standalone.awaitStart(5, TimeUnit.SECONDS));
 
@@ -225,8 +326,6 @@ public class WriteFailoverTest {
                 sender.flush();
                 waitFor(() -> ack.totalBinary.get() >= 1, 5_000);
             }
-        } finally {
-            standalone.close();
         }
     }
 
@@ -267,107 +366,6 @@ public class WriteFailoverTest {
         }
     }
 
-    @Test
-    public void testAuthTimeoutBoundsHungUpgrade() throws Exception {
-        // Per spec, auth_timeout_ms bounds each WebSocket upgrade. A
-        // server that accepts the TCP connection but never sends a 101
-        // response should NOT burn the entire reconnect budget on a
-        // single host — the upgrade times out per-host, the sender
-        // moves on. Use a no-op listener that just accepts and parks.
-        int hangPort;
-        int goodPort;
-        try (java.net.ServerSocket hangListener = new java.net.ServerSocket(0)) {
-            hangPort = hangListener.getLocalPort();
-            // Park accepted sockets so the WebSocket upgrade never gets
-            // a 101 response. Daemon thread so the JVM can exit.
-            Thread acceptor = new Thread(() -> {
-                try {
-                    while (!hangListener.isClosed()) {
-                        java.net.Socket s = hangListener.accept();
-                        // Hold the socket open without writing anything.
-                        // Test cleanup closes the listener to release.
-                        s.setSoTimeout(60_000);
-                    }
-                } catch (IOException ignored) {
-                    // listener closed
-                }
-            }, "hang-acceptor");
-            acceptor.setDaemon(true);
-            acceptor.start();
-
-            AckHandler ack = new AckHandler();
-            try (TestWebSocketServer good = new TestWebSocketServer(BASE_PORT + 81, ack, false, "PRIMARY")) {
-                good.start();
-                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
-                goodPort = BASE_PORT + 81;
-
-                long t0 = System.nanoTime();
-                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address("localhost:" + hangPort)
-                        .address("localhost:" + goodPort)
-                        .authTimeoutMillis(500)
-                        .build()) {
-                    sender.table("foo").longColumn("v", 1L).atNow();
-                    sender.flush();
-                    waitFor(() -> ack.totalBinary.get() >= 1, 5_000);
-                }
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                // hangPort exhausts auth_timeout_ms (500ms) then we move to
-                // goodPort and connect. Should be well under the legacy
-                // default-15s timeout; allow generous slack for CI.
-                Assert.assertTrue(
-                        "expected auth_timeout_ms to bound the hang (~500ms) but elapsed=" + elapsedMs + "ms",
-                        elapsedMs < 5_000L);
-            }
-        } catch (IOException ignored) {
-            // best-effort
-        }
-    }
-
-    @Test
-    public void testFailoverPromotedReplicaJoinsRotation() throws Exception {
-        // Failover during a real failover window: server1 starts as REPLICA
-        // (rejects), server2 starts as PRIMARY (accepts). Mid-test, server1
-        // is promoted (clear the reject) and we verify the sender stays on
-        // server2 — currentAddressIndex stickiness means we don't rotate
-        // off a healthy primary just because another node became writable.
-        int port1 = BASE_PORT + 50;
-        int port2 = BASE_PORT + 51;
-        AckHandler ack = new AckHandler();
-        TestWebSocketServer s1 = new TestWebSocketServer(port1, ack);
-        s1.setRejectWithRole("REPLICA");
-        TestWebSocketServer s2 = new TestWebSocketServer(port2, ack, false, "PRIMARY");
-        try {
-            s1.start();
-            s2.start();
-            Assert.assertTrue(s1.awaitStart(5, TimeUnit.SECONDS));
-            Assert.assertTrue(s2.awaitStart(5, TimeUnit.SECONDS));
-
-            try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
-                    .address("localhost:" + port1)
-                    .address("localhost:" + port2)
-                    .build()) {
-                sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
-                waitFor(() -> ack.totalBinary.get() >= 1, 5_000);
-
-                // Promote server1 (no longer rejects). Sender should stay
-                // on server2 because the primary it landed on is still
-                // healthy — rotation only happens on failure.
-                s1.setRejectWithRole(null);
-                s1.setAdvertisedRole("PRIMARY");
-
-                long beforeBatch2 = ack.totalBinary.get();
-                sender.table("foo").longColumn("v", 2L).atNow();
-                sender.flush();
-                waitFor(() -> ack.totalBinary.get() > beforeBatch2, 5_000);
-            }
-        } finally {
-            s1.close();
-            s2.close();
-        }
-    }
-
     private static WebSocketUpgradeException findUpgradeOnChain(Throwable t) {
         for (Throwable cur = t; cur != null; cur = cur.getCause()) {
             if (cur instanceof WebSocketUpgradeException) {
@@ -395,7 +393,9 @@ public class WriteFailoverTest {
         boolean test();
     }
 
-    /** Minimal ACK handler shared across tests; keeps senders unblocked. */
+    /**
+     * Minimal ACK handler shared across tests; keeps senders unblocked.
+     */
     private static class AckHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicLong totalBinary = new AtomicLong();
         private final AtomicLong nextSeq = new AtomicLong(0);

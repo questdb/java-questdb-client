@@ -44,6 +44,16 @@ public class QueryEvent {
      * having to reconstruct the classification from a side-channel latch.
      */
     public static final int KIND_TRANSPORT_ERROR = 4;
+    /**
+     * Synthesised on the I/O thread when a received frame carries a QWP
+     * version byte outside {@code [1, ClientMaxVersion]}, when the magic
+     * doesn't match, or when any other byte-level header invariant breaks.
+     * Distinct from {@link #KIND_TRANSPORT_ERROR} so {@code execute()}
+     * surfaces it directly through {@code onError} -- a cluster-wide
+     * version disagreement is masked by failover (failover.md §6
+     * Terminal), so the loop must NOT enter the retry path.
+     */
+    public static final int KIND_PROTOCOL_ERROR = 5;
 
     public QwpBatchBuffer buffer;     // valid for KIND_BATCH (must be released to pool by consumer)
     public String errorMessage;       // valid for KIND_ERROR
@@ -79,6 +89,14 @@ public class QueryEvent {
         this.buffer = null;
         this.opType = opType;
         this.rowsAffected = rowsAffected;
+        return this;
+    }
+
+    public QueryEvent asProtocolError(byte status, String message) {
+        this.kind = KIND_PROTOCOL_ERROR;
+        this.buffer = null;
+        this.errorStatus = status;
+        this.errorMessage = message;
         return this;
     }
 

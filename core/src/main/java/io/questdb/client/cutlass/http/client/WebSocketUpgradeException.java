@@ -71,25 +71,25 @@ public class WebSocketUpgradeException extends HttpClientException {
     }
 
     /**
-     * True when the role mismatch reflects a *transient* cluster condition:
-     * the node believes it is primary but is still uploading WAL segments
-     * to the shared object store before accepting writes
-     * ({@code X-QuestDB-Role: PRIMARY_CATCHUP}). Per .NET spec §1.2 this
-     * gets higher retry priority than a {@code REPLICA} reject because
-     * a catchup node typically becomes writable within seconds.
-     */
-    public boolean isTransientRoleReject() {
-        return isRoleMismatch() && "PRIMARY_CATCHUP".equals(serverRole);
-    }
-
-    /**
      * True when the role mismatch reflects a *topological* condition: the
      * node is a read-only replica that pulls WAL segments from the shared
-     * object store ({@code X-QuestDB-Role: REPLICA}). Per .NET spec §1.2
+     * object store ({@code X-QuestDB-Role: REPLICA}). Per failover.md §5
      * this is the lowest-priority retry target because a replica won't
      * become writable without an operator-driven failover.
      */
     public boolean isTopologicalRoleReject() {
         return isRoleMismatch() && "REPLICA".equals(serverRole);
+    }
+
+    /**
+     * True when the role mismatch reflects a *transient* cluster condition:
+     * the node believes it is primary but is still uploading WAL segments
+     * to the shared object store before accepting writes
+     * ({@code X-QuestDB-Role: PRIMARY_CATCHUP}). Per failover.md §5 this
+     * gets higher retry priority than a {@code REPLICA} reject because
+     * a catchup node typically becomes writable within seconds.
+     */
+    public boolean isTransientRoleReject() {
+        return isRoleMismatch() && "PRIMARY_CATCHUP".equals(serverRole);
     }
 }

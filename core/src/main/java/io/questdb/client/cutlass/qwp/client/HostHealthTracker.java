@@ -153,12 +153,16 @@ public final class HostHealthTracker {
      * other than {@link State#HEALTHY}; we don't want a single hiccup to
      * cancel out a transient or topological classification we already
      * captured.
+     * <p>
+     * Per failover spec §2.1, this MUST NOT touch the round's attempted
+     * flag — that bit is owned by the round lifecycle (record* / begin*)
+     * and reflects whether the loop has tried this host in the current
+     * round, which is independent of mid-stream demotion.
      */
     public void recordMidStreamFailure(int idx) {
         synchronized (lock) {
             if (states[idx] == State.HEALTHY) {
                 states[idx] = State.TRANSPORT_ERROR;
-                attempted[idx] = true;
             }
         }
     }
