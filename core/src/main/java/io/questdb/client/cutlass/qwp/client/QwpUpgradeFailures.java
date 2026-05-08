@@ -41,7 +41,8 @@ final class QwpUpgradeFailures {
     static HttpClientException classify(WebSocketClient client, String host, int port, HttpClientException ex) {
         String role = client.getUpgradeRejectRole();
         if (role != null) {
-            QwpIngressRoleRejectedException re = new QwpIngressRoleRejectedException(role, host, port);
+            QwpIngressRoleRejectedException re = new QwpIngressRoleRejectedException(
+                    role, host, port, client.getUpgradeRejectZone());
             re.initCause(ex);
             return re;
         }

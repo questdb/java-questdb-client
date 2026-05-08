@@ -42,13 +42,23 @@ public final class QwpIngressRoleRejectedException extends HttpClientException {
     private final String host;
     private final int port;
     private final String role;
+    // Server-advertised zone identifier from the upgrade reject response's
+    // X-QuestDB-Zone header. Null when the header was absent or empty.
+    // Used by the host tracker to record the host's zone tier (failover.md
+    // §5) without a successful upgrade.
+    private final String zoneId;
 
     public QwpIngressRoleRejectedException(String role, String host, int port) {
+        this(role, host, port, null);
+    }
+
+    public QwpIngressRoleRejectedException(String role, String host, int port, String zoneId) {
         super("WebSocket ingress upgrade rejected by role=");
         put(role).put(" at ").put(host).put(':').put(port);
         this.role = role;
         this.host = host;
         this.port = port;
+        this.zoneId = zoneId;
     }
 
     public String getHost() {
@@ -61,6 +71,10 @@ public final class QwpIngressRoleRejectedException extends HttpClientException {
 
     public String getRole() {
         return role;
+    }
+
+    public String getZoneId() {
+        return zoneId;
     }
 
     public boolean isTopological() {

@@ -30,7 +30,9 @@ package io.questdb.client.cutlass.qwp.client;
  * <p>
  * Within a round, {@link #pickNext()} returns the highest-priority host that
  * has not yet been attempted; the caller advances the round via
- * {@link #beginRound(boolean)}.
+ * {@link #beginRound(boolean)}. Priority is the lexicographic
+ * {@code (state, zone_tier)} tuple per failover.md §2 -- state outranks zone
+ * so a known-good cross-zone host is picked before an untried local host.
  * <p>
  * Each method is internally synchronized, but pickNext + recordX is not atomic
  * across the pair. Callers must externally serialize a pick → record sequence
@@ -46,6 +48,19 @@ public final class QwpHostHealthTracker {
         TOPOLOGY_REJECT,
     }
 
+    /**
+     * Server-zone classification relative to the client's configured
+     * {@code zone=} value (failover.md §2). {@code SAME} ranks first,
+     * {@code UNKNOWN} second, {@code OTHER} last. When the client zone is
+     * unset or {@code target=primary}, every host's tier collapses to
+     * {@code SAME}, degenerating selection to state-only ordering.
+     */
+    public enum ZoneTier {
+        SAME,
+        UNKNOWN,
+        OTHER,
+    }
+
     private static final HostState[] PRIORITY_ORDER = {
             HostState.HEALTHY,
             HostState.UNKNOWN,
@@ -53,33 +68,90 @@ public final class QwpHostHealthTracker {
             HostState.TRANSPORT_ERROR,
             HostState.TOPOLOGY_REJECT,
     };
+    private static final ZoneTier[] ZONE_PRIORITY_ORDER = {
+            ZoneTier.SAME,
+            ZoneTier.UNKNOWN,
+            ZoneTier.OTHER,
+    };
 
     private final boolean[] attemptedThisRound;
+    // Configured client zone, lower-cased and trimmed at construction. Null
+    // when the user did not pass zone= -- in that case every host's tier is
+    // collapsed to SAME (zone-blind selection, identical to the pre-zone
+    // behaviour). Comparison against server-advertised zone_id is
+    // case-insensitive per failover.md §1.1.
+    private final String configuredZone;
     private final int hostCount;
     private final long[] lastSuccessEpoch;
     private final Object lock = new Object();
     private final HostState[] states;
+    // True when target=primary. Per failover.md §2, every host's zone tier
+    // collapses to SAME because writers must be followed across zones.
+    // recordZone is still called per the spec pseudocode but the tier never
+    // leaves SAME.
+    private final boolean targetPrimary;
+    private final ZoneTier[] zoneTiers;
     private long successEpoch;
 
+    /**
+     * Constructs a zone-blind tracker; equivalent to
+     * {@link #QwpHostHealthTracker(int, String, boolean)} with no client zone
+     * and {@code targetPrimary=false}.
+     */
     public QwpHostHealthTracker(int hostCount) {
+        this(hostCount, null, false);
+    }
+
+    /**
+     * @param hostCount     number of configured endpoints (must be &gt; 0).
+     * @param clientZone    client {@code zone=} value, opaque case-insensitive
+     *                      string (e.g. {@code eu-west-1a}). Null or empty
+     *                      collapses every host's zone tier to {@code SAME},
+     *                      matching the pre-zone selection behaviour.
+     * @param targetPrimary {@code true} when {@code target=primary}. Collapses
+     *                      every host's zone tier to {@code SAME} regardless
+     *                      of {@code clientZone}; writers must be followed
+     *                      across zones (failover.md §2).
+     */
+    public QwpHostHealthTracker(int hostCount, String clientZone, boolean targetPrimary) {
         if (hostCount <= 0) {
             throw new IllegalArgumentException("hostCount must be > 0");
         }
         this.hostCount = hostCount;
+        this.targetPrimary = targetPrimary;
+        if (clientZone != null) {
+            String trimmed = clientZone.trim();
+            this.configuredZone = trimmed.isEmpty() ? null : trimmed;
+        } else {
+            this.configuredZone = null;
+        }
         this.states = new HostState[hostCount];
         this.attemptedThisRound = new boolean[hostCount];
         this.lastSuccessEpoch = new long[hostCount];
+        this.zoneTiers = new ZoneTier[hostCount];
+        // When no zone preference is in effect, default every host to SAME so
+        // selection degenerates to state-only ordering. Otherwise start at
+        // UNKNOWN: the tier flips to SAME or OTHER the first time a zone is
+        // observed via recordZone.
+        ZoneTier initialTier = (configuredZone == null || targetPrimary) ? ZoneTier.SAME : ZoneTier.UNKNOWN;
         for (int i = 0; i < hostCount; i++) {
             states[i] = HostState.UNKNOWN;
+            zoneTiers[i] = initialTier;
         }
     }
 
     /**
      * Resets attempted flags. With {@code forgetClassifications}, every host
-     * except the most-recently-successful {@link HostState#HEALTHY} entry is
+     * except the most-recently-successful {@code (HEALTHY, SAME)} entry is
      * reset to {@link HostState#UNKNOWN}; the sticky-Healthy keeps the last
-     * successful host first in line on the next round. Recency uses the
+     * same-zone successful host first in line on the next round. Cross-zone
+     * (zone tier {@code OTHER}) {@code HEALTHY} entries are reset to
+     * {@code UNKNOWN} rather than preserved -- a sticky pin in another zone
+     * would otherwise defeat same-zone preference. Recency uses the
      * {@code recordSuccess} epoch counter, not array order.
+     * <p>
+     * Per failover.md §2.1, {@code zone_tier} is NOT cleared by this method --
+     * once observed it persists across rounds.
      */
     public void beginRound(boolean forgetClassifications) {
         synchronized (lock) {
@@ -87,7 +159,9 @@ public final class QwpHostHealthTracker {
             if (forgetClassifications) {
                 long bestEpoch = -1L;
                 for (int i = 0; i < hostCount; i++) {
-                    if (states[i] == HostState.HEALTHY && lastSuccessEpoch[i] > bestEpoch) {
+                    if (states[i] == HostState.HEALTHY
+                            && zoneTiers[i] == ZoneTier.SAME
+                            && lastSuccessEpoch[i] > bestEpoch) {
                         bestEpoch = lastSuccessEpoch[i];
                         stickyIndex = i;
                     }
@@ -112,6 +186,12 @@ public final class QwpHostHealthTracker {
         }
     }
 
+    public ZoneTier getZoneTier(int idx) {
+        synchronized (lock) {
+            return zoneTiers[idx];
+        }
+    }
+
     public boolean isRoundExhausted() {
         synchronized (lock) {
             for (int i = 0; i < hostCount; i++) {
@@ -125,16 +205,23 @@ public final class QwpHostHealthTracker {
 
     /**
      * Returns the highest-priority host not yet attempted this round, or -1
-     * when the round is exhausted. The caller is expected to be externally
-     * serialized (see class doc): the returned index is intended to be paired
-     * with a follow-up {@code recordX(idx)} on the same logical thread.
+     * when the round is exhausted. Priority is the lexicographic
+     * {@code (state, zone_tier)} tuple: state outranks zone, so a known-good
+     * cross-zone host is picked before an untried local host. Within a tied
+     * {@code (state, zone_tier)} bucket, the lowest array index wins.
+     * <p>
+     * The caller is expected to be externally serialized (see class doc): the
+     * returned index is intended to be paired with a follow-up
+     * {@code recordX(idx)} on the same logical thread.
      */
     public int pickNext() {
         synchronized (lock) {
             for (HostState p : PRIORITY_ORDER) {
-                for (int i = 0; i < hostCount; i++) {
-                    if (!attemptedThisRound[i] && states[i] == p) {
-                        return i;
+                for (ZoneTier z : ZONE_PRIORITY_ORDER) {
+                    for (int i = 0; i < hostCount; i++) {
+                        if (!attemptedThisRound[i] && states[i] == p && zoneTiers[i] == z) {
+                            return i;
+                        }
                     }
                 }
             }
@@ -147,7 +234,7 @@ public final class QwpHostHealthTracker {
      * prior state is anything other than {@link HostState#HEALTHY} so a single
      * hiccup does not erase an already-captured topology or transient reject.
      * <p>
-     * Per failover spec §2.1, this MUST NOT touch the round's attempted bit —
+     * Per failover spec §2.1, this MUST NOT touch the round's attempted bit --
      * that flag is owned by the round lifecycle (record* / beginRound) and
      * reflects whether the loop has tried this host in the current round, which
      * is independent of mid-stream demotion. After the demote the host stays
@@ -181,6 +268,43 @@ public final class QwpHostHealthTracker {
         synchronized (lock) {
             states[idx] = HostState.TRANSPORT_ERROR;
             attemptedThisRound[idx] = true;
+        }
+    }
+
+    /**
+     * Records a server-advertised zone for the given host index per
+     * failover.md §2.1. Called once with {@code SERVER_INFO.zone_id} after a
+     * successful upgrade on a v2 connection (gated by {@code CAP_ZONE}), and
+     * once with the {@code X-QuestDB-Zone} HTTP header on a {@code 421}
+     * upgrade reject.
+     * <p>
+     * Update rules:
+     * <ul>
+     *   <li>{@code zoneId} null/empty (after trimming): no-op. The existing
+     *       zone tier is preserved so a missing header on a {@code 421} does
+     *       not erase a tier set by an earlier {@code SERVER_INFO}.</li>
+     *   <li>Client zone unset or {@code target=primary}: tier = {@code SAME}
+     *       regardless of {@code zoneId}.</li>
+     *   <li>Otherwise: tier = {@code SAME} when {@code zoneId} matches
+     *       {@code clientZone} case-insensitively, else {@code OTHER}.</li>
+     * </ul>
+     */
+    public void recordZone(int idx, String zoneId) {
+        if (zoneId == null) {
+            return;
+        }
+        String trimmed = zoneId.trim();
+        if (trimmed.isEmpty()) {
+            return;
+        }
+        synchronized (lock) {
+            if (configuredZone == null || targetPrimary) {
+                zoneTiers[idx] = ZoneTier.SAME;
+            } else if (trimmed.equalsIgnoreCase(configuredZone)) {
+                zoneTiers[idx] = ZoneTier.SAME;
+            } else {
+                zoneTiers[idx] = ZoneTier.OTHER;
+            }
         }
     }
 }

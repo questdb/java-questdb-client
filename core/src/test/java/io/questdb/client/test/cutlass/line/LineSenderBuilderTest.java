@@ -306,12 +306,6 @@ public class LineSenderBuilderTest {
     }
 
     @Test
-    public void testHttpTokenNotSupportedForTcp() throws Exception {
-        assertMemoryLeak(() -> assertThrows("HTTP token authentication is not supported for TCP protocol",
-                Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpToken("foo")));
-    }
-
-    @Test
     public void testHttpPathNotSupportedForTcp() throws Exception {
         assertMemoryLeak(() -> assertThrows("HTTP path is not supported for TCP protocol",
                 () -> Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpPath("/custom/path")));
@@ -321,6 +315,12 @@ public class LineSenderBuilderTest {
     public void testHttpSettingPathNotSupportedForTcp() throws Exception {
         assertMemoryLeak(() -> assertThrows("HTTP settings path is not supported for TCP protocol",
                 () -> Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpSettingPath("/custom/settings")));
+    }
+
+    @Test
+    public void testHttpTokenNotSupportedForTcp() throws Exception {
+        assertMemoryLeak(() -> assertThrows("HTTP token authentication is not supported for TCP protocol",
+                Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpToken("foo")));
     }
 
     @Test
@@ -456,6 +456,50 @@ public class LineSenderBuilderTest {
     public void testUsernamePasswordAuthNotSupportedForTcp() throws Exception {
         assertMemoryLeak(() -> assertThrows("username/password authentication is not supported for TCP protocol",
                 Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpUsernamePassword("foo", "bar")));
+    }
+
+    @Test
+    public void testZoneSilentlyAcceptedOnIngress() throws Exception {
+        // failover.md §1.1 / changelog 2026-05-08: zone= is egress-only effective.
+        // Ingress is zone-blind (pinned to v1) and silently accepts the key so
+        // the same connect string can be shared across ingress and egress
+        // clients without a per-startup WARN that would fire spuriously for a
+        // setting already working on its egress siblings. Exercise every
+        // ingress protocol -- HTTP/HTTPS, WebSocket, TCP, UDP -- and confirm
+        // the parser does not raise on the key. A connect-time failure is
+        // tolerated (these are unreachable test addresses) as long as the
+        // exception message does not point at zone= as the offender.
+        assertMemoryLeak(() -> {
+            // protocol_version is pinned on HTTP/HTTPS so fromConfig does not
+            // contact the server for auto-detection.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";zone=eu-west-1a;protocol_version=2;");
+            assertConfStrOk("https::addr=" + LOCALHOST + ";zone=eu-west-1a;tls_verify=unsafe_off;protocol_version=2;");
+            // UDP build is purely local; no I/O.
+            assertConfStrOk("udp::addr=" + LOCALHOST + ";zone=eu-west-1a;");
+            // WebSocket and TCP attempt synchronous connect at build time.
+            // Allow LineSenderException for connect failure but require the
+            // parser did not flag zone=.
+            assertConfStrAcceptsZoneKey("ws::addr=127.0.0.1:1;zone=eu-west-1a;");
+            assertConfStrAcceptsZoneKey("tcp::addr=127.0.0.1:1;zone=eu-west-1a;");
+            // Empty zone value is also accepted: the unknown-key fallthrough
+            // only rejects a malformed value, and an empty value after `=`
+            // is well-formed.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";zone=;protocol_version=2;");
+            // Mixed-case zone identifier is accepted verbatim by the ingress
+            // parser; case-insensitivity is the egress comparator's
+            // responsibility, not the parser's.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";zone=EU-West-1a;protocol_version=2;");
+        });
+    }
+
+    private static void assertConfStrAcceptsZoneKey(String conf) {
+        try {
+            Sender.fromConfig(conf).close();
+        } catch (LineSenderException e) {
+            if (e.getMessage().contains("zone")) {
+                fail("parser must not flag zone=, was: " + e.getMessage());
+            }
+        }
     }
 
     private static void assertConfStrError(String conf, String expectedError) {

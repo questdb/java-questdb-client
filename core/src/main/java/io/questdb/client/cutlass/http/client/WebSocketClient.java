@@ -76,6 +76,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int PARSE_NEED_MORE = -1;
     private static final int PARSE_OK = 1;
     private static final String QUESTDB_ROLE_HEADER_NAME = "X-QuestDB-Role:";
+    private static final String QUESTDB_ZONE_HEADER_NAME = "X-QuestDB-Zone:";
     private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
@@ -135,6 +136,12 @@ public abstract class WebSocketClient implements QuietCloseable {
     private boolean serverDurableAckEnabled;
     private int serverQwpVersion = 1;
     private String upgradeRejectRole;
+    // Server-advertised zone identifier from the most recent rejected upgrade,
+    // captured from the X-QuestDB-Zone response header on a 421. Null when the
+    // header was absent or empty. Per failover.md §5 servers SHOULD emit this
+    // on every 421 reject so a client can record the host's zone tier without
+    // a successful upgrade. Reset to null on every upgrade() invocation.
+    private String upgradeRejectZone;
     private int upgradeStatusCode;
     private boolean upgraded;
 
@@ -305,6 +312,17 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public String getUpgradeRejectRole() {
         return upgradeRejectRole;
+    }
+
+    /**
+     * Zone identifier from {@code X-QuestDB-Zone} on the most recent rejected
+     * upgrade, or null when the header was absent or empty (after trimming).
+     * Per {@code failover.md} §5 this is the upgrade-time companion to
+     * {@code SERVER_INFO.zone_id} so a client can classify a host's zone tier
+     * even when the upgrade did not succeed.
+     */
+    public String getUpgradeRejectZone() {
+        return upgradeRejectZone;
     }
 
     /**
@@ -524,6 +542,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             return; // Already upgraded
         }
         upgradeRejectRole = null;
+        upgradeRejectZone = null;
         upgradeStatusCode = 0;
 
         // Generate random key
@@ -670,6 +689,26 @@ public abstract class WebSocketClient implements QuietCloseable {
         while (lineStart >= 0 && lineStart + 2 + headerLen <= responseLen) {
             int hStart = lineStart + 2;
             if (response.regionMatches(true, hStart, QUESTDB_ROLE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = hStart + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                return value.isEmpty() ? null : value;
+            }
+            lineStart = response.indexOf("\r\n", hStart);
+        }
+        return null;
+    }
+
+    private static String extractZoneHeader(String response) {
+        int headerLen = QUESTDB_ZONE_HEADER_NAME.length();
+        int responseLen = response.length();
+        int lineStart = response.indexOf("\r\n");
+        while (lineStart >= 0 && lineStart + 2 + headerLen <= responseLen) {
+            int hStart = lineStart + 2;
+            if (response.regionMatches(true, hStart, QUESTDB_ZONE_HEADER_NAME, 0, headerLen)) {
                 int valueStart = hStart + headerLen;
                 int lineEnd = response.indexOf('\r', valueStart);
                 if (lineEnd < 0) {
@@ -1092,6 +1131,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             upgradeStatusCode = parseStatusCode(statusLine);
             if (upgradeStatusCode == 421) {
                 upgradeRejectRole = extractRoleHeader(response);
+                upgradeRejectZone = extractZoneHeader(response);
             }
             WebSocketUpgradeException ex = new WebSocketUpgradeException(
                     upgradeStatusCode, upgradeRejectRole, "WebSocket upgrade failed: ");

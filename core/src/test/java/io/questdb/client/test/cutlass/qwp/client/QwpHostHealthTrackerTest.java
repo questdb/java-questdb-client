@@ -194,4 +194,129 @@ public class QwpHostHealthTrackerTest {
         Assert.assertEquals(QwpHostHealthTracker.HostState.UNKNOWN, t.getState(2));
         Assert.assertEquals(0, t.pickNext());
     }
+
+    @Test
+    public void testZone_ConfiguredZoneUnsetCollapsesAllToSame() {
+        // Per failover.md §1.1: when client zone= is unset, every host's tier
+        // is SAME from construction time and recordZone() leaves it SAME
+        // regardless of the server-advertised zone.
+        QwpHostHealthTracker t = new QwpHostHealthTracker(3, null, false);
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(1));
+        t.recordZone(0, "eu-west-1a");
+        t.recordZone(1, "us-east-2");
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(1));
+    }
+
+    @Test
+    public void testZone_NullOrEmptyZoneIdIsNoop() {
+        // recordZone with null/empty preserves the existing tier (failover.md
+        // §2.1) so a missing X-QuestDB-Zone on a 421 reject does not erase a
+        // tier set by an earlier successful SERVER_INFO observation.
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2, "eu-west-1a", false);
+        t.recordZone(0, "eu-west-1a");
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+
+        t.recordZone(0, null);
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+        t.recordZone(0, "");
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+        t.recordZone(0, "   ");
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+    }
+
+    @Test
+    public void testZone_PersistsAcrossBeginRound() {
+        // Per failover.md §2.1, zone_tier is NOT cleared by BeginRound -- once
+        // observed it persists across rounds so observations don't have to be
+        // re-issued on every walk.
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2, "eu-west-1a", false);
+        t.recordZone(0, "eu-west-1a");
+        t.recordZone(1, "us-east-2");
+        t.recordSuccess(0);
+        t.recordTransportError(1);
+
+        t.beginRound(true);
+        // States may have been reset by the forget-classifications round, but
+        // zone tiers must persist.
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.OTHER, t.getZoneTier(1));
+    }
+
+    @Test
+    public void testZone_PrefersSameZoneWhenStateTied() {
+        // Two UNKNOWN hosts: same-zone (1) wins over cross-zone (0). State
+        // ties break by zone tier per failover.md §2.
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2, "eu-west-1a", false);
+        t.recordZone(0, "us-east-2");
+        t.recordZone(1, "eu-west-1a");
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.OTHER, t.getZoneTier(0));
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(1));
+        Assert.assertEquals(1, t.pickNext());
+    }
+
+    @Test
+    public void testZone_StateOutranksZoneTier() {
+        // Per failover.md §2.1: state outranks zone, so a known-good cross-zone
+        // host is picked before an untried local host (the alternative is to
+        // gamble on the unknown host versus accept a working connection
+        // already in hand).
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2, "eu-west-1a", false);
+        // Host 0: HEALTHY, OTHER (cross-zone). Host 1: UNKNOWN, SAME (local).
+        t.recordZone(0, "us-east-2");
+        t.recordSuccess(0);
+        t.recordZone(1, "eu-west-1a");
+        t.beginRound(false);   // clear attempted, keep classifications
+        Assert.assertEquals(0, t.pickNext());   // HEALTHY > UNKNOWN regardless of zone
+    }
+
+    @Test
+    public void testZone_StickyHealthyPreservesOnlySameZone() {
+        // Per failover.md §2.2: cross-zone HEALTHY entries are reset to
+        // UNKNOWN on beginRound(true). Only the most recent same-zone HEALTHY
+        // entry is preserved; otherwise a sticky pin in another zone would
+        // defeat same-zone preference.
+        QwpHostHealthTracker t = new QwpHostHealthTracker(3, "eu-west-1a", false);
+        t.recordZone(0, "us-east-2");
+        t.recordSuccess(0);            // HEALTHY, OTHER -- most recent
+        t.recordZone(1, "eu-west-1a");
+        t.recordSuccess(1);            // HEALTHY, SAME
+        t.recordZone(2, "us-east-2");
+        t.recordSuccess(2);            // HEALTHY, OTHER -- even more recent than 1
+
+        t.beginRound(true);
+
+        // Despite host 2 being the most recent overall HEALTHY, it's
+        // cross-zone and must be reset; host 1 (most recent same-zone HEALTHY)
+        // is the sticky-Healthy.
+        Assert.assertEquals(QwpHostHealthTracker.HostState.UNKNOWN, t.getState(0));
+        Assert.assertEquals(QwpHostHealthTracker.HostState.HEALTHY, t.getState(1));
+        Assert.assertEquals(QwpHostHealthTracker.HostState.UNKNOWN, t.getState(2));
+        Assert.assertEquals(1, t.pickNext());
+    }
+
+    @Test
+    public void testZone_TargetPrimaryCollapsesAllToSame() {
+        // Per failover.md §2: target=primary collapses every host's zone tier
+        // to SAME because the master must be followed across zones.
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2, "eu-west-1a", true);
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(1));
+        // Even after recording a mismatched zone, tier stays SAME.
+        t.recordZone(0, "us-east-2");
+        t.recordZone(1, "ap-south-1");
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(1));
+    }
+
+    @Test
+    public void testZone_ZoneIdComparisonIsCaseInsensitive() {
+        // failover.md §1.1: zone identifiers are opaque, case-insensitive.
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2, "EU-West-1a", false);
+        t.recordZone(0, "eu-WEST-1a");
+        t.recordZone(1, "us-east-2");
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
+        Assert.assertEquals(QwpHostHealthTracker.ZoneTier.OTHER, t.getZoneTier(1));
+    }
 }
