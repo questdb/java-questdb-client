@@ -132,9 +132,9 @@ public class QwpWebSocketSender implements Sender {
     private final Decimal256 currentDecimal256 = new Decimal256();
     // Encoder for QWP v1 messages
     private final QwpWebSocketEncoder encoder;
+    private final List<Endpoint> endpoints;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
-    private final List<Endpoint> endpoints;
     private final QwpHostHealthTracker hostTracker;
     private final int maxSchemasPerConnection;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
@@ -196,7 +196,6 @@ public class QwpWebSocketSender implements Sender {
     private int maxSentSchemaId = -1;
     // Track the highest symbol ID sent to server (for delta encoding)
     // Once sent over TCP, server is guaranteed to receive it (or connection dies)
-    private int maxSentSymbolId = -1;
     private int nextSchemaId;
     private boolean ownsCursorEngine;
     private long pendingBytes;
@@ -556,7 +555,7 @@ public class QwpWebSocketSender implements Sender {
      * @return unconnected sender
      */
     public static QwpWebSocketSender createForTesting(String host, int port) {
-        return createForTesting(host, port, (String) null);
+        return createForTesting(host, port, null);
     }
 
     public static QwpWebSocketSender createForTesting(String host, int port, String authorizationHeader) {
@@ -1222,8 +1221,7 @@ public class QwpWebSocketSender implements Sender {
      * Snapshot of drainers the foreground sender has dispatched. Useful
      * for monitoring orphan-drain progress without parsing logs.
      */
-    public ObjList<BackgroundDrainer>
-    getBackgroundDrainers() {
+    public ObjList<BackgroundDrainer> getBackgroundDrainers() {
         if (drainerPool == null) return new ObjList<>(0);
         return drainerPool.snapshot();
     }
@@ -1257,22 +1255,6 @@ public class QwpWebSocketSender implements Sender {
     public SenderError getLastTerminalError() {
         CursorWebSocketSendLoop l = cursorSendLoop;
         return l == null ? null : l.getLastTerminalServerError();
-    }
-
-    /**
-     * Test accessor: highest schema ID confirmed sent on the current connection.
-     */
-    @TestOnly
-    public int getMaxSentSchemaIdForTest() {
-        return maxSentSchemaId;
-    }
-
-    /**
-     * Test accessor: highest symbol ID confirmed sent on the current connection.
-     */
-    @TestOnly
-    public int getMaxSentSymbolIdForTest() {
-        return maxSentSymbolId;
     }
 
     /**
@@ -1520,6 +1502,17 @@ public class QwpWebSocketSender implements Sender {
             throw e;
         }
         return this;
+    }
+
+    /**
+     * Returns a {@link CursorWebSocketSendLoop.ReconnectFactory} that, on each
+     * call, performs the multi-endpoint walk and returns a freshly connected
+     * {@link WebSocketClient}. Each factory holds private "previously-bound
+     * endpoint" state for mid-stream-failure attribution; the host tracker
+     * itself is shared across factories.
+     */
+    public CursorWebSocketSendLoop.ReconnectFactory newReconnectFactory() {
+        return new ReconnectSupplier();
     }
 
     @Override
@@ -1848,6 +1841,10 @@ public class QwpWebSocketSender implements Sender {
         throw new LineSenderException("close failed: " + t.getMessage(), t);
     }
 
+    private static List<Endpoint> singleEndpoint(String host, int port) {
+        return Collections.singletonList(new Endpoint(host, port));
+    }
+
     private void atMicros(long timestampMicros) {
         // Add designated timestamp column (empty name for designated timestamp)
         // Use cached reference to avoid hashmap lookup per row
@@ -1866,26 +1863,6 @@ public class QwpWebSocketSender implements Sender {
         }
         cachedTimestampNanosColumn.addLong(timestampNanos);
         sendRow();
-    }
-
-    /**
-     * Returns a {@link CursorWebSocketSendLoop.ReconnectFactory} that, on each
-     * call, performs the multi-endpoint walk and returns a freshly connected
-     * {@link WebSocketClient}. Each factory holds private "previously-bound
-     * endpoint" state for mid-stream-failure attribution; the host tracker
-     * itself is shared across factories.
-     */
-    public CursorWebSocketSendLoop.ReconnectFactory newReconnectFactory() {
-        return new ReconnectSupplier();
-    }
-
-    private final class ReconnectSupplier implements CursorWebSocketSendLoop.ReconnectFactory {
-        private int previousIdx = -1;
-
-        @Override
-        public WebSocketClient reconnect() {
-            return buildAndConnect(this);
-        }
     }
 
     private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
@@ -1930,7 +1907,7 @@ public class QwpWebSocketSender implements Sender {
                     continue;
                 }
                 if (classified instanceof QwpAuthFailedException) {
-                    throw (QwpAuthFailedException) classified;
+                    throw classified;
                 }
                 hostTracker.recordTransportError(idx);
                 lastError = classified;
@@ -2062,6 +2039,11 @@ public class QwpWebSocketSender implements Sender {
             }
         }
         return tableCount;
+    }
+
+    private Endpoint currentEndpoint() {
+        int idx = currentEndpointIdx;
+        return idx < 0 ? null : endpoints.get(idx);
     }
 
     /**
@@ -2329,7 +2311,6 @@ public class QwpWebSocketSender implements Sender {
         // If sealAndSwapBuffer() threw, these remain unchanged so the
         // next batch's delta dictionary will correctly re-include the
         // symbols and schema that the server never received.
-        maxSentSymbolId = currentBatchMaxSymbolId;
         maxSentSchemaId = batchMaxSchemaId;
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
@@ -2354,10 +2335,6 @@ public class QwpWebSocketSender implements Sender {
         return pendingBytes;
     }
 
-    private boolean recordConnectionFailure(LineSenderException error) {
-        return connectionError.compareAndSet(null, error);
-    }
-
     private void resetSchemaStateForNewConnection() {
         maxSentSchemaId = -1;
         nextSchemaId = 0;
@@ -2369,7 +2346,6 @@ public class QwpWebSocketSender implements Sender {
         // server's confirmed max, leaving column refs into a dictionary the
         // new server has never seen. Reset both so the next batch ships a
         // delta starting at id 0 covering every referenced symbol.
-        maxSentSymbolId = -1;
         currentBatchMaxSymbolId = -1;
 
         ObjList<CharSequence> keys = tableBuffers.keys();
@@ -2526,15 +2502,6 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    private static List<Endpoint> singleEndpoint(String host, int port) {
-        return Collections.singletonList(new Endpoint(host, port));
-    }
-
-    private Endpoint currentEndpoint() {
-        int idx = currentEndpointIdx;
-        return idx < 0 ? null : endpoints.get(idx);
-    }
-
     public static final class Endpoint {
         public final String host;
         public final int port;
@@ -2542,6 +2509,15 @@ public class QwpWebSocketSender implements Sender {
         public Endpoint(String host, int port) {
             this.host = host;
             this.port = port;
+        }
+    }
+
+    private final class ReconnectSupplier implements CursorWebSocketSendLoop.ReconnectFactory {
+        private int previousIdx = -1;
+
+        @Override
+        public WebSocketClient reconnect() {
+            return buildAndConnect(this);
         }
     }
 }
