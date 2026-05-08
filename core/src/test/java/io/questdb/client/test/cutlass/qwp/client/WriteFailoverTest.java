@@ -269,7 +269,7 @@ public class WriteFailoverTest {
 
     @Test
     public void testAuthTimeoutBoundsHungUpgrade() throws Exception {
-        // Per spec §4.1, auth_timeout bounds each WebSocket upgrade. A
+        // Per spec, auth_timeout_ms bounds each WebSocket upgrade. A
         // server that accepts the TCP connection but never sends a 101
         // response should NOT burn the entire reconnect budget on a
         // single host — the upgrade times out per-host, the sender
@@ -312,11 +312,11 @@ public class WriteFailoverTest {
                     waitFor(() -> ack.totalBinary.get() >= 1, 5_000);
                 }
                 long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                // hangPort exhausts auth_timeout (500ms) then we move to
+                // hangPort exhausts auth_timeout_ms (500ms) then we move to
                 // goodPort and connect. Should be well under the legacy
                 // default-15s timeout; allow generous slack for CI.
                 Assert.assertTrue(
-                        "expected auth_timeout to bound the hang (~500ms) but elapsed=" + elapsedMs + "ms",
+                        "expected auth_timeout_ms to bound the hang (~500ms) but elapsed=" + elapsedMs + "ms",
                         elapsedMs < 5_000L);
             }
         } catch (IOException ignored) {

@@ -875,15 +875,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * constructor blocking on a fully unreachable cluster equals
          * {@code authTimeoutMillis × addresses}. WebSocket transport only.
          * <p>
-         * Mirrors the {@code auth_timeout} key from .NET QWP ingress
-         * spec §4.1.
+         * Mirrors the {@code auth_timeout_ms} connect-string key from the
+         * QWP spec.
          */
         public LineSenderBuilder authTimeoutMillis(int millis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("auth_timeout is only supported for WebSocket transport");
+                throw new LineSenderException("auth_timeout_ms is only supported for WebSocket transport");
             }
             if (millis <= 0) {
-                throw new LineSenderException("auth_timeout must be positive")
+                throw new LineSenderException("auth_timeout_ms must be positive")
                         .put(" [millis=").put(millis).put("]");
             }
             this.authTimeoutMillis = millis;
@@ -2473,14 +2473,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (Chars.equals("addr", sink)) {
                     pos = getValue(configurationString, pos, sink, "address");
-                    address(sink);
-                    if (ports.size() == hosts.size() - 1) {
-                        // not set
-                        port(protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT
-                                : protocol == PROTOCOL_UDP ? DEFAULT_UDP_PORT
-                                : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
-                                : DEFAULT_TCP_PORT);
-                    }
+                    parseAddrList(sink);
                 } else if (Chars.equals("user", sink)) {
                     // deprecated key: user, new key: username
                     pos = getValue(configurationString, pos, sink, "user");
@@ -2712,12 +2705,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "durable_ack_keepalive_interval_millis");
                     durableAckKeepaliveIntervalMillis(parseLongValue(sink, "durable_ack_keepalive_interval_millis"));
-                } else if (Chars.equals("auth_timeout", sink)) {
+                } else if (Chars.equals("auth_timeout_ms", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("auth_timeout is only supported for WebSocket transport");
+                        throw new LineSenderException("auth_timeout_ms is only supported for WebSocket transport");
                     }
-                    pos = getValue(configurationString, pos, sink, "auth_timeout");
-                    authTimeoutMillis(parseIntValue(sink, "auth_timeout"));
+                    pos = getValue(configurationString, pos, sink, "auth_timeout_ms");
+                    authTimeoutMillis(parseIntValue(sink, "auth_timeout_ms"));
                 } else if (Chars.equals("reconnect_max_duration_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
@@ -2833,6 +2826,40 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put("[protocol=").put(protocol).put("]");
             }
             protocol = PROTOCOL_HTTP;
+        }
+
+        /**
+         * Parses an {@code addr=} value as a comma-separated list of {@code host[:port]}
+         * entries and adds each entry to the host list, applying the protocol's default
+         * port when an entry omits one. The connect-string parser also accepts repeated
+         * {@code addr=} keys; the two forms accumulate. Empty entries (leading/trailing
+         * commas, or {@code ,,}) are rejected.
+         */
+        private void parseAddrList(StringSink value) {
+            if (Chars.isBlank(value)) {
+                // delegate to address() so the existing "address cannot be empty" message is preserved
+                address(value);
+                return;
+            }
+            int len = value.length();
+            int start = 0;
+            for (int i = 0; i <= len; i++) {
+                if (i == len || value.charAt(i) == ',') {
+                    if (i == start) {
+                        throw new LineSenderException("empty entry in addr list [value=")
+                                .put(value).put("]");
+                    }
+                    address(value.subSequence(start, i));
+                    if (ports.size() == hosts.size() - 1) {
+                        // entry did not include a port; fill in the protocol default
+                        port(protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT
+                                : protocol == PROTOCOL_UDP ? DEFAULT_UDP_PORT
+                                : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
+                                : DEFAULT_TCP_PORT);
+                    }
+                    start = i + 1;
+                }
+            }
         }
 
         private void tcp() {
