@@ -69,8 +69,6 @@ public class QwpQueryClientPostConnectGuardTest {
         assertRejects(c -> c.withFailoverMaxAttempts(3), "withFailoverMaxAttempts");
         // withFailoverMaxDuration
         assertRejects(c -> c.withFailoverMaxDuration(15_000L), "withFailoverMaxDuration");
-        // withLbStrategy
-        assertRejects(c -> c.withLbStrategy("first"), "withLbStrategy");
         // withAuthTimeout
         assertRejects(c -> c.withAuthTimeout(5_000L), "withAuthTimeout");
         // withInitialCredit

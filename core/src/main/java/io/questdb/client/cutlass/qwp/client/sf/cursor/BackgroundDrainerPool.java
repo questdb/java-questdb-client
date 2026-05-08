@@ -76,22 +76,16 @@ public final class BackgroundDrainerPool implements QuietCloseable {
 
     private final ExecutorService executor;
     private final CopyOnWriteArrayList<BackgroundDrainer> active = new CopyOnWriteArrayList<>();
-    private final int maxConcurrent;
 
     public BackgroundDrainerPool(int maxConcurrent) {
         if (maxConcurrent <= 0) {
             throw new IllegalArgumentException("maxConcurrent must be > 0: " + maxConcurrent);
         }
-        this.maxConcurrent = maxConcurrent;
         this.executor = Executors.newFixedThreadPool(maxConcurrent, r -> {
             Thread t = new Thread(r, "qdb-orphan-drainer");
             t.setDaemon(true);
             return t;
         });
-    }
-
-    public int maxConcurrent() {
-        return maxConcurrent;
     }
 
     /**

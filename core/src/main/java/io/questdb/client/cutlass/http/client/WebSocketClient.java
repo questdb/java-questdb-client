@@ -1115,8 +1115,18 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
 
-        // Extract X-QWP-Version (optional, defaults to 1 if absent)
+        // Extract X-QWP-Version (optional, defaults to 1 if absent).
+        // Reject a server-advertised version outside [1, qwpMaxVersion]: this
+        // is per-endpoint, not cluster-wide (a rolling upgrade can leave one
+        // node ahead of or behind its peers), so the connect loop classifies
+        // it as a transport error and walks to the next host. Throwing
+        // HttpClientException here lets QwpUpgradeFailures.classify() route
+        // it through the standard transient path; see failover.md §6.
         serverQwpVersion = extractQwpVersion(response);
+        if (serverQwpVersion < 1 || serverQwpVersion > qwpMaxVersion) {
+            throw new HttpClientException("WebSocket upgrade failed: server advertised unsupported QWP version ")
+                    .put(serverQwpVersion).put(" [client max=").put(qwpMaxVersion).put(']');
+        }
 
         // Extract X-QWP-Durable-Ack confirmation (optional, absent on servers
         // without primary replication or when the client did not opt in).

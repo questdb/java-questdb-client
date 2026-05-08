@@ -78,7 +78,7 @@ public class QwpInPlaceDecodeAliasingTest {
             int payloadCap = 256;
             long staging = Unsafe.malloc(payloadCap, MemoryTag.NATIVE_DEFAULT);
             QwpEgressIoThread io = new QwpEgressIoThread(null, /*bufferPoolSize=*/ 2,
-                    (status, message, isProtocol) -> {
+                    (status, message) -> {
                         // Terminal failures during this test would mean the
                         // decode itself rejected our frame -- fail loudly.
                         throw new AssertionError("unexpected terminal failure during decode: " + message);

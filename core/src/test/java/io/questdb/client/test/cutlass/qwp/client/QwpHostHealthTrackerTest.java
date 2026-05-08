@@ -99,14 +99,30 @@ public class QwpHostHealthTrackerTest {
     }
 
     @Test
-    public void testMidStreamFailure_MarksAttempted() {
+    public void testMidStreamFailure_DoesNotTouchAttempted() {
+        // Spec failover.md §2.1: recordMidStreamFailure mutates classification
+        // only; the round's attempted bit belongs to the round lifecycle.
+        // After the demote the host stays pickable in the current round under
+        // TRANSPORT_ERROR priority.
         QwpHostHealthTracker t = new QwpHostHealthTracker(2);
-        t.recordSuccess(0);
-        t.beginRound(false);
+        t.recordSuccess(0);                 // state=HEALTHY, attempted=true
+        t.beginRound(false);                // attempted cleared, classifications preserved
+        Assert.assertEquals(QwpHostHealthTracker.HostState.HEALTHY, t.getState(0));
+        Assert.assertFalse(t.isRoundExhausted());
+
         t.recordMidStreamFailure(0);
+        Assert.assertEquals(QwpHostHealthTracker.HostState.TRANSPORT_ERROR, t.getState(0));
+        Assert.assertFalse(t.isRoundExhausted());
+
+        // Host 1 (UNKNOWN) outranks host 0 (TRANSPORT_ERROR), so pickNext
+        // returns 1 first. Host 0 is still pickable afterwards because
+        // recordMidStreamFailure left attempted[0]=false.
         Assert.assertEquals(1, t.pickNext());
         t.recordTransportError(1);
-        Assert.assertEquals(-1, t.pickNext());
+        Assert.assertFalse(t.isRoundExhausted());
+        Assert.assertEquals(0, t.pickNext());
+        t.recordTransportError(0);
+        Assert.assertTrue(t.isRoundExhausted());
     }
 
     @Test

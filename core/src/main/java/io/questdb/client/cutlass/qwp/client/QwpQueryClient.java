@@ -41,10 +41,8 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Collections;
 import java.util.List;
 import java.util.Random;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -102,8 +100,6 @@ public class QwpQueryClient implements QuietCloseable {
 
     public static final String DEFAULT_ENDPOINT_PATH = "/read/v1";
     public static final int DEFAULT_WS_PORT = 9000;
-    public static final String LB_STRATEGY_FIRST = "first";
-    public static final String LB_STRATEGY_RANDOM = "random";
     /**
      * Hard ceiling on {@link #withMaxBatchRows}. Matches the client decoder's
      * own {@code MAX_ROWS_PER_BATCH} safety cap so a user cannot ask for a
@@ -143,8 +139,6 @@ public class QwpQueryClient implements QuietCloseable {
     private static final long DEFAULT_FAILOVER_MAX_BACKOFF_MS = 1_000L;
     private static final long DEFAULT_FAILOVER_MAX_DURATION_MS = 30_000L;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
-    private static final String LB_FIRST = "first";
-    private static final String LB_RANDOM = "random";
     /**
      * How long {@link #connect()} waits to read the v2 {@code SERVER_INFO} frame
      * from each endpoint before giving up and moving to the next. 5 seconds is
@@ -236,7 +230,6 @@ public class QwpQueryClient implements QuietCloseable {
     private volatile QwpEgressIoThread ioThread;
     private volatile Thread ioThreadHandle;
     private boolean lastCloseTimedOut;
-    private String lbStrategy = LB_RANDOM;
     // Client preference for server-side per-batch row cap. 0 means "unset",
     // server uses its default. Set via {@code max_batch_rows=N} in the
     // connection string or {@link #withMaxBatchRows}. Smaller values give
@@ -361,7 +354,6 @@ public class QwpQueryClient implements QuietCloseable {
         Long failoverBackoffMaxMs = null;
         Long failoverMaxDurationMs = null;
         Long authTimeoutMs = null;
-        String lbStrategy = null;
         String auth = null;
         String username = null;
         String password = null;
@@ -452,13 +444,6 @@ public class QwpQueryClient implements QuietCloseable {
                     failoverMaxDurationMs = parsed;
                     break;
                 }
-                case "lb_strategy":
-                    if (!LB_RANDOM.equals(value) && !LB_FIRST.equals(value)) {
-                        throw new IllegalArgumentException(
-                                "invalid lb_strategy: " + value + " (expected random or first)");
-                    }
-                    lbStrategy = value;
-                    break;
                 case "auth_timeout_ms": {
                     long parsed;
                     try {
@@ -597,9 +582,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
         if (failoverMaxDurationMs != null) {
             client.withFailoverMaxDuration(failoverMaxDurationMs);
-        }
-        if (lbStrategy != null) {
-            client.withLbStrategy(lbStrategy);
         }
         if (authTimeoutMs != null) {
             client.withAuthTimeout(authTimeoutMs);
@@ -763,17 +745,12 @@ public class QwpQueryClient implements QuietCloseable {
         }
         lastCloseTimedOut = false;
         if (hostTracker == null) {
-            if (LB_RANDOM.equals(lbStrategy) && endpoints.size() > 1) {
-                List<Endpoint> shuffled = new ArrayList<>(endpoints);
-                Collections.shuffle(shuffled, ThreadLocalRandom.current());
-                endpoints.clear();
-                endpoints.addAll(shuffled);
-            }
             hostTracker = new QwpHostHealthTracker(endpoints.size());
         } else {
             hostTracker.beginRound(false);
         }
         QwpServerInfo lastObservedMismatch = null;
+        QwpIngressRoleRejectedException lastUpgradeRoleReject = null;
         boolean sawV1Mismatch = false;
         Throwable lastTransportError = null;
         while (true) {
@@ -789,6 +766,7 @@ public class QwpQueryClient implements QuietCloseable {
                 throw ae;
             } catch (QwpIngressRoleRejectedException re) {
                 lastTransportError = re;
+                lastUpgradeRoleReject = re;
                 hostTracker.recordRoleReject(i, re.isTransient());
                 LOG.info("QwpQueryClient {}:{} rejected upgrade with role={}; trying next",
                         ep.host, ep.port, re.getRole());
@@ -841,6 +819,22 @@ public class QwpQueryClient implements QuietCloseable {
                     "no endpoint matches target=" + target
                             + "; at least one endpoint negotiated v1 and cannot supply a role"
             );
+        }
+        if (lastUpgradeRoleReject != null) {
+            // 421 + X-QuestDB-Role on every host: the cluster answered with role
+            // information at upgrade time but no host satisfied target=. Surface
+            // QwpRoleMismatchException with the last role for diagnostics so
+            // callers can distinguish "no primary available" from "all unreachable"
+            // (failover.md §6 Topology / wire-egress.md §11.9.2).
+            QwpRoleMismatchException ex = new QwpRoleMismatchException(
+                    target,
+                    null,
+                    "no endpoint matches target=" + target
+                            + "; last observed role=" + lastUpgradeRoleReject.getRole()
+                            + " at " + lastUpgradeRoleReject.getHost() + ':' + lastUpgradeRoleReject.getPort()
+            );
+            ex.initCause(lastUpgradeRoleReject);
+            throw ex;
         }
         throw new HttpClientException(
                 "all QWP endpoints unreachable [count=" + endpoints.size()
@@ -1019,10 +1013,6 @@ public class QwpQueryClient implements QuietCloseable {
         return failoverMaxDurationMs;
     }
 
-    public String getLbStrategyForTest() {
-        return lbStrategy;
-    }
-
     public int getNegotiatedQwpVersion() {
         return negotiatedQwpVersion;
     }
@@ -1196,23 +1186,6 @@ public class QwpQueryClient implements QuietCloseable {
             throw new IllegalArgumentException("failoverMaxDurationMs must be >= 0");
         }
         this.failoverMaxDurationMs = maxDurationMs;
-        return this;
-    }
-
-    /**
-     * Initial address-pick strategy: {@code "random"} (default) shuffles the
-     * endpoint list so N clients spread across N hosts; {@code "first"} keeps
-     * the connection-string order, useful for tests and primary-preferred
-     * topologies. Failover walks deterministically by tracker priority in
-     * either case.
-     */
-    public QwpQueryClient withLbStrategy(String strategy) {
-        checkPreConnect("withLbStrategy");
-        if (!LB_RANDOM.equals(strategy) && !LB_FIRST.equals(strategy)) {
-            throw new IllegalArgumentException(
-                    "lbStrategy must be \"random\" or \"first\", got " + strategy);
-        }
-        this.lbStrategy = strategy;
         return this;
     }
 
@@ -1631,11 +1604,7 @@ public class QwpQueryClient implements QuietCloseable {
         GenerationListener listener = currentGenerationListener;
         TerminalFailure tf = listener != null ? listener.get() : null;
         if (tf != null) {
-            if (tf.isProtocol) {
-                probe.onError(tf.status, tf.message);
-            } else {
-                probe.markTransportFailure(tf.status, tf.message);
-            }
+            probe.markTransportFailure(tf.status, tf.message);
             return;
         }
         bindValues.reset();
@@ -1681,9 +1650,6 @@ public class QwpQueryClient implements QuietCloseable {
                             return;
                         case QueryEvent.KIND_TRANSPORT_ERROR:
                             probe.markTransportFailure(ev.errorStatus, ev.errorMessage);
-                            return;
-                        case QueryEvent.KIND_PROTOCOL_ERROR:
-                            probe.onError(ev.errorStatus, ev.errorMessage);
                             return;
                         default:
                             probe.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind);
@@ -1869,14 +1835,9 @@ public class QwpQueryClient implements QuietCloseable {
      */
     @SuppressWarnings("unused")
     void recordTerminalFailure(byte status, String message) {
-        recordTerminalFailure(status, message, false);
-    }
-
-    @SuppressWarnings("unused")
-    void recordTerminalFailure(byte status, String message, boolean isProtocol) {
         GenerationListener listener = currentGenerationListener;
         if (listener != null) {
-            listener.onTerminalFailure(status, message, isProtocol);
+            listener.onTerminalFailure(status, message);
         }
     }
 
@@ -1976,11 +1937,11 @@ public class QwpQueryClient implements QuietCloseable {
         private volatile boolean orphaned;
 
         @Override
-        public void onTerminalFailure(byte status, String message, boolean isProtocol) {
+        public void onTerminalFailure(byte status, String message) {
             if (orphaned) {
                 return;
             }
-            target.compareAndSet(null, new TerminalFailure(status, message, isProtocol));
+            target.compareAndSet(null, new TerminalFailure(status, message));
         }
 
         TerminalFailure get() {
@@ -2045,14 +2006,12 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     private static final class TerminalFailure {
-        final boolean isProtocol;
         final String message;
         final byte status;
 
-        TerminalFailure(byte status, String message, boolean isProtocol) {
+        TerminalFailure(byte status, String message) {
             this.status = status;
             this.message = message;
-            this.isProtocol = isProtocol;
         }
     }
 }

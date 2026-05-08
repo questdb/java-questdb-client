@@ -60,7 +60,7 @@ public class QwpEgressIoThreadCloseRaceTest {
                 // and must leave freeBuffers empty + all buffers closed by
                 // the time both threads exit.
                 QwpEgressIoThread io = new QwpEgressIoThread(null, /*bufferPoolSize=*/ 2,
-                        (status, message, isProtocol) -> { /* unused */ });
+                        (status, message) -> { /* unused */ });
                 QwpBatchBuffer b0 = new QwpBatchBuffer(64);
                 QwpBatchBuffer b1 = new QwpBatchBuffer(64);
 

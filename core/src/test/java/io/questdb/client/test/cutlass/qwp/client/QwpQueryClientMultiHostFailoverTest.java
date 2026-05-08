@@ -48,7 +48,7 @@ public class QwpQueryClientMultiHostFailoverTest {
             auth.start();
 
             String cfg = "ws::addr=127.0.0.1:" + replica.port() + ",127.0.0.1:" + auth.port()
-                    + ";lb_strategy=first;auth_timeout_ms=2000;failover=off;target=any;";
+                    + ";auth_timeout_ms=2000;failover=off;target=any;";
             try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg)) {
                 try {
                     client.connect();
@@ -72,7 +72,7 @@ public class QwpQueryClientMultiHostFailoverTest {
             r2.start();
 
             String cfg = "ws::addr=127.0.0.1:" + r1.port() + ",127.0.0.1:" + r2.port()
-                    + ";lb_strategy=first;auth_timeout_ms=2000;failover=off;target=any;";
+                    + ";auth_timeout_ms=2000;failover=off;target=any;";
             try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg)) {
                 try {
                     client.connect();
@@ -99,7 +99,7 @@ public class QwpQueryClientMultiHostFailoverTest {
             String cfg = "ws::addr=127.0.0.1:" + r1.port()
                     + ",127.0.0.1:" + r2.port()
                     + ",127.0.0.1:" + r3.port()
-                    + ";lb_strategy=first;auth_timeout_ms=2000;failover=off;target=any;";
+                    + ";auth_timeout_ms=2000;failover=off;target=any;";
             try (QwpQueryClient client = QwpQueryClient.fromConfig(cfg)) {
                 try {
                     client.connect();

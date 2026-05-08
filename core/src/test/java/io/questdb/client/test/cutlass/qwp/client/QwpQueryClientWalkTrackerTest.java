@@ -25,7 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.http.client.HttpClientException;
-import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
+import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -90,7 +90,7 @@ public class QwpQueryClientWalkTrackerTest {
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 
             try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + port404 + ",localhost:" + portOk + ";lb_strategy=first;auth_timeout_ms=2000;")) {
+                    "ws::addr=localhost:" + port404 + ",localhost:" + portOk + ";auth_timeout_ms=2000;")) {
                 client.connect();
                 Assert.assertTrue("client must walk past 404", client.isConnected());
             }
@@ -116,7 +116,7 @@ public class QwpQueryClientWalkTrackerTest {
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 
             try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + port426 + ",localhost:" + portOk + ";lb_strategy=first;auth_timeout_ms=2000;")) {
+                    "ws::addr=localhost:" + port426 + ",localhost:" + portOk + ";auth_timeout_ms=2000;")) {
                 client.connect();
                 Assert.assertTrue("client must walk past 426 to the second host", client.isConnected());
             }
@@ -146,7 +146,7 @@ public class QwpQueryClientWalkTrackerTest {
             Assert.assertTrue(rep2.awaitStart(5, TimeUnit.SECONDS));
 
             try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + port1 + ",localhost:" + port2 + ";target=primary;lb_strategy=first;auth_timeout_ms=2000;")) {
+                    "ws::addr=localhost:" + port1 + ",localhost:" + port2 + ";target=primary;auth_timeout_ms=2000;")) {
                 try {
                     client.connect();
                     Assert.fail("expected QwpRoleMismatchException");
@@ -173,7 +173,7 @@ public class QwpQueryClientWalkTrackerTest {
         int port1 = BASE_PORT + 200;
         int port2 = BASE_PORT + 201;
         try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                "ws::addr=localhost:" + port1 + ",localhost:" + port2 + ";lb_strategy=first;auth_timeout_ms=300;")) {
+                "ws::addr=localhost:" + port1 + ",localhost:" + port2 + ";auth_timeout_ms=300;")) {
             try {
                 client.connect();
                 Assert.fail("expected HttpClientException on unreachable hosts");
@@ -199,11 +199,11 @@ public class QwpQueryClientWalkTrackerTest {
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 
             try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + port403 + ",localhost:" + portOk + ";lb_strategy=first;auth_timeout_ms=2000;")) {
+                    "ws::addr=localhost:" + port403 + ",localhost:" + portOk + ";auth_timeout_ms=2000;")) {
                 try {
                     client.connect();
-                    Assert.fail("expected WebSocketUpgradeException on 403");
-                } catch (WebSocketUpgradeException expected) {
+                    Assert.fail("expected QwpAuthFailedException on 403");
+                } catch (QwpAuthFailedException expected) {
                     Assert.assertEquals(403, expected.getStatusCode());
                 }
             }
@@ -232,11 +232,11 @@ public class QwpQueryClientWalkTrackerTest {
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 
             try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + port401 + ",localhost:" + portOk + ";lb_strategy=first;auth_timeout_ms=2000;")) {
+                    "ws::addr=localhost:" + port401 + ",localhost:" + portOk + ";auth_timeout_ms=2000;")) {
                 try {
                     client.connect();
-                    Assert.fail("expected WebSocketUpgradeException on 401");
-                } catch (WebSocketUpgradeException expected) {
+                    Assert.fail("expected QwpAuthFailedException on 401");
+                } catch (QwpAuthFailedException expected) {
                     Assert.assertEquals(401, expected.getStatusCode());
                 }
                 Assert.assertFalse("client must NOT be bound after terminal auth failure",
@@ -278,7 +278,7 @@ public class QwpQueryClientWalkTrackerTest {
             Assert.assertTrue(b.awaitStart(5, TimeUnit.SECONDS));
 
             try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + portA + ",localhost:" + portB + ";lb_strategy=first;auth_timeout_ms=2000;")) {
+                    "ws::addr=localhost:" + portA + ",localhost:" + portB + ";auth_timeout_ms=2000;")) {
                 // First connect: both REPLICA → role mismatch.
                 try {
                     client.connect();
@@ -315,7 +315,7 @@ public class QwpQueryClientWalkTrackerTest {
             Assert.assertTrue(prim.awaitStart(5, TimeUnit.SECONDS));
 
             try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + portReplica + ",localhost:" + portPrimary + ";lb_strategy=first;auth_timeout_ms=2000;")) {
+                    "ws::addr=localhost:" + portReplica + ",localhost:" + portPrimary + ";auth_timeout_ms=2000;")) {
                 client.connect();
                 Assert.assertTrue("client must be connected after walk", client.isConnected());
             }
@@ -337,7 +337,7 @@ public class QwpQueryClientWalkTrackerTest {
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 
             try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + portDead + ",localhost:" + portOk + ";lb_strategy=first;auth_timeout_ms=500;")) {
+                    "ws::addr=localhost:" + portDead + ",localhost:" + portOk + ";auth_timeout_ms=500;")) {
                 client.connect();
                 Assert.assertTrue("client must bind to second host", client.isConnected());
             }

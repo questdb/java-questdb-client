@@ -233,7 +233,7 @@ public class QwpResultBatchDecoderHardeningTest {
         AtomicReference<String> failure = new AtomicReference<>();
         TestUtils.assertMemoryLeak(() -> {
             QwpEgressIoThread io = new QwpEgressIoThread(null, /*bufferPoolSize=*/ 2,
-                    (status, message, isProtocol) -> failure.compareAndSet(null, message));
+                    (status, message) -> failure.compareAndSet(null, message));
             try {
                 int cap = 64;
                 long buf = Unsafe.malloc(cap, MemoryTag.NATIVE_DEFAULT);
@@ -464,7 +464,7 @@ public class QwpResultBatchDecoderHardeningTest {
         AtomicReference<String> failure = new AtomicReference<>();
         TestUtils.assertMemoryLeak(() -> {
             QwpEgressIoThread io = new QwpEgressIoThread(null, /*bufferPoolSize=*/ 2,
-                    (status, message, isProtocol) -> failure.compareAndSet(null, message));
+                    (status, message) -> failure.compareAndSet(null, message));
             try {
                 int cap = 64;
                 long buf = Unsafe.malloc(cap, MemoryTag.NATIVE_DEFAULT);
@@ -497,7 +497,7 @@ public class QwpResultBatchDecoderHardeningTest {
         AtomicReference<String> failure = new AtomicReference<>();
         TestUtils.assertMemoryLeak(() -> {
             QwpEgressIoThread io = new QwpEgressIoThread(null, /*bufferPoolSize=*/ 2,
-                    (status, message, isProtocol) -> failure.compareAndSet(null, message));
+                    (status, message) -> failure.compareAndSet(null, message));
             try {
                 int cap = 64;
                 long buf = Unsafe.malloc(cap, MemoryTag.NATIVE_DEFAULT);

@@ -214,7 +214,7 @@ public class QwpQueryClientFromConfigTest {
 
     @Test
     public void testAuthTimeoutMsZeroRejected() {
-        assertReject("ws::addr=db:9000;auth_timeout_ms=0;", "auth_timeout_ms must be >= 1");
+        assertReject("ws::addr=db:9000;auth_timeout_ms=0;", "auth_timeout_ms must be > 0");
     }
 
     @Test
@@ -499,27 +499,22 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testLbStrategyDefaultsToRandom() {
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;")) {
-            Assert.assertEquals(QwpQueryClient.LB_STRATEGY_RANDOM, c.getLbStrategyForTest());
-        }
+    public void testLbStrategyKeyRejectedAsUnknown() {
+        // lb_strategy was removed: cluster-level load balancing is the
+        // server's concern, not the client's. The connect-string parser
+        // must surface its absence as an unknown-key error rather than
+        // silently swallowing the value.
+        assertReject("ws::addr=db:9000;lb_strategy=first;",
+                "unknown configuration key: lb_strategy");
     }
 
     @Test
-    public void testLbStrategyFirstAccepted() {
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;lb_strategy=first;")) {
-            Assert.assertEquals(QwpQueryClient.LB_STRATEGY_FIRST, c.getLbStrategyForTest());
-        }
-    }
-
-    @Test
-    public void testLbStrategyFirstPreservesEndpointOrder() {
-        // With lb_strategy=first the parser must preserve the declared
-        // host order on the resulting client. Three distinct hosts make
-        // the assertion robust against accidental rotation by any single
-        // step.
+    public void testEndpointOrderPreserved() {
+        // The parser walks the declared host list in order and the client
+        // walks it in priority order. Three distinct hosts make the
+        // assertion robust against accidental rotation by any single step.
         try (QwpQueryClient c = QwpQueryClient.fromConfig(
-                "ws::addr=alpha:9000,bravo:9001,charlie:9002;lb_strategy=first;")) {
+                "ws::addr=alpha:9000,bravo:9001,charlie:9002;")) {
             Assert.assertEquals(3, c.getEndpointCountForTest());
             Assert.assertEquals("alpha", c.getEndpointHostForTest(0));
             Assert.assertEquals(9000, c.getEndpointPortForTest(0));
@@ -527,58 +522,6 @@ public class QwpQueryClientFromConfigTest {
             Assert.assertEquals(9001, c.getEndpointPortForTest(1));
             Assert.assertEquals("charlie", c.getEndpointHostForTest(2));
             Assert.assertEquals(9002, c.getEndpointPortForTest(2));
-        }
-    }
-
-    @Test
-    public void testLbStrategyInvalidValueRejected() {
-        assertReject("ws::addr=db:9000;lb_strategy=robin;",
-                "invalid lb_strategy: robin (expected random or first)");
-    }
-
-    @Test
-    public void testLbStrategyRandomAccepted() {
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;lb_strategy=random;")) {
-            Assert.assertEquals(QwpQueryClient.LB_STRATEGY_RANDOM, c.getLbStrategyForTest());
-        }
-    }
-
-    @Test
-    public void testLbStrategyRandomShuffleEventuallyReorders() {
-        // Statistical: with 8 distinct hosts, lb_strategy=random must
-        // produce at least one ordering that is NOT the declared order
-        // across a moderate number of trials. The probability of every
-        // trial producing the declared order is 1/8! per trial (~2.5e-5);
-        // 64 trials make a false positive ~1.6e-3 -- enough to keep the
-        // test from being a flake without blowing up the trial budget.
-        // 8 is a deliberate sweet spot: bigger than 2!=2 trials per pair
-        // can return identity order; smaller than the default endpoint
-        // pool a tester may bring.
-        String declared = "h0:9000,h1:9001,h2:9002,h3:9003,h4:9004,h5:9005,h6:9006,h7:9007";
-        boolean sawReorder = false;
-        for (int trial = 0; trial < 64 && !sawReorder; trial++) {
-            try (QwpQueryClient c = QwpQueryClient.fromConfig(
-                    "ws::addr=" + declared + ";lb_strategy=random;")) {
-                for (int i = 0; i < 8; i++) {
-                    if (!("h" + i).equals(c.getEndpointHostForTest(i))) {
-                        sawReorder = true;
-                        break;
-                    }
-                }
-            }
-        }
-        Assert.assertTrue("lb_strategy=random did not reorder over 64 trials -- shuffle is broken", sawReorder);
-    }
-
-    @Test
-    public void testLbStrategyRandomSingleEndpointNoOp() {
-        // With one endpoint, the shuffle is a no-op by definition. The
-        // explicit test pins that the parser does not, e.g., index off the
-        // end of a one-element list.
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=only:9000;lb_strategy=random;")) {
-            Assert.assertEquals(1, c.getEndpointCountForTest());
-            Assert.assertEquals("only", c.getEndpointHostForTest(0));
-            Assert.assertEquals(9000, c.getEndpointPortForTest(0));
         }
     }
 
@@ -812,22 +755,6 @@ public class QwpQueryClientFromConfigTest {
     public void testFailoverMaxDuration_NonNumericRejected() {
         assertReject("ws::addr=a:9000;failover_max_duration_ms=forever;",
                 "invalid failover_max_duration_ms: forever");
-    }
-
-    @Test
-    public void testLbStrategy_AcceptsRandom() {
-        assertParses("ws::addr=a:9000,b:9000;lb_strategy=random;");
-    }
-
-    @Test
-    public void testLbStrategy_AcceptsFirst() {
-        assertParses("ws::addr=a:9000,b:9000;lb_strategy=first;");
-    }
-
-    @Test
-    public void testLbStrategy_OtherRejected() {
-        assertReject("ws::addr=a:9000;lb_strategy=roundrobin;",
-                "invalid lb_strategy: roundrobin (expected random or first)");
     }
 
     @Test

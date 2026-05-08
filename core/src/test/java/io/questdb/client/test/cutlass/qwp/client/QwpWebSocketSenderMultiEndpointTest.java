@@ -55,7 +55,7 @@ public class QwpWebSocketSenderMultiEndpointTest {
             primary.start();
 
             String cfg = "ws::addr=127.0.0.1:" + replica.port() + ",127.0.0.1:" + primary.port()
-                    + ";lb_strategy=first;auth_timeout_ms=2000;";
+                    + ";auth_timeout_ms=2000;";
             try (Sender ignored = Sender.fromConfig(cfg)) {
                 Assert.assertEquals("primary should accept exactly one upgrade",
                         1, primary.upgradeCount.get());
@@ -73,7 +73,7 @@ public class QwpWebSocketSenderMultiEndpointTest {
             healthy.start();
 
             String cfg = "ws::addr=127.0.0.1:" + auth.port() + ",127.0.0.1:" + healthy.port()
-                    + ";lb_strategy=first;auth_timeout_ms=2000;";
+                    + ";auth_timeout_ms=2000;";
             try {
                 Sender.fromConfig(cfg).close();
                 Assert.fail("expected auth-fail to terminate connect across endpoints");
@@ -94,7 +94,7 @@ public class QwpWebSocketSenderMultiEndpointTest {
             r2.start();
 
             String cfg = "ws::addr=127.0.0.1:" + r1.port() + ",127.0.0.1:" + r2.port()
-                    + ";lb_strategy=first;auth_timeout_ms=2000;";
+                    + ";auth_timeout_ms=2000;";
             try {
                 Sender.fromConfig(cfg).close();
                 Assert.fail("expected connect to fail when all endpoints reject by role");

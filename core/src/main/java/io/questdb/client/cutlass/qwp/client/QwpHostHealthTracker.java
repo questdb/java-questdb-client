@@ -143,16 +143,22 @@ public final class QwpHostHealthTracker {
     }
 
     /**
-     * Demotes a previously-healthy host on send/receive failure and marks it
-     * attempted in the current round so a subsequent {@link #pickNext()}
-     * inside the same round does not pick it again.
+     * Demotes a previously-Healthy host on send/receive failure. No-op when the
+     * prior state is anything other than {@link HostState#HEALTHY} so a single
+     * hiccup does not erase an already-captured topology or transient reject.
+     * <p>
+     * Per failover spec §2.1, this MUST NOT touch the round's attempted bit —
+     * that flag is owned by the round lifecycle (record* / beginRound) and
+     * reflects whether the loop has tried this host in the current round, which
+     * is independent of mid-stream demotion. After the demote the host stays
+     * pickable in the current round, but at TRANSPORT_ERROR priority it will
+     * lose to any untried Healthy / Unknown / TransientReject peer.
      */
     public void recordMidStreamFailure(int idx) {
         synchronized (lock) {
             if (states[idx] == HostState.HEALTHY) {
                 states[idx] = HostState.TRANSPORT_ERROR;
             }
-            attemptedThisRound[idx] = true;
         }
     }
 
