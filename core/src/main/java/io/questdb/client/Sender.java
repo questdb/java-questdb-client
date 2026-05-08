@@ -62,7 +62,9 @@ import java.nio.charset.StandardCharsets;
 import java.security.PrivateKey;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -512,6 +514,43 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Builder class to construct a new instance of a Sender.
+     * <br>
+     * Example usage for HTTP transport:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+     *  .address("localhost:9000")
+     *  .build()) {
+     *      sender.table(tableName).column("value", 42).atNow();
+     *      sender.flush();
+     *  }
+     * }</pre>
+     * <br>
+     * Example usage for HTTP transport and TLS:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+     *  .address("localhost:9000")
+     *  .enableTls()
+     *  .build()) {
+     *    sender.table(tableName).column("value", 42).atNow();
+     *    sender.flush();
+     *   }
+     * }</pre>
+     * <br>
+     * Example usage for TCP transport and TLS:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.TCP)
+     *  .address("localhost:9000")
+     *  .enableTls()
+     *  .build()) {
+     *    sender.table(tableName).column("value", 42).atNow();
+     *    sender.flush();
+     *   }
+     * }</pre>
+     *
+     * @see Sender#fromConfig(CharSequence) for creating a Sender directly from a configuration String
+     */
+    /**
      * Durability contract for the store-and-forward write path. Selects when
      * the SF segment file is fsynced; trades latency / throughput for
      * crash-survival of unacked frames.
@@ -562,43 +601,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         ASYNC
     }
 
-    /**
-     * Builder class to construct a new instance of a Sender.
-     * <br>
-     * Example usage for HTTP transport:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-     *  .address("localhost:9000")
-     *  .build()) {
-     *      sender.table(tableName).column("value", 42).atNow();
-     *      sender.flush();
-     *  }
-     * }</pre>
-     * <br>
-     * Example usage for HTTP transport and TLS:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-     *  .address("localhost:9000")
-     *  .enableTls()
-     *  .build()) {
-     *    sender.table(tableName).column("value", 42).atNow();
-     *    sender.flush();
-     *   }
-     * }</pre>
-     * <br>
-     * Example usage for TCP transport and TLS:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.TCP)
-     *  .address("localhost:9000")
-     *  .enableTls()
-     *  .build()) {
-     *    sender.table(tableName).column("value", 42).atNow();
-     *    sender.flush();
-     *   }
-     * }</pre>
-     *
-     * @see Sender#fromConfig(CharSequence) for creating a Sender directly from a configuration String
-     */
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
@@ -625,16 +627,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // We want to fail-fast even when an explicitly configured options happens to be same value as the default value,
         // because this still indicates a user error and silently ignoring it could lead to hard-to-debug issues.
         private static final int PARAMETER_NOT_SET_EXPLICITLY = -1;
+        private static final int PORT_NOT_SET = -1;
         private static final int PROTOCOL_HTTP = 1;
         private static final int PROTOCOL_TCP = 0;
         private static final int PROTOCOL_UDP = 3;
         private static final int PROTOCOL_WEBSOCKET = 2;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
-        // Per-host upgrade timeout for ws:: / wss:: senders (.NET spec §4.1).
-        // Default 15s; bounds each WebSocket handshake. Worst-case construct
-        // time on a fully unreachable cluster = authTimeoutMillis × addresses.
-        private int authTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
@@ -733,7 +732,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // build() time. 0 or negative is a documented "disable" value, so
         // a Long.MIN_VALUE sentinel keeps it distinguishable from "unset".
         private static final long DURABLE_ACK_KEEPALIVE_NOT_SET = Long.MIN_VALUE;
+        private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
+        private boolean gorillaEnabled = true;
         // Drives the initial-connect strategy. OFF is fail-fast (default).
         // SYNC retries on the user thread up to the reconnect cap. ASYNC
         // returns immediately and lets the I/O thread retry in the
@@ -809,32 +810,83 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 hostSansPort = address.toString();
             }
 
-            // best effort dup detection, we might have incomplete information at this point,
-            // for example port or protocol might not be configured yet. so we are conservative
-            // and only detect dups when we have full information about the address
             if (parsedPort != -1) {
-                // we have a port, so we can do a full dup check
                 for (int i = 0, n = hosts.size(); i < n; i++) {
                     String storedHost = hosts.get(i);
                     if (Chars.equals(storedHost, hostSansPort)) {
-                        // given host is already configured, let's see if the port is the same
-                        if (ports.size() > i) {
-                            // ok, the previous address had a port explicitly configured, let's see if it's the same
-                            if (ports.getQuick(i) == parsedPort) {
-                                throw new LineSenderException("duplicated addresses are not allowed ")
-                                        .put("[address=").put(address).put("]");
-                            }
+                        if (ports.size() > i && ports.getQuick(i) == parsedPort) {
+                            throw new LineSenderException("duplicated addresses are not allowed ")
+                                    .put("[address=").put(address).put("]");
                         }
                     }
                 }
-
-            }
-            this.hosts.add(hostSansPort);
-            if (parsedPort != -1) {
-                // port was specified in the address, so we use it
+                while (ports.size() < hosts.size()) {
+                    ports.add(PORT_NOT_SET);
+                }
+                this.hosts.add(hostSansPort);
                 this.ports.add(parsedPort);
+            } else {
+                this.hosts.add(hostSansPort);
             }
             return this;
+        }
+
+        private void addAddressEntry(CharSequence src, int start, int end, int defaultPort) {
+            int colon = Chars.indexOf(src, start, end, ':');
+            if (colon == end - 1) {
+                throw new LineSenderException("invalid address, use IPv4 address or a domain name [address=")
+                        .put(src.subSequence(start, end)).put("]");
+            }
+            int hostEnd = colon < 0 ? end : colon;
+            int portStart = colon < 0 ? end : colon + 1;
+            while (hostEnd > start && Character.isWhitespace(src.charAt(hostEnd - 1))) hostEnd--;
+            while (portStart < end && Character.isWhitespace(src.charAt(portStart))) portStart++;
+            int parsedPort = -1;
+            if (colon >= 0) {
+                try {
+                    parsedPort = Numbers.parseInt(src, portStart, end);
+                    if (parsedPort < 1 || parsedPort > 65535) {
+                        throw new LineSenderException("invalid port [port=").put(parsedPort).put("]");
+                    }
+                } catch (NumericException e) {
+                    throw new LineSenderException("cannot parse a port from the address, use IPv4 address or a domain name")
+                            .put(" [address=").put(src.subSequence(start, end)).put("]");
+                }
+            }
+            if (hostEnd == start) {
+                throw new LineSenderException("empty host in addr entry [address=")
+                        .put(src.subSequence(start, end)).put("]");
+            }
+            int effectivePort = parsedPort != -1 ? parsedPort : defaultPort;
+            for (int i = 0, n = hosts.size(); i < n; i++) {
+                String storedHost = hosts.get(i);
+                if (charsEqualsRange(storedHost, src, start, hostEnd)) {
+                    int storedEffectivePort = ports.size() > i && ports.getQuick(i) != PORT_NOT_SET
+                            ? ports.getQuick(i) : defaultPort;
+                    if (storedEffectivePort == effectivePort) {
+                        throw new LineSenderException("duplicated addresses are not allowed [address=")
+                                .put(src.subSequence(start, end)).put("]");
+                    }
+                }
+            }
+            while (ports.size() < hosts.size()) {
+                ports.add(PORT_NOT_SET);
+            }
+            hosts.add(src.subSequence(start, hostEnd).toString());
+            ports.add(parsedPort != -1 ? parsedPort : PORT_NOT_SET);
+        }
+
+        private static boolean charsEqualsRange(CharSequence a, CharSequence b, int bStart, int bEnd) {
+            int len = bEnd - bStart;
+            if (a.length() != len) {
+                return false;
+            }
+            for (int i = 0; i < len; i++) {
+                if (a.charAt(i) != b.charAt(bStart + i)) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         /**
@@ -865,28 +917,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          */
         @Deprecated
         public LineSenderBuilder asyncMode(boolean enabled) {
-            return this;
-        }
-
-        /**
-         * Per-host WebSocket upgrade timeout (ms). Bounds each
-         * {@code /write/v4} handshake so a single hung host can't burn
-         * the entire reconnect budget. Default 15s. Worst-case
-         * constructor blocking on a fully unreachable cluster equals
-         * {@code authTimeoutMillis × addresses}. WebSocket transport only.
-         * <p>
-         * Mirrors the {@code auth_timeout_ms} connect-string key from the
-         * QWP spec.
-         */
-        public LineSenderBuilder authTimeoutMillis(int millis) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("auth_timeout_ms is only supported for WebSocket transport");
-            }
-            if (millis <= 0) {
-                throw new LineSenderException("auth_timeout_ms must be positive")
-                        .put(" [millis=").put(millis).put("]");
-            }
-            this.authTimeoutMillis = millis;
             return this;
         }
 
@@ -1055,6 +1085,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
 
             if (protocol == PROTOCOL_WEBSOCKET) {
+                if (hosts.size() < 1) {
+                    throw new LineSenderException("WebSocket transport requires at least one host:port pair");
+                }
+
                 int actualAutoFlushRows = autoFlushRows == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_ROWS : autoFlushRows;
                 int actualAutoFlushBytes = autoFlushBytes == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_WS_AUTO_FLUSH_BYTES : autoFlushBytes;
                 long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
@@ -1086,19 +1120,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (actualInFlightWindowSize <= 1) {
                     throw new LineSenderException(
                             "WebSocket transport requires async mode (in_flight_window > 1)");
-                }
-                // .NET spec §3.5: initial_connect_retry on/sync/async requires
-                // sf_dir. Memory-mode senders lose all in-flight rows on
-                // disconnect, so retrying through a long reconnect budget
-                // gives the user the misleading impression that data is
-                // safe; force them to opt into SF to get the durable
-                // semantics that match the retry behavior.
-                if (initialConnectMode != InitialConnectMode.OFF && sfDir == null) {
-                    throw new LineSenderException(
-                            "initial_connect_retry=" + initialConnectMode.name().toLowerCase()
-                                    + " requires sf_dir (memory-mode senders cannot durably "
-                                    + "retry across reconnects); set sf_dir=... or use "
-                                    + "initial_connect_retry=off");
                 }
                 if (sfDurability != SfDurability.MEMORY) {
                     throw new LineSenderException(
@@ -1136,9 +1157,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
                                 ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
                                 : durableAckKeepaliveIntervalMillis;
-                int actualAuthTimeoutMillis = authTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY
-                        ? QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MILLIS
-                        : authTimeoutMillis;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1172,11 +1190,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                         ? errorInboxCapacity
                         : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
+                List<QwpWebSocketSender.Endpoint> wsEndpoints =
+                        new ArrayList<>(hosts.size());
+                for (int i = 0, n = hosts.size(); i < n; i++) {
+                    wsEndpoints.add(new QwpWebSocketSender.Endpoint(hosts.getQuick(i), ports.getQuick(i)));
+                }
                 QwpWebSocketSender connected;
                 try {
                     connected = QwpWebSocketSender.connect(
-                            hosts,
-                            ports,
+                            wsEndpoints,
                             wsTlsConfig,
                             actualAutoFlushRows,
                             actualAutoFlushBytes,
@@ -1194,7 +1216,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             errorHandler,
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
-                            actualAuthTimeoutMillis
+                            authTimeoutMillis,
+                            gorillaEnabled
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -2011,6 +2034,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Per-endpoint timeout on the WebSocket upgrade response read. Default
+         * {@value QwpWebSocketSender#DEFAULT_AUTH_TIMEOUT_MS} ms.
+         */
+        public LineSenderBuilder authTimeoutMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException(
+                        "auth_timeout_ms is only supported for WebSocket transport");
+            }
+            if (millis <= 0L) {
+                throw new LineSenderException("auth_timeout_ms must be > 0: ").put(millis);
+            }
+            this.authTimeoutMillis = millis;
+            return this;
+        }
+
+        public LineSenderBuilder gorilla(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("gorilla is only supported for WebSocket transport");
+            }
+            this.gorillaEnabled = enabled;
+            return this;
+        }
+
+        /**
          * Per-outage cap on the cursor I/O loop's reconnect retry budget.
          * Once a wire failure occurs, the loop retries with exponential
          * backoff until either reconnect succeeds (timer resets) or this
@@ -2294,7 +2341,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // parseLong only takes a full CharSequence. The suffix-trimming
             // path is parser-time (called once per connect string), so a
             // tiny per-call substring allocation is acceptable.
-            CharSequence digits = end == len ? value : value.toString().substring(0, end);
+            CharSequence digits = end == len ? (CharSequence) value : value.toString().substring(0, end);
             try {
                 long n = Numbers.parseLong(digits);
                 // Overflow check on multiply.
@@ -2358,16 +2405,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (maximumBufferCapacity == PARAMETER_NOT_SET_EXPLICITLY) {
                 maximumBufferCapacity = protocol == PROTOCOL_HTTP ? DEFAULT_MAXIMUM_BUFFER_CAPACITY : bufferCapacity;
             }
-            if (ports.size() == 0) {
-                if (protocol == PROTOCOL_HTTP) {
-                    ports.add(DEFAULT_HTTP_PORT);
-                } else if (protocol == PROTOCOL_UDP) {
-                    ports.add(DEFAULT_UDP_PORT);
-                } else if (protocol == PROTOCOL_WEBSOCKET) {
-                    ports.add(DEFAULT_WEBSOCKET_PORT);
-                } else {
-                    ports.add(DEFAULT_TCP_PORT);
+            int defaultPort;
+            if (protocol == PROTOCOL_HTTP) {
+                defaultPort = DEFAULT_HTTP_PORT;
+            } else if (protocol == PROTOCOL_UDP) {
+                defaultPort = DEFAULT_UDP_PORT;
+            } else if (protocol == PROTOCOL_WEBSOCKET) {
+                defaultPort = DEFAULT_WEBSOCKET_PORT;
+            } else {
+                defaultPort = DEFAULT_TCP_PORT;
+            }
+            int hostsCount = Math.max(hosts.size(), 1);
+            for (int i = 0, n = ports.size(); i < n; i++) {
+                if (ports.getQuick(i) == PORT_NOT_SET) {
+                    ports.set(i, defaultPort);
                 }
+            }
+            while (ports.size() < hostsCount) {
+                ports.add(defaultPort);
             }
             if (tlsValidationMode == null) {
                 tlsValidationMode = TlsValidationMode.DEFAULT;
@@ -2473,7 +2528,25 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (Chars.equals("addr", sink)) {
                     pos = getValue(configurationString, pos, sink, "address");
-                    parseAddrList(sink);
+                    int defaultPort = protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT
+                            : protocol == PROTOCOL_UDP ? DEFAULT_UDP_PORT
+                            : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
+                            : DEFAULT_TCP_PORT;
+                    int valLen = sink.length();
+                    int entryStart = 0;
+                    for (int i = 0; i <= valLen; i++) {
+                        if (i == valLen || sink.charAt(i) == ',') {
+                            int s = entryStart;
+                            int e = i;
+                            while (s < e && Character.isWhitespace(sink.charAt(s))) s++;
+                            while (e > s && Character.isWhitespace(sink.charAt(e - 1))) e--;
+                            if (s == e) {
+                                throw new LineSenderException("empty addr entry");
+                            }
+                            addAddressEntry(sink, s, e, defaultPort);
+                            entryStart = i + 1;
+                        }
+                    }
                 } else if (Chars.equals("user", sink)) {
                     // deprecated key: user, new key: username
                     pos = getValue(configurationString, pos, sink, "user");
@@ -2698,6 +2771,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "close_flush_timeout_millis");
                     closeFlushTimeoutMillis(parseLongValue(sink, "close_flush_timeout_millis"));
+                } else if (Chars.equals("auth_timeout_ms", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("auth_timeout_ms is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "auth_timeout_ms");
+                    authTimeoutMillis(parseLongValue(sink, "auth_timeout_ms"));
+                } else if (Chars.equals("gorilla", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("gorilla is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "gorilla");
+                    if (Chars.equals("on", sink) || Chars.equals("true", sink)) {
+                        gorilla(true);
+                    } else if (Chars.equals("off", sink) || Chars.equals("false", sink)) {
+                        gorilla(false);
+                    } else {
+                        throw new LineSenderException("invalid gorilla [value=").put(sink).put(", allowed=[on, off]]");
+                    }
                 } else if (Chars.equals("durable_ack_keepalive_interval_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException(
@@ -2705,12 +2796,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "durable_ack_keepalive_interval_millis");
                     durableAckKeepaliveIntervalMillis(parseLongValue(sink, "durable_ack_keepalive_interval_millis"));
-                } else if (Chars.equals("auth_timeout_ms", sink)) {
-                    if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("auth_timeout_ms is only supported for WebSocket transport");
-                    }
-                    pos = getValue(configurationString, pos, sink, "auth_timeout_ms");
-                    authTimeoutMillis(parseIntValue(sink, "auth_timeout_ms"));
                 } else if (Chars.equals("reconnect_max_duration_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
@@ -2828,40 +2913,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             protocol = PROTOCOL_HTTP;
         }
 
-        /**
-         * Parses an {@code addr=} value as a comma-separated list of {@code host[:port]}
-         * entries and adds each entry to the host list, applying the protocol's default
-         * port when an entry omits one. The connect-string parser also accepts repeated
-         * {@code addr=} keys; the two forms accumulate. Empty entries (leading/trailing
-         * commas, or {@code ,,}) are rejected.
-         */
-        private void parseAddrList(StringSink value) {
-            if (Chars.isBlank(value)) {
-                // delegate to address() so the existing "address cannot be empty" message is preserved
-                address(value);
-                return;
-            }
-            int len = value.length();
-            int start = 0;
-            for (int i = 0; i <= len; i++) {
-                if (i == len || value.charAt(i) == ',') {
-                    if (i == start) {
-                        throw new LineSenderException("empty entry in addr list [value=")
-                                .put(value).put("]");
-                    }
-                    address(value.subSequence(start, i));
-                    if (ports.size() == hosts.size() - 1) {
-                        // entry did not include a port; fill in the protocol default
-                        port(protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT
-                                : protocol == PROTOCOL_UDP ? DEFAULT_UDP_PORT
-                                : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
-                                : DEFAULT_TCP_PORT);
-                    }
-                    start = i + 1;
-                }
-            }
-        }
-
         private void tcp() {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
                 throw new LineSenderException("protocol was already configured ")
@@ -2884,6 +2935,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (hosts.size() != ports.size()) {
                 throw new LineSenderException("mismatch between number of hosts and number of ports");
+            }
+            for (int i = 0, n = hosts.size(); i < n; i++) {
+                String host = hosts.get(i);
+                int port = ports.getQuick(i);
+                for (int j = i + 1; j < n; j++) {
+                    if (ports.getQuick(j) == port && Chars.equals(host, hosts.get(j))) {
+                        throw new LineSenderException("duplicated addresses are not allowed [address=")
+                                .put(host).put(':').put(port).put("]");
+                    }
+                }
             }
             if (!tlsEnabled && trustStorePath != null) {
                 throw new LineSenderException("custom trust store configured, but TLS was not enabled ")

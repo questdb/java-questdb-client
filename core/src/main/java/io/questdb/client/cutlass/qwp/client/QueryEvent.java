@@ -44,6 +44,13 @@ public class QueryEvent {
      * having to reconstruct the classification from a side-channel latch.
      */
     public static final int KIND_TRANSPORT_ERROR = 4;
+    /**
+     * Permanent protocol-level disagreement (unsupported version, framing
+     * corruption that won't recover). {@code execute()} surfaces this directly
+     * instead of triggering failover -- version mismatch is cluster-wide and
+     * retrying against another endpoint masks the disagreement.
+     */
+    public static final int KIND_PROTOCOL_ERROR = 5;
 
     public QwpBatchBuffer buffer;     // valid for KIND_BATCH (must be released to pool by consumer)
     public String errorMessage;       // valid for KIND_ERROR
@@ -79,6 +86,14 @@ public class QueryEvent {
         this.buffer = null;
         this.opType = opType;
         this.rowsAffected = rowsAffected;
+        return this;
+    }
+
+    public QueryEvent asProtocolError(byte status, String message) {
+        this.kind = KIND_PROTOCOL_ERROR;
+        this.buffer = null;
+        this.errorStatus = status;
+        this.errorMessage = message;
         return this;
     }
 

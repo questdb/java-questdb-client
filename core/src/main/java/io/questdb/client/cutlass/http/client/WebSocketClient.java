@@ -134,10 +134,8 @@ public abstract class WebSocketClient implements QuietCloseable {
     // setQwpRequestDurableAck) is the early-fail signal.
     private boolean serverDurableAckEnabled;
     private int serverQwpVersion = 1;
-    // Set during upgrade response validation from the X-QuestDB-Role header
-    // on every server response (101 success and 421 role-mismatch alike).
-    // Null when the server omitted the header (legacy build or non-QWP path).
-    private String serverRole;
+    private String upgradeRejectRole;
+    private int upgradeStatusCode;
     private boolean upgraded;
 
     public WebSocketClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
@@ -302,14 +300,19 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Returns the server's replication role as advertised in the
-     * {@code X-QuestDB-Role} header during the upgrade handshake, or
-     * {@code null} when the server omitted the header. Possible values:
-     * {@code STANDALONE}, {@code PRIMARY}, {@code REPLICA},
-     * {@code PRIMARY_CATCHUP}, {@code UNKNOWN}.
+     * Role from {@code X-QuestDB-Role} on the most recent rejected upgrade,
+     * or null when no such header was present.
      */
-    public String getServerRole() {
-        return serverRole;
+    public String getUpgradeRejectRole() {
+        return upgradeRejectRole;
+    }
+
+    /**
+     * HTTP status code from the most recent rejected upgrade, or 0 if no
+     * upgrade rejection has been observed yet.
+     */
+    public int getUpgradeStatusCode() {
+        return upgradeStatusCode;
     }
 
     /**
@@ -520,6 +523,8 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (upgraded) {
             return; // Already upgraded
         }
+        upgradeRejectRole = null;
+        upgradeStatusCode = 0;
 
         // Generate random key
         byte[] keyBytes = new byte[16];
@@ -640,29 +645,32 @@ public abstract class WebSocketClient implements QuietCloseable {
         return false;
     }
 
-    private static int parseStatusCode(String response) {
-        // "HTTP/1.1 NNN ..." — find the first space, then read three ASCII digits.
-        int sp = response.indexOf(' ');
-        if (sp < 0 || sp + 4 > response.length()) {
-            return WebSocketUpgradeException.STATUS_NONE;
+    private static int parseStatusCode(String statusLine) {
+        int sp1 = statusLine.indexOf(' ');
+        if (sp1 < 0 || sp1 + 4 > statusLine.length()) return 0;
+        if (sp1 + 4 < statusLine.length()) {
+            char afterCode = statusLine.charAt(sp1 + 4);
+            if (afterCode != ' ' && afterCode != '\r' && afterCode != '\n') {
+                return 0;
+            }
         }
         int code = 0;
-        for (int i = sp + 1; i < sp + 4; i++) {
-            char c = response.charAt(i);
-            if (c < '0' || c > '9') {
-                return WebSocketUpgradeException.STATUS_NONE;
-            }
+        for (int i = sp1 + 1; i < sp1 + 4; i++) {
+            char c = statusLine.charAt(i);
+            if (c < '0' || c > '9') return 0;
             code = code * 10 + (c - '0');
         }
         return code;
     }
 
-    private static String extractServerRole(String response) {
+    private static String extractRoleHeader(String response) {
         int headerLen = QUESTDB_ROLE_HEADER_NAME.length();
         int responseLen = response.length();
-        for (int i = 0; i <= responseLen - headerLen; i++) {
-            if (response.regionMatches(true, i, QUESTDB_ROLE_HEADER_NAME, 0, headerLen)) {
-                int valueStart = i + headerLen;
+        int lineStart = response.indexOf("\r\n");
+        while (lineStart >= 0 && lineStart + 2 + headerLen <= responseLen) {
+            int hStart = lineStart + 2;
+            if (response.regionMatches(true, hStart, QUESTDB_ROLE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = hStart + headerLen;
                 int lineEnd = response.indexOf('\r', valueStart);
                 if (lineEnd < 0) {
                     lineEnd = responseLen;
@@ -670,6 +678,7 @@ public abstract class WebSocketClient implements QuietCloseable {
                 String value = response.substring(valueStart, lineEnd).trim();
                 return value.isEmpty() ? null : value;
             }
+            lineStart = response.indexOf("\r\n", hStart);
         }
         return null;
     }
@@ -1078,22 +1087,16 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
         String response = new String(responseBytes, StandardCharsets.US_ASCII);
 
-        // Parse the X-QuestDB-Role header off any response (101 success or
-        // 421 role-mismatch), so callers that walk a multi-host list can
-        // log/diagnose which role the unsuitable node reported.
-        serverRole = extractServerRole(response);
-
-        // Check status line. Parse the numeric status code so callers can
-        // distinguish a transient role-mismatch (421) from a terminal upgrade
-        // rejection (401, 403, 426) without sniffing the message text.
         if (!response.startsWith("HTTP/1.1 101")) {
-            int lineEnd = response.indexOf('\r');
-            String statusLine = lineEnd < 0 ? response : response.substring(0, lineEnd);
-            int statusCode = parseStatusCode(response);
-            throw new WebSocketUpgradeException(
-                    statusCode,
-                    serverRole,
-                    "WebSocket upgrade failed: " + statusLine);
+            String statusLine = response.split("\r\n")[0];
+            upgradeStatusCode = parseStatusCode(statusLine);
+            if (upgradeStatusCode == 421) {
+                upgradeRejectRole = extractRoleHeader(response);
+            }
+            WebSocketUpgradeException ex = new WebSocketUpgradeException(
+                    upgradeStatusCode, upgradeRejectRole, "WebSocket upgrade failed: ");
+            ex.put(statusLine);
+            throw ex;
         }
 
         // Verify Upgrade: websocket (case-insensitive value per RFC 6455 Section 4.1)

@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.client.QwpBatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpDecodeException;
 import io.questdb.client.cutlass.qwp.client.QwpEgressIoThread;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
+import io.questdb.client.cutlass.qwp.client.QwpProtocolVersionException;
 import io.questdb.client.cutlass.qwp.client.QwpResultBatchDecoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.MemoryTag;
@@ -103,6 +104,33 @@ public class QwpResultBatchDecoderHardeningTest {
                 // no exception => decoder accepts the well-formed wire bytes
             } finally {
                 Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    @Test
+    public void testUnsupportedVersionThrowsProtocolVersionException() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(128);
+            long staging = Unsafe.malloc(128, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int len = writeMinimalResultBatch(staging, 0L);
+                Unsafe.getUnsafe().putByte(staging + 4, (byte) 99);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must throw on unsupported version");
+                } catch (QwpProtocolVersionException expected) {
+                    Assert.assertTrue("error must reference unsupported version: " + expected.getMessage(),
+                            expected.getMessage().contains("unsupported version"));
+                    Assert.assertTrue("must extend QwpDecodeException",
+                            expected instanceof QwpDecodeException);
+                }
+            } finally {
+                Unsafe.free(staging, 128, MemoryTag.NATIVE_DEFAULT);
                 buffer.close();
                 decoder.close();
             }
@@ -205,7 +233,7 @@ public class QwpResultBatchDecoderHardeningTest {
         AtomicReference<String> failure = new AtomicReference<>();
         TestUtils.assertMemoryLeak(() -> {
             QwpEgressIoThread io = new QwpEgressIoThread(null, /*bufferPoolSize=*/ 2,
-                    (status, message) -> failure.compareAndSet(null, message));
+                    (status, message, isProtocol) -> failure.compareAndSet(null, message));
             try {
                 int cap = 64;
                 long buf = Unsafe.malloc(cap, MemoryTag.NATIVE_DEFAULT);
@@ -436,7 +464,7 @@ public class QwpResultBatchDecoderHardeningTest {
         AtomicReference<String> failure = new AtomicReference<>();
         TestUtils.assertMemoryLeak(() -> {
             QwpEgressIoThread io = new QwpEgressIoThread(null, /*bufferPoolSize=*/ 2,
-                    (status, message) -> failure.compareAndSet(null, message));
+                    (status, message, isProtocol) -> failure.compareAndSet(null, message));
             try {
                 int cap = 64;
                 long buf = Unsafe.malloc(cap, MemoryTag.NATIVE_DEFAULT);
@@ -469,7 +497,7 @@ public class QwpResultBatchDecoderHardeningTest {
         AtomicReference<String> failure = new AtomicReference<>();
         TestUtils.assertMemoryLeak(() -> {
             QwpEgressIoThread io = new QwpEgressIoThread(null, /*bufferPoolSize=*/ 2,
-                    (status, message) -> failure.compareAndSet(null, message));
+                    (status, message, isProtocol) -> failure.compareAndSet(null, message));
             try {
                 int cap = 64;
                 long buf = Unsafe.malloc(cap, MemoryTag.NATIVE_DEFAULT);
