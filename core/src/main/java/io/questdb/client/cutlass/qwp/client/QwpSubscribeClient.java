@@ -225,22 +225,35 @@ public class QwpSubscribeClient implements QuietCloseable {
     }
 
     /**
-     * Subscribes to {@code tableName} starting from the next-committed txn.
+     * Subscribes to {@code tableName} starting from the next-committed txn,
+     * using the default {@link QwpSubscribeMsgKind#FEED_DATA} feed.
      * Blocks until the server's SUBSCRIBE_ACK arrives (or the call times out
      * via {@code handshakeTimeoutMs}). Once this method returns, the handler
      * has already received {@link QwpSubscriptionHandler#onAck}.
      */
     public QwpSubscription subscribe(String tableName, QwpSubscriptionHandler handler) {
-        return subscribe(tableName, 0L, handler);
+        return subscribe(tableName, 0L, QwpSubscribeMsgKind.FEED_DATA, handler);
     }
 
     /**
-     * Subscribes to {@code tableName} starting from {@code startTxn}.
+     * Subscribes to {@code tableName} starting from {@code startTxn}, using
+     * the default {@link QwpSubscribeMsgKind#FEED_DATA} feed.
      * {@code startTxn=0} means tail-from-now; non-zero values request
      * resume-from-txn (server may reject with STALE if the underlying WAL
      * segment has been purged).
      */
     public QwpSubscription subscribe(String tableName, long startTxn, QwpSubscriptionHandler handler) {
+        return subscribe(tableName, startTxn, QwpSubscribeMsgKind.FEED_DATA, handler);
+    }
+
+    /**
+     * Subscribes to {@code tableName} with an explicit {@code feedKind}.
+     * The byte selects which {@code SubscriptionFeedFactory} the server
+     * uses; {@link QwpSubscribeMsgKind#FEED_DATA} is the built-in WAL
+     * row-data feed, and downstream extensions may register additional
+     * kinds (txn metadata, filtered queries, ...).
+     */
+    public QwpSubscription subscribe(String tableName, long startTxn, byte feedKind, QwpSubscriptionHandler handler) {
         if (!isConnected()) {
             throw new HttpClientException("not connected");
         }
@@ -255,7 +268,8 @@ public class QwpSubscribeClient implements QuietCloseable {
         subscriptions.put(subId, sub);
         sendSubscribeRequest(subId, tableName, startTxn,
                 initialCredit < 0 ? Long.MAX_VALUE : initialCredit,
-                maxBatchRows < 0 ? 0 : maxBatchRows);
+                maxBatchRows < 0 ? 0 : maxBatchRows,
+                feedKind);
         // Block until ack or end arrives for this subscription.
         long deadline = System.nanoTime() + (long) handshakeTimeoutMs * 1_000_000L;
         while (!sub.acked && sub.active) {
@@ -395,7 +409,7 @@ public class QwpSubscribeClient implements QuietCloseable {
         ws.sendBinary(scratchAddr, (int) (p - scratchAddr));
     }
 
-    private void sendSubscribeRequest(long subId, String tableName, long startTxn, long credit, int batchMaxRows) {
+    private void sendSubscribeRequest(long subId, String tableName, long startTxn, long credit, int batchMaxRows, byte feedKind) {
         byte[] tn = tableName.getBytes(StandardCharsets.UTF_8);
         if (tn.length > 0xFFFF) {
             throw new IllegalArgumentException("tableName too long");
@@ -413,7 +427,8 @@ public class QwpSubscribeClient implements QuietCloseable {
         p = encodeVarint(p, credit);
         Unsafe.getUnsafe().putInt(p, batchMaxRows);
         Unsafe.getUnsafe().putInt(p + 4, 0); // flags
-        p += 8;
+        Unsafe.getUnsafe().putByte(p + 8, feedKind);
+        p += 9;
         ws.sendBinary(scratchAddr, (int) (p - scratchAddr));
     }
 

@@ -35,9 +35,13 @@ package io.questdb.client.cutlass.qwp.client;
  * <ul>
  *   <li>{@link #SUBSCRIBE_REQUEST} (C-&gt;S): {@code msg_kind:u8,
  *       subscription_id:u64, table_name:u16_len+utf8, start_txn:varint,
- *       credit_bytes:varint, batch_max_rows:u32, flags:u32}.
+ *       credit_bytes:varint, batch_max_rows:u32, flags:u32, feed_kind:u8}.
  *       {@code start_txn=0} means tail-from-now; non-zero requests resume
- *       from an explicit sequencer txn (server may reject with STALE).</li>
+ *       from an explicit sequencer txn (server may reject with STALE).
+ *       {@code feed_kind} selects which feed factory the server uses:
+ *       {@link #FEED_DATA} is the built-in WAL row-data feed; downstream
+ *       extensions (txn metadata, filtered queries, ...) may register more
+ *       kinds without changing the wire format.</li>
  *   <li>{@link #SUBSCRIBE_ACK} (S-&gt;C): {@code msg_kind:u8,
  *       subscription_id:u64, start_txn:u64, schema_id:u32, schema_full:bytes}.
  *       Carries the resolved start_txn and the table's full schema.</li>
@@ -84,6 +88,12 @@ public final class QwpSubscribeMsgKind {
     public static final byte SUB_CANCEL = 0x1D;
     /** Client -&gt; server subscription credit replenishment. */
     public static final byte SUB_CREDIT = 0x1E;
+    /**
+     * Built-in feed kind: WAL row data delivered as one batch per committed
+     * sequencer txn (or per chunk for multi-chunk txns). Default selector
+     * for {@code feed_kind} on {@link #SUBSCRIBE_REQUEST}.
+     */
+    public static final byte FEED_DATA = 0x00;
 
     private QwpSubscribeMsgKind() {
     }
