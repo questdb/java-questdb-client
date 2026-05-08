@@ -45,7 +45,7 @@ public class QwpColumnBatchHandlerTest {
         QwpColumnBatchHandler handler = new MinimalHandler();
         // Both callable with arbitrary args including null without raising:
         handler.onFailoverReset(null);
-        handler.onFailoverReset(new QwpServerInfo((byte) 0, 0L, 0, 0L, "", ""));
+        handler.onFailoverReset(new QwpServerInfo((byte) 0, 0L, 0, 0L, "", "", null));
         handler.onExecDone((short) 0, 0L);
         handler.onExecDone((short) 1, 12345L);
         handler.onExecDone(Short.MAX_VALUE, Long.MAX_VALUE);

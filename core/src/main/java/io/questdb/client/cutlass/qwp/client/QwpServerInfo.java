@@ -37,6 +37,7 @@ public final class QwpServerInfo {
     private final String nodeId;
     private final byte role;
     private final long serverWallNs;
+    private final String zoneId;
 
     public QwpServerInfo(
             byte role,
@@ -44,7 +45,8 @@ public final class QwpServerInfo {
             int capabilities,
             long serverWallNs,
             String clusterId,
-            String nodeId
+            String nodeId,
+            String zoneId
     ) {
         this.role = role;
         this.epoch = epoch;
@@ -52,6 +54,7 @@ public final class QwpServerInfo {
         this.serverWallNs = serverWallNs;
         this.clusterId = clusterId;
         this.nodeId = nodeId;
+        this.zoneId = zoneId;
     }
 
     /**
@@ -99,12 +102,24 @@ public final class QwpServerInfo {
         return serverWallNs;
     }
 
+    /**
+     * Server-advertised zone identifier (e.g. {@code eu-west-1a}). {@code null}
+     * when the {@link QwpEgressMsgKind#CAP_ZONE} bit is unset on
+     * {@link #getCapabilities()}; a possibly-empty string otherwise. Clients
+     * that pass {@code zone=} on the connect string compare this case-insensitively
+     * against their configured zone to prefer same-zone endpoints.
+     */
+    public String getZoneId() {
+        return zoneId;
+    }
+
     @Override
     public String toString() {
         return "QwpServerInfo{role=" + roleName(role)
                 + ", epoch=" + epoch
                 + ", clusterId='" + clusterId + '\''
                 + ", nodeId='" + nodeId + '\''
+                + ", zoneId=" + (zoneId == null ? "null" : "'" + zoneId + '\'')
                 + ", capabilities=0x" + Integer.toHexString(capabilities)
                 + ", serverWallNs=" + serverWallNs
                 + '}';
