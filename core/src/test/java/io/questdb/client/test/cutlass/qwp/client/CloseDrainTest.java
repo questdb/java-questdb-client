@@ -33,6 +33,7 @@ import org.junit.Test;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -176,6 +177,78 @@ public class CloseDrainTest {
             Assert.assertTrue("close() exceeded the bounded timeout by too much: " + elapsedMs + "ms",
                     elapsedMs < timeoutMs * 4);
         }
+    }
+
+    @Test
+    public void testAsyncCloseDrainSucceedsWhenServerStartsDuringDrain() throws Exception {
+        int port = TEST_PORT + 5;
+        DelayingAckHandler handler = new DelayingAckHandler(0);
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            String cfg = "ws::addr=localhost:" + port
+                    + sfDirOpt()
+                    + ";initial_connect_retry=async"
+                    + ";reconnect_max_duration_millis=10000"
+                    + ";reconnect_initial_backoff_millis=20"
+                    + ";reconnect_max_backoff_millis=100"
+                    + ";close_flush_timeout_millis=5000;";
+
+            Sender sender = Sender.fromConfig(cfg);
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
+
+            Thread starter = new Thread(() -> {
+                try {
+                    Thread.sleep(150);
+                    server.start();
+                } catch (Exception ignored) {
+                }
+            }, "delayed-server-start");
+            starter.start();
+
+            long t0 = System.nanoTime();
+            sender.close();
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+
+            starter.join(5000);
+            Assert.assertTrue(server.awaitStart(2, TimeUnit.SECONDS));
+            Assert.assertTrue("close() took " + elapsedMs + "ms",
+                    elapsedMs < 4500);
+        }
+    }
+
+    @Test
+    public void testAsyncCloseDrainSucceedsWhenServerWasUpAllAlong() throws Exception {
+        int port = TEST_PORT + 6;
+        DelayingAckHandler handler = new DelayingAckHandler(0);
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            for (int i = 0; i < 20; i++) {
+                String cfg = "ws::addr=localhost:" + port
+                        + sfDirOpt()
+                        + ";initial_connect_retry=async"
+                        + ";reconnect_max_duration_millis=10000"
+                        + ";reconnect_initial_backoff_millis=20"
+                        + ";reconnect_max_backoff_millis=100"
+                        + ";close_flush_timeout_millis=3000;";
+                long t0 = System.nanoTime();
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    sender.table("foo").longColumn("v", (long) i).atNow();
+                    sender.flush();
+                }
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                Assert.assertTrue("iteration " + i + " close() took " + elapsedMs + "ms",
+                        elapsedMs < 2500);
+            }
+        }
+    }
+
+    private static String sfDirOpt() {
+        String dir = Paths.get(
+                System.getProperty("java.io.tmpdir"),
+                "qdb-close-drain-" + System.nanoTime()).toString();
+        return ";sf_dir=" + dir;
     }
 
     /** Acks every binary frame after a fixed delay, so we can observe close() blocking. */

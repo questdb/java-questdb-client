@@ -1902,7 +1902,7 @@ public class QwpWebSocketSender implements Sender {
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
         while (true) {
-            if (closed) {
+            if (cursorSendLoop == null ? closed : !cursorSendLoop.isRunning()) {
                 throw new LineSenderException("sender closed during connect");
             }
             int idx = hostTracker.pickNext();

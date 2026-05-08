@@ -405,6 +405,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return hasEverConnected;
     }
 
+    public boolean isRunning() {
+        return running;
+    }
+
     public long getTotalAcks() {
         return totalAcks.get();
     }
