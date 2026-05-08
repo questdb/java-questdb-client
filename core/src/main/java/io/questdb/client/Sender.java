@@ -608,7 +608,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
-        private static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128;
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
         private static final int DEFAULT_MAX_BACKOFF_MILLIS = 1_000;
         private static final int DEFAULT_MAX_DATAGRAM_SIZE = 1400;
@@ -642,7 +641,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpToken;
-        private int inFlightWindowSize = PARAMETER_NOT_SET_EXPLICITLY;
         private String keyId;
         private int maxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxDatagramSize = PARAMETER_NOT_SET_EXPLICITLY;
@@ -906,21 +904,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * @param enabled ignored
-         * @return this instance for method chaining
-         * @deprecated Async mode is now derived from {@link #inFlightWindowSize(int)}.
-         * Window size 1 implies synchronous mode, greater than 1 implies asynchronous mode.
-         * The default window size is 128 (asynchronous). Call {@code inFlightWindowSize(1)}
-         * for synchronous behavior.
-         * <br>
-         * This method is a no-op and will be removed in a future release.
-         */
-        @Deprecated
-        public LineSenderBuilder asyncMode(boolean enabled) {
-            return this;
-        }
-
-        /**
          * Set the maximum number of bytes per batch before auto-flushing.
          * <br>
          * This is only used when communicating over WebSocket transport.
@@ -1094,7 +1077,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
                         ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
                         : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
-                int actualInFlightWindowSize = inFlightWindowSize == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_IN_FLIGHT_WINDOW_SIZE : inFlightWindowSize;
                 int actualMaxSchemasPerConnection = maxSchemasPerConnection == PARAMETER_NOT_SET_EXPLICITLY
                         ? QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION : maxSchemasPerConnection;
 
@@ -1117,10 +1099,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // omitting it gives memory-only mode (same lock-free architecture,
                 // no disk involvement). sf_durability != memory is a planned
                 // feature; throw today instead of silently downgrading.
-                if (actualInFlightWindowSize <= 1) {
-                    throw new LineSenderException(
-                            "WebSocket transport requires async mode (in_flight_window > 1)");
-                }
                 if (sfDurability != SfDurability.MEMORY) {
                     throw new LineSenderException(
                             "sf_durability=" + sfDurability.name().toLowerCase()
@@ -1203,7 +1181,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualAutoFlushRows,
                             actualAutoFlushBytes,
                             actualAutoFlushIntervalNanos,
-                            actualInFlightWindowSize,
                             wsAuthHeader,
                             actualMaxSchemasPerConnection,
                             requestDurableAck,
@@ -1554,35 +1531,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             this.username = username;
             this.password = password;
-            return this;
-        }
-
-        /**
-         * Set the maximum number of batches that can be in-flight awaiting server acknowledgment.
-         * <br>
-         * This is only used when communicating over WebSocket transport.
-         * <br>
-         * A value of 1 means synchronous mode: each batch waits for an ACK before sending the next one.
-         * A value greater than 1 enables asynchronous mode with pipelined sends and a background I/O thread.
-         * <br>
-         * Default value is 128 (asynchronous).
-         *
-         * @param size maximum number of in-flight batches
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder inFlightWindowSize(int size) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("in-flight window size is only supported for WebSocket transport");
-            }
-            if (this.inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY) {
-                throw new LineSenderException("in-flight window size was already configured")
-                        .put("[size=").put(this.inFlightWindowSize).put("]");
-            }
-            if (size < 1) {
-                throw new LineSenderException("in-flight window size must be positive")
-                        .put("[size=").put(size).put("]");
-            }
-            this.inFlightWindowSize = size;
             return this;
         }
 
@@ -2709,13 +2657,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         int protocolVersion = parseIntValue(sink, "protocol_version");
                         protocolVersion(protocolVersion);
                     }
-                } else if (Chars.equals("in_flight_window", sink)) {
-                    if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("in_flight_window is only supported for WebSocket transport");
-                    }
-                    pos = getValue(configurationString, pos, sink, "in_flight_window");
-                    int windowSize = parseIntValue(sink, "in_flight_window");
-                    inFlightWindowSize(windowSize);
                 } else if (Chars.equals("request_durable_ack", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
@@ -3032,9 +2973,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (protocolVersion != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("protocol version is not supported for UDP transport");
-                }
-                if (inFlightWindowSize != PARAMETER_NOT_SET_EXPLICITLY) {
-                    throw new LineSenderException("in-flight window size is not supported for UDP transport");
                 }
                 if (httpPath != null) {
                     throw new LineSenderException("HTTP path is not supported for UDP transport");

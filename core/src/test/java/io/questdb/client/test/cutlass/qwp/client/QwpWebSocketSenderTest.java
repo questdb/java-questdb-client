@@ -427,8 +427,7 @@ public class QwpWebSocketSenderTest {
      */
     private QwpWebSocketSender createUnconnectedAsyncSender() {
         return QwpWebSocketSender.createForTesting("localhost", 9000,
-                500, 0, 0L,  // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
-                8);          // inFlightWindowSize
+                500, 0, 0L);  // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
     }
 
     /**
@@ -436,7 +435,7 @@ public class QwpWebSocketSenderTest {
      * For unit tests that don't need actual connectivity.
      */
     private QwpWebSocketSender createUnconnectedSender() {
-        return QwpWebSocketSender.createForTesting("localhost", 9000, 1);  // window=1 for sync
+        return QwpWebSocketSender.createForTesting("localhost", 9000);
     }
 
 }

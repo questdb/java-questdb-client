@@ -116,7 +116,6 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_AUTO_FLUSH_BYTES = 0;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
-    public static final int DEFAULT_IN_FLIGHT_WINDOW_SIZE = 128;
     public static final int DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
@@ -137,7 +136,6 @@ public class QwpWebSocketSender implements Sender {
     private final GlobalSymbolDictionary globalSymbolDictionary;
     private final List<Endpoint> endpoints;
     private final QwpHostHealthTracker hostTracker;
-    private final int inFlightWindowSize;
     private final int maxSchemasPerConnection;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
@@ -224,7 +222,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             String authorizationHeader,
             int maxSchemasPerConnection
     ) {
@@ -244,7 +241,6 @@ public class QwpWebSocketSender implements Sender {
         this.autoFlushRows = autoFlushRows;
         this.autoFlushBytes = autoFlushBytes;
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
-        this.inFlightWindowSize = inFlightWindowSize;
         this.maxSchemasPerConnection = maxSchemasPerConnection;
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
 
@@ -296,7 +292,7 @@ public class QwpWebSocketSender implements Sender {
             return connect(
                     host, port, tlsConfig,
                     DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                    DEFAULT_IN_FLIGHT_WINDOW_SIZE, null, DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                    null, DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
                     false, engine
             );
         } catch (Throwable t) {
@@ -321,14 +317,13 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             String authorizationHeader,
             int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection,
+                authorizationHeader, maxSchemasPerConnection,
                 requestDurableAck, cursorEngine, 5_000L);
     }
 
@@ -345,7 +340,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             String authorizationHeader,
             int maxSchemasPerConnection,
             boolean requestDurableAck,
@@ -353,7 +347,7 @@ public class QwpWebSocketSender implements Sender {
             long closeFlushTimeoutMillis
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                autoFlushIntervalNanos, authorizationHeader,
                 maxSchemasPerConnection, requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis,
                 CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
@@ -374,7 +368,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             String authorizationHeader,
             int maxSchemasPerConnection,
             boolean requestDurableAck,
@@ -385,7 +378,7 @@ public class QwpWebSocketSender implements Sender {
             long reconnectMaxBackoffMillis
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                autoFlushIntervalNanos, authorizationHeader,
                 maxSchemasPerConnection, requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
@@ -406,7 +399,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             String authorizationHeader,
             int maxSchemasPerConnection,
             boolean requestDurableAck,
@@ -418,7 +410,7 @@ public class QwpWebSocketSender implements Sender {
             Sender.InitialConnectMode initialConnectMode
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                autoFlushIntervalNanos, authorizationHeader,
                 maxSchemasPerConnection, requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
@@ -437,7 +429,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             String authorizationHeader,
             int maxSchemasPerConnection,
             boolean requestDurableAck,
@@ -451,7 +442,7 @@ public class QwpWebSocketSender implements Sender {
             int errorInboxCapacity
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, inFlightWindowSize, authorizationHeader,
+                autoFlushIntervalNanos, authorizationHeader,
                 maxSchemasPerConnection, requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
@@ -472,7 +463,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             String authorizationHeader,
             int maxSchemasPerConnection,
             boolean requestDurableAck,
@@ -489,7 +479,7 @@ public class QwpWebSocketSender implements Sender {
         return connect(
                 singleEndpoint(host, port), tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection,
+                authorizationHeader, maxSchemasPerConnection,
                 requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
@@ -507,7 +497,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             String authorizationHeader,
             int maxSchemasPerConnection,
             boolean requestDurableAck,
@@ -526,7 +515,7 @@ public class QwpWebSocketSender implements Sender {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, authorizationHeader, maxSchemasPerConnection
+                authorizationHeader, maxSchemasPerConnection
         );
         try {
             sender.requestDurableAck = requestDurableAck;
@@ -562,20 +551,19 @@ public class QwpWebSocketSender implements Sender {
      * This allows unit tests to test sender logic without requiring a real server.
      * Uses default auto-flush settings.
      *
-     * @param host               server host (not connected)
-     * @param port               server port (not connected)
-     * @param inFlightWindowSize max batches awaiting server ACK (must be > 1)
+     * @param host server host (not connected)
+     * @param port server port (not connected)
      * @return unconnected sender
      */
-    public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize) {
-        return createForTesting(host, port, inFlightWindowSize, null);
+    public static QwpWebSocketSender createForTesting(String host, int port) {
+        return createForTesting(host, port, (String) null);
     }
 
-    public static QwpWebSocketSender createForTesting(String host, int port, int inFlightWindowSize, String authorizationHeader) {
+    public static QwpWebSocketSender createForTesting(String host, int port, String authorizationHeader) {
         return new QwpWebSocketSender(
                 singleEndpoint(host, port), null,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                inFlightWindowSize, authorizationHeader, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
+                authorizationHeader, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
         );
     }
 
@@ -587,7 +575,6 @@ public class QwpWebSocketSender implements Sender {
      * @param autoFlushRows          rows per batch (0 = no limit)
      * @param autoFlushBytes         bytes per batch (0 = no limit)
      * @param autoFlushIntervalNanos age before flush in nanos (0 = no limit)
-     * @param inFlightWindowSize     max batches awaiting server ACK (must be > 1)
      * @return unconnected sender
      */
     public static QwpWebSocketSender createForTesting(
@@ -595,8 +582,7 @@ public class QwpWebSocketSender implements Sender {
             int port,
             int autoFlushRows,
             int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            int inFlightWindowSize
+            long autoFlushIntervalNanos
     ) {
         return createForTesting(
                 host,
@@ -604,7 +590,6 @@ public class QwpWebSocketSender implements Sender {
                 autoFlushRows,
                 autoFlushBytes,
                 autoFlushIntervalNanos,
-                inFlightWindowSize,
                 DEFAULT_MAX_SCHEMAS_PER_CONNECTION
         );
     }
@@ -615,13 +600,12 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            int inFlightWindowSize,
             int maxSchemasPerConnection
     ) {
         return new QwpWebSocketSender(
                 singleEndpoint(host, port), null,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                inFlightWindowSize, null, maxSchemasPerConnection
+                null, maxSchemasPerConnection
         );
     }
 
@@ -2215,8 +2199,8 @@ public class QwpWebSocketSender implements Sender {
             String host = ep == null ? "<unbound>" : ep.host;
             int port = ep == null ? -1 : ep.port;
             encoder.setVersion((byte) client.getServerQwpVersion());
-            LOG.info("Connected to WebSocket [host={}, port={}, windowSize={}, qwpVersion={}]",
-                    host, port, inFlightWindowSize, client.getServerQwpVersion());
+            LOG.info("Connected to WebSocket [host={}, port={}, qwpVersion={}]",
+                    host, port, client.getServerQwpVersion());
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
             // its default version (V1). Schema state still gets reset for
@@ -2224,8 +2208,8 @@ public class QwpWebSocketSender implements Sender {
             // does not need a producer-side reset signal because every
             // cursor frame is self-sufficient.
             Endpoint ep = endpoints.get(0);
-            LOG.info("Async initial connect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}, windowSize={}]",
-                    ep.host, ep.port, endpoints.size(), inFlightWindowSize);
+            LOG.info("Async initial connect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}]",
+                    ep.host, ep.port, endpoints.size());
         }
         // Server starts fresh on each connection — discard any schema IDs
         // retained from prior state. Cursor frames are self-sufficient (every

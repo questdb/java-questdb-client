@@ -82,8 +82,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .address(LOCALHOST)
                 .autoFlushRows(500)
                 .autoFlushBytes(512 * 1024)
-                .autoFlushIntervalMillis(50)
-                .inFlightWindowSize(8);
+                .autoFlushIntervalMillis(50);
         Assert.assertNotNull(builder);
     }
 
@@ -451,8 +450,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .address(LOCALHOST)
                 .autoFlushRows(1000)
                 .autoFlushBytes(1024 * 1024)
-                .autoFlushIntervalMillis(100)
-                .inFlightWindowSize(16);
+                .autoFlushIntervalMillis(100);
         Assert.assertNotNull(builder);
     }
 
@@ -463,8 +461,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .enableTls()
                 .advancedTls().disableCertificateValidation()
                 .autoFlushRows(1000)
-                .autoFlushBytes(1024 * 1024)
-                .inFlightWindowSize(16);
+                .autoFlushBytes(1024 * 1024);
         Assert.assertNotNull(builder);
     }
 
@@ -498,47 +495,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
                 .httpToken("token");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testInFlightWindowSizeDoubleSet_fails() {
-        assertThrows("already configured",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .inFlightWindowSize(8)
-                        .inFlightWindowSize(16));
-    }
-
-    @Test
-    public void testInFlightWindowSizeNegative_fails() {
-        assertThrows("must be positive",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .inFlightWindowSize(-1));
-    }
-
-    @Test
-    public void testInFlightWindowSizeOne_syncMode() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .inFlightWindowSize(1);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testInFlightWindowSizeZero_fails() {
-        assertThrows("must be positive",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .inFlightWindowSize(0));
-    }
-
-    @Test
-    public void testInFlightWindowSize_customValue() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .inFlightWindowSize(16);
         Assert.assertNotNull(builder);
     }
 
@@ -749,11 +705,9 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testSyncModeAutoFlushDefaults() throws Exception {
-        // Regression test: sync-mode connect() must not hardcode autoFlush to 0.
-        // createForTesting(host, port, windowSize) mirrors what connect(h,p,tls)
-        // creates internally. Verify it uses sensible defaults.
+        // Regression test: connect() must not hardcode autoFlush to 0.
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0)) {
                 Assert.assertEquals(
                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
                         sender.getAutoFlushRows()
@@ -827,42 +781,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
             assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
-        });
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindow() throws Exception {
-        assertMemoryLeak(() -> {
-            int port = findUnusedPort();
-            assertBadConfig("ws::addr=localhost:" + port + ";in_flight_window=64;", "connect", "Failed");
-        });
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindowDoubleSet_fails() {
-        assertBadConfig("ws::addr=localhost:9000;in_flight_window=64;in_flight_window=128;", "already configured");
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindowInvalid_fails() {
-        assertBadConfig("ws::addr=localhost:9000;in_flight_window=0;", "must be positive");
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindowNotSupportedForHttp_fails() {
-        assertBadConfig("http::addr=localhost:9000;in_flight_window=64;", "only supported for WebSocket");
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindowSync() throws Exception {
-        // Sync mode (in_flight_window=1) was removed alongside the legacy
-        // ingest path: cursor is the only async path now, and it requires
-        // window > 1. build() rejects sync at parse time rather than
-        // attempting to connect.
-        assertMemoryLeak(() -> {
-            int port = findUnusedPort();
-            assertBadConfig("ws::addr=localhost:" + port + ";in_flight_window=1;",
-                    "async", "in_flight_window");
         });
     }
 
