@@ -82,7 +82,7 @@ public class FilesTest {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/test.bin";
             int fd = Files.openCleanRW(path, 0);
-            assertTrue("expected fd > 0, got " + fd, fd > 0);
+            assertTrue("expected fd >= 0, got " + fd, fd >= 0);
             try {
                 long buf = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
                 try {
