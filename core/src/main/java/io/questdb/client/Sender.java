@@ -870,10 +870,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
             }
             while (ports.size() < hosts.size()) {
-                ports.add(PORT_NOT_SET);
+                ports.add(defaultPort);
             }
             hosts.add(src.subSequence(start, hostEnd).toString());
-            ports.add(parsedPort != -1 ? parsedPort : PORT_NOT_SET);
+            ports.add(effectivePort);
         }
 
         private static boolean charsEqualsRange(CharSequence a, CharSequence b, int bStart, int bEnd) {
