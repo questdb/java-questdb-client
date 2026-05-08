@@ -159,15 +159,6 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
     }
 
     @Test
-    public void testUdp_inFlightWindowSizeNotSupported() {
-        assertThrowsAny(
-                () -> Sender.builder(Sender.Transport.UDP)
-                        .address("localhost")
-                        .inFlightWindowSize(1000),
-                "only supported for WebSocket");
-    }
-
-    @Test
     public void testUdp_maxBackoffNotSupported() {
         assertThrowsAny(
                 Sender.builder(Sender.Transport.UDP)
@@ -276,11 +267,6 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
                         .address("localhost")
                         .enableTls(),
                 "TLS is not supported for UDP");
-    }
-
-    @Test
-    public void testUdpScheme_inFlightWindow_fails() {
-        assertBadConfig("udp::addr=localhost:9007;in_flight_window=64;", "only supported for WebSocket");
     }
 
     @Test

@@ -224,20 +224,6 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSfWithSyncWindowRejected() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
-                    + ";in_flight_window=1;";
-            try (Sender ignored = Sender.fromConfig(config)) {
-                Assert.fail("expected rejection of SF with sync mode");
-            } catch (LineSenderException expected) {
-                Assert.assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("async"));
-            }
-        });
-    }
-
-    @Test
     public void testSfMaxBytesAcceptsSizeSuffixes() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             int port = TEST_PORT + 9;

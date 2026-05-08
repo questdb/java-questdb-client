@@ -28,10 +28,7 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
-import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
-import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
-import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -47,7 +44,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
-import java.util.function.BooleanSupplier;
 
 /**
  * The cursor-engine I/O loop. Owns one I/O thread that:
@@ -74,6 +70,15 @@ import java.util.function.BooleanSupplier;
  */
 public final class CursorWebSocketSendLoop implements QuietCloseable {
 
+    public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
+    /** Default per-outage reconnect time cap (5 min). */
+    public static final long DEFAULT_RECONNECT_MAX_DURATION_MILLIS = 300_000L;
+    /** Default initial reconnect backoff (100 ms). */
+    public static final long DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS = 100L;
+    /** Default reconnect max backoff (5 s). */
+    public static final long DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS = 5_000L;
+    /** Throttle "reconnect attempt N failed" WARN logs to one per 5 s. */
+    private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
     /**
      * Default cadence for the keepalive PING the I/O loop emits while
      * waiting on STATUS_DURABLE_ACK frames. See
@@ -85,35 +90,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * server-side. {@code 0} or negative disables the keepalive entirely.
      */
     public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
-    public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
-    /**
-     * Default initial reconnect backoff (100 ms).
-     */
-    public static final long DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS = 100L;
-    /**
-     * Default reconnect max backoff (5 s).
-     */
-    public static final long DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS = 5_000L;
-    /**
-     * Default per-outage reconnect time cap (5 min).
-     */
-    public static final long DEFAULT_RECONNECT_MAX_DURATION_MILLIS = 300_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
-    /**
-     * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
-     */
-    private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
+
     private final AtomicLong consecutiveSendErrors = new AtomicLong();
-    // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
-    // Zero or negative disables the keepalive entirely.
-    private final long durableAckKeepaliveIntervalNanos;
-    // When true, OK frames do NOT advance engine.acknowledge -- only
-    // STATUS_DURABLE_ACK frames do. The OK frame's wireSeq is stashed in
-    // pendingDurable along with its per-table seqTxns, and trim only advances
-    // when a durable-ack covers every batch up to some wireSeq. When false
-    // (default), the loop trims on OK as it always has and ignores any
-    // STATUS_DURABLE_ACK frames that might still arrive (logs a warning).
-    private final boolean durableAckMode;
     // Per-table cumulative durable-upload watermarks, populated only when
     // durableAckMode is true. Updated from STATUS_DURABLE_ACK frame entries
     // (each entry is monotonically non-decreasing per spec). Reset on every
@@ -133,43 +112,76 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // the durable watermark can lag behind the OK watermark.
     private final ArrayDeque<PendingDurableEntry> pendingDurable = new ArrayDeque<>();
     private final ArrayDeque<PendingDurableEntry> pendingDurablePool = new ArrayDeque<>();
-    // Optional reconnect plumbing. When non-null, a wire failure triggers a
-    // reconnect attempt instead of a terminal fail(). The factory produces a
-    // fresh, connected+upgraded WebSocketClient.
-    private final ReconnectFactory reconnectFactory;
-    private final long reconnectInitialBackoffMillis;
-    private final long reconnectMaxBackoffMillis;
-    private final long reconnectMaxDurationMillis;
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
     private final AtomicLong totalAcks = new AtomicLong();
-    // Counters for observability of the durable-ack path. Both are zero
-    // when durableAckMode is false.
-    private final AtomicLong totalDurableAcks = new AtomicLong();
-    private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
-    // Frames sent during the post-reconnect catch-up window — i.e. frames
-    // whose FSN was already published before the wire dropped. A non-zero
-    // value confirms replay is working; a sustained nonzero rate means
-    // the connection is flapping and replay is doing real work each cycle.
-    private final AtomicLong totalFramesReplayed = new AtomicLong();
+    // Total non-OK / non-DURABLE_ACK frames received from the server, classified
+    // by category. Includes both DROP_AND_CONTINUE and HALT outcomes — i.e. every
+    // server-side rejection observed regardless of how the loop reacted.
+    private final AtomicLong totalServerErrors = new AtomicLong();
     private final AtomicLong totalFramesSent = new AtomicLong();
+    private final AtomicLong totalReconnects = new AtomicLong();
     // Every iteration of the reconnect loop bumps this — failures and
     // success alike. Diverges from totalReconnects (success-only) when the
     // server is flapping. Useful for "is reconnect making progress?"
     // observability.
     private final AtomicLong totalReconnectAttempts = new AtomicLong();
-    private final AtomicLong totalReconnects = new AtomicLong();
-    // Total non-OK / non-DURABLE_ACK frames received from the server, classified
-    // by category. Includes both DROP_AND_CONTINUE and HALT outcomes — i.e. every
-    // server-side rejection observed regardless of how the loop reacted.
-    private final AtomicLong totalServerErrors = new AtomicLong();
-    private WebSocketClient client;
+    // Frames sent during the post-reconnect catch-up window — i.e. frames
+    // whose FSN was already published before the wire dropped. A non-zero
+    // value confirms replay is working; a sustained nonzero rate means
+    // the connection is flapping and replay is doing real work each cycle.
+    private final AtomicLong totalFramesReplayed = new AtomicLong();
+    // Set at swapClient time to publishedFsn at that moment; cleared back
+    // to -1 once trySendOne has caught up past it. Used to count replay
+    // frames without a per-frame branch on the steady-state path.
+    private long replayTargetFsn = -1L;
+    // Optional reconnect plumbing. When non-null, a wire failure triggers a
+    // reconnect attempt instead of a terminal fail(). The factory produces a
+    // fresh, connected+upgraded WebSocketClient.
+    private final ReconnectFactory reconnectFactory;
+    private final long reconnectMaxDurationMillis;
+    private final long reconnectInitialBackoffMillis;
+    private final long reconnectMaxBackoffMillis;
     // Optional: when non-null, every server-rejection error (DROP and HALT
     // alike) is offered to the dispatcher for async delivery to the user's
     // handler. Null disables async delivery entirely; the producer-side
     // typed-throw path is unaffected.
     private SenderErrorDispatcher errorDispatcher;
+    private SenderProgressDispatcher progressDispatcher;
+    // When true, OK frames do NOT advance engine.acknowledge -- only
+    // STATUS_DURABLE_ACK frames do. The OK frame's wireSeq is stashed in
+    // pendingDurable along with its per-table seqTxns, and trim only advances
+    // when a durable-ack covers every batch up to some wireSeq. When false
+    // (default), the loop trims on OK as it always has and ignores any
+    // STATUS_DURABLE_ACK frames that might still arrive (logs a warning).
+    private final boolean durableAckMode;
+    // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
+    // Zero or negative disables the keepalive entirely.
+    private final long durableAckKeepaliveIntervalNanos;
+    // Counters for observability of the durable-ack path. Both are zero
+    // when durableAckMode is false.
+    private final AtomicLong totalDurableAcks = new AtomicLong();
+    private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
+    // Wall clock of the last keepalive PING the I/O loop sent to prod the
+    // server into flushing durable-ack frames. Zero until the first PING.
+    private long lastKeepalivePingNanos;
+    private WebSocketClient client;
+    // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
+    // a fresh connection, this is 0. After a reconnect, it's set to
+    // engine.ackedFsn() + 1 — the first frame we replay maps to wireSeq=0
+    // on the new connection so server-side ACK math stays aligned.
+    private long fsnAtZero;
+    // sendingSegment: the segment we're currently consuming bytes from. Starts
+    // at engine.activeSegment(); advances to newer sealed segments / the new
+    // active as the producer rotates.
+    private MmapSegment sendingSegment;
+    // sendOffset: byte offset inside sendingSegment of the first not-yet-sent
+    // byte. Initialized to MmapSegment.HEADER_SIZE on a fresh segment.
+    private long sendOffset = MmapSegment.HEADER_SIZE;
+    private long nextWireSeq;
+    private volatile boolean running;
+    private volatile Throwable lastError;
     // Set by checkError() the first time it actually rethrows lastError to a
     // synchronous user-thread caller (flush/append/close). close() consults
     // this to decide whether to rethrow the latched terminal -- if a producer
@@ -178,11 +190,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // async dispatcher path does NOT set this flag: a user who only watches
     // the async error inbox still gets a loud failure on shutdown.
     private volatile boolean errorSurfacedSynchronously;
-    // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
-    // a fresh connection, this is 0. After a reconnect, it's set to
-    // engine.ackedFsn() + 1 — the first frame we replay maps to wireSeq=0
-    // on the new connection so server-side ACK math stays aligned.
-    private long fsnAtZero;
+    // Typed payload sibling to lastError. Set when recordFatal is called with
+    // a SenderError (HALT-policy server rejection or terminal protocol violation);
+    // remains null for wire-level fatals (reconnect-budget exhaustion, etc).
+    // Read by QwpWebSocketSender.getLastTerminalError() for ops visibility.
+    private volatile SenderError lastTerminalServerError;
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
     // successful connect attempt in any mode). Once true, stays true. Used to
@@ -190,36 +202,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // config typo or firewall block) from "lost connection after we were
     // up" (looks transient).
     private volatile boolean hasEverConnected;
-    private Thread ioThread;
-    private volatile Throwable lastError;
-    // Wall clock of the last keepalive PING the I/O loop sent to prod the
-    // server into flushing durable-ack frames. Zero until the first PING.
-    private long lastKeepalivePingNanos;
-    // Typed payload sibling to lastError. Set when recordFatal is called with
-    // a SenderError (HALT-policy server rejection or terminal protocol violation);
-    // remains null for wire-level fatals (reconnect-budget exhaustion, etc).
-    // Read by QwpWebSocketSender.getLastTerminalError() for ops visibility.
-    private volatile SenderError lastTerminalServerError;
-    private long nextWireSeq;
-    private SenderProgressDispatcher progressDispatcher;
-    // Set at swapClient time to publishedFsn at that moment; cleared back
-    // to -1 once trySendOne has caught up past it. Used to count replay
-    // frames without a per-frame branch on the steady-state path.
-    private long replayTargetFsn = -1L;
-    private volatile boolean running;
-    // sendOffset: byte offset inside sendingSegment of the first not-yet-sent
-    // byte. Initialized to MmapSegment.HEADER_SIZE on a fresh segment.
-    private long sendOffset = MmapSegment.HEADER_SIZE;
-    // sendingSegment: the segment we're currently consuming bytes from. Starts
-    // at engine.activeSegment(); advances to newer sealed segments / the new
-    // active as the producer rotates.
-    private MmapSegment sendingSegment;
-    // (failover.md §4.2, skip-backoff-within-round) When non-null and
-    // returning true, the per-attempt reconnect backoff sleep is skipped.
-    // Wired by QwpWebSocketSender to
-    // `() -> !hostHealthTracker.isRoundExhausted()` so the I/O thread
-    // walks the full address list before paying the doubling delay.
-    private BooleanSupplier skipBackoffPredicate;
+    private volatile Thread ioThread;
 
     /**
      * Full constructor with explicit reconnect-policy knobs. When
@@ -312,288 +295,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Maps a server status byte to a {@link SenderError.Category}. Exposed for unit tests.
+     * Factory used by the I/O loop to build a fresh, connected, upgraded
+     * {@link WebSocketClient} after a wire failure. Implementations close
+     * the old client (if needed), build a new one with the same auth/TLS
+     * config, connect, perform the WebSocket upgrade, and return it ready
+     * to send. Throw on a terminal failure (auth rejection, etc.) — the
+     * I/O loop will treat the throw as fatal.
      */
-    @TestOnly
-    public static SenderError.Category classify(byte status) {
-        switch (status) {
-            case WebSocketResponse.STATUS_SCHEMA_MISMATCH:
-                return SenderError.Category.SCHEMA_MISMATCH;
-            case WebSocketResponse.STATUS_PARSE_ERROR:
-                return SenderError.Category.PARSE_ERROR;
-            case WebSocketResponse.STATUS_INTERNAL_ERROR:
-                return SenderError.Category.INTERNAL_ERROR;
-            case WebSocketResponse.STATUS_SECURITY_ERROR:
-                return SenderError.Category.SECURITY_ERROR;
-            case WebSocketResponse.STATUS_WRITE_ERROR:
-                return SenderError.Category.WRITE_ERROR;
-            default:
-                return SenderError.Category.UNKNOWN;
-        }
-    }
-
-    /**
-     * Single-pass walk of the configured address list. Used by
-     * {@code initial_connect_retry=off} to mirror failover.md §1.2/§4.2
-     * off-mode behavior: try each host once with no inter-host backoff,
-     * then fail terminally if every host rejected.
-     * <p>
-     * Each call to {@code factory.reconnect()} is expected to advance the
-     * sender's internal {@code currentAddressIndex} on failure (see
-     * {@code QwpWebSocketSender.buildAndConnect}); over {@code maxAttempts}
-     * iterations the loop covers every configured host exactly once.
-     * <p>
-     * Outcomes:
-     * <ul>
-     *   <li>Success → return the connected client.</li>
-     *   <li>{@link #isTerminalUpgradeError(Throwable)} true (auth / version)
-     *       → re-throw immediately. Auth/version are per-cluster, not
-     *       per-host, so further walking is pointless.</li>
-     *   <li>Every attempt was a role mismatch → throw
-     *       {@link QwpRoleMismatchException} so callers distinguish
-     *       "no PRIMARY in the configured pool" from "everyone unreachable".</li>
-     *   <li>Otherwise → throw {@link LineSenderException} wrapping the last
-     *       failure.</li>
-     * </ul>
-     */
-    public static WebSocketClient connectSinglePass(
-            ReconnectFactory factory,
-            int maxAttempts,
-            String contextLabel
-    ) {
-        if (maxAttempts <= 0) {
-            throw new LineSenderException(contextLabel + " requires at least one configured address");
-        }
-        Throwable lastError = null;
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                WebSocketClient c = factory.reconnect();
-                if (c != null) {
-                    if (attempt > 1) {
-                        LOG.info("{} succeeded on attempt {}/{} (single-pass walk)",
-                                contextLabel, attempt, maxAttempts);
-                    }
-                    return c;
-                }
-            } catch (Throwable e) {
-                if (isTerminalUpgradeError(e)) {
-                    String upgradeMsg = findUpgradeFailureMessage(e);
-                    LOG.error("{} hit terminal upgrade error on attempt {}/{}, halting walk: {}",
-                            contextLabel, attempt, maxAttempts, upgradeMsg);
-                    throw new LineSenderException(
-                            "WebSocket upgrade failed during " + contextLabel
-                                    + " (won't retry): " + upgradeMsg, e);
-                }
-                lastError = e;
-                LOG.warn("{} attempt {}/{} failed: {}",
-                        contextLabel, attempt, maxAttempts, e.getMessage());
-            }
-        }
-        WebSocketUpgradeException roleMismatch = lastError == null ? null : findRoleMismatch(lastError);
-        if (roleMismatch != null) {
-            QwpRoleMismatchException ex = new QwpRoleMismatchException(
-                    "PRIMARY",
-                    null,
-                    contextLabel + " walked " + maxAttempts
-                            + " host(s); no PRIMARY among configured addresses; "
-                            + "last seen role=" + roleMismatch.getServerRole());
-            // Preserve the typed upgrade exception on the cause chain so
-            // diagnostic helpers can recover the parsed status code / role.
-            ex.initCause(lastError);
-            throw ex;
-        }
-        String lastMsg = lastError == null ? "no attempts made" : lastError.getMessage();
-        throw new LineSenderException(
-                contextLabel + " failed after walking " + maxAttempts
-                        + " host(s) (single-pass): " + lastMsg,
-                lastError);
-    }
-
-    /**
-     * Same as the 5-arg overload but also accepts a
-     * {@code skipBackoffPredicate}. When non-null and returning {@code true}
-     * after a failed attempt, the loop skips the per-attempt backoff
-     * sleep and proceeds immediately to the next factory call. Wired to
-     * {@code () -> !tracker.isRoundExhausted()} so the engine walks the
-     * full address list without backoff before paying the doubling delay
-     * (failover.md §4.2, skip-backoff-within-round).
-     * <p>
-     * Role-reject failures (421) take a separate sub-branch: the per-attempt
-     * backoff resets to {@code initialBackoffMillis} (no doubling) but the
-     * outage start clock is preserved, so {@code maxDurationMillis} still
-     * bounds how long the loop will tolerate a stuck PRIMARY_CATCHUP cluster
-     * (failover.md §3.2 / §4.2, role-reject does not advance doubling).
-     */
-    public static WebSocketClient connectWithRetry(
-            ReconnectFactory factory,
-            long maxDurationMillis,
-            long initialBackoffMillis,
-            long maxBackoffMillis,
-            String contextLabel,
-            BooleanSupplier skipBackoffPredicate
-    ) {
-        long startNanos = System.nanoTime();
-        long deadlineNanos = startNanos + maxDurationMillis * 1_000_000L;
-        long backoffMillis = initialBackoffMillis;
-        int attempts = 0;
-        long lastLogNanos = 0L;
-        Throwable lastError = null;
-        while (System.nanoTime() < deadlineNanos) {
-            attempts++;
-            try {
-                WebSocketClient c = factory.reconnect();
-                if (c != null) {
-                    long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
-                    if (attempts > 1) {
-                        LOG.info("{} succeeded after {}ms / {} attempts",
-                                contextLabel, elapsedMs, attempts);
-                    }
-                    return c;
-                }
-            } catch (Throwable e) {
-                if (isTerminalUpgradeError(e)) {
-                    String upgradeMsg = findUpgradeFailureMessage(e);
-                    LOG.error("{} hit terminal upgrade error, won't retry: {}",
-                            contextLabel, upgradeMsg);
-                    throw new LineSenderException(
-                            "WebSocket upgrade failed during " + contextLabel
-                                    + " (won't retry): " + upgradeMsg, e);
-                }
-                lastError = e;
-                long now = System.nanoTime();
-                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
-                    LOG.warn("{} attempt {} failed: {}",
-                            contextLabel, attempts, e.getMessage());
-                    lastLogNanos = now;
-                }
-            }
-            // (failover.md §4.2) Three sleep paths:
-            //   - skipBackoffPredicate true  → no sleep, try the next host
-            //     immediately. Wired to !tracker.isRoundExhausted() so the
-            //     full address list gets walked before the doubling delay
-            //     (the spec's skip-backoff-within-round rule).
-            //   - role-reject (421)          → InitialBackoff only, do not
-            //     advance the doubling counter (preserves outage clock).
-            //   - other failures             → standard exponential backoff
-            //     with jitter.
-            boolean skipBackoff = skipBackoffPredicate != null && skipBackoffPredicate.getAsBoolean();
-            boolean isRoleReject = lastError != null && findRoleMismatch(lastError) != null;
-            long sleepMillis;
-            if (skipBackoff) {
-                sleepMillis = 0L;
-            } else if (isRoleReject) {
-                sleepMillis = initialBackoffMillis;
-                // Reset the doubling counter: a 421+role reply means the
-                // cluster is reachable, just topologically wrong. A
-                // subsequent transport error is a fresh signal, not a
-                // continuation of the prior outage (failover.md §3.2).
-                backoffMillis = initialBackoffMillis;
-            } else {
-                long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
-                sleepMillis = backoffMillis + jitter;
-                backoffMillis = Math.min(backoffMillis * 2, maxBackoffMillis);
-            }
-            long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
-            if (remainingMillis <= 0) {
-                break;
-            }
-            if (sleepMillis > remainingMillis) {
-                sleepMillis = remainingMillis;
-            }
-            if (sleepMillis > 0) {
-                LockSupport.parkNanos(sleepMillis * 1_000_000L);
-            }
-        }
-        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
-        String lastMsg = lastError == null ? "no attempts made" : lastError.getMessage();
-        WebSocketUpgradeException roleMismatch = lastError == null ? null : findRoleMismatch(lastError);
-        if (roleMismatch != null) {
-            // Every attempt within the budget hit a server that wasn't
-            // primary. Surface this distinctly from a plain transport
-            // failure so callers can wait for a failover and retry rather
-            // than treat it as a hard misconfiguration.
-            QwpRoleMismatchException ex = new QwpRoleMismatchException(
-                    "PRIMARY",
-                    null,
-                    contextLabel + " failed after " + elapsedMs + "ms / "
-                            + attempts + " attempts: no PRIMARY among configured addresses; "
-                            + "last seen role=" + roleMismatch.getServerRole());
-            ex.initCause(lastError);
-            throw ex;
-        }
-        throw new LineSenderException(
-                contextLabel + " failed after " + elapsedMs + "ms / "
-                        + attempts + " attempts: " + lastMsg,
-                lastError);
-    }
-
-    /**
-     * Same retry-with-exponential-backoff-and-jitter loop the I/O thread
-     * uses on a wire failure, but reusable from {@code ensureConnected} to
-     * implement {@code initial_connect_retry=true}. Returns the connected
-     * client on success; throws on terminal upgrade error (won't retry) or
-     * budget exhaustion.
-     * <p>
-     * Caller-supplied {@code factory} is invoked once per attempt and
-     * should produce a fresh, connected, upgraded client (or throw). The
-     * lambda is intentionally a {@link ReconnectFactory} so the same
-     * implementation in {@code QwpWebSocketSender.buildAndConnect()} can
-     * serve both startup and reconnect paths verbatim.
-     */
-    public static WebSocketClient connectWithRetry(
-            ReconnectFactory factory,
-            long maxDurationMillis,
-            long initialBackoffMillis,
-            long maxBackoffMillis,
-            String contextLabel
-    ) {
-        return connectWithRetry(factory, maxDurationMillis, initialBackoffMillis,
-                maxBackoffMillis, contextLabel, null);
-    }
-
-    /**
-     * Default policy per spec § "Default category → policy". User overrides
-     * (builder + connect-string) plug in here in a later commit; today this is
-     * the only resolver. Exposed for unit tests.
-     */
-    @TestOnly
-    public static SenderError.Policy defaultPolicyFor(SenderError.Category category) {
-        switch (category) {
-            case SCHEMA_MISMATCH:
-            case WRITE_ERROR:
-                return SenderError.Policy.DROP_AND_CONTINUE;
-            case PARSE_ERROR:
-            case INTERNAL_ERROR:
-            case SECURITY_ERROR:
-            case PROTOCOL_VIOLATION:
-            case UNKNOWN:
-            default:
-                return SenderError.Policy.HALT;
-        }
-    }
-
-    /**
-     * True if a WebSocket close code signals an unrecoverable protocol-layer
-     * violation: replaying the same bytes will produce the same close. Reserved
-     * codes that "MUST NOT be sent in a Close frame" (1004/1005/1006/1015) are
-     * intentionally not classified as terminal here — when they arrive in
-     * practice they signal abnormal disconnect rather than the server's
-     * reasoned rejection of payload bytes, so reconnect is the right reaction.
-     * Exposed for unit tests.
-     */
-    @TestOnly
-    public static boolean isTerminalCloseCode(int code) {
-        switch (code) {
-            case WebSocketCloseCode.PROTOCOL_ERROR:
-            case WebSocketCloseCode.UNSUPPORTED_DATA:
-            case WebSocketCloseCode.INVALID_PAYLOAD_DATA:
-            case WebSocketCloseCode.POLICY_VIOLATION:
-            case WebSocketCloseCode.MESSAGE_TOO_BIG:
-            case WebSocketCloseCode.MANDATORY_EXTENSION:
-                return true;
-            default:
-                return false;
-        }
+    @FunctionalInterface
+    public interface ReconnectFactory {
+        WebSocketClient reconnect() throws Exception;
     }
 
     /**
@@ -611,6 +322,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
     }
 
+    /**
+     * True when {@link #lastError} is set AND no synchronous user-thread
+     * caller has yet seen it via {@link #checkError()}. close() uses this
+     * to decide whether to rethrow as a safety net: a user who only ever
+     * called close() (e.g. async-initial-connect that never reached the
+     * server) needs to see the error from somewhere; a user who already
+     * caught it from flush() does not.
+     */
+    public boolean hasUnsurfacedError() {
+        return lastError != null && !errorSurfacedSynchronously;
+    }
+
     @Override
     public synchronized void close() {
         // Synchronized on the same monitor as start(): a close() racing a
@@ -623,6 +346,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         running = false;
         Thread t = ioThread;
         if (t != null) {
+            LockSupport.unpark(t);
             // Only await the shutdown latch if the I/O thread actually ran.
             // If start() failed after assigning ioThread but before t.start()
             // succeeded (e.g. native stack OOM), ioLoop never ran and its
@@ -669,61 +393,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return lastTerminalServerError;
     }
 
-    public long getTotalAcks() {
-        return totalAcks.get();
-    }
-
-    /**
-     * Total {@code STATUS_DURABLE_ACK} frames received since the loop started.
-     * Always 0 when {@code durableAckMode} is false. Useful for confirming
-     * the server is actually emitting durable acks under load.
-     */
-    public long getTotalDurableAcks() {
-        return totalDurableAcks.get();
-    }
-
-    /**
-     * Total times a durable-ack frame caused {@link CursorSendEngine#acknowledge}
-     * to advance. Always 0 when {@code durableAckMode} is false. A non-zero
-     * value bounded below {@code getTotalDurableAcks} is normal -- many
-     * durable-acks land on watermarks that don't yet cover any pending
-     * entries (e.g. one of two tables has caught up but the other has not).
-     */
-    public long getTotalDurableTrimAdvances() {
-        return totalDurableTrimAdvances.get();
-    }
-
-    /**
-     * Total frames re-sent on the post-reconnect replay window.
-     */
-    public long getTotalFramesReplayed() {
-        return totalFramesReplayed.get();
-    }
-
-    public long getTotalFramesSent() {
-        return totalFramesSent.get();
-    }
-
-    /**
-     * Total reconnect attempts (succeeded + failed).
-     */
-    public long getTotalReconnectAttempts() {
-        return totalReconnectAttempts.get();
-    }
-
-    public long getTotalReconnects() {
-        return totalReconnects.get();
-    }
-
-    /**
-     * Total server-side rejection frames observed since the loop started. Counts both
-     * DROP_AND_CONTINUE and HALT outcomes — every non-OK frame the server sent that
-     * the client classified as a {@link SenderError}.
-     */
-    public long getTotalServerErrors() {
-        return totalServerErrors.get();
-    }
-
     /**
      * True iff the I/O loop has at least once installed a live (connected
      * + upgraded) WebSocket client. Sticky — once true, stays true even
@@ -736,23 +405,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return hasEverConnected;
     }
 
-    /**
-     * True when {@link #lastError} is set AND no synchronous user-thread
-     * caller has yet seen it via {@link #checkError()}. close() uses this
-     * to decide whether to rethrow as a safety net: a user who only ever
-     * called close() (e.g. async-initial-connect that never reached the
-     * server) needs to see the error from somewhere; a user who already
-     * caught it from flush() does not.
-     */
-    public boolean hasUnsurfacedError() {
-        return lastError != null && !errorSurfacedSynchronously;
+    public long getTotalAcks() {
+        return totalAcks.get();
     }
 
     /**
-     * True when this loop drives trim from durable-ack frames. Diagnostic only.
+     * Total server-side rejection frames observed since the loop started. Counts both
+     * DROP_AND_CONTINUE and HALT outcomes — every non-OK frame the server sent that
+     * the client classified as a {@link SenderError}.
      */
-    public boolean isDurableAckMode() {
-        return durableAckMode;
+    public long getTotalServerErrors() {
+        return totalServerErrors.get();
     }
 
     /**
@@ -773,18 +436,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.progressDispatcher = dispatcher;
     }
 
-    /**
-     * Wires the skip-backoff predicate (failover.md §4.2,
-     * skip-backoff-within-round). When the predicate returns {@code true}
-     * after a reconnect attempt fails, the loop skips the per-attempt
-     * backoff sleep and proceeds immediately to the next factory call.
-     * {@link QwpWebSocketSender} sets this to
-     * {@code () -> !hostHealthTracker.isRoundExhausted()} so the I/O
-     * thread walks the full address list without backoff before paying
-     * the doubling delay. Pass {@code null} to disable.
-     */
-    public void setSkipBackoffPredicate(BooleanSupplier predicate) {
-        this.skipBackoffPredicate = predicate;
+    public long getTotalFramesSent() {
+        return totalFramesSent.get();
+    }
+
+    public long getTotalReconnects() {
+        return totalReconnects.get();
+    }
+
+    /** Total reconnect attempts (succeeded + failed). */
+    public long getTotalReconnectAttempts() {
+        return totalReconnectAttempts.get();
+    }
+
+    /** Total frames re-sent on the post-reconnect replay window. */
+    public long getTotalFramesReplayed() {
+        return totalFramesReplayed.get();
     }
 
     public synchronized void start() {
@@ -820,74 +487,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Walks the cause chain looking for a {@link WebSocketUpgradeException}
-     * that represents a role mismatch (status 421). Returns the typed
-     * exception so callers can surface the server role to the user, or
-     * {@code null} if no role-mismatch is on the chain.
+     * Sets {@code fsnAtZero}, {@code nextWireSeq}, and the cursor
+     * (sendingSegment + sendOffset) to the first unsent FSN. Visible for
+     * tests so they can assert correct positioning without spinning a
+     * real I/O thread + WebSocket.
      */
-    private static WebSocketUpgradeException findRoleMismatch(Throwable t) {
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            if (cur instanceof WebSocketUpgradeException
-                    && ((WebSocketUpgradeException) cur).isRoleMismatch()) {
-                return (WebSocketUpgradeException) cur;
-            }
-            if (cur.getCause() == cur) {
-                break;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Walks the cause chain looking for the WebSocketClient's
-     * "WebSocket upgrade failed:" sentinel and returns its message, or
-     * {@code null} if not present. The upgrade failure is thrown deep
-     * inside WebSocketClient and gets wrapped by the connect path before
-     * reaching us — so we have to look past the outermost wrapper.
-     */
-    private static String findUpgradeFailureMessage(Throwable t) {
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            String msg = cur.getMessage();
-            if (msg != null && msg.contains("WebSocket upgrade failed:")) {
-                return msg;
-            }
-            if (cur.getCause() == cur) break;
-        }
-        return null;
-    }
-
-    /**
-     * True when the given throwable indicates a server-side reject that
-     * won't fix itself on retry. WebSocket upgrade failures with a non-101
-     * HTTP status (401 unauthorized, 403 forbidden, 426 upgrade-required,
-     * etc.) indicate auth or version mismatch — retrying just delays the
-     * user seeing the misconfig. Other failures (TCP refused, IO error
-     * during handshake) are treated as transient.
-     * <p>
-     * 421 Misdirected Request is explicitly NOT terminal: it signals the
-     * server is a REPLICA / PRIMARY_CATCHUP, and the next connect attempt
-     * should rotate to a different host (or wait for a primary to be
-     * elected).
-     */
-    private static boolean isTerminalUpgradeError(Throwable t) {
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            if (cur instanceof WebSocketUpgradeException) {
-                return !((WebSocketUpgradeException) cur).isRoleMismatch();
-            }
-            if (cur.getCause() == cur) {
-                break;
-            }
-        }
-        // Legacy fallback: WebSocketClient used to throw a plain
-        // HttpClientException with a "WebSocket upgrade failed:" prefix.
-        // Recognize that too so older builds and intermediate wrappers
-        // still classify correctly.
-        return findUpgradeFailureMessage(t) != null;
-    }
-
-    private PendingDurableEntry acquirePendingEntry() {
-        PendingDurableEntry e = pendingDurablePool.pollFirst();
-        return e != null ? e : new PendingDurableEntry();
+    void positionCursorForStart() {
+        long replayStart = engine.ackedFsn() + 1L;
+        this.fsnAtZero = replayStart;
+        this.nextWireSeq = 0L;
+        positionCursorAt(replayStart);
     }
 
     /**
@@ -927,50 +536,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return liveActive;
     }
 
-    private void applyDurableAck() {
-        // Update per-table watermarks from the inbound frame, taking the
-        // max so a reordered or older cumulative frame can't move a watermark
-        // backwards. Then walk the head of pendingDurable, popping every
-        // entry whose tables are all covered. The map's NO_ENTRY_VALUE
-        // sentinel is -1L; valid seqTxns are non-negative, so the guard
-        // doubles as an "absent" check.
-        int n = response.getTableEntryCount();
-        for (int i = 0; i < n; i++) {
-            String name = response.getTableName(i);
-            long seqTxn = response.getTableSeqTxn(i);
-            long current = durableTableWatermarks.get(name);
-            if (seqTxn > current) {
-                durableTableWatermarks.put(name, seqTxn);
-            }
-        }
-        drainPendingDurable();
-    }
-
     /**
-     * Drives the very first connect attempt on the I/O thread, used in the
-     * async-initial-connect mode (constructed with {@code client == null}).
-     * Reuses the same retry+backoff machinery as {@link #fail(Throwable)} —
-     * a terminal upgrade reject or budget exhaustion is delivered through
-     * the dispatcher, not thrown to the producer.
+     * Surface a wire failure. With reconnect plumbing wired (factory +
+     * listener both non-null), enters the per-outage retry loop:
+     * exponential backoff with jitter, time-capped at
+     * {@code reconnectMaxDurationMillis}, terminal on auth/upgrade
+     * rejections (so the budget isn't burned on errors that won't fix
+     * themselves). On the first successful reconnect within the budget,
+     * the I/O loop resumes with reset wire state and replays from
+     * {@code engine.ackedFsn() + 1}.
+     * <p>
+     * Without reconnect plumbing, the failure is immediately terminal
+     * (legacy behavior).
      */
-    private void attemptInitialConnect() {
-        connectLoop(new LineSenderException(
-                        "async initial connect deferred to I/O thread"),
-                "initial connect");
-    }
-
-    private void clearDurableAckTracking() {
-        if (!durableAckMode) {
-            return;
-        }
-        while (!pendingDurable.isEmpty()) {
-            releasePendingEntry(pendingDurable.pollFirst());
-        }
-        durableTableWatermarks.clear();
-        // Reset the keepalive throttle so the new connection can prod the
-        // server immediately rather than waiting out the leftover interval
-        // from before the reconnect.
-        lastKeepalivePingNanos = 0L;
+    private void fail(Throwable initial) {
+        connectLoop(initial, "reconnect");
     }
 
     /**
@@ -1026,14 +606,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             System.nanoTime()
                     );
                     totalServerErrors.incrementAndGet();
-                    // recordFatal MUST run before dispatchError: the spec
-                    // requires signal.terminalError to be latched BEFORE the
-                    // handler is invoked, so a handler that synchronously
-                    // probes getLastTerminalError() (or calls flush()) sees
-                    // the typed error rather than null.
                     recordFatal(new LineSenderServerException(err), err);
                     dispatchError(err);
                     return;
+                }
+                if (isRoleReject(e)) {
+                    backoffMillis = reconnectInitialBackoffMillis;
+                    lastReconnectError = e;
+                    if (running) {
+                        long remainingNanos = deadlineNanos - System.nanoTime();
+                        if (remainingNanos <= 0L) {
+                            break;
+                        }
+                        long parkNanos = Math.min(reconnectInitialBackoffMillis * 1_000_000L, remainingNanos);
+                        LockSupport.parkNanos(parkNanos);
+                    }
+                    continue;
                 }
                 lastReconnectError = e;
                 long now = System.nanoTime();
@@ -1042,34 +630,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     lastLogNanos = now;
                 }
             }
-            // (failover.md §4.2) Three sleep paths:
-            //   - skipBackoffPredicate true → no sleep, advance to next host
-            //     (used while there are still untried hosts in the round —
-            //     the spec's skip-backoff-within-round rule).
-            //   - role-reject (421)        → InitialBackoff only; do NOT
-            //     advance the doubling counter, so the outage budget caps
-            //     a stuck PRIMARY_CATCHUP cluster but each attempt sleeps
-            //     a short, fixed amount.
-            //   - other failures          → standard exponential backoff
-            //     with [backoff, 2*backoff) jitter.
             if (running) {
-                boolean skipBackoff = skipBackoffPredicate != null && skipBackoffPredicate.getAsBoolean();
-                boolean isRoleReject = findRoleMismatch(lastReconnectError) != null;
-                long sleepMillis;
-                if (skipBackoff) {
-                    sleepMillis = 0L;
-                } else if (isRoleReject) {
-                    sleepMillis = reconnectInitialBackoffMillis;
-                    // Reset the doubling counter: a 421+role reply means the
-                    // cluster is reachable, just topologically wrong. A
-                    // subsequent transport error is a fresh signal, not a
-                    // continuation of the prior outage (failover.md §3.2).
-                    backoffMillis = reconnectInitialBackoffMillis;
-                } else {
-                    long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
-                    sleepMillis = backoffMillis + jitter;
-                    backoffMillis = Math.min(backoffMillis * 2, reconnectMaxBackoffMillis);
-                }
+                long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+                long sleepMillis = backoffMillis + jitter;
                 long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
                 if (remainingMillis <= 0) {
                     break;
@@ -1077,9 +640,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (sleepMillis > remainingMillis) {
                     sleepMillis = remainingMillis;
                 }
-                if (sleepMillis > 0) {
-                    LockSupport.parkNanos(sleepMillis * 1_000_000L);
-                }
+                LockSupport.parkNanos(sleepMillis * 1_000_000L);
+                backoffMillis = Math.min(backoffMillis * 2, reconnectMaxBackoffMillis);
             }
         }
         long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
@@ -1092,19 +654,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // a successful upgrade, the user is most likely looking at a config
         // problem (typo in addr, wrong port, firewall, server not deployed
         // yet); if we connected at least once and then exhausted the budget,
-        // it's a transient connectivity issue (server down, network flap);
-        // and if every attempt hit a non-writable role, it's a failover
-        // window in progress. Tag and free-text hint encode the same signal
-        // so both grep-the-logs and read-the-message users get it without
-        // parsing.
-        WebSocketUpgradeException roleMismatch = findRoleMismatch(lastReconnectError);
+        // it's a transient connectivity issue (server down, network flap).
+        // Tag and free-text hint encode the same signal so both grep-the-logs
+        // and read-the-message users get it without parsing.
         String connectivityTag;
         String connectivityHint;
-        if (roleMismatch != null) {
-            connectivityTag = "no-primary-budget-exhausted";
-            connectivityHint = "no PRIMARY among configured addresses (last seen role="
-                    + roleMismatch.getServerRole() + "); waiting for failover";
-        } else if (hasEverConnected) {
+        if (hasEverConnected) {
             connectivityTag = "connection-lost-budget-exhausted";
             connectivityHint = "server unreachable since last connect (transient)";
         } else {
@@ -1132,89 +687,251 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Send {@code err} to the async-delivery dispatcher if one is configured.
-     * Producer-side typed throw (HALT) goes through {@code recordFatal} +
-     * {@code checkError} regardless — this is purely the async observer path.
+     * Drives the very first connect attempt on the I/O thread, used in the
+     * async-initial-connect mode (constructed with {@code client == null}).
+     * Reuses the same retry+backoff machinery as {@link #fail(Throwable)} —
+     * a terminal upgrade reject or budget exhaustion is delivered through
+     * the dispatcher, not thrown to the producer.
      */
-    private void dispatchError(SenderError err) {
-        SenderErrorDispatcher d = errorDispatcher;
-        if (d != null) {
-            d.offer(err);
+    private void attemptInitialConnect() {
+        connectLoop(new LineSenderException(
+                "async initial connect deferred to I/O thread"),
+                "initial connect");
+    }
+
+    /**
+     * Mark the loop as fatally failed. Caller has decided no reconnect
+     * is possible (or it ran out of budget) — record the error so
+     * {@link #checkError} can surface it to the producer thread, then
+     * stop the loop.
+     */
+    private void recordFatal(Throwable t) {
+        recordFatal(t, null);
+    }
+
+    /**
+     * Server-rejection-aware variant. Stashes a typed {@link SenderError} alongside
+     * the throwable so {@code QwpWebSocketSender.getLastTerminalError()} can surface
+     * the structured payload for ops/observability. Idempotent — only the first
+     * failure latches.
+     */
+    private void recordFatal(Throwable t, SenderError serverError) {
+        if (lastError == null) {
+            lastError = t;
+            lastTerminalServerError = serverError;
+        }
+        running = false;
+        if (serverError != null) {
+            LOG.error("Cursor I/O loop failure: {}", t.getMessage());
+        } else {
+            LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
         }
     }
 
     /**
-     * Notify the progress dispatcher that the ack watermark advanced to
-     * {@code ackedFsn}. Caller must already have observed the advance via
-     * {@link CursorSendEngine#acknowledge}'s boolean return; this method
-     * does no further filtering.
+     * True when the given throwable indicates a server-side reject that
+     * won't fix itself on retry. Today this is detected by message
+     * sniffing: WebSocket upgrade failures with a non-101 HTTP status
+     * (401 unauthorized, 403 forbidden, 426 upgrade-required, etc.)
+     * indicate auth or version mismatch — retrying just delays the user
+     * seeing the misconfig. Other failures (TCP refused, IO error during
+     * handshake) are treated as transient.
      */
-    private void dispatchProgress(long ackedFsn) {
-        SenderProgressDispatcher d = progressDispatcher;
-        if (d != null) {
-            d.offer(ackedFsn);
+    private static boolean isTerminalUpgradeError(Throwable t) {
+        if (isRoleReject(t)) {
+            return false;
         }
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof io.questdb.client.cutlass.qwp.client.QwpAuthFailedException) {
+                return true;
+            }
+            if (cur.getCause() == cur) break;
+        }
+        return findUpgradeFailureMessage(t) != null;
+    }
+
+    private static boolean isRoleReject(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException) {
+                return true;
+            }
+            if (cur.getCause() == cur) break;
+        }
+        return false;
     }
 
     /**
-     * Pop every head entry whose tables are all covered by the durable
-     * watermarks and call {@link CursorSendEngine#acknowledge} once with
-     * the highest popped wireSeq. Trivially-durable entries (tableCount=0,
-     * from empty-WAL OK frames or NACK frames) pop unconditionally.
+     * Walks the cause chain looking for the WebSocketClient's
+     * "WebSocket upgrade failed:" sentinel and returns its message, or
+     * {@code null} if not present. The upgrade failure is thrown deep
+     * inside WebSocketClient and gets wrapped by the connect path before
+     * reaching us — so we have to look past the outermost wrapper.
      */
-    private void drainPendingDurable() {
-        long highest = Long.MIN_VALUE;
-        while (!pendingDurable.isEmpty()) {
-            PendingDurableEntry head = pendingDurable.peekFirst();
-            if (!head.isDurableUnder(durableTableWatermarks)) {
+    private static String findUpgradeFailureMessage(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            String msg = cur.getMessage();
+            if (msg != null && msg.contains("WebSocket upgrade failed:")) {
+                return msg;
+            }
+            if (cur.getCause() == cur) break;
+        }
+        return null;
+    }
+
+    /**
+     * Same retry-with-exponential-backoff-and-jitter loop the I/O thread
+     * uses on a wire failure, but reusable from {@code ensureConnected} to
+     * implement {@code initial_connect_retry=true}. Returns the connected
+     * client on success; throws on terminal upgrade error (won't retry) or
+     * budget exhaustion.
+     * <p>
+     * Caller-supplied {@code factory} is invoked once per attempt and
+     * should produce a fresh, connected, upgraded client (or throw). The
+     * lambda is intentionally a {@link ReconnectFactory} so the same
+     * implementation in {@code QwpWebSocketSender.buildAndConnect()} can
+     * serve both startup and reconnect paths verbatim.
+     */
+    public static WebSocketClient connectWithRetry(
+            ReconnectFactory factory,
+            long maxDurationMillis,
+            long initialBackoffMillis,
+            long maxBackoffMillis,
+            String contextLabel
+    ) {
+        long startNanos = System.nanoTime();
+        long deadlineNanos = startNanos + maxDurationMillis * 1_000_000L;
+        long backoffMillis = initialBackoffMillis;
+        int attempts = 0;
+        long lastLogNanos = 0L;
+        Throwable lastError = null;
+        while (System.nanoTime() < deadlineNanos) {
+            attempts++;
+            try {
+                WebSocketClient c = factory.reconnect();
+                if (c != null) {
+                    long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+                    if (attempts > 1) {
+                        LOG.info("{} succeeded after {}ms / {} attempts",
+                                contextLabel, elapsedMs, attempts);
+                    }
+                    return c;
+                }
+            } catch (Throwable e) {
+                if (isTerminalUpgradeError(e)) {
+                    String upgradeMsg = findUpgradeFailureMessage(e);
+                    LOG.error("{} hit terminal upgrade error, won't retry: {}",
+                            contextLabel, upgradeMsg);
+                    throw new LineSenderException(
+                            "WebSocket upgrade failed during " + contextLabel
+                                    + " (won't retry): " + upgradeMsg, e);
+                }
+                lastError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("{} attempt {} failed: {}",
+                            contextLabel, attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
+            }
+            long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+            long sleepMillis = backoffMillis + jitter;
+            long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
+            if (remainingMillis <= 0) {
                 break;
             }
-            highest = head.wireSeq;
+            if (sleepMillis > remainingMillis) {
+                sleepMillis = remainingMillis;
+            }
+            LockSupport.parkNanos(sleepMillis * 1_000_000L);
+            backoffMillis = Math.min(backoffMillis * 2, maxBackoffMillis);
+        }
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        String lastMsg = lastError == null ? "no attempts made" : lastError.getMessage();
+        throw new LineSenderException(
+                contextLabel + " failed after " + elapsedMs + "ms / "
+                        + attempts + " attempts: " + lastMsg,
+                lastError);
+    }
+
+    /**
+     * Reset wire state for a fresh connection: install the new client,
+     * realign {@code fsnAtZero} to the next unacked FSN, restart wire
+     * sequencing from 0, and reposition the cursor so the next
+     * {@link #trySendOne} call replays the first unacked frame.
+     */
+    private void swapClient(WebSocketClient newClient) {
+        WebSocketClient old = this.client;
+        this.client = newClient;
+        // Sticky: once the wire is up, we've reached the server at least
+        // once for this sender's lifetime. Used downstream to classify a
+        // subsequent budget exhaustion as transient vs config-likely.
+        this.hasEverConnected = true;
+        if (old != null) {
+            try {
+                old.close();
+            } catch (Throwable ignored) {
+                // best-effort
+            }
+        }
+        long replayStart = engine.ackedFsn() + 1L;
+        this.fsnAtZero = replayStart;
+        this.nextWireSeq = 0L;
+        this.consecutiveSendErrors.set(0L);
+        // Snapshot publishedFsn at swap time — frames at FSN ≤ this value
+        // were already on the wire before the drop and will be replayed.
+        // trySendOne increments totalFramesReplayed for each one, then
+        // resets replayTargetFsn to -1 once we cross the boundary.
+        long pubAtSwap = engine.publishedFsn();
+        this.replayTargetFsn = pubAtSwap >= replayStart ? pubAtSwap : -1L;
+        // Drop any durable-ack tracking from the previous connection. The
+        // new connection will re-OK every replayed batch and the server
+        // re-emits cumulative durable-ack watermarks from scratch, so
+        // carrying stale state across the wire boundary would either
+        // double-trim or starve the queue.
+        clearDurableAckTracking();
+        positionCursorAt(replayStart);
+    }
+
+    private void clearDurableAckTracking() {
+        if (!durableAckMode) {
+            return;
+        }
+        while (!pendingDurable.isEmpty()) {
             releasePendingEntry(pendingDurable.pollFirst());
         }
-        if (highest != Long.MIN_VALUE) {
-            long fsn = fsnAtZero + highest;
-            if (engine.acknowledge(fsn)) {
-                dispatchProgress(fsn);
-            }
-            totalDurableTrimAdvances.incrementAndGet();
-        }
+        durableTableWatermarks.clear();
+        // Reset the keepalive throttle so the new connection can prod the
+        // server immediately rather than waiting out the leftover interval
+        // from before the reconnect.
+        lastKeepalivePingNanos = 0L;
     }
 
     /**
-     * Stash a wireSeq + per-table seqTxns from the current OK / NACK frame
-     * for later durable-ack confirmation. {@link #response} must hold the
-     * OK or rejection frame at call time. NACK frames carry no per-table
-     * entries, so they enqueue as trivially-durable empty placeholders.
+     * Walk the engine's segments to find the one containing {@code targetFsn},
+     * and set {@code sendOffset} to the byte offset of that frame within it.
+     * If {@code targetFsn} is past everything published, park at the live
+     * active segment's published offset (caller will wait for new bytes).
      */
-    private void enqueuePendingOk(long wireSeq) {
-        PendingDurableEntry e = acquirePendingEntry();
-        e.wireSeq = wireSeq;
-        int n = response.getTableEntryCount();
-        e.ensureCapacity(n);
-        for (int i = 0; i < n; i++) {
-            e.tableNames[i] = response.getTableName(i);
-            e.seqTxns[i] = response.getTableSeqTxn(i);
+    private void positionCursorAt(long targetFsn) {
+        MmapSegment seg = engine.findSegmentContaining(targetFsn);
+        if (seg == null) {
+            // targetFsn is at or past publishedFsn — nothing to replay.
+            // Resume from the active segment's tip; producer may add more.
+            sendingSegment = engine.activeSegment();
+            sendOffset = sendingSegment.publishedOffset();
+            return;
         }
-        e.tableCount = n;
-        pendingDurable.addLast(e);
-    }
-
-    /**
-     * Surface a wire failure. With reconnect plumbing wired (factory +
-     * listener both non-null), enters the per-outage retry loop:
-     * exponential backoff with jitter, time-capped at
-     * {@code reconnectMaxDurationMillis}, terminal on auth/upgrade
-     * rejections (so the budget isn't burned on errors that won't fix
-     * themselves). On the first successful reconnect within the budget,
-     * the I/O loop resumes with reset wire state and replays from
-     * {@code engine.ackedFsn() + 1}.
-     * <p>
-     * Without reconnect plumbing, the failure is immediately terminal
-     * (legacy behavior).
-     */
-    private void fail(Throwable initial) {
-        connectLoop(initial, "reconnect");
+        sendingSegment = seg;
+        // Walk frame-by-frame from HEADER_SIZE until we land on targetFsn.
+        long offset = MmapSegment.HEADER_SIZE;
+        long fsn = seg.baseSeq();
+        long base = seg.address();
+        while (fsn < targetFsn) {
+            int payloadLen = Unsafe.getUnsafe().getInt(base + offset + 4);
+            offset += MmapSegment.FRAME_HEADER_SIZE + payloadLen;
+            fsn++;
+        }
+        sendOffset = offset;
     }
 
     private void ioLoop() {
@@ -1257,150 +974,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         } finally {
             shutdownLatch.countDown();
         }
-    }
-
-    /**
-     * Walk the engine's segments to find the one containing {@code targetFsn},
-     * and set {@code sendOffset} to the byte offset of that frame within it.
-     * If {@code targetFsn} is past everything published, park at the live
-     * active segment's published offset (caller will wait for new bytes).
-     */
-    private void positionCursorAt(long targetFsn) {
-        MmapSegment seg = engine.findSegmentContaining(targetFsn);
-        if (seg == null) {
-            // targetFsn is at or past publishedFsn — nothing to replay.
-            // Resume from the active segment's tip; producer may add more.
-            sendingSegment = engine.activeSegment();
-            sendOffset = sendingSegment.publishedOffset();
-            return;
-        }
-        sendingSegment = seg;
-        // Walk frame-by-frame from HEADER_SIZE until we land on targetFsn.
-        long offset = MmapSegment.HEADER_SIZE;
-        long fsn = seg.baseSeq();
-        long base = seg.address();
-        while (fsn < targetFsn) {
-            int payloadLen = Unsafe.getUnsafe().getInt(base + offset + 4);
-            offset += MmapSegment.FRAME_HEADER_SIZE + payloadLen;
-            fsn++;
-        }
-        sendOffset = offset;
-    }
-
-    /**
-     * Mark the loop as fatally failed. Caller has decided no reconnect
-     * is possible (or it ran out of budget) — record the error so
-     * {@link #checkError} can surface it to the producer thread, then
-     * stop the loop.
-     */
-    private void recordFatal(Throwable t) {
-        recordFatal(t, null);
-    }
-
-    /**
-     * Server-rejection-aware variant. Stashes a typed {@link SenderError} alongside
-     * the throwable so {@code QwpWebSocketSender.getLastTerminalError()} can surface
-     * the structured payload for ops/observability. Idempotent — only the first
-     * failure latches.
-     */
-    private void recordFatal(Throwable t, SenderError serverError) {
-        if (lastError == null) {
-            lastError = t;
-            lastTerminalServerError = serverError;
-        }
-        running = false;
-        if (serverError != null) {
-            LOG.error("Cursor I/O loop failure: {}", t.getMessage());
-        } else {
-            LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
-        }
-    }
-
-    private void releasePendingEntry(PendingDurableEntry e) {
-        if (e == null) return;
-        e.tableCount = 0;
-        // Null out name references so released entries don't pin Strings
-        // alive across reconnects. Length is small, so the loop cost is
-        // negligible compared to the indirect tenuring savings.
-        if (e.tableNames != null) {
-            Arrays.fill(e.tableNames, null);
-        }
-        pendingDurablePool.addFirst(e);
-    }
-
-    /**
-     * Send a WebSocket PING to prod the server into flushing pending
-     * STATUS_DURABLE_ACK frames, but only when the throttle interval has
-     * elapsed since the last keepalive PING. The server's egress code only
-     * runs flushPendingAck on inbound recv events; without this prod, an
-     * idle connection waiting on durable-ack confirmation can sit forever.
-     * <p>
-     * Best-effort: any send failure routes through the standard fail() path
-     * so the reconnect loop can take over. Caller is responsible for the
-     * "do we even need to send" gate (durableAckMode + non-empty pending).
-     */
-    private void sendDurableAckKeepaliveIfDue() {
-        long now = System.nanoTime();
-        if (now - lastKeepalivePingNanos < durableAckKeepaliveIntervalNanos) {
-            return;
-        }
-        lastKeepalivePingNanos = now;
-        try {
-            client.sendPing(1000);
-        } catch (Throwable t) {
-            fail(t);
-        }
-    }
-
-    /**
-     * Reset wire state for a fresh connection: install the new client,
-     * realign {@code fsnAtZero} to the next unacked FSN, restart wire
-     * sequencing from 0, and reposition the cursor so the next
-     * {@link #trySendOne} call replays the first unacked frame.
-     */
-    private void swapClient(WebSocketClient newClient) {
-        WebSocketClient old = this.client;
-        this.client = newClient;
-        // Sticky: once the wire is up, we've reached the server at least
-        // once for this sender's lifetime. Used downstream to classify a
-        // subsequent budget exhaustion as transient vs config-likely.
-        this.hasEverConnected = true;
-        if (old != null) {
-            try {
-                old.close();
-            } catch (Throwable ignored) {
-                // best-effort
-            }
-        }
-        long replayStart = engine.ackedFsn() + 1L;
-        this.fsnAtZero = replayStart;
-        this.nextWireSeq = 0L;
-        this.consecutiveSendErrors.set(0L);
-        // Snapshot publishedFsn at swap time — frames at FSN ≤ this value
-        // were already on the wire before the drop and will be replayed.
-        // trySendOne increments totalFramesReplayed for each one, then
-        // resets replayTargetFsn to -1 once we cross the boundary.
-        long pubAtSwap = engine.publishedFsn();
-        this.replayTargetFsn = pubAtSwap >= replayStart ? pubAtSwap : -1L;
-        // Drop any durable-ack tracking from the previous connection. The
-        // new connection will re-OK every replayed batch and the server
-        // re-emits cumulative durable-ack watermarks from scratch, so
-        // carrying stale state across the wire boundary would either
-        // double-trim or starve the queue.
-        clearDurableAckTracking();
-        positionCursorAt(replayStart);
-    }
-
-    private boolean tryReceiveAcks() {
-        boolean any = false;
-        try {
-            while (running && client.tryReceiveFrame(responseHandler)) {
-                any = true;
-            }
-        } catch (Throwable t) {
-            fail(t);
-        }
-        return any;
     }
 
     /**
@@ -1459,71 +1032,80 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return true;
     }
 
-    /**
-     * Sets {@code fsnAtZero}, {@code nextWireSeq}, and the cursor
-     * (sendingSegment + sendOffset) to the first unsent FSN. Visible for
-     * tests so they can assert correct positioning without spinning a
-     * real I/O thread + WebSocket.
-     */
-    void positionCursorForStart() {
-        long replayStart = engine.ackedFsn() + 1L;
-        this.fsnAtZero = replayStart;
-        this.nextWireSeq = 0L;
-        positionCursorAt(replayStart);
+    private boolean tryReceiveAcks() {
+        boolean any = false;
+        try {
+            while (running && client.tryReceiveFrame(responseHandler)) {
+                any = true;
+            }
+        } catch (Throwable t) {
+            fail(t);
+        }
+        return any;
     }
 
     /**
-     * Factory used by the I/O loop to build a fresh, connected, upgraded
-     * {@link WebSocketClient} after a wire failure. Implementations close
-     * the old client (if needed), build a new one with the same auth/TLS
-     * config, connect, perform the WebSocket upgrade, and return it ready
-     * to send. Throw on a terminal failure (auth rejection, etc.) — the
-     * I/O loop will treat the throw as fatal.
-     */
-    @FunctionalInterface
-    public interface ReconnectFactory {
-        WebSocketClient reconnect() throws Exception;
-    }
-
-    /**
-     * One slot in the pendingDurable FIFO. Holds a wireSeq plus the per-table
-     * (name, seqTxn) pairs from its OK frame. Empty entries (tableCount = 0)
-     * represent batches that committed nothing to a WAL table -- spec defines
-     * them as trivially durable as soon as preceding entries are durable.
+     * Send a WebSocket PING to prod the server into flushing pending
+     * STATUS_DURABLE_ACK frames, but only when the throttle interval has
+     * elapsed since the last keepalive PING. The server's egress code only
+     * runs flushPendingAck on inbound recv events; without this prod, an
+     * idle connection waiting on durable-ack confirmation can sit forever.
      * <p>
-     * Reused via the loop's pendingDurablePool to keep steady-state allocation
-     * confined to capacity growth.
+     * Best-effort: any send failure routes through the standard fail() path
+     * so the reconnect loop can take over. Caller is responsible for the
+     * "do we even need to send" gate (durableAckMode + non-empty pending).
      */
-    private static final class PendingDurableEntry {
-        long[] seqTxns;
-        int tableCount;
-        String[] tableNames;
-        long wireSeq;
-
-        void ensureCapacity(int n) {
-            if (tableNames == null || tableNames.length < n) {
-                int newCap = Math.max(n, tableNames == null ? 4 : tableNames.length * 2);
-                tableNames = new String[newCap];
-                seqTxns = new long[newCap];
-            }
+    private void sendDurableAckKeepaliveIfDue() {
+        long now = System.nanoTime();
+        if (now - lastKeepalivePingNanos < durableAckKeepaliveIntervalNanos) {
+            return;
         }
-
-        boolean isDurableUnder(CharSequenceLongHashMap watermarks) {
-            for (int i = 0; i < tableCount; i++) {
-                // NO_ENTRY_VALUE is -1L; valid seqTxns are non-negative, so
-                // a single comparison covers both "absent" and "behind".
-                if (watermarks.get(tableNames[i]) < seqTxns[i]) {
-                    return false;
-                }
-            }
-            return true;
+        lastKeepalivePingNanos = now;
+        try {
+            client.sendPing(1000);
+        } catch (Throwable t) {
+            fail(t);
         }
     }
 
-    /**
-     * Inner ACK handler — parses the binary frame, calls engine.acknowledge.
-     */
+    /** Inner ACK handler — parses the binary frame, calls engine.acknowledge. */
     private final class ResponseHandler implements WebSocketFrameHandler {
+        @Override
+        public void onClose(int code, String reason) {
+            // Terminal close codes signal the server has rejected the wire
+            // bytes themselves — reconnecting and replaying the same bytes
+            // produces the same close. Stash a typed PROTOCOL_VIOLATION
+            // SenderError and halt directly. Reconnect-eligible codes
+            // (NORMAL_CLOSURE, GOING_AWAY, ABNORMAL_CLOSURE, etc.) still go
+            // through fail() so the reconnect retry loop can handle them.
+            if (isTerminalCloseCode(code)) {
+                long fromFsn = engine.ackedFsn() + 1L;
+                long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                String msg = "ws-close[" + code + " " + WebSocketCloseCode.describe(code)
+                        + "]: " + reason;
+                SenderError err = new SenderError(
+                        SenderError.Category.PROTOCOL_VIOLATION,
+                        SenderError.Policy.HALT,
+                        SenderError.NO_STATUS_BYTE,
+                        msg,
+                        SenderError.NO_MESSAGE_SEQUENCE,
+                        fromFsn,
+                        toFsn,
+                        null,
+                        System.nanoTime()
+                );
+                totalServerErrors.incrementAndGet();
+                // recordFatal MUST run before dispatchError so the producer-
+                // observable terminal error is latched before the handler is
+                // invoked.
+                recordFatal(new LineSenderServerException(err), err);
+                dispatchError(err);
+                return;
+            }
+            fail(new LineSenderException(
+                    "WebSocket closed by server: code=" + code + " reason=" + reason));
+        }
+
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
             if (!response.readFrom(payloadPtr, payloadLen)) {
@@ -1584,42 +1166,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // for now; user-override resolution lands in a later commit),
             // dispatch.
             handleServerRejection(wireSeq);
-        }
-
-        @Override
-        public void onClose(int code, String reason) {
-            // Terminal close codes signal the server has rejected the wire
-            // bytes themselves — reconnecting and replaying the same bytes
-            // produces the same close. Stash a typed PROTOCOL_VIOLATION
-            // SenderError and halt directly. Reconnect-eligible codes
-            // (NORMAL_CLOSURE, GOING_AWAY, ABNORMAL_CLOSURE, etc.) still go
-            // through fail() so the reconnect retry loop can handle them.
-            if (isTerminalCloseCode(code)) {
-                long fromFsn = engine.ackedFsn() + 1L;
-                long toFsn = Math.max(fromFsn, engine.publishedFsn());
-                String msg = "ws-close[" + code + " " + WebSocketCloseCode.describe(code)
-                        + "]: " + reason;
-                SenderError err = new SenderError(
-                        SenderError.Category.PROTOCOL_VIOLATION,
-                        SenderError.Policy.HALT,
-                        SenderError.NO_STATUS_BYTE,
-                        msg,
-                        SenderError.NO_MESSAGE_SEQUENCE,
-                        fromFsn,
-                        toFsn,
-                        null,
-                        System.nanoTime()
-                );
-                totalServerErrors.incrementAndGet();
-                // recordFatal MUST run before dispatchError so the producer-
-                // observable terminal error is latched before the handler is
-                // invoked.
-                recordFatal(new LineSenderServerException(err), err);
-                dispatchError(err);
-                return;
-            }
-            fail(new LineSenderException(
-                    "WebSocket closed by server: code=" + code + " reason=" + reason));
         }
 
         private void handlePreSendRejection(long wireSeq, byte status,
@@ -1745,6 +1291,235 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
                 dispatchError(err);
             }
+        }
+    }
+
+    /**
+     * True if a WebSocket close code signals an unrecoverable protocol-layer
+     * violation: replaying the same bytes will produce the same close. Reserved
+     * codes that "MUST NOT be sent in a Close frame" (1004/1005/1006/1015) are
+     * intentionally not classified as terminal here — when they arrive in
+     * practice they signal abnormal disconnect rather than the server's
+     * reasoned rejection of payload bytes, so reconnect is the right reaction.
+     * Exposed for unit tests.
+     */
+    @TestOnly
+    public static boolean isTerminalCloseCode(int code) {
+        switch (code) {
+            case WebSocketCloseCode.PROTOCOL_ERROR:
+            case WebSocketCloseCode.UNSUPPORTED_DATA:
+            case WebSocketCloseCode.INVALID_PAYLOAD_DATA:
+            case WebSocketCloseCode.POLICY_VIOLATION:
+            case WebSocketCloseCode.MESSAGE_TOO_BIG:
+            case WebSocketCloseCode.MANDATORY_EXTENSION:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Total {@code STATUS_DURABLE_ACK} frames received since the loop started.
+     * Always 0 when {@code durableAckMode} is false. Useful for confirming
+     * the server is actually emitting durable acks under load.
+     */
+    public long getTotalDurableAcks() {
+        return totalDurableAcks.get();
+    }
+
+    /**
+     * Total times a durable-ack frame caused {@link CursorSendEngine#acknowledge}
+     * to advance. Always 0 when {@code durableAckMode} is false. A non-zero
+     * value bounded below {@code getTotalDurableAcks} is normal -- many
+     * durable-acks land on watermarks that don't yet cover any pending
+     * entries (e.g. one of two tables has caught up but the other has not).
+     */
+    public long getTotalDurableTrimAdvances() {
+        return totalDurableTrimAdvances.get();
+    }
+
+    /** True when this loop drives trim from durable-ack frames. Diagnostic only. */
+    public boolean isDurableAckMode() {
+        return durableAckMode;
+    }
+
+    private PendingDurableEntry acquirePendingEntry() {
+        PendingDurableEntry e = pendingDurablePool.pollFirst();
+        return e != null ? e : new PendingDurableEntry();
+    }
+
+    private void applyDurableAck() {
+        // Update per-table watermarks from the inbound frame, taking the
+        // max so a reordered or older cumulative frame can't move a watermark
+        // backwards. Then walk the head of pendingDurable, popping every
+        // entry whose tables are all covered. The map's NO_ENTRY_VALUE
+        // sentinel is -1L; valid seqTxns are non-negative, so the guard
+        // doubles as an "absent" check.
+        int n = response.getTableEntryCount();
+        for (int i = 0; i < n; i++) {
+            String name = response.getTableName(i);
+            long seqTxn = response.getTableSeqTxn(i);
+            long current = durableTableWatermarks.get(name);
+            if (seqTxn > current) {
+                durableTableWatermarks.put(name, seqTxn);
+            }
+        }
+        drainPendingDurable();
+    }
+
+    /**
+     * Stash a wireSeq + per-table seqTxns from the current OK / NACK frame
+     * for later durable-ack confirmation. {@link #response} must hold the
+     * OK or rejection frame at call time. NACK frames carry no per-table
+     * entries, so they enqueue as trivially-durable empty placeholders.
+     */
+    private void enqueuePendingOk(long wireSeq) {
+        PendingDurableEntry e = acquirePendingEntry();
+        e.wireSeq = wireSeq;
+        int n = response.getTableEntryCount();
+        e.ensureCapacity(n);
+        for (int i = 0; i < n; i++) {
+            e.tableNames[i] = response.getTableName(i);
+            e.seqTxns[i] = response.getTableSeqTxn(i);
+        }
+        e.tableCount = n;
+        pendingDurable.addLast(e);
+    }
+
+    /**
+     * Pop every head entry whose tables are all covered by the durable
+     * watermarks and call {@link CursorSendEngine#acknowledge} once with
+     * the highest popped wireSeq. Trivially-durable entries (tableCount=0,
+     * from empty-WAL OK frames or NACK frames) pop unconditionally.
+     */
+    private void drainPendingDurable() {
+        long highest = Long.MIN_VALUE;
+        while (!pendingDurable.isEmpty()) {
+            PendingDurableEntry head = pendingDurable.peekFirst();
+            if (!head.isDurableUnder(durableTableWatermarks)) {
+                break;
+            }
+            highest = head.wireSeq;
+            releasePendingEntry(pendingDurable.pollFirst());
+        }
+        if (highest != Long.MIN_VALUE) {
+            long fsn = fsnAtZero + highest;
+            if (engine.acknowledge(fsn)) {
+                dispatchProgress(fsn);
+            }
+            totalDurableTrimAdvances.incrementAndGet();
+        }
+    }
+
+    private void releasePendingEntry(PendingDurableEntry e) {
+        if (e == null) return;
+        e.tableCount = 0;
+        // Null out name references so released entries don't pin Strings
+        // alive across reconnects. Length is small, so the loop cost is
+        // negligible compared to the indirect tenuring savings.
+        if (e.tableNames != null) {
+            Arrays.fill(e.tableNames, null);
+        }
+        pendingDurablePool.addFirst(e);
+    }
+
+    /**
+     * Send {@code err} to the async-delivery dispatcher if one is configured.
+     * Producer-side typed throw (HALT) goes through {@code recordFatal} +
+     * {@code checkError} regardless — this is purely the async observer path.
+     */
+    private void dispatchError(SenderError err) {
+        SenderErrorDispatcher d = errorDispatcher;
+        if (d != null) {
+            d.offer(err);
+        }
+    }
+
+    /**
+     * Notify the progress dispatcher that the ack watermark advanced to
+     * {@code ackedFsn}. Caller must already have observed the advance via
+     * {@link CursorSendEngine#acknowledge}'s boolean return; this method
+     * does no further filtering.
+     */
+    private void dispatchProgress(long ackedFsn) {
+        SenderProgressDispatcher d = progressDispatcher;
+        if (d != null) {
+            d.offer(ackedFsn);
+        }
+    }
+
+    /** Maps a server status byte to a {@link SenderError.Category}. Exposed for unit tests. */
+    @TestOnly
+    public static SenderError.Category classify(byte status) {
+        switch (status) {
+            case WebSocketResponse.STATUS_SCHEMA_MISMATCH:
+                return SenderError.Category.SCHEMA_MISMATCH;
+            case WebSocketResponse.STATUS_PARSE_ERROR:
+                return SenderError.Category.PARSE_ERROR;
+            case WebSocketResponse.STATUS_INTERNAL_ERROR:
+                return SenderError.Category.INTERNAL_ERROR;
+            case WebSocketResponse.STATUS_SECURITY_ERROR:
+                return SenderError.Category.SECURITY_ERROR;
+            case WebSocketResponse.STATUS_WRITE_ERROR:
+                return SenderError.Category.WRITE_ERROR;
+            default:
+                return SenderError.Category.UNKNOWN;
+        }
+    }
+
+    /**
+     * Default policy per spec § "Default category → policy". User overrides
+     * (builder + connect-string) plug in here in a later commit; today this is
+     * the only resolver. Exposed for unit tests.
+     */
+    @TestOnly
+    public static SenderError.Policy defaultPolicyFor(SenderError.Category category) {
+        switch (category) {
+            case SCHEMA_MISMATCH:
+            case WRITE_ERROR:
+                return SenderError.Policy.DROP_AND_CONTINUE;
+            case PARSE_ERROR:
+            case INTERNAL_ERROR:
+            case SECURITY_ERROR:
+            case PROTOCOL_VIOLATION:
+            case UNKNOWN:
+            default:
+                return SenderError.Policy.HALT;
+        }
+    }
+
+    /**
+     * One slot in the pendingDurable FIFO. Holds a wireSeq plus the per-table
+     * (name, seqTxn) pairs from its OK frame. Empty entries (tableCount = 0)
+     * represent batches that committed nothing to a WAL table -- spec defines
+     * them as trivially durable as soon as preceding entries are durable.
+     * <p>
+     * Reused via the loop's pendingDurablePool to keep steady-state allocation
+     * confined to capacity growth.
+     */
+    private static final class PendingDurableEntry {
+        long[] seqTxns;
+        int tableCount;
+        String[] tableNames;
+        long wireSeq;
+
+        void ensureCapacity(int n) {
+            if (tableNames == null || tableNames.length < n) {
+                int newCap = Math.max(n, tableNames == null ? 4 : tableNames.length * 2);
+                tableNames = new String[newCap];
+                seqTxns = new long[newCap];
+            }
+        }
+
+        boolean isDurableUnder(CharSequenceLongHashMap watermarks) {
+            for (int i = 0; i < tableCount; i++) {
+                // NO_ENTRY_VALUE is -1L; valid seqTxns are non-negative, so
+                // a single comparison covers both "absent" and "behind".
+                if (watermarks.get(tableNames[i]) < seqTxns[i]) {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 }

@@ -44,7 +44,7 @@ public class LineSenderBuilderTest {
 
     @Test
     public void testAddressDoubleSet_firstAddressThenAddress() throws Exception {
-        assertMemoryLeak(() -> assertThrows("mismatch",
+        assertMemoryLeak(() -> assertThrows("only a single address",
                 Sender.builder(Sender.Transport.TCP).address(LOCALHOST).address("127.0.0.1")));
     }
 

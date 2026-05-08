@@ -29,7 +29,6 @@ import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
-import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.std.Chars;
@@ -42,8 +41,9 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.List;
-import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -101,8 +101,6 @@ public class QwpQueryClient implements QuietCloseable {
 
     public static final String DEFAULT_ENDPOINT_PATH = "/read/v1";
     public static final int DEFAULT_WS_PORT = 9000;
-    public static final String LB_STRATEGY_FIRST = "first";
-    public static final String LB_STRATEGY_RANDOM = "random";
     /**
      * Hard ceiling on {@link #withMaxBatchRows}. Matches the client decoder's
      * own {@code MAX_ROWS_PER_BATCH} safety cap so a user cannot ask for a
@@ -115,14 +113,6 @@ public class QwpQueryClient implements QuietCloseable {
     public static final String TARGET_ANY = "any";
     public static final String TARGET_PRIMARY = "primary";
     public static final String TARGET_REPLICA = "replica";
-    /**
-     * Default per-host upper bound on the HTTP upgrade response read.
-     * Matches {@code failover.md} §1.1. Bounds the common "TCP accepts but
-     * the server never replies" blackhole. Does not cover TCP connect (OS
-     * default) or the post-upgrade {@code SERVER_INFO} frame read (separate
-     * 5 s timeout via {@link #DEFAULT_SERVER_INFO_TIMEOUT_MS}).
-     */
-    private static final int DEFAULT_AUTH_TIMEOUT_MS = 15_000;
     /**
      * Default initial backoff between failover attempts, in milliseconds.
      * Doubled on each subsequent retry up to
@@ -146,15 +136,12 @@ public class QwpQueryClient implements QuietCloseable {
      * in bounded wall time: with 8 attempts and a 1 s cap the client gives
      * up after roughly 5 s of cumulative sleep.
      */
+    private static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
     private static final long DEFAULT_FAILOVER_MAX_BACKOFF_MS = 1_000L;
-    /**
-     * Default per-{@link #execute} wall-clock budget across all failover
-     * attempts. Matches {@code failover.md} §1.3. {@code 0} means
-     * unbounded; the loop is then governed by {@link #failoverMaxAttempts}
-     * alone.
-     */
     private static final long DEFAULT_FAILOVER_MAX_DURATION_MS = 30_000L;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
+    private static final String LB_FIRST = "first";
+    private static final String LB_RANDOM = "random";
     /**
      * How long {@link #connect()} waits to read the v2 {@code SERVER_INFO} frame
      * from each endpoint before giving up and moving to the next. 5 seconds is
@@ -176,16 +163,8 @@ public class QwpQueryClient implements QuietCloseable {
     // scratch.
     private final AtomicBoolean closedFlag = new AtomicBoolean();
     private final List<Endpoint> endpoints = new ArrayList<>();
-    // Source of randomness for full-jitter backoff (failover.md §3.1) and
-    // for any future entropy needs that ride on the failover loop. Held
-    // as a field so tests can swap a deterministic instance via
-    // {@link #withFailoverRandom(Random)}.
-    private final Random failoverRandom = new Random();
-    // Per-host upper bound on the HTTP upgrade response read.
-    // Bounds the "TCP accepts but the server never replies" blackhole.
-    // Configured via {@code auth_timeout_ms=} in the connection string;
-    // see failover.md §1.1.
-    private int authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
+    private final AtomicBoolean executing = new AtomicBoolean();
+    private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private String authorizationHeader;
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private String clientId;
@@ -197,18 +176,17 @@ public class QwpQueryClient implements QuietCloseable {
     // {@code compression=zstd} (demands zstd) or {@code compression=auto}
     // (advertises zstd,raw and lets the server pick).
     private String compressionPreference = "raw";
-    // Published by connect() / reconnectSkippingIndex() and read by cancel(),
+    // Published by connect() / reconnectViaTracker() and read by cancel(),
     // close(), and the pre-connect-guard on the configuration setters. Volatile
     // both for the standard happens-before relationship against pre-connect
     // configuration writes and so a second thread calling cancel() or close()
     // observes the freshly-bound state without explicit synchronisation.
     private volatile boolean connected;
     // Index of the endpoint the current connection is bound to. -1 when
-    // disconnected. Read by the failover path to record mid-stream demotes
-    // against the right host before the next walkTracker call. Volatile
-    // because execute() on the user thread reads + rewrites across a
-    // cleanup-reconnect handoff and cancel() from another thread may also
-    // read it for diagnostics.
+    // disconnected. Used by the failover path to skip the current endpoint
+    // when picking the next one to try. Volatile because execute() on the
+    // user thread reads + rewrites across a cleanup-reconnect handoff and
+    // cancel() from another thread may also read it for diagnostics.
     private volatile int currentEndpointIndex = -1;
     // One-shot terminal-failure listener held by the currently-bound I/O
     // thread. Every new QwpEgressIoThread gets a fresh instance wired to it
@@ -232,17 +210,8 @@ public class QwpQueryClient implements QuietCloseable {
     private long failoverInitialBackoffMs = DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
     private int failoverMaxAttempts = DEFAULT_FAILOVER_MAX_ATTEMPTS;
     private long failoverMaxBackoffMs = DEFAULT_FAILOVER_MAX_BACKOFF_MS;
-    // Total wall-clock budget across all failover attempts in a single
-    // {@link #execute} call. {@code 0} disables the deadline (loop is then
-    // bounded by {@link #failoverMaxAttempts} alone). See failover.md §1.3.
     private long failoverMaxDurationMs = DEFAULT_FAILOVER_MAX_DURATION_MS;
-    // Per-host classification tracker driving multi-host failover. Lazily
-    // sized to {@link #endpoints#size} on the first call to
-    // {@link #ensureHostHealthTracker} -- this lets {@link #fromConfig}
-    // append every parsed endpoint before the tracker is dimensioned.
-    // Subsequent {@link #connect}/{@link #execute} calls read/write the
-    // same instance.
-    private HostHealthTracker hostHealthTracker;
+    private QwpHostHealthTracker hostTracker;
     // Credit-flow send-ahead budget. 0 = unbounded (Phase-1 default, no CREDIT
     // bookkeeping on either side). A positive value puts the stream under byte-
     // based flow control: the server emits at most this many bytes of result
@@ -263,13 +232,7 @@ public class QwpQueryClient implements QuietCloseable {
     private volatile QwpEgressIoThread ioThread;
     private volatile Thread ioThreadHandle;
     private boolean lastCloseTimedOut;
-    // Initial address-list ordering at client construction:
-    // {@link #LB_STRATEGY_RANDOM} (default) shuffles the addr list once so a
-    // fleet of clients hitting the same primary distributes its first
-    // attempt across endpoints; {@link #LB_STRATEGY_FIRST} preserves the
-    // declared order. Configured via {@code lb_strategy=} in the connection
-    // string; see failover.md §1.3.
-    private String lbStrategy = LB_STRATEGY_RANDOM;
+    private String lbStrategy = LB_RANDOM;
     // Client preference for server-side per-batch row cap. 0 means "unset",
     // server uses its default. Set via {@code max_batch_rows=N} in the
     // connection string or {@link #withMaxBatchRows}. Smaller values give
@@ -306,7 +269,7 @@ public class QwpQueryClient implements QuietCloseable {
     private int tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
     private char[] trustStorePassword;
     private String trustStorePath;
-    private WebSocketClient webSocketClient;
+    private volatile WebSocketClient webSocketClient;
 
     private QwpQueryClient(String host, int port) {
         this.endpoints.add(new Endpoint(host, port));
@@ -334,18 +297,6 @@ public class QwpQueryClient implements QuietCloseable {
      *       {@link #execute}, reconnect to another endpoint and re-submit the query.
      *       The user handler sees {@link QwpColumnBatchHandler#onFailoverReset} before
      *       replayed batches begin arriving (batch_seq restarts at 0 on the new node).</li>
-     *   <li>{@code failover_max_attempts=N} -- per-{@link #execute} retry cap, including the
-     *       initial attempt. Default 8.</li>
-     *   <li>{@code failover_backoff_initial_ms=N} -- first post-failure sleep between failover
-     *       reconnects. Default 50.</li>
-     *   <li>{@code failover_backoff_max_ms=N} -- ceiling on the per-attempt sleep. Default 1000.</li>
-     *   <li>{@code failover_max_duration_ms=N} -- total wall-clock budget per {@link #execute}.
-     *       {@code 0} disables the deadline. Default 30000.</li>
-     *   <li>{@code auth_timeout_ms=N} -- per-host upper bound on the HTTP upgrade response read.
-     *       Default 15000. See failover.md §1.1.</li>
-     *   <li>{@code lb_strategy=random|first} -- initial address-list ordering at client construction.
-     *       {@code random} (default) shuffles once so a client fleet spreads its first attempt across
-     *       endpoints; {@code first} preserves the declared order.</li>
      *   <li>{@code path=/read/v1} -- egress endpoint. Default {@value #DEFAULT_ENDPOINT_PATH}.</li>
      *   <li>{@code auth=<value>} -- sent verbatim as the HTTP {@code Authorization} header during the upgrade handshake.
      *       Mutually exclusive with {@code username}/{@code password} and {@code token}.</li>
@@ -405,7 +356,7 @@ public class QwpQueryClient implements QuietCloseable {
         Long failoverBackoffInitialMs = null;
         Long failoverBackoffMaxMs = null;
         Long failoverMaxDurationMs = null;
-        Integer authTimeoutMs = null;
+        Long authTimeoutMs = null;
         String lbStrategy = null;
         String auth = null;
         String username = null;
@@ -484,33 +435,39 @@ public class QwpQueryClient implements QuietCloseable {
                         throw new IllegalArgumentException("failover_backoff_max_ms must be >= 0");
                     }
                     break;
-                case "failover_max_duration_ms":
+                case "failover_max_duration_ms": {
+                    long parsed;
                     try {
-                        failoverMaxDurationMs = Long.parseLong(value);
+                        parsed = Long.parseLong(value);
                     } catch (NumberFormatException e) {
                         throw new IllegalArgumentException("invalid failover_max_duration_ms: " + value);
                     }
-                    if (failoverMaxDurationMs < 0L) {
+                    if (parsed < 0L) {
                         throw new IllegalArgumentException("failover_max_duration_ms must be >= 0");
                     }
+                    failoverMaxDurationMs = parsed;
                     break;
-                case "auth_timeout_ms":
-                    try {
-                        authTimeoutMs = Integer.parseInt(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid auth_timeout_ms: " + value);
-                    }
-                    if (authTimeoutMs < 1) {
-                        throw new IllegalArgumentException("auth_timeout_ms must be >= 1");
-                    }
-                    break;
+                }
                 case "lb_strategy":
-                    if (!LB_STRATEGY_RANDOM.equals(value) && !LB_STRATEGY_FIRST.equals(value)) {
+                    if (!LB_RANDOM.equals(value) && !LB_FIRST.equals(value)) {
                         throw new IllegalArgumentException(
                                 "invalid lb_strategy: " + value + " (expected random or first)");
                     }
                     lbStrategy = value;
                     break;
+                case "auth_timeout_ms": {
+                    long parsed;
+                    try {
+                        parsed = Long.parseLong(value);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("invalid auth_timeout_ms: " + value);
+                    }
+                    if (parsed <= 0L) {
+                        throw new IllegalArgumentException("auth_timeout_ms must be > 0");
+                    }
+                    authTimeoutMs = parsed;
+                    break;
+                }
                 case "path":
                     path = value;
                     break;
@@ -613,22 +570,11 @@ public class QwpQueryClient implements QuietCloseable {
             throw new IllegalArgumentException(
                     "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
         }
-        // Apply lb_strategy=random (default) shuffle to the parsed list
-        // BEFORE constructing the client so the client's view of the
-        // endpoint order is the post-shuffle order. lb_strategy=first
-        // preserves declared order. The shuffle happens once at
-        // construction; subsequent walks through the tracker reorder by
-        // priority but never re-shuffle.
-        boolean useRandomStrategy = lbStrategy == null || LB_STRATEGY_RANDOM.equals(lbStrategy);
-        if (useRandomStrategy && parsedEndpoints.size() > 1) {
-            java.util.Collections.shuffle(parsedEndpoints);
-        }
         Endpoint first = parsedEndpoints.get(0);
         QwpQueryClient client = new QwpQueryClient(first.host, first.port);
         for (int i = 1; i < parsedEndpoints.size(); i++) {
             client.endpoints.add(parsedEndpoints.get(i));
         }
-        client.lbStrategy = lbStrategy != null ? lbStrategy : LB_STRATEGY_RANDOM;
         client.withTarget(target);
         if (failover != null) {
             client.withFailover(failover);
@@ -647,6 +593,9 @@ public class QwpQueryClient implements QuietCloseable {
         }
         if (failoverMaxDurationMs != null) {
             client.withFailoverMaxDuration(failoverMaxDurationMs);
+        }
+        if (lbStrategy != null) {
+            client.withLbStrategy(lbStrategy);
         }
         if (authTimeoutMs != null) {
             client.withAuthTimeout(authTimeoutMs);
@@ -801,34 +750,87 @@ public class QwpQueryClient implements QuietCloseable {
      * endpoints unreachable" (the latter surfaces as a plain
      * {@link HttpClientException}).
      */
-    public void connect() {
+    public synchronized void connect() {
+        if (closedFlag.get()) {
+            throw new IllegalStateException("QwpQueryClient is closed");
+        }
         if (connected) {
             return;
         }
-        ensureHostHealthTracker();
-        // Initial connect uses one WalkTracker invocation (failover.md
-        // §4.3). The tracker is fresh -- every host UNKNOWN, attempted=false
-        // -- so no BeginRound is needed. WalkTracker handles its own
-        // fall-through reset on round exhaustion.
-        WalkResult result = walkTracker();
-        if (result.success) {
+        lastCloseTimedOut = false;
+        if (hostTracker == null) {
+            if (LB_RANDOM.equals(lbStrategy) && endpoints.size() > 1) {
+                List<Endpoint> shuffled = new ArrayList<>(endpoints);
+                Collections.shuffle(shuffled, ThreadLocalRandom.current());
+                endpoints.clear();
+                endpoints.addAll(shuffled);
+            }
+            hostTracker = new QwpHostHealthTracker(endpoints.size());
+        } else {
+            hostTracker.beginRound(false);
+        }
+        QwpServerInfo lastObservedMismatch = null;
+        boolean sawV1Mismatch = false;
+        Throwable lastTransportError = null;
+        while (true) {
+            int i = hostTracker.pickNext();
+            if (i < 0) {
+                break;
+            }
+            Endpoint ep = endpoints.get(i);
+            try {
+                connectToEndpoint(ep);
+            } catch (QwpAuthFailedException ae) {
+                cleanupFailedConnect();
+                throw ae;
+            } catch (QwpIngressRoleRejectedException re) {
+                lastTransportError = re;
+                hostTracker.recordRoleReject(i, re.isTransient());
+                LOG.info("QwpQueryClient {}:{} rejected upgrade with role={}; trying next",
+                        ep.host, ep.port, re.getRole());
+                cleanupFailedConnect();
+                continue;
+            } catch (RuntimeException e) {
+                lastTransportError = e;
+                hostTracker.recordTransportError(i);
+                LOG.warn("QwpQueryClient connect failed for {}:{} -- {}", ep.host, ep.port, e.getMessage());
+                cleanupFailedConnect();
+                continue;
+            }
+            QwpServerInfo info = serverInfo;
+            if (!TARGET_ANY.equals(target) && info == null) {
+                sawV1Mismatch = true;
+                hostTracker.recordRoleReject(i, false);
+                LOG.info("QwpQueryClient {}:{} negotiated v1 (no SERVER_INFO) and target={} requires v2; trying next",
+                        ep.host, ep.port, target);
+                cleanupFailedConnect();
+                continue;
+            }
+            if (info != null && !matchesTarget(info.getRole(), target)) {
+                lastObservedMismatch = info;
+                boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
+                hostTracker.recordRoleReject(i, isTransient);
+                LOG.info("QwpQueryClient {}:{} role={} does not match target={}, trying next",
+                        ep.host, ep.port, QwpServerInfo.roleName(info.getRole()), target);
+                cleanupFailedConnect();
+                continue;
+            }
+            spawnIoThread();
+            hostTracker.recordSuccess(i);
+            currentEndpointIndex = i;
+            connected = true;
             return;
         }
-        // No endpoint matches the target / is reachable. Surface the most
-        // informative error: a role-mismatch result tells the caller "no
-        // primary available", a transport-only result tells them "all
-        // endpoints unreachable". The two get distinct exception types so
-        // callers can branch on the failure mode.
-        if (result.lastInfo != null) {
+        if (lastObservedMismatch != null) {
             throw new QwpRoleMismatchException(
                     target,
-                    result.lastInfo,
+                    lastObservedMismatch,
                     "no endpoint matches target=" + target + "; last observed role="
-                            + QwpServerInfo.roleName(result.lastInfo.getRole())
-                            + " cluster=" + result.lastInfo.getClusterId()
+                            + QwpServerInfo.roleName(lastObservedMismatch.getRole())
+                            + " cluster=" + lastObservedMismatch.getClusterId()
             );
         }
-        if (result.sawV1Mismatch) {
+        if (sawV1Mismatch) {
             throw new QwpRoleMismatchException(
                     target,
                     null,
@@ -836,20 +838,9 @@ public class QwpQueryClient implements QuietCloseable {
                             + "; at least one endpoint negotiated v1 and cannot supply a role"
             );
         }
-        if (result.anyRoleMismatch) {
-            // 421 + X-QuestDB-Role at every walked endpoint (no v2
-            // SERVER_INFO available). Disambiguate from "all unreachable"
-            // so callers see "no primary available" semantics.
-            throw new QwpRoleMismatchException(
-                    target,
-                    null,
-                    "no endpoint matches target=" + target
-                            + "; every endpoint replied with 421 + X-QuestDB-Role"
-            );
-        }
         throw new HttpClientException(
                 "all QWP endpoints unreachable [count=" + endpoints.size()
-                        + ", lastError=" + (result.lastError == null ? "<none>" : result.lastError.getMessage()) + ']');
+                        + ", lastError=" + (lastTransportError == null ? "<none>" : lastTransportError.getMessage()) + ']');
     }
 
     /**
@@ -882,23 +873,38 @@ public class QwpQueryClient implements QuietCloseable {
      * defeats this reuse.
      */
     public void execute(String sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+        if (!executing.compareAndSet(false, true)) {
+            throw new IllegalStateException(
+                    "QwpQueryClient.execute called while another execute is in flight; one query at a time per client");
+        }
+        try {
+            executeImpl(sql, binds, handler);
+        } finally {
+            executing.set(false);
+        }
+    }
+
+    private void executeImpl(String sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+        if (closedFlag.get()) {
+            throw new IllegalStateException("QwpQueryClient is closed");
+        }
         if (!connected) {
             throw new IllegalStateException("QwpQueryClient not connected; call connect() first");
         }
-        // Per-Execute round reset uses BeginRound(forgetClassifications=false)
-        // (failover.md §4.3): the attempted-this-round flags are cleared but
-        // topology classifications observed in prior Executes are preserved.
-        // A previously role-rejected endpoint stays at the bottom of the
-        // priority order; WalkTracker fall-through reset rehabilitates it
-        // once the round walks off the end.
-        ensureHostHealthTracker();
-        hostHealthTracker.beginRound(false);
+        hostTracker.beginRound(false);
+        long failoverDeadlineNanos;
+        if (failoverMaxDurationMs > 0L) {
+            long durationNanos = failoverMaxDurationMs > Long.MAX_VALUE / 1_000_000L
+                    ? Long.MAX_VALUE
+                    : failoverMaxDurationMs * 1_000_000L;
+            long start = System.nanoTime();
+            failoverDeadlineNanos = start + durationNanos < start
+                    ? Long.MAX_VALUE
+                    : start + durationNanos;
+        } else {
+            failoverDeadlineNanos = Long.MAX_VALUE;
+        }
         int attempt = 0;
-        long backoffMs = failoverInitialBackoffMs;
-        long startNs = System.nanoTime();
-        long deadlineNs = failoverMaxDurationMs <= 0L
-                ? Long.MAX_VALUE
-                : startNs + Math.multiplyExact(failoverMaxDurationMs, 1_000_000L);
         while (true) {
             attempt++;
             FailoverProbeHandler probe = new FailoverProbeHandler(handler);
@@ -907,21 +913,10 @@ public class QwpQueryClient implements QuietCloseable {
                 return;
             }
             if (!failoverEnabled) {
-                // failover disabled: surface the transport failure to the user
-                // and leave the client in a broken state (per documented contract).
                 handler.onError(probe.interceptedStatus, probe.interceptedMessage);
                 return;
             }
-            if (probe.terminalFailoverBypass) {
-                // The I/O thread reported a failure that bypasses failover by
-                // contract (AuthError, ProtocolVersionError -- see
-                // failover.md §6 "Terminal"). Surface verbatim so the caller
-                // sees the cluster-wide condition rather than masking it
-                // behind a "failover exhausted" wrapper.
-                handler.onError(probe.interceptedStatus, probe.interceptedMessage);
-                return;
-            }
-            if (attempt >= failoverMaxAttempts) {
+            if (attempt >= failoverMaxAttempts || System.nanoTime() - failoverDeadlineNanos >= 0) {
                 int failovers = Math.max(0, attempt - 1);
                 handler.onError(probe.interceptedStatus,
                         "transport failure after " + attempt + " execute attempt"
@@ -931,91 +926,49 @@ public class QwpQueryClient implements QuietCloseable {
                                 + probe.interceptedMessage);
                 return;
             }
-            long nowNs = System.nanoTime();
-            if (nowNs >= deadlineNs) {
-                handler.onError(probe.interceptedStatus,
-                        "failover budget exhausted after "
-                                + ((nowNs - startNs) / 1_000_000L) + " ms (cap=" + failoverMaxDurationMs
-                                + " ms); last error: " + probe.interceptedMessage);
-                return;
-            }
-            // Snapshot the endpoint we were just bound to before cleanup
-            // clobbers currentEndpointIndex. The recordMidStreamFailure call
-            // MUST land on this index BEFORE the next walkTracker pick
-            // (failover.md §2.3) so a Healthy host gets demoted to
-            // TransportError before the tracker has a chance to re-pick it.
             int failedIndex = currentEndpointIndex;
-            if (failedIndex >= 0) {
-                hostHealthTracker.recordMidStreamFailure(failedIndex);
+            if (hostTracker != null && failedIndex >= 0) {
+                hostTracker.recordMidStreamFailure(failedIndex);
             }
-            // Tear the broken connection down before reconnecting. We don't want
-            // to leak the current I/O thread or WebSocket. cleanupFailedConnect
-            // also orphans the outgoing generation's terminal-failure listener
-            // so a late callback from the dying I/O thread cannot pollute the
-            // new connection's state.
             cleanupFailedConnect();
             connected = false;
-            // Full-jitter backoff (failover.md §3.1): sleep is uniform in
-            // [0, base). Clamped to remaining deadline budget so a single
-            // sleep cannot overshoot failoverMaxDurationMs.
-            long sleepMs = computeFailoverSleepMs(backoffMs, deadlineNs);
-            if (sleepMs > 0L) {
-                try {
-                    Thread.sleep(sleepMs);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
+            if (failoverInitialBackoffMs > 0L) {
+                long base = failoverInitialBackoffMs << Math.min(attempt - 1, 30);
+                if (base < 0L) base = failoverMaxBackoffMs;
+                long capped = Math.min(base, failoverMaxBackoffMs);
+                long delay = capped > 0L
+                        ? ThreadLocalRandom.current().nextLong(capped)
+                        : 0L;
+                long remainingNanos = failoverDeadlineNanos - System.nanoTime();
+                long remaining = remainingNanos <= 0L ? 0L : remainingNanos / 1_000_000L;
+                if (remainingNanos <= 0L) {
+                    int failovers = Math.max(0, attempt - 1);
                     handler.onError(probe.interceptedStatus,
-                            "failover interrupted while backing off after attempt "
-                                    + attempt + "; last error: " + probe.interceptedMessage);
+                            "transport failure after " + attempt + " execute attempt"
+                                    + (attempt == 1 ? "" : "s") + " ("
+                                    + failovers + " failover reconnect"
+                                    + (failovers == 1 ? "" : "s") + "); last error: "
+                                    + probe.interceptedMessage);
                     return;
+                }
+                if (delay > remaining) {
+                    delay = remaining;
+                }
+                if (delay > 0L) {
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        handler.onError(probe.interceptedStatus,
+                                "failover interrupted while backing off after attempt "
+                                        + attempt + "; last error: " + probe.interceptedMessage);
+                        return;
+                    }
                 }
             }
-            // Double the per-attempt backoff base for the next retry, capped
-            // at failoverMaxBackoffMs. The actual sleep stays in [0, base)
-            // so the doubling shows up as a wider jitter window, not a
-            // larger fixed sleep. Saturating before doubling guards against
-            // overflow on large initial values.
-            backoffMs = (backoffMs >= failoverMaxBackoffMs / 2L)
-                    ? failoverMaxBackoffMs
-                    : Math.min(backoffMs * 2L, failoverMaxBackoffMs);
-            // Reconnect inside the loop also walks the tracker without
-            // calling BeginRound (failover.md §4.3): topology
-            // classifications observed during this Execute()'s reconnects
-            // accumulate. Once the round exhausts, walkTracker calls
-            // BeginRound(forgetClassifications=true) once and walks one
-            // more time before returning failure.
             try {
-                WalkResult result = walkTracker();
-                if (!result.success) {
-                    handler.onError(probe.interceptedStatus,
-                            "failover exhausted after " + attempt + " attempt"
-                                    + (attempt == 1 ? "" : "s") + " across "
-                                    + endpoints.size() + " endpoint"
-                                    + (endpoints.size() == 1 ? "" : "s")
-                                    + (result.lastInfo != null
-                                    ? "; last observed role="
-                                      + QwpServerInfo.roleName(result.lastInfo.getRole())
-                                    : "")
-                                    + " [last error: " + probe.interceptedMessage
-                                    + ", reconnect error: "
-                                    + (result.lastError == null ? "<none>" : result.lastError.getMessage())
-                                    + ']');
-                    return;
-                }
-            } catch (WebSocketUpgradeException ue) {
-                // walkTracker rethrows 401/403 verbatim (failover.md §6
-                // AuthError is terminal). Surface as a clean auth-failure
-                // message rather than wrapping in a generic "reconnect
-                // failed" envelope.
-                handler.onError(probe.interceptedStatus,
-                        "auth failure during failover reconnect [status="
-                                + ue.getStatusCode() + "]: " + ue.getMessage());
-                return;
+                reconnectViaTracker();
             } catch (RuntimeException reconnectErr) {
-                // walkTracker rethrows other terminal categories
-                // (ProtocolVersionError) as well. Surface them verbatim so
-                // the caller sees the cluster-wide condition rather than a
-                // misleading "exhausted" wrapper.
                 handler.onError(probe.interceptedStatus,
                         "failover reconnect failed after " + attempt + " attempt"
                                 + (attempt == 1 ? "" : "s") + " [last error: "
@@ -1024,16 +977,7 @@ public class QwpQueryClient implements QuietCloseable {
                 return;
             }
             handler.onFailoverReset(serverInfo);
-            // loop back: next iteration re-executes the query on the fresh connection
         }
-    }
-
-    /**
-     * Test/introspection helper: returns the per-host upgrade-response
-     * read budget (failover.md §1.1).
-     */
-    public int getAuthTimeoutMsForTest() {
-        return authTimeoutMs;
     }
 
     /**
@@ -1044,72 +988,6 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public String getCompressionPreference() {
         return compressionPreference;
-    }
-
-    /**
-     * Test/introspection helper: returns the number of configured endpoints
-     * after lb_strategy ordering has been applied at construction time.
-     */
-    public int getEndpointCountForTest() {
-        return endpoints.size();
-    }
-
-    /**
-     * Test/introspection helper: returns the host of the endpoint at
-     * {@code idx} after the lb_strategy ordering. Throws {@link IndexOutOfBoundsException}
-     * for invalid indices.
-     */
-    public String getEndpointHostForTest(int idx) {
-        return endpoints.get(idx).host;
-    }
-
-    /**
-     * Test/introspection helper: returns the port of the endpoint at
-     * {@code idx} after the lb_strategy ordering.
-     */
-    public int getEndpointPortForTest(int idx) {
-        return endpoints.get(idx).port;
-    }
-
-    /**
-     * Test/introspection helper: returns the configured initial failover
-     * backoff in milliseconds.
-     */
-    public long getFailoverInitialBackoffMsForTest() {
-        return failoverInitialBackoffMs;
-    }
-
-    /**
-     * Test/introspection helper: returns the configured per-Execute
-     * failover attempt cap.
-     */
-    public int getFailoverMaxAttemptsForTest() {
-        return failoverMaxAttempts;
-    }
-
-    /**
-     * Test/introspection helper: returns the configured failover backoff
-     * ceiling in milliseconds.
-     */
-    public long getFailoverMaxBackoffMsForTest() {
-        return failoverMaxBackoffMs;
-    }
-
-    /**
-     * Test/introspection helper: returns the configured per-Execute
-     * failover wall-clock budget. {@code 0} means unbounded.
-     */
-    public long getFailoverMaxDurationMsForTest() {
-        return failoverMaxDurationMs;
-    }
-
-    /**
-     * Test/introspection helper: returns the configured initial-ordering
-     * strategy. One of {@link #LB_STRATEGY_RANDOM} (default) or
-     * {@link #LB_STRATEGY_FIRST}.
-     */
-    public String getLbStrategyForTest() {
-        return lbStrategy;
     }
 
     public int getNegotiatedQwpVersion() {
@@ -1131,17 +1009,6 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Test/introspection helper: seeds the failover RNG so jitter samples
-     * are reproducible. Production code never calls this; tests use it to
-     * pin the full-jitter window in deterministic assertions.
-     */
-    public void seedFailoverRandomForTest(long seed) {
-        synchronized (failoverRandom) {
-            failoverRandom.setSeed(seed);
-        }
-    }
-
-    /**
      * Returns true if the most recent {@link #close()} call abandoned the I/O thread
      * because it failed to exit within the join timeout. The native buffer pool and
      * WebSocket socket are leaked for the lifetime of the JVM; the daemon I/O thread
@@ -1149,19 +1016,6 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public boolean wasLastCloseTimedOut() {
         return lastCloseTimedOut;
-    }
-
-    /**
-     * Programmatic equivalent of the {@code auth_timeout_ms=} connection-string
-     * key. Bounds the per-host HTTP upgrade response read; does NOT cover TCP
-     * connect or the post-upgrade {@code SERVER_INFO} frame read. Default
-     * {@value #DEFAULT_AUTH_TIMEOUT_MS} ms (matches failover.md §1.1).
-     */
-    public QwpQueryClient withAuthTimeout(int ms) {
-        checkPreConnect("withAuthTimeout");
-        if (ms < 1) throw new IllegalArgumentException("authTimeoutMs must be >= 1");
-        this.authTimeoutMs = ms;
-        return this;
     }
 
     public void withAuthorization(String authorizationHeader) {
@@ -1262,9 +1116,11 @@ public class QwpQueryClient implements QuietCloseable {
      * Configures the exponential backoff applied between failover reconnect
      * attempts. {@code initialMs} is the delay before the first retry (the
      * second overall execute attempt); each subsequent retry doubles the
-     * delay up to {@code maxMs}. A zero {@code initialMs} disables backoff
-     * entirely -- retries fire back to back, which is fine for fast LAN
-     * clusters but risks hammering a struggling one during a real outage.
+     * delay up to {@code maxMs}. Setting either {@code initialMs} or
+     * {@code maxMs} to 0 disables backoff entirely -- retries fire back to
+     * back, bounded only by {@link #withFailoverMaxAttempts} and
+     * {@link #withFailoverMaxDuration}. Fine for fast LAN clusters, but
+     * risks hammering a struggling one during a real outage.
      * Defaults: initial {@value #DEFAULT_FAILOVER_INITIAL_BACKOFF_MS} ms,
      * max {@value #DEFAULT_FAILOVER_MAX_BACKOFF_MS} ms.
      */
@@ -1291,16 +1147,48 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Programmatic equivalent of the {@code failover_max_duration_ms=}
-     * connection-string key. Total wall-clock budget across all failover
-     * attempts in a single {@link #execute} call. {@code 0} disables the
-     * deadline (loop bounded by {@link #failoverMaxAttempts} alone). Default
-     * {@value #DEFAULT_FAILOVER_MAX_DURATION_MS} ms.
+     * Total wall-clock cap on the failover loop; {@code 0} disables.
+     * Whichever of this or {@link #withFailoverMaxAttempts} fires first ends
+     * the loop. Default {@value #DEFAULT_FAILOVER_MAX_DURATION_MS} ms.
      */
-    public QwpQueryClient withFailoverMaxDuration(long ms) {
+    public QwpQueryClient withFailoverMaxDuration(long maxDurationMs) {
         checkPreConnect("withFailoverMaxDuration");
-        if (ms < 0L) throw new IllegalArgumentException("failoverMaxDurationMs must be >= 0");
-        this.failoverMaxDurationMs = ms;
+        if (maxDurationMs < 0L) {
+            throw new IllegalArgumentException("failoverMaxDurationMs must be >= 0");
+        }
+        this.failoverMaxDurationMs = maxDurationMs;
+        return this;
+    }
+
+    /**
+     * Initial address-pick strategy: {@code "random"} (default) shuffles the
+     * endpoint list so N clients spread across N hosts; {@code "first"} keeps
+     * the connection-string order, useful for tests and primary-preferred
+     * topologies. Failover walks deterministically by tracker priority in
+     * either case.
+     */
+    public QwpQueryClient withLbStrategy(String strategy) {
+        checkPreConnect("withLbStrategy");
+        if (!LB_RANDOM.equals(strategy) && !LB_FIRST.equals(strategy)) {
+            throw new IllegalArgumentException(
+                    "lbStrategy must be \"random\" or \"first\", got " + strategy);
+        }
+        this.lbStrategy = strategy;
+        return this;
+    }
+
+    /**
+     * Per-endpoint timeout on the HTTP upgrade response read. Bounds the common
+     * "host accepts TCP but never replies" blackhole. Does NOT bound the TCP
+     * connect itself (no native knob); a routing blackhole with no SYN-ACK
+     * still falls back to OS defaults. Default {@value #DEFAULT_AUTH_TIMEOUT_MS} ms.
+     */
+    public QwpQueryClient withAuthTimeout(long authTimeoutMs) {
+        checkPreConnect("withAuthTimeout");
+        if (authTimeoutMs <= 0L) {
+            throw new IllegalArgumentException("authTimeoutMs must be > 0");
+        }
+        this.authTimeoutMs = authTimeoutMs;
         return this;
     }
 
@@ -1487,7 +1375,7 @@ public class QwpQueryClient implements QuietCloseable {
                         host = entry;
                         port = DEFAULT_WS_PORT;
                     } else {
-                        host = entry.substring(0, colon);
+                        host = entry.substring(0, colon).trim();
                         port = parsePort(entry.substring(colon + 1), entry);
                     }
                 }
@@ -1608,31 +1496,22 @@ public class QwpQueryClient implements QuietCloseable {
         currentEndpointIndex = -1;
     }
 
-    /**
-     * Computes the failover sleep for the next attempt: full-jitter
-     * {@code [0, base)} clamped to whatever wall-clock budget is left
-     * (failover.md §3 / §3.1). When {@code base} is zero or non-positive,
-     * returns 0 (no backoff). When the deadline has already passed,
-     * returns 0 -- the caller will surface the deadline-exhausted error
-     * directly, no benefit in sleeping further.
-     */
-    private long computeFailoverSleepMs(long baseMs, long deadlineNs) {
-        if (baseMs <= 0L) {
-            return 0L;
+    private void runUpgradeWithTimeout(Endpoint ep) {
+        int timeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
+        try {
+            webSocketClient.connect(ep.host, ep.port);
+            webSocketClient.upgrade(endpointPath, timeoutMs, authorizationHeader);
+        } catch (HttpClientException ex) {
+            if (ex.isTimeout()) {
+                HttpClientException timeout = new HttpClientException("WebSocket upgrade to ")
+                        .put(ep.host).put(':').put(ep.port)
+                        .put(" exceeded auth_timeout=").put(authTimeoutMs).put("ms");
+                timeout.initCause(ex);
+                timeout.flagAsTimeout();
+                throw timeout;
+            }
+            throw QwpUpgradeFailures.classify(webSocketClient, ep.host, ep.port, ex);
         }
-        long jitter;
-        synchronized (failoverRandom) {
-            jitter = (failoverRandom.nextLong() & Long.MAX_VALUE) % baseMs;
-        }
-        if (deadlineNs == Long.MAX_VALUE) {
-            return jitter;
-        }
-        long remainingNs = deadlineNs - System.nanoTime();
-        if (remainingNs <= 0L) {
-            return 0L;
-        }
-        long remainingMs = remainingNs / 1_000_000L;
-        return Math.min(jitter, remainingMs);
     }
 
     private void connectToEndpoint(Endpoint ep) {
@@ -1646,11 +1525,7 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.setQwpClientId(clientId != null ? clientId : defaultClientId());
         webSocketClient.setQwpAcceptEncoding(buildAcceptEncodingHeader());
         webSocketClient.setQwpMaxBatchRows(maxBatchRows);
-        webSocketClient.connect(ep.host, ep.port);
-        // Per-host upgrade timeout (failover.md §1.1). Bounds the HTTP upgrade
-        // response read so a half-open peer cannot burn the wider per-Execute
-        // failover budget alone.
-        webSocketClient.upgrade(endpointPath, authTimeoutMs, authorizationHeader);
+        runUpgradeWithTimeout(ep);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
 
         // v2 servers send SERVER_INFO as the first WebSocket frame after the
@@ -1674,7 +1549,9 @@ public class QwpQueryClient implements QuietCloseable {
         if (!"raw".equals(compressionPreference)) {
             probeZstdAvailable();
         }
+    }
 
+    private void spawnIoThread() {
         // Wire a fresh generation-scoped listener into this I/O thread. Each
         // listener owns its own terminal-failure latch, so even if a dying
         // I/O thread slips a late onTerminalFailure callback past the orphan
@@ -1697,19 +1574,6 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Lazily builds the {@link HostHealthTracker} once the endpoint list is
-     * known. {@link #fromConfig} appends every parsed endpoint after
-     * constructing the client, so the tracker can't be sized at constructor
-     * time. Called on the user thread from {@link #connect} and
-     * {@link #execute}; idempotent thereafter.
-     */
-    private void ensureHostHealthTracker() {
-        if (hostHealthTracker == null) {
-            hostHealthTracker = new HostHealthTracker(endpoints.size());
-        }
-    }
-
-    /**
      * Inner loop for a single query attempt. Driven by {@link #execute}; wraps
      * the user's handler in a {@link FailoverProbeHandler} so that the outer
      * loop can intercept transport failures before they reach the user.
@@ -1728,12 +1592,8 @@ public class QwpQueryClient implements QuietCloseable {
         GenerationListener listener = currentGenerationListener;
         TerminalFailure tf = listener != null ? listener.get() : null;
         if (tf != null) {
-            // I/O thread already reported a transport- or protocol-level failure
-            // on a previous call. The terminal-failover-bypass bit on the
-            // latch tells us whether to enter failover (transport) or
-            // surface verbatim (protocol-version, server status reject).
-            if (tf.bypassFailover) {
-                probe.markTerminalFailover(tf.status, tf.message);
+            if (tf.isProtocol) {
+                probe.onError(tf.status, tf.message);
             } else {
                 probe.markTransportFailure(tf.status, tf.message);
             }
@@ -1778,23 +1638,13 @@ public class QwpQueryClient implements QuietCloseable {
                             probe.onExecDone(ev.opType, ev.rowsAffected);
                             return;
                         case QueryEvent.KIND_ERROR:
-                            // Server-emitted QUERY_ERROR. Connection remains healthy;
-                            // pass straight through to the user. Never triggers failover.
                             probe.onError(ev.errorStatus, ev.errorMessage);
                             return;
                         case QueryEvent.KIND_TRANSPORT_ERROR:
-                            // Transport / protocol-level failure synthesised by the
-                            // I/O thread. Tag as a transport failure so the outer
-                            // execute loop can decide whether to replay (failover=on)
-                            // or surface as a final onError (failover=off).
                             probe.markTransportFailure(ev.errorStatus, ev.errorMessage);
                             return;
                         case QueryEvent.KIND_PROTOCOL_ERROR:
-                            // Protocol-version disagreement (failover.md §6
-                            // Terminal). Mask via failover would just hide a
-                            // cluster-wide condition; surface verbatim through
-                            // the terminal-bypass path.
-                            probe.markTerminalFailover(ev.errorStatus, ev.errorMessage);
+                            probe.onError(ev.errorStatus, ev.errorMessage);
                             return;
                         default:
                             probe.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind);
@@ -1825,32 +1675,37 @@ public class QwpQueryClient implements QuietCloseable {
      * the caller doesn't inherit a half-open socket.
      */
     private void probeZstdAvailable() {
-        long dctx;
+        long dctx = 0;
         try {
-            dctx = Zstd.createDCtx();
-        } catch (UnsatisfiedLinkError e) {
-            LOG.error("zstd JNI symbols missing from libquestdb; aborting connect", e);
-            if (webSocketClient != null) {
-                webSocketClient.close();
-                webSocketClient = null;
+            try {
+                dctx = Zstd.createDCtx();
+            } catch (UnsatisfiedLinkError e) {
+                LOG.error("zstd JNI symbols missing from libquestdb; aborting connect", e);
+                if (webSocketClient != null) {
+                    webSocketClient.close();
+                    webSocketClient = null;
+                }
+                throw new HttpClientException("this client build does not support zstd compression -- "
+                        + "libquestdb was built without the zstd submodule. Rebuild the native library "
+                        + "with 'git submodule update --init --recursive' and 'cmake --build', or set "
+                        + "compression=raw on the connection string to skip the probe. "
+                        + "[cause=" + e.getMessage() + "]");
             }
-            throw new HttpClientException("this client build does not support zstd compression -- "
-                    + "libquestdb was built without the zstd submodule. Rebuild the native library "
-                    + "with 'git submodule update --init --recursive' and 'cmake --build', or set "
-                    + "compression=raw on the connection string to skip the probe. "
-                    + "[cause=" + e.getMessage() + "]");
-        }
-        if (dctx == 0) {
-            LOG.error("zstd createDCtx returned 0 (native allocation failure); aborting connect");
-            if (webSocketClient != null) {
-                webSocketClient.close();
-                webSocketClient = null;
+            if (dctx == 0) {
+                LOG.error("zstd createDCtx returned 0 (native allocation failure); aborting connect");
+                if (webSocketClient != null) {
+                    webSocketClient.close();
+                    webSocketClient = null;
+                }
+                throw new HttpClientException("zstd decompression context allocation failed; "
+                        + "cannot accept compressed batches. Set compression=raw on the connection "
+                        + "string to disable compression, or retry once memory pressure subsides.");
             }
-            throw new HttpClientException("zstd decompression context allocation failed; "
-                    + "cannot accept compressed batches. Set compression=raw on the connection "
-                    + "string to disable compression, or retry once memory pressure subsides.");
+        } finally {
+            if (dctx != 0) {
+                Zstd.freeDCtx(dctx);
+            }
         }
-        Zstd.freeDCtx(dctx);
     }
 
     private QwpServerInfo receiveServerInfoSync() {
@@ -1880,122 +1735,88 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Drives one walk through the endpoint list against the
-     * {@link #hostHealthTracker} (failover.md §4.4 {@code WalkTracker}).
+     * Walks the endpoint list by tracker priority (HEALTHY → UNKNOWN →
+     * TRANSIENT_REJECT → TRANSPORT_ERROR → TOPOLOGY_REJECT). The mid-stream
+     * failed endpoint was demoted by {@link QwpHostHealthTracker#recordMidStreamFailure}
+     * before this method is entered, so in multi-host configurations a different
+     * endpoint is preferred; with a single configured endpoint the same host is
+     * the only option. After the first round exhausts, classifications other
+     * than HEALTHY are forgotten and the list is walked once more so a long-lived
+     * client recovers from topology changes.
      * <p>
-     * Each iteration calls {@code pickNext()}; the highest-priority
-     * not-yet-attempted host is tried in turn. On the first {@code -1}
-     * return (round exhausted) the loop calls
-     * {@code BeginRound(forgetClassifications=true)} and walks one more
-     * time so stale {@code TransientReject}/{@code TopologyReject} hosts
-     * from prior outages get another shot; on the second {@code -1} the
-     * walk fails.
-     * <p>
-     * Per-endpoint outcome classification:
-     * <ul>
-     *   <li>Connect + role-match: {@code recordSuccess}, install transport,
-     *       return success.</li>
-     *   <li>{@link WebSocketUpgradeException} with status 401/403:
-     *       <strong>rethrow</strong>. Auth failures are cluster-wide;
-     *       failover masks them (failover.md §6).</li>
-     *   <li>{@link WebSocketUpgradeException} with status 421 + role:
-     *       {@code recordRoleReject(idx, transient = role == PRIMARY_CATCHUP)},
-     *       continue.</li>
-     *   <li>SERVER_INFO role-mismatch (target filter rejects):
-     *       {@code recordRoleReject(idx, transient = role == PRIMARY_CATCHUP)},
-     *       continue.</li>
-     *   <li>{@code target=primary|replica} on a v1-negotiated server (no
-     *       SERVER_INFO frame): treated as
-     *       {@code recordRoleReject(idx, transient=false)} -- v1 cannot
-     *       supply a role guarantee.</li>
-     *   <li>Any other transport / decode failure: {@code recordTransportError},
-     *       continue.</li>
-     * </ul>
+     * On success, leaves the client in the same state {@link #connect()}
+     * produces: {@code connected=true}, {@code ioThread} spawned,
+     * {@code serverInfo} populated. On exhaustion, raises the same exceptions
+     * as {@link #connect()}.
      */
-    private WalkResult walkTracker() {
-        WalkResult result = new WalkResult();
+    private void reconnectViaTracker() {
+        int total = endpoints.size();
+        lastCloseTimedOut = false;
+        hostTracker.beginRound(false);
+        QwpServerInfo lastMismatch = null;
+        boolean sawV1Mismatch = false;
+        Throwable lastError = null;
         boolean retriedAfterReset = false;
         while (true) {
-            int idx = hostHealthTracker.pickNext();
-            if (idx < 0) {
+            int i = hostTracker.pickNext();
+            if (i < 0) {
                 if (!retriedAfterReset) {
-                    // Fall-through reset (failover.md §4.4): give stale
-                    // TransientReject / TopologyReject hosts from prior
-                    // outages another chance before declaring the walk
-                    // failed. Sticky-Healthy preserves the most recent
-                    // good host as the priority pick on the next walk.
-                    hostHealthTracker.beginRound(true);
+                    hostTracker.beginRound(true);
                     retriedAfterReset = true;
                     continue;
                 }
-                // Two consecutive exhaustions; nothing more to try.
-                return result;
+                break;
             }
-            Endpoint ep = endpoints.get(idx);
+            Endpoint ep = endpoints.get(i);
             try {
                 connectToEndpoint(ep);
-            } catch (WebSocketUpgradeException ue) {
-                int code = ue.getStatusCode();
-                if (code == 401 || code == 403) {
-                    // Terminal: auth credentials are cluster-wide, retrying
-                    // every host floods server logs without recovery
-                    // (failover.md §6). Tear down the half-built state
-                    // before propagating so the caller doesn't inherit a
-                    // dangling I/O thread.
-                    cleanupFailedConnect();
-                    hostHealthTracker.recordTransportError(idx);
-                    throw ue;
-                }
-                if (ue.isRoleMismatch()) {
-                    hostHealthTracker.recordRoleReject(idx, ue.isTransientRoleReject());
-                    result.anyRoleMismatch = true;
-                    LOG.info("QwpQueryClient {}:{} 421 + role={} does not match target={}, walking next",
-                            ep.host, ep.port, ue.getServerRole(), target);
-                } else {
-                    hostHealthTracker.recordTransportError(idx);
-                    result.lastError = ue;
-                    LOG.warn("QwpQueryClient connect failed for {}:{} -- {}",
-                            ep.host, ep.port, ue.getMessage());
-                }
+            } catch (QwpAuthFailedException ae) {
+                cleanupFailedConnect();
+                throw ae;
+            } catch (QwpIngressRoleRejectedException re) {
+                lastError = re;
+                hostTracker.recordRoleReject(i, re.isTransient());
                 cleanupFailedConnect();
                 continue;
             } catch (RuntimeException e) {
-                hostHealthTracker.recordTransportError(idx);
-                result.lastError = e;
-                LOG.warn("QwpQueryClient connect failed for {}:{} -- {}",
-                        ep.host, ep.port, e.getMessage());
+                lastError = e;
+                hostTracker.recordTransportError(i);
                 cleanupFailedConnect();
                 continue;
             }
             QwpServerInfo info = serverInfo;
             if (!TARGET_ANY.equals(target) && info == null) {
-                // v1 cannot supply a role guarantee: recordRoleReject as
-                // topological (transient=false) so the host falls to the
-                // bottom of the priority order.
-                hostHealthTracker.recordRoleReject(idx, false);
-                result.anyRoleMismatch = true;
-                result.sawV1Mismatch = true;
-                LOG.info("QwpQueryClient {}:{} negotiated v1 (no SERVER_INFO) and target={} requires v2; walking next",
-                        ep.host, ep.port, target);
+                sawV1Mismatch = true;
+                hostTracker.recordRoleReject(i, false);
                 cleanupFailedConnect();
                 continue;
             }
             if (info != null && !matchesTarget(info.getRole(), target)) {
-                boolean transient_ = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
-                hostHealthTracker.recordRoleReject(idx, transient_);
-                result.anyRoleMismatch = true;
-                result.lastInfo = info;
-                LOG.info("QwpQueryClient {}:{} role={} does not match target={}, walking next",
-                        ep.host, ep.port, QwpServerInfo.roleName(info.getRole()), target);
+                lastMismatch = info;
+                boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
+                hostTracker.recordRoleReject(i, isTransient);
                 cleanupFailedConnect();
                 continue;
             }
-            hostHealthTracker.recordSuccess(idx);
-            currentEndpointIndex = idx;
+            spawnIoThread();
+            hostTracker.recordSuccess(i);
+            currentEndpointIndex = i;
             connected = true;
-            result.success = true;
-            return result;
+            return;
         }
+        if (lastMismatch != null) {
+            throw new QwpRoleMismatchException(target, lastMismatch,
+                    "no endpoint matches target=" + target + " on failover; last observed role="
+                            + QwpServerInfo.roleName(lastMismatch.getRole()));
+        }
+        if (sawV1Mismatch) {
+            throw new QwpRoleMismatchException(target, null,
+                    "no endpoint matches target=" + target
+                            + " on failover; at least one endpoint negotiated v1 and cannot supply a role");
+        }
+        throw new HttpClientException(
+                "all QWP endpoints unreachable on failover [count=" + total
+                        + ", lastError=" + (lastError == null ? "<none>" : lastError.getMessage()) + ']');
     }
 
     /**
@@ -2013,10 +1834,10 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     @SuppressWarnings("unused")
-    void recordTerminalFailure(byte status, String message, boolean bypassFailover) {
+    void recordTerminalFailure(byte status, String message, boolean isProtocol) {
         GenerationListener listener = currentGenerationListener;
         if (listener != null) {
-            listener.onTerminalFailure(status, message, bypassFailover);
+            listener.onTerminalFailure(status, message, isProtocol);
         }
     }
 
@@ -2047,11 +1868,6 @@ public class QwpQueryClient implements QuietCloseable {
         final QwpColumnBatchHandler delegate;
         String interceptedMessage;
         byte interceptedStatus;
-        // Set together with transportFailureIntercepted when the I/O
-        // thread reported a category that bypasses failover by spec
-        // (failover.md §6 Terminal). The execute() loop reads this and
-        // surfaces verbatim through onError instead of looping.
-        boolean terminalFailoverBypass;
         boolean transportFailureIntercepted;
 
         FailoverProbeHandler(QwpColumnBatchHandler delegate) {
@@ -2090,21 +1906,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
 
         /**
-         * Records a transport-level failure that the spec classifies as
-         * terminal (failover.md §6): {@code AuthError},
-         * {@code ProtocolVersionError}, server-emitted status reject. The
-         * loop surfaces these verbatim instead of entering the failover
-         * retry path -- they are cluster-wide conditions and retrying
-         * every host floods server logs without recovery.
-         */
-        void markTerminalFailover(byte status, String message) {
-            transportFailureIntercepted = true;
-            terminalFailoverBypass = true;
-            interceptedStatus = status;
-            interceptedMessage = message;
-        }
-
-        /**
          * Records a transport-level failure so the outer {@code execute()}
          * loop can decide whether to replay or surface to the user. Does
          * NOT call any user callback -- the user sees either a clean replay
@@ -2136,16 +1937,11 @@ public class QwpQueryClient implements QuietCloseable {
         private volatile boolean orphaned;
 
         @Override
-        public void onTerminalFailure(byte status, String message) {
-            onTerminalFailure(status, message, false);
-        }
-
-        @Override
-        public void onTerminalFailure(byte status, String message, boolean bypassFailover) {
+        public void onTerminalFailure(byte status, String message, boolean isProtocol) {
             if (orphaned) {
                 return;
             }
-            target.compareAndSet(null, new TerminalFailure(status, message, bypassFailover));
+            target.compareAndSet(null, new TerminalFailure(status, message, isProtocol));
         }
 
         TerminalFailure get() {
@@ -2210,30 +2006,14 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     private static final class TerminalFailure {
-        final boolean bypassFailover;
+        final boolean isProtocol;
         final String message;
         final byte status;
 
-        TerminalFailure(byte status, String message, boolean bypassFailover) {
+        TerminalFailure(byte status, String message, boolean isProtocol) {
             this.status = status;
             this.message = message;
-            this.bypassFailover = bypassFailover;
+            this.isProtocol = isProtocol;
         }
-    }
-
-    /**
-     * Result bundle returned by {@link #walkTracker} so callers can
-     * disambiguate the three failure modes the spec calls out (failover.md
-     * §4.4): role mismatch (some endpoint replied with a non-matching
-     * SERVER_INFO or 421+role), v1-with-specific-target (server cannot
-     * supply a role), or pure transport unreachable. {@link #success}
-     * tells the caller whether to read these fields at all.
-     */
-    private static final class WalkResult {
-        boolean anyRoleMismatch;
-        Throwable lastError;
-        QwpServerInfo lastInfo;
-        boolean sawV1Mismatch;
-        boolean success;
     }
 }

@@ -193,7 +193,6 @@ public class StacBenchmarkClient {
                 if (batchSize > 0) b.autoFlushRows(batchSize);
                 if (flushBytes > 0) b.autoFlushBytes(flushBytes);
                 if (flushIntervalMs > 0) b.autoFlushIntervalMillis((int) flushIntervalMs);
-                if (inFlightWindow > 0) b.inFlightWindowSize(inFlightWindow);
                 return b.build();
             default:
                 throw new IllegalArgumentException("Unknown protocol: " + protocol +

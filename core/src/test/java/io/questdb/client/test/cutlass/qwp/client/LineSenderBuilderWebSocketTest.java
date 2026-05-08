@@ -82,8 +82,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .address(LOCALHOST)
                 .autoFlushRows(500)
                 .autoFlushBytes(512 * 1024)
-                .autoFlushIntervalMillis(50)
-                .inFlightWindowSize(8);
+                .autoFlushIntervalMillis(50);
         Assert.assertNotNull(builder);
     }
 
@@ -340,13 +339,118 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testAuthTimeoutConfig_acceptsPositive() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;auth_timeout_ms=2500;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testAuthTimeoutConfig_zeroRejected() {
+        assertBadConfig("ws::addr=localhost:9000;auth_timeout_ms=0;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeoutConfig_negativeRejected() {
+        assertBadConfig("ws::addr=localhost:9000;auth_timeout_ms=-50;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeoutConfig_notSupportedForHttp() {
+        assertBadConfig("http::addr=localhost:9000;auth_timeout_ms=1000;",
+                "auth_timeout_ms is only supported for WebSocket transport");
+    }
+
+    @Test
+    public void testAuthTimeoutBuilder_notSupportedForTcp() {
+        assertThrows("auth_timeout_ms is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .authTimeoutMillis(1000));
+    }
+
+    @Test
+    public void testGorillaConfig_acceptsOn() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=on;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testGorillaConfig_acceptsOff() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=off;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testGorillaConfig_acceptsTrue() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=true;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testGorillaConfig_acceptsFalse() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=false;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testGorillaConfig_unknownValueRejected() {
+        assertBadConfig("ws::addr=localhost:9000;gorilla=maybe;",
+                "invalid gorilla [value=maybe");
+    }
+
+    @Test
+    public void testGorillaConfig_notSupportedForHttp() {
+        assertBadConfig("http::addr=localhost:9000;gorilla=on;",
+                "gorilla is only supported for WebSocket transport");
+    }
+
+    @Test
+    public void testGorillaBuilder_notSupportedForTcp() {
+        assertThrows("gorilla is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .gorilla(false));
+    }
+
+    @Test
+    public void testWsConfigString_emptyHost_fails() {
+        assertBadConfig("ws::addr=:9000;", "empty host in addr entry");
+    }
+
+    @Test
+    public void testWsConfigString_dupAddr_explicitThenDefaultPort_fails() {
+        assertBadConfig("ws::addr=a:9000,a;", "duplicated addresses are not allowed");
+    }
+
+    @Test
+    public void testWsConfigString_dupAddr_defaultThenExplicitPort_fails() {
+        assertBadConfig("ws::addr=a,a:9000;", "duplicated addresses are not allowed");
+    }
+
+    @Test
+    public void testWsConfigString_dupAddr_bothDefaultPort_fails() {
+        assertBadConfig("ws::addr=a,a;", "duplicated addresses are not allowed");
+    }
+
+    @Test
+    public void testWsConfigString_addrWithTrailingHostWhitespace_trimmed() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost :9000;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testWsConfigString_addrWithLeadingPortWhitespace_trimmed() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost: 9000;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
     public void testFullAsyncConfiguration() {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
                 .autoFlushRows(1000)
                 .autoFlushBytes(1024 * 1024)
-                .autoFlushIntervalMillis(100)
-                .inFlightWindowSize(16);
+                .autoFlushIntervalMillis(100);
         Assert.assertNotNull(builder);
     }
 
@@ -357,8 +461,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 .enableTls()
                 .advancedTls().disableCertificateValidation()
                 .autoFlushRows(1000)
-                .autoFlushBytes(1024 * 1024)
-                .inFlightWindowSize(16);
+                .autoFlushBytes(1024 * 1024);
         Assert.assertNotNull(builder);
     }
 
@@ -392,47 +495,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address(LOCALHOST)
                 .httpToken("token");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testInFlightWindowSizeDoubleSet_fails() {
-        assertThrows("already configured",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .inFlightWindowSize(8)
-                        .inFlightWindowSize(16));
-    }
-
-    @Test
-    public void testInFlightWindowSizeNegative_fails() {
-        assertThrows("must be positive",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .inFlightWindowSize(-1));
-    }
-
-    @Test
-    public void testInFlightWindowSizeOne_syncMode() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .inFlightWindowSize(1);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testInFlightWindowSizeZero_fails() {
-        assertThrows("must be positive",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .inFlightWindowSize(0));
-    }
-
-    @Test
-    public void testInFlightWindowSize_customValue() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .inFlightWindowSize(16);
         Assert.assertNotNull(builder);
     }
 
@@ -564,6 +626,50 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testMultipleAddresses_buildable() {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address(LOCALHOST + ":9000")
+                .address(LOCALHOST + ":9001");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
+    public void testMultipleAddresses_noPorts_buildPastValidation() {
+        // configureDefaults() must pad ports so hosts.size == ports.size for
+        // multi-host builders that omit explicit ports. The build() then fails
+        // on connection (no server), NOT on the "host:port pair" validation.
+        try {
+            Sender.builder(Sender.Transport.WEBSOCKET)
+                    .address("127.0.0.1")
+                    .address("127.0.0.1")
+                    .build()
+                    .close();
+            Assert.fail("expected build to fail with connection error");
+        } catch (LineSenderException e) {
+            String msg = e.getMessage();
+            Assert.assertFalse(
+                    "build failed on host/port count validation: " + msg,
+                    msg.contains("host:port pair") || msg.contains("host/port count mismatch"));
+        }
+    }
+
+    @Test
+    public void testMixedPortAddresses_unevenCounts_rejected() {
+        assertThrowsAny(
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST + ":9000")
+                        .address(LOCALHOST + ":9001")
+                        .port(9099),
+                "mismatch between number of hosts and number of ports");
+    }
+
+    @Test
+    public void testWsConfigString_sameHostDifferentPorts_passes() {
+        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=a:9000,a:9001;");
+        Assert.assertNotNull(builder);
+    }
+
+    @Test
     public void testNoAddress_fails() {
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET),
@@ -599,11 +705,9 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testSyncModeAutoFlushDefaults() throws Exception {
-        // Regression test: sync-mode connect() must not hardcode autoFlush to 0.
-        // createForTesting(host, port, windowSize) mirrors what connect(h,p,tls)
-        // creates internally. Verify it uses sensible defaults.
+        // Regression test: connect() must not hardcode autoFlush to 0.
         assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0, 1)) {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 0)) {
                 Assert.assertEquals(
                         QwpWebSocketSender.DEFAULT_AUTO_FLUSH_ROWS,
                         sender.getAutoFlushRows()
@@ -681,42 +785,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWsConfigString_inFlightWindow() throws Exception {
-        assertMemoryLeak(() -> {
-            int port = findUnusedPort();
-            assertBadConfig("ws::addr=localhost:" + port + ";in_flight_window=64;", "connect", "Failed");
-        });
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindowDoubleSet_fails() {
-        assertBadConfig("ws::addr=localhost:9000;in_flight_window=64;in_flight_window=128;", "already configured");
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindowInvalid_fails() {
-        assertBadConfig("ws::addr=localhost:9000;in_flight_window=0;", "must be positive");
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindowNotSupportedForHttp_fails() {
-        assertBadConfig("http::addr=localhost:9000;in_flight_window=64;", "only supported for WebSocket");
-    }
-
-    @Test
-    public void testWsConfigString_inFlightWindowSync() throws Exception {
-        // Sync mode (in_flight_window=1) was removed alongside the legacy
-        // ingest path: cursor is the only async path now, and it requires
-        // window > 1. build() rejects sync at parse time rather than
-        // attempting to connect.
-        assertMemoryLeak(() -> {
-            int port = findUnusedPort();
-            assertBadConfig("ws::addr=localhost:" + port + ";in_flight_window=1;",
-                    "async", "in_flight_window");
-        });
-    }
-
-    @Test
     public void testWsConfigString_missingAddr_fails() throws Exception {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
@@ -740,6 +808,13 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     @Test
     public void testWsConfigString_uppercaseNotSupported() {
         assertBadConfig("WS::addr=localhost:9000;", "invalid schema");
+    }
+
+    @Test
+    public void testWsConfigString_multipleAddresses() {
+        Sender.LineSenderBuilder builder =
+                Sender.builder("ws::addr=a:9000,b:9001,c:9002;");
+        Assert.assertNotNull(builder);
     }
 
     @Test

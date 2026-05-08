@@ -224,7 +224,6 @@ public class QwpAllocationTestClient {
                 if (batchSize > 0) wsBuilder.autoFlushRows(batchSize);
                 if (flushBytes >= 0) wsBuilder.autoFlushBytes(flushBytes);
                 if (flushIntervalMs > 0) wsBuilder.autoFlushIntervalMillis((int) flushIntervalMs);
-                if (inFlightWindow > 0) wsBuilder.inFlightWindowSize(inFlightWindow);
                 return wsBuilder.build();
             case PROTOCOL_QWP_UDP:
                 Sender.LineSenderBuilder udpBuilder = Sender.builder(Sender.Transport.UDP)

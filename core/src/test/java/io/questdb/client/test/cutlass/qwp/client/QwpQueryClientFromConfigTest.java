@@ -792,6 +792,65 @@ public class QwpQueryClientFromConfigTest {
         assertReject("ws::addr=a:9000, ,b:9000;", "empty addr entry");
     }
 
+    @Test
+    public void testFailoverMaxDuration_AcceptsZero() {
+        assertParses("ws::addr=a:9000;failover_max_duration_ms=0;");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_AcceptsPositive() {
+        assertParses("ws::addr=a:9000;failover_max_duration_ms=5000;");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_NegativeRejected() {
+        assertReject("ws::addr=a:9000;failover_max_duration_ms=-1;",
+                "failover_max_duration_ms must be >= 0");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_NonNumericRejected() {
+        assertReject("ws::addr=a:9000;failover_max_duration_ms=forever;",
+                "invalid failover_max_duration_ms: forever");
+    }
+
+    @Test
+    public void testLbStrategy_AcceptsRandom() {
+        assertParses("ws::addr=a:9000,b:9000;lb_strategy=random;");
+    }
+
+    @Test
+    public void testLbStrategy_AcceptsFirst() {
+        assertParses("ws::addr=a:9000,b:9000;lb_strategy=first;");
+    }
+
+    @Test
+    public void testLbStrategy_OtherRejected() {
+        assertReject("ws::addr=a:9000;lb_strategy=roundrobin;",
+                "invalid lb_strategy: roundrobin (expected random or first)");
+    }
+
+    @Test
+    public void testAuthTimeout_AcceptsPositive() {
+        assertParses("ws::addr=a:9000;auth_timeout_ms=2500;");
+    }
+
+    @Test
+    public void testAuthTimeout_ZeroRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=0;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeout_NegativeRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=-50;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeout_NonNumericRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=forever;",
+                "invalid auth_timeout_ms: forever");
+    }
+
     /**
      * Asserts that {@code conf} parses into a non-null {@link QwpQueryClient}
      * and closes the result on the way out. Centralising both checks here

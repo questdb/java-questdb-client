@@ -530,6 +530,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * latch -- the latch stays strictly for short-circuiting subsequent
      * {@code execute()} calls on a broken client.
      */
+    private void emitTerminalProtocolError(String message) {
+        notifyTerminalFailure(message, true);
+        events.offer(new QueryEvent().asProtocolError(WebSocketResponse.STATUS_INTERNAL_ERROR, message));
+        shutdown = true;
+    }
+
     private void emitTerminalTransportError(String message) {
         notifyTerminalFailure(message);
         events.offer(new QueryEvent().asTransportError(WebSocketResponse.STATUS_INTERNAL_ERROR, message));
@@ -594,15 +600,17 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         // buffer) directly, skipping the previous per-batch memcpy into buf.scratchAddr.
         try {
             decoder.decode(buf, payloadPtr, payloadLen);
-        } catch (QwpDecodeException e) {
-            // Same invariant as releaseBuffer: a slot is always free for a buf
-            // we took out of the pool moments ago. Close-on-failure is a
-            // defensive guard against future refactors breaking that invariant.
+        } catch (QwpProtocolVersionException e) {
             if (!freeBuffers.offer(buf)) {
                 buf.close();
             }
-            // A decode failure leaves the client-side decoder out of step with
-            // the server's byte stream: the next frame cannot be trusted.
+            emitTerminalProtocolError(e.getMessage());
+            currentQueryDone = true;
+            return;
+        } catch (QwpDecodeException e) {
+            if (!freeBuffers.offer(buf)) {
+                buf.close();
+            }
             emitTerminalTransportError("decode failure: " + e.getMessage());
             currentQueryDone = true;
             return;
@@ -643,9 +651,13 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     }
 
     private void notifyTerminalFailure(String message) {
+        notifyTerminalFailure(message, false);
+    }
+
+    private void notifyTerminalFailure(String message, boolean isProtocol) {
         if (terminalFailureListener != null) {
             try {
-                terminalFailureListener.onTerminalFailure(WebSocketResponse.STATUS_INTERNAL_ERROR, message);
+                terminalFailureListener.onTerminalFailure(WebSocketResponse.STATUS_INTERNAL_ERROR, message, isProtocol);
             } catch (Throwable ignored) {
                 // Listener must not bring down the I/O thread. A first-failure-wins
                 // CAS in the listener cannot throw in practice; defensive anyway.
@@ -739,19 +751,9 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         events.offer(new QueryEvent().asError(WebSocketResponse.STATUS_INTERNAL_ERROR, "QwpQueryClient closed"));
     }
 
+    @FunctionalInterface
     public interface TerminalFailureListener {
-        void onTerminalFailure(byte status, String message);
-
-        /**
-         * Latches a terminal failure together with a hint to {@code execute()}
-         * that the spec classifies the failure as bypassing failover
-         * (failover.md §6 Terminal: AuthError, ProtocolVersionError,
-         * server status reject). Default delegates to the legacy
-         * single-arg overload so existing callers keep working.
-         */
-        default void onTerminalFailure(byte status, String message, boolean bypassFailover) {
-            onTerminalFailure(status, message);
-        }
+        void onTerminalFailure(byte status, String message, boolean isProtocol);
     }
 
     private static final class QueryRequest {
