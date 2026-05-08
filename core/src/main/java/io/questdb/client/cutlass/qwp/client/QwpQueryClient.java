@@ -43,6 +43,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -101,6 +102,8 @@ public class QwpQueryClient implements QuietCloseable {
 
     public static final String DEFAULT_ENDPOINT_PATH = "/read/v1";
     public static final int DEFAULT_WS_PORT = 9000;
+    public static final String LB_STRATEGY_FIRST = "first";
+    public static final String LB_STRATEGY_RANDOM = "random";
     /**
      * Hard ceiling on {@link #withMaxBatchRows}. Matches the client decoder's
      * own {@code MAX_ROWS_PER_BATCH} safety cap so a user cannot ask for a
@@ -164,6 +167,7 @@ public class QwpQueryClient implements QuietCloseable {
     private final AtomicBoolean closedFlag = new AtomicBoolean();
     private final List<Endpoint> endpoints = new ArrayList<>();
     private final AtomicBoolean executing = new AtomicBoolean();
+    private final Random failoverRandom = new Random();
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private String authorizationHeader;
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
@@ -936,9 +940,14 @@ public class QwpQueryClient implements QuietCloseable {
                 long base = failoverInitialBackoffMs << Math.min(attempt - 1, 30);
                 if (base < 0L) base = failoverMaxBackoffMs;
                 long capped = Math.min(base, failoverMaxBackoffMs);
-                long delay = capped > 0L
-                        ? ThreadLocalRandom.current().nextLong(capped)
-                        : 0L;
+                long delay;
+                if (capped > 0L) {
+                    synchronized (failoverRandom) {
+                        delay = (failoverRandom.nextLong() & Long.MAX_VALUE) % capped;
+                    }
+                } else {
+                    delay = 0L;
+                }
                 long remainingNanos = failoverDeadlineNanos - System.nanoTime();
                 long remaining = remainingNanos <= 0L ? 0L : remainingNanos / 1_000_000L;
                 if (remainingNanos <= 0L) {
@@ -980,6 +989,10 @@ public class QwpQueryClient implements QuietCloseable {
         }
     }
 
+    public long getAuthTimeoutMsForTest() {
+        return authTimeoutMs;
+    }
+
     /**
      * Returns the current compression preference: one of {@code raw} (the
      * library default, no compression), {@code zstd} (demand zstd), or
@@ -988,6 +1001,26 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public String getCompressionPreference() {
         return compressionPreference;
+    }
+
+    public int getEndpointCountForTest() {
+        return endpoints.size();
+    }
+
+    public String getEndpointHostForTest(int idx) {
+        return endpoints.get(idx).host;
+    }
+
+    public int getEndpointPortForTest(int idx) {
+        return endpoints.get(idx).port;
+    }
+
+    public long getFailoverMaxDurationMsForTest() {
+        return failoverMaxDurationMs;
+    }
+
+    public String getLbStrategyForTest() {
+        return lbStrategy;
     }
 
     public int getNegotiatedQwpVersion() {
@@ -1006,6 +1039,12 @@ public class QwpQueryClient implements QuietCloseable {
 
     public boolean isConnected() {
         return connected;
+    }
+
+    public void seedFailoverRandomForTest(long seed) {
+        synchronized (failoverRandom) {
+            failoverRandom.setSeed(seed);
+        }
     }
 
     /**
