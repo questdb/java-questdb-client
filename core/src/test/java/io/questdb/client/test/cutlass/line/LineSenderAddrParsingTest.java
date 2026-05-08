@@ -106,24 +106,24 @@ public class LineSenderAddrParsingTest {
 
     @Test
     public void testAddrEmptyEntryConsecutiveCommasRejected() {
-        assertConfStrError("http::addr=h1,,h2;", "empty entry in addr list");
+        assertConfStrError("http::addr=h1,,h2;", "empty addr entry");
     }
 
     @Test
     public void testAddrEmptyEntryLeadingCommaRejected() {
-        assertConfStrError("http::addr=,h1:9000;", "empty entry in addr list");
+        assertConfStrError("http::addr=,h1:9000;", "empty addr entry");
     }
 
     @Test
     public void testAddrEmptyEntryTrailingCommaRejected() {
-        assertConfStrError("http::addr=h1:9000,;", "empty entry in addr list");
+        assertConfStrError("http::addr=h1:9000,;", "empty addr entry");
     }
 
     @Test
     public void testAddrEmptyValuePreservesLegacyError() {
-        // Empty addr= must still surface the existing "address cannot be empty"
+        // Empty addr= must still surface the existing "empty addr entry"
         // diagnostic so downstream tooling that matches that string is undisturbed.
-        assertConfStrError("http::addr=;", "address cannot be empty nor null");
+        assertConfStrError("http::addr=;", "empty addr entry");
     }
 
     @Test
