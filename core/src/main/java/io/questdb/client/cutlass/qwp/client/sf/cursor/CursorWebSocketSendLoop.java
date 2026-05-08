@@ -742,6 +742,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * handshake) are treated as transient.
      */
     private static boolean isTerminalUpgradeError(Throwable t) {
+        // Durable-ack mismatch is terminal regardless of any underlying
+        // role-reject in the cause chain: when request_durable_ack=on and
+        // every endpoint is non-primary (replica/catchup), no amount of
+        // retry within the connect window converts a replica into a
+        // durable-ack-capable primary. The QwpWebSocketSender.buildAndConnect
+        // wraps such walks as a "WebSocket upgrade failed: ... durable ack..."
+        // throw with the last role-reject as cause; without this short-circuit
+        // isRoleReject() below would trump the terminal classification and
+        // burn the full reconnect_max_duration_millis budget.
+        if (isDurableAckMismatch(t)) {
+            return true;
+        }
         if (isRoleReject(t)) {
             return false;
         }
@@ -752,6 +764,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (cur.getCause() == cur) break;
         }
         return findUpgradeFailureMessage(t) != null;
+    }
+
+    private static boolean isDurableAckMismatch(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            String msg = cur.getMessage();
+            if (msg != null
+                    && msg.contains("WebSocket upgrade failed:")
+                    && msg.contains("durable ack")) {
+                return true;
+            }
+            if (cur.getCause() == cur) break;
+        }
+        return false;
     }
 
     private static boolean isRoleReject(Throwable t) {

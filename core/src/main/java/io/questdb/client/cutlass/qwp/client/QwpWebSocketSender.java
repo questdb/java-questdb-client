@@ -1970,6 +1970,29 @@ public class QwpWebSocketSender implements Sender {
             throw ex;
         }
         if (lastRoleReject != null) {
+            // When the client opted into durable ack but every endpoint
+            // role-rejected the /write/v4 upgrade (typically a misconfigured
+            // address list pointing at replicas only), a primary that can
+            // serve durable ack will not appear by retrying. Surface the
+            // failure as a terminal upgrade error so the SYNC/ASYNC connect
+            // path fails fast instead of burning the full
+            // reconnect_max_duration_millis budget walking the same replicas.
+            // The "WebSocket upgrade failed:" prefix is the sentinel that
+            // CursorWebSocketSendLoop.isTerminalUpgradeError() sniffs to
+            // suppress retry; "durable" in the message points the user at
+            // the cause without needing to read the stack.
+            if (requestDurableAck) {
+                LineSenderException ackErr = new LineSenderException(
+                        "WebSocket upgrade failed: server does not support durable ack [host=")
+                        .put(lastRoleReject.getHost()).put(", port=").put(lastRoleReject.getPort())
+                        .put(", role=").put(lastRoleReject.getRole()).put("]. The client opted in via "
+                                + "request_durable_ack=on but every configured endpoint role-rejected "
+                                + "the /write/v4 upgrade -- only a PRIMARY (or STANDALONE) with "
+                                + "primary replication configured can echo X-QWP-Durable-Ack: enabled. "
+                                + "Either disable request_durable_ack or point at a primary endpoint.");
+                ackErr.initCause(lastRoleReject);
+                throw ackErr;
+            }
             QwpRoleMismatchException ex = new QwpRoleMismatchException(
                     QwpIngressRoleRejectedException.ROLE_PRIMARY,
                     null,
