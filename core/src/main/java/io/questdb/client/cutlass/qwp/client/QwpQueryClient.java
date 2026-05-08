@@ -971,6 +971,17 @@ public class QwpQueryClient implements QuietCloseable {
             }
             try {
                 reconnectViaTracker();
+            } catch (QwpAuthFailedException authErr) {
+                // failover.md S6: AuthError is terminal across all hosts.
+                // Credentials are cluster-wide, so retrying floods server logs
+                // without recovery. Surface a distinct message so monitoring
+                // can pull auth incidents apart from generic transport failures.
+                handler.onError(probe.interceptedStatus,
+                        "auth failure during failover reconnect [host="
+                                + authErr.getHost() + ':' + authErr.getPort()
+                                + ", status=" + authErr.getStatusCode()
+                                + ", last error: " + probe.interceptedMessage + ']');
+                return;
             } catch (RuntimeException reconnectErr) {
                 handler.onError(probe.interceptedStatus,
                         "failover reconnect failed after " + attempt + " attempt"
@@ -1828,13 +1839,12 @@ public class QwpQueryClient implements QuietCloseable {
      * Test-only / diagnostics hook: injects a synthetic terminal failure
      * through the current generation's listener. Production code does not
      * call this -- transport failures arrive through the I/O thread's own
-     * callback path. Package-private so it does not leak into the public
-     * client API; tests in a different package reach it via reflection to
-     * simulate the I/O thread reporting a failure without actually tearing
-     * the WebSocket down.
+     * callback path. Public + name-tagged so tests in other packages can
+     * call it without reflection; the {@code ForTest} suffix mirrors
+     * {@link #seedFailoverRandomForTest} and makes it obvious at the call
+     * site that this is not a normal API entry point.
      */
-    @SuppressWarnings("unused")
-    void recordTerminalFailure(byte status, String message) {
+    public void recordTerminalFailureForTest(byte status, String message) {
         GenerationListener listener = currentGenerationListener;
         if (listener != null) {
             listener.onTerminalFailure(status, message);
