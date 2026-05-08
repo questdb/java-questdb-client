@@ -1915,6 +1915,7 @@ public class QwpWebSocketSender implements Sender {
         }
         Throwable lastError = null;
         Throwable terminalUpgradeError = null;
+        QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
         while (true) {
             if (closed) {
@@ -1941,6 +1942,7 @@ public class QwpWebSocketSender implements Sender {
                     QwpIngressRoleRejectedException re = (QwpIngressRoleRejectedException) classified;
                     hostTracker.recordRoleReject(idx, re.isTransient());
                     lastError = re;
+                    lastRoleReject = re;
                     continue;
                 }
                 if (classified instanceof QwpAuthFailedException) {
@@ -1983,14 +1985,22 @@ public class QwpWebSocketSender implements Sender {
                     .put(terminalUpgradeError.getMessage());
             throw ex;
         }
+        if (lastRoleReject != null) {
+            QwpRoleMismatchException ex = new QwpRoleMismatchException(
+                    QwpIngressRoleRejectedException.ROLE_PRIMARY,
+                    null,
+                    "walked all " + endpoints.size()
+                            + " endpoint(s); no endpoint matches target="
+                            + QwpIngressRoleRejectedException.ROLE_PRIMARY
+                            + "; last observed role=" + lastRoleReject.getRole()
+                            + " at " + lastRoleReject.getHost() + ':' + lastRoleReject.getPort());
+            ex.initCause(lastRoleReject);
+            throw ex;
+        }
         LineSenderException ex = new LineSenderException(lastError);
         ex.put("Failed to connect: ");
         if (lastEndpoint == null) {
             ex.put("no endpoints available");
-        } else if (lastError instanceof QwpIngressRoleRejectedException) {
-            ex.put("all ").put(endpoints.size())
-                    .put(" endpoint(s) rejected the upgrade by role; last=")
-                    .put(lastEndpoint.host).put(':').put(lastEndpoint.port);
         } else {
             ex.put("all ").put(endpoints.size()).put(" endpoint(s) unreachable; last=")
                     .put(lastEndpoint.host).put(':').put(lastEndpoint.port);

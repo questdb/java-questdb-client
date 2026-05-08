@@ -56,30 +56,104 @@ public class InitialConnectAsyncTest {
     private static final int TEST_PORT = 19_800 + (int) (System.nanoTime() % 100);
 
     @Test
-    public void testAsyncReturnsImmediatelyWithNoServer() {
-        // No server. With async mode, fromConfig must return fast — the
-        // I/O thread will keep retrying in the background until cap, but
-        // the producer is unblocked. A 60s cap would normally hang
-        // anything that waited on connect; we assert a sub-second
-        // construction time.
-        int port = TEST_PORT + 1;
-        long t0 = System.nanoTime();
+    public void testAsyncAuthFailureDeliversToErrorInbox() throws Exception {
+        // Server returns HTTP 401 on every upgrade attempt. Auth failures
+        // are terminal at the I/O thread; in async mode they are
+        // delivered as a SenderError, not thrown from fromConfig.
+        int port = TEST_PORT + 4;
+        try (Always401Fixture fixture = new Always401Fixture(port)) {
+            fixture.start();
+            AtomicReference<SenderError> observedError = new AtomicReference<>();
+            String cfg = "ws::addr=localhost:" + port
+                    + sfDirOpt() + ";initial_connect_retry=async"
+                    + ";reconnect_max_duration_millis=10000"
+                    + ";close_flush_timeout_millis=0;";
+            Sender sender = Sender.builder(cfg)
+                    .errorHandler(observedError::set)
+                    .build();
+            try {
+                // Auth-terminal must surface within hundreds of ms even
+                // though the cap is 10s.
+                long t0 = System.nanoTime();
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline
+                        && observedError.get() == null) {
+                    Thread.sleep(20);
+                }
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+                SenderError err = observedError.get();
+                Assert.assertNotNull(
+                        "401 upgrade reject must surface a SenderError",
+                        err);
+                Assert.assertTrue(
+                        "auth-terminal must surface well inside the cap; took "
+                                + elapsedMs + "ms (cap was 10000ms)",
+                        elapsedMs < 5_000L);
+                Assert.assertEquals(
+                        "category must be SECURITY_ERROR for ws-upgrade-failed",
+                        SenderError.Category.SECURITY_ERROR, err.getCategory());
+                Assert.assertEquals(
+                        "auth failure is HALT",
+                        SenderError.Policy.HALT, err.getAppliedPolicy());
+                String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
+                Assert.assertTrue(
+                        "error message must mention ws-upgrade-failed: " + msg,
+                        msg.contains("ws-upgrade-failed")
+                                || msg.contains("401"));
+            } finally {
+                assertCloseRethrowsTerminal(sender, "ws-upgrade-failed");
+            }
+        }
+    }
+
+    @Test
+    public void testAsyncBudgetExhaustionDeliversToErrorInbox() throws Exception {
+        // No server. With async mode and a tight cap, the I/O thread
+        // exhausts its connect budget and surfaces a SenderError to the
+        // user-supplied handler. fromConfig itself does not throw; only
+        // close() rethrows the latched terminal so a user who never
+        // installed a handler still sees the failure on shutdown.
+        int port = TEST_PORT + 3;
+        AtomicReference<SenderError> observedError = new AtomicReference<>();
         String cfg = "ws::addr=localhost:" + port
-                + ";initial_connect_retry=async"
-                + ";reconnect_max_duration_millis=60000"
+                + sfDirOpt() + ";initial_connect_retry=async"
+                + ";reconnect_max_duration_millis=400"
                 + ";reconnect_initial_backoff_millis=10"
                 + ";reconnect_max_backoff_millis=50"
                 + ";close_flush_timeout_millis=0;";
-        try (Sender sender = Sender.fromConfig(cfg)) {
-            long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+        Sender sender = Sender.builder(cfg)
+                .errorHandler(observedError::set)
+                .build();
+        try {
+            // Wait up to 5s for the I/O thread to exhaust its budget.
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (System.currentTimeMillis() < deadline
+                    && observedError.get() == null) {
+                Thread.sleep(20);
+            }
+            SenderError err = observedError.get();
+            Assert.assertNotNull(
+                    "async budget exhaustion must surface a SenderError to the inbox",
+                    err);
+            Assert.assertEquals(
+                    "budget exhaustion is a HALT-policy terminal",
+                    SenderError.Policy.HALT, err.getAppliedPolicy());
+            Assert.assertEquals(
+                    "category must be PROTOCOL_VIOLATION for budget exhaustion",
+                    SenderError.Category.PROTOCOL_VIOLATION, err.getCategory());
+            String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
             Assert.assertTrue(
-                    "fromConfig must return immediately in async mode (took " + elapsedMs + "ms)",
-                    elapsedMs < 2_000L);
-            // Producer-thread API works without a live wire — frames
-            // accumulate on the cursor SF engine while the I/O thread
-            // is still trying to connect.
-            sender.table("foo").longColumn("v", 1L).atNow();
-            sender.flush();
+                    "error message must use never-connected tag (no successful connect): " + msg,
+                    msg.contains("never-connected-budget-exhausted"));
+            Assert.assertTrue(
+                    "error message must hint at config-likely cause: " + msg,
+                    msg.contains("never reached the server"));
+            Assert.assertFalse(
+                    "wasEverConnected() must be false when no connect ever succeeded",
+                    ((QwpWebSocketSender) sender).wasEverConnected());
+        } finally {
+            assertCloseRethrowsTerminal(sender,
+                    "never-connected-budget-exhausted");
         }
     }
 
@@ -93,7 +167,7 @@ public class InitialConnectAsyncTest {
         AckHandler handler = new AckHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             String cfg = "ws::addr=localhost:" + port
-                    + ";initial_connect_retry=async"
+                    + sfDirOpt() + ";initial_connect_retry=async"
                     + ";reconnect_max_duration_millis=10000"
                     + ";reconnect_initial_backoff_millis=20"
                     + ";reconnect_max_backoff_millis=200"
@@ -135,77 +209,30 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
-    public void testWasEverConnectedTrueImmediatelyInSyncMode() {
-        // Default (OFF) and SYNC modes both connect on the user thread
-        // before fromConfig returns. wasEverConnected() must therefore
-        // already be true the instant the sender becomes visible to the
-        // caller — there is no observable "never connected" window in
-        // those modes, so misclassifying a budget exhaustion as
-        // never-connected is impossible.
-        int port = TEST_PORT + 6;
-        try (TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler())) {
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));
-            String cfg = "ws::addr=localhost:" + port
-                    + ";close_flush_timeout_millis=0;";
-            try (Sender sender = Sender.fromConfig(cfg)) {
-                Assert.assertTrue(
-                        "wasEverConnected() must be true immediately in OFF/SYNC mode",
-                        ((QwpWebSocketSender) sender).wasEverConnected());
-            }
-        } catch (Exception ignored) {
-            // already closed
-        }
-    }
-
-    @Test
-    public void testAsyncBudgetExhaustionDeliversToErrorInbox() throws Exception {
-        // No server. With async mode and a tight cap, the I/O thread
-        // exhausts its connect budget and surfaces a SenderError to the
-        // user-supplied handler. fromConfig itself does not throw; only
-        // close() rethrows the latched terminal so a user who never
-        // installed a handler still sees the failure on shutdown.
-        int port = TEST_PORT + 3;
-        AtomicReference<SenderError> observedError = new AtomicReference<>();
+    public void testAsyncReturnsImmediatelyWithNoServer() {
+        // No server. With async mode, fromConfig must return fast — the
+        // I/O thread will keep retrying in the background until cap, but
+        // the producer is unblocked. A 60s cap would normally hang
+        // anything that waited on connect; we assert a sub-second
+        // construction time.
+        int port = TEST_PORT + 1;
+        long t0 = System.nanoTime();
         String cfg = "ws::addr=localhost:" + port
-                + ";initial_connect_retry=async"
-                + ";reconnect_max_duration_millis=400"
+                + sfDirOpt() + ";initial_connect_retry=async"
+                + ";reconnect_max_duration_millis=60000"
                 + ";reconnect_initial_backoff_millis=10"
                 + ";reconnect_max_backoff_millis=50"
                 + ";close_flush_timeout_millis=0;";
-        Sender sender = Sender.builder(cfg)
-                .errorHandler(observedError::set)
-                .build();
-        try {
-            // Wait up to 5s for the I/O thread to exhaust its budget.
-            long deadline = System.currentTimeMillis() + 5_000;
-            while (System.currentTimeMillis() < deadline
-                    && observedError.get() == null) {
-                Thread.sleep(20);
-            }
-            SenderError err = observedError.get();
-            Assert.assertNotNull(
-                    "async budget exhaustion must surface a SenderError to the inbox",
-                    err);
-            Assert.assertEquals(
-                    "budget exhaustion is a HALT-policy terminal",
-                    SenderError.Policy.HALT, err.getAppliedPolicy());
-            Assert.assertEquals(
-                    "category must be PROTOCOL_VIOLATION for budget exhaustion",
-                    SenderError.Category.PROTOCOL_VIOLATION, err.getCategory());
-            String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
+        try (Sender sender = Sender.fromConfig(cfg)) {
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
             Assert.assertTrue(
-                    "error message must use never-connected tag (no successful connect): " + msg,
-                    msg.contains("never-connected-budget-exhausted"));
-            Assert.assertTrue(
-                    "error message must hint at config-likely cause: " + msg,
-                    msg.contains("never reached the server"));
-            Assert.assertFalse(
-                    "wasEverConnected() must be false when no connect ever succeeded",
-                    ((QwpWebSocketSender) sender).wasEverConnected());
-        } finally {
-            assertCloseRethrowsTerminal(sender,
-                    "never-connected-budget-exhausted");
+                    "fromConfig must return immediately in async mode (took " + elapsedMs + "ms)",
+                    elapsedMs < 2_000L);
+            // Producer-thread API works without a live wire — frames
+            // accumulate on the cursor SF engine while the I/O thread
+            // is still trying to connect.
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
         }
     }
 
@@ -284,66 +311,39 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
-    public void testAsyncAuthFailureDeliversToErrorInbox() throws Exception {
-        // Server returns HTTP 401 on every upgrade attempt. Auth failures
-        // are terminal at the I/O thread; in async mode they are
-        // delivered as a SenderError, not thrown from fromConfig.
-        int port = TEST_PORT + 4;
-        try (Always401Fixture fixture = new Always401Fixture(port)) {
-            fixture.start();
-            AtomicReference<SenderError> observedError = new AtomicReference<>();
+    public void testWasEverConnectedTrueImmediatelyInSyncMode() {
+        // Default (OFF) and SYNC modes both connect on the user thread
+        // before fromConfig returns. wasEverConnected() must therefore
+        // already be true the instant the sender becomes visible to the
+        // caller — there is no observable "never connected" window in
+        // those modes, so misclassifying a budget exhaustion as
+        // never-connected is impossible.
+        int port = TEST_PORT + 6;
+        try (TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler())) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));
             String cfg = "ws::addr=localhost:" + port
-                    + ";initial_connect_retry=async"
-                    + ";reconnect_max_duration_millis=10000"
                     + ";close_flush_timeout_millis=0;";
-            Sender sender = Sender.builder(cfg)
-                    .errorHandler(observedError::set)
-                    .build();
-            try {
-                // Auth-terminal must surface within hundreds of ms even
-                // though the cap is 10s.
-                long t0 = System.nanoTime();
-                long deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline
-                        && observedError.get() == null) {
-                    Thread.sleep(20);
-                }
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                SenderError err = observedError.get();
-                Assert.assertNotNull(
-                        "401 upgrade reject must surface a SenderError",
-                        err);
+            try (Sender sender = Sender.fromConfig(cfg)) {
                 Assert.assertTrue(
-                        "auth-terminal must surface well inside the cap; took "
-                                + elapsedMs + "ms (cap was 10000ms)",
-                        elapsedMs < 5_000L);
-                Assert.assertEquals(
-                        "category must be SECURITY_ERROR for ws-upgrade-failed",
-                        SenderError.Category.SECURITY_ERROR, err.getCategory());
-                Assert.assertEquals(
-                        "auth failure is HALT",
-                        SenderError.Policy.HALT, err.getAppliedPolicy());
-                String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
-                Assert.assertTrue(
-                        "error message must mention ws-upgrade-failed: " + msg,
-                        msg.contains("ws-upgrade-failed")
-                                || msg.contains("401"));
-            } finally {
-                assertCloseRethrowsTerminal(sender, "ws-upgrade-failed");
+                        "wasEverConnected() must be true immediately in OFF/SYNC mode",
+                        ((QwpWebSocketSender) sender).wasEverConnected());
             }
+        } catch (Exception ignored) {
+            // already closed
         }
     }
 
     /**
      * Closes the sender and tolerates either outcome:
-     *   * close() throws -- the latched terminal must mention the expected
-     *     substring (safety-net rethrow path);
-     *   * close() returns cleanly -- the user installed an async error
-     *     handler in this test, so the dispatcher already delivered the
-     *     error to the handler (or will, on shutdown). Rethrowing on top
-     *     of that would mask try-with-resources cleanup in real callers,
-     *     so close() suppresses the rethrow when a custom handler is
-     *     installed.
+     * * close() throws -- the latched terminal must mention the expected
+     * substring (safety-net rethrow path);
+     * * close() returns cleanly -- the user installed an async error
+     * handler in this test, so the dispatcher already delivered the
+     * error to the handler (or will, on shutdown). Rethrowing on top
+     * of that would mask try-with-resources cleanup in real callers,
+     * so close() suppresses the rethrow when a custom handler is
+     * installed.
      * Either way, the inbox observation earlier in the test pins the
      * primary contract -- this helper just guards against close() throwing
      * with a wrong message.
@@ -359,7 +359,21 @@ public class InitialConnectAsyncTest {
         }
     }
 
-    /** Acks every binary frame so the sender's flush completes. */
+    /**
+     * Returns a unique temp sf_dir snippet for embedding in a config
+     * string. initial_connect_retry on/sync/async requires sf_dir per
+     * spec §3.5; without it the builder rejects construction.
+     */
+    private static String sfDirOpt() {
+        String dir = java.nio.file.Paths.get(
+                System.getProperty("java.io.tmpdir"),
+                "qdb-async-" + System.nanoTime()).toString();
+        return ";sf_dir=" + dir;
+    }
+
+    /**
+     * Acks every binary frame so the sender's flush completes.
+     */
     private static class AckHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicLong totalAcked = new AtomicLong();
         private final AtomicLong nextSeq = new AtomicLong(0);
@@ -392,8 +406,8 @@ public class InitialConnectAsyncTest {
      * the response as a terminal upgrade failure.
      */
     private static class Always401Fixture implements AutoCloseable {
-        private final ServerSocket serverSocket;
         private final java.util.List<Socket> openSockets = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final ServerSocket serverSocket;
         private Thread acceptThread;
         private volatile boolean running;
 
@@ -423,13 +437,6 @@ public class InitialConnectAsyncTest {
                     Thread.currentThread().interrupt();
                 }
             }
-        }
-
-        void start() {
-            running = true;
-            acceptThread = new Thread(this::acceptLoop, "always401-fixture-accept");
-            acceptThread.setDaemon(true);
-            acceptThread.start();
         }
 
         private void acceptLoop() {
@@ -473,6 +480,13 @@ public class InitialConnectAsyncTest {
             } catch (Exception ignored) {
                 // best-effort
             }
+        }
+
+        void start() {
+            running = true;
+            acceptThread = new Thread(this::acceptLoop, "always401-fixture-accept");
+            acceptThread.setDaemon(true);
+            acceptThread.start();
         }
     }
 }

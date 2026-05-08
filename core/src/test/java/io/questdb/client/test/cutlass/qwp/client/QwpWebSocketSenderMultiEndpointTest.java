@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -97,9 +98,10 @@ public class QwpWebSocketSenderMultiEndpointTest {
             try {
                 Sender.fromConfig(cfg).close();
                 Assert.fail("expected connect to fail when all endpoints reject by role");
-            } catch (LineSenderException e) {
-                Assert.assertTrue("expected role-reject summary, got: " + e.getMessage(),
-                        e.getMessage().contains("rejected the upgrade by role"));
+            } catch (QwpRoleMismatchException e) {
+                Assert.assertEquals("PRIMARY", e.getTargetRole());
+                Assert.assertTrue("expected REPLICA on observed role: " + e.getMessage(),
+                        e.getMessage().contains("REPLICA"));
             }
         }
     }

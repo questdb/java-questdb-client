@@ -1093,7 +1093,10 @@ public abstract class WebSocketClient implements QuietCloseable {
             if (upgradeStatusCode == 421) {
                 upgradeRejectRole = extractRoleHeader(response);
             }
-            throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);
+            WebSocketUpgradeException ex = new WebSocketUpgradeException(
+                    upgradeStatusCode, upgradeRejectRole, "WebSocket upgrade failed: ");
+            ex.put(statusLine);
+            throw ex;
         }
 
         // Verify Upgrade: websocket (case-insensitive value per RFC 6455 Section 4.1)
