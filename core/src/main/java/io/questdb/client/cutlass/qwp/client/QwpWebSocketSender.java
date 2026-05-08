@@ -271,7 +271,7 @@ public class QwpWebSocketSender implements Sender {
                     "QwpWebSocketSender requires at least one address and parallel hosts/ports lists");
         }
         if (authTimeoutMillis <= 0) {
-            throw new LineSenderException("auth_timeout must be positive [millis=")
+            throw new LineSenderException("auth_timeout_ms must be positive [millis=")
                     .put(authTimeoutMillis).put("]");
         }
         this.authorizationHeader = authorizationHeader;
@@ -582,8 +582,8 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Multi-host master connect overload — also accepts the per-host
-     * {@code auth_timeout} that bounds each WebSocket upgrade handshake
-     * (.NET spec §4.1).
+     * {@code auth_timeout_ms} that bounds each WebSocket upgrade handshake
+     * (QWP spec).
      */
     public static QwpWebSocketSender connect(
             ObjList<String> hosts,
@@ -2053,6 +2053,35 @@ public class QwpWebSocketSender implements Sender {
                 if (role != null) {
                     roleHint = " [serverRole=" + role + "]";
                 }
+            }
+            // Durable-ack opt-in + 421 role-reject = terminal. The server
+            // returns 421 before durable-ack negotiation runs, so a
+            // durable-ack-mismatch is masked by the role-mismatch unless
+            // we re-classify here. A REPLICA cannot serve durable-ack
+            // (registry is gated on primary replication being enabled),
+            // so retrying just burns the reconnect budget on a structural
+            // misconfig. The "WebSocket upgrade failed:" prefix is
+            // load-bearing -- isTerminalUpgradeError() sniffs for it via
+            // the legacy fallback to classify the throw as terminal. The
+            // original WebSocketUpgradeException is attached as suppressed
+            // (not as cause) so the typed-exception walk in
+            // isTerminalUpgradeError does not re-classify the throw as
+            // transient on the role-mismatch branch.
+            if (requestDurableAck
+                    && e instanceof WebSocketUpgradeException
+                    && ((WebSocketUpgradeException) e).isRoleMismatch()) {
+                LineSenderException terminal = new LineSenderException(
+                        "WebSocket upgrade failed: server does not support durable ack"
+                                + roleHint
+                                + " [host=" + host + ", port=" + port + "]. "
+                                + "The client opted in via request_durable_ack=on but the server "
+                                + "rejected the upgrade with 421 Misdirected Request before "
+                                + "durable-ack negotiation could run. A REPLICA / PRIMARY_CATCHUP "
+                                + "node cannot emit STATUS_DURABLE_ACK frames. Either disable "
+                                + "request_durable_ack or connect to a PRIMARY with replication "
+                                + "configured.");
+                terminal.addSuppressed(e);
+                throw terminal;
             }
             throw new LineSenderException(
                     "Failed to connect to " + host + ":" + port + roleHint, e);
