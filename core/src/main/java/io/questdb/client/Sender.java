@@ -514,43 +514,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Builder class to construct a new instance of a Sender.
-     * <br>
-     * Example usage for HTTP transport:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-     *  .address("localhost:9000")
-     *  .build()) {
-     *      sender.table(tableName).column("value", 42).atNow();
-     *      sender.flush();
-     *  }
-     * }</pre>
-     * <br>
-     * Example usage for HTTP transport and TLS:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-     *  .address("localhost:9000")
-     *  .enableTls()
-     *  .build()) {
-     *    sender.table(tableName).column("value", 42).atNow();
-     *    sender.flush();
-     *   }
-     * }</pre>
-     * <br>
-     * Example usage for TCP transport and TLS:
-     * <pre>{@code
-     * try (Sender sender = Sender.builder(Sender.Transport.TCP)
-     *  .address("localhost:9000")
-     *  .enableTls()
-     *  .build()) {
-     *    sender.table(tableName).column("value", 42).atNow();
-     *    sender.flush();
-     *   }
-     * }</pre>
-     *
-     * @see Sender#fromConfig(CharSequence) for creating a Sender directly from a configuration String
-     */
-    /**
      * Durability contract for the store-and-forward write path. Selects when
      * the SF segment file is fsynced; trades latency / throughput for
      * crash-survival of unacked frames.
@@ -601,6 +564,43 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         ASYNC
     }
 
+    /**
+     * Builder class to construct a new instance of a Sender.
+     * <br>
+     * Example usage for HTTP transport:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+     *  .address("localhost:9000")
+     *  .build()) {
+     *      sender.table(tableName).column("value", 42).atNow();
+     *      sender.flush();
+     *  }
+     * }</pre>
+     * <br>
+     * Example usage for HTTP transport and TLS:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+     *  .address("localhost:9000")
+     *  .enableTls()
+     *  .build()) {
+     *    sender.table(tableName).column("value", 42).atNow();
+     *    sender.flush();
+     *   }
+     * }</pre>
+     * <br>
+     * Example usage for TCP transport and TLS:
+     * <pre>{@code
+     * try (Sender sender = Sender.builder(Sender.Transport.TCP)
+     *  .address("localhost:9000")
+     *  .enableTls()
+     *  .build()) {
+     *    sender.table(tableName).column("value", 42).atNow();
+     *    sender.flush();
+     *   }
+     * }</pre>
+     *
+     * @see Sender#fromConfig(CharSequence) for creating a Sender directly from a configuration String
+     */
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
@@ -2072,7 +2072,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * and the I/O thread retries in the background), use
          * {@link #initialConnectMode(InitialConnectMode)} with
          * {@link InitialConnectMode#ASYNC}.
+         *
+         * @deprecated Superseded by {@link #initialConnectMode(InitialConnectMode)},
+         * which exposes the third {@link InitialConnectMode#ASYNC} mode this
+         * boolean cannot reach. {@code initialConnectRetry(true)} is equivalent to
+         * {@code initialConnectMode(InitialConnectMode.SYNC)};
+         * {@code initialConnectRetry(false)} is equivalent to
+         * {@code initialConnectMode(InitialConnectMode.OFF)}.
          */
+        @Deprecated
         public LineSenderBuilder initialConnectRetry(boolean enabled) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
@@ -2289,7 +2297,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // parseLong only takes a full CharSequence. The suffix-trimming
             // path is parser-time (called once per connect string), so a
             // tiny per-call substring allocation is acceptable.
-            CharSequence digits = end == len ? (CharSequence) value : value.toString().substring(0, end);
+            CharSequence digits = end == len ? value : value.toString().substring(0, end);
             try {
                 long n = Numbers.parseLong(digits);
                 // Overflow check on multiply.

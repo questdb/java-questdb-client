@@ -25,11 +25,16 @@
 package io.questdb.client.test.cutlass.line;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.auth.AuthUtils;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Test;
 
+import javax.security.auth.DestroyFailedException;
+import java.security.PrivateKey;
+
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.fail;
 
 /**
@@ -392,6 +397,34 @@ public class LineSenderBuilderTest {
     public void testPlainOldTokenNotSupportedForHttpProtocol() throws Exception {
         assertMemoryLeak(() -> assertThrows("old token authentication is not supported for HTTP protocol",
                 Sender.builder(Sender.Transport.HTTP).address("localhost:9000").enableAuth("key").authToken(AUTH_TOKEN_KEY1)));
+    }
+
+    @Test
+    public void testPlainPrivateKey_connectionRefused() throws Exception {
+        // privateKey(PrivateKey) is the bring-your-own-key alternative to
+        // authToken(String): the caller hands over a PrivateKey already in
+        // memory (e.g. fetched from an HSM/KMS) and retains ownership of
+        // its lifecycle. Verify the builder accepts it and walks all the
+        // way to the connect step (which fails -- nothing listens on
+        // 19003), and that the key is NOT destroyed by the builder
+        // (shouldDestroyPrivKey stays false on this path).
+        assertMemoryLeak(() -> {
+            PrivateKey key = AuthUtils.toPrivateKey(AUTH_TOKEN_KEY1);
+            try {
+                assertThrows("could not connect",
+                        Sender.builder(Sender.Transport.TCP)
+                                .enableAuth("foo")
+                                .privateKey(key)
+                                .address(LOCALHOST + ":19003"));
+                assertFalse("privateKey() must not destroy a caller-owned key", key.isDestroyed());
+            } finally {
+                try {
+                    key.destroy();
+                } catch (DestroyFailedException ignore) {
+                    // best-effort; some PrivateKey impls reject destroy()
+                }
+            }
+        });
     }
 
     @Test

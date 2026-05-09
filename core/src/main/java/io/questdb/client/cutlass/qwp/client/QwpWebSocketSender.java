@@ -33,10 +33,10 @@ import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
@@ -204,7 +204,6 @@ public class QwpWebSocketSender implements Sender {
     // Async-delivery sink for ack-watermark advances. Default no-op; a
     // setProgressHandler call before connect() swaps in a real handler.
     private SenderProgressHandler progressHandler = DefaultSenderProgressHandler.INSTANCE;
-    private int progressInboxCapacity = SenderProgressDispatcher.DEFAULT_CAPACITY;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -1218,35 +1217,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Snapshot of drainers the foreground sender has dispatched. Useful
-     * for monitoring orphan-drain progress without parsing logs.
-     */
-    public ObjList<BackgroundDrainer> getBackgroundDrainers() {
-        if (drainerPool == null) return new ObjList<>(0);
-        return drainerPool.snapshot();
-    }
-
-    /**
-     * Errors lost because the user handler was too slow to drain the bounded
-     * inbox. Non-zero means the handler is misbehaving or the server is
-     * dumping rejections faster than the handler can absorb. Visible to ops.
-     */
-    public long getDroppedErrorNotifications() {
-        SenderErrorDispatcher d = errorDispatcher;
-        return d == null ? 0L : d.getDroppedNotifications();
-    }
-
-    /**
-     * Progress notifications dropped due to inbox overflow. Non-zero is
-     * tolerable on this path (the next delivered FSN supersedes any drop)
-     * but signals handler latency for ops dashboards.
-     */
-    public long getDroppedProgressNotifications() {
-        SenderProgressDispatcher d = progressDispatcher;
-        return d == null ? 0L : d.getDroppedNotifications();
-    }
-
-    /**
      * Snapshot of the typed payload for the latched terminal server-rejection error,
      * or {@code null} if the I/O loop has not latched a server-rejection terminal
      * (initial state, or only a wire-level failure has been latched). Read-only —
@@ -1272,14 +1242,6 @@ public class QwpWebSocketSender implements Sender {
         return globalId;
     }
 
-    /**
-     * Returns the number of pending rows not yet flushed.
-     * For testing.
-     */
-    public int getPendingRowCount() {
-        return pendingRowCount;
-    }
-
     @TestOnly
     public QwpTableBuffer getTableBuffer(String tableName) {
         QwpTableBuffer buffer = tableBuffers.get(tableName);
@@ -1301,41 +1263,11 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Errors successfully delivered to the user handler since startup. Counts
-     * delivery attempts including those where the handler threw — exceptions
-     * are caught and logged, but the delivery still happened.
-     */
-    public long getTotalErrorNotificationsDelivered() {
-        SenderErrorDispatcher d = errorDispatcher;
-        return d == null ? 0L : d.getTotalDelivered();
-    }
-
-    /**
-     * Frames re-sent on the post-reconnect catch-up window — i.e. frames
-     * whose FSN was already on the wire before the drop. Useful for
-     * verifying replay actually re-emitted the unacked tail.
-     */
-    public long getTotalFramesReplayed() {
-        CursorWebSocketSendLoop l = cursorSendLoop;
-        return l == null ? 0L : l.getTotalFramesReplayed();
-    }
-
-    /**
      * Total binary frames the cursor I/O loop has issued to the wire.
      */
     public long getTotalFramesSent() {
         CursorWebSocketSendLoop l = cursorSendLoop;
         return l == null ? 0L : l.getTotalFramesSent();
-    }
-
-    /**
-     * Progress notifications successfully delivered to the user handler.
-     * Strictly increases over the lifetime of a sender; useful as an ops
-     * heartbeat for "is the I/O loop progressing".
-     */
-    public long getTotalProgressNotificationsDelivered() {
-        SenderProgressDispatcher d = progressDispatcher;
-        return d == null ? 0L : d.getTotalDelivered();
     }
 
     /**
@@ -1358,8 +1290,6 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Total errors observed by the I/O loop (DROP and HALT combined).
-     * Diverges from {@link #getDroppedErrorNotifications()} which counts only
-     * notifications dropped due to inbox overflow.
      */
     public long getTotalServerErrors() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -1604,17 +1534,6 @@ public class QwpWebSocketSender implements Sender {
         if (d != null) {
             d.setHandler(effective);
         }
-    }
-
-    /**
-     * Configure the bounded inbox capacity for the progress dispatcher. Must
-     * be called before {@code connect()}; later changes have no effect.
-     */
-    public void setProgressInboxCapacity(int capacity) {
-        if (capacity < 1) {
-            throw new IllegalArgumentException("progressInboxCapacity must be >= 1, was " + capacity);
-        }
-        this.progressInboxCapacity = capacity;
     }
 
     /**
@@ -1875,7 +1794,15 @@ public class QwpWebSocketSender implements Sender {
             hostTracker.beginRound(true);
         }
         Throwable lastError = null;
-        Throwable terminalUpgradeError = null;
+        // Latches the first typed upgrade failure that won't fix on retry
+        // within this connect window: durable-ack mismatch (cluster-wide config),
+        // version mismatch (rolling upgrade across all endpoints), or any other
+        // non-421 WebSocketUpgradeException (4xx/5xx). The catch block walks
+        // remaining endpoints in case the failure is per-endpoint, then surfaces
+        // this latched typed exception when the round ends without a successful
+        // connect. Auth failures are NOT latched here -- they throw immediately
+        // because a rejected credential is uniformly rejected across the cluster.
+        HttpClientException terminalUpgradeError = null;
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
         while (true) {
@@ -1909,6 +1836,12 @@ public class QwpWebSocketSender implements Sender {
                 if (classified instanceof QwpAuthFailedException) {
                     throw classified;
                 }
+                if (terminalUpgradeError == null && (
+                        classified instanceof QwpVersionMismatchException
+                                || (classified instanceof WebSocketUpgradeException
+                                        && !((WebSocketUpgradeException) classified).isRoleMismatch()))) {
+                    terminalUpgradeError = classified;
+                }
                 hostTracker.recordTransportError(idx);
                 lastError = classified;
                 continue;
@@ -1921,13 +1854,8 @@ public class QwpWebSocketSender implements Sender {
             if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
                 newClient.close();
                 hostTracker.recordRoleReject(idx, false);
-                LineSenderException ackErr = new LineSenderException(
-                        "WebSocket upgrade failed: server does not support durable ack [host=")
-                        .put(ep.host).put(", port=").put(ep.port)
-                        .put("]. The client opted in via request_durable_ack=on but the server "
-                                + "did not echo X-QWP-Durable-Ack: enabled in the upgrade response. "
-                                + "Either disable request_durable_ack or connect to a server with "
-                                + "primary replication configured.");
+                QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
+                        ep.host, ep.port, null);
                 if (terminalUpgradeError == null) {
                     terminalUpgradeError = ackErr;
                 }
@@ -1940,33 +1868,21 @@ public class QwpWebSocketSender implements Sender {
             return newClient;
         }
         if (terminalUpgradeError != null) {
-            LineSenderException ex = new LineSenderException(terminalUpgradeError);
-            ex.put("Failed to connect: WebSocket upgrade failed across ")
-                    .put(endpoints.size()).put(" endpoint(s); cause: ")
-                    .put(terminalUpgradeError.getMessage());
-            throw ex;
+            throw terminalUpgradeError;
         }
         if (lastRoleReject != null) {
             // When the client opted into durable ack but every endpoint
             // role-rejected the /write/v4 upgrade (typically a misconfigured
             // address list pointing at replicas only), a primary that can
-            // serve durable ack will not appear by retrying. Surface the
-            // failure as a terminal upgrade error so the SYNC/ASYNC connect
-            // path fails fast instead of burning the full
-            // reconnect_max_duration_millis budget walking the same replicas.
-            // The "WebSocket upgrade failed:" prefix is the sentinel that
-            // CursorWebSocketSendLoop.isTerminalUpgradeError() sniffs to
-            // suppress retry; "durable" in the message points the user at
-            // the cause without needing to read the stack.
+            // serve durable ack will not appear by retrying. Throw the typed
+            // QwpDurableAckMismatchException -- the cursor send loop's terminal
+            // classifier recognises it by instanceof and suppresses retry, so
+            // the SYNC/ASYNC connect paths fail fast instead of burning the
+            // full reconnect_max_duration_millis budget walking the same
+            // replicas.
             if (requestDurableAck) {
-                LineSenderException ackErr = new LineSenderException(
-                        "WebSocket upgrade failed: server does not support durable ack [host=")
-                        .put(lastRoleReject.getHost()).put(", port=").put(lastRoleReject.getPort())
-                        .put(", role=").put(lastRoleReject.getRole()).put("]. The client opted in via "
-                                + "request_durable_ack=on but every configured endpoint role-rejected "
-                                + "the /write/v4 upgrade -- only a PRIMARY (or STANDALONE) with "
-                                + "primary replication configured can echo X-QWP-Durable-Ack: enabled. "
-                                + "Either disable request_durable_ack or point at a primary endpoint.");
+                QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
+                        lastRoleReject.getHost(), lastRoleReject.getPort(), lastRoleReject.getRole());
                 ackErr.initCause(lastRoleReject);
                 throw ackErr;
             }
@@ -2179,7 +2095,7 @@ public class QwpWebSocketSender implements Sender {
             // I/O thread should never observe a null dispatcher between
             // an ack arrival and the notify call.
             if (progressDispatcher == null) {
-                progressDispatcher = new SenderProgressDispatcher(progressHandler, progressInboxCapacity);
+                progressDispatcher = new SenderProgressDispatcher(progressHandler, SenderProgressDispatcher.DEFAULT_CAPACITY);
             }
             cursorSendLoop.setProgressDispatcher(progressDispatcher);
             cursorSendLoop.start();

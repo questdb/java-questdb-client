@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.http.client;
 
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
@@ -255,17 +256,6 @@ public abstract class WebSocketClient implements QuietCloseable {
         recvPos = 0;
         recvReadPos = 0;
         resetFragmentState();
-    }
-
-    /**
-     * Closes the socket to force-unblock a thread blocked in send/recv.
-     * <p>
-     * Unlike {@link #disconnect()}, this method only closes the socket
-     * and does not reset client state. It is safe to call from a different
-     * thread than the one performing I/O.
-     */
-    public void forceDisconnect() {
-        Misc.free(socket);
     }
 
     /**
@@ -664,22 +654,25 @@ public abstract class WebSocketClient implements QuietCloseable {
         return false;
     }
 
-    private static int parseStatusCode(String statusLine) {
-        int sp1 = statusLine.indexOf(' ');
-        if (sp1 < 0 || sp1 + 4 > statusLine.length()) return 0;
-        if (sp1 + 4 < statusLine.length()) {
-            char afterCode = statusLine.charAt(sp1 + 4);
-            if (afterCode != ' ' && afterCode != '\r' && afterCode != '\n') {
-                return 0;
+    private static int extractQwpVersion(String response) {
+        int headerLen = QWP_VERSION_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QWP_VERSION_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                try {
+                    return Integer.parseInt(value);
+                } catch (NumberFormatException e) {
+                    return 1;
+                }
             }
         }
-        int code = 0;
-        for (int i = sp1 + 1; i < sp1 + 4; i++) {
-            char c = statusLine.charAt(i);
-            if (c < '0' || c > '9') return 0;
-            code = code * 10 + (c - '0');
-        }
-        return code;
+        return 1;
     }
 
     private static String extractRoleHeader(String response) {
@@ -722,25 +715,22 @@ public abstract class WebSocketClient implements QuietCloseable {
         return null;
     }
 
-    private static int extractQwpVersion(String response) {
-        int headerLen = QWP_VERSION_HEADER_NAME.length();
-        int responseLen = response.length();
-        for (int i = 0; i <= responseLen - headerLen; i++) {
-            if (response.regionMatches(true, i, QWP_VERSION_HEADER_NAME, 0, headerLen)) {
-                int valueStart = i + headerLen;
-                int lineEnd = response.indexOf('\r', valueStart);
-                if (lineEnd < 0) {
-                    lineEnd = responseLen;
-                }
-                String value = response.substring(valueStart, lineEnd).trim();
-                try {
-                    return Integer.parseInt(value);
-                } catch (NumberFormatException e) {
-                    return 1;
-                }
+    private static int parseStatusCode(String statusLine) {
+        int sp1 = statusLine.indexOf(' ');
+        if (sp1 < 0 || sp1 + 4 > statusLine.length()) return 0;
+        if (sp1 + 4 < statusLine.length()) {
+            char afterCode = statusLine.charAt(sp1 + 4);
+            if (afterCode != ' ' && afterCode != '\r' && afterCode != '\n') {
+                return 0;
             }
         }
-        return 1;
+        int code = 0;
+        for (int i = sp1 + 1; i < sp1 + 4; i++) {
+            char c = statusLine.charAt(i);
+            if (c < '0' || c > '9') return 0;
+            code = code * 10 + (c - '0');
+        }
+        return code;
     }
 
     private static int remainingTime(int timeoutMillis, long startTimeNanos) {
@@ -1159,13 +1149,13 @@ public abstract class WebSocketClient implements QuietCloseable {
         // Reject a server-advertised version outside [1, qwpMaxVersion]: this
         // is per-endpoint, not cluster-wide (a rolling upgrade can leave one
         // node ahead of or behind its peers), so the connect loop classifies
-        // it as a transport error and walks to the next host. Throwing
-        // HttpClientException here lets QwpUpgradeFailures.classify() route
-        // it through the standard transient path; see failover.md §6.
+        // it as a transport error and walks to the next host. The typed
+        // QwpVersionMismatchException lets the cursor send loop's terminal
+        // classifier match by instanceof rather than message sniffing; see
+        // failover.md §6.
         serverQwpVersion = extractQwpVersion(response);
         if (serverQwpVersion < 1 || serverQwpVersion > qwpMaxVersion) {
-            throw new HttpClientException("WebSocket upgrade failed: server advertised unsupported QWP version ")
-                    .put(serverQwpVersion).put(" [client max=").put(qwpMaxVersion).put(']');
+            throw new QwpVersionMismatchException(serverQwpVersion, qwpMaxVersion);
         }
 
         // Extract X-QWP-Durable-Ack confirmation (optional, absent on servers

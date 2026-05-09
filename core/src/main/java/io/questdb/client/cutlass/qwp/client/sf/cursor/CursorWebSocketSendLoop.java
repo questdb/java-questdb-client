@@ -28,7 +28,13 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
+import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -131,7 +137,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // whose FSN was already published before the wire dropped. A non-zero
     // value confirms replay is working; a sustained nonzero rate means
     // the connection is flapping and replay is doing real work each cycle.
-    private final AtomicLong totalFramesReplayed = new AtomicLong();
     // Set at swapClient time to publishedFsn at that moment; cleared back
     // to -1 once trySendOne has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
@@ -453,11 +458,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return totalReconnectAttempts.get();
     }
 
-    /** Total frames re-sent on the post-reconnect replay window. */
-    public long getTotalFramesReplayed() {
-        return totalFramesReplayed.get();
-    }
-
     public synchronized void start() {
         if (ioThread != null) {
             throw new IllegalStateException("already started");
@@ -591,42 +591,51 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             phase, elapsedMs, attempts, fsnAtZero);
                     return;
                 }
-            } catch (Throwable e) {
-                if (isTerminalUpgradeError(e)) {
-                    String upgradeMsg = findUpgradeFailureMessage(e);
-                    LOG.error("terminal upgrade error during {} -- won't retry: {}",
-                            phase, upgradeMsg);
-                    long fromFsn = engine.ackedFsn() + 1L;
-                    long toFsn = Math.max(fromFsn, engine.publishedFsn());
-                    SenderError err = new SenderError(
-                            SenderError.Category.SECURITY_ERROR,
-                            SenderError.Policy.HALT,
-                            SenderError.NO_STATUS_BYTE,
-                            "ws-upgrade-failed: " + upgradeMsg,
-                            SenderError.NO_MESSAGE_SEQUENCE,
-                            fromFsn,
-                            toFsn,
-                            null,
-                            System.nanoTime()
-                    );
-                    totalServerErrors.incrementAndGet();
-                    recordFatal(new LineSenderServerException(err), err);
-                    dispatchError(err);
-                    return;
-                }
-                if (isRoleReject(e)) {
-                    backoffMillis = reconnectInitialBackoffMillis;
-                    lastReconnectError = e;
-                    if (running) {
-                        long remainingNanos = deadlineNanos - System.nanoTime();
-                        if (remainingNanos <= 0L) {
-                            break;
-                        }
-                        long parkNanos = Math.min(reconnectInitialBackoffMillis * 1_000_000L, remainingNanos);
-                        LockSupport.parkNanos(parkNanos);
+            } catch (QwpAuthFailedException | QwpDurableAckMismatchException
+                    | QwpVersionMismatchException | WebSocketUpgradeException e) {
+                // Terminal across all configured endpoints. WebSocketUpgradeException
+                // reaching here is always non-421: QwpUpgradeFailures.classify
+                // upstream converts a 421-with-X-QuestDB-Role to
+                // QwpIngressRoleRejectedException, and a 421 without that header
+                // walks the transport-error path in buildAndConnect and lands as
+                // a LineSenderException, falling into the Throwable branch below.
+                LOG.error("terminal upgrade error during {} -- won't retry: {}",
+                        phase, e.getMessage());
+                long fromFsn = engine.ackedFsn() + 1L;
+                long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                SenderError err = new SenderError(
+                        SenderError.Category.SECURITY_ERROR,
+                        SenderError.Policy.HALT,
+                        SenderError.NO_STATUS_BYTE,
+                        "ws-upgrade-failed: " + e.getMessage(),
+                        SenderError.NO_MESSAGE_SEQUENCE,
+                        fromFsn,
+                        toFsn,
+                        null,
+                        System.nanoTime()
+                );
+                totalServerErrors.incrementAndGet();
+                recordFatal(new LineSenderServerException(err), err);
+                dispatchError(err);
+                return;
+            } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
+                // Role mismatch: cluster reconfigured during this connect, the
+                // previously-writable endpoint is now read-only. Reset backoff
+                // (don't double on each role reject -- failover usually clears
+                // within seconds) and park for the initial interval before the
+                // next attempt.
+                backoffMillis = reconnectInitialBackoffMillis;
+                lastReconnectError = e;
+                if (running) {
+                    long remainingNanos = deadlineNanos - System.nanoTime();
+                    if (remainingNanos <= 0L) {
+                        break;
                     }
-                    continue;
+                    long parkNanos = Math.min(reconnectInitialBackoffMillis * 1_000_000L, remainingNanos);
+                    LockSupport.parkNanos(parkNanos);
                 }
+                continue;
+            } catch (Throwable e) {
                 lastReconnectError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
@@ -733,81 +742,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * True when the given throwable indicates a server-side reject that
-     * won't fix itself on retry. Today this is detected by message
-     * sniffing: WebSocket upgrade failures with a non-101 HTTP status
-     * (401 unauthorized, 403 forbidden, 426 upgrade-required, etc.)
-     * indicate auth or version mismatch — retrying just delays the user
-     * seeing the misconfig. Other failures (TCP refused, IO error during
-     * handshake) are treated as transient.
-     */
-    private static boolean isTerminalUpgradeError(Throwable t) {
-        // Durable-ack mismatch is terminal regardless of any underlying
-        // role-reject in the cause chain: when request_durable_ack=on and
-        // every endpoint is non-primary (replica/catchup), no amount of
-        // retry within the connect window converts a replica into a
-        // durable-ack-capable primary. The QwpWebSocketSender.buildAndConnect
-        // wraps such walks as a "WebSocket upgrade failed: ... durable ack..."
-        // throw with the last role-reject as cause; without this short-circuit
-        // isRoleReject() below would trump the terminal classification and
-        // burn the full reconnect_max_duration_millis budget.
-        if (isDurableAckMismatch(t)) {
-            return true;
-        }
-        if (isRoleReject(t)) {
-            return false;
-        }
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            if (cur instanceof io.questdb.client.cutlass.qwp.client.QwpAuthFailedException) {
-                return true;
-            }
-            if (cur.getCause() == cur) break;
-        }
-        return findUpgradeFailureMessage(t) != null;
-    }
-
-    private static boolean isDurableAckMismatch(Throwable t) {
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            String msg = cur.getMessage();
-            if (msg != null
-                    && msg.contains("WebSocket upgrade failed:")
-                    && msg.contains("durable ack")) {
-                return true;
-            }
-            if (cur.getCause() == cur) break;
-        }
-        return false;
-    }
-
-    private static boolean isRoleReject(Throwable t) {
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            if (cur instanceof io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException) {
-                return true;
-            }
-            if (cur.getCause() == cur) break;
-        }
-        return false;
-    }
-
-    /**
-     * Walks the cause chain looking for the WebSocketClient's
-     * "WebSocket upgrade failed:" sentinel and returns its message, or
-     * {@code null} if not present. The upgrade failure is thrown deep
-     * inside WebSocketClient and gets wrapped by the connect path before
-     * reaching us — so we have to look past the outermost wrapper.
-     */
-    private static String findUpgradeFailureMessage(Throwable t) {
-        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
-            String msg = cur.getMessage();
-            if (msg != null && msg.contains("WebSocket upgrade failed:")) {
-                return msg;
-            }
-            if (cur.getCause() == cur) break;
-        }
-        return null;
-    }
-
-    /**
      * Same retry-with-exponential-backoff-and-jitter loop the I/O thread
      * uses on a wire failure, but reusable from {@code ensureConnected} to
      * implement {@code initial_connect_retry=true}. Returns the connected
@@ -845,15 +779,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     }
                     return c;
                 }
+            } catch (QwpAuthFailedException | QwpDurableAckMismatchException
+                    | QwpVersionMismatchException | WebSocketUpgradeException e) {
+                // Terminal across all configured endpoints; see the parallel
+                // catch in the cursor reconnect loop above for why
+                // WebSocketUpgradeException reaching here is always non-421.
+                LOG.error("{} hit terminal upgrade error, won't retry: {}",
+                        contextLabel, e.getMessage());
+                throw e;
             } catch (Throwable e) {
-                if (isTerminalUpgradeError(e)) {
-                    String upgradeMsg = findUpgradeFailureMessage(e);
-                    LOG.error("{} hit terminal upgrade error, won't retry: {}",
-                            contextLabel, upgradeMsg);
-                    throw new LineSenderException(
-                            "WebSocket upgrade failed during " + contextLabel
-                                    + " (won't retry): " + upgradeMsg, e);
-                }
                 lastError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
@@ -908,8 +842,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.consecutiveSendErrors.set(0L);
         // Snapshot publishedFsn at swap time — frames at FSN ≤ this value
         // were already on the wire before the drop and will be replayed.
-        // trySendOne increments totalFramesReplayed for each one, then
-        // resets replayTargetFsn to -1 once we cross the boundary.
+        // trySendOne resets replayTargetFsn to -1 once we cross the boundary.
         long pubAtSwap = engine.publishedFsn();
         this.replayTargetFsn = pubAtSwap >= replayStart ? pubAtSwap : -1L;
         // Drop any durable-ack tracking from the previous connection. The
@@ -1051,11 +984,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long fsnSent = fsnAtZero + nextWireSeq;
         nextWireSeq++;
         totalFramesSent.incrementAndGet();
-        if (replayTargetFsn >= 0) {
-            totalFramesReplayed.incrementAndGet();
-            if (fsnSent >= replayTargetFsn) {
-                replayTargetFsn = -1L; // catch-up complete
-            }
+        if (replayTargetFsn >= 0 && fsnSent >= replayTargetFsn) {
+            replayTargetFsn = -1L; // catch-up complete
         }
         consecutiveSendErrors.set(0);
         return true;
@@ -1365,11 +1295,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public long getTotalDurableTrimAdvances() {
         return totalDurableTrimAdvances.get();
-    }
-
-    /** True when this loop drives trim from durable-ack frames. Diagnostic only. */
-    public boolean isDurableAckMode() {
-        return durableAckMode;
     }
 
     private PendingDurableEntry acquirePendingEntry() {

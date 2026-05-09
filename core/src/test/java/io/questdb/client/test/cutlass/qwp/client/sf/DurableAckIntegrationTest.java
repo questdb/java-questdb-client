@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
@@ -72,7 +73,7 @@ public class DurableAckIntegrationTest {
         // like "yes" or "1" doesn't silently disable the durability the user
         // intended.
         try {
-            Sender.fromConfig("ws::addr=localhost:1;sf_dir=" + sfDir + ";request_durable_ack=yes;");
+            Sender.fromConfig("ws::addr=localhost:1;sf_dir=" + sfDir + ";request_durable_ack=yes;").close();
             Assert.fail("expected LineSenderException for invalid value");
         } catch (LineSenderException e) {
             Assert.assertTrue(
@@ -117,11 +118,10 @@ public class DurableAckIntegrationTest {
 
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";request_durable_ack=on;";
                 try (Sender ignored = Sender.fromConfig(config)) {
-                    Assert.fail("expected connect to fail with server-no-support message");
-                } catch (LineSenderException e) {
-                    String msg = e.getMessage() == null ? "" : e.getMessage();
-                    Assert.assertTrue("error mentions durable ack, was: " + msg,
-                            msg.toLowerCase().contains("durable"));
+                    Assert.fail("expected connect to fail with QwpDurableAckMismatchException");
+                } catch (QwpDurableAckMismatchException e) {
+                    Assert.assertEquals("localhost", e.getHost());
+                    Assert.assertEquals(port, e.getPort());
                 }
             }
         });
@@ -154,7 +154,7 @@ public class DurableAckIntegrationTest {
                     // client's ackedFsn must still be behind publishedFsn --
                     // we don't assert on internals here, just observe that
                     // the contract holds at the boundary check below.
-                    handler.awaitOks(50, 5_000);
+                    handler.awaitOks();
 
                     // Release a cumulative durable-ack covering everything that
                     // has been OK'd so far. The client's I/O thread reads new
@@ -175,8 +175,8 @@ public class DurableAckIntegrationTest {
         return nextPort++;
     }
 
-    private static byte[] buildDurableAckFrame(String tableName, long seqTxn) {
-        byte[] name = tableName.getBytes(StandardCharsets.UTF_8);
+    private static byte[] buildDurableAckFrame(long seqTxn) {
+        byte[] name = DurableAckCapableHandler.TABLE_NAME.getBytes(StandardCharsets.UTF_8);
         ByteBuffer bb = ByteBuffer.allocate(1 + 2 + 2 + name.length + 8).order(ByteOrder.LITTLE_ENDIAN);
         bb.put((byte) 0x02); // STATUS_DURABLE_ACK
         bb.putShort((short) 1); // tableCount
@@ -186,8 +186,8 @@ public class DurableAckIntegrationTest {
         return bb.array();
     }
 
-    private static byte[] buildOkFrame(long wireSeq, String tableName, long seqTxn) {
-        byte[] name = tableName.getBytes(StandardCharsets.UTF_8);
+    private static byte[] buildOkFrame(long wireSeq, long seqTxn) {
+        byte[] name = DurableAckCapableHandler.TABLE_NAME.getBytes(StandardCharsets.UTF_8);
         ByteBuffer bb = ByteBuffer.allocate(1 + 8 + 2 + 2 + name.length + 8).order(ByteOrder.LITTLE_ENDIAN);
         bb.put((byte) 0x00); // STATUS_OK
         bb.putLong(wireSeq);
@@ -218,21 +218,27 @@ public class DurableAckIntegrationTest {
         Files.remove(dir);
     }
 
-    /**
-     * Server handler that ACKs every binary message with a STATUS_OK that
-     * declares the batch wrote to a single fixed table, monotonic seqTxns.
-     * Tests use {@link #emitDurableAck} to release durable-acks at controlled
-     * times so the client's deferred-trim path is exercised deterministically.
-     */
     private static class DurableAckCapableHandler implements TestWebSocketServer.WebSocketServerHandler {
         private static final String TABLE_NAME = "trades";
         private final AtomicLong nextSeqTxn = new AtomicLong(0);
         private final AtomicLong nextWireSeq = new AtomicLong(0);
         private volatile TestWebSocketServer.ClientHandler activeClient;
 
-        void awaitOks(long target, long timeoutMillis) throws InterruptedException {
-            long deadline = System.currentTimeMillis() + timeoutMillis;
-            while (totalOks() < target && System.currentTimeMillis() < deadline) {
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            activeClient = client;
+            try {
+                long wireSeq = nextWireSeq.getAndIncrement();
+                long seqTxn = nextSeqTxn.getAndIncrement();
+                client.sendBinary(buildOkFrame(wireSeq, seqTxn));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        void awaitOks() throws InterruptedException {
+            long deadline = System.currentTimeMillis() + (long) 5000;
+            while (totalOks() < (long) 50 && System.currentTimeMillis() < deadline) {
                 Thread.sleep(10);
             }
         }
@@ -243,19 +249,7 @@ public class DurableAckIntegrationTest {
             TestWebSocketServer.ClientHandler c = activeClient;
             if (c != null) {
                 long seqTxn = Math.max(0L, nextSeqTxn.get() - 1L);
-                c.sendBinary(buildDurableAckFrame(TABLE_NAME, seqTxn));
-            }
-        }
-
-        @Override
-        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            activeClient = client;
-            try {
-                long wireSeq = nextWireSeq.getAndIncrement();
-                long seqTxn = nextSeqTxn.getAndIncrement();
-                client.sendBinary(buildOkFrame(wireSeq, TABLE_NAME, seqTxn));
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+                c.sendBinary(buildDurableAckFrame(seqTxn));
             }
         }
 

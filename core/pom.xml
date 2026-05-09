@@ -33,7 +33,7 @@
         <outputPath>target</outputPath>
         <runtime.assembly>none</runtime.assembly>
         <javac.target>11</javac.target>
-        <argLine>-ea -Dfile.encoding=UTF-8 -XX:+UseParallelGC -Dslf4j.provider=ch.qos.logback.classic.spi.LogbackServiceProvider</argLine>
+        <argLine>-ea -Dfile.encoding=UTF-8 -XX:+UseParallelGC -Dslf4j.provider=ch.qos.logback.classic.spi.LogbackServiceProvider --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util=io.questdb.test</argLine>
         <test.exclude>None</test.exclude>
         <test.include>%regex[.*[^o].class]</test.include><!-- exclude module-info.class-->
         <jmh.version>1.37</jmh.version>
