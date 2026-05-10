@@ -69,7 +69,7 @@ public class SegmentManagerCloseRaceTest {
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-mgr-close-race-" + System.nanoTime()).toString();
-        Assert.assertEquals(0, Files.mkdir(tmpDir, 0755));
+        Assert.assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After
@@ -89,12 +89,10 @@ public class SegmentManagerCloseRaceTest {
             manager.start();
 
             SegmentRing[] rings = new SegmentRing[ITERATIONS];
-            String[] slots = new String[ITERATIONS];
             try {
                 for (int i = 0; i < ITERATIONS; i++) {
                     String slot = tmpDir + "/slot-" + i;
-                    Assert.assertEquals(0, Files.mkdir(slot, 0755));
-                    slots[i] = slot;
+                    Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
                     MmapSegment initial = MmapSegment.create(
                             slot + "/sf-initial.sfa", 0L, SEGMENT_SIZE);
                     rings[i] = new SegmentRing(initial, SEGMENT_SIZE);

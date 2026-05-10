@@ -57,7 +57,7 @@ public class SegmentManagerRecoveryCapTest {
     public void setUp() {
         slotDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-mgr-recover-cap-" + System.nanoTime()).toString();
-        Assert.assertEquals(0, Files.mkdir(slotDir, 0755));
+        Assert.assertEquals(0, Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After
@@ -86,18 +86,16 @@ public class SegmentManagerRecoveryCapTest {
             Assert.assertNotNull("recovery should produce a ring", ring);
 
             SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000_000L /* 1ms */, cap);
-            manager.start();
-            try {
+            try (manager) {
+                manager.start();
                 manager.register(ring, slotDir);
                 // Give the manager several ticks. With the bug, it provisions
                 // because totalBytes stays at 0 even though the ring already
                 // owns 3 × SEGMENT_SIZE.
                 Thread.sleep(100);
-            } finally {
-                // Stop the manager before counting to avoid races with the
-                // worker thread mid-provision.
-                manager.close();
             }
+            // Stop the manager before counting to avoid races with the
+            // worker thread mid-provision.
 
             int sfaAfter = countSfaFiles(slotDir);
             Assert.assertEquals(
@@ -125,15 +123,13 @@ public class SegmentManagerRecoveryCapTest {
                 Unsafe.getUnsafe().putByte(buf + i, (byte) i);
             }
             for (int i = 0; i < n; i++) {
-                MmapSegment seg = MmapSegment.create(
+                // baseSeq=0,1,2 each holding 1 frame → contiguous
+                try (MmapSegment seg = MmapSegment.create(
                         dir + "/sf-pre-" + i + ".sfa",
-                        (long) i, // baseSeq=0,1,2 each holding 1 frame → contiguous
-                        SEGMENT_SIZE);
-                try {
+                        i, // baseSeq=0,1,2 each holding 1 frame → contiguous
+                        SEGMENT_SIZE)) {
                     Assert.assertTrue("setup append should succeed",
                             seg.tryAppend(buf, 64) >= 0);
-                } finally {
-                    seg.close();
                 }
             }
         } finally {

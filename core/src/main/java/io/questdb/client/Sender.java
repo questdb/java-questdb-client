@@ -751,6 +751,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private boolean drainOrphans = false;
         private int maxBackgroundDrainers = DEFAULT_MAX_BACKGROUND_DRAINERS;
         private static final int DEFAULT_MAX_BACKGROUND_DRAINERS = 4;
+        // Optional user-supplied async connection-event listener. When null,
+        // the sender uses DefaultSenderConnectionListener.INSTANCE
+        // (loud-not-silent log of every transition).
+        private io.questdb.client.SenderConnectionListener connectionListener;
+        // Bounded inbox capacity for the async connection-event dispatcher.
+        // PARAMETER_NOT_SET_EXPLICITLY → spec default (64).
+        private int connectionListenerInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         // Optional user-supplied async error handler. When null, the sender
         // uses DefaultSenderErrorHandler.INSTANCE (loud-not-silent log).
         private io.questdb.client.SenderErrorHandler errorHandler;
@@ -1150,7 +1157,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     slotPath = null;
                 } else {
                     if (!Files.exists(sfDir)) {
-                        int rc = Files.mkdir(sfDir, 0755);
+                        int rc = Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT);
                         if (rc != 0) {
                             throw new LineSenderException(
                                     "could not create sf_dir: " + sfDir + " rc=" + rc);
@@ -1168,6 +1175,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                         ? errorInboxCapacity
                         : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
+                int actualConnectionListenerInboxCapacity = connectionListenerInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
+                        ? connectionListenerInboxCapacity
+                        : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher.DEFAULT_CAPACITY;
                 List<QwpWebSocketSender.Endpoint> wsEndpoints =
                         new ArrayList<>(hosts.size());
                 for (int i = 0, n = hosts.size(); i < n; i++) {
@@ -1194,7 +1204,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
                             authTimeoutMillis,
-                            gorillaEnabled
+                            gorillaEnabled,
+                            connectionListener,
+                            actualConnectionListenerInboxCapacity
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -1779,6 +1791,50 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
             }
             this.requestDurableAck = enabled;
+            return this;
+        }
+
+        /**
+         * Sets the async listener invoked on every connection-state transition:
+         * initial connect, primary failover, individual endpoint attempt
+         * failures, the full address list being unreachable, and terminal
+         * auth/budget rejections. The listener runs on a dedicated daemon
+         * dispatcher thread, never on the I/O thread or producer thread; slow
+         * listeners cannot stall publishing or reconnect. If the bounded inbox
+         * fills up, surplus events are dropped (visible via
+         * {@code QwpWebSocketSender.getDroppedConnectionNotifications()}).
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param listener the listener; {@code null} resets to the loud-not-silent default
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder connectionListener(io.questdb.client.SenderConnectionListener listener) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("connection_listener is only supported for WebSocket transport");
+            }
+            this.connectionListener = listener;
+            return this;
+        }
+
+        /**
+         * Sets the bounded inbox capacity used by the async connection-event
+         * dispatcher. When the inbox fills up, additional events are dropped
+         * and counted. Default 64.
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param capacity must be {@code >= 1}
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder connectionListenerInboxCapacity(int capacity) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("connection_listener_inbox_capacity is only supported for WebSocket transport");
+            }
+            if (capacity < 1) {
+                throw new LineSenderException("connection_listener_inbox_capacity must be >= 1, was " + capacity);
+            }
+            this.connectionListenerInboxCapacity = capacity;
             return this;
         }
 
@@ -2802,6 +2858,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "error_inbox_capacity");
                     errorInboxCapacity(parseIntValue(sink, "error_inbox_capacity"));
+                } else if (Chars.equals("connection_listener_inbox_capacity", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("connection_listener_inbox_capacity is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "connection_listener_inbox_capacity");
+                    connectionListenerInboxCapacity(parseIntValue(sink, "connection_listener_inbox_capacity"));
                 } else if (Chars.equals("reconnect_max_backoff_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("reconnect_max_backoff_millis is only supported for WebSocket transport");

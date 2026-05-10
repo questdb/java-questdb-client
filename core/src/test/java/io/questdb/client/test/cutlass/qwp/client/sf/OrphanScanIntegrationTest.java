@@ -77,8 +77,7 @@ public class OrphanScanIntegrationTest {
             int port = TEST_PORT + 1;
 
             // Phase 1: ghost writes + closes; never acked.
-            TestWebSocketServer ghostServer = new TestWebSocketServer(port, new SilentHandler());
-            try {
+            try (TestWebSocketServer ghostServer = new TestWebSocketServer(port, new SilentHandler())) {
                 ghostServer.start();
                 Assert.assertTrue(ghostServer.awaitStart(5, TimeUnit.SECONDS));
 
@@ -90,12 +89,8 @@ public class OrphanScanIntegrationTest {
                     // No wait for ACK — close right away; close_flush_timeout=0
                     // means we don't drain.
                 }
-            } finally {
-                try {
-                    ghostServer.close();
-                } catch (Exception ignored) {
-                    // best-effort
-                }
+            } catch (Exception ignored) {
+                // best-effort
             }
             // Independent verification: the scanner sees the ghost slot.
             ObjList<String> seen = OrphanScanner.scan(sfDir, "primary");
@@ -106,8 +101,7 @@ public class OrphanScanIntegrationTest {
             // can't directly assert the log output in this test, but the
             // call must not throw, and the primary's own slot must NOT
             // appear in a fresh scan (sender_id-filtered).
-            TestWebSocketServer primaryServer = new TestWebSocketServer(port + 1000, new AckHandler());
-            try {
+            try (TestWebSocketServer primaryServer = new TestWebSocketServer(port + 1000, new AckHandler())) {
                 primaryServer.start();
                 Assert.assertTrue(primaryServer.awaitStart(5, TimeUnit.SECONDS));
 
@@ -129,12 +123,8 @@ public class OrphanScanIntegrationTest {
                         "drain_orphans=true should have drained + removed the "
                                 + "ghost slot; primary's own slot is sender_id-filtered",
                         0, postRun.size());
-            } finally {
-                try {
-                    primaryServer.close();
-                } catch (Exception ignored) {
-                    // best-effort
-                }
+            } catch (Exception ignored) {
+                // best-effort
             }
         });
     }
@@ -145,9 +135,9 @@ public class OrphanScanIntegrationTest {
             // Manually construct an orphan slot, then drop a .failed sentinel.
             // The scan must hide it — automation has already given up on this
             // slot and a human needs to act before it gets touched again.
-            Assert.assertEquals(0, Files.mkdir(sfDir, 0755));
+            Assert.assertEquals(0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
             String orphan = sfDir + "/manual";
-            Assert.assertEquals(0, Files.mkdir(orphan, 0755));
+            Assert.assertEquals(0, Files.mkdir(orphan, Files.DIR_MODE_DEFAULT));
             touchFile(orphan + "/sf-0001.sfa");
 
             Assert.assertEquals(1, OrphanScanner.scan(sfDir, "x").size());

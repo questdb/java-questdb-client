@@ -362,19 +362,61 @@ public final class SegmentManager implements QuietCloseable {
         // 2. Trim any segments that the ring says are fully acked. For
         //    memory-mode rings, "trim" is just close() (Unsafe.free) — no
         //    file to unlink.
-        ObjList<MmapSegment> trim = e.ring.drainTrimmable();
+        //
+        //    drainTrimmable + the totalBytes commit run together under
+        //    `lock` so deregister cannot observe the intermediate state
+        //    where segments have left ring.sealedSegments but the worker
+        //    has not yet subtracted their bytes. Two interleavings would
+        //    otherwise drift the counter:
+        //      (a) deregister snapshots ring.totalSegmentBytes() before
+        //          drainTrimmable mutates the ring → deregister subtracts
+        //          including the about-to-be-drained bytes, then this
+        //          loop subtracts them again. Drift: -drained.
+        //      (b) drainTrimmable runs first (without holding lock) so
+        //          ring.totalSegmentBytes() at deregister-time is already
+        //          short by the drained bytes; if the worker then skips
+        //          the subtract on a stillRegistered=false check, those
+        //          bytes are never accounted. Drift: +drained.
+        //    Atomic drain+commit under lock collapses both windows: any
+        //    deregister sees either the pre-drain ring (with everything
+        //    still counted) or the post-drain ring with the worker's
+        //    subtraction already applied. Mirrors the spare-install
+        //    path's stillRegistered guard above.
+        //
+        //    munmap + unlink stay outside the lock — they can be slow
+        //    and shouldn't block register/deregister or sibling rings.
+        ObjList<MmapSegment> trim;
+        synchronized (lock) {
+            trim = e.ring.drainTrimmable();
+            if (trim != null) {
+                boolean stillRegistered = false;
+                for (int i = 0, n = rings.size(); i < n; i++) {
+                    if (rings.get(i) == e) {
+                        stillRegistered = true;
+                        break;
+                    }
+                }
+                if (stillRegistered) {
+                    for (int i = 0, n = trim.size(); i < n; i++) {
+                        totalBytes -= trim.get(i).sizeBytes();
+                    }
+                }
+                // else: deregister already subtracted these bytes via
+                // ring.totalSegmentBytes() (the drained segments were
+                // still in sealedSegments at that read), so subtracting
+                // again here would double-count. The segments are still
+                // ours to close + unlink below — drainTrimmable has
+                // already transferred ownership.
+            }
+        }
         if (trim != null) {
             for (int i = 0, n = trim.size(); i < n; i++) {
                 MmapSegment s = trim.get(i);
                 String path = s.path();
-                long sz = s.sizeBytes();
                 try {
                     s.close();
                     if (path != null && !Files.remove(path)) {
                         LOG.warn("Failed to unlink trimmed segment {}", path);
-                    }
-                    synchronized (lock) {
-                        totalBytes -= sz;
                     }
                 } catch (Throwable t) {
                     LOG.warn("Failed to trim segment {}", path == null ? "<memory>" : path, t);

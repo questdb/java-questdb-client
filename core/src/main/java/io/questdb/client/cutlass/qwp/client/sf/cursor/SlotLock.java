@@ -58,12 +58,10 @@ public final class SlotLock implements QuietCloseable {
     private static final String LOCK_FILE_NAME = ".lock";
     private static final String LOCK_PID_FILE_NAME = ".lock.pid";
     private final String slotDir;
-    private final String lockPath;
     private int fd;
 
-    private SlotLock(String slotDir, String lockPath, int fd) {
+    private SlotLock(String slotDir, int fd) {
         this.slotDir = slotDir;
-        this.lockPath = lockPath;
         this.fd = fd;
     }
 
@@ -80,7 +78,7 @@ public final class SlotLock implements QuietCloseable {
             throw new IllegalArgumentException("slotDir must not be empty");
         }
         if (!Files.exists(slotDir)) {
-            int rc = Files.mkdir(slotDir, 0755);
+            int rc = Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT);
             if (rc != 0) {
                 throw new IllegalStateException(
                         "could not create slot dir: " + slotDir + " rc=" + rc);
@@ -104,7 +102,7 @@ public final class SlotLock implements QuietCloseable {
             }
             writePid(pidPath);
             ok = true;
-            return new SlotLock(slotDir, lockPath, fd);
+            return new SlotLock(slotDir, fd);
         } finally {
             if (!ok) {
                 Files.close(fd);

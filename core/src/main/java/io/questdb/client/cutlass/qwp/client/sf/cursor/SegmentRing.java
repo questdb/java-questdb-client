@@ -175,8 +175,9 @@ public final class SegmentRing implements QuietCloseable {
                     String name = Files.utf8ToString(Files.findName(find));
                     if (name != null && name.endsWith(".sfa")) {
                         String path = sfDir + "/" + name;
+                        MmapSegment seg = null;
                         try {
-                            MmapSegment seg = MmapSegment.openExisting(path);
+                            seg = MmapSegment.openExisting(path);
                             // Filter out empty leftovers — typically hot-spare
                             // segments the manager pre-allocated for a prior
                             // session that never got rotated into active. They
@@ -200,6 +201,7 @@ public final class SegmentRing implements QuietCloseable {
                             if (seg.frameCount() == 0) {
                                 long torn = seg.tornTailBytes();
                                 seg.close();
+                                seg = null;
                                 if (torn > 0) {
                                     Files.rename(path, path + ".corrupt");
                                 } else {
@@ -207,18 +209,36 @@ public final class SegmentRing implements QuietCloseable {
                                 }
                             } else {
                                 opened.add(seg);
+                                seg = null;
                             }
-                        } catch (Throwable t) {
-                            // Per-file errors must NOT abort the whole
-                            // recovery. The narrow MmapSegmentException case
-                            // is a stray .sfa with a bad header / unreadable
-                            // file (skip with log). Anything else (OOM from
-                            // mmap, IOOBE from a malformed scan) is also
-                            // best handled by skipping this one file —
-                            // bringing down recovery would lose every
-                            // sibling segment too. Surfacing via a WARN gives
-                            // operators a paper trail.
-                            LOG.warn("openExisting: skipping {} — {}", path, t.toString());
+                        } catch (MmapSegmentException t) {
+                            // Per-file data error (bad magic, bad header,
+                            // unsupported version, mmap rejection on this one
+                            // file). Don't take down recovery for one corrupt
+                            // .sfa — log and skip so siblings still recover.
+                            // Resource exhaustion (OOM) and programmer errors
+                            // (IOOBE) deliberately propagate to the outer
+                            // catch, which closes every already-recovered
+                            // segment and rethrows: continuing the loop after
+                            // an OOM would just fail again on the next file
+                            // while silently leaking the segments we managed
+                            // to recover before it.
+                            LOG.warn("openExisting: skipping {} -- {}", path, t.toString());
+                        } finally {
+                            // Close any seg whose ownership wasn't transferred
+                            // (either to opened, or via the empty-branch close
+                            // above). Fires on a propagating throw between
+                            // open and transfer — most importantly an OOM
+                            // from ObjList.add growing its backing array
+                            // after the mmap+fd were already acquired.
+                            if (seg != null) {
+                                try {
+                                    seg.close();
+                                } catch (Throwable closeErr) {
+                                    LOG.warn("openExisting: error closing in-flight segment {}",
+                                            path, closeErr);
+                                }
+                            }
                         }
                     }
                     rc = Files.findNext(find);

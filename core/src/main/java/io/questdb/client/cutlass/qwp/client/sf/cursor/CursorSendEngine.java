@@ -376,13 +376,31 @@ public final class CursorSendEngine implements QuietCloseable {
             boolean fullyDrained = sfDir != null
                     && (ring.publishedFsn() < 0
                     || ring.ackedFsn() >= ring.publishedFsn());
-            manager.deregister(ring);
-            if (ownsManager) {
-                manager.close();
+            // Each cleanup step in its own try/catch so a single failure
+            // doesn't strand later cleanups — mirrors the constructor's
+            // catch block. Without this, a throw from manager.deregister
+            // or manager.close() would leave the ring mmap'd and any
+            // residual .sfa files on disk, where the next sender can
+            // adopt them and replay already-acked data.
+            try {
+                manager.deregister(ring);
+            } catch (Throwable ignored) {
             }
-            ring.close();
+            if (ownsManager) {
+                try {
+                    manager.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            try {
+                ring.close();
+            } catch (Throwable ignored) {
+            }
             if (fullyDrained) {
-                unlinkAllSegmentFiles(sfDir);
+                try {
+                    unlinkAllSegmentFiles(sfDir);
+                } catch (Throwable ignored) {
+                }
             }
         } finally {
             if (slotLock != null) {

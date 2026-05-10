@@ -76,6 +76,13 @@ public final class BackgroundDrainerPool implements QuietCloseable {
 
     private final ExecutorService executor;
     private final CopyOnWriteArrayList<BackgroundDrainer> active = new CopyOnWriteArrayList<>();
+    /**
+     * Pool-level listener applied to drainers at submit time when the
+     * drainer doesn't already carry one. Volatile so callers can install
+     * (or rotate) the listener at any point relative to {@link #submit};
+     * each submit reads it once into a local.
+     */
+    private volatile BackgroundDrainerListener listener;
 
     public BackgroundDrainerPool(int maxConcurrent) {
         if (maxConcurrent <= 0) {
@@ -108,6 +115,13 @@ public final class BackgroundDrainerPool implements QuietCloseable {
             }
             if (state.compareAndSet(s, s + 1)) break;
         }
+        // Apply the pool-level listener only if the drainer doesn't already
+        // carry one. Per-drainer listeners (set by the caller before submit)
+        // win — the pool listener is a fallback default, not an override.
+        BackgroundDrainerListener poolListener = listener;
+        if (poolListener != null && drainer.getListener() == null) {
+            drainer.setListener(poolListener);
+        }
         boolean accepted = false;
         try {
             active.add(drainer);
@@ -128,6 +142,18 @@ public final class BackgroundDrainerPool implements QuietCloseable {
             // only the low 31 bits move.
             state.decrementAndGet();
         }
+    }
+
+    /**
+     * Plug a default {@link BackgroundDrainerListener} for drainers
+     * submitted through this pool. {@code null} clears the default.
+     * Drainers that already have a listener set by the caller before
+     * {@link #submit} are not overridden — the pool default is a
+     * fallback, not an override. Subsequent submits pick up the most
+     * recently set value.
+     */
+    public void setListener(BackgroundDrainerListener listener) {
+        this.listener = listener;
     }
 
     /**

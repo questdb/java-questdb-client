@@ -52,7 +52,7 @@ public class PrReviewRedTests {
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-pr-red-" + System.nanoTime()).toString();
-        Assert.assertEquals(0, Files.mkdir(tmpDir, 0755));
+        Assert.assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After

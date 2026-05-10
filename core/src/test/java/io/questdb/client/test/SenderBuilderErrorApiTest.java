@@ -137,8 +137,76 @@ public class SenderBuilderErrorApiTest {
         Sender.LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET)
                 .address("127.0.0.1:1")
                 .errorHandler(err -> { /* no-op */ })
-                .errorInboxCapacity(64);
+                .errorInboxCapacity(64)
+                .connectionListener(ev -> { /* no-op */ })
+                .connectionListenerInboxCapacity(64);
         Assert.assertNotNull(b);
+    }
+
+    @Test
+    public void testConnectionListenerInboxCapacityRejectsZeroAndNegative() {
+        try {
+            Sender.builder(Sender.Transport.WEBSOCKET).connectionListenerInboxCapacity(0);
+            Assert.fail("zero capacity must be rejected");
+        } catch (LineSenderException expected) {
+            Assert.assertTrue(expected.getMessage().contains("connection_listener_inbox_capacity"));
+            Assert.assertTrue(expected.getMessage().contains(">="));
+        }
+        try {
+            Sender.builder(Sender.Transport.WEBSOCKET).connectionListenerInboxCapacity(-5);
+            Assert.fail("negative capacity must be rejected");
+        } catch (LineSenderException expected) {
+            // ok
+        }
+    }
+
+    @Test
+    public void testConnectionListenerInboxCapacityRejectedOnNonWebSocketProtocol() {
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("127.0.0.1:1").connectionListenerInboxCapacity(100);
+            Assert.fail("expected LineSenderException");
+        } catch (LineSenderException expected) {
+            Assert.assertTrue(expected.getMessage().contains("connection_listener_inbox_capacity"));
+            Assert.assertTrue(expected.getMessage().contains("WebSocket"));
+        }
+    }
+
+    @Test
+    public void testConnectStringParsesConnectionListenerInboxCapacity() {
+        // Parse must accept the key without complaining; build() will fail
+        // on the connect step against an unreachable port, but that's a
+        // different failure mode from a connect-string parse error.
+        try {
+            Sender.builder("ws::addr=127.0.0.1:1;connection_listener_inbox_capacity=512;").build().close();
+            Assert.fail("expected LineSenderException from connect attempt");
+        } catch (LineSenderException expected) {
+            String msg = expected.getMessage();
+            Assert.assertFalse("connection_listener_inbox_capacity must parse: " + msg,
+                    msg.toLowerCase().contains("connection_listener_inbox_capacity"));
+        }
+    }
+
+    @Test
+    public void testConnectStringRejectsBadConnectionListenerInboxCapacity() {
+        try {
+            Sender.builder("ws::addr=127.0.0.1:1;connection_listener_inbox_capacity=NaN;").build().close();
+            Assert.fail("expected LineSenderException for non-numeric capacity");
+        } catch (LineSenderException expected) {
+            Assert.assertTrue("expected parse complaint about connection_listener_inbox_capacity: "
+                            + expected.getMessage(),
+                    expected.getMessage().contains("connection_listener_inbox_capacity"));
+        }
+    }
+
+    @Test
+    public void testConnectStringRejectsConnectionListenerInboxCapacityOnNonWebSocket() {
+        try {
+            Sender.builder("http::addr=127.0.0.1:1;connection_listener_inbox_capacity=10;").build().close();
+            Assert.fail("expected LineSenderException — http transport rejects connection_listener_inbox_capacity");
+        } catch (LineSenderException expected) {
+            Assert.assertTrue("expected WebSocket-only complaint: " + expected.getMessage(),
+                    expected.getMessage().contains("connection_listener_inbox_capacity"));
+        }
     }
 
     @Test

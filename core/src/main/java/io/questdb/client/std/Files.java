@@ -69,6 +69,13 @@ public final class Files {
      */
     public static final long PAGE_SIZE;
 
+    /**
+     * Default POSIX mode bits (rwxr-xr-x) used by {@link #mkdir(String, int)}
+     * for directories created by the client. Owner has full access; group and
+     * others may traverse and read but not modify. 0755 octal
+     */
+    public static final int DIR_MODE_DEFAULT = 493;
+
     /** {@code dirent.d_type} sentinel: type unknown (filesystem doesn't fill it). */
     public static final int DT_UNKNOWN = 0;
     /** {@code dirent.d_type}: directory entry. */
@@ -182,9 +189,9 @@ public final class Files {
 
     /**
      * Creates a directory at {@code path} with the given mode (POSIX-style
-     * permission bits, e.g. {@code 0755}). Returns 0 on success, non-zero on
-     * failure (e.g. parent missing, already exists, permission denied).
-     * Non-recursive — caller must ensure the parent exists.
+     * permission bits, e.g. {@link #DIR_MODE_DEFAULT}). Returns 0 on success,
+     * non-zero on failure (e.g. parent missing, already exists, permission
+     * denied). Non-recursive — caller must ensure the parent exists.
      */
     public static int mkdir(String path, int mode) {
         long ptr = pathPtr(path);

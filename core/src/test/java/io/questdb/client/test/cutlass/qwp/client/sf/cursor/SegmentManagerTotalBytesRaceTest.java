@@ -81,7 +81,7 @@ public class SegmentManagerTotalBytesRaceTest {
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-segmgr-race-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(tmpDir, 0755));
+        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After
@@ -123,7 +123,7 @@ public class SegmentManagerTotalBytesRaceTest {
                             start.await();
                             for (int i = 0; i < perThread; i++) {
                                 String dir = tmpDir + "/t" + threadId + "_r" + i;
-                                assertEquals(0, Files.mkdir(dir, 0755));
+                                assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
                                 String activePath = dir + "/sf-initial.sfa";
                                 MmapSegment active = MmapSegment.create(activePath, 0L, segSize);
                                 SegmentRing ring = new SegmentRing(active, segSize);

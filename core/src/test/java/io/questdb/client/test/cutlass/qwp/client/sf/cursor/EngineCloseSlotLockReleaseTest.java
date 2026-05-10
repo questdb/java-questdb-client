@@ -78,7 +78,7 @@ public class EngineCloseSlotLockReleaseTest {
     public void setUp() {
         sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-engine-close-leak-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(sfDir, 0755));
+        assertEquals(0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After
@@ -154,9 +154,8 @@ public class EngineCloseSlotLockReleaseTest {
             // The user-visible test: can a fresh SlotLock acquire the
             // same slot? If the original lock fd is still held, the
             // kernel's flock blocks this acquire and we throw.
-            try (SlotLock fresh = SlotLock.acquire(sfDir)) {
+            try (SlotLock ignored = SlotLock.acquire(sfDir)) {
                 // good — slot was released despite the close-path throw.
-                fresh.close();
             } catch (Exception leaked) {
                 fail("slotLock was leaked: a follow-up SlotLock.acquire on the "
                         + "same dir failed because engine.close() threw before "

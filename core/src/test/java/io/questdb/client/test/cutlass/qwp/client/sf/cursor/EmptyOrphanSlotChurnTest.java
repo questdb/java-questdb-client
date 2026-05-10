@@ -35,7 +35,6 @@ import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
 
 /**
  * Regression test for M6 — drainer adopting an empty orphan slot would
@@ -64,7 +63,7 @@ public class EmptyOrphanSlotChurnTest {
     public void setUp() {
         sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-empty-churn-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(sfDir, 0755));
+        assertEquals(0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After

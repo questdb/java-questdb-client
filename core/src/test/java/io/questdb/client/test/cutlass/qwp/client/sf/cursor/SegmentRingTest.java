@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Misc;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -51,7 +52,7 @@ public class SegmentRingTest {
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-ring-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(tmpDir, 0755));
+        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After
@@ -221,10 +222,7 @@ public class SegmentRingTest {
 
     @Test
     public void testOpenExistingReturnsNullOnEmptyDir() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            assertEquals("nothing in dir → null ring",
-                    null, SegmentRing.openExisting(tmpDir, 8192));
-        });
+        TestUtils.assertMemoryLeak(() -> assertNull("nothing in dir → null ring", SegmentRing.openExisting(tmpDir, 8192)));
     }
 
     @Test
@@ -287,7 +285,7 @@ public class SegmentRingTest {
                 s2.close();
 
                 try {
-                    SegmentRing.openExisting(tmpDir, segSize);
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
                     throw new AssertionError("expected FSN gap to be detected");
                 } catch (MmapSegmentException expected) {
                     assertTrue(expected.getMessage(),
@@ -351,7 +349,7 @@ public class SegmentRingTest {
                     for (int i = 0; i <= 200; i++) {
                         Unsafe.getUnsafe().putLong(buf, i);
                         long fsn = ring.appendOrFsn(buf, 8);
-                        assertEquals((long) i, fsn);
+                        assertEquals(i, fsn);
                     }
                     assertEquals(200L, ring.publishedFsn());
 
@@ -449,6 +447,7 @@ public class SegmentRingTest {
                                 tmpDir + "/t-" + (i + 1) + ".sfa", ring.nextSeqHint(), segSize));
                     }
                     MmapSegment seg0Snapshot = ring.firstSealed();
+                    assertNotNull(seg0Snapshot);
                     assertEquals(0, seg0Snapshot.baseSeq());
                     // Simulate trim: ack everything in seg0 and seg1, drain.
                     ring.acknowledge(1);
@@ -500,11 +499,8 @@ public class SegmentRingTest {
                     String name = String.format("sf-%05d.sfa", i);
                     long segSize = MmapSegment.HEADER_SIZE
                             + MmapSegment.FRAME_HEADER_SIZE + 16;
-                    MmapSegment seg = MmapSegment.create(tmpDir + "/" + name, i, segSize);
-                    try {
+                    try (MmapSegment seg = MmapSegment.create(tmpDir + "/" + name, i, segSize)) {
                         assertTrue("setup append " + i, seg.tryAppend(buf, 16) >= 0);
-                    } finally {
-                        seg.close();
                     }
                 }
 
@@ -563,12 +559,9 @@ public class SegmentRingTest {
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg = MmapSegment.create(tmpDir + "/sf-00000.sfa", 0, segSize);
-                try {
+                try (MmapSegment seg = MmapSegment.create(tmpDir + "/sf-00000.sfa", 0, segSize)) {
                     fillPattern(buf, 32, 0);
                     assertTrue(seg.tryAppend(buf, 32) >= 0);
-                } finally {
-                    seg.close();
                 }
 
                 try (SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize)) {

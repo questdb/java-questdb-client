@@ -26,6 +26,8 @@ package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.Sender;
+import io.questdb.client.SenderConnectionEvent;
+import io.questdb.client.SenderConnectionListener;
 import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.SenderProgressHandler;
@@ -39,8 +41,10 @@ import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
@@ -155,6 +159,13 @@ public class QwpWebSocketSender implements Sender {
     private long closeFlushTimeoutMillis = 5_000L;
     private volatile boolean closed;
     private boolean connected;
+    private SenderConnectionDispatcher connectionDispatcher;
+    // Async-delivery sink for SenderConnectionEvent notifications. Default
+    // installed at construction; the builder hook can swap before connect()
+    // runs, and post-connect setConnectionListener() propagates to the live
+    // dispatcher.
+    private SenderConnectionListener connectionListener = DefaultSenderConnectionListener.INSTANCE;
+    private int connectionListenerInboxCapacity = SenderConnectionDispatcher.DEFAULT_CAPACITY;
     // Track max global symbol ID used in current batch (for delta calculation)
     private int currentBatchMaxSymbolId = -1;
     private volatile int currentEndpointIdx = -1;
@@ -184,6 +195,10 @@ public class QwpWebSocketSender implements Sender {
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
     private boolean gorillaEnabled = true;
+    // Stickys true once any successful connect has happened. Drives the
+    // CONNECTED-vs-RECONNECTED-vs-FAILED_OVER classification at the success
+    // point in buildAndConnect.
+    private boolean hasEverConnected;
     // OFF   → startup connect failure is immediately terminal (default).
     // SYNC  → startup connect goes through the same retry-with-backoff
     //         loop as in-flight reconnect; auth failures still terminal.
@@ -213,6 +228,14 @@ public class QwpWebSocketSender implements Sender {
     private long reconnectMaxDurationMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private boolean requestDurableAck;
+    // Monotonic per-attempt counter snapshotted onto every connection event
+    // fired from buildAndConnect. Counts every endpoint try -- successes and
+    // failures alike -- across this sender's lifetime.
+    private long roundConnectAttemptSeq;
+    // Monotonic per-round counter incremented inside buildAndConnect on each
+    // beginRound(true) call. roundSeq=1 is the first round; CONNECTED in the
+    // first round indicates the initial connect.
+    private long roundSeq;
 
     private QwpWebSocketSender(
             List<Endpoint> endpoints,
@@ -488,6 +511,11 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Multi-endpoint variant. {@code endpoints} must be non-empty; the order is the failover
      * preference (single-primary cluster: walk the list until one accepts the upgrade).
+     * <p>
+     * Delegates to the wider overload that also accepts the connection-listener
+     * configuration; passes {@code null} listener and the dispatcher default
+     * inbox capacity, matching the contract of the older callers that were
+     * written before connection events shipped.
      */
     public static QwpWebSocketSender connect(
             List<Endpoint> endpoints,
@@ -509,6 +537,43 @@ public class QwpWebSocketSender implements Sender {
             long durableAckKeepaliveIntervalMillis,
             long authTimeoutMs,
             boolean gorillaEnabled
+    ) {
+        return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeader,
+                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, gorillaEnabled,
+                null, SenderConnectionDispatcher.DEFAULT_CAPACITY);
+    }
+
+    /**
+     * Multi-endpoint variant that also accepts the async connection-event
+     * listener and its dispatcher inbox capacity.
+     */
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            int maxSchemasPerConnection,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            boolean gorillaEnabled,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
@@ -532,6 +597,10 @@ public class QwpWebSocketSender implements Sender {
                 sender.setErrorHandler(errorHandler);
             }
             sender.setErrorInboxCapacity(errorInboxCapacity);
+            if (connectionListener != null) {
+                sender.setConnectionListener(connectionListener);
+            }
+            sender.setConnectionListenerInboxCapacity(connectionListenerInboxCapacity);
             if (cursorEngine != null) {
                 sender.setCursorEngine(cursorEngine, true);
             }
@@ -939,6 +1008,14 @@ public class QwpWebSocketSender implements Sender {
                     terminalError = captureCloseError(terminalError, t);
                 }
             }
+            if (connectionDispatcher != null) {
+                try {
+                    connectionDispatcher.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing connection dispatcher: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
+            }
 
             LOG.info("QwpWebSocketSender closed");
 
@@ -1255,6 +1332,27 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Number of {@link SenderConnectionEvent} notifications dropped because
+     * the bounded inbox was full. Non-zero means the user-supplied
+     * {@link SenderConnectionListener} cannot keep up. Returns 0 if the
+     * dispatcher has not been allocated yet.
+     */
+    public long getDroppedConnectionNotifications() {
+        SenderConnectionDispatcher d = connectionDispatcher;
+        return d == null ? 0L : d.getDroppedNotifications();
+    }
+
+    /**
+     * Number of {@link SenderConnectionEvent} notifications delivered to the
+     * user listener since this sender started. Counts every delivery attempt,
+     * including those where the listener threw.
+     */
+    public long getTotalConnectionEventsDelivered() {
+        SenderConnectionDispatcher d = connectionDispatcher;
+        return d == null ? 0L : d.getTotalDelivered();
+    }
+
+    /**
      * Total binary frames whose ACKs have been received and applied.
      */
     public long getTotalAcks() {
@@ -1482,6 +1580,42 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Register an async listener for connection-state transitions: initial
+     * connect, primary failover, endpoint attempt failures, the full address
+     * list being unreachable, and terminal auth/budget rejections.
+     * <p>
+     * May be called either before or after {@code connect()} -- when called
+     * after, the change propagates to the live dispatcher and takes effect on
+     * the next delivery. Pass {@code null} to revert to the loud-not-silent
+     * default.
+     * <p>
+     * The listener is invoked on a dedicated daemon dispatcher thread, never
+     * on the I/O thread or the producer thread; slow listeners cannot stall
+     * publishing or reconnect. See {@link SenderConnectionListener} for the
+     * full delivery contract.
+     */
+    public void setConnectionListener(SenderConnectionListener listener) {
+        SenderConnectionListener effective = listener != null ? listener : DefaultSenderConnectionListener.INSTANCE;
+        this.connectionListener = effective;
+        SenderConnectionDispatcher d = connectionDispatcher;
+        if (d != null) {
+            d.setListener(effective);
+        }
+    }
+
+    /**
+     * Configure the bounded inbox capacity used by the connection-event
+     * dispatcher. Must be called before {@code connect()}; later changes have
+     * no effect.
+     */
+    public void setConnectionListenerInboxCapacity(int capacity) {
+        if (capacity < 1) {
+            throw new IllegalArgumentException("connectionListenerInboxCapacity must be >= 1, was " + capacity);
+        }
+        this.connectionListenerInboxCapacity = capacity;
+    }
+
+    /**
      * Configure the user-supplied error handler. May be called either before
      * or after {@code connect()} — when called after, the change propagates
      * to the live dispatcher and takes effect on the next delivery. Pass
@@ -1589,7 +1723,9 @@ public class QwpWebSocketSender implements Sender {
                             newReconnectFactory(),
                             reconnectMaxDurationMillis,
                             reconnectInitialBackoffMillis,
-                            reconnectMaxBackoffMillis);
+                            reconnectMaxBackoffMillis,
+                            requestDurableAck,
+                            durableAckKeepaliveIntervalMillis);
             drainerPool.submit(drainer);
         }
     }
@@ -1787,10 +1923,23 @@ public class QwpWebSocketSender implements Sender {
     private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
         int previousIdx = ctx.previousIdx;
         if (previousIdx >= 0) {
+            // Mid-stream wire failure -- the I/O loop just observed the active
+            // connection drop and called us via the reconnect factory. Surface
+            // a DISCONNECTED event identifying which endpoint just went away
+            // before we start the per-endpoint walk for a replacement.
+            Endpoint priorEp = endpoints.get(previousIdx);
+            dispatchConnectionEvent(
+                    SenderConnectionEvent.Kind.DISCONNECTED,
+                    priorEp.host, priorEp.port,
+                    null, SenderConnectionEvent.NO_PORT,
+                    SenderConnectionEvent.NO_ATTEMPT_NUMBER,
+                    roundSeq,
+                    null);
             hostTracker.recordMidStreamFailure(previousIdx);
             ctx.previousIdx = -1;
         }
         if (hostTracker.isRoundExhausted()) {
+            roundSeq++;
             hostTracker.beginRound(true);
         }
         Throwable lastError = null;
@@ -1813,6 +1962,7 @@ public class QwpWebSocketSender implements Sender {
             if (idx < 0) break;
             Endpoint ep = endpoints.get(idx);
             lastEndpoint = ep;
+            long attemptNumber = ++roundConnectAttemptSeq;
             WebSocketClient newClient = tlsConfig != null
                     ? WebSocketClientFactory.newTlsInstance(tlsConfig)
                     : WebSocketClientFactory.newPlainTextInstance();
@@ -1831,9 +1981,23 @@ public class QwpWebSocketSender implements Sender {
                     hostTracker.recordRoleReject(idx, re.isTransient());
                     lastError = re;
                     lastRoleReject = re;
+                    dispatchConnectionEvent(
+                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                            attemptNumber, roundSeq, re);
                     continue;
                 }
                 if (classified instanceof QwpAuthFailedException) {
+                    // Auth is uniform across the cluster; we won't keep walking
+                    // endpoints. Fire AUTH_FAILED before throwing so the user
+                    // listener observes the terminal classification at the
+                    // moment the I/O thread gives up, ahead of the producer
+                    // thread learning via LineSenderException on the next
+                    // API call.
+                    dispatchConnectionEvent(
+                            SenderConnectionEvent.Kind.AUTH_FAILED,
+                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                            attemptNumber, roundSeq, classified);
                     throw classified;
                 }
                 if (terminalUpgradeError == null && (
@@ -1844,11 +2008,19 @@ public class QwpWebSocketSender implements Sender {
                 }
                 hostTracker.recordTransportError(idx);
                 lastError = classified;
+                dispatchConnectionEvent(
+                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                        attemptNumber, roundSeq, classified);
                 continue;
             } catch (Exception e) {
                 newClient.close();
                 hostTracker.recordTransportError(idx);
                 lastError = e;
+                dispatchConnectionEvent(
+                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                        attemptNumber, roundSeq, e);
                 continue;
             }
             if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
@@ -1860,12 +2032,54 @@ public class QwpWebSocketSender implements Sender {
                     terminalUpgradeError = ackErr;
                 }
                 lastError = ackErr;
+                dispatchConnectionEvent(
+                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                        attemptNumber, roundSeq, ackErr);
                 continue;
             }
+            int previousLiveIdx = currentEndpointIdx;
             hostTracker.recordSuccess(idx);
             ctx.previousIdx = idx;
             currentEndpointIdx = idx;
+            // Classify the success. CONNECTED only fires once per sender
+            // lifetime; subsequent successes are RECONNECTED (same endpoint
+            // as before) or FAILED_OVER (different endpoint). hasEverConnected
+            // is set after the classification so the very first success picks
+            // CONNECTED before flipping the flag.
+            SenderConnectionEvent.Kind successKind;
+            String prevHost = null;
+            int prevPort = SenderConnectionEvent.NO_PORT;
+            if (!hasEverConnected) {
+                successKind = SenderConnectionEvent.Kind.CONNECTED;
+                hasEverConnected = true;
+            } else if (previousLiveIdx == idx) {
+                successKind = SenderConnectionEvent.Kind.RECONNECTED;
+            } else {
+                successKind = SenderConnectionEvent.Kind.FAILED_OVER;
+                if (previousLiveIdx >= 0) {
+                    Endpoint prevEp = endpoints.get(previousLiveIdx);
+                    prevHost = prevEp.host;
+                    prevPort = prevEp.port;
+                }
+            }
+            dispatchConnectionEvent(
+                    successKind, ep.host, ep.port, prevHost, prevPort,
+                    attemptNumber, roundSeq, null);
             return newClient;
+        }
+        // Round walked every endpoint without a success. Surface
+        // ALL_ENDPOINTS_UNREACHABLE before any of the typed throws so a
+        // single failed sweep produces exactly one such event regardless of
+        // which terminal branch fires next. The connectLoop wrapper retries,
+        // and each retry that re-enters this method and fails again produces
+        // its own ALL_ENDPOINTS_UNREACHABLE event.
+        if (lastEndpoint != null) {
+            dispatchConnectionEvent(
+                    SenderConnectionEvent.Kind.ALL_ENDPOINTS_UNREACHABLE,
+                    lastEndpoint.host, lastEndpoint.port,
+                    null, SenderConnectionEvent.NO_PORT,
+                    SenderConnectionEvent.NO_ATTEMPT_NUMBER, roundSeq, lastError);
         }
         if (terminalUpgradeError != null) {
             throw terminalUpgradeError;
@@ -1963,6 +2177,32 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Build and offer a connection event to the dispatcher. No-op when the
+     * dispatcher has not been allocated yet (e.g. very early in connect()
+     * before ensureConnected wired it up). The dispatcher itself is
+     * non-blocking and drops on overflow; this helper is safe to call from
+     * any thread.
+     */
+    private void dispatchConnectionEvent(
+            SenderConnectionEvent.Kind kind,
+            String host,
+            int port,
+            String previousHost,
+            int previousPort,
+            long attemptNumber,
+            long roundNumber,
+            Throwable cause
+    ) {
+        SenderConnectionDispatcher d = connectionDispatcher;
+        if (d == null) {
+            return;
+        }
+        d.offer(new SenderConnectionEvent(
+                kind, host, port, previousHost, previousPort,
+                attemptNumber, roundNumber, cause, System.currentTimeMillis()));
+    }
+
+    /**
      * Bounded drain on close: block until {@code ackedFsn >= publishedFsn}
      * or until {@code closeFlushTimeoutMillis} elapses. {@code <= 0} skips
      * the drain (fast close). On timeout, throw a {@link LineSenderException}
@@ -2039,6 +2279,15 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine == null) {
             throw new LineSenderException("cursor engine must be attached before connect");
         }
+        // Allocate the connection-event dispatcher BEFORE any buildAndConnect
+        // attempt so fire points inside buildAndConnect (CONNECTED,
+        // ENDPOINT_ATTEMPT_FAILED, AUTH_FAILED, ALL_ENDPOINTS_UNREACHABLE,
+        // FAILED_OVER, RECONNECTED) always have a real sink. Dispatcher
+        // dispatcher thread is lazy-started on the first offer().
+        if (connectionDispatcher == null) {
+            connectionDispatcher = new SenderConnectionDispatcher(
+                    connectionListener, connectionListenerInboxCapacity);
+        }
         CursorWebSocketSendLoop.ReconnectFactory reconnectFactory = newReconnectFactory();
         switch (initialConnectMode) {
             case SYNC:
@@ -2098,6 +2347,12 @@ public class QwpWebSocketSender implements Sender {
                 progressDispatcher = new SenderProgressDispatcher(progressHandler, SenderProgressDispatcher.DEFAULT_CAPACITY);
             }
             cursorSendLoop.setProgressDispatcher(progressDispatcher);
+            // Connection-event dispatcher: lets the cursor I/O loop fire
+            // DISCONNECTED on outage entry and RECONNECT_BUDGET_EXHAUSTED on
+            // budget exit. Sender-side fire points (buildAndConnect) write
+            // directly to connectionDispatcher; this getter just shares the
+            // same instance with the loop.
+            cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
             cursorSendLoop.start();
         } catch (Throwable t) {
             if (client != null) {

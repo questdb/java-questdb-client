@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.LineSenderServerException;
+import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
@@ -152,8 +153,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // alike) is offered to the dispatcher for async delivery to the user's
     // handler. Null disables async delivery entirely; the producer-side
     // typed-throw path is unaffected.
-    private SenderErrorDispatcher errorDispatcher;
-    private SenderProgressDispatcher progressDispatcher;
+    // Optional: when non-null, RECONNECT_BUDGET_EXHAUSTED is offered to the
+    // dispatcher for async delivery to the user's listener at the moment
+    // connectLoop gives up. Sender-side fire points (CONNECTED, FAILED_OVER,
+    // ENDPOINT_ATTEMPT_FAILED, AUTH_FAILED, ALL_ENDPOINTS_UNREACHABLE) write
+    // directly to the same dispatcher from QwpWebSocketSender.
+    private volatile SenderConnectionDispatcher connectionDispatcher;
+    private volatile SenderErrorDispatcher errorDispatcher;
+    private volatile SenderProgressDispatcher progressDispatcher;
     // When true, OK frames do NOT advance engine.acknowledge -- only
     // STATUS_DURABLE_ACK frames do. The OK frame's wireSeq is stashed in
     // pendingDurable along with its per-table seqTxns, and trim only advances
@@ -428,6 +435,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Plug an async-delivery sink for {@link SenderConnectionEvent}
+     * notifications. The loop fires {@code RECONNECT_BUDGET_EXHAUSTED}
+     * through this sink when {@code connectLoop} gives up; other connection
+     * events fire from {@code QwpWebSocketSender.buildAndConnect} directly
+     * into the same dispatcher. Same lifecycle contract as
+     * {@link #setErrorDispatcher}.
+     */
+    public void setConnectionDispatcher(SenderConnectionDispatcher dispatcher) {
+        this.connectionDispatcher = dispatcher;
+    }
+
+    /**
      * Plug an async-delivery sink for {@link SenderError} notifications.
      * Idempotent — set once before {@link #start()}; later reassignment is
      * permitted but races between dispatchers are the caller's problem.
@@ -697,6 +716,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // terminal error is latched before the handler is invoked.
         recordFatal(new LineSenderServerException(err), err);
         dispatchError(err);
+        // Surface the terminal classification through the connection-event
+        // dispatcher too. Listeners learn about budget exhaustion without
+        // having to also subscribe to SenderError. Fire AFTER recordFatal so
+        // a listener that immediately checks the producer-side terminal state
+        // sees a consistent picture.
+        SenderConnectionDispatcher cd = connectionDispatcher;
+        if (cd != null) {
+            cd.offer(new SenderConnectionEvent(
+                    SenderConnectionEvent.Kind.RECONNECT_BUDGET_EXHAUSTED,
+                    null, SenderConnectionEvent.NO_PORT,
+                    null, SenderConnectionEvent.NO_PORT,
+                    attempts,
+                    SenderConnectionEvent.NO_ROUND_NUMBER,
+                    lastReconnectError,
+                    System.currentTimeMillis()));
+        }
     }
 
     /**

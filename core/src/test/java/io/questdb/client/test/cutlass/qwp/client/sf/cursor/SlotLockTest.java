@@ -45,7 +45,7 @@ public class SlotLockTest {
     public void setUp() {
         parentDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-slotlock-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(parentDir, 0755));
+        assertEquals(0, Files.mkdir(parentDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After
@@ -71,7 +71,7 @@ public class SlotLockTest {
     public void testSecondAcquireFailsOnLockContention() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slot = parentDir + "/contended";
-            try (SlotLock first = SlotLock.acquire(slot)) {
+            try (SlotLock ignored1 = SlotLock.acquire(slot)) {
                 try (SlotLock ignored = SlotLock.acquire(slot)) {
                     fail("expected slot contention to throw");
                 } catch (IllegalStateException expected) {
@@ -93,7 +93,7 @@ public class SlotLockTest {
     public void testCloseReleasesLock() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slot = parentDir + "/release";
-            try (SlotLock first = SlotLock.acquire(slot)) {
+            try (SlotLock ignored = SlotLock.acquire(slot)) {
                 // explicit no-op; close happens via try-with-resources
             }
             // After release, a fresh acquire should succeed.

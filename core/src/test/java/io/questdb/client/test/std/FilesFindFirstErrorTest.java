@@ -72,7 +72,7 @@ public class FilesFindFirstErrorTest {
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-files-findfirst-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(tmpDir, 0755));
+        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After

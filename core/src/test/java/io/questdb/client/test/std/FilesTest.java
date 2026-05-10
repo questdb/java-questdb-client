@@ -34,14 +34,10 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.File;
-import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.*;
 
 public class FilesTest {
 
@@ -51,7 +47,7 @@ public class FilesTest {
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-files-test-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(tmpDir, 0755));
+        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After

@@ -51,7 +51,7 @@ public class SegmentRingRecoveryUnlinkTest {
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-ring-recover-unlink-" + System.nanoTime()).toString();
-        Assert.assertEquals(0, Files.mkdir(tmpDir, 0755));
+        Assert.assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After
@@ -129,16 +129,14 @@ public class SegmentRingRecoveryUnlinkTest {
             Assert.assertTrue("setup: orphan .sfa should exist", Files.exists(orphanPath));
 
             SegmentRing recovered = SegmentRing.openExisting(tmpDir, SEGMENT_SIZE);
-            Assert.assertNotNull("recovery dropped the valid segment", recovered);
-            try {
+            try (recovered) {
+                Assert.assertNotNull("recovery dropped the valid segment", recovered);
                 Assert.assertTrue(
                         "recovery should keep the valid segment on disk",
                         Files.exists(validPath));
                 Assert.assertFalse(
                         "recovery should unlink the empty orphan .sfa — currently leaks",
                         Files.exists(orphanPath));
-            } finally {
-                recovered.close();
             }
         });
     }

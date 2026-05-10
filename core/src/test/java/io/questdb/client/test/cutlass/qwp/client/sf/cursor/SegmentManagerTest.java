@@ -49,7 +49,7 @@ public class SegmentManagerTest {
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
                 "qdb-segmgr-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(tmpDir, 0755));
+        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
     @After
@@ -256,7 +256,7 @@ public class SegmentManagerTest {
             // post-rotation wakeup runs before the next 5s poll.
             long pollNanos = 5_000_000_000L;
             long segSize = MmapSegment.HEADER_SIZE
-                    + 1 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+                    + (MmapSegment.FRAME_HEADER_SIZE + 16);
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
@@ -302,13 +302,15 @@ public class SegmentManagerTest {
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
             // Three rings, each with their own subdir.
-            String dirA = tmpDir + "/A"; Files.mkdir(dirA, 0755);
-            String dirB = tmpDir + "/B"; Files.mkdir(dirB, 0755);
-            String dirC = tmpDir + "/C"; Files.mkdir(dirC, 0755);
-            SegmentRing ringA = new SegmentRing(MmapSegment.create(dirA + "/0000000000000000.sfa", 0, segSize), segSize);
-            SegmentRing ringB = new SegmentRing(MmapSegment.create(dirB + "/0000000000000000.sfa", 0, segSize), segSize);
-            SegmentRing ringC = new SegmentRing(MmapSegment.create(dirC + "/0000000000000000.sfa", 0, segSize), segSize);
-            try (SegmentManager mgr = new SegmentManager(segSize, 200_000L)) {
+            String dirA = tmpDir + "/A"; Files.mkdir(dirA, Files.DIR_MODE_DEFAULT);
+            String dirB = tmpDir + "/B"; Files.mkdir(dirB, Files.DIR_MODE_DEFAULT);
+            String dirC = tmpDir + "/C"; Files.mkdir(dirC, Files.DIR_MODE_DEFAULT);
+            try (
+                    SegmentRing ringA = new SegmentRing(MmapSegment.create(dirA + "/0000000000000000.sfa", 0, segSize), segSize);
+                    SegmentRing ringB = new SegmentRing(MmapSegment.create(dirB + "/0000000000000000.sfa", 0, segSize), segSize);
+                    SegmentRing ringC = new SegmentRing(MmapSegment.create(dirC + "/0000000000000000.sfa", 0, segSize), segSize);
+                    SegmentManager mgr = new SegmentManager(segSize, 200_000L)
+            ) {
                 mgr.start();
                 mgr.register(ringA, dirA);
                 mgr.register(ringB, dirB);
@@ -322,9 +324,6 @@ public class SegmentManagerTest {
                 // halts — but B still owns whatever spare the manager already gave it.
                 mgr.deregister(ringB);
             } finally {
-                ringA.close();
-                ringB.close();
-                ringC.close();
                 Files.remove(dirA);
                 Files.remove(dirB);
                 Files.remove(dirC);
