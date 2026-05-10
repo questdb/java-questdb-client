@@ -103,7 +103,14 @@ public class SegmentManagerTrimDeregisterRaceTest {
                 mgr.start();
 
                 final int threads = 8;
-                final int perThread = 200;
+                // 50 iterations per thread × 8 threads = 400 deregister/trim
+                // race attempts. The earlier 200/thread setup measured ~1.6 s
+                // on Linux but blew through the 40 s done.await on Windows
+                // CI agents (filesystem syscalls on Azure Windows are
+                // ~20-25x slower than Linux). 400 attempts still hits the
+                // bug pre-fix while leaving a comfortable margin on slow
+                // agents.
+                final int perThread = 50;
                 final CountDownLatch start = new CountDownLatch(1);
                 final CountDownLatch done = new CountDownLatch(threads);
                 final AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -172,39 +179,49 @@ public class SegmentManagerTrimDeregisterRaceTest {
                     worker.start();
                 }
 
-                start.countDown();
-                assertTrue("producers should finish",
-                        done.await(40, TimeUnit.SECONDS));
-                Throwable f = failure.get();
-                if (f != null) throw new AssertionError("producer thread failed", f);
+                try {
+                    start.countDown();
+                    assertTrue("producers should finish",
+                            done.await(40, TimeUnit.SECONDS));
+                    Throwable f = failure.get();
+                    if (f != null) throw new AssertionError("producer thread failed", f);
 
-                // Let any in-flight serviceRing iterations land their trim
-                // subtraction before reading totalBytes.
-                Thread.sleep(200L);
+                    // Let any in-flight serviceRing iterations land their trim
+                    // subtraction before reading totalBytes.
+                    Thread.sleep(200L);
 
-                long observed = readTotalBytes(mgr);
+                    long observed = readTotalBytes(mgr);
 
-                // Now safe to close. Some rings will already have empty
-                // sealedSegments (worker drained); others won't (close
-                // beat drain). close() handles both.
-                for (List<SegmentRing> rings : outstanding) {
-                    for (SegmentRing ring : rings) ring.close();
+                    assertEquals(
+                            "totalBytes drifted away from 0. Observed " + observed
+                                    + " bytes (segSize=" + segSize + ", drift = "
+                                    + (observed / (double) segSize) + " segments). "
+                                    + "Negative drift means SegmentManager.serviceRing's "
+                                    + "trim loop (lines 365-378) subtracted bytes that "
+                                    + "deregister had already subtracted via "
+                                    + "ring.totalSegmentBytes(): no stillRegistered guard "
+                                    + "mirrors the spare-install path at lines 323-336. "
+                                    + "Fix: gate `totalBytes -= sz` on a stillRegistered "
+                                    + "re-check, or move totalBytes accounting fully into "
+                                    + "SegmentRing so it can't be split across two threads' "
+                                    + "bookkeeping.",
+                            0L, observed);
+                } finally {
+                    // Close every ring whether or not we got past the
+                    // assertions — leaving rings open leaks mmap memory
+                    // into the next test's assertMemoryLeak baseline.
+                    // SegmentRing.close() is idempotent, so the success
+                    // path closing them all once is the only cost.
+                    for (List<SegmentRing> rings : outstanding) {
+                        for (SegmentRing ring : rings) {
+                            try {
+                                ring.close();
+                            } catch (Throwable ignored) {
+                                // best-effort cleanup
+                            }
+                        }
+                    }
                 }
-
-                assertEquals(
-                        "totalBytes drifted away from 0. Observed " + observed
-                                + " bytes (segSize=" + segSize + ", drift = "
-                                + (observed / (double) segSize) + " segments). "
-                                + "Negative drift means SegmentManager.serviceRing's "
-                                + "trim loop (lines 365-378) subtracted bytes that "
-                                + "deregister had already subtracted via "
-                                + "ring.totalSegmentBytes(): no stillRegistered guard "
-                                + "mirrors the spare-install path at lines 323-336. "
-                                + "Fix: gate `totalBytes -= sz` on a stillRegistered "
-                                + "re-check, or move totalBytes accounting fully into "
-                                + "SegmentRing so it can't be split across two threads' "
-                                + "bookkeeping.",
-                        0L, observed);
             }
         });
     }

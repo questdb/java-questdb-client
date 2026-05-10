@@ -25,8 +25,10 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.Numbers;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
+import io.questdb.client.std.str.StringSink;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -67,8 +69,14 @@ public final class SegmentManager implements QuietCloseable {
     private final AtomicLong fileGeneration = new AtomicLong();
     private final Object lock = new Object();
     private final long maxTotalBytes;
+    // Reused by the manager worker thread to build spare-segment paths
+    // without per-rotation String.format / concat allocation.
+    private final StringSink pathSink = new StringSink();
     private final long pollNanos;
     private final ObjList<RingEntry> rings = new ObjList<>();
+    // Reused by the worker thread each tick to snapshot `rings` under the
+    // lock without per-tick allocation. Owned exclusively by workerLoop().
+    private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final long segmentSizeBytes;
     // Total bytes currently allocated across every segment owned by every
     // registered ring (active + sealed + hot-spare). Mutated by the manager
@@ -433,26 +441,32 @@ public final class SegmentManager implements QuietCloseable {
      * discovers segments by extension + header magic, not by filename.
      */
     private String nextSparePath(String dir) {
-        return dir + "/sf-" + String.format("%016x", fileGeneration.getAndIncrement()) + ".sfa";
+        pathSink.clear();
+        pathSink.put(dir).put("/sf-");
+        Numbers.appendHex(pathSink, fileGeneration.getAndIncrement(), true);
+        pathSink.put(".sfa");
+        return pathSink.toString();
     }
 
     private void workerLoop() {
         while (running) {
             // Snapshot the rings under the lock so we don't hold it through the
-            // (potentially slow) syscalls during creation/unlink.
-            int snapshotSize;
-            RingEntry[] snapshot;
+            // (potentially slow) syscalls during creation/unlink. ringSnapshot
+            // is a thread-confined field — no per-tick allocation.
+            ringSnapshot.clear();
             synchronized (lock) {
-                snapshotSize = rings.size();
-                snapshot = new RingEntry[snapshotSize];
-                for (int i = 0; i < snapshotSize; i++) {
-                    snapshot[i] = rings.get(i);
+                for (int i = 0, n = rings.size(); i < n; i++) {
+                    ringSnapshot.add(rings.getQuick(i));
                 }
             }
-            for (int i = 0; i < snapshotSize; i++) {
+            for (int i = 0, n = ringSnapshot.size(); i < n; i++) {
                 if (!running) break;
-                serviceRing(snapshot[i]);
+                serviceRing(ringSnapshot.getQuick(i));
             }
+            // Drop strong refs so a deregistered ring becomes collectable
+            // before the next tick (otherwise the snapshot pins it for up
+            // to pollNanos after deregister).
+            ringSnapshot.clear();
             if (!running) break;
             LockSupport.parkNanos(pollNanos);
         }
