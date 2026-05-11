@@ -85,6 +85,12 @@ public final class SegmentManager implements QuietCloseable {
     // consistent across registration boundaries.
     private long totalBytes;
     private long lastDiskFullLogNs;
+    // Test seam: runs on the worker thread just before the trim block's
+    // synchronized(lock) entry. Null in production; only
+    // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
+    // inject a deregister(ring) call into the exact race window that the
+    // stillRegistered guard inside the trim block closes.
+    volatile Runnable beforeTrimSyncHook;
     private volatile boolean running;
     // volatile because wakeWorker() reads workerThread without holding the
     // monitor; the synchronized start()/close() pair handles the
@@ -394,6 +400,10 @@ public final class SegmentManager implements QuietCloseable {
         //    munmap + unlink stay outside the lock — they can be slow
         //    and shouldn't block register/deregister or sibling rings.
         ObjList<MmapSegment> trim;
+        Runnable hook = beforeTrimSyncHook;
+        if (hook != null) {
+            hook.run();
+        }
         synchronized (lock) {
             trim = e.ring.drainTrimmable();
             if (trim != null) {

@@ -37,42 +37,33 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Red test for {@code SegmentManager.totalBytes} drift on the
- * <b>trim</b> path of {@code serviceRing} (lines 365-378). The trim loop
- * subtracts {@code s.sizeBytes()} per drained segment with no
- * {@code stillRegistered} re-check; if {@code deregister(ring)} fires
- * between the worker's {@code rings} snapshot and its
- * {@code drainTrimmable} call, deregister's
- * {@code totalBytes -= ring.totalSegmentBytes()} already accounts for
- * those sealed segments, and the loop subtracts them again. Drift is
- * negative (over-subtraction) and persists for the lifetime of the
- * manager, so {@code sf_max_total_bytes} backpressure either fires too
- * early (false-positive cap) or the cap as a memory bound is broken.
+ * Deterministic test for {@code SegmentManager.totalBytes} drift on the
+ * <b>trim</b> path of {@code serviceRing}. The bug: the trim loop subtracts
+ * {@code s.sizeBytes()} per drained segment with no {@code stillRegistered}
+ * re-check, so if {@code deregister(ring)} fires between the worker's
+ * {@code rings} snapshot and the trim block's {@code synchronized(lock)},
+ * deregister's {@code totalBytes -= ring.totalSegmentBytes()} already
+ * accounts for those sealed segments and the loop double-counts them.
  *
- * <p>Counterpart to {@link SegmentManagerTotalBytesRaceTest}, which
- * targets the spare-install commit drift on the same path. The
- * spare-install path has a {@code stillRegistered} guard
- * ({@code SegmentManager} lines 323-336); the trim path was missed.
+ * <p>Drives the race with the {@code beforeTrimSyncHook} seam on
+ * {@code SegmentManager}, which fires on the worker thread immediately
+ * before the trim block's {@code synchronized(lock)}. The hook performs the
+ * deregister synchronously; when the worker subsequently enters the
+ * synchronized block, the stillRegistered re-check sees the entry removed
+ * and skips the (otherwise double-counted) subtract.
  *
- * <p>Setup per ring: one frame fits in a segment, so a second append
- * always rotates. After rotation the prior active is sealed; ack'ing
- * FSN 0 makes it trimmable. Producer holds the ring open across
- * deregister so {@code SegmentRing.close} (which clears
- * {@code sealedSegments}) cannot pre-empt the worker's drain — close
- * before drain would close the bug's window.
- *
- * <p>Drift direction: in the bug, {@code totalBytes} ends below 0;
- * after the fix it is exactly 0.
+ * <p>Pre-fix the test ends with {@code totalBytes < 0}; post-fix it ends at
+ * exactly {@code 0}. No stress, no concurrency in setup, no spin loops in
+ * the assertion path: the hook fires exactly once, on a single woken tick.
  */
 public class SegmentManagerTrimDeregisterRaceTest {
 
@@ -91,139 +82,148 @@ public class SegmentManagerTrimDeregisterRaceTest {
         rmDirRecursive(tmpDir);
     }
 
-    @Test(timeout = 60_000L)
+    @Test(timeout = 15_000L)
     public void testTrimPathDoesNotDoubleSubtractAfterDeregister() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // One frame per segment, so a second append always rotates.
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
-            long maxTotal = segSize * 32_768L;
+            long maxTotal = segSize * 8L;
 
+            // Large pollNanos: the worker parks until explicitly woken, so we
+            // own the tick boundaries. SegmentRing fires managerWakeup on
+            // appendOrFsn whenever a spare is needed, so the producer-driven
+            // setup phase still gets prompt service.
             try (SegmentManager mgr = new SegmentManager(
-                    segSize, 1_000L /* 1us tick — busy-poll */, maxTotal)) {
+                    segSize, TimeUnit.SECONDS.toNanos(60), maxTotal)) {
                 mgr.start();
 
-                final int threads = 8;
-                // 50 iterations per thread × 8 threads = 400 deregister/trim
-                // race attempts. The earlier 200/thread setup measured ~1.6 s
-                // on Linux but blew through the 40 s done.await on Windows
-                // CI agents (filesystem syscalls on Azure Windows are
-                // ~20-25x slower than Linux). 400 attempts still hits the
-                // bug pre-fix while leaving a comfortable margin on slow
-                // agents.
-                final int perThread = 50;
-                final CountDownLatch start = new CountDownLatch(1);
-                final CountDownLatch done = new CountDownLatch(threads);
-                final AtomicReference<Throwable> failure = new AtomicReference<>();
+                String dir = tmpDir + "/single-ring";
+                assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
+                String activePath = dir + "/sf-initial.sfa";
+                MmapSegment seg0 = MmapSegment.create(activePath, 0L, segSize);
+                SegmentRing ring = new SegmentRing(seg0, segSize);
 
-                // Hold rings open until after the assertion so close() does
-                // not clear sealedSegments before the worker's drain — the
-                // race window only stays open while sealedSegments has the
-                // trimmable seg0 in it.
-                final List<List<SegmentRing>> outstanding = new ArrayList<>();
-                for (int t = 0; t < threads; t++) outstanding.add(new ArrayList<>());
-
-                for (int t = 0; t < threads; t++) {
-                    final int threadId = t;
-                    final List<SegmentRing> myRings = outstanding.get(t);
-                    Thread worker = new Thread(() -> {
-                        long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-                        try {
-                            start.await();
-                            for (int i = 0; i < perThread; i++) {
-                                String dir = tmpDir + "/t" + threadId + "_r" + i;
-                                assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
-                                String activePath = dir + "/sf-initial.sfa";
-                                MmapSegment seg0 = MmapSegment.create(activePath, 0L, segSize);
-                                SegmentRing ring = new SegmentRing(seg0, segSize);
-                                myRings.add(ring);
-
-                                mgr.register(ring, dir);
-                                // FSN 0 fills seg0. Wait for the manager to
-                                // park a spare. Then FSN 1 rotates: seg0
-                                // joins sealedSegments, the spare becomes
-                                // active.
-                                ring.appendOrFsn(buf, 32);
-                                long deadline = System.nanoTime() + 1_000_000_000L;
-                                while (ring.needsHotSpare()) {
-                                    if (System.nanoTime() > deadline) {
-                                        throw new AssertionError(
-                                                "spare never arrived for ring t" + threadId + "_r" + i);
-                                    }
-                                    Thread.onSpinWait();
-                                }
-                                ring.appendOrFsn(buf, 32);
-                                // ackedFsn = 0 makes seg0 (baseSeq=0,
-                                // frameCount=1, lastSeq=0) trimmable. The
-                                // very next worker tick will drain it
-                                // unless deregister beats it.
-                                ring.acknowledge(0L);
-
-                                // Tiny burn so the worker has a realistic
-                                // chance to land in serviceRing(this ring)
-                                // with a snapshot that still includes us
-                                // BEFORE deregister fires.
-                                spinNanos(20_000L);
-                                mgr.deregister(ring);
-                                // DO NOT close: close() would clear
-                                // sealedSegments under the ring monitor and
-                                // foreclose the worker's drain.
-                            }
-                        } catch (Throwable t1) {
-                            failure.compareAndSet(null, t1);
-                        } finally {
-                            Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
-                            done.countDown();
-                        }
-                    }, "trim-race-producer-" + t);
-                    worker.setDaemon(true);
-                    worker.start();
-                }
-
+                long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
                 try {
-                    start.countDown();
-                    assertTrue("producers should finish",
-                            done.await(40, TimeUnit.SECONDS));
-                    Throwable f = failure.get();
-                    if (f != null) throw new AssertionError("producer thread failed", f);
+                    mgr.register(ring, dir);
+                    // Fill seg0 (FSN 0). The ring auto-wakes the worker to
+                    // provision a spare; wait for that spare so the next
+                    // append can rotate.
+                    ring.appendOrFsn(buf, 32);
+                    awaitSpare(ring, "after seg0 fill");
+                    // Rotate: seg0 joins sealedSegments, the spare becomes
+                    // active. Worker auto-wakes again to provision the next
+                    // spare; whether that completes before we install the
+                    // hook does not matter for the test (the hook fires only
+                    // on a worker tick we trigger explicitly below).
+                    ring.appendOrFsn(buf, 32);
+                    awaitSpare(ring, "after rotation");
+                    // FSN 0 acked: seg0 (baseSeq=0, lastSeq=0) is now
+                    // trimmable. Acknowledge does NOT wake the worker, so the
+                    // trim does not happen until we wakeWorker() below.
+                    ring.acknowledge(0L);
 
-                    // Let any in-flight serviceRing iterations land their trim
-                    // subtraction before reading totalBytes.
-                    Thread.sleep(200L);
+                    // Snapshot totalBytes before the race. With a spare
+                    // installed both before and after rotation, the ring
+                    // owns 3 segments; if the second spare failed to install
+                    // (e.g. allocation race we did not orchestrate), it owns
+                    // 2. Either way the test invariant is "deregister +
+                    // trim net to zero", regardless of the starting value.
+                    long bytesBeforeRace = readTotalBytes(mgr);
+                    assertTrue("expected totalBytes > 0 before race, was " + bytesBeforeRace,
+                            bytesBeforeRace > 0L);
+
+                    // Hook fires on the worker thread immediately before the
+                    // trim block's synchronized(lock). It deregisters the
+                    // ring synchronously, then the worker enters the lock,
+                    // calls drainTrimmable() (returns seg0), the
+                    // stillRegistered check sees the entry removed, and
+                    // skips the subtract that would otherwise double-count
+                    // the bytes deregister already accounted for.
+                    AtomicBoolean fired = new AtomicBoolean();
+                    CountDownLatch hookDone = new CountDownLatch(1);
+                    AtomicReference<Throwable> hookErr = new AtomicReference<>();
+                    setBeforeTrimSyncHook(mgr, () -> {
+                        if (!fired.compareAndSet(false, true)) return;
+                        try {
+                            mgr.deregister(ring);
+                        } catch (Throwable t) {
+                            hookErr.compareAndSet(null, t);
+                        } finally {
+                            hookDone.countDown();
+                        }
+                    });
+
+                    // Trigger exactly one worker tick — the one that fires
+                    // the hook. The worker may run additional ticks if the
+                    // hook's deregister itself wakes it, but the fired CAS
+                    // makes subsequent invocations no-ops.
+                    mgr.wakeWorker();
+
+                    assertTrue("hook never fired", hookDone.await(5, TimeUnit.SECONDS));
+                    if (hookErr.get() != null) {
+                        throw new AssertionError("hook failed", hookErr.get());
+                    }
+
+                    // Wait for the worker to park again, which is our signal
+                    // that the trim block following the hook has finished
+                    // (drain + maybe-subtract + lock release + iteration
+                    // exit). The 60 s pollNanos means TIMED_WAITING is a
+                    // strong signal; with the entry deregistered, no further
+                    // wakeups arrive.
+                    Thread worker = workerThread(mgr);
+                    awaitParked(worker);
 
                     long observed = readTotalBytes(mgr);
-
-                    assertEquals(
-                            "totalBytes drifted away from 0. Observed " + observed
-                                    + " bytes (segSize=" + segSize + ", drift = "
-                                    + (observed / (double) segSize) + " segments). "
+                    assertEquals("totalBytes drifted away from 0. Observed "
+                                    + observed + " (segSize=" + segSize + ", "
+                                    + "bytesBeforeRace=" + bytesBeforeRace + "). "
                                     + "Negative drift means SegmentManager.serviceRing's "
-                                    + "trim loop (lines 365-378) subtracted bytes that "
-                                    + "deregister had already subtracted via "
-                                    + "ring.totalSegmentBytes(): no stillRegistered guard "
-                                    + "mirrors the spare-install path at lines 323-336. "
-                                    + "Fix: gate `totalBytes -= sz` on a stillRegistered "
-                                    + "re-check, or move totalBytes accounting fully into "
-                                    + "SegmentRing so it can't be split across two threads' "
-                                    + "bookkeeping.",
+                                    + "trim loop subtracted bytes that deregister had "
+                                    + "already subtracted via ring.totalSegmentBytes(): "
+                                    + "no stillRegistered guard. Fix: gate "
+                                    + "`totalBytes -= sz` on a stillRegistered re-check "
+                                    + "under the same lock that covers deregister.",
                             0L, observed);
                 } finally {
-                    // Close every ring whether or not we got past the
-                    // assertions — leaving rings open leaks mmap memory
-                    // into the next test's assertMemoryLeak baseline.
-                    // SegmentRing.close() is idempotent, so the success
-                    // path closing them all once is the only cost.
-                    for (List<SegmentRing> rings : outstanding) {
-                        for (SegmentRing ring : rings) {
-                            try {
-                                ring.close();
-                            } catch (Throwable ignored) {
-                                // best-effort cleanup
-                            }
-                        }
+                    setBeforeTrimSyncHook(mgr, null);
+                    Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+                    try {
+                        ring.close();
+                    } catch (Throwable ignored) {
+                        // best-effort
                     }
                 }
             }
         });
+    }
+
+    private static void awaitParked(Thread t) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (true) {
+            Thread.State s = t.getState();
+            if (s == Thread.State.TIMED_WAITING || s == Thread.State.WAITING) return;
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("worker did not park within 5 s; state=" + s);
+            }
+            Thread.onSpinWait();
+        }
+    }
+
+    private static void awaitSpare(SegmentRing ring, String where) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (ring.needsHotSpare()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("spare never installed " + where);
+            }
+            Thread.onSpinWait();
+        }
+    }
+
+    private static void setBeforeTrimSyncHook(SegmentManager mgr, Runnable hook) throws Exception {
+        Field f = SegmentManager.class.getDeclaredField("beforeTrimSyncHook");
+        f.setAccessible(true);
+        f.set(mgr, hook);
     }
 
     private static long readTotalBytes(SegmentManager mgr) throws Exception {
@@ -259,10 +259,9 @@ public class SegmentManagerTrimDeregisterRaceTest {
         Files.remove(dir);
     }
 
-    private static void spinNanos(long nanos) {
-        long deadline = System.nanoTime() + nanos;
-        while (System.nanoTime() < deadline) {
-            Thread.onSpinWait();
-        }
+    private static Thread workerThread(SegmentManager mgr) throws Exception {
+        Field f = SegmentManager.class.getDeclaredField("workerThread");
+        f.setAccessible(true);
+        return (Thread) f.get(mgr);
     }
 }
