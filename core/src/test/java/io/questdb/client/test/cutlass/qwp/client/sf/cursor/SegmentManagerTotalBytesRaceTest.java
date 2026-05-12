@@ -28,8 +28,6 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
-import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -61,10 +59,16 @@ import static org.junit.Assert.assertTrue;
  * synchronized block, the stillRegistered re-check sees the entry removed
  * and skips the (otherwise drifting) install + commit.
  *
- * <p>Pre-fix the test ends with {@code totalBytes > 0}; post-fix it ends at
- * exactly {@code 0}. No stress, no concurrency in setup, no spin loops in
- * the assertion path: the hook fires exactly once, on a single worker tick
- * the test triggers via the ring's managerWakeup callback.
+ * <p>Concurrent but non-racy: {@code mgr.register} and
+ * {@code setBeforeInstallSyncHook} both run before {@code mgr.start}, so
+ * the worker's first iteration deterministically observes the registered
+ * ring (with {@code hotSpare == null}, so {@code needsHotSpare()} is true)
+ * and the hook. The hook fires exactly once and signals the test via a
+ * {@code CountDownLatch}; the test then waits for the worker to park
+ * before reading {@code totalBytes}.
+ *
+ * <p>Pre-fix the test ends with {@code totalBytes > 0}; post-fix it ends
+ * at exactly {@code 0}.
  */
 public class SegmentManagerTotalBytesRaceTest {
 
@@ -86,26 +90,21 @@ public class SegmentManagerTotalBytesRaceTest {
     @Test(timeout = 15_000L)
     public void testInstallPathDoesNotCommitAfterDeregister() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // One frame per segment, so the very first append forces the
-            // ring into needsHotSpare and wakes the manager.
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
             long maxTotal = segSize * 8L;
 
-            // Large pollNanos: the worker parks until explicitly woken. The
-            // ring's appendOrFsn fires managerWakeup when it needs a spare,
-            // so the producer-driven setup phase still gets prompt service.
             try (SegmentManager mgr = new SegmentManager(
                     segSize, TimeUnit.SECONDS.toNanos(60), maxTotal)) {
-                mgr.start();
-
                 String dir = tmpDir + "/single-ring";
                 assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
                 String activePath = dir + "/sf-initial.sfa";
                 MmapSegment seg0 = MmapSegment.create(activePath, 0L, segSize);
                 SegmentRing ring = new SegmentRing(seg0, segSize);
 
-                long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
                 try {
+                    // Register + read totalBytes BEFORE the worker exists.
+                    // No worker thread means readTotalBytes here is the
+                    // pure effect of register: exactly one initial segment.
                     mgr.register(ring, dir);
                     long bytesAfterRegister = readTotalBytes(mgr);
                     assertEquals("register should account for the initial segment",
@@ -134,11 +133,14 @@ public class SegmentManagerTotalBytesRaceTest {
                         }
                     });
 
-                    // Fill the single-frame active segment. The ring's
-                    // needsHotSpare flips to true and managerWakeup fires,
-                    // unparking the worker; serviceRing enters the install
-                    // path and triggers the hook.
-                    ring.appendOrFsn(buf, 32);
+                    // Concurrent but non-racy: register + hook are visible
+                    // before the worker exists (Thread.start() establishes
+                    // a happens-before edge). hotSpare is null at construction,
+                    // so needsHotSpare() returns true on the worker's first
+                    // and only relevant iteration -- no producer-side append
+                    // needed to trigger the install. The hook then fires
+                    // exactly once and hookDone signals the test.
+                    mgr.start();
 
                     assertTrue("install hook never fired",
                             hookDone.await(5, TimeUnit.SECONDS));
@@ -147,10 +149,12 @@ public class SegmentManagerTotalBytesRaceTest {
                     }
 
                     // Wait for the worker to park again. With the entry
-                    // deregistered, no further wakeups arrive and a 60 s
-                    // pollNanos makes TIMED_WAITING a strong signal that
-                    // the current tick (snapshot + serviceRing + iteration
-                    // exit) has finished.
+                    // deregistered, the next loop iteration finds rings
+                    // empty and parks for the full 60 s pollNanos. That
+                    // TIMED_WAITING transition is the test's signal that
+                    // the worker has finished serviceRing -- including the
+                    // stillRegistered re-check and the (skipped) commit --
+                    // so readTotalBytes below observes the final state.
                     Thread worker = workerThread(mgr);
                     awaitParked(worker);
 
@@ -167,7 +171,6 @@ public class SegmentManagerTotalBytesRaceTest {
                             0L, observed);
                 } finally {
                     setBeforeInstallSyncHook(mgr, null);
-                    Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
                     try {
                         ring.close();
                     } catch (Throwable ignored) {
