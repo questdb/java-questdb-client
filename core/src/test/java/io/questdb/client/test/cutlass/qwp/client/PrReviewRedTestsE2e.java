@@ -52,8 +52,6 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class PrReviewRedTestsE2e {
 
-    private static final int BASE_PORT = 19_500 + (int) (System.nanoTime() % 200);
-
     /**
      * Finding C4 — {@code recordFatal} is called AFTER {@code dispatchError}
      * in three sites of {@code CursorWebSocketSendLoop}:
@@ -80,7 +78,7 @@ public class PrReviewRedTestsE2e {
     @Test
     public void testC4_handlerMustObserveTerminalErrorWhenInvoked() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = BASE_PORT;
+            int port = TestPorts.findUnusedPort();
             int iterations = 30;
             AtomicInteger nullObservations = new AtomicInteger();
             AtomicInteger totalObservations = new AtomicInteger();
@@ -163,7 +161,7 @@ public class PrReviewRedTestsE2e {
     @Test
     public void testC11_postHaltFlushThrowsTypedLineSenderServerException() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = BASE_PORT + 1;
+            int port = TestPorts.findUnusedPort();
             ParseErrorAckHandler serverHandler = new ParseErrorAckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, serverHandler)) {
                 server.start();

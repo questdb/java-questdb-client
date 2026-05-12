@@ -64,11 +64,9 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class ServerErrorAckTerminalTest {
 
-    private static final int TEST_PORT = 19_400 + (int) (System.nanoTime() % 100);
-
     @Test
     public void testServerErrorAckIsTerminalAndDoesNotBurnReconnectBudget() throws Exception {
-        int port = TEST_PORT + 1;
+        int port = TestPorts.findUnusedPort();
         ErrorAckHandler handler = new ErrorAckHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();
@@ -157,7 +155,7 @@ public class ServerErrorAckTerminalTest {
      */
     @Test
     public void testDropPolicyNackDoesNotHaltAndAdvancesAck() throws Exception {
-        int port = TEST_PORT + 2;
+        int port = TestPorts.findUnusedPort();
         SchemaMismatchAckHandler handler = new SchemaMismatchAckHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();

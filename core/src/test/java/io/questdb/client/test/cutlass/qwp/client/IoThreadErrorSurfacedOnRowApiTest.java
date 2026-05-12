@@ -62,11 +62,9 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class IoThreadErrorSurfacedOnRowApiTest {
 
-    private static final int TEST_PORT = 19_350 + (int) (System.nanoTime() % 100);
-
     @Test
     public void testRowApiMethodSurfacesIoThreadTerminalError() throws Exception {
-        int port = TEST_PORT + 1;
+        int port = TestPorts.findUnusedPort();
         ErrorAckHandler handler = new ErrorAckHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();

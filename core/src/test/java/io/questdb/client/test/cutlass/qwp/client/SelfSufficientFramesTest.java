@@ -50,8 +50,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class SelfSufficientFramesTest {
 
-    private static final int TEST_PORT = 19_300 + (int) (System.nanoTime() % 100);
-
     /** First byte of the symbol-dict delta payload after the 12-byte QWP header. */
     private static final int DELTA_START_OFFSET = 12;
 
@@ -62,7 +60,7 @@ public class SelfSufficientFramesTest {
         // batch 2 would emit deltaStart=1, deltaCount=1 — only the new
         // symbol. With self-sufficient frames, batch 2 must emit
         // deltaStart=0 covering BOTH symbols.
-        int port = TEST_PORT + 1;
+        int port = TestPorts.findUnusedPort();
         CapturingHandler handler = new CapturingHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();

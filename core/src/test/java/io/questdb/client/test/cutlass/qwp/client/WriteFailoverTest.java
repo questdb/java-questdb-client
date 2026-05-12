@@ -55,8 +55,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class WriteFailoverTest {
 
-    private static final int BASE_PORT = 19_700 + (int) (System.nanoTime() % 100);
-
     @Test
     public void testAuthTimeoutBoundsHungUpgrade() throws Exception {
         // Per spec, auth_timeout_ms bounds each WebSocket upgrade. A
@@ -86,10 +84,10 @@ public class WriteFailoverTest {
             acceptor.start();
 
             AckHandler ack = new AckHandler();
-            try (TestWebSocketServer good = new TestWebSocketServer(BASE_PORT + 81, ack, false, "PRIMARY")) {
+            goodPort = TestPorts.findUnusedPort();
+            try (TestWebSocketServer good = new TestWebSocketServer(goodPort, ack, false, "PRIMARY")) {
                 good.start();
                 Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
-                goodPort = BASE_PORT + 81;
 
                 long t0 = System.nanoTime();
                 try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
@@ -119,8 +117,8 @@ public class WriteFailoverTest {
         // Two servers: server1 always rejects with 421 + REPLICA, server2
         // accepts with 101 + PRIMARY. The sender's connect path must walk
         // past server1 and land on server2 within the reconnect budget.
-        int port1 = BASE_PORT + 10;
-        int port2 = BASE_PORT + 11;
+        int port1 = TestPorts.findUnusedPort();
+        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
         TestWebSocketServer replica = new TestWebSocketServer(port1, ack);
         replica.setRejectWithRole("REPLICA");
@@ -154,8 +152,8 @@ public class WriteFailoverTest {
         // is promoted (clear the reject) and we verify the sender stays on
         // server2 — currentAddressIndex stickiness means we don't rotate
         // off a healthy primary just because another node became writable.
-        int port1 = BASE_PORT + 50;
-        int port2 = BASE_PORT + 51;
+        int port1 = TestPorts.findUnusedPort();
+        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
         TestWebSocketServer s1 = new TestWebSocketServer(port1, ack);
         s1.setRejectWithRole("REPLICA");
@@ -196,8 +194,8 @@ public class WriteFailoverTest {
         // Off-mode walk that hits only replicas must surface
         // QwpRoleMismatchException — the walked address list resembles
         // a deployment mid-failover, distinguishable from "all hosts down".
-        int port1 = BASE_PORT + 70;
-        int port2 = BASE_PORT + 71;
+        int port1 = TestPorts.findUnusedPort();
+        int port2 = TestPorts.findUnusedPort();
         TestWebSocketServer r1 = new TestWebSocketServer(port1, new AckHandler());
         r1.setRejectWithRole("REPLICA");
         TestWebSocketServer r2 = new TestWebSocketServer(port2, new AckHandler());
@@ -234,8 +232,8 @@ public class WriteFailoverTest {
         // with NO inter-host backoff; only after every host has been
         // tried does it fail terminally. Java's prior off-mode tried
         // hosts[0] alone.
-        int port1 = BASE_PORT + 60;
-        int port2 = BASE_PORT + 61;
+        int port1 = TestPorts.findUnusedPort();
+        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
         TestWebSocketServer replica = new TestWebSocketServer(port1, ack);
         replica.setRejectWithRole("REPLICA");
@@ -267,8 +265,8 @@ public class WriteFailoverTest {
         // QwpRoleMismatchException (not a generic LineSenderException) so
         // operators can distinguish "no primary elected yet" from
         // "everything is down".
-        int port1 = BASE_PORT + 20;
-        int port2 = BASE_PORT + 21;
+        int port1 = TestPorts.findUnusedPort();
+        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
         TestWebSocketServer r1 = new TestWebSocketServer(port1, ack);
         r1.setRejectWithRole("REPLICA");
@@ -313,7 +311,7 @@ public class WriteFailoverTest {
         // OSS / single-node deployments advertise STANDALONE. The client
         // must accept that handshake without rotation since standalone
         // nodes are writable.
-        int port = BASE_PORT + 30;
+        int port = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
         try (TestWebSocketServer standalone = new TestWebSocketServer(port, ack, false, "STANDALONE")) {
             standalone.start();
@@ -337,7 +335,7 @@ public class WriteFailoverTest {
         // diagnostics. With a single-replica config the off-mode walk
         // wraps it in QwpRoleMismatchException; the WebSocketUpgradeException
         // sits on the cause chain via initCause().
-        int port = BASE_PORT + 40;
+        int port = TestPorts.findUnusedPort();
         TestWebSocketServer replica = new TestWebSocketServer(port, new AckHandler());
         try (replica) {
             replica.setRejectWithRole("REPLICA");

@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.Files;
+import io.questdb.client.test.cutlass.qwp.client.TestPorts;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -42,8 +43,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class SfFromConfigTest {
-
-    private static final int TEST_PORT = 19_900 + (int) (System.nanoTime() % 100);
 
     private String sfDir;
 
@@ -61,7 +60,7 @@ public class SfFromConfigTest {
     @Test
     public void testFromConfigEnablesSfAndOwnsLog() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TEST_PORT + 1;
+            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();
@@ -96,7 +95,7 @@ public class SfFromConfigTest {
     @Test
     public void testSfMaxBytesParsing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TEST_PORT + 2;
+            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();
@@ -124,7 +123,7 @@ public class SfFromConfigTest {
             // Absence of sf_dir is the only way to disable SF — no separate
             // off switch. Verify a basic SF-less sender still works end-to-end
             // and creates no directory.
-            int port = TEST_PORT + 3;
+            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();
@@ -149,7 +148,7 @@ public class SfFromConfigTest {
     @Test
     public void testSfMaxTotalBytesAcceptsLargeValue() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TEST_PORT + 8;
+            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();
@@ -226,7 +225,7 @@ public class SfFromConfigTest {
     @Test
     public void testSfMaxBytesAcceptsSizeSuffixes() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TEST_PORT + 9;
+            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();
@@ -251,7 +250,7 @@ public class SfFromConfigTest {
         TestUtils.assertMemoryLeak(() -> {
             // sender_id="primary" => slot dir <sfDir>/primary; the engine writes
             // its segments and lock there, leaving sibling slot dirs untouched.
-            int port = TEST_PORT + 11;
+            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();
@@ -278,7 +277,7 @@ public class SfFromConfigTest {
             // share a group root. The second open with a colliding id must
             // refuse to start — silently allowing it would interleave FSN
             // sequences on disk and corrupt recovery.
-            int port = TEST_PORT + 12;
+            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();
@@ -307,7 +306,7 @@ public class SfFromConfigTest {
         TestUtils.assertMemoryLeak(() -> {
             // Two senders against the same group root with distinct sender_id
             // values are independent slots — both must start cleanly.
-            int port = TEST_PORT + 13;
+            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();

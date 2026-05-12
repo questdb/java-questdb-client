@@ -61,15 +61,13 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class ReconnectTest {
 
-    private static final int TEST_PORT = 19_900 + (int) (System.nanoTime() % 100);
-
     @Test
     public void testReconnectAfterServerInducedDisconnect() throws Exception {
         // Server ACKs the first batch then closes the client connection.
         // Without reconnect, the next batch's flush() would throw. With
         // reconnect, the I/O loop opens a fresh connection (same port,
         // same server) and the second batch goes through.
-        int port = TEST_PORT + 1;
+        int port = TestPorts.findUnusedPort();
         DisconnectAfterFirstAckHandler handler = new DisconnectAfterFirstAckHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();
@@ -109,7 +107,7 @@ public class ReconnectTest {
         // connection-refused and accumulate against the budget. With a
         // 500ms cap, the loop should give up well inside the test's 5s
         // poll window and the next user-thread flush() must throw.
-        int port = TEST_PORT + 3;
+        int port = TestPorts.findUnusedPort();
         TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler());
         try {
             server.start();
@@ -179,7 +177,7 @@ public class ReconnectTest {
         // a 401 happening on the very first reconnect, the cursor I/O
         // loop should surface the terminal error within hundreds of ms,
         // not after 10s.
-        int port = TEST_PORT + 4;
+        int port = TestPorts.findUnusedPort();
         try (Auth401AfterFirstConnectionFixture fixture =
                      new Auth401AfterFirstConnectionFixture(port)) {
             fixture.start();
@@ -237,7 +235,7 @@ public class ReconnectTest {
         // ackedFsn is still -1. On reconnect, the cursor must reposition at
         // FSN 0 and replay it — the new connection should observe the
         // *same* batch a second time before any new batch arrives.
-        int port = TEST_PORT + 2;
+        int port = TestPorts.findUnusedPort();
         ReceiveThenDisconnectHandler handler = new ReceiveThenDisconnectHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();

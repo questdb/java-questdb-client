@@ -53,14 +53,12 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class InitialConnectAsyncTest {
 
-    private static final int TEST_PORT = 19_800 + (int) (System.nanoTime() % 100);
-
     @Test
     public void testAsyncAuthFailureDeliversToErrorInbox() throws Exception {
         // Server returns HTTP 401 on every upgrade attempt. Auth failures
         // are terminal at the I/O thread; in async mode they are
         // delivered as a SenderError, not thrown from fromConfig.
-        int port = TEST_PORT + 4;
+        int port = TestPorts.findUnusedPort();
         try (Always401Fixture fixture = new Always401Fixture(port)) {
             fixture.start();
             AtomicReference<SenderError> observedError = new AtomicReference<>();
@@ -113,7 +111,7 @@ public class InitialConnectAsyncTest {
         // user-supplied handler. fromConfig itself does not throw; only
         // close() rethrows the latched terminal so a user who never
         // installed a handler still sees the failure on shutdown.
-        int port = TEST_PORT + 3;
+        int port = TestPorts.findUnusedPort();
         AtomicReference<SenderError> observedError = new AtomicReference<>();
         String cfg = "ws::addr=localhost:" + port
                 + sfDirOpt() + ";initial_connect_retry=async"
@@ -163,7 +161,7 @@ public class InitialConnectAsyncTest {
         // appended to the cursor SF engine on the producer thread. The
         // I/O thread retries connect in the background; once the server
         // comes up, the buffered frame is sent and ACKed.
-        int port = TEST_PORT + 2;
+        int port = TestPorts.findUnusedPort();
         AckHandler handler = new AckHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             String cfg = "ws::addr=localhost:" + port
@@ -215,7 +213,7 @@ public class InitialConnectAsyncTest {
         // the producer is unblocked. A 60s cap would normally hang
         // anything that waited on connect; we assert a sub-second
         // construction time.
-        int port = TEST_PORT + 1;
+        int port = TestPorts.findUnusedPort();
         long t0 = System.nanoTime();
         String cfg = "ws::addr=localhost:" + port
                 + sfDirOpt() + ";initial_connect_retry=async"
@@ -244,7 +242,7 @@ public class InitialConnectAsyncTest {
         // Because the loop did connect at least once before the outage,
         // the SenderError must use the connection-lost tag and the sender
         // must report wasEverConnected()==true.
-        int port = TEST_PORT + 5;
+        int port = TestPorts.findUnusedPort();
         AckHandler handler = new AckHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();
@@ -318,7 +316,7 @@ public class InitialConnectAsyncTest {
         // caller — there is no observable "never connected" window in
         // those modes, so misclassifying a budget exhaustion as
         // never-connected is impossible.
-        int port = TEST_PORT + 6;
+        int port = TestPorts.findUnusedPort();
         try (TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler())) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));

@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.test.cutlass.qwp.client.TestPorts;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -52,7 +53,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class OrphanScanIntegrationTest {
 
-    private static final int TEST_PORT = 19_500 + (int) (System.nanoTime() % 100);
     private String sfDir;
 
     @Before
@@ -74,7 +74,7 @@ public class OrphanScanIntegrationTest {
             // unacked .sfa files when the sender shuts down. Then the same
             // slot should be reported as an orphan when a second sender opens
             // with sender_id=primary and drain_orphans=true.
-            int port = TEST_PORT + 1;
+            int port = TestPorts.findUnusedPort();
 
             // Phase 1: ghost writes + closes; never acked.
             try (TestWebSocketServer ghostServer = new TestWebSocketServer(port, new SilentHandler())) {

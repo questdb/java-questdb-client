@@ -41,8 +41,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class InitialConnectRetryTest {
 
-    private static final int TEST_PORT = 19_700 + (int) (System.nanoTime() % 100);
-
     /**
      * Temp sf_dir for retry-mode tests. Per spec §3.5,
      * initial_connect_retry on/sync/async requires sf_dir — memory-mode
@@ -79,7 +77,7 @@ public class InitialConnectRetryTest {
         // names the elapsed budget and attempt count. The actual budget
         // honoring is observable through that message — we don't need a
         // wall-clock check.
-        int port = TEST_PORT + 3;
+        int port = TestPorts.findUnusedPort();
         String sfDir = makeSfDir();
         try {
             String cfg = "ws::addr=127.0.0.1:" + port
@@ -107,7 +105,7 @@ public class InitialConnectRetryTest {
         // the server, then start the server in a background thread after
         // a short delay. The retry loop should see the server come up and
         // proceed cleanly.
-        int port = TEST_PORT + 2;
+        int port = TestPorts.findUnusedPort();
         AckHandler handler = new AckHandler();
         TestWebSocketServer server = new TestWebSocketServer(port, handler);
         Thread starter = new Thread(() -> {
@@ -150,7 +148,7 @@ public class InitialConnectRetryTest {
         // the retry loop. We assert the structural shape of the error: the
         // raw "Failed to connect" message from buildAndConnect, NOT the
         // "initial connect ... attempts" message connectWithRetry produces.
-        int port = TEST_PORT + 1;
+        int port = TestPorts.findUnusedPort();
         // Use the IPv4 literal so the test doesn't pay first-call
         // getaddrinfo("localhost") cost on Windows (1-2 s cold lookup).
         try (Sender ignored = Sender.fromConfig("ws::addr=127.0.0.1:" + port + ";")) {

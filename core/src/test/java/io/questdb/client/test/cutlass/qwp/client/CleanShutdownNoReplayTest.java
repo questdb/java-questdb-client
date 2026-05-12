@@ -55,7 +55,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class CleanShutdownNoReplayTest {
 
-    private static final int TEST_PORT = 19_200 + (int) (System.nanoTime() % 100);
     private String sfDir;
 
     @Before
@@ -74,7 +73,7 @@ public class CleanShutdownNoReplayTest {
         // Phase 1: server ACKs every frame. Sender writes a few rows,
         // flushes, then close() blocks for the default 5s drain — by the
         // time close returns, every frame has been ACK'd.
-        int port1 = TEST_PORT + 1;
+        int port1 = TestPorts.findUnusedPort();
         AckHandler ack1 = new AckHandler();
         try (TestWebSocketServer s1 = new TestWebSocketServer(port1, ack1)) {
             s1.start();

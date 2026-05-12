@@ -55,7 +55,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class RecoveryReplayTest {
 
-    private static final int TEST_PORT = 19_100 + (int) (System.nanoTime() % 100);
     private String sfDir;
 
     @Before
@@ -74,7 +73,7 @@ public class RecoveryReplayTest {
         // Phase 1: silent server, sender 1 writes enough to rotate at
         // least once, closes fast (no drain). Slot ends up with sealed +
         // active segments holding unacked data.
-        int port1 = TEST_PORT + 1;
+        int port1 = TestPorts.findUnusedPort();
         try (TestWebSocketServer silent = new TestWebSocketServer(port1, new SilentHandler())) {
             silent.start();
             Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
@@ -111,7 +110,7 @@ public class RecoveryReplayTest {
         // sender 1 wrote (50 of them) reaches the new server. Without
         // the fix, the sender would only ship the active segment's data
         // (≪ 50) and orphan the sealed segments forever.
-        int port2 = port1 + 50;
+        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
         try (TestWebSocketServer good = new TestWebSocketServer(port2, ack)) {
             good.start();

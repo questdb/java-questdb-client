@@ -49,14 +49,12 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class CloseDrainTest {
 
-    private static final int TEST_PORT = 19_700 + (int) (System.nanoTime() % 100);
-
     @Test
     public void testCloseBlocksUntilAckArrives() throws Exception {
         // Server delays every ACK by 800ms. With the default
         // close_flush_timeout_millis=5000, close() must wait for that ACK
         // before returning. Pre-fix close() returned within milliseconds.
-        int port = TEST_PORT + 1;
+        int port = TestPorts.findUnusedPort();
         long ackDelayMs = 800;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
@@ -84,7 +82,7 @@ public class CloseDrainTest {
         // Same delayed-ACK server, but with close_flush_timeout_millis=0
         // (fast close). close() must return immediately, well before the
         // ACK delay would have elapsed.
-        int port = TEST_PORT + 2;
+        int port = TestPorts.findUnusedPort();
         long ackDelayMs = 1500;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
@@ -117,7 +115,7 @@ public class CloseDrainTest {
         // sentinel in LineSenderBuilder, so the build path silently substitutes
         // DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS (5000ms) and close() blocks for the
         // full ACK delay instead of returning fast.
-        int port = TEST_PORT + 4;
+        int port = TestPorts.findUnusedPort();
         long ackDelayMs = 1500;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
@@ -146,7 +144,7 @@ public class CloseDrainTest {
         // Server that buffers frames silently and never ACKs. close() must
         // throw a drain-timeout LineSenderException after roughly the
         // configured timeout — not hang forever and not return immediately.
-        int port = TEST_PORT + 3;
+        int port = TestPorts.findUnusedPort();
         long timeoutMs = 500;
         SilentHandler handler = new SilentHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
@@ -181,7 +179,7 @@ public class CloseDrainTest {
 
     @Test
     public void testAsyncCloseDrainSucceedsWhenServerStartsDuringDrain() throws Exception {
-        int port = TEST_PORT + 5;
+        int port = TestPorts.findUnusedPort();
         DelayingAckHandler handler = new DelayingAckHandler(0);
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             String cfg = "ws::addr=localhost:" + port
@@ -218,7 +216,7 @@ public class CloseDrainTest {
 
     @Test
     public void testAsyncCloseDrainSucceedsWhenServerWasUpAllAlong() throws Exception {
-        int port = TEST_PORT + 6;
+        int port = TestPorts.findUnusedPort();
         DelayingAckHandler handler = new DelayingAckHandler(0);
         try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
             server.start();
