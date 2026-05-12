@@ -28,11 +28,13 @@ import io.questdb.client.cutlass.http.client.HttpClientException;
 
 /**
  * Server completed the WebSocket upgrade (HTTP 101) but advertised an
- * {@code X-QWP-Version} outside the client's supported range. Per-endpoint
- * (transient) at the connect-loop level: a rolling upgrade can leave one node
- * ahead of or behind its peers, so the connect loop walks to the next host.
- * Terminal at the retry loop level once every configured endpoint reports the
- * same mismatch -- retrying the same set will not converge.
+ * {@code X-QWP-Version} outside the client's supported range. Treated as
+ * transient at every layer per sf-client.md section 13.3: the per-endpoint
+ * round walks to the next host (rolling upgrade can leave one node ahead of
+ * or behind its peers), and a full round of mismatches consumes the per-outage
+ * reconnect budget. Only after the budget exhausts does the connect loop
+ * surface a terminal error -- as {@code PROTOCOL_VIOLATION} via the natural
+ * giveup path, not {@code SECURITY_ERROR}.
  */
 public final class QwpVersionMismatchException extends HttpClientException {
     public QwpVersionMismatchException(int serverVersion, int clientMaxVersion) {

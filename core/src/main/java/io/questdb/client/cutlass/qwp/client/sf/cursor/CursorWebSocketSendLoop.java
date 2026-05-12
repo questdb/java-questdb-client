@@ -35,7 +35,6 @@ import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
-import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -629,14 +628,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             phase, elapsedMs, attempts, fsnAtZero);
                     return;
                 }
-            } catch (QwpAuthFailedException | QwpDurableAckMismatchException
-                    | QwpVersionMismatchException | WebSocketUpgradeException e) {
-                // Terminal across all configured endpoints. WebSocketUpgradeException
-                // reaching here is always non-421: QwpUpgradeFailures.classify
-                // upstream converts a 421-with-X-QuestDB-Role to
-                // QwpIngressRoleRejectedException, and a 421 without that header
-                // walks the transport-error path in buildAndConnect and lands as
-                // a LineSenderException, falling into the Throwable branch below.
+            } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
+                // Terminal across all configured endpoints per spec sf-client.md
+                // section 13.3: auth (401/403) bypasses reconnect and surfaces as
+                // SECURITY_ERROR. WebSocketUpgradeException reaching here is always
+                // non-421: QwpUpgradeFailures.classify upstream converts a
+                // 421-with-X-QuestDB-Role to QwpIngressRoleRejectedException, and a
+                // 421 without that header walks the transport-error path in
+                // buildAndConnect and lands as a LineSenderException, falling into
+                // the Throwable branch below.
                 LOG.error("terminal upgrade error during {} -- won't retry: {}",
                         phase, e.getMessage());
                 long fromFsn = engine.ackedFsn() + 1L;
@@ -646,6 +646,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         SenderError.Policy.HALT,
                         SenderError.NO_STATUS_BYTE,
                         "ws-upgrade-failed: " + e.getMessage(),
+                        SenderError.NO_MESSAGE_SEQUENCE,
+                        fromFsn,
+                        toFsn,
+                        null,
+                        System.nanoTime()
+                );
+                totalServerErrors.incrementAndGet();
+                recordFatal(new LineSenderServerException(err), err);
+                dispatchError(err);
+                return;
+            } catch (QwpDurableAckMismatchException e) {
+                // Per spec sf-client.md section 8.1: the client opted into durable
+                // ack but the cluster cannot honour it. Loud fail at connect rather
+                // than silently waiting for ack frames that will never arrive.
+                // Classified as PROTOCOL_VIOLATION (config/capability mismatch),
+                // not SECURITY_ERROR -- this is not an auth failure.
+                LOG.error("durable-ack mismatch during {} -- won't retry: {}",
+                        phase, e.getMessage());
+                long fromFsn = engine.ackedFsn() + 1L;
+                long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                SenderError err = new SenderError(
+                        SenderError.Category.PROTOCOL_VIOLATION,
+                        SenderError.Policy.HALT,
+                        SenderError.NO_STATUS_BYTE,
+                        "durable-ack-mismatch: " + e.getMessage(),
                         SenderError.NO_MESSAGE_SEQUENCE,
                         fromFsn,
                         toFsn,
@@ -834,10 +859,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     return c;
                 }
             } catch (QwpAuthFailedException | QwpDurableAckMismatchException
-                    | QwpVersionMismatchException | WebSocketUpgradeException e) {
-                // Terminal across all configured endpoints; see the parallel
-                // catch in the cursor reconnect loop above for why
-                // WebSocketUpgradeException reaching here is always non-421.
+                    | WebSocketUpgradeException e) {
+                // Terminal across all configured endpoints per sf-client.md sections
+                // 8.1 (durable-ack mismatch) and 13.3 (auth). Version mismatch is
+                // NOT terminal here -- it falls through to the Throwable branch and
+                // consumes the per-outage budget so the loop walks the cluster
+                // across rolling-upgrade windows. See the parallel catch in the
+                // cursor reconnect loop above for why WebSocketUpgradeException
+                // reaching here is always non-421.
                 LOG.error("{} hit terminal upgrade error, won't retry: {}",
                         contextLabel, e.getMessage());
                 throw e;
