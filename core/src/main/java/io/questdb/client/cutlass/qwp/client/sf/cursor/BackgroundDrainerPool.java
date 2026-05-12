@@ -34,6 +34,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Bounded thread pool that runs {@link BackgroundDrainer} tasks. One pool
@@ -76,6 +77,18 @@ public final class BackgroundDrainerPool implements QuietCloseable {
 
     private final ExecutorService executor;
     private final CopyOnWriteArrayList<BackgroundDrainer> active = new CopyOnWriteArrayList<>();
+    /**
+     * Cumulative count of drainers whose runnable returned with
+     * {@link BackgroundDrainer.DrainOutcome#FAILED}. Bumped once per
+     * drainer in the finally block of {@link #submit}.
+     */
+    private final AtomicLong totalFailed = new AtomicLong();
+    /**
+     * Cumulative count of drainers whose runnable returned with
+     * {@link BackgroundDrainer.DrainOutcome#SUCCESS}. Bumped once per
+     * drainer in the finally block of {@link #submit}.
+     */
+    private final AtomicLong totalSucceeded = new AtomicLong();
     /**
      * Pool-level listener applied to drainers at submit time when the
      * drainer doesn't already carry one. Volatile so callers can install
@@ -130,6 +143,12 @@ public final class BackgroundDrainerPool implements QuietCloseable {
                     drainer.run();
                 } finally {
                     active.remove(drainer);
+                    BackgroundDrainer.DrainOutcome out = drainer.outcome();
+                    if (out == BackgroundDrainer.DrainOutcome.SUCCESS) {
+                        totalSucceeded.incrementAndGet();
+                    } else if (out == BackgroundDrainer.DrainOutcome.FAILED) {
+                        totalFailed.incrementAndGet();
+                    }
                 }
             });
             accepted = true;
@@ -167,6 +186,31 @@ public final class BackgroundDrainerPool implements QuietCloseable {
             result.add(d);
         }
         return result;
+    }
+
+    /**
+     * Number of drainers currently tracked by the pool. Same lax-cleanup
+     * race as {@link #snapshot} — a drainer that finished moments ago may
+     * still count for a few ms before its executor task removes it.
+     */
+    public int getActiveCount() {
+        return active.size();
+    }
+
+    /**
+     * Cumulative count of drainers that exited with
+     * {@link BackgroundDrainer.DrainOutcome#FAILED}, since pool creation.
+     */
+    public long getTotalFailed() {
+        return totalFailed.get();
+    }
+
+    /**
+     * Cumulative count of drainers that exited with
+     * {@link BackgroundDrainer.DrainOutcome#SUCCESS}, since pool creation.
+     */
+    public long getTotalSucceeded() {
+        return totalSucceeded.get();
     }
 
     @Override

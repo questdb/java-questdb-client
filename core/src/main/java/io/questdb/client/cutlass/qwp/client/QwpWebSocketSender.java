@@ -1273,6 +1273,18 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Number of background orphan-slot drainers this sender is currently
+     * running. Returns 0 when {@code drain_orphans} is disabled or no
+     * orphan slots were discovered at startup. Carries the same lax
+     * cleanup race as the underlying pool — a drainer that finished
+     * moments ago may still count for a few ms.
+     */
+    public int getActiveBackgroundDrainers() {
+        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool pool = drainerPool;
+        return pool == null ? 0 : pool.getActiveCount();
+    }
+
+    /**
      * Returns the auto-flush byte threshold.
      */
     public int getAutoFlushBytes() {
@@ -1343,6 +1355,17 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Number of {@link SenderError} notifications dropped because the
+     * bounded inbox was full. Non-zero means the user-supplied
+     * {@link SenderErrorHandler} cannot keep up. Returns 0 if the error
+     * dispatcher has not been allocated yet.
+     */
+    public long getDroppedErrorNotifications() {
+        SenderErrorDispatcher d = errorDispatcher;
+        return d == null ? 0L : d.getDroppedNotifications();
+    }
+
+    /**
      * Number of {@link SenderConnectionEvent} notifications delivered to the
      * user listener since this sender started. Counts every delivery attempt,
      * including those where the listener threw.
@@ -1358,6 +1381,60 @@ public class QwpWebSocketSender implements Sender {
     public long getTotalAcks() {
         CursorWebSocketSendLoop l = cursorSendLoop;
         return l == null ? 0L : l.getTotalAcks();
+    }
+
+    /**
+     * Cumulative count of background orphan-slot drainers that exited
+     * by dropping a {@code .failed} sentinel since this sender started.
+     * Returns 0 when {@code drain_orphans} is disabled or no orphan
+     * slots were discovered at startup.
+     */
+    public long getTotalBackgroundDrainersFailed() {
+        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool pool = drainerPool;
+        return pool == null ? 0L : pool.getTotalFailed();
+    }
+
+    /**
+     * Cumulative count of background orphan-slot drainers that drained
+     * their slot fully and exited cleanly since this sender started.
+     * Returns 0 when {@code drain_orphans} is disabled or no orphan
+     * slots were discovered at startup.
+     */
+    public long getTotalBackgroundDrainersSucceeded() {
+        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool pool = drainerPool;
+        return pool == null ? 0L : pool.getTotalSucceeded();
+    }
+
+    /**
+     * Cumulative number of times {@code appendBlocking} hit a full engine
+     * ring and parked waiting for the segment manager or the wire to free
+     * space. One increment per blocking call, not per spin. Returns 0
+     * when the cursor engine has not been allocated yet.
+     */
+    public long getTotalBackpressureStalls() {
+        CursorSendEngine e = cursorEngine;
+        return e == null ? 0L : e.getTotalBackpressureStalls();
+    }
+
+    /**
+     * Number of {@link SenderError} notifications delivered to the user
+     * handler since this sender started. Counts every delivery attempt,
+     * including those where the handler threw. Returns 0 if the error
+     * dispatcher has not been allocated yet.
+     */
+    public long getTotalErrorNotificationsDelivered() {
+        SenderErrorDispatcher d = errorDispatcher;
+        return d == null ? 0L : d.getTotalDelivered();
+    }
+
+    /**
+     * Cumulative count of frames re-sent during post-reconnect catch-up
+     * windows. Zero in steady state; a sustained nonzero rate signals
+     * flapping where every reconnect replays meaningful work.
+     */
+    public long getTotalFramesReplayed() {
+        CursorWebSocketSendLoop l = cursorSendLoop;
+        return l == null ? 0L : l.getTotalFramesReplayed();
     }
 
     /**

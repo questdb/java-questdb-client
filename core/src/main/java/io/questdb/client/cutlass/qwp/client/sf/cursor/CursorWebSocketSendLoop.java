@@ -128,6 +128,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // server-side rejection observed regardless of how the loop reacted.
     private final AtomicLong totalServerErrors = new AtomicLong();
     private final AtomicLong totalFramesSent = new AtomicLong();
+    // Cumulative count of frames the loop has re-sent during post-reconnect
+    // catch-up windows. Bumped once per frame on every iteration that
+    // observes replayTargetFsn >= 0. A flat zero confirms steady state; a
+    // sustained nonzero rate means the connection is flapping and replay
+    // is doing real work each cycle.
+    private final AtomicLong totalFramesReplayed = new AtomicLong();
     private final AtomicLong totalReconnects = new AtomicLong();
     // Every iteration of the reconnect loop bumps this — failures and
     // success alike. Diverges from totalReconnects (success-only) when the
@@ -462,6 +468,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public void setProgressDispatcher(SenderProgressDispatcher dispatcher) {
         this.progressDispatcher = dispatcher;
+    }
+
+    /**
+     * Cumulative count of frames re-sent during post-reconnect catch-up
+     * windows. One increment per replayed frame. Zero in steady state; a
+     * sustained nonzero rate signals flapping where every reconnect replays
+     * meaningful work.
+     */
+    public long getTotalFramesReplayed() {
+        return totalFramesReplayed.get();
     }
 
     public long getTotalFramesSent() {
@@ -1019,8 +1035,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long fsnSent = fsnAtZero + nextWireSeq;
         nextWireSeq++;
         totalFramesSent.incrementAndGet();
-        if (replayTargetFsn >= 0 && fsnSent >= replayTargetFsn) {
-            replayTargetFsn = -1L; // catch-up complete
+        if (replayTargetFsn >= 0) {
+            totalFramesReplayed.incrementAndGet();
+            if (fsnSent >= replayTargetFsn) {
+                replayTargetFsn = -1L; // catch-up complete
+            }
         }
         consecutiveSendErrors.set(0);
         return true;

@@ -260,6 +260,13 @@ public class ReconnectTest {
                         "expected ≥ 2 distinct connections (reconnect): saw "
                                 + handler.connectionsAccepted.get(),
                         handler.connectionsAccepted.get() >= 2);
+
+                io.questdb.client.cutlass.qwp.client.QwpWebSocketSender wss =
+                        (io.questdb.client.cutlass.qwp.client.QwpWebSocketSender) sender;
+                Assert.assertTrue(
+                        "getTotalFramesReplayed must count the replayed frame: saw "
+                                + wss.getTotalFramesReplayed(),
+                        wss.getTotalFramesReplayed() >= 1L);
             }
         }
     }

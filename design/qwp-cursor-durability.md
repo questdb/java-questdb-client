@@ -106,8 +106,14 @@ Status: **draft v3**, working notes for the cursor SF refactor on `vi_sf`.
 - **No automatic cleanup of empty slot dirs.** Goal is data preservation; only ACK'd data is trimmed (within a slot, by the segment manager). Empty slot dirs are cheap and stay forever unless the user removes them.
 
 ### Visibility
-- WS-only accessor `sender.getBackgroundDrainers()` returns a snapshot list: `{dir, framesPending, framesAcked, lastError, isFailed}`.
-- Lets users observe orphan-drain progress without parsing logs.
+- Three WS-only counter accessors on `QwpWebSocketSender`:
+  - `getActiveBackgroundDrainers()` — current count of running drainers
+  - `getTotalBackgroundDrainersSucceeded()` — cumulative since startup
+  - `getTotalBackgroundDrainersFailed()` — cumulative since startup
+- Per-drainer event observation goes through the existing
+  `BackgroundDrainerListener` callback. The pool's `.failed` sentinels
+  on disk remain the canonical record of giveup events; the three
+  counters are for dashboards and post-startup health checks.
 
 ### Per-sender threading cost
 - Each engine (foreground + each background drainer) has its own `SegmentManager`. That's 1 manager thread + 1 I/O thread per engine. With `max_background_drainers=4`, worst case is 1 (foreground) + 4 (drainers) = 5 engines = 10 threads + 5 sockets per `Sender.fromConfig` call. Acceptable for typical deployments; users with hundreds of senders per JVM should set `max_background_drainers` low.
@@ -132,11 +138,13 @@ Status: **draft v3**, working notes for the cursor SF refactor on `vi_sf`.
 Each new knob also gets a `LineSenderBuilder` setter.
 
 ## Counter accessors (WS-only, on QwpWebSocketSender)
-- `getTotalBackpressureStalls()` — already exists
+- `getTotalBackpressureStalls()`
 - `getTotalReconnectAttempts()`
 - `getTotalReconnectsSucceeded()`
 - `getTotalFramesReplayed()`
-- `getBackgroundDrainers()` — list of `{dir, framesPending, framesAcked, lastError, isFailed}`
+- `getActiveBackgroundDrainers()`
+- `getTotalBackgroundDrainersSucceeded()`
+- `getTotalBackgroundDrainersFailed()`
 
 ## Stated assumptions (server contract)
 - Server **dedups** replayed batches by `messageSequence`. Replay-after-reconnect produces duplicates; without server-side dedup, every reconnect = double-write. Legacy code already relied on this; the new design continues to.
