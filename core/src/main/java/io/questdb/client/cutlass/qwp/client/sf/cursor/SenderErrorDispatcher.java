@@ -96,7 +96,11 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     private final String threadName;
     private final AtomicLong totalDelivered = new AtomicLong();
     private volatile boolean closed;
-    private Thread dispatcherThread;
+    // volatile to give the off-lock read in offer() a happens-before with
+    // the write under `lock` in startDispatcherIfNeeded(). Without it the
+    // double-checked first-null guard is a JMM race -- benign in practice
+    // (the synchronized re-check covers double-start) but spec-incorrect.
+    private volatile Thread dispatcherThread;
 
     public SenderErrorDispatcher(SenderErrorHandler handler) {
         this(handler, DEFAULT_CAPACITY, "qdb-sf-error-dispatcher");

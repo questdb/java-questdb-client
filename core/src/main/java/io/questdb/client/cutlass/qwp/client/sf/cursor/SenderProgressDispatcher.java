@@ -87,7 +87,12 @@ public final class SenderProgressDispatcher implements QuietCloseable {
     private final AtomicLong totalDelivered = new AtomicLong();
     private final AtomicLong totalOffered = new AtomicLong();
     private volatile boolean closed;
-    private Thread dispatcherThread;
+    // volatile to give the off-lock reads in offer() a happens-before with
+    // the write under `lock` in startDispatcherIfNeeded(). Without it the
+    // double-checked first-null guard is a JMM race -- benign in practice
+    // (the synchronized re-check covers double-start; a stale-null unpark
+    // is just skipped) but spec-incorrect.
+    private volatile Thread dispatcherThread;
     // Single-slot inbox. Producer (I/O thread) overwrites unconditionally;
     // consumer reads via volatile and skips when the value has already been
     // delivered. Monotonic FSNs make overwrite safe -- the latest value

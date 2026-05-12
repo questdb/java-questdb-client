@@ -70,7 +70,11 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
     private final String threadName;
     private final AtomicLong totalDelivered = new AtomicLong();
     private volatile boolean closed;
-    private Thread dispatcherThread;
+    // volatile to give the off-lock read in offer() a happens-before with
+    // the write under `lock` in startDispatcherIfNeeded(). Without it the
+    // double-checked first-null guard is a JMM race -- benign in practice
+    // (the synchronized re-check covers double-start) but spec-incorrect.
+    private volatile Thread dispatcherThread;
 
     public SenderConnectionDispatcher(SenderConnectionListener listener) {
         this(listener, DEFAULT_CAPACITY, "qdb-sf-connection-dispatcher");
