@@ -789,7 +789,10 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
             assertBadConfig("ws::addr=localhost:" + port + ";", "connect", "Failed");
-            assertBadConfig("ws::foo=bar;", "addr is missing");
+            // sf-client.md §4.6 now rejects unknown keys, so a valid key
+            // (user=) is used to drive the parser past key parsing and
+            // surface the missing-addr error on its own.
+            assertBadConfig("ws::user=foo;", "addr is missing");
         });
     }
 

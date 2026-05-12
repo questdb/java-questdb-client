@@ -220,6 +220,17 @@ public class LineSenderBuilderTest {
             assertConfStrOk("https::addr=localhost:8080;tls_verify=on;protocol_version=3;");
             assertConfStrError("https::addr=2001:0db8:85a3:0000:0000:8a2e:0370:7334;tls_verify=on;", "cannot parse a port from the address, use IPv4 address or a domain name [address=2001:0db8:85a3:0000:0000:8a2e:0370:7334]");
             assertConfStrError("https::addr=[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:9000;tls_verify=on;", "cannot parse a port from the address, use IPv4 address or a domain name [address=[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:9000]");
+
+            // sf-client.md §4.6: unknown keys must be rejected, not silently
+            // ignored. Forward-compat is via the spec, so silent ignore would
+            // let language clients drift on the same connect string.
+            assertConfStrError("http::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            assertConfStrError("tcp::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            assertConfStrError("ws::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            assertConfStrError("udp::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            // The unknown-key error must surface even when the value would
+            // itself be malformed -- the key is the reportable defect.
+            assertConfStrError("http::addr=localhost;not_a_real_key=", "unknown configuration key [key=not_a_real_key]");
         });
     }
 
@@ -514,9 +525,8 @@ public class LineSenderBuilderTest {
             // parser did not flag zone=.
             assertConfStrAcceptsZoneKey("ws::addr=127.0.0.1:1;zone=eu-west-1a;");
             assertConfStrAcceptsZoneKey("tcp::addr=127.0.0.1:1;zone=eu-west-1a;");
-            // Empty zone value is also accepted: the unknown-key fallthrough
-            // only rejects a malformed value, and an empty value after `=`
-            // is well-formed.
+            // Empty zone value is also accepted: an empty value after `=`
+            // is well-formed and the zone branch silently consumes it.
             assertConfStrOk("http::addr=" + LOCALHOST + ";zone=;protocol_version=2;");
             // Mixed-case zone identifier is accepted verbatim by the ingress
             // parser; case-insensitivity is the egress comparator's

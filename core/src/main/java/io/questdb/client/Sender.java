@@ -2878,11 +2878,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "multicast_ttl");
                     int ttl = parseIntValue(sink, "multicast_ttl");
                     multicastTtl(ttl);
+                } else if (Chars.equals("zone", sink)) {
+                    // failover.md §1.1: zone= is egress-only effective. Ingress is
+                    // zone-blind (pinned to v1) and silently accepts the key so
+                    // the same connect string works on both sides.
+                    pos = getValue(configurationString, pos, sink, "zone");
                 } else {
-                    // ignore unknown keys, unless they are malformed
-                    if ((pos = ConfStringParser.value(configurationString, pos, sink)) < 0) {
-                        throw new LineSenderException("invalid parameter [error=").put(sink).put("]");
-                    }
+                    // sf-client.md §4.6: parser must reject unknown keys.
+                    // Forward-compat is via the spec, not silent ignore — silent
+                    // ignore guarantees divergence across language clients.
+                    throw new LineSenderException("unknown configuration key [key=").put(sink).put(']');
                 }
             }
             if (hosts.size() == 0) {
