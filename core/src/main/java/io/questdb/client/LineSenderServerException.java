@@ -75,7 +75,7 @@ public class LineSenderServerException extends LineSenderException {
         }
         String msg = e.getServerMessage();
         if (msg != null && !msg.isEmpty()) {
-            sb.append(" — ").append(msg);
+            sb.append(" - ").append(msg);
         }
         return sb.toString();
     }

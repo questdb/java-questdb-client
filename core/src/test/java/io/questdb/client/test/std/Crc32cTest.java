@@ -35,28 +35,31 @@ import static org.junit.Assert.assertEquals;
 
 public class Crc32cTest {
 
+    /**
+     * Two distinct inputs must produce distinct CRCs (with overwhelming probability).
+     * Single bit-flips at every position must change the CRC.
+     */
     @Test
-    public void testEmptyReturnsSeed() throws Exception {
+    public void testBitFlipChangesCrc() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            assertEquals(Crc32c.INIT, Crc32c.update(Crc32c.INIT, 0, 0));
-            assertEquals(0x12345678, Crc32c.update(0x12345678, 0, 0));
-        });
-    }
-
-    @Test
-    public void testKnownVector() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // CRC-32C of "123456789" = 0xE3069283 (Castagnoli standard test vector)
-            byte[] msg = "123456789".getBytes();
-            long buf = Unsafe.malloc(msg.length, MemoryTag.NATIVE_DEFAULT);
+            byte[] data = new byte[256];
+            for (int i = 0; i < data.length; i++) data[i] = (byte) i;
+            long buf = Unsafe.malloc(data.length, MemoryTag.NATIVE_DEFAULT);
             try {
-                for (int i = 0; i < msg.length; i++) {
-                    Unsafe.getUnsafe().putByte(buf + i, msg[i]);
+                for (int i = 0; i < data.length; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, data[i]);
                 }
-                int crc = Crc32c.update(Crc32c.INIT, buf, msg.length);
-                assertEquals(0xE3069283, crc);
+                int original = Crc32c.update(Crc32c.INIT, buf, data.length);
+                for (int pos = 0; pos < data.length; pos++) {
+                    byte saved = data[pos];
+                    Unsafe.getUnsafe().putByte(buf + pos, (byte) (saved ^ 1));
+                    int flipped = Crc32c.update(Crc32c.INIT, buf, data.length);
+                    Assert.assertNotEquals("bit flip at pos=" + pos + " did not change CRC",
+                            original, flipped);
+                    Unsafe.getUnsafe().putByte(buf + pos, saved);
+                }
             } finally {
-                Unsafe.free(buf, msg.length, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(buf, data.length, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -117,35 +120,6 @@ public class Crc32cTest {
         });
     }
 
-    /**
-     * Two distinct inputs must produce distinct CRCs (with overwhelming probability).
-     * Single bit-flips at every position must change the CRC.
-     */
-    @Test
-    public void testBitFlipChangesCrc() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            byte[] data = new byte[256];
-            for (int i = 0; i < data.length; i++) data[i] = (byte) i;
-            long buf = Unsafe.malloc(data.length, MemoryTag.NATIVE_DEFAULT);
-            try {
-                for (int i = 0; i < data.length; i++) {
-                    Unsafe.getUnsafe().putByte(buf + i, data[i]);
-                }
-                int original = Crc32c.update(Crc32c.INIT, buf, data.length);
-                for (int pos = 0; pos < data.length; pos++) {
-                    byte saved = data[pos];
-                    Unsafe.getUnsafe().putByte(buf + pos, (byte) (saved ^ 1));
-                    int flipped = Crc32c.update(Crc32c.INIT, buf, data.length);
-                    Assert.assertNotEquals("bit flip at pos=" + pos + " did not change CRC",
-                            original, flipped);
-                    Unsafe.getUnsafe().putByte(buf + pos, saved);
-                }
-            } finally {
-                Unsafe.free(buf, data.length, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
     /** Length zero with arbitrary seeds returns the seed unchanged. */
     @Test
     public void testEmptyChainingIdempotent() throws Exception {
@@ -155,6 +129,32 @@ public class Crc32cTest {
                 int seed = rnd.nextInt();
                 Assert.assertEquals(seed, Crc32c.update(seed, 0, 0));
                 Assert.assertEquals(seed, Crc32c.update(seed, 0xDEADBEEF, 0));
+            }
+        });
+    }
+
+    @Test
+    public void testEmptyReturnsSeed() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            assertEquals(Crc32c.INIT, Crc32c.update(Crc32c.INIT, 0, 0));
+            assertEquals(0x12345678, Crc32c.update(0x12345678, 0, 0));
+        });
+    }
+
+    @Test
+    public void testKnownVector() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // CRC-32C of "123456789" = 0xE3069283 (Castagnoli standard test vector)
+            byte[] msg = "123456789".getBytes();
+            long buf = Unsafe.malloc(msg.length, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < msg.length; i++) {
+                    Unsafe.getUnsafe().putByte(buf + i, msg[i]);
+                }
+                int crc = Crc32c.update(Crc32c.INIT, buf, msg.length);
+                assertEquals(0xE3069283, crc);
+            } finally {
+                Unsafe.free(buf, msg.length, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

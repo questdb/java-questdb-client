@@ -73,18 +73,11 @@ public final class SegmentManager implements QuietCloseable {
     // without per-rotation String.format / concat allocation.
     private final StringSink pathSink = new StringSink();
     private final long pollNanos;
-    private final ObjList<RingEntry> rings = new ObjList<>();
     // Reused by the worker thread each tick to snapshot `rings` under the
     // lock without per-tick allocation. Owned exclusively by workerLoop().
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
+    private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
-    // Total bytes currently allocated across every segment owned by every
-    // registered ring (active + sealed + hot-spare). Mutated by the manager
-    // thread on provision/trim and by register/deregister callers under
-    // {@link #lock}; the lock covers both paths so the counter stays
-    // consistent across registration boundaries.
-    private long totalBytes;
-    private long lastDiskFullLogNs;
     // Test seam: runs on the worker thread just before the install path's
     // synchronized(lock) entry (the one that performs installHotSpare + the
     // totalBytes += segmentSize commit). Null in production; only
@@ -98,7 +91,14 @@ public final class SegmentManager implements QuietCloseable {
     // inject a deregister(ring) call into the exact race window that the
     // stillRegistered guard inside the trim block closes.
     volatile Runnable beforeTrimSyncHook;
+    private long lastDiskFullLogNs;
     private volatile boolean running;
+    // Total bytes currently allocated across every segment owned by every
+    // registered ring (active + sealed + hot-spare). Mutated by the manager
+    // thread on provision/trim and by register/deregister callers under
+    // {@link #lock}; the lock covers both paths so the counter stays
+    // consistent across registration boundaries.
+    private long totalBytes;
     // volatile because wakeWorker() reads workerThread without holding the
     // monitor; the synchronized start()/close() pair handles the
     // start-vs-close ordering.
@@ -239,6 +239,30 @@ public final class SegmentManager implements QuietCloseable {
         ring.setManagerWakeup(this::wakeWorker);
     }
 
+    public synchronized void start() {
+        if (workerThread != null) {
+            throw new IllegalStateException("already started");
+        }
+        running = true;
+        workerThread = new Thread(this::workerLoop, "qdb-sf-segment-manager");
+        workerThread.setDaemon(true);
+        workerThread.start();
+    }
+
+    /**
+     * Unparks the worker thread out of its poll-park so it processes
+     * registered rings on the very next loop iteration. Cheap — a single
+     * {@code LockSupport.unpark}; safe to call from any thread; idempotent
+     * (multiple unparks coalesce into a single permit). No-op if the worker
+     * hasn't been {@link #start()}'d yet.
+     */
+    public void wakeWorker() {
+        Thread t = workerThread;
+        if (t != null) {
+            LockSupport.unpark(t);
+        }
+    }
+
     /**
      * Returns the highest hex-encoded generation across {@code sf-<gen>.sfa}
      * files in {@code dir}, or {@code -1} if none exist. Skips files that
@@ -278,27 +302,18 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
-     * Unparks the worker thread out of its poll-park so it processes
-     * registered rings on the very next loop iteration. Cheap — a single
-     * {@code LockSupport.unpark}; safe to call from any thread; idempotent
-     * (multiple unparks coalesce into a single permit). No-op if the worker
-     * hasn't been {@link #start()}'d yet.
+     * Spare files are named with a JVM-wide monotonic generation counter
+     * rather than a baseSeq-derived name, because the spare's baseSeq is
+     * provisional at create time (SegmentRing.appendOrFsn rebases it at
+     * rotation). Pattern: {@code <dir>/sf-<gen:016x>.sfa}. Recovery
+     * discovers segments by extension + header magic, not by filename.
      */
-    public void wakeWorker() {
-        Thread t = workerThread;
-        if (t != null) {
-            LockSupport.unpark(t);
-        }
-    }
-
-    public synchronized void start() {
-        if (workerThread != null) {
-            throw new IllegalStateException("already started");
-        }
-        running = true;
-        workerThread = new Thread(this::workerLoop, "qdb-sf-segment-manager");
-        workerThread.setDaemon(true);
-        workerThread.start();
+    private String nextSparePath(String dir) {
+        pathSink.clear();
+        pathSink.put(dir).put("/sf-");
+        Numbers.appendHex(pathSink, fileGeneration.getAndIncrement(), true);
+        pathSink.put(".sfa");
+        return pathSink.toString();
     }
 
     private void serviceRing(RingEntry e) {
@@ -485,21 +500,6 @@ public final class SegmentManager implements QuietCloseable {
                 }
             }
         }
-    }
-
-    /**
-     * Spare files are named with a JVM-wide monotonic generation counter
-     * rather than a baseSeq-derived name, because the spare's baseSeq is
-     * provisional at create time (SegmentRing.appendOrFsn rebases it at
-     * rotation). Pattern: {@code <dir>/sf-<gen:016x>.sfa}. Recovery
-     * discovers segments by extension + header magic, not by filename.
-     */
-    private String nextSparePath(String dir) {
-        pathSink.clear();
-        pathSink.put(dir).put("/sf-");
-        Numbers.appendHex(pathSink, fileGeneration.getAndIncrement(), true);
-        pathSink.put(".sfa");
-        return pathSink.toString();
     }
 
     private void workerLoop() {

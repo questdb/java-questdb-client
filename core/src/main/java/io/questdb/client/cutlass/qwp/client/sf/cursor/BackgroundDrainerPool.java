@@ -52,14 +52,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class BackgroundDrainerPool implements QuietCloseable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainerPool.class);
-    // Time we let drainers finish their drain naturally before signaling
-    // stop. awaitTermination returns as soon as the last drainer exits,
-    // so this only matters when something is genuinely stuck.
-    private static final long GRACEFUL_DRAIN_MILLIS = 2_500L;
-    // After signaling stop, give drainers a brief window to unwind cleanly
-    // (release slot lock, close engine) before forcing shutdownNow.
-    private static final long STOP_GRACE_MILLIS = 500L;
     // CAS gate. Single AtomicInteger packs the closed flag (sign bit) and
     // the in-flight submit count (low 31 bits):
     //   state >= 0       → open, value is the in-flight submit count
@@ -73,10 +65,17 @@ public final class BackgroundDrainerPool implements QuietCloseable {
     // either lands before close (and close waits for it to finish) or
     // sees the closed bit and throws.
     private static final int CLOSED_BIT = Integer.MIN_VALUE;
-    private final AtomicInteger state = new AtomicInteger();
-
-    private final ExecutorService executor;
+    // Time we let drainers finish their drain naturally before signaling
+    // stop. awaitTermination returns as soon as the last drainer exits,
+    // so this only matters when something is genuinely stuck.
+    private static final long GRACEFUL_DRAIN_MILLIS = 2_500L;
+    private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainerPool.class);
+    // After signaling stop, give drainers a brief window to unwind cleanly
+    // (release slot lock, close engine) before forcing shutdownNow.
+    private static final long STOP_GRACE_MILLIS = 500L;
     private final CopyOnWriteArrayList<BackgroundDrainer> active = new CopyOnWriteArrayList<>();
+    private final ExecutorService executor;
+    private final AtomicInteger state = new AtomicInteger();
     /**
      * Cumulative count of drainers whose runnable returned with
      * {@link BackgroundDrainer.DrainOutcome#FAILED}. Bumped once per
@@ -106,6 +105,99 @@ public final class BackgroundDrainerPool implements QuietCloseable {
             t.setDaemon(true);
             return t;
         });
+    }
+
+    @Override
+    public void close() {
+        // Set the closed bit. CAS-loop because the in-flight count can be
+        // changing under us. Subsequent submit() calls will fail their
+        // CAS check (state < 0) and throw.
+        for (;;) {
+            int s = state.get();
+            if (s < 0) return; // already closed (idempotent)
+            if (state.compareAndSet(s, s | CLOSED_BIT)) break;
+        }
+        // Wait for in-flight submits to release their slots — i.e. for
+        // state to drain to exactly CLOSED_BIT (no low bits set). This
+        // ensures every submit's executor.submit has already returned
+        // before we shut the executor down.
+        while (state.get() != CLOSED_BIT) {
+            Thread.onSpinWait();
+        }
+        // Reject new tasks but let in-flight drainers finish their drain
+        // naturally. Without this grace window a drainer that's seconds
+        // away from acked >= target gets requestStop()'d and exits as
+        // STOPPED — its engine.close() then sees fullyDrained=false and
+        // leaves the slot's .sfa files behind, defeating drain_orphans.
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(GRACEFUL_DRAIN_MILLIS, TimeUnit.MILLISECONDS)) {
+                LOG.warn("orphan drainers still running after {}ms — signaling stop",
+                        GRACEFUL_DRAIN_MILLIS);
+                for (BackgroundDrainer d : active) {
+                    d.requestStop();
+                }
+                if (!executor.awaitTermination(STOP_GRACE_MILLIS, TimeUnit.MILLISECONDS)) {
+                    LOG.warn("drainer pool did not exit in {}ms after stop; "
+                                    + "remaining drainers will exit on their own",
+                            STOP_GRACE_MILLIS);
+                    executor.shutdownNow();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * Number of drainers currently tracked by the pool. Same lax-cleanup
+     * race as {@link #snapshot} — a drainer that finished moments ago may
+     * still count for a few ms before its executor task removes it.
+     */
+    public int getActiveCount() {
+        return active.size();
+    }
+
+    /**
+     * Cumulative count of drainers that exited with
+     * {@link BackgroundDrainer.DrainOutcome#FAILED}, since pool creation.
+     */
+    public long getTotalFailed() {
+        return totalFailed.get();
+    }
+
+    /**
+     * Cumulative count of drainers that exited with
+     * {@link BackgroundDrainer.DrainOutcome#SUCCESS}, since pool creation.
+     */
+    public long getTotalSucceeded() {
+        return totalSucceeded.get();
+    }
+
+    /**
+     * Plug a default {@link BackgroundDrainerListener} for drainers
+     * submitted through this pool. {@code null} clears the default.
+     * Drainers that already have a listener set by the caller before
+     * {@link #submit} are not overridden — the pool default is a
+     * fallback, not an override. Subsequent submits pick up the most
+     * recently set value.
+     */
+    public void setListener(BackgroundDrainerListener listener) {
+        this.listener = listener;
+    }
+
+    /**
+     * Snapshot of currently-tracked drainers. May include drainers that
+     * finished moments ago — the cleanup race is intentionally lax.
+     * Useful for visibility / status accessors.
+     */
+    public ObjList<BackgroundDrainer> snapshot() {
+        ObjList<BackgroundDrainer> result = new ObjList<>(active.size());
+        for (BackgroundDrainer d : active) {
+            result.add(d);
+        }
+        return result;
     }
 
     /**
@@ -160,99 +252,6 @@ public final class BackgroundDrainerPool implements QuietCloseable {
             // closed bit's state — the bit lives in position 31 and
             // only the low 31 bits move.
             state.decrementAndGet();
-        }
-    }
-
-    /**
-     * Plug a default {@link BackgroundDrainerListener} for drainers
-     * submitted through this pool. {@code null} clears the default.
-     * Drainers that already have a listener set by the caller before
-     * {@link #submit} are not overridden — the pool default is a
-     * fallback, not an override. Subsequent submits pick up the most
-     * recently set value.
-     */
-    public void setListener(BackgroundDrainerListener listener) {
-        this.listener = listener;
-    }
-
-    /**
-     * Snapshot of currently-tracked drainers. May include drainers that
-     * finished moments ago — the cleanup race is intentionally lax.
-     * Useful for visibility / status accessors.
-     */
-    public ObjList<BackgroundDrainer> snapshot() {
-        ObjList<BackgroundDrainer> result = new ObjList<>(active.size());
-        for (BackgroundDrainer d : active) {
-            result.add(d);
-        }
-        return result;
-    }
-
-    /**
-     * Number of drainers currently tracked by the pool. Same lax-cleanup
-     * race as {@link #snapshot} — a drainer that finished moments ago may
-     * still count for a few ms before its executor task removes it.
-     */
-    public int getActiveCount() {
-        return active.size();
-    }
-
-    /**
-     * Cumulative count of drainers that exited with
-     * {@link BackgroundDrainer.DrainOutcome#FAILED}, since pool creation.
-     */
-    public long getTotalFailed() {
-        return totalFailed.get();
-    }
-
-    /**
-     * Cumulative count of drainers that exited with
-     * {@link BackgroundDrainer.DrainOutcome#SUCCESS}, since pool creation.
-     */
-    public long getTotalSucceeded() {
-        return totalSucceeded.get();
-    }
-
-    @Override
-    public void close() {
-        // Set the closed bit. CAS-loop because the in-flight count can be
-        // changing under us. Subsequent submit() calls will fail their
-        // CAS check (state < 0) and throw.
-        for (;;) {
-            int s = state.get();
-            if (s < 0) return; // already closed (idempotent)
-            if (state.compareAndSet(s, s | CLOSED_BIT)) break;
-        }
-        // Wait for in-flight submits to release their slots — i.e. for
-        // state to drain to exactly CLOSED_BIT (no low bits set). This
-        // ensures every submit's executor.submit has already returned
-        // before we shut the executor down.
-        while (state.get() != CLOSED_BIT) {
-            Thread.onSpinWait();
-        }
-        // Reject new tasks but let in-flight drainers finish their drain
-        // naturally. Without this grace window a drainer that's seconds
-        // away from acked >= target gets requestStop()'d and exits as
-        // STOPPED — its engine.close() then sees fullyDrained=false and
-        // leaves the slot's .sfa files behind, defeating drain_orphans.
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(GRACEFUL_DRAIN_MILLIS, TimeUnit.MILLISECONDS)) {
-                LOG.warn("orphan drainers still running after {}ms — signaling stop",
-                        GRACEFUL_DRAIN_MILLIS);
-                for (BackgroundDrainer d : active) {
-                    d.requestStop();
-                }
-                if (!executor.awaitTermination(STOP_GRACE_MILLIS, TimeUnit.MILLISECONDS)) {
-                    LOG.warn("drainer pool did not exit in {}ms after stop; "
-                                    + "remaining drainers will exit on their own",
-                            STOP_GRACE_MILLIS);
-                    executor.shutdownNow();
-                }
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            executor.shutdownNow();
         }
     }
 }

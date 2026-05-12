@@ -46,7 +46,7 @@ import org.slf4j.LoggerFactory;
  * </ul>
  * No locks; the only cross-thread state is {@link #publishedFsn} (volatile,
  * single-writer) and {@link #ackedFsn} (volatile, single-writer). Hot-spare
- * handoff uses {@code volatile} as well — the segment manager publishes a
+ * handoff uses {@code volatile} as well -- the segment manager publishes a
  * spare; the producer thread consumes it on the next rotation.
  * <p>
  * <b>Backpressure model:</b> {@link #appendOrFsn} returns
@@ -57,33 +57,37 @@ import org.slf4j.LoggerFactory;
  */
 public final class SegmentRing implements QuietCloseable {
 
-    private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
-
     /** Sentinel: append failed because no hot spare was available to rotate into. */
     public static final long BACKPRESSURE_NO_SPARE = -1L;
-
     /** Sentinel: append failed because the payload doesn't fit in a fresh segment. */
     public static final long PAYLOAD_TOO_LARGE = -2L;
-
+    private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
     private final long maxBytesPerSegment;
-    // High-water byte offset within the active segment at which we proactively
-    // ask the segment manager to provision a spare (if one isn't already
-    // installed). Computed once as 3/4 of segment capacity — leaves the manager
-    // a quarter-of-a-segment of producer runway to do its open+mmap before the
-    // producer would otherwise hit BACKPRESSURE_NO_SPARE.
-    private final long signalAtBytes;
     // Sealed segments in baseSeq order, oldest first. Active is held separately.
     // Single-writer (producer thread, on rotation); single-reader at trim time
     // (the segment manager). For now, both sides synchronize via the single-
-    // writer guarantee plus the volatile ackedFsn — the segment manager only
+    // writer guarantee plus the volatile ackedFsn -- the segment manager only
     // looks at sealedSegments after observing a higher ackedFsn, by which
     // point the producer thread's add to sealedSegments has retired.
     private final ObjList<MmapSegment> sealedSegments = new ObjList<>();
+    // High-water byte offset within the active segment at which we proactively
+    // ask the segment manager to provision a spare (if one isn't already
+    // installed). Computed once as 3/4 of segment capacity -- leaves the manager
+    // a quarter-of-a-segment of producer runway to do its open+mmap before the
+    // producer would otherwise hit BACKPRESSURE_NO_SPARE.
+    private final long signalAtBytes;
+    private volatile long ackedFsn = -1L;
     // active: written by producer (constructor + appendOrFsn rotation),
     // read by I/O thread via getActive(). Volatile so the I/O thread sees
     // rotations promptly and never observes a torn reference.
     private volatile MmapSegment active;
-    private volatile long ackedFsn = -1L;
+    // Set to true by close(); checked by installHotSpare under the ring's
+    // monitor to reject spares that arrive after the ring has been torn
+    // down. Without this, a manager's serviceRing tick that snapshotted
+    // the ring before deregister could create a fresh MmapSegment, then
+    // call installHotSpare on a closed ring (whose hotSpare was just
+    // zeroed by close()) -- the spare's mmap + fd would never be reclaimed.
+    private boolean closed;
     // hotSpare: written by segment manager (installHotSpare), read+cleared by
     // producer thread on rotation. Volatile so the producer sees fresh installs.
     private volatile MmapSegment hotSpare;
@@ -91,23 +95,16 @@ public final class SegmentRing implements QuietCloseable {
     // so the producer can wake the manager out of its poll-park the moment
     // a spare is needed (rotation just consumed one, or active crossed the
     // high-water mark while no spare is installed). Without this, the
-    // manager only notices on its next polling tick — fine on average,
+    // manager only notices on its next polling tick -- fine on average,
     // but the worst-case wait is the full poll interval. Producer-thread-only.
     private Runnable managerWakeup;
+    private long nextSeq;
+    private volatile long publishedFsn;
     // Plain (producer-thread-only) flag; set to true the first time we ask
     // the manager for a spare for the current active segment, cleared on
     // every rotation. Coalesces multiple high-water-mark crossings into a
     // single unpark per active.
     private boolean wakeupRequestedForActive;
-    private long nextSeq;
-    private volatile long publishedFsn;
-    // Set to true by close(); checked by installHotSpare under the ring's
-    // monitor to reject spares that arrive after the ring has been torn
-    // down. Without this, a manager's serviceRing tick that snapshotted
-    // the ring before deregister could create a fresh MmapSegment, then
-    // call installHotSpare on a closed ring (whose hotSpare was just
-    // zeroed by close()) — the spare's mmap + fd would never be reclaimed.
-    private boolean closed;
 
     /**
      * Creates a ring with the given segment cap and an already-prepared
@@ -139,14 +136,14 @@ public final class SegmentRing implements QuietCloseable {
      *   <li>All others become sealed segments awaiting ACK and trim.</li>
      * </ul>
      * Returns {@code null} if the directory is empty or contains no
-     * recognizable {@code .sfa} files — the caller should then construct a
+     * recognizable {@code .sfa} files -- the caller should then construct a
      * fresh ring with {@link #SegmentRing(MmapSegment, long)} and a freshly
      * created initial segment.
      * <p>
      * Recovery is best-effort: a single bad-magic file is silently skipped
      * (logged-then-ignored is the right call here; a stray unrelated file in
      * the SF dir shouldn't take the whole sender down). A failure to open
-     * an otherwise-valid segment IS fatal — the caller's data integrity
+     * an otherwise-valid segment IS fatal -- the caller's data integrity
      * depends on every segment being readable.
      */
     public static SegmentRing openExisting(String sfDir, long maxBytesPerSegment) {
@@ -156,16 +153,16 @@ public final class SegmentRing implements QuietCloseable {
         ObjList<MmapSegment> opened = new ObjList<>();
         long find = Files.findFirst(sfDir);
         if (find < 0) {
-            LOG.warn("openExisting could not enumerate {} — treating as empty, "
+            LOG.warn("openExisting could not enumerate {} - treating as empty, "
                     + "but this may indicate a permission or transient error", sfDir);
             return null;
         }
         if (find == 0) {
             return null;
         }
-        // Outer try-catch: anything escaping the recovery body — IOOBE from
+        // Outer try-catch: anything escaping the recovery body -- IOOBE from
         // ObjList growth, OOM from native mmap during MmapSegment.openExisting,
-        // unforeseen RuntimeException from the contiguity check, etc. — must
+        // unforeseen RuntimeException from the contiguity check, etc. -- must
         // not leave fds + mmaps owned by `opened` orphaned. Close every
         // recovered segment and rethrow so the engine surfaces the failure.
         try {
@@ -178,7 +175,7 @@ public final class SegmentRing implements QuietCloseable {
                         MmapSegment seg = null;
                         try {
                             seg = MmapSegment.openExisting(path);
-                            // Filter out empty leftovers — typically hot-spare
+                            // Filter out empty leftovers -- typically hot-spare
                             // segments the manager pre-allocated for a prior
                             // session that never got rotated into active. They
                             // carry the provisional baseSeq=0 and frameCount=0,
@@ -193,7 +190,7 @@ public final class SegmentRing implements QuietCloseable {
                             // empty past the header. If frame[0] failed CRC
                             // (bit-rot, partial-page-write at crash, etc.) but
                             // valid frames followed, scanFrames returns
-                            // lastGood=HEADER_SIZE and frameCount=0 — yet
+                            // lastGood=HEADER_SIZE and frameCount=0 -- yet
                             // tornTailBytes is non-zero. Treating that as
                             // "empty hot-spare" would silently destroy every
                             // surviving frame. Quarantine to <path>.corrupt
@@ -215,7 +212,7 @@ public final class SegmentRing implements QuietCloseable {
                             // Per-file data error (bad magic, bad header,
                             // unsupported version, mmap rejection on this one
                             // file). Don't take down recovery for one corrupt
-                            // .sfa — log and skip so siblings still recover.
+                            // .sfa -- log and skip so siblings still recover.
                             // Resource exhaustion (OOM) and programmer errors
                             // (IOOBE) deliberately propagate to the outer
                             // catch, which closes every already-recovered
@@ -228,7 +225,7 @@ public final class SegmentRing implements QuietCloseable {
                             // Close any seg whose ownership wasn't transferred
                             // (either to opened, or via the empty-branch close
                             // above). Fires on a propagating throw between
-                            // open and transfer — most importantly an OOM
+                            // open and transfer -- most importantly an OOM
                             // from ObjList.add growing its backing array
                             // after the mmap+fd were already acquired.
                             if (seg != null) {
@@ -250,7 +247,7 @@ public final class SegmentRing implements QuietCloseable {
                 return null;
             }
             // Sort by baseSeq ascending. Worst-case segment count is
-            // sf_max_total_bytes / sf_max_bytes — at the documented ceiling
+            // sf_max_total_bytes / sf_max_bytes -- at the documented ceiling
             // (1 TiB / 64 MiB) that is ~16K entries, where an O(N²) sort spends
             // multiple seconds in compares + shifts before the I/O thread can
             // start. In-place quicksort with median-of-three pivot keeps the
@@ -292,7 +289,7 @@ public final class SegmentRing implements QuietCloseable {
             // After the success path, `opened` no longer contains the active
             // segment (removed above), but the sealed segments transferred to
             // ring.sealedSegments are still owned by the ring once it's
-            // returned — so this catch only fires before the return statement.
+            // returned -- so this catch only fires before the return statement.
             for (int i = 0, n = opened.size(); i < n; i++) {
                 try {
                     opened.get(i).close();
@@ -315,7 +312,7 @@ public final class SegmentRing implements QuietCloseable {
 
     /**
      * I/O thread (or anyone tracking ACK) advances the ACK cursor. {@code seq}
-     * is cumulative — the server has confirmed every FSN up to and including
+     * is cumulative -- the server has confirmed every FSN up to and including
      * this value. Idempotent: a second call with the same or smaller value is
      * a no-op.
      * <p>
@@ -327,8 +324,8 @@ public final class SegmentRing implements QuietCloseable {
      *
      * @return {@code true} if the watermark advanced, {@code false} on
      *         no-op (idempotent re-ack or clamped). Callers wishing to fire
-     *         a one-shot side effect on advance only — e.g. dispatching to a
-     *         {@code SenderProgressHandler} — gate on the return value to
+     *         a one-shot side effect on advance only -- e.g. dispatching to a
+     *         {@code SenderProgressHandler} -- gate on the return value to
      *         avoid emitting stale values.
      */
     public boolean acknowledge(long seq) {
@@ -351,7 +348,7 @@ public final class SegmentRing implements QuietCloseable {
      * <p>
      * Rotation is automatic: when the active segment is full, the hot spare
      * (if installed) is promoted, the previous active joins the sealed list,
-     * and the segment manager is signaled (implicitly — it polls
+     * and the segment manager is signaled (implicitly -- it polls
      * {@link #needsHotSpare}) to prepare the next spare.
      */
     public long appendOrFsn(long payloadAddr, int payloadLen) {
@@ -370,7 +367,7 @@ public final class SegmentRing implements QuietCloseable {
             long actualBase = active.baseSeq() + active.frameCount();
             spare.rebaseSeq(actualBase);
             // Mutate sealedSegments under the same monitor used by
-            // snapshotSealedSegments — the I/O thread reads through that
+            // snapshotSealedSegments -- the I/O thread reads through that
             // path and must not see a half-resized ObjList.
             synchronized (this) {
                 sealedSegments.add(active);
@@ -387,7 +384,7 @@ public final class SegmentRing implements QuietCloseable {
             }
             offset = active.tryAppend(payloadAddr, payloadLen);
             if (offset == -1L) {
-                // Doesn't fit even in a fresh segment — payload is genuinely too big.
+                // Doesn't fit even in a fresh segment -- payload is genuinely too big.
                 return PAYLOAD_TOO_LARGE;
             }
         } else if (!wakeupRequestedForActive
@@ -463,84 +460,6 @@ public final class SegmentRing implements QuietCloseable {
         return out;
     }
 
-    /** Active segment — exposed for the I/O thread's "send next batch" path. */
-    public MmapSegment getActive() {
-        return active;
-    }
-
-    /**
-     * Direct view of sealed segments (oldest first). NOT thread-safe — use
-     * only from the producer thread, or alongside a lock that excludes
-     * concurrent rotation. Cross-thread readers (typically the I/O loop)
-     * should use {@link #snapshotSealedSegments(MmapSegment[])} instead.
-     */
-    public ObjList<MmapSegment> getSealedSegments() {
-        return sealedSegments;
-    }
-
-    /**
-     * Thread-safe snapshot of the current sealed-segment list. Copies
-     * references into the caller-supplied {@code target} array (oldest
-     * first, packed left). Returns the number of references copied. If
-     * {@code target} is too small, copies the first {@code target.length}
-     * references and returns {@code -1} as a signal that the caller needs
-     * to grow the buffer and retry.
-     * <p>
-     * Synchronized against rotation (producer's
-     * {@link #appendOrFsn} mutates {@code sealedSegments}). Cost is one
-     * monitor acquire/release per call, paid by the I/O loop at most once
-     * per tick — far below the cost of the actual {@code sendBinary} that
-     * the I/O loop is about to do.
-     */
-    public synchronized int snapshotSealedSegments(MmapSegment[] target) {
-        int n = sealedSegments.size();
-        if (n > target.length) {
-            for (int i = 0; i < target.length; i++) {
-                target[i] = sealedSegments.get(i);
-            }
-            return -1;
-        }
-        for (int i = 0; i < n; i++) {
-            target[i] = sealedSegments.get(i);
-        }
-        return n;
-    }
-
-    /**
-     * Returns the sealed segment whose {@code baseSeq} immediately follows
-     * {@code current.baseSeq()}, or {@code null} if no such segment exists
-     * (caller should fall through to {@link #getActive()}). Used by the I/O
-     * loop to walk forward through the sealed list one segment at a time
-     * without snapshotting the whole list — important when the producer
-     * outpaces the I/O thread and sealed segments accumulate well beyond
-     * any reasonable snapshot-array size.
-     * <p>
-     * Identity match is intentionally avoided: we compare {@code baseSeq}
-     * so the loop is robust against the case where {@code current} was
-     * trimmed out from under us (already ACK'd before the I/O thread
-     * advanced) — we still return the next segment in baseSeq order rather
-     * than failing. Synchronized against rotation.
-     */
-    public synchronized MmapSegment nextSealedAfter(MmapSegment current) {
-        long currentBase = current.baseSeq();
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
-            MmapSegment s = sealedSegments.get(i);
-            if (s.baseSeq() > currentBase) {
-                return s;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Oldest sealed segment, or {@code null} if the sealed list is empty.
-     * Used by the I/O loop's "current was trimmed out from under us"
-     * fallback — see {@link #nextSealedAfter(MmapSegment)}.
-     */
-    public synchronized MmapSegment firstSealed() {
-        return sealedSegments.size() > 0 ? sealedSegments.get(0) : null;
-    }
-
     /**
      * Returns the segment whose published frame range covers {@code fsn}, or
      * {@code null} if no segment currently holds it (e.g. the FSN is past
@@ -549,7 +468,7 @@ public final class SegmentRing implements QuietCloseable {
      * replay.
      * <p>
      * Walks sealed first (oldest → newest) then the active. The sealed list
-     * is small enough — and reconnects are rare enough — that the linear
+     * is small enough -- and reconnects are rare enough -- that the linear
      * scan cost doesn't matter.
      */
     public synchronized MmapSegment findSegmentContaining(long fsn) {
@@ -571,12 +490,36 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * Oldest sealed segment, or {@code null} if the sealed list is empty.
+     * Used by the I/O loop's "current was trimmed out from under us"
+     * fallback -- see {@link #nextSealedAfter(MmapSegment)}.
+     */
+    public synchronized MmapSegment firstSealed() {
+        return sealedSegments.size() > 0 ? sealedSegments.get(0) : null;
+    }
+
+    /** Active segment -- exposed for the I/O thread's "send next batch" path. */
+    public MmapSegment getActive() {
+        return active;
+    }
+
+    /**
+     * Direct view of sealed segments (oldest first). NOT thread-safe -- use
+     * only from the producer thread, or alongside a lock that excludes
+     * concurrent rotation. Cross-thread readers (typically the I/O loop)
+     * should use {@link #snapshotSealedSegments(MmapSegment[])} instead.
+     */
+    public ObjList<MmapSegment> getSealedSegments() {
+        return sealedSegments;
+    }
+
+    /**
      * Segment manager pre-creates the next segment and parks it here. The
      * producer consumes the spare on its next rotation. Throws if a spare
      * is already installed (the manager should have polled {@link #needsHotSpare}
      * first; double-install is a programming error), or if the ring has
      * been closed since the manager started provisioning the spare. The
-     * latter is a benign race — the manager's catch block already closes
+     * latter is a benign race -- the manager's catch block already closes
      * the unused spare and unlinks its file.
      */
     public synchronized void installHotSpare(MmapSegment spare) {
@@ -594,6 +537,96 @@ public final class SegmentRing implements QuietCloseable {
 
     public long maxBytesPerSegment() {
         return maxBytesPerSegment;
+    }
+
+    /** True when the segment manager should prepare and install a fresh spare. */
+    public boolean needsHotSpare() {
+        return hotSpare == null;
+    }
+
+    /**
+     * Returns the sealed segment whose {@code baseSeq} immediately follows
+     * {@code current.baseSeq()}, or {@code null} if no such segment exists
+     * (caller should fall through to {@link #getActive()}). Used by the I/O
+     * loop to walk forward through the sealed list one segment at a time
+     * without snapshotting the whole list -- important when the producer
+     * outpaces the I/O thread and sealed segments accumulate well beyond
+     * any reasonable snapshot-array size.
+     * <p>
+     * Identity match is intentionally avoided: we compare {@code baseSeq}
+     * so the loop is robust against the case where {@code current} was
+     * trimmed out from under us (already ACK'd before the I/O thread
+     * advanced) -- we still return the next segment in baseSeq order rather
+     * than failing. Synchronized against rotation.
+     */
+    public synchronized MmapSegment nextSealedAfter(MmapSegment current) {
+        long currentBase = current.baseSeq();
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            MmapSegment s = sealedSegments.get(i);
+            if (s.baseSeq() > currentBase) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The next FSN that {@link #appendOrFsn} will assign. Useful for the
+     * segment manager to know what {@code baseSeq} the next spare should use.
+     */
+    public long nextSeqHint() {
+        return nextSeq;
+    }
+
+    /**
+     * Highest FSN whose frame is fully written and visible to consumers (the
+     * I/O thread). Returns -1 when nothing has been appended yet. Volatile
+     * read; safe to call from any thread.
+     */
+    public long publishedFsn() {
+        return publishedFsn;
+    }
+
+    /**
+     * Registers a wakeup callback that the producer thread will invoke when
+     * a hot spare is needed -- either right after a rotation has consumed the
+     * previous spare, or when the active segment crosses the 75% high-water
+     * mark while no spare is installed. The callback is expected to be cheap
+     * (e.g. {@code LockSupport.unpark} of the segment manager's worker).
+     * <p>
+     * Set once, before the producer starts appending. Idempotent re-set is
+     * allowed but not thread-safe.
+     */
+    public void setManagerWakeup(Runnable wakeup) {
+        this.managerWakeup = wakeup;
+    }
+
+    /**
+     * Thread-safe snapshot of the current sealed-segment list. Copies
+     * references into the caller-supplied {@code target} array (oldest
+     * first, packed left). Returns the number of references copied. If
+     * {@code target} is too small, copies the first {@code target.length}
+     * references and returns {@code -1} as a signal that the caller needs
+     * to grow the buffer and retry.
+     * <p>
+     * Synchronized against rotation (producer's
+     * {@link #appendOrFsn} mutates {@code sealedSegments}). Cost is one
+     * monitor acquire/release per call, paid by the I/O loop at most once
+     * per tick -- far below the cost of the actual {@code sendBinary} that
+     * the I/O loop is about to do.
+     */
+    public synchronized int snapshotSealedSegments(MmapSegment[] target) {
+        int n = sealedSegments.size();
+        if (n > target.length) {
+            for (int i = 0; i < target.length; i++) {
+                target[i] = sealedSegments.get(i);
+            }
+            return -1;
+        }
+        for (int i = 0; i < n; i++) {
+            target[i] = sealedSegments.get(i);
+        }
+        return n;
     }
 
     /**
@@ -617,47 +650,11 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Registers a wakeup callback that the producer thread will invoke when
-     * a hot spare is needed — either right after a rotation has consumed the
-     * previous spare, or when the active segment crosses the 75% high-water
-     * mark while no spare is installed. The callback is expected to be cheap
-     * (e.g. {@code LockSupport.unpark} of the segment manager's worker).
-     * <p>
-     * Set once, before the producer starts appending. Idempotent re-set is
-     * allowed but not thread-safe.
-     */
-    public void setManagerWakeup(Runnable wakeup) {
-        this.managerWakeup = wakeup;
-    }
-
-    /** True when the segment manager should prepare and install a fresh spare. */
-    public boolean needsHotSpare() {
-        return hotSpare == null;
-    }
-
-    /**
-     * The next FSN that {@link #appendOrFsn} will assign. Useful for the
-     * segment manager to know what {@code baseSeq} the next spare should use.
-     */
-    public long nextSeqHint() {
-        return nextSeq;
-    }
-
-    /**
-     * Highest FSN whose frame is fully written and visible to consumers (the
-     * I/O thread). Returns -1 when nothing has been appended yet. Volatile
-     * read; safe to call from any thread.
-     */
-    public long publishedFsn() {
-        return publishedFsn;
-    }
-
-    /**
      * In-place quicksort over {@code list[lo, hi)} keyed by ascending
      * {@code baseSeq}. Median-of-three pivot avoids the pathological O(N²)
      * on already-sorted input that lexicographic readdir produces (our
      * filenames are zero-padded hex of {@code baseSeq}). Recursion depth is
-     * bounded by ~2 log₂(N) — for the documented 16K-segment ceiling, well
+     * bounded by ~2 log₂(N) -- for the documented 16K-segment ceiling, well
      * under the JVM default stack.
      */
     private static void sortByBaseSeq(ObjList<MmapSegment> list, int lo, int hi) {

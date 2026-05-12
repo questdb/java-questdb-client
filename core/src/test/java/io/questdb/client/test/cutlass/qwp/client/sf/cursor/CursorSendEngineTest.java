@@ -79,51 +79,6 @@ public class CursorSendEngineTest {
     }
 
     @Test
-    public void testAppendBlockingNeverFailsUnderManagerSupply() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
-                for (int i = 0; i < 200; i++) {
-                    Unsafe.getUnsafe().putInt(buf, i);
-                    long fsn = engine.appendBlocking(buf, 64);
-                    assertEquals(i, fsn);
-                }
-                assertEquals(199, engine.publishedFsn());
-                assertNotNull("active segment is always non-null", engine.activeSegment());
-            } finally {
-                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testAppendOrFsnReturnsBackpressureWhenSpareUnavailable() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // Run with a deliberately stalled manager: poll cadence so slow
-            // it never installs a spare in the test window. The first segment
-            // fills, then appendOrFsn returns BACKPRESSURE_NO_SPARE.
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-                // Fill the active deterministically (this is the initial segment;
-                // manager hasn't had a chance to provision a spare yet on a fast box,
-                // so we use a short spin deadline so the test runs quickly).
-                long deadline = System.nanoTime();
-                engine.appendOrFsn(buf, 64, deadline);
-                engine.appendOrFsn(buf, 64, deadline);
-                // Third append: active is full, spare may or may not be ready
-                // depending on race with manager. With a zero-deadline spin we
-                // get either the FSN (if manager beat us) or backpressure.
-                long fsn = engine.appendOrFsn(buf, 64, deadline);
-                assertTrue("unexpected fsn=" + fsn, fsn == 2L || fsn == -1L);
-            } finally {
-                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
     public void testAcknowledgePropagatesToRing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
@@ -143,11 +98,20 @@ public class CursorSendEngineTest {
     }
 
     @Test
-    public void testCloseIsIdempotent() throws Exception {
+    public void testAppendBlockingNeverFailsUnderManagerSupply() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096);
-            engine.close();
-            engine.close();
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                for (int i = 0; i < 200; i++) {
+                    Unsafe.getUnsafe().putInt(buf, i);
+                    long fsn = engine.appendBlocking(buf, 64);
+                    assertEquals(i, fsn);
+                }
+                assertEquals(199, engine.publishedFsn());
+                assertNotNull("active segment is always non-null", engine.activeSegment());
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
         });
     }
 
@@ -184,6 +148,135 @@ public class CursorSendEngineTest {
                 // Counter must record the stall.
                 assertTrue("stall counter must increment: " + engine.getTotalBackpressureStalls(),
                         engine.getTotalBackpressureStalls() >= 1);
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testAppendOrFsnReturnsBackpressureWhenSpareUnavailable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Run with a deliberately stalled manager: poll cadence so slow
+            // it never installs a spare in the test window. The first segment
+            // fills, then appendOrFsn returns BACKPRESSURE_NO_SPARE.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                // Fill the active deterministically (this is the initial segment;
+                // manager hasn't had a chance to provision a spare yet on a fast box,
+                // so we use a short spin deadline so the test runs quickly).
+                long deadline = System.nanoTime();
+                engine.appendOrFsn(buf, 64, deadline);
+                engine.appendOrFsn(buf, 64, deadline);
+                // Third append: active is full, spare may or may not be ready
+                // depending on race with manager. With a zero-deadline spin we
+                // get either the FSN (if manager beat us) or backpressure.
+                long fsn = engine.appendOrFsn(buf, 64, deadline);
+                assertTrue("unexpected fsn=" + fsn, fsn == 2L || fsn == -1L);
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testCloseIsIdempotent() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096);
+            engine.close();
+            engine.close();
+        });
+    }
+
+    @Test
+    public void testMemoryModeSkipsDirAndStillWorks() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // sfDir == null → memory-only ring. No files, no mkdir, no path.
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
+                assertNull(engine.sfDir());
+                for (int i = 0; i < 16; i++) {
+                    long fsn = engine.appendBlocking(buf, 32);
+                    assertEquals(i, fsn);
+                }
+                // Active segment must be a memory-backed MmapSegment (path == null).
+                assertNull(engine.activeSegment().path());
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveryAdvancesAckedFsnPastWatermark() throws Exception {
+        // Pin the spec invariant: when a valid .ack-watermark sits above
+        // the segment-derived seed but at or below publishedFsn,
+        // recovery picks the watermark (advancing the cursor past the
+        // already-durable-acked prefix of the lowest surviving segment).
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Session 1: append four frames so publishedFsn = 3.
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    for (int i = 0; i < 4; i++) {
+                        engine.appendBlocking(buf, 64);
+                    }
+                }
+                // Forge a watermark of 2 -- as if the previous session
+                // had received durable acks up through FSN 2 before
+                // dying. lowestBase is 0 so the bare baseSeed is -1;
+                // recovery must pick max(-1, 2) == 2.
+                try (AckWatermark w = AckWatermark.open(tmpDir)) {
+                    assertNotNull(w);
+                    w.write(2L);
+                }
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    assertEquals("watermark must advance recovered ackedFsn",
+                            2L, engine.ackedFsn());
+                    assertEquals("publishedFsn must reflect all four recovered frames",
+                            3L, engine.publishedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveryIgnoresWatermarkAbovePublishedFsn() throws Exception {
+        // Pin the corruption defence: a watermark higher than what the
+        // on-disk segments could account for must be rejected so
+        // recovery doesn't seed ackedFsn past publishedFsn (which would
+        // silently drop every un-acked frame on the next replay).
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Session 1: publishedFsn = 3 (four frames, FSNs 0..3).
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    for (int i = 0; i < 4; i++) {
+                        engine.appendBlocking(buf, 64);
+                    }
+                }
+                // Corrupt-high watermark -- 100 is far above the 0..3
+                // range the on-disk segments could justify.
+                try (AckWatermark w = AckWatermark.open(tmpDir)) {
+                    assertNotNull(w);
+                    w.write(100L);
+                }
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    // baseSeed = lowestBase - 1 = 0 - 1 = -1. Recovery
+                    // must fall back to baseSeed because the watermark
+                    // is past publishedFsn=3.
+                    assertEquals("corrupt-high watermark must fall back to lowestBase - 1",
+                            -1L, engine.ackedFsn());
+                    assertEquals(3L, engine.publishedFsn());
+                }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
@@ -236,31 +329,12 @@ public class CursorSendEngineTest {
                 // and ignores the on-disk segments.
                 try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
                     long fsn = engine.appendBlocking(buf, 64);
-                    assertEquals("FSN must continue, not restart — overlapping "
+                    assertEquals("FSN must continue, not restart - overlapping "
                                     + "FSNs would corrupt ACK translation, trim, and replay",
                             totalFrames, fsn);
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testMemoryModeSkipsDirAndStillWorks() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // sfDir == null → memory-only ring. No files, no mkdir, no path.
-            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-            try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
-                assertNull(engine.sfDir());
-                for (int i = 0; i < 16; i++) {
-                    long fsn = engine.appendBlocking(buf, 32);
-                    assertEquals(i, fsn);
-                }
-                // Active segment must be a memory-backed MmapSegment (path == null).
-                assertNull(engine.activeSegment().path());
-            } finally {
-                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -420,80 +494,6 @@ public class CursorSendEngineTest {
                 try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
                     assertTrue("session 2 must observe disk recovery",
                             engine.wasRecoveredFromDisk());
-                }
-            } finally {
-                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testRecoveryAdvancesAckedFsnPastWatermark() throws Exception {
-        // Pin the spec invariant: when a valid .ack-watermark sits above
-        // the segment-derived seed but at or below publishedFsn,
-        // recovery picks the watermark (advancing the cursor past the
-        // already-durable-acked prefix of the lowest surviving segment).
-        TestUtils.assertMemoryLeak(() -> {
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-            try {
-                // Session 1: append four frames so publishedFsn = 3.
-                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-                    for (int i = 0; i < 4; i++) {
-                        engine.appendBlocking(buf, 64);
-                    }
-                }
-                // Forge a watermark of 2 -- as if the previous session
-                // had received durable acks up through FSN 2 before
-                // dying. lowestBase is 0 so the bare baseSeed is -1;
-                // recovery must pick max(-1, 2) == 2.
-                try (AckWatermark w = AckWatermark.open(tmpDir)) {
-                    assertNotNull(w);
-                    w.write(2L);
-                }
-                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-                    assertEquals("watermark must advance recovered ackedFsn",
-                            2L, engine.ackedFsn());
-                    assertEquals("publishedFsn must reflect all four recovered frames",
-                            3L, engine.publishedFsn());
-                }
-            } finally {
-                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    @Test
-    public void testRecoveryIgnoresWatermarkAbovePublishedFsn() throws Exception {
-        // Pin the corruption defence: a watermark higher than what the
-        // on-disk segments could account for must be rejected so
-        // recovery doesn't seed ackedFsn past publishedFsn (which would
-        // silently drop every un-acked frame on the next replay).
-        TestUtils.assertMemoryLeak(() -> {
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-            try {
-                // Session 1: publishedFsn = 3 (four frames, FSNs 0..3).
-                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-                    for (int i = 0; i < 4; i++) {
-                        engine.appendBlocking(buf, 64);
-                    }
-                }
-                // Corrupt-high watermark -- 100 is far above the 0..3
-                // range the on-disk segments could justify.
-                try (AckWatermark w = AckWatermark.open(tmpDir)) {
-                    assertNotNull(w);
-                    w.write(100L);
-                }
-                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-                    // baseSeed = lowestBase - 1 = 0 - 1 = -1. Recovery
-                    // must fall back to baseSeed because the watermark
-                    // is past publishedFsn=3.
-                    assertEquals("corrupt-high watermark must fall back to lowestBase - 1",
-                            -1L, engine.ackedFsn());
-                    assertEquals(3L, engine.publishedFsn());
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
