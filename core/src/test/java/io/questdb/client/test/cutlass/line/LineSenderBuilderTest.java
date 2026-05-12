@@ -170,6 +170,8 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost:8080;max_buf_size=notanumber;", "invalid max_buf_size [value=notanumber]");
             assertConfStrError("http::addr=localhost:8080;init_buf_size=notanumber;", "invalid init_buf_size [value=notanumber]");
             assertConfStrError("http::addr=localhost:8080;init_buf_size=-42;", "buffer capacity cannot be negative [capacity=-42]");
+            assertConfStrError("http::addr=localhost:8080;max_buf_size=4g;", "max_buf_size exceeds maximum [value=4g]");
+            assertConfStrError("http::addr=localhost:8080;init_buf_size=4g;", "init_buf_size exceeds maximum [value=4g]");
             assertConfStrError("http::addr=localhost:8080;auto_flush_rows=0;", "invalid auto_flush_rows [value=0]");
             assertConfStrError("http::addr=localhost:8080;auto_flush_rows=notanumber;", "invalid auto_flush_rows [value=notanumber]");
             assertConfStrError("http::addr=localhost:8080;auto_flush=invalid;", "invalid auto_flush [value=invalid, allowed-values=[on, off]]");
@@ -214,6 +216,10 @@ public class LineSenderBuilderTest {
             assertConfStrOk("addr=localhost:8080", "token=foo", "retry_timeout=1000", "max_buf_size=1000000", "protocol_version=2");
             assertConfStrOk("addr=localhost:8080", "token=foo", "retry_timeout=1000", "max_buf_size=1000000", "protocol_version=1");
             assertConfStrOk("http::addr=localhost:8080;token=foo;max_buf_size=1000000;retry_timeout=1000;protocol_version=2;");
+            assertConfStrOk("http::addr=localhost:8080;max_buf_size=100m;protocol_version=2;");
+            assertConfStrOk("http::addr=localhost:8080;max_buf_size=1G;protocol_version=2;");
+            assertConfStrOk("http::addr=localhost:8080;init_buf_size=64k;protocol_version=2;");
+            assertConfStrOk("http::addr=localhost:8080;init_buf_size=128KB;max_buf_size=2M;protocol_version=2;");
             assertConfStrOk("https::addr=localhost:8080;tls_verify=unsafe_off;auto_flush_rows=100;protocol_version=2;");
             assertConfStrOk("https::addr=localhost:8080;tls_verify=unsafe_off;auto_flush_rows=100;protocol_version=2;max_name_len=256;");
             assertConfStrOk("https::addr=localhost:8080;tls_verify=on;protocol_version=2;");

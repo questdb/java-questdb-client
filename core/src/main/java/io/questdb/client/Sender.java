@@ -2312,6 +2312,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
         }
 
+        private static int parseSizeIntValue(@NotNull StringSink value, @NotNull String name) {
+            long size = parseSizeValue(value, name);
+            if (size > Integer.MAX_VALUE) {
+                throw new LineSenderException(name).put(" exceeds maximum [value=").put(value).put(']');
+            }
+            return (int) size;
+        }
+
         /**
          * Parses a byte-count value with optional unit suffix:
          * <ul>
@@ -2632,7 +2640,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     retryTimeoutMillis(timeout);
                 } else if (Chars.equals("max_buf_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_buf_size");
-                    int maxBufferSize = parseIntValue(sink, "max_buf_size");
+                    int maxBufferSize = parseSizeIntValue(sink, "max_buf_size");
                     maxBufferCapacity(maxBufferSize);
                 } else if (Chars.equals("max_name_len", sink)) {
                     pos = getValue(configurationString, pos, sink, "max_name_len");
@@ -2640,7 +2648,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     maxNameLength(len);
                 } else if (Chars.equals("init_buf_size", sink)) {
                     pos = getValue(configurationString, pos, sink, "init_buf_size");
-                    int initBufSize = parseIntValue(sink, "init_buf_size");
+                    int initBufSize = parseSizeIntValue(sink, "init_buf_size");
                     if (autoFlushBytesSet) {
                         assert protocol == PROTOCOL_TCP;
                         if (initBufSize != bufferCapacity) {
