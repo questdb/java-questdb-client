@@ -181,9 +181,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // when durableAckMode is false.
     private final AtomicLong totalDurableAcks = new AtomicLong();
     private final AtomicLong totalDurableTrimAdvances = new AtomicLong();
-    // Wall clock of the last keepalive PING the I/O loop sent to prod the
-    // server into flushing durable-ack frames. Zero until the first PING.
-    private long lastKeepalivePingNanos;
+    // Wall clock of the last outbound activity on the wire -- a sent frame
+    // (trySendOne) or a keepalive PING (sendDurableAckKeepaliveIfDue).
+    // Throttles the durable-ack keepalive PING so it fires only when the
+    // configured interval has elapsed since the most recent outbound event.
+    // Zero until the first send; reset to zero on reconnect.
+    private long lastFrameOrPingNanos;
     private WebSocketClient client;
     // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
     // a fresh connection, this is 0. After a reconnect, it's set to
@@ -916,7 +919,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // Reset the keepalive throttle so the new connection can prod the
         // server immediately rather than waiting out the leftover interval
         // from before the reconnect.
-        lastKeepalivePingNanos = 0L;
+        lastFrameOrPingNanos = 0L;
     }
 
     /**
@@ -1031,6 +1034,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             fail(t);
             return false;
         }
+        lastFrameOrPingNanos = System.nanoTime();
         sendOffset = frameEnd;
         long fsnSent = fsnAtZero + nextWireSeq;
         nextWireSeq++;
@@ -1060,9 +1064,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Send a WebSocket PING to prod the server into flushing pending
      * STATUS_DURABLE_ACK frames, but only when the throttle interval has
-     * elapsed since the last keepalive PING. The server's egress code only
-     * runs flushPendingAck on inbound recv events; without this prod, an
-     * idle connection waiting on durable-ack confirmation can sit forever.
+     * elapsed since the last outbound activity -- a sent frame or a prior
+     * keepalive PING. The server's egress code only runs flushPendingAck on
+     * inbound recv events; without this prod, an idle connection waiting on
+     * durable-ack confirmation can sit forever. The "last sent frame" half
+     * of the gate avoids a redundant PING shortly after a producer batch
+     * goes idle: the recent frame already triggered a server-side flush.
      * <p>
      * Best-effort: any send failure routes through the standard fail() path
      * so the reconnect loop can take over. Caller is responsible for the
@@ -1070,10 +1077,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private void sendDurableAckKeepaliveIfDue() {
         long now = System.nanoTime();
-        if (now - lastKeepalivePingNanos < durableAckKeepaliveIntervalNanos) {
+        if (now - lastFrameOrPingNanos < durableAckKeepaliveIntervalNanos) {
             return;
         }
-        lastKeepalivePingNanos = now;
+        lastFrameOrPingNanos = now;
         try {
             client.sendPing(1000);
         } catch (Throwable t) {
