@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.std.Files;
@@ -419,6 +420,80 @@ public class CursorSendEngineTest {
                 try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
                     assertTrue("session 2 must observe disk recovery",
                             engine.wasRecoveredFromDisk());
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveryAdvancesAckedFsnPastWatermark() throws Exception {
+        // Pin the spec invariant: when a valid .ack-watermark sits above
+        // the segment-derived seed but at or below publishedFsn,
+        // recovery picks the watermark (advancing the cursor past the
+        // already-durable-acked prefix of the lowest surviving segment).
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Session 1: append four frames so publishedFsn = 3.
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    for (int i = 0; i < 4; i++) {
+                        engine.appendBlocking(buf, 64);
+                    }
+                }
+                // Forge a watermark of 2 -- as if the previous session
+                // had received durable acks up through FSN 2 before
+                // dying. lowestBase is 0 so the bare baseSeed is -1;
+                // recovery must pick max(-1, 2) == 2.
+                try (AckWatermark w = AckWatermark.open(tmpDir)) {
+                    assertNotNull(w);
+                    w.write(2L);
+                }
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    assertEquals("watermark must advance recovered ackedFsn",
+                            2L, engine.ackedFsn());
+                    assertEquals("publishedFsn must reflect all four recovered frames",
+                            3L, engine.publishedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveryIgnoresWatermarkAbovePublishedFsn() throws Exception {
+        // Pin the corruption defence: a watermark higher than what the
+        // on-disk segments could account for must be rejected so
+        // recovery doesn't seed ackedFsn past publishedFsn (which would
+        // silently drop every un-acked frame on the next replay).
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Session 1: publishedFsn = 3 (four frames, FSNs 0..3).
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    for (int i = 0; i < 4; i++) {
+                        engine.appendBlocking(buf, 64);
+                    }
+                }
+                // Corrupt-high watermark -- 100 is far above the 0..3
+                // range the on-disk segments could justify.
+                try (AckWatermark w = AckWatermark.open(tmpDir)) {
+                    assertNotNull(w);
+                    w.write(100L);
+                }
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    // baseSeed = lowestBase - 1 = 0 - 1 = -1. Recovery
+                    // must fall back to baseSeed because the watermark
+                    // is past publishedFsn=3.
+                    assertEquals("corrupt-high watermark must fall back to lowestBase - 1",
+                            -1L, engine.ackedFsn());
+                    assertEquals(3L, engine.publishedFsn());
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);

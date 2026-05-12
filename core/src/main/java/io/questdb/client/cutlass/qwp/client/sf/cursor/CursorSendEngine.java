@@ -230,7 +230,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 long watermarkFsn = watermarkInProgress != null
                         ? watermarkInProgress.read()
                         : AckWatermark.INVALID;
-                long seed = Math.max(watermarkFsn, baseSeed);
+                // Reject watermarks past publishedFsn: a correctly
+                // operating prior session cannot have produced one, so
+                // a value above the on-disk frame ceiling is corruption
+                // (torn write on a non-atomic filesystem, hardware
+                // fault, manual edit). Trusting it would seed ackedFsn
+                // = publishedFsn after ring.acknowledge clamps it, and
+                // the cursor would position past every un-acked frame
+                // -- silent data loss. Fall back to the segment-derived
+                // seed so the un-acked tail still replays.
+                long publishedFsn = recovered.publishedFsn();
+                long candidate = Math.max(watermarkFsn, baseSeed);
+                long seed = candidate > publishedFsn ? baseSeed : candidate;
                 if (seed >= 0) {
                     recovered.acknowledge(seed);
                 }
