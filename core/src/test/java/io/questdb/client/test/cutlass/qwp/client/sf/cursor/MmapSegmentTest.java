@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -37,6 +38,7 @@ import org.junit.Test;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -105,6 +107,98 @@ public class MmapSegmentTest {
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
+        });
+    }
+
+    @Test
+    public void testCreateFailsCleanlyWhenAllocateReturnsFalse() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-enospc.sfa";
+            long sizeBytes = MmapSegment.HEADER_SIZE
+                    + MmapSegment.FRAME_HEADER_SIZE + 64;
+            FaultyFilesFacade ff = new FaultyFilesFacade();
+            ff.failOnAllocate = true;
+            try {
+                MmapSegment.create(ff, path, 0L, sizeBytes);
+                fail("expected MmapSegmentException from failed pre-allocation");
+            } catch (MmapSegmentException expected) {
+                assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("pre-allocation failed"));
+            }
+            assertEquals("openCleanRW must run exactly once", 1, ff.openCleanRWCalls);
+            assertEquals("allocate must run exactly once", 1, ff.allocateCalls);
+            assertEquals("fd must be closed on allocate failure", 1, ff.closeCalls);
+            assertEquals("file must be removed on allocate failure", 1, ff.removeCalls);
+            assertFalse("partial file must not survive failed allocate",
+                    Files.exists(path));
+        });
+    }
+
+    @Test
+    public void testCreateFailsCleanlyWhenOpenCleanRWReturnsMinusOne() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-noopen.sfa";
+            long sizeBytes = MmapSegment.HEADER_SIZE
+                    + MmapSegment.FRAME_HEADER_SIZE + 64;
+            FaultyFilesFacade ff = new FaultyFilesFacade();
+            ff.failOnOpenCleanRW = true;
+            try {
+                MmapSegment.create(ff, path, 0L, sizeBytes);
+                fail("expected MmapSegmentException from openCleanRW returning -1");
+            } catch (MmapSegmentException expected) {
+                assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("openCleanRW failed"));
+            }
+            assertEquals("openCleanRW must run exactly once", 1, ff.openCleanRWCalls);
+            assertEquals("allocate must not run after openCleanRW failure",
+                    0, ff.allocateCalls);
+            assertEquals("close must not be called when no fd was opened",
+                    0, ff.closeCalls);
+            assertEquals("remove must not be called when openCleanRW failed",
+                    0, ff.removeCalls);
+            assertFalse("no file should exist when openCleanRW failed",
+                    Files.exists(path));
+        });
+    }
+
+    @Test
+    public void testCreateRepeatedAllocateFailuresDoNotAccumulateOrphans() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long sizeBytes = MmapSegment.HEADER_SIZE
+                    + MmapSegment.FRAME_HEADER_SIZE + 64;
+            FaultyFilesFacade ff = new FaultyFilesFacade();
+            ff.failOnAllocate = true;
+            int attempts = 50;
+            for (int i = 0; i < attempts; i++) {
+                try {
+                    MmapSegment.create(ff, tmpDir + "/seg-" + i + ".sfa", 0L, sizeBytes);
+                    fail("expected MmapSegmentException on iteration " + i);
+                } catch (MmapSegmentException ignored) {
+                    // expected
+                }
+            }
+            long find = Files.findFirst(tmpDir);
+            int survivors = 0;
+            if (find > 0) {
+                try {
+                    int rc = 1;
+                    while (rc > 0) {
+                        String name = Files.utf8ToString(Files.findName(find));
+                        if (name != null && !".".equals(name) && !"..".equals(name)) {
+                            survivors++;
+                        }
+                        rc = Files.findNext(find);
+                    }
+                } finally {
+                    Files.findClose(find);
+                }
+            }
+            assertEquals("no orphan files may survive repeated allocate failures",
+                    0, survivors);
+            assertEquals(attempts, ff.openCleanRWCalls);
+            assertEquals(attempts, ff.allocateCalls);
+            assertEquals(attempts, ff.closeCalls);
+            assertEquals(attempts, ff.removeCalls);
         });
     }
 
@@ -412,6 +506,138 @@ public class MmapSegmentTest {
     private static void fillPattern(long addr, int len, int seed) {
         for (int i = 0; i < len; i++) {
             Unsafe.getUnsafe().putByte(addr + i, (byte) (seed * 31 + i + 17));
+        }
+    }
+
+    // Test seam: counts the calls MmapSegment.create makes through the facade
+    // and lets each test induce a clean failure at one of the create-time
+    // syscalls. Anything not overridden here delegates to FilesFacade.INSTANCE.
+    private static final class FaultyFilesFacade implements FilesFacade {
+        int allocateCalls;
+        int closeCalls;
+        boolean failOnAllocate;
+        boolean failOnOpenCleanRW;
+        int openCleanRWCalls;
+        int removeCalls;
+
+        @Override
+        public boolean allocate(int fd, long size) {
+            allocateCalls++;
+            if (failOnAllocate) {
+                return false;
+            }
+            return INSTANCE.allocate(fd, size);
+        }
+
+        @Override
+        public long allocNativePath(String path) {
+            return INSTANCE.allocNativePath(path);
+        }
+
+        @Override
+        public int close(int fd) {
+            closeCalls++;
+            return INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            INSTANCE.freeNativePath(pathPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            return INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return INSTANCE.length(fd);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path, long size) {
+            openCleanRWCalls++;
+            if (failOnOpenCleanRW) {
+                return -1;
+            }
+            return INSTANCE.openCleanRW(path, size);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return INSTANCE.openRW(path);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            removeCalls++;
+            return INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            return INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return INSTANCE.truncate(fd, size);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            return INSTANCE.write(fd, addr, len, offset);
         }
     }
 }

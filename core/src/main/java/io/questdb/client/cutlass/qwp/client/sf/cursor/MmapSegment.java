@@ -26,6 +26,7 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
@@ -116,20 +117,57 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Creates a fresh segment file at {@code path}, pre-allocating exactly
-     * {@code sizeBytes} bytes and mmapping the whole region RW. Writes the
-     * 24-byte header and positions the cursor immediately after it. Throws
-     * {@link MmapSegmentException} on any I/O failure (file already exists,
-     * disk full, mmap rejected).
+     * Convenience overload of {@link #create(FilesFacade, String, long, long)}
+     * that uses {@link FilesFacade#INSTANCE} (production default). Tests that
+     * need to fault-inject filesystem failures (ENOSPC at openCleanRW or
+     * allocate) should call the facade-aware overload directly.
      */
     public static MmapSegment create(String path, long baseSeq, long sizeBytes) {
+        return create(FilesFacade.INSTANCE, path, baseSeq, sizeBytes);
+    }
+
+    /**
+     * Creates a fresh segment file at {@code path}, pre-allocating exactly
+     * {@code sizeBytes} bytes of real disk blocks and mmapping the whole
+     * region RW. Writes the 24-byte header and positions the cursor
+     * immediately after it. Throws {@link MmapSegmentException} on any I/O
+     * failure (file already exists, openCleanRW failed, ENOSPC during
+     * pre-allocation, mmap rejected).
+     * <p>
+     * Pre-allocation uses {@link FilesFacade#allocate(int, long)} so that
+     * ENOSPC surfaces as a clean failure at create time, before the producer
+     * starts appending. Without it, a logically-sized-but-sparse file would
+     * defer ENOSPC to mmap-store time, where it manifests as a SIGBUS that
+     * tears down the JVM. On filesystems where the underlying
+     * {@code posix_fallocate} / {@code F_PREALLOCATE} is not supported, the
+     * native fallback to {@code ftruncate} reintroduces the SIGBUS risk for
+     * that filesystem only.
+     */
+    public static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes) {
         if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
             throw new IllegalArgumentException(
                     "sizeBytes too small for header + one minimal frame: " + sizeBytes);
         }
-        int fd = Files.openCleanRW(path, sizeBytes);
+        int fd = ff.openCleanRW(path, sizeBytes);
         if (fd < 0) {
             throw new MmapSegmentException("openCleanRW failed for " + path);
+        }
+        // Reserve real disk blocks so ENOSPC surfaces here, before the
+        // producer thread starts writing frames into the mapping. The
+        // openCleanRW call above only sets the logical file size via
+        // ftruncate; the blocks remain sparse until something writes them.
+        // Calling allocate immediately after promotes ENOSPC from a
+        // SIGBUS-on-mmap-store (which aborts the JVM) to a clean failure
+        // path the caller can recover from.
+        if (!ff.allocate(fd, sizeBytes)) {
+            ff.close(fd);
+            // Unlink the partially-created file so a sf_max_bytes-sized
+            // empty file does not survive the failure. Under sustained
+            // disk-full pressure with the manager polling, hundreds would
+            // otherwise accumulate.
+            //noinspection ResultOfMethodCallIgnored
+            ff.remove(path);
+            throw new MmapSegmentException("pre-allocation failed for " + path);
         }
         long addr = Files.FAILED_MMAP_ADDRESS;
         try {
@@ -149,15 +187,12 @@ public final class MmapSegment implements QuietCloseable {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
             }
-            Files.close(fd);
-            // openCleanRW already truncated the file to sizeBytes — if mmap
-            // (or the header writes) failed, leaving it on disk leaks a
-            // sf_max_bytes-sized empty file every time. Under disk-full
-            // pressure with the manager polling, hundreds can accumulate.
-            // Best-effort: if the unlink itself fails, the original mmap
-            // failure is the more useful one to surface.
+            ff.close(fd);
+            // mmap (or header writes) failed after a successful allocate —
+            // best-effort unlink to keep the directory from accumulating
+            // full-size empty segments under repeated failures.
             //noinspection ResultOfMethodCallIgnored
-            Files.remove(path);
+            ff.remove(path);
             throw t;
         }
     }

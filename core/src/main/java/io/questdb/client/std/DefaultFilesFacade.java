@@ -32,6 +32,11 @@ package io.questdb.client.std;
 final class DefaultFilesFacade implements FilesFacade {
 
     @Override
+    public boolean allocate(int fd, long size) {
+        return Files.allocate(fd, size);
+    }
+
+    @Override
     public long allocNativePath(String path) {
         return Files.allocNativePath(path);
     }
