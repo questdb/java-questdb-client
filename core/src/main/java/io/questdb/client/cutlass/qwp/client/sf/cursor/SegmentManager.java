@@ -192,8 +192,21 @@ public final class SegmentManager implements QuietCloseable {
      * the high-water mark — no waiting on the next tick.
      */
     public void register(SegmentRing ring, String dir) {
+        register(ring, dir, null);
+    }
+
+    /**
+     * Same as {@link #register(SegmentRing, String)} but also wires an
+     * {@link AckWatermark} the manager will keep up to date on every
+     * tick. The watermark is owned by the caller (typically
+     * {@link CursorSendEngine}); the manager only writes through it
+     * and never closes it. {@code null} watermark falls back to the
+     * legacy behaviour: no on-disk watermark, recovery seeds from
+     * {@code lowestSurvivingBaseSeq - 1}.
+     */
+    public void register(SegmentRing ring, String dir, AckWatermark watermark) {
         synchronized (lock) {
-            rings.add(new RingEntry(ring, dir));
+            rings.add(new RingEntry(ring, dir, watermark));
             // Account for bytes the ring already owns when it joins. A
             // recovered ring (post-restart, orphan adoption) can come up
             // at-or-above the cap; without this seed, totalBytes stays
@@ -399,6 +412,26 @@ public final class SegmentManager implements QuietCloseable {
         //
         //    munmap + unlink stay outside the lock — they can be slow
         //    and shouldn't block register/deregister or sibling rings.
+        // Persist the current ackedFsn watermark BEFORE the trim runs.
+        // On host crash between the persist and the unlinks below, the
+        // segments survive and the watermark is correct. On crash AFTER
+        // the unlinks but before next tick, the segments are gone and
+        // the watermark is stale, but recovery clamps with
+        // max(lowestSurvivingBaseSeq - 1, watermark) so either ordering
+        // is safe. Memory-mode rings (and callers that didn't supply a
+        // watermark) skip the write.
+        // Persist only on advance to avoid pointless mmap stores when
+        // ackedFsn is steady. The store is a single 8-byte put against
+        // an already-mapped region -- no syscall, no allocation -- but
+        // the gate keeps the dirty-page footprint minimal under
+        // steady-state load with no new acks arriving.
+        if (e.watermark != null) {
+            long currentAck = e.ring.ackedFsn();
+            if (currentAck > e.lastPersistedAck) {
+                e.watermark.write(currentAck);
+                e.lastPersistedAck = currentAck;
+            }
+        }
         ObjList<MmapSegment> trim;
         Runnable hook = beforeTrimSyncHook;
         if (hook != null) {
@@ -485,10 +518,21 @@ public final class SegmentManager implements QuietCloseable {
     private static final class RingEntry {
         final String dir;
         final SegmentRing ring;
+        // Engine-owned ack watermark for this slot, or null in memory
+        // mode and for callers that didn't supply one. Manager-thread
+        // only after register; never closed here (owner closes).
+        final AckWatermark watermark;
+        // Highest FSN this entry has written to its watermark. Manager-
+        // thread only -- no concurrent access. Initialized to -1 so the
+        // first observed acked FSN (>= 0) triggers the first write.
+        // Survives across multiple serviceRing ticks and avoids a
+        // write-storm when ackedFsn is steady.
+        long lastPersistedAck = -1L;
 
-        RingEntry(SegmentRing ring, String dir) {
+        RingEntry(SegmentRing ring, String dir, AckWatermark watermark) {
             this.ring = ring;
             this.dir = dir;
+            this.watermark = watermark;
         }
     }
 }

@@ -87,6 +87,12 @@ public final class CursorSendEngine implements QuietCloseable {
     // mode (no slot, no lock). Released by {@link #close()}; the kernel
     // also drops it on hard process exit.
     private final SlotLock slotLock;
+    // Engine-owned mmap'd watermark file. {@code null} in memory mode and
+    // in disk mode if open() failed (we proceed without it; recovery just
+    // falls back to lowestBase - 1). Lifetime tied to the engine: opened
+    // in the constructor, closed by {@link #close()}. The segment manager
+    // writes through this on every tick where ackedFsn has advanced.
+    private final AckWatermark watermark;
     // close() is publicly callable from any thread (Sender.close from a user
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
@@ -160,6 +166,7 @@ public final class CursorSendEngine implements QuietCloseable {
         // and manager.register throws, the catch block closes the local
         // reference instead of orphaning the mmap'd segments + fds.
         SegmentRing ringInProgress = null;
+        AckWatermark watermarkInProgress = null;
         boolean managerStarted = false;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
@@ -180,14 +187,63 @@ public final class CursorSendEngine implements QuietCloseable {
                 // not exist on disk if earlier segments have been trimmed,
                 // causing it to fall through to the active segment's tip
                 // and skip the unacked sealed segments entirely.
+                //
+                // Then check the persisted ack watermark. If present and
+                // larger than the segment-derived seed, prefer it: it
+                // captures durable-acks that landed inside the lowest
+                // surviving sealed segment before the previous sender
+                // crashed. Without this, those already-acked frames would
+                // be re-replayed on reconnect, producing row-level
+                // duplicates unless the target table dedupes them.
+                // max(lowestBase - 1, watermark) absorbs both write
+                // orderings of the manager's "persist then trim" tick:
+                //   - persist crashed before trim: segments still on disk
+                //     are >= lowest, watermark is correct; max picks
+                //     watermark.
+                //   - trim ran before persist: segments are gone (so
+                //     lowestBase is higher than watermark), watermark is
+                //     stale; max picks lowestBase - 1.
                 MmapSegment first = recovered.firstSealed();
                 long lowestBase = first != null
                         ? first.baseSeq()
                         : recovered.getActive().baseSeq();
-                if (lowestBase > 0) {
-                    recovered.acknowledge(lowestBase - 1);
+                // Open the watermark and use it (if present) to refine
+                // the seed. The watermark may carry durable-acks the
+                // previous sender received for frames inside the lowest
+                // surviving sealed segment -- without it, those frames
+                // get re-replayed across process restart, producing
+                // row-level duplicates unless the target table dedupes
+                // them. max(lowestBase - 1, watermark) absorbs both
+                // write orderings of the manager's "persist then trim"
+                // tick:
+                //   - persist crashed before trim: segments still on
+                //     disk are >= lowest, watermark is correct; max
+                //     picks watermark.
+                //   - trim ran before persist: segments are gone (so
+                //     lowestBase is higher than watermark), watermark
+                //     is stale; max picks lowestBase - 1.
+                // open() returns null on any setup failure so a missing
+                // mmap doesn't take down the engine -- we just fall
+                // back to the bare lowestBase - 1 seed.
+                watermarkInProgress = AckWatermark.open(sfDir);
+                long baseSeed = lowestBase - 1;
+                long watermarkFsn = watermarkInProgress != null
+                        ? watermarkInProgress.read()
+                        : AckWatermark.INVALID;
+                long seed = Math.max(watermarkFsn, baseSeed);
+                if (seed >= 0) {
+                    recovered.acknowledge(seed);
                 }
             } else {
+                // Fresh start with no recovered segments. Any stale
+                // watermark from a prior fully-drained session refers
+                // to a lifecycle now gone -- unlink it before opening
+                // so the new session's first read() correctly reports
+                // INVALID (magic=0 on a freshly zero-filled file).
+                if (!memoryMode) {
+                    AckWatermark.removeOrphan(sfDir);
+                    watermarkInProgress = AckWatermark.open(sfDir);
+                }
                 MmapSegment initial;
                 String initialPath = null;
                 if (memoryMode) {
@@ -211,14 +267,17 @@ public final class CursorSendEngine implements QuietCloseable {
                 manager.start();
                 managerStarted = true;
             }
-            manager.register(ringInProgress, sfDir);
-            // All construction succeeded — commit the ring reference.
+            manager.register(ringInProgress, sfDir, watermarkInProgress);
+            // All construction succeeded — commit the ring and
+            // watermark references.
             this.ring = ringInProgress;
+            this.watermark = watermarkInProgress;
         } catch (Throwable t) {
             // Order: ring first (releases mmap/fd), then manager (joins
             // worker thread, but only if we started it AND we own it),
-            // then slot lock. Each in its own try/catch so a single
-            // failure doesn't strand later cleanups.
+            // then watermark (releases its own mmap/fd), then slot lock.
+            // Each in its own try/catch so a single failure doesn't
+            // strand later cleanups.
             if (ringInProgress != null) {
                 try {
                     ringInProgress.close();
@@ -228,6 +287,12 @@ public final class CursorSendEngine implements QuietCloseable {
             if (ownsManager && managerStarted) {
                 try {
                     manager.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (watermarkInProgress != null) {
+                try {
+                    watermarkInProgress.close();
                 } catch (Throwable ignored) {
                 }
             }
@@ -396,9 +461,27 @@ public final class CursorSendEngine implements QuietCloseable {
                 ring.close();
             } catch (Throwable ignored) {
             }
+            // Close the watermark mmap/fd after the manager (which
+            // writes through it) is gone but before the slot lock is
+            // released. On fully-drained close, also unlink the file
+            // -- a stale watermark with no segments behind it would
+            // confuse a future recovery cycle if (it wouldn't actually
+            // confuse current recovery, which only reads the watermark
+            // when segments are present, but unlinking keeps the slot
+            // dir clean and matches the "remove orphan" intent above).
+            if (watermark != null) {
+                try {
+                    watermark.close();
+                } catch (Throwable ignored) {
+                }
+            }
             if (fullyDrained) {
                 try {
                     unlinkAllSegmentFiles(sfDir);
+                } catch (Throwable ignored) {
+                }
+                try {
+                    AckWatermark.removeOrphan(sfDir);
                 } catch (Throwable ignored) {
                 }
             }
