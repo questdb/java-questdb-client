@@ -342,7 +342,7 @@ public final class BackgroundDrainer implements Runnable {
             // Backoff before the next sweep. Honor stopRequested by parking in
             // small chunks rather than a single long park so close() doesn't
             // wait for a full sleep to elapse.
-            long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+            long jitter = ThreadLocalRandom.current().nextLong(Math.max(1L, backoffMillis));
             long sleepMillis = Math.min(backoffMillis + jitter,
                     Math.max(0L, (deadlineNanos - System.nanoTime()) / 1_000_000L));
             if (sleepMillis > 0L && !stopRequested) {
