@@ -69,6 +69,12 @@ public class CursorWebSocketSendLoopReconnectLeakTest {
 
                 String cfg = "ws::addr=localhost:" + port + ";";
                 Sender sender = Sender.fromConfig(cfg);
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                // Hand the sender to the handler so it can wait for the
+                // client's ACK counter to advance before closing the
+                // connection — a deterministic alternative to a fixed
+                // server-side sleep.
+                handler.bindSender(wss);
                 WebSocketClient liveClient;
                 try {
                     // Batch 1: server ACKs and immediately disconnects. The
@@ -82,18 +88,20 @@ public class CursorWebSocketSendLoopReconnectLeakTest {
                     // Wait for the loop to register a successful reconnect.
                     // The handler can't count a "connection" until it sees a
                     // binary frame, and the I/O loop has nothing to replay
-                    // post-ACK — so use the loop's own counter instead.
-                    QwpWebSocketSender wss = (QwpWebSocketSender) sender;
-                    long deadline = System.currentTimeMillis() + 5_000L;
-                    while (System.currentTimeMillis() < deadline
-                            && wss.getTotalReconnectsSucceeded() < 1) {
-                        Thread.sleep(20);
+                    // post-ACK — so use the loop's own counter instead. Spin
+                    // (no sleep) because the reconnect normally lands in a
+                    // few milliseconds; the deadline only protects against
+                    // pathological CI stalls.
+                    long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    while (wss.getTotalReconnectsSucceeded() < 1L) {
+                        if (System.nanoTime() > deadlineNanos) {
+                            throw new AssertionError(
+                                    "precondition: reconnect must happen within 5s — saw "
+                                            + wss.getTotalReconnectsSucceeded()
+                                            + " successful reconnects");
+                        }
+                        Thread.onSpinWait();
                     }
-                    Assert.assertTrue(
-                            "precondition: reconnect must happen — saw "
-                                    + wss.getTotalReconnectsSucceeded()
-                                    + " successful reconnects",
-                            wss.getTotalReconnectsSucceeded() >= 1);
 
                     // Reach into the loop to capture the live client BEFORE we
                     // call sender.close() — that's the reference we want to
@@ -149,6 +157,15 @@ public class CursorWebSocketSendLoopReconnectLeakTest {
         final AtomicLong totalBinaryReceived = new AtomicLong();
         private final AtomicLong nextSeq = new AtomicLong();
         private TestWebSocketServer.ClientHandler firstClient;
+        // Bound by the test so the handler can wait for the client to
+        // confirm receipt of the ACK before closing the wire, replacing the
+        // fixed 50ms server-side sleep that was racing the ACK delivery on
+        // loaded CI machines.
+        private volatile QwpWebSocketSender sender;
+
+        void bindSender(QwpWebSocketSender sender) {
+            this.sender = sender;
+        }
 
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
@@ -156,16 +173,35 @@ public class CursorWebSocketSendLoopReconnectLeakTest {
                 connectionsAccepted.incrementAndGet();
                 if (firstClient == null) firstClient = client;
             }
-            totalBinaryReceived.incrementAndGet();
+            long observedReceived = totalBinaryReceived.incrementAndGet();
             try {
+                long baselineAcks = sender == null ? 0L : sender.getTotalAcks();
                 client.sendBinary(buildAck(nextSeq.getAndIncrement()));
-                if (totalBinaryReceived.get() == 1) {
-                    Thread.sleep(50);
+                if (observedReceived == 1L) {
+                    // Wait until the client confirms it processed the ACK we
+                    // just sent — getTotalAcks is the I/O thread's own
+                    // counter, so seeing it advance past the pre-send
+                    // baseline guarantees the ACK was applied before we
+                    // close the wire underneath the loop.
+                    awaitAckProcessed(baselineAcks);
                     client.close();
                 }
-            } catch (IOException | InterruptedException e) {
-                Thread.currentThread().interrupt();
+            } catch (IOException e) {
                 throw new RuntimeException(e);
+            }
+        }
+
+        private void awaitAckProcessed(long baseline) {
+            QwpWebSocketSender s = sender;
+            if (s == null) return;
+            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (s.getTotalAcks() <= baseline) {
+                if (System.nanoTime() > deadlineNanos) {
+                    throw new AssertionError(
+                            "client never reported processing the ACK within 5s "
+                                    + "(baseline=" + baseline + ", current=" + s.getTotalAcks() + ")");
+                }
+                Thread.onSpinWait();
             }
         }
 

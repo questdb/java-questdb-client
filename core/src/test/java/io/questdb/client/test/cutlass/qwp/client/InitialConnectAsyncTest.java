@@ -40,6 +40,8 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -61,25 +63,23 @@ public class InitialConnectAsyncTest {
         int port = TestPorts.findUnusedPort();
         try (Always401Fixture fixture = new Always401Fixture(port)) {
             fixture.start();
-            AtomicReference<SenderError> observedError = new AtomicReference<>();
+            ErrorInbox inbox = new ErrorInbox();
             String cfg = "ws::addr=localhost:" + port
                     + sfDirOpt() + ";initial_connect_retry=async"
                     + ";reconnect_max_duration_millis=10000"
                     + ";close_flush_timeout_millis=0;";
             Sender sender = Sender.builder(cfg)
-                    .errorHandler(observedError::set)
+                    .errorHandler(inbox)
                     .build();
             try {
                 // Auth-terminal must surface within hundreds of ms even
                 // though the cap is 10s.
                 long t0 = System.nanoTime();
-                long deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline
-                        && observedError.get() == null) {
-                    Thread.sleep(20);
-                }
+                Assert.assertTrue(
+                        "401 upgrade reject must surface a SenderError within 5s",
+                        inbox.await(5, TimeUnit.SECONDS));
                 long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                SenderError err = observedError.get();
+                SenderError err = inbox.get();
                 Assert.assertNotNull(
                         "401 upgrade reject must surface a SenderError",
                         err);
@@ -112,7 +112,7 @@ public class InitialConnectAsyncTest {
         // close() rethrows the latched terminal so a user who never
         // installed a handler still sees the failure on shutdown.
         int port = TestPorts.findUnusedPort();
-        AtomicReference<SenderError> observedError = new AtomicReference<>();
+        ErrorInbox inbox = new ErrorInbox();
         String cfg = "ws::addr=localhost:" + port
                 + sfDirOpt() + ";initial_connect_retry=async"
                 + ";reconnect_max_duration_millis=400"
@@ -120,16 +120,14 @@ public class InitialConnectAsyncTest {
                 + ";reconnect_max_backoff_millis=50"
                 + ";close_flush_timeout_millis=0;";
         Sender sender = Sender.builder(cfg)
-                .errorHandler(observedError::set)
+                .errorHandler(inbox)
                 .build();
         try {
             // Wait up to 5s for the I/O thread to exhaust its budget.
-            long deadline = System.currentTimeMillis() + 5_000;
-            while (System.currentTimeMillis() < deadline
-                    && observedError.get() == null) {
-                Thread.sleep(20);
-            }
-            SenderError err = observedError.get();
+            Assert.assertTrue(
+                    "async budget exhaustion must surface a SenderError within 5s",
+                    inbox.await(5, TimeUnit.SECONDS));
+            SenderError err = inbox.get();
             Assert.assertNotNull(
                     "async budget exhaustion must surface a SenderError to the inbox",
                     err);
@@ -171,6 +169,7 @@ public class InitialConnectAsyncTest {
                     + ";reconnect_max_backoff_millis=200"
                     + ";close_flush_timeout_millis=2000;";
             try (Sender sender = Sender.fromConfig(cfg)) {
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
                 // wasEverConnected starts false in async mode — the I/O
                 // thread has not yet completed an upgrade.
                 Assert.assertFalse(
@@ -181,20 +180,18 @@ public class InitialConnectAsyncTest {
                 sender.table("foo").longColumn("v", 42L).atNow();
                 sender.flush();
 
-                // Server starts AFTER the producer has already published.
-                Thread.sleep(150);
+                // Server starts AFTER the producer has published AND after
+                // the I/O thread has registered at least one failed connect
+                // attempt — that's what makes "server arrives late" the
+                // scenario under test rather than "server is already up".
+                awaitAtLeastOneConnectAttempt(wss);
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));
 
                 // Wait up to 5s for the buffered frame to land + ACK.
-                long deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline
-                        && handler.totalAcked.get() < 1L) {
-                    Thread.sleep(20);
-                }
                 Assert.assertTrue(
                         "buffered frame must be delivered once server is up",
-                        handler.totalAcked.get() >= 1L);
+                        handler.awaitFirstAck(5, TimeUnit.SECONDS));
                 // Once the I/O thread completes its upgrade, the sticky
                 // flag flips to true.
                 Assert.assertTrue(
@@ -248,47 +245,33 @@ public class InitialConnectAsyncTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));
 
-            AtomicReference<SenderError> observedError = new AtomicReference<>();
+            ErrorInbox inbox = new ErrorInbox();
             String cfg = "ws::addr=localhost:" + port
                     + ";reconnect_max_duration_millis=400"
                     + ";reconnect_initial_backoff_millis=10"
                     + ";reconnect_max_backoff_millis=50"
                     + ";close_flush_timeout_millis=0;";
             Sender sender = Sender.builder(cfg)
-                    .errorHandler(observedError::set)
+                    .errorHandler(inbox)
                     .build();
             try {
                 // Confirm we connected and got an ACK.
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
-                long deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline
-                        && handler.totalAcked.get() < 1L) {
-                    Thread.sleep(20);
-                }
                 Assert.assertTrue("expected at least one ACK before tearing down server",
-                        handler.totalAcked.get() >= 1L);
+                        handler.awaitFirstAck(5, TimeUnit.SECONDS));
                 Assert.assertTrue(
                         "wasEverConnected() must be true after a successful connect",
                         ((QwpWebSocketSender) sender).wasEverConnected());
 
-                // Tear the server down; subsequent reconnects will exhaust
-                // the budget.
+                // Tear the server down. The cursor I/O loop's tryReceiveAcks
+                // polls every 50us and discovers the peer disconnect on its
+                // own, then enters the reconnect loop and exhausts the
+                // 400ms budget — no producer activity required.
                 server.close();
-
-                deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline
-                        && observedError.get() == null) {
-                    try {
-                        sender.table("foo").longColumn("v", 2L).atNow();
-                        sender.flush();
-                    } catch (Throwable ignored) {
-                        // Producer-side throw is fine; we want the inbox
-                        // delivery either way.
-                    }
-                    Thread.sleep(50);
-                }
-                SenderError err = observedError.get();
+                Assert.assertTrue("budget exhaustion must surface a SenderError within 5s",
+                        inbox.await(5, TimeUnit.SECONDS));
+                SenderError err = inbox.get();
                 Assert.assertNotNull("budget exhaustion must surface a SenderError", err);
                 String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
                 Assert.assertTrue(
@@ -333,6 +316,25 @@ public class InitialConnectAsyncTest {
     }
 
     /**
+     * Spins on {@link QwpWebSocketSender#getTotalReconnectAttempts()} until
+     * the I/O thread has logged at least one connect attempt. The
+     * connectLoop bumps that counter on every iteration of the retry loop —
+     * including the async-initial-connect path — so seeing it advance is a
+     * deterministic signal that the I/O thread has tried (and so far failed)
+     * to reach a server.
+     */
+    private static void awaitAtLeastOneConnectAttempt(QwpWebSocketSender wss) {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (wss.getTotalReconnectAttempts() < 1L) {
+            if (System.nanoTime() > deadlineNanos) {
+                throw new AssertionError(
+                        "I/O thread did not log a connect attempt within 5s");
+            }
+            Thread.onSpinWait();
+        }
+    }
+
+    /**
      * Closes the sender and tolerates either outcome:
      * * close() throws -- the latched terminal must mention the expected
      * substring (safety-net rethrow path);
@@ -370,11 +372,18 @@ public class InitialConnectAsyncTest {
     }
 
     /**
-     * Acks every binary frame so the sender's flush completes.
+     * Acks every binary frame so the sender's flush completes. Latches the
+     * first ACK so tests can await it deterministically instead of polling
+     * {@code totalAcked} with sleeps.
      */
     private static class AckHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicLong totalAcked = new AtomicLong();
+        private final CountDownLatch firstAck = new CountDownLatch(1);
         private final AtomicLong nextSeq = new AtomicLong(0);
+
+        boolean awaitFirstAck(long timeout, TimeUnit unit) throws InterruptedException {
+            return firstAck.await(timeout, unit);
+        }
 
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
@@ -382,6 +391,7 @@ public class InitialConnectAsyncTest {
                 long seq = nextSeq.getAndIncrement();
                 client.sendBinary(buildAck(seq));
                 totalAcked.incrementAndGet();
+                firstAck.countDown();
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
@@ -394,6 +404,33 @@ public class InitialConnectAsyncTest {
             bb.putLong(seq);
             bb.putShort((short) 0);
             return buf;
+        }
+    }
+
+    /**
+     * Bridges the {@link Sender}'s async {@code errorHandler} callback to a
+     * {@link CountDownLatch} so tests can block deterministically until the
+     * first error lands, instead of polling an {@link AtomicReference} via
+     * {@code Thread.sleep}. The reference is preserved for the assertions
+     * that inspect the error's category/policy/message.
+     */
+    private static class ErrorInbox implements io.questdb.client.SenderErrorHandler {
+        private final CountDownLatch latch = new CountDownLatch(1);
+        private final AtomicReference<SenderError> ref = new AtomicReference<>();
+
+        boolean await(long timeout, TimeUnit unit) throws InterruptedException {
+            return latch.await(timeout, unit);
+        }
+
+        SenderError get() {
+            return ref.get();
+        }
+
+        @Override
+        public void onError(SenderError err) {
+            if (ref.compareAndSet(null, err)) {
+                latch.countDown();
+            }
         }
     }
 

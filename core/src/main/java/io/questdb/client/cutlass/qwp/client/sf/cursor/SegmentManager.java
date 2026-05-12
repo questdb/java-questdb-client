@@ -85,6 +85,13 @@ public final class SegmentManager implements QuietCloseable {
     // consistent across registration boundaries.
     private long totalBytes;
     private long lastDiskFullLogNs;
+    // Test seam: runs on the worker thread just before the install path's
+    // synchronized(lock) entry (the one that performs installHotSpare + the
+    // totalBytes += segmentSize commit). Null in production; only
+    // SegmentManagerInstallDeregisterRaceTest installs it, to deterministically
+    // inject a deregister(ring) call into the exact race window that the
+    // stillRegistered guard inside the install block closes.
+    volatile Runnable beforeInstallSyncHook;
     // Test seam: runs on the worker thread just before the trim block's
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
@@ -334,6 +341,10 @@ public final class SegmentManager implements QuietCloseable {
                     } else {
                         path = nextSparePath(e.dir);
                         spare = MmapSegment.create(path, e.ring.nextSeqHint(), segmentSizeBytes);
+                    }
+                    Runnable installHook = beforeInstallSyncHook;
+                    if (installHook != null) {
+                        installHook.run();
                     }
                     // Install + commit atomically under the manager lock.
                     // If `e.ring` was deregistered between the snapshot

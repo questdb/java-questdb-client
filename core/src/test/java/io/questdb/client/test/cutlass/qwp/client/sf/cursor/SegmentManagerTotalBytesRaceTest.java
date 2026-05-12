@@ -28,6 +28,8 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -35,43 +37,34 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Red test for M2 — {@code SegmentManager.totalBytes} accounting drift
- * under register/serviceRing/deregister contention.
+ * Deterministic test for {@code SegmentManager.totalBytes} drift on the
+ * <b>install</b> path of {@code serviceRing}. The bug: between the worker's
+ * "decide to install a spare" and "commit the +segmentSize under lock", a
+ * concurrent {@code deregister(ring)} would subtract the ring's bytes (which
+ * at that moment don't include the in-flight spare) and the worker would
+ * still commit, inflating {@code totalBytes} by one segment per occurrence
+ * with no future subtractor.
  *
- * <p>The bug fires in this exact window inside {@code serviceRing}:
- * <pre>
- *   1. snapshot observedTotal under lock
- *   2. drop lock; create MmapSegment (slow IO — race window opens)
- *   3. ring.installHotSpare(spare)
- *   4. re-acquire lock; totalBytes += segmentSize       (commit)
- * </pre>
- * If {@code deregister(ring)} fires between (1) and (3), it subtracts
- * {@code ring.totalSegmentBytes()} — which at that moment <em>does not</em>
- * include the in-flight spare — and the commit at (4) adds {@code
- * segmentSize} with no future subtractor. {@code totalBytes} permanently
- * inflates by one segment per occurrence.
+ * <p>Drives the race with the {@code beforeInstallSyncHook} seam on
+ * {@code SegmentManager}, which fires on the worker thread immediately
+ * before the install block's {@code synchronized(lock)}. The hook performs
+ * the deregister synchronously; when the worker subsequently enters the
+ * synchronized block, the stillRegistered re-check sees the entry removed
+ * and skips the (otherwise drifting) install + commit.
  *
- * <p>The test runs many parallel producer threads that register a ring,
- * pause briefly to let the worker enter {@code MmapSegment.create}, then
- * deregister, then close the ring later. Across thousands of iterations
- * with the worker polling at sub-microsecond intervals the race fires
- * many times and {@code totalBytes} accumulates drift.
- *
- * <p>The deferred {@code ring.close()} matters: if the producer closes
- * the ring before the worker calls {@code installHotSpare}, the install
- * throws ISE, the spare is cleaned up by the manager's catch, and no
- * commit fires (safe path). The bug requires the ring to be deregistered
- * but still open when the worker installs.
+ * <p>Pre-fix the test ends with {@code totalBytes > 0}; post-fix it ends at
+ * exactly {@code 0}. No stress, no concurrency in setup, no spin loops in
+ * the assertion path: the hook fires exactly once, on a single worker tick
+ * the test triggers via the ring's managerWakeup callback.
  */
 public class SegmentManagerTotalBytesRaceTest {
 
@@ -80,7 +73,7 @@ public class SegmentManagerTotalBytesRaceTest {
     @Before
     public void setUp() {
         tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-segmgr-race-" + System.nanoTime()).toString();
+                "qdb-segmgr-install-race-" + System.nanoTime()).toString();
         assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
     }
 
@@ -90,92 +83,111 @@ public class SegmentManagerTotalBytesRaceTest {
         rmDirRecursive(tmpDir);
     }
 
-    @Test(timeout = 60_000L)
-    public void testTotalBytesIsZeroAfterAllRingsDeregistered() throws Exception {
+    @Test(timeout = 15_000L)
+    public void testInstallPathDoesNotCommitAfterDeregister() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
-            // Cap large enough that the manager keeps provisioning spares
-            // (cap is not the rate-limiter for this test).
-            long maxTotal = segSize * 8192L;
+            // One frame per segment, so the very first append forces the
+            // ring into needsHotSpare and wakes the manager.
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            long maxTotal = segSize * 8L;
 
+            // Large pollNanos: the worker parks until explicitly woken. The
+            // ring's appendOrFsn fires managerWakeup when it needs a spare,
+            // so the producer-driven setup phase still gets prompt service.
             try (SegmentManager mgr = new SegmentManager(
-                    segSize, 1_000L /* 1us tick — busy-poll */, maxTotal)) {
+                    segSize, TimeUnit.SECONDS.toNanos(60), maxTotal)) {
                 mgr.start();
 
-                final int threads = 8;
-                final int perThread = 200;
-                final CountDownLatch start = new CountDownLatch(1);
-                final CountDownLatch done = new CountDownLatch(threads);
-                final AtomicReference<Throwable> failure = new AtomicReference<>();
+                String dir = tmpDir + "/single-ring";
+                assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
+                String activePath = dir + "/sf-initial.sfa";
+                MmapSegment seg0 = MmapSegment.create(activePath, 0L, segSize);
+                SegmentRing ring = new SegmentRing(seg0, segSize);
 
-                // Each producer holds onto its rings until the end so the
-                // worker can install spares on already-deregistered rings
-                // (the bug scenario).
-                final List<List<SegmentRing>> outstanding = new ArrayList<>();
-                for (int t = 0; t < threads; t++) outstanding.add(new ArrayList<>());
+                long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    mgr.register(ring, dir);
+                    long bytesAfterRegister = readTotalBytes(mgr);
+                    assertEquals("register should account for the initial segment",
+                            segSize, bytesAfterRegister);
 
-                for (int t = 0; t < threads; t++) {
-                    final int threadId = t;
-                    final List<SegmentRing> myRings = outstanding.get(t);
-                    Thread worker = new Thread(() -> {
+                    // Hook fires on the worker thread immediately before the
+                    // install block's synchronized(lock) — i.e. AFTER the
+                    // worker has snapshotted observedTotal, dropped the lock,
+                    // and finished MmapSegment.create, but BEFORE it tries to
+                    // commit +segmentSize. The hook deregisters the ring
+                    // synchronously, then the worker enters the lock, the
+                    // stillRegistered check sees the entry removed, and skips
+                    // the install + commit. Without the guard the worker
+                    // would still commit and drift totalBytes by +segSize.
+                    CountDownLatch hookDone = new CountDownLatch(1);
+                    AtomicBoolean fired = new AtomicBoolean();
+                    AtomicReference<Throwable> hookErr = new AtomicReference<>();
+                    setBeforeInstallSyncHook(mgr, () -> {
+                        if (!fired.compareAndSet(false, true)) return;
                         try {
-                            start.await();
-                            for (int i = 0; i < perThread; i++) {
-                                String dir = tmpDir + "/t" + threadId + "_r" + i;
-                                assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
-                                String activePath = dir + "/sf-initial.sfa";
-                                MmapSegment active = MmapSegment.create(activePath, 0L, segSize);
-                                SegmentRing ring = new SegmentRing(active, segSize);
-                                myRings.add(ring);
-                                mgr.register(ring, dir);
-                                // Tiny burn so the manager's worker has a
-                                // realistic chance to start serviceRing on
-                                // this ring before we deregister.
-                                spinNanos(20_000L);
-                                mgr.deregister(ring);
-                                // DO NOT close the ring yet. The bug window
-                                // requires installHotSpare to succeed on a
-                                // deregistered-but-open ring.
-                            }
-                        } catch (Throwable t1) {
-                            failure.compareAndSet(null, t1);
+                            mgr.deregister(ring);
+                        } catch (Throwable t) {
+                            hookErr.compareAndSet(null, t);
                         } finally {
-                            done.countDown();
+                            hookDone.countDown();
                         }
-                    }, "race-producer-" + t);
-                    worker.setDaemon(true);
-                    worker.start();
+                    });
+
+                    // Fill the single-frame active segment. The ring's
+                    // needsHotSpare flips to true and managerWakeup fires,
+                    // unparking the worker; serviceRing enters the install
+                    // path and triggers the hook.
+                    ring.appendOrFsn(buf, 32);
+
+                    assertTrue("install hook never fired",
+                            hookDone.await(5, TimeUnit.SECONDS));
+                    if (hookErr.get() != null) {
+                        throw new AssertionError("install hook failed", hookErr.get());
+                    }
+
+                    // Wait for the worker to park again. With the entry
+                    // deregistered, no further wakeups arrive and a 60 s
+                    // pollNanos makes TIMED_WAITING a strong signal that
+                    // the current tick (snapshot + serviceRing + iteration
+                    // exit) has finished.
+                    Thread worker = workerThread(mgr);
+                    awaitParked(worker);
+
+                    long observed = readTotalBytes(mgr);
+                    assertEquals("totalBytes drifted away from 0. Observed "
+                                    + observed + " (segSize=" + segSize + ", "
+                                    + "bytesAfterRegister=" + bytesAfterRegister + "). "
+                                    + "Positive drift means SegmentManager.serviceRing's "
+                                    + "install block committed +segmentSize after deregister "
+                                    + "had already subtracted ring.totalSegmentBytes(): no "
+                                    + "stillRegistered guard. Fix: gate installHotSpare + "
+                                    + "totalBytes += segmentSize on a stillRegistered re-check "
+                                    + "under the same lock that covers deregister.",
+                            0L, observed);
+                } finally {
+                    setBeforeInstallSyncHook(mgr, null);
+                    Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+                    try {
+                        ring.close();
+                    } catch (Throwable ignored) {
+                        // best-effort
+                    }
                 }
-
-                start.countDown();
-                assertTrue("producers should finish",
-                        done.await(40, TimeUnit.SECONDS));
-                Throwable f = failure.get();
-                if (f != null) throw new AssertionError("producer thread failed", f);
-
-                // Let any in-flight serviceRing iterations land their
-                // commits before we read totalBytes.
-                Thread.sleep(200L);
-
-                long observed = readTotalBytes(mgr);
-
-                // Now safe to close every ring (closes any spare the
-                // worker may have installed after deregister).
-                for (List<SegmentRing> rings : outstanding) {
-                    for (SegmentRing ring : rings) ring.close();
-                }
-
-                assertEquals(
-                        "totalBytes should be 0 after every ring is deregistered. "
-                                + "Drift means the manager's worker installed a hot spare "
-                                + "into a deregistered ring AFTER deregister had already "
-                                + "subtracted ring.totalSegmentBytes(), and then committed "
-                                + "+= segmentSize with no future subtractor. Observed "
-                                + "drift bytes: " + observed,
-                        0L, observed);
             }
         });
+    }
+
+    private static void awaitParked(Thread t) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (true) {
+            Thread.State s = t.getState();
+            if (s == Thread.State.TIMED_WAITING || s == Thread.State.WAITING) return;
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("worker did not park within 5 s; state=" + s);
+            }
+            Thread.onSpinWait();
+        }
     }
 
     private static long readTotalBytes(SegmentManager mgr) throws Exception {
@@ -186,13 +198,6 @@ public class SegmentManagerTotalBytesRaceTest {
         Object lock = lockF.get(mgr);
         synchronized (lock) {
             return f.getLong(mgr);
-        }
-    }
-
-    private static void spinNanos(long nanos) {
-        long deadline = System.nanoTime() + nanos;
-        while (System.nanoTime() < deadline) {
-            Thread.onSpinWait();
         }
     }
 
@@ -216,5 +221,17 @@ public class SegmentManagerTotalBytesRaceTest {
             }
         }
         Files.remove(dir);
+    }
+
+    private static void setBeforeInstallSyncHook(SegmentManager mgr, Runnable hook) throws Exception {
+        Field f = SegmentManager.class.getDeclaredField("beforeInstallSyncHook");
+        f.setAccessible(true);
+        f.set(mgr, hook);
+    }
+
+    private static Thread workerThread(SegmentManager mgr) throws Exception {
+        Field f = SegmentManager.class.getDeclaredField("workerThread");
+        f.setAccessible(true);
+        return (Thread) f.get(mgr);
     }
 }
