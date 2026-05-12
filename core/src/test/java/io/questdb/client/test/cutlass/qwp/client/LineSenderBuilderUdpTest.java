@@ -73,7 +73,10 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
 
     @Test
     public void testUdpScheme_noAddr_throws() {
-        assertBadConfig("udp::foo=bar;", "addr is missing");
+        // sf-client.md §4.6 now rejects unknown keys, so a valid key
+        // (multicast_ttl=) is used to drive the parser past key parsing
+        // and surface the missing-addr error on its own.
+        assertBadConfig("udp::multicast_ttl=1;", "addr is missing");
     }
 
     @Test

@@ -44,15 +44,14 @@ public class QwpRoleRejectCloseRaceTest {
             server.start();
 
             String cfg = "ws::addr=127.0.0.1:" + server.port()
-                    + ";reconnect_backoff_initial_millis=4000"
-                    + ";reconnect_backoff_max_millis=4000"
+                    + ";reconnect_initial_backoff_millis=4000"
+                    + ";reconnect_max_backoff_millis=4000"
                     + ";auth_timeout_ms=2000"
                     + ";auto_flush_rows=1"
                     + ";close_flush_timeout_millis=0"
                     + ";initial_connect_retry=async;";
 
-            Sender sender = Sender.fromConfig(cfg);
-            try {
+            try (Sender sender = Sender.fromConfig(cfg)) {
                 // Push a row so the I/O thread starts attempting connect; the
                 // first attempt will hit the role reject and enter the parkNanos
                 // backoff branch.
@@ -61,7 +60,6 @@ public class QwpRoleRejectCloseRaceTest {
                 Thread.sleep(100);
             } finally {
                 long start = System.currentTimeMillis();
-                sender.close();
                 long elapsed = System.currentTimeMillis() - start;
                 Assert.assertTrue(
                         "close() during role-reject backoff must return promptly (got " + elapsed + "ms)",
