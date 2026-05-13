@@ -385,9 +385,14 @@ public final class Files {
     /**
      * Reserves disk blocks for the file up to {@code size} bytes. On Linux
      * uses {@code posix_fallocate}; on macOS uses {@code F_PREALLOCATE}
-     * with {@code F_ALLOCATEALL}. Falls back to {@code ftruncate} if
-     * pre-allocation isn't supported by the underlying filesystem (in which
-     * case the logical size is set but blocks remain sparse).
+     * with {@code F_ALLOCATEALL}; on Windows uses
+     * {@code SetFileInformationByHandle(FileAllocationInfo)}, which on
+     * NTFS reserves clusters synchronously and fails with
+     * {@code ERROR_DISK_FULL} when free space is insufficient. Never
+     * shrinks the file: requests smaller than the current logical size
+     * are rounded up. Falls back to {@code ftruncate} on Linux/macOS if
+     * pre-allocation isn't supported by the underlying filesystem (in
+     * which case the logical size is set but blocks remain sparse).
      */
     public static native boolean allocate(int fd, long size);
 

@@ -241,14 +241,43 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_truncate
 
 JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
         (JNIEnv *e, jclass cl, jint fd, jlong size) {
-    /* Windows: setting end-of-file zero-fills the gap on most filesystems and
-       reserves disk blocks via SetFileValidData where supported. We use plain
-       SetEndOfFile here for simplicity; it is sufficient for our SF segments. */
-    FILE_END_OF_FILE_INFO eof;
-    eof.EndOfFile.QuadPart = size;
-    if (!SetFileInformationByHandle(FD_TO_HANDLE(fd), FileEndOfFileInfo, &eof, sizeof(eof))) {
+    /* SetEndOfFile alone leaves the file sparse on NTFS: clusters are
+     * allocated lazily as writes occur. If the disk fills up between
+     * create and write, the cache manager raises an in-page exception
+     * on the writing thread when it flushes a mapped page — a
+     * SIGBUS-class failure that tears down the JVM. FILE_ALLOCATION_INFO
+     * instructs NTFS to physically reserve clusters now and returns
+     * ERROR_DISK_FULL synchronously on the call site, matching the
+     * posix_fallocate contract.
+     *
+     * Match the POSIX behaviour of posix_fallocate(fd, 0, size): round
+     * the request up to the existing logical size so an allocate call
+     * never shrinks a file that the caller already extended. */
+    HANDLE handle = FD_TO_HANDLE(fd);
+
+    LARGE_INTEGER current;
+    if (!GetFileSizeEx(handle, &current)) {
         SaveLastError();
         return JNI_FALSE;
+    }
+    jlong target = size > current.QuadPart ? size : (jlong) current.QuadPart;
+
+    FILE_ALLOCATION_INFO alloc;
+    alloc.AllocationSize.QuadPart = target;
+    if (!SetFileInformationByHandle(handle, FileAllocationInfo, &alloc, sizeof(alloc))) {
+        SaveLastError();
+        return JNI_FALSE;
+    }
+
+    /* FILE_ALLOCATION_INFO reserves clusters but does not advance EOF.
+     * Extend the logical size separately when growing the file. */
+    if (size > current.QuadPart) {
+        FILE_END_OF_FILE_INFO eof;
+        eof.EndOfFile.QuadPart = size;
+        if (!SetFileInformationByHandle(handle, FileEndOfFileInfo, &eof, sizeof(eof))) {
+            SaveLastError();
+            return JNI_FALSE;
+        }
     }
     return JNI_TRUE;
 }

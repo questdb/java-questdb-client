@@ -38,13 +38,15 @@ public interface FilesFacade {
     /**
      * Reserves disk blocks for {@code fd} up to {@code size} bytes. On Linux
      * uses {@code posix_fallocate}; on macOS uses {@code F_PREALLOCATE} with
-     * {@code F_ALLOCATEALL}. Returns {@code true} on success, {@code false}
-     * on failure (most importantly ENOSPC). Test injection point: a wrapping
-     * facade can return {@code false} to simulate disk-full at create time so
-     * the caller's recovery path is exercised. Callers that observe
-     * {@code false} MUST close the fd and unlink the file — the partially
-     * created file would otherwise occupy its full logical size on disk.
-     * Default delegates to {@link Files#allocate(int, long)}.
+     * {@code F_ALLOCATEALL}; on Windows uses
+     * {@code SetFileInformationByHandle(FileAllocationInfo)}. Returns
+     * {@code true} on success, {@code false} on failure (most importantly
+     * ENOSPC). Test injection point: a wrapping facade can return
+     * {@code false} to simulate disk-full at create time so the caller's
+     * recovery path is exercised. Callers that observe {@code false} MUST
+     * close the fd and unlink the file — the partially created file would
+     * otherwise occupy its full logical size on disk. Default delegates to
+     * {@link Files#allocate(int, long)}.
      */
     boolean allocate(int fd, long size);
 
