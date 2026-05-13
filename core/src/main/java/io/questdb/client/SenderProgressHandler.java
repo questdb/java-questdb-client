@@ -30,10 +30,31 @@ package io.questdb.client;
  * on {@code QwpWebSocketSender} via {@code setProgressHandler(...)} or on the
  * builder via {@code LineSenderBuilder.progressHandler(...)}.
  *
+ * <h2>WARNING -- settled is not durable</h2>
+ * {@code ackedFsn} is a <em>settled</em> watermark, not a <em>durable</em> one.
+ * A {@code DROP_AND_CONTINUE} server rejection (the default policy for the
+ * {@code SCHEMA_MISMATCH} and {@code WRITE_ERROR} categories) advances
+ * {@code ackedFsn} past the dropped FSN range exactly as a successful OK
+ * does -- the loop cannot leave a dropped FSN unsettled without leaking
+ * storage and stalling the wire. This handler therefore CANNOT distinguish
+ * a batch that the server committed to the WAL from one that the server
+ * discarded.
+ *
+ * <p>Code that gates a downstream side effect on {@code onAcked} without
+ * also tracking {@link SenderErrorHandler} drops will treat dropped batches
+ * as durable. The result is silent data loss: rows discarded by the server
+ * are marked "saved" by the user's outbox, locks released, source records
+ * deleted, downstream confirmations emitted -- for data that no longer
+ * exists on the server.
+ *
+ * <p>Required pattern when durability matters: register a
+ * {@link SenderErrorHandler}, record the {@code [fromFsn, toFsn]} range of
+ * every error whose {@code getAppliedPolicy()} is
+ * {@link SenderError.Policy#DROP_AND_CONTINUE}, and exclude those FSNs from
+ * the "durable" set you derive from the watermark.
+ *
  * <h2>Watermark semantics</h2>
- * {@code ackedFsn} is the highest FSN whose batch is now durable on the server
- * side (committed to WAL, or skipped past on a {@code DROP_AND_CONTINUE}
- * rejection). The handler fires only when the watermark <em>advances</em>:
+ * The handler fires only when the watermark <em>advances</em>:
  * <ul>
  *   <li>delivered values are strictly increasing,</li>
  *   <li>the handler may be called many times during the lifetime of a sender,</li>
@@ -41,14 +62,15 @@ package io.questdb.client;
  *       frames into one OK frame.</li>
  * </ul>
  *
- * Callers polling for "is everything up to FSN N durable?" should compare
- * {@code ackedFsn} against their target and act once the inequality is satisfied,
- * not assume one call per sent batch.
+ * <p>Callers polling for "is everything up to FSN N settled?" should compare
+ * {@code ackedFsn} against their target and act once the inequality is
+ * satisfied, not assume one call per sent batch. The "settled" wording is
+ * deliberate -- see the WARNING above for the distinction from "durable".
  *
  * <h2>Threading</h2>
  * Implementations are invoked on a dedicated daemon dispatcher thread, never on
  * the I/O thread or the producer thread. Slow handlers cannot stall publishing.
- * If the bounded inbox fills, surplus notifications are dropped — visible via
+ * If the bounded inbox fills, surplus notifications are dropped -- visible via
  * {@code QwpWebSocketSender.getDroppedProgressNotifications()}. Drops are
  * tolerable because the next delivered call carries an equal-or-higher FSN, so
  * watchers comparing against a target threshold catch up automatically.
@@ -58,10 +80,11 @@ package io.questdb.client;
  * dispatcher. The dispatcher and the sender continue running.
  *
  * <h2>What this callback is for</h2>
- * Marking application state durable, releasing producer-side latches, fan-out
- * to journals tagged with {@code (fsn, domainContext)} pairs returned by
- * {@code flushAndGetSequence()}. For an "is this batch rejected" question on the
- * producer thread, see {@link SenderErrorHandler} and
+ * Marking application state settled (see the WARNING for the distinction from
+ * durable), releasing producer-side latches, fan-out to journals tagged with
+ * {@code (fsn, domainContext)} pairs returned by {@code flushAndGetSequence()}.
+ * For an "is this batch rejected" question on the producer thread, see
+ * {@link SenderErrorHandler} and
  * {@link io.questdb.client.cutlass.line.LineSenderException}.
  *
  * @see SenderErrorHandler
@@ -69,8 +92,11 @@ package io.questdb.client;
 @FunctionalInterface
 public interface SenderProgressHandler {
     /**
-     * Called when the server-acked watermark advances. Strictly monotonic:
-     * {@code ackedFsn} on call N+1 is greater than on call N.
+     * Called when the settled watermark advances. Strictly monotonic:
+     * {@code ackedFsn} on call N+1 is greater than on call N. "Settled" covers
+     * both successful OK frames and {@code DROP_AND_CONTINUE} rejections --
+     * see the class javadoc WARNING before treating this as a durability
+     * signal.
      */
     void onAcked(long ackedFsn);
 }
