@@ -97,7 +97,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     /** Throttle "reconnect attempt N failed" WARN logs to one per 5 s. */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
-    private final AtomicLong consecutiveSendErrors = new AtomicLong();
     // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
     // Zero or negative disables the keepalive entirely.
     private final long durableAckKeepaliveIntervalNanos;
@@ -1195,7 +1194,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
-        this.consecutiveSendErrors.set(0L);
         // Snapshot publishedFsn at swap time — frames at FSN ≤ this value
         // were already on the wire before the drop and will be replayed.
         // trySendOne resets replayTargetFsn to -1 once we cross the boundary.
@@ -1275,7 +1273,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 replayTargetFsn = -1L; // catch-up complete
             }
         }
-        consecutiveSendErrors.set(0);
         return true;
     }
 
