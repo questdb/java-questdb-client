@@ -200,8 +200,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @param configurationString configuration string
      * @return Sender instance
      * @see #fromEnv()
-     * @see #fromConfig(CharSequence)
-     * @see LineSenderBuilder#fromConfig(CharSequence)
+     * @see #builder(CharSequence)
      */
     static Sender fromConfig(CharSequence configurationString) {
         return builder(configurationString).build();
