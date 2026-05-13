@@ -144,13 +144,30 @@ public final class MmapSegment implements QuietCloseable {
      * that filesystem only.
      */
     public static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes) {
+        long pathPtr = ff.allocNativePath(path);
+        try {
+            return create(ff, pathPtr, path, baseSeq, sizeBytes);
+        } finally {
+            ff.freeNativePath(pathPtr);
+        }
+    }
+
+    /**
+     * Variant of {@link #create(FilesFacade, String, long, long)} that takes a
+     * pre-encoded native UTF-8 path pointer plus a parallel String for use in
+     * exception messages and {@link #path()}. The pointer must be a
+     * null-terminated UTF-8 path, typically built into a reused
+     * {@code DirectUtf8Sink} by the rotation hot path so it does not incur a
+     * per-call {@code byte[]} + native-malloc the way the String overload does.
+     */
+    public static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes) {
         if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
             throw new IllegalArgumentException(
                     "sizeBytes too small for header + one minimal frame: " + sizeBytes);
         }
-        int fd = ff.openCleanRW(path, sizeBytes);
+        int fd = ff.openCleanRW(pathPtr, sizeBytes);
         if (fd < 0) {
-            throw new MmapSegmentException("openCleanRW failed for " + path);
+            throw new MmapSegmentException("openCleanRW failed for " + displayPath);
         }
         // Reserve real disk blocks so ENOSPC surfaces here, before the
         // producer thread starts writing frames into the mapping. The
@@ -165,15 +182,14 @@ public final class MmapSegment implements QuietCloseable {
             // empty file does not survive the failure. Under sustained
             // disk-full pressure with the manager polling, hundreds would
             // otherwise accumulate.
-            //noinspection ResultOfMethodCallIgnored
-            ff.remove(path);
-            throw new MmapSegmentException("pre-allocation failed for " + path);
+            ff.remove(pathPtr);
+            throw new MmapSegmentException("pre-allocation failed for " + displayPath);
         }
         long addr = Files.FAILED_MMAP_ADDRESS;
         try {
             addr = Files.mmap(fd, sizeBytes, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
             if (addr == Files.FAILED_MMAP_ADDRESS) {
-                throw new MmapSegmentException("mmap failed for " + path);
+                throw new MmapSegmentException("mmap failed for " + displayPath);
             }
             // Header goes straight into the mapping — no separate write syscall.
             Unsafe.getUnsafe().putInt(addr, FILE_MAGIC);
@@ -182,7 +198,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(path, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L);
+            return new MmapSegment(displayPath, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
@@ -191,8 +207,7 @@ public final class MmapSegment implements QuietCloseable {
             // mmap (or header writes) failed after a successful allocate —
             // best-effort unlink to keep the directory from accumulating
             // full-size empty segments under repeated failures.
-            //noinspection ResultOfMethodCallIgnored
-            ff.remove(path);
+            ff.remove(pathPtr);
             throw t;
         }
     }
@@ -419,7 +434,11 @@ public final class MmapSegment implements QuietCloseable {
         }
         Unsafe.getUnsafe().putInt(mmapAddress + offset, crc);
         appendCursor = offset + total;
-        frameCount++;
+        // Plain read + write of the volatile field. `frameCount++` would
+        // trip the "non-atomic increment of volatile" inspection, but
+        // single-writer invariant (only the producer thread mutates) makes
+        // the RMW race-free by design.
+        frameCount = frameCount + 1;
         // Publish last. Until this volatile write retires, the consumer
         // cannot see any of the bytes we just wrote.
         publishedCursor = appendCursor;

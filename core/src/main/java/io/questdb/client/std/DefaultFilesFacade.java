@@ -107,8 +107,23 @@ final class DefaultFilesFacade implements FilesFacade {
     }
 
     @Override
+    public int openCleanRW(long pathPtr, long size) {
+        return Files.openCleanRW(pathPtr, size);
+    }
+
+    @Override
     public int openRW(String path) {
         return Files.openRW(path);
+    }
+
+    @Override
+    public int openRW(long pathPtr) {
+        return Files.openRW(pathPtr);
+    }
+
+    @Override
+    public long length(long pathPtr) {
+        return Files.length(pathPtr);
     }
 
     @Override
