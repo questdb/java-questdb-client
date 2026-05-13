@@ -479,6 +479,40 @@ public class CursorWebSocketSendLoopDurableAckTest {
         });
     }
 
+    @Test
+    public void testTotalDurableTrimAdvancesSkipsRedundantEngineAck() throws Exception {
+        // After a successful drain advances ackedFsn, a subsequent enqueue+drain
+        // that resolves to the same or lower fsn must NOT bump trimAdvances. The
+        // counter's contract is "watermark actually advanced", so it gates on
+        // engine.acknowledge's return value rather than the pop event. Repro
+        // here: deliver OK 4 + matching durable-ack -> trim advances to 1, then
+        // deliver a duplicate OK 4 + redundant durable-ack -> engine.acknowledge
+        // returns false (no watermark move) and trimAdvances stays at 1.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 5);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine);
+                setSentCount(loop, 5);
+
+                deliverOk(loop, 4, names("trades"), txns(50L));
+                deliverDurableAck(loop, names("trades"), txns(50L));
+                assertEquals("first cycle advances trim",
+                        1L, loop.getTotalDurableTrimAdvances());
+                long ackedAfterFirst = engine.ackedFsn();
+
+                // Duplicate OK for the same wireSeq with a watermark that already
+                // covers it. drainPendingDurable pops the entry, computes fsn at
+                // ackedAfterFirst, and engine.acknowledge no-ops. Pre-fix this
+                // path bumped trimAdvances anyway, overcounting.
+                deliverOk(loop, 4, names("trades"), txns(50L));
+                assertEquals("redundant ack must not bump trim counter",
+                        1L, loop.getTotalDurableTrimAdvances());
+                assertEquals("redundant ack must not move ackedFsn",
+                        ackedAfterFirst, engine.ackedFsn());
+            }
+        });
+    }
+
     private static void appendFrames(CursorSendEngine engine, int count) {
         long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
         try {

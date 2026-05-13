@@ -992,9 +992,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (highest != Long.MIN_VALUE) {
             long fsn = fsnAtZero + highest;
             if (engine.acknowledge(fsn)) {
+                totalDurableTrimAdvances.incrementAndGet();
                 dispatchProgress(fsn);
             }
-            totalDurableTrimAdvances.incrementAndGet();
         }
     }
 
