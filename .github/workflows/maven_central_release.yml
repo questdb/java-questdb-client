@@ -23,11 +23,12 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: maven-release
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       MAVEN_RELEASE_AWS_REGION: ${{ vars.MAVEN_RELEASE_AWS_REGION }}
       MAVEN_RELEASE_AWS_ROLE_ARN: ${{ vars.MAVEN_RELEASE_AWS_ROLE_ARN }}
-      MAVEN_RELEASE_AWS_SECRET_ID: ${{ vars.MAVEN_RELEASE_AWS_SECRET_ID }}
+      MAVEN_RELEASE_AWS_SECRET_ARN: ${{ vars.MAVEN_RELEASE_AWS_SECRET_ARN }}
     steps:
       - name: Validate workflow configuration
         run: |
@@ -49,7 +50,7 @@ jobs:
           required_vars=(
             MAVEN_RELEASE_AWS_REGION
             MAVEN_RELEASE_AWS_ROLE_ARN
-            MAVEN_RELEASE_AWS_SECRET_ID
+            MAVEN_RELEASE_AWS_SECRET_ARN
           )
 
           for var_name in "${required_vars[@]}"; do
@@ -83,7 +84,7 @@ jobs:
         uses: aws-actions/aws-secretsmanager-get-secrets@v2
         with:
           secret-ids: |
-            ,${{ env.MAVEN_RELEASE_AWS_SECRET_ID }}
+            ,${{ env.MAVEN_RELEASE_AWS_SECRET_ARN }}
           parse-json-secrets: true
 
       - name: Validate release credentials
@@ -97,7 +98,7 @@ jobs:
 
           for var_name in "${required_vars[@]}"; do
             if [[ -z "${!var_name:-}" ]]; then
-              echo "::error::AWS secret ${MAVEN_RELEASE_AWS_SECRET_ID} must define ${var_name}."
+              echo "::error::AWS secret ${MAVEN_RELEASE_AWS_SECRET_ARN} must define ${var_name}."
               exit 1
             fi
           done

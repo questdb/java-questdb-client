@@ -16,49 +16,6 @@ The repo now includes a GitHub Actions workflow at `.github/workflows/maven_cent
 
 ## Automated GitHub Release
 
-### AWS secret payload
-
-Store a single JSON secret in AWS Secrets Manager with these keys:
-
-```json
-{
-  "MAVEN_GPG_PRIVATE_KEY": "-----BEGIN PGP PRIVATE KEY BLOCK-----\n...\n-----END PGP PRIVATE KEY BLOCK-----",
-  "MAVEN_GPG_PASSPHRASE": "your-passphrase",
-  "MAVEN_CENTRAL_USERNAME": "your-central-username",
-  "MAVEN_CENTRAL_PASSWORD": "your-central-password-or-token"
-}
-```
-
-Export the private key in ASCII armor form:
-
-```bash
-gpg --armor --export-secret-keys <YOUR_KEY_ID>
-```
-
-### Repository configuration
-
-Create these GitHub repository variables:
-
-- `MAVEN_RELEASE_AWS_REGION`
-- `MAVEN_RELEASE_AWS_ROLE_ARN`
-- `MAVEN_RELEASE_AWS_SECRET_ID`
-
-Optional GitHub repository secret:
-
-- `MAVEN_RELEASE_GIT_TOKEN`
-
-Use `MAVEN_RELEASE_GIT_TOKEN` only if the default `GITHUB_TOKEN` cannot push the release commits and tag to the default branch because of branch protection.
-
-### AWS permissions
-
-The IAM role assumed by the workflow needs:
-
-- `secretsmanager:GetSecretValue` on the release secret
-- `secretsmanager:ListSecrets`
-- `kms:Decrypt` if the secret uses a customer-managed KMS key
-
-Its trust policy must allow GitHub Actions to assume the role through the GitHub OIDC provider.
-
 ### Trigger the release
 
 Run the `Release to Maven Central` workflow from the default branch and provide:
