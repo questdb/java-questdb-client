@@ -97,23 +97,28 @@ public class SenderErrorDispatcherTest {
     }
 
     @Test
-    public void testFullInboxDropsAndCounts() throws Exception {
-        // Slow handler — releases once the test allows it. Until then, every
-        // offer beyond capacity must be dropped (returning false) and counted.
+    public void testFullInboxDropsOldestAndCounts() throws Exception {
+        // Spec sf-client.md section 14.6: on overflow, drop the OLDEST entry
+        // and admit the new one. The latest entry is always the most
+        // informative, so the FIFO head loses, not the new arrival.
         CountDownLatch unblock = new CountDownLatch(1);
-        AtomicInteger delivered = new AtomicInteger();
-        /*capacity=*/
+        List<SenderError> received = new ArrayList<>();
+        Object lock = new Object();
+        CountDownLatch allDelivered = new CountDownLatch(5);
         try (SenderErrorDispatcher d = new SenderErrorDispatcher(err -> {
             try {
                 unblock.await();
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
-            delivered.incrementAndGet();
+            synchronized (lock) {
+                received.add(err);
+            }
+            allDelivered.countDown();
         }, /*capacity=*/ 4)) {
-            // First offer starts the dispatcher and is taken into the
-            // handler immediately (and blocks there). Now we can fill the
-            // bounded inbox to capacity, then overflow.
+            // First offer starts the dispatcher and lands in the handler
+            // immediately (and blocks there). Now we can fill the bounded
+            // inbox to capacity, then overflow.
             Assert.assertTrue(d.offer(buildError(0)));
             // Give the dispatcher a moment to take the head into the
             // handler so subsequent offers don't get an extra slot.
@@ -122,11 +127,27 @@ public class SenderErrorDispatcherTest {
                 Assert.assertTrue("inbox should accept offer " + i,
                         d.offer(buildError(i)));
             }
-            // Inbox is now at capacity (4); next offer must drop.
-            Assert.assertFalse("offer beyond capacity must drop",
+            // Inbox is now at capacity (4) holding [1,2,3,4]. The next two
+            // offers must each drop the head (1, then 2) to admit the new
+            // arrival. They return true because the new entry IS enqueued.
+            Assert.assertTrue("offer beyond capacity must admit the new entry",
                     d.offer(buildError(5)));
-            Assert.assertFalse(d.offer(buildError(6)));
+            Assert.assertTrue(d.offer(buildError(6)));
             Assert.assertEquals(2L, d.getDroppedNotifications());
+
+            unblock.countDown();
+            Assert.assertTrue("all retained entries should deliver within 5s",
+                    allDelivered.await(5, TimeUnit.SECONDS));
+            synchronized (lock) {
+                // 0 was taken by the handler before overflow began; 1 and 2
+                // are the dropped pair; 3, 4, 5, 6 are the surviving tail.
+                long[] fromFsns = new long[received.size()];
+                for (int i = 0; i < received.size(); i++) {
+                    fromFsns[i] = received.get(i).getFromFsn();
+                }
+                Assert.assertArrayEquals("drop-oldest must retain the newest tail",
+                        new long[]{0, 3, 4, 5, 6}, fromFsns);
+            }
         } finally {
             unblock.countDown();
         }
