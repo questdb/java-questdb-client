@@ -125,6 +125,9 @@ public class QwpWebSocketSender implements Sender {
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
     private static final int MAX_TABLE_NAME_LENGTH = 127;
+    // sf-client.md section 4.4 floor: drop-oldest under bursts needs a wide
+    // enough window to preserve the trailing category distribution.
+    private static final int MIN_ERROR_INBOX_CAPACITY = 16;
     private static final String WRITE_PATH = "/write/v4";
     private final String authorizationHeader;
     private final int autoFlushBytes;
@@ -1725,10 +1728,13 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Configure the bounded inbox capacity used by the dispatcher. Must be
      * called before {@code connect()}; later changes have no effect.
+     * The minimum follows sf-client.md section 4.4: drop-oldest under bursts
+     * needs a wide enough window to preserve the trailing category distribution.
      */
     public void setErrorInboxCapacity(int capacity) {
-        if (capacity < 1) {
-            throw new IllegalArgumentException("errorInboxCapacity must be >= 1, was " + capacity);
+        if (capacity < MIN_ERROR_INBOX_CAPACITY) {
+            throw new IllegalArgumentException("errorInboxCapacity must be >= "
+                    + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
         }
         this.errorInboxCapacity = capacity;
     }

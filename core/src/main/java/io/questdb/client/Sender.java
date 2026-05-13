@@ -620,6 +620,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
         private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 1_000;
         private static final int MIN_BUFFER_SIZE = AuthUtils.CHALLENGE_LEN + 1; // challenge size + 1;
+        // sf-client.md section 4.4: the inbox capacity must accommodate the
+        // distinct error categories in a bursty error stream so that drop-oldest
+        // does not erase the trailing distribution of categories.
+        private static final int MIN_ERROR_INBOX_CAPACITY = 16;
         // The PARAMETER_NOT_SET_EXPLICITLY constant is used to detect if a parameter was set explicitly in configuration parameters
         // where it matters. This is needed to detect invalid combinations of parameters. Why?
         // We want to fail-fast even when an explicitly configured options happens to be same value as the default value,
@@ -1864,15 +1868,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          *
          * <p>WebSocket transport only; setting on other transports throws.
          *
-         * @param capacity must be {@code >= 1}
+         * @param capacity must be {@code >= 16} (sf-client.md section 4.4).
+         *                 The floor exists because overflow drops the oldest
+         *                 entry and watermarks are monotonic, so the inbox
+         *                 must be wide enough to keep a useful trailing
+         *                 window of categories under bursty errors.
          * @return this instance for method chaining
          */
         public LineSenderBuilder errorInboxCapacity(int capacity) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("error_inbox_capacity is only supported for WebSocket transport");
             }
-            if (capacity < 1) {
-                throw new LineSenderException("error_inbox_capacity must be >= 1, was " + capacity);
+            if (capacity < MIN_ERROR_INBOX_CAPACITY) {
+                throw new LineSenderException("error_inbox_capacity must be >= "
+                        + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
             }
             this.errorInboxCapacity = capacity;
             return this;
