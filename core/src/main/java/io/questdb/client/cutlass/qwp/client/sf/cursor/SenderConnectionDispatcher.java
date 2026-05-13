@@ -30,8 +30,7 @@ import io.questdb.client.std.QuietCloseable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -61,10 +60,10 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
             SenderConnectionEvent.NO_ROUND_NUMBER,
             null, 0L);
     private final AtomicLong dropped = new AtomicLong();
-    // volatile so the user can swap the listener post-connect, mirroring
-    // SenderErrorDispatcher's setHandler contract.
-    private volatile SenderConnectionListener listener;
-    private final BlockingQueue<SenderConnectionEvent> inbox;
+    // Deque (not plain queue) so offer() can drop the head when the inbox is
+    // full, per the drop-oldest contract inherited from SenderErrorDispatcher
+    // (sf-client.md section 14.6).
+    private final LinkedBlockingDeque<SenderConnectionEvent> inbox;
     // First offer() that observes a null thread wins the race to spawn it.
     private final Object lock = new Object();
     private final String threadName;
@@ -75,6 +74,9 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
     // double-checked first-null guard is a JMM race -- benign in practice
     // (the synchronized re-check covers double-start) but spec-incorrect.
     private volatile Thread dispatcherThread;
+    // volatile so the user can swap the listener post-connect, mirroring
+    // SenderErrorDispatcher's setHandler contract.
+    private volatile SenderConnectionListener listener;
 
     public SenderConnectionDispatcher(SenderConnectionListener listener) {
         this(listener, DEFAULT_CAPACITY, "qdb-sf-connection-dispatcher");
@@ -92,7 +94,7 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
             throw new IllegalArgumentException("capacity must be >= 1, was " + capacity);
         }
         this.listener = listener;
-        this.inbox = new ArrayBlockingQueue<>(capacity);
+        this.inbox = new LinkedBlockingDeque<>(capacity);
         this.threadName = threadName;
     }
 
@@ -103,7 +105,6 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
                 return;
             }
             closed = true;
-            //noinspection ResultOfMethodCallIgnored
             inbox.offer(POISON);
             Thread t = dispatcherThread;
             if (t != null) {
@@ -128,9 +129,10 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
     }
 
     /**
-     * Total events dropped via inbox-overflow since startup. Non-zero means the
-     * listener is slower than the event rate -- typically a symptom of a
-     * misbehaving listener. Reported by the sender for ops dashboards.
+     * Total events discarded by the drop-oldest overflow policy since startup.
+     * Non-zero means the listener is slower than the event rate -- typically
+     * a symptom of a misbehaving listener. Reported by the sender for ops
+     * dashboards.
      */
     public long getDroppedNotifications() {
         return dropped.get();
@@ -145,18 +147,14 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
     }
 
     /**
-     * Replace the user-supplied listener. Effective for the next delivery.
-     * Null reverts to the loud-not-silent default.
-     */
-    public void setListener(SenderConnectionListener listener) {
-        this.listener = listener != null ? listener : DefaultSenderConnectionListener.INSTANCE;
-    }
-
-    /**
-     * Non-blocking enqueue. Returns {@code true} if the event will be
-     * delivered to the listener (eventually, on the dispatcher thread).
-     * Returns {@code false} if the inbox was full or the dispatcher was
-     * closed -- caller's only obligation is to not block.
+     * Non-blocking enqueue. Always admits the new event unless the dispatcher
+     * is closed or {@code event} is null. Returns {@code true} when the new
+     * event is enqueued for delivery, {@code false} when rejected outright.
+     *
+     * <p>When the inbox is full, drops the oldest pending entry to make room
+     * (sf-client.md section 14.6, inherited contract) and bumps
+     * {@link #getDroppedNotifications()}. The newest entry is always retained
+     * because later events carry the most recent connection state.
      *
      * <p>Lazy-starts the dispatcher thread on the first successful offer.
      */
@@ -164,15 +162,31 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
         if (closed || event == null) {
             return false;
         }
-        boolean accepted = inbox.offer(event);
-        if (!accepted) {
-            dropped.incrementAndGet();
-            return false;
+        // Drop-oldest overflow policy. The pollFirst()/offerLast() pair is
+        // not atomic with the consumer, but the consumer can only remove
+        // entries (never add). The retry loop converges in at most one extra
+        // iteration under SPSC; close()'s POISON enqueue widens the race
+        // briefly but the `closed` re-check exits cleanly.
+        while (!inbox.offerLast(event)) {
+            if (inbox.pollFirst() != null) {
+                dropped.incrementAndGet();
+            }
+            if (closed) {
+                return false;
+            }
         }
         if (dispatcherThread == null) {
             startDispatcherIfNeeded();
         }
         return true;
+    }
+
+    /**
+     * Replace the user-supplied listener. Effective for the next delivery.
+     * Null reverts to the loud-not-silent default.
+     */
+    public void setListener(SenderConnectionListener listener) {
+        this.listener = listener != null ? listener : DefaultSenderConnectionListener.INSTANCE;
     }
 
     private void dispatchLoop() {

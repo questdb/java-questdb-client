@@ -164,9 +164,16 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
     fst.fst_length = (off_t) size;
     fst.fst_bytesalloc = 0;
     if (fcntl((int) fd, F_PREALLOCATE, &fst) == -1) {
+        /* Contiguous allocation failed (e.g. fragmented filesystem); retry
+         * non-contiguous all-or-nothing. Only fall through to ftruncate when
+         * the filesystem doesn't support F_PREALLOCATE at all; real failures
+         * (notably ENOSPC) must surface so the caller doesn't end up with a
+         * sparse file that SIGBUSes on later mmap store (sf-client.md §6). */
         fst.fst_flags = F_ALLOCATEALL;
-        (void) fcntl((int) fd, F_PREALLOCATE, &fst);
-        /* if F_PREALLOCATE fails we still try ftruncate to set logical size */
+        if (fcntl((int) fd, F_PREALLOCATE, &fst) == -1
+            && errno != ENOTSUP && errno != EOPNOTSUPP) {
+            return JNI_FALSE;
+        }
     }
 #endif
     int res2;

@@ -376,8 +376,11 @@ public final class SegmentRing implements QuietCloseable {
             hotSpare = null;
             // Fresh active just consumed the spare → ask the manager to start
             // making the next one immediately, before this segment fills.
+            // The flag is per-active and tracks whether the backup-signal
+            // branch has fired for the *current* active. Rotation installs a
+            // new active, so the flag resets here to re-arm the backup branch.
             // Plain field reset is safe (producer-only state).
-            wakeupRequestedForActive = true;
+            wakeupRequestedForActive = false;
             Runnable wakeup = managerWakeup;
             if (wakeup != null) {
                 wakeup.run();

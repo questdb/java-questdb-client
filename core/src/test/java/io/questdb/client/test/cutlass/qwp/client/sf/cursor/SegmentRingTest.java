@@ -167,6 +167,67 @@ public class SegmentRingTest {
     }
 
     @Test
+    public void testRotationRearmsHighWaterBackupWakeup() throws Exception {
+        // The producer-thread flag that gates the high-water backup wakeup is
+        // per-active. Rotation must reset it so the new active can fire the
+        // backup again if the rotation-time wakeup didn't get a fresh spare
+        // installed in time. Pre-fix the flag stayed sticky-true after the
+        // first set, so on every active past the first the backup branch was
+        // a dead path.
+        TestUtils.assertMemoryLeak(() -> {
+            // 4 100-byte frames per segment. signalAtBytes is 75% of segSize,
+            // and HEADER (24) + 3 frames (3*108 = 324) lands publishedOffset
+            // at 348, just past the 342-byte threshold.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 100);
+            long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/wseg0.sfa", 0, segSize);
+                try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
+                    int[] wakeups = {0};
+                    ring.setManagerWakeup(() -> wakeups[0]++);
+                    fillPattern(buf, 100, 0);
+
+                    // First active: two frames stay below high-water.
+                    assertEquals(0, ring.appendOrFsn(buf, 100));
+                    assertEquals(1, ring.appendOrFsn(buf, 100));
+                    assertEquals("no wakeup before high-water", 0, wakeups[0]);
+                    // Third frame crosses 75%: backup branch fires once.
+                    assertEquals(2, ring.appendOrFsn(buf, 100));
+                    assertEquals("backup signal fires on high-water crossing", 1, wakeups[0]);
+                    // Fourth frame fills the active. Still same active, so the
+                    // backup branch must coalesce and not fire again.
+                    assertEquals(3, ring.appendOrFsn(buf, 100));
+                    assertEquals("backup signal coalesces within an active", 1, wakeups[0]);
+                    // Active is full and there is still no spare.
+                    assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE,
+                            ring.appendOrFsn(buf, 100));
+                    assertEquals("backpressure does not fire wakeup", 1, wakeups[0]);
+
+                    // Install spare, then retry. The retry triggers rotation,
+                    // which fires the wakeup unconditionally.
+                    ring.installHotSpare(MmapSegment.create(
+                            tmpDir + "/wseg1.sfa", ring.nextSeqHint(), segSize));
+                    assertEquals(4, ring.appendOrFsn(buf, 100));
+                    assertEquals("rotation fires wakeup", 2, wakeups[0]);
+
+                    // New active. Two frames keep publishedOffset below the
+                    // high-water mark (the rotated frame counts as the first).
+                    assertEquals(5, ring.appendOrFsn(buf, 100));
+                    assertEquals(2, wakeups[0]);
+                    // Third frame on the new active crosses 75% again. Without
+                    // rotation re-arming the per-active flag, this assertion
+                    // catches the regression: pre-fix wakeups stayed at 2.
+                    assertEquals(6, ring.appendOrFsn(buf, 100));
+                    assertEquals("backup signal re-arms on the new active", 3, wakeups[0]);
+                }
+            } finally {
+                Unsafe.free(buf, 100, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testAcknowledgeAndDrainTrimsOldestFirstUntilUnackedFound() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Three small segments worth of frames; ack progressively, drain.

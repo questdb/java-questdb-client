@@ -258,12 +258,15 @@ public final class Files {
      */
     public static int rename(String oldPath, String newPath) {
         long o = pathPtr(oldPath);
-        long n = pathPtr(newPath);
         try {
-            return rename0(o, n);
+            long n = pathPtr(newPath);
+            try {
+                return rename0(o, n);
+            } finally {
+                freePathPtr(n);
+            }
         } finally {
             freePathPtr(o);
-            freePathPtr(n);
         }
     }
 

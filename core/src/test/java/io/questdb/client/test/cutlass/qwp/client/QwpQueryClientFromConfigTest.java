@@ -161,6 +161,48 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testAddrRepeatedKeysAccumulate() {
+        // failover.md section 1: repeated addr= keys must accumulate into a
+        // single ordered list, mirroring the ingress Sender behavior.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig(
+                "ws::addr=alpha:9000;addr=bravo:9001;addr=charlie:9002;")) {
+            Assert.assertEquals(3, c.getEndpointCountForTest());
+            Assert.assertEquals("alpha", c.getEndpointHostForTest(0));
+            Assert.assertEquals(9000, c.getEndpointPortForTest(0));
+            Assert.assertEquals("bravo", c.getEndpointHostForTest(1));
+            Assert.assertEquals(9001, c.getEndpointPortForTest(1));
+            Assert.assertEquals("charlie", c.getEndpointHostForTest(2));
+            Assert.assertEquals(9002, c.getEndpointPortForTest(2));
+        }
+    }
+
+    @Test
+    public void testAddrRepeatedKeysAndCommasMixed() {
+        // The two accumulation forms must compose: comma-list followed by a
+        // second addr= key extends the list, not replaces it.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig(
+                "ws::addr=alpha:9000,bravo:9001;addr=charlie:9002,delta:9003;")) {
+            Assert.assertEquals(4, c.getEndpointCountForTest());
+            Assert.assertEquals("alpha", c.getEndpointHostForTest(0));
+            Assert.assertEquals(9000, c.getEndpointPortForTest(0));
+            Assert.assertEquals("bravo", c.getEndpointHostForTest(1));
+            Assert.assertEquals(9001, c.getEndpointPortForTest(1));
+            Assert.assertEquals("charlie", c.getEndpointHostForTest(2));
+            Assert.assertEquals(9002, c.getEndpointPortForTest(2));
+            Assert.assertEquals("delta", c.getEndpointHostForTest(3));
+            Assert.assertEquals(9003, c.getEndpointPortForTest(3));
+        }
+    }
+
+    @Test
+    public void testAddrRepeatedKeysEmptyEntryStillRejected() {
+        // The empty-entry rejection must fire on every addr= occurrence, not
+        // just the first one, so a second key cannot smuggle in a malformed
+        // value.
+        assertReject("ws::addr=a:9000;addr=b:9000,;", "empty addr entry");
+    }
+
+    @Test
     public void testAddrSingleWhitespaceTrimmedAroundHostPort() {
         // The parser splits on commas and trims; a single leading space on a
         // valid entry must therefore be tolerated rather than rejected as
