@@ -27,8 +27,8 @@ jobs:
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       MAVEN_RELEASE_AWS_REGION: ${{ vars.MAVEN_RELEASE_AWS_REGION }}
-      MAVEN_RELEASE_AWS_ROLE_ARN: ${{ vars.MAVEN_RELEASE_AWS_ROLE_ARN }}
-      MAVEN_RELEASE_AWS_SECRET_ARN: ${{ vars.MAVEN_RELEASE_AWS_SECRET_ARN }}
+      MAVEN_RELEASE_AWS_ROLE_ARN: ${{ secrets.MAVEN_RELEASE_AWS_ROLE_ARN }}
+      MAVEN_RELEASE_AWS_SECRET_ARN: ${{ secrets.MAVEN_RELEASE_AWS_SECRET_ARN }}
     steps:
       - name: Validate workflow configuration
         run: |
@@ -49,13 +49,23 @@ jobs:
 
           required_vars=(
             MAVEN_RELEASE_AWS_REGION
-            MAVEN_RELEASE_AWS_ROLE_ARN
-            MAVEN_RELEASE_AWS_SECRET_ARN
           )
 
           for var_name in "${required_vars[@]}"; do
             if [[ -z "${!var_name:-}" ]]; then
               echo "::error::Repository variable ${var_name} is required."
+              exit 1
+            fi
+          done
+
+          required_secrets=(
+            MAVEN_RELEASE_AWS_ROLE_ARN
+            MAVEN_RELEASE_AWS_SECRET_ARN
+          )
+
+          for secret_name in "${required_secrets[@]}"; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "::error::GitHub secret ${secret_name} is required."
               exit 1
             fi
           done

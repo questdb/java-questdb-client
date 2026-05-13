@@ -14,6 +14,12 @@ The repo now includes a GitHub Actions workflow at `.github/workflows/maven_cent
 - runs `mvn release:prepare release:perform`
 - pushes the release commits and tag only after Central publication succeeds
 
+Workflow configuration:
+
+- repository variable `MAVEN_RELEASE_AWS_REGION`
+- GitHub secret `MAVEN_RELEASE_AWS_ROLE_ARN`
+- GitHub secret `MAVEN_RELEASE_AWS_SECRET_ARN`
+
 ## Automated GitHub Release
 
 ### Trigger the release
