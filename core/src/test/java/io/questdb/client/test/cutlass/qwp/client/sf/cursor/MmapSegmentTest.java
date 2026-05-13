@@ -144,7 +144,7 @@ public class MmapSegmentTest {
             FaultyFilesFacade ff = new FaultyFilesFacade();
             ff.failOnAllocate = true;
             try {
-                MmapSegment.create(ff, path, 0L, sizeBytes);
+                MmapSegment.create(ff, path, 0L, sizeBytes).close();
                 fail("expected MmapSegmentException from failed pre-allocation");
             } catch (MmapSegmentException expected) {
                 assertTrue(expected.getMessage(),
@@ -168,7 +168,7 @@ public class MmapSegmentTest {
             FaultyFilesFacade ff = new FaultyFilesFacade();
             ff.failOnOpenCleanRW = true;
             try {
-                MmapSegment.create(ff, path, 0L, sizeBytes);
+                MmapSegment.create(ff, path, 0L, sizeBytes).close();
                 fail("expected MmapSegmentException from openCleanRW returning -1");
             } catch (MmapSegmentException expected) {
                 assertTrue(expected.getMessage(),
@@ -196,7 +196,7 @@ public class MmapSegmentTest {
             int attempts = 50;
             for (int i = 0; i < attempts; i++) {
                 try {
-                    MmapSegment.create(ff, tmpDir + "/seg-" + i + ".sfa", 0L, sizeBytes);
+                    MmapSegment.create(ff, tmpDir + "/seg-" + i + ".sfa", 0L, sizeBytes).close();
                     fail("expected MmapSegmentException on iteration " + i);
                 } catch (MmapSegmentException ignored) {
                     // expected
@@ -605,8 +605,27 @@ public class MmapSegmentTest {
         }
 
         @Override
+        public int openCleanRW(long pathPtr, long size) {
+            openCleanRWCalls++;
+            if (failOnOpenCleanRW) {
+                return -1;
+            }
+            return INSTANCE.openCleanRW(pathPtr, size);
+        }
+
+        @Override
         public int openRW(String path) {
             return INSTANCE.openRW(path);
+        }
+
+        @Override
+        public int openRW(long pathPtr) {
+            return INSTANCE.openRW(pathPtr);
+        }
+
+        @Override
+        public long length(long pathPtr) {
+            return INSTANCE.length(pathPtr);
         }
 
         @Override
@@ -622,6 +641,7 @@ public class MmapSegmentTest {
 
         @Override
         public boolean remove(long pathPtr) {
+            removeCalls++;
             return INSTANCE.remove(pathPtr);
         }
 

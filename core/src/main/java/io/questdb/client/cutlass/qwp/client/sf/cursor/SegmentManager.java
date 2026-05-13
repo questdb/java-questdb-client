@@ -25,10 +25,11 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
-import io.questdb.client.std.str.StringSink;
+import io.questdb.client.std.str.DirectUtf8Sink;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -70,8 +71,13 @@ public final class SegmentManager implements QuietCloseable {
     private final Object lock = new Object();
     private final long maxTotalBytes;
     // Reused by the manager worker thread to build spare-segment paths
-    // without per-rotation String.format / concat allocation.
-    private final StringSink pathSink = new StringSink();
+    // directly into native memory. Each rotation writes the path bytes plus
+    // a trailing NUL terminator into the same buffer, and passes the
+    // pointer to the long-ptr Files / MmapSegment overloads -- eliminating
+    // the byte[] + native malloc pair that Files.pathPtr(String) would
+    // otherwise allocate per call. Sized for typical SF directory paths;
+    // grows on demand if a longer path is registered. Closed in close().
+    private final DirectUtf8Sink pathScratch = new DirectUtf8Sink(256);
     private final long pollNanos;
     // Reused by the worker thread each tick to snapshot `rings` under the
     // lock without per-tick allocation. Owned exclusively by workerLoop().
@@ -160,6 +166,10 @@ public final class SegmentManager implements QuietCloseable {
             }
             workerThread = null;
         }
+        // Free the rotation-path native scratch buffer. Safe to do here
+        // (after the worker has joined) since the buffer is only touched
+        // on the worker thread.
+        pathScratch.close();
     }
 
     /**
@@ -307,13 +317,27 @@ public final class SegmentManager implements QuietCloseable {
      * provisional at create time (SegmentRing.appendOrFsn rebases it at
      * rotation). Pattern: {@code <dir>/sf-<gen:016x>.sfa}. Recovery
      * discovers segments by extension + header magic, not by filename.
+     * <p>
+     * Builds the path bytes directly into {@link #pathScratch} and writes
+     * a trailing NUL so the same buffer can be handed to the long-ptr
+     * {@link FilesFacade} overloads (no per-rotation byte[] + native
+     * malloc). The String returned is the same path without the NUL --
+     * captured before terminating so it is suitable for {@link MmapSegment#path()}
+     * and exception messages.
      */
     private String nextSparePath(String dir) {
-        pathSink.clear();
-        pathSink.put(dir).put("/sf-");
-        Numbers.appendHex(pathSink, fileGeneration.getAndIncrement(), true);
-        pathSink.put(".sfa");
-        return pathSink.toString();
+        pathScratch.clear();
+        pathScratch.putAscii(dir).putAscii("/sf-");
+        Numbers.appendHex(pathScratch, fileGeneration.getAndIncrement(), true);
+        pathScratch.putAscii(".sfa");
+        String displayPath = pathScratch.toString();
+        // Trailing NUL must be appended AFTER toString() captures the path
+        // text -- DirectUtf8Sink.toString reads the full sink contents and
+        // would otherwise include the terminator in the result. Use putAny
+        // so the assertion in DirectUtf8Sink.put(byte) does not trip on a
+        // non-negative byte.
+        pathScratch.putAny((byte) 0);
+        return displayPath;
     }
 
     private void serviceRing(RingEntry e) {
@@ -355,7 +379,14 @@ public final class SegmentManager implements QuietCloseable {
                         spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
                     } else {
                         path = nextSparePath(e.dir);
-                        spare = MmapSegment.create(path, e.ring.nextSeqHint(), segmentSizeBytes);
+                        // Native path bytes (NUL-terminated) live in pathScratch
+                        // from the call above. Hand them straight to MmapSegment.create
+                        // via its long-ptr overload, bypassing the byte[] + native
+                        // malloc that the String overload would incur on every
+                        // rotation.
+                        spare = MmapSegment.create(FilesFacade.INSTANCE,
+                                pathScratch.ptr(), path,
+                                e.ring.nextSeqHint(), segmentSizeBytes);
                     }
                     Runnable installHook = beforeInstallSyncHook;
                     if (installHook != null) {

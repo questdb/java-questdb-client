@@ -89,7 +89,24 @@ public interface FilesFacade {
 
     int openCleanRW(String path, long size);
 
+    /**
+     * Variant of {@link #openCleanRW(String, long)} taking a pre-encoded
+     * native UTF-8 path pointer; lets callers in hot paths cache the encoded
+     * path (e.g. via a reused {@code DirectUtf8Sink}) and skip the per-call
+     * {@code byte[]} + native-malloc allocation.
+     */
+    int openCleanRW(long pathPtr, long size);
+
     int openRW(String path);
+
+    /** Variant of {@link #openRW(String)} taking a pre-encoded native UTF-8 path pointer. */
+    int openRW(long pathPtr);
+
+    /**
+     * Variant of {@code length(String)} taking a pre-encoded native UTF-8 path
+     * pointer; same allocation-elision rationale as {@link #openRW(long)}.
+     */
+    long length(long pathPtr);
 
     long read(int fd, long addr, long len, long offset);
 

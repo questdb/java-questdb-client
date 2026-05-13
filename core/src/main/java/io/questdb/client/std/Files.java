@@ -144,6 +144,17 @@ public final class Files {
     }
 
     /**
+     * Variant of {@link #openRW(String)} that takes a pre-encoded native UTF-8
+     * path pointer (from {@link #allocNativePath(String)} or a reused
+     * {@code DirectUtf8Sink}). Lets callers in hot paths avoid the {@code
+     * byte[]} + native-malloc allocations that {@link #pathPtr(String)} incurs
+     * on every call. The pointer must reference a null-terminated UTF-8 string.
+     */
+    public static int openRW(long pathPtr) {
+        return openRW0(pathPtr);
+    }
+
+    /**
      * Opens {@code path} for append-only writes, creating it (mode 0644) if
      * absent. Every {@link #append(int, long, long)} writes at end-of-file
      * regardless of the current logical position. Returns a non-negative fd
@@ -175,6 +186,16 @@ public final class Files {
     }
 
     /**
+     * Variant of {@link #openCleanRW(String, long)} taking a pre-encoded
+     * native UTF-8 path pointer; lets callers cache the encoded path and
+     * skip the per-call {@code byte[]} + native-malloc that
+     * {@link #pathPtr(String)} incurs.
+     */
+    public static int openCleanRW(long pathPtr, long size) {
+        return openCleanRW0(pathPtr, size);
+    }
+
+    /**
      * Returns the on-disk size of {@code path} via {@code stat}, or -1 if
      * the path does not exist or is otherwise unreadable.
      */
@@ -185,6 +206,14 @@ public final class Files {
         } finally {
             freePathPtr(ptr);
         }
+    }
+
+    /**
+     * Variant of {@link #length(String)} taking a pre-encoded native UTF-8
+     * path pointer; same allocation-elision rationale as {@link #openRW(long)}.
+     */
+    public static long length(long pathPtr) {
+        return length0(pathPtr);
     }
 
     /**
