@@ -853,6 +853,14 @@ public class QwpWebSocketSender implements Sender {
             // SCHEMA_MISMATCH HALT) from users who only call close() and
             // never call flush() afterwards.
             Throwable terminalError = null;
+            // Snapshot the latched terminal error that the user thread has
+            // ALREADY caught (via flush()/at()) before close() ran. If
+            // flushPendingRows/drainOnClose below also rethrow the same
+            // instance, dropping it at the final rethrow avoids
+            // try-with-resources self-suppression: Throwable.addSuppressed
+            // raises IllegalArgumentException when primary == suppressed.
+            Throwable alreadyOwnedByUser = (cursorSendLoop != null && !cursorSendLoop.hasUnsurfacedError())
+                    ? cursorSendLoop.getLastError() : null;
 
             try {
                 // Only drain when both the engine and the I/O loop are wired
@@ -1019,6 +1027,13 @@ public class QwpWebSocketSender implements Sender {
 
             LOG.info("QwpWebSocketSender closed");
 
+            // If close() ended up holding the same instance the user already
+            // caught earlier, suppress the rethrow. The user's catch block
+            // wraps close() (try-with-resources), and Throwable refuses
+            // self-suppression.
+            if (terminalError != null && terminalError == alreadyOwnedByUser) {
+                terminalError = null;
+            }
             rethrowTerminal(terminalError);
         }
     }
