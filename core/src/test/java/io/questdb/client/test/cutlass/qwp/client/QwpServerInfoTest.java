@@ -46,7 +46,8 @@ public class QwpServerInfoTest {
                 0xCAFEBABE,
                 1_700_000_000_000_000_000L,
                 "cluster-x",
-                "node-7"
+                "node-7",
+                "eu-west-1a"
         );
         Assert.assertEquals(QwpEgressMsgKind.ROLE_PRIMARY, info.getRole());
         Assert.assertEquals(42L, info.getEpoch());
@@ -54,6 +55,14 @@ public class QwpServerInfoTest {
         Assert.assertEquals(1_700_000_000_000_000_000L, info.getServerWallNs());
         Assert.assertEquals("cluster-x", info.getClusterId());
         Assert.assertEquals("node-7", info.getNodeId());
+        Assert.assertEquals("eu-west-1a", info.getZoneId());
+    }
+
+    @Test
+    public void testNullZoneIdAccessor() {
+        QwpServerInfo info = new QwpServerInfo(
+                QwpEgressMsgKind.ROLE_STANDALONE, 0L, 0, 0L, "c", "n", null);
+        Assert.assertNull(info.getZoneId());
     }
 
     @Test
@@ -77,30 +86,32 @@ public class QwpServerInfoTest {
         QwpServerInfo info = new QwpServerInfo(
                 QwpEgressMsgKind.ROLE_REPLICA,
                 7L,
-                0x10,
+                QwpEgressMsgKind.CAP_ZONE,
                 1234L,
                 "myCluster",
-                "myNode"
+                "myNode",
+                "myZone"
         );
         String s = info.toString();
         Assert.assertTrue("expected role name in toString: " + s, s.contains("REPLICA"));
         Assert.assertTrue("expected epoch in toString: " + s, s.contains("epoch=7"));
         Assert.assertTrue("expected clusterId in toString: " + s, s.contains("myCluster"));
         Assert.assertTrue("expected nodeId in toString: " + s, s.contains("myNode"));
-        Assert.assertTrue("expected hex capabilities in toString: " + s, s.contains("0x10"));
+        Assert.assertTrue("expected zoneId in toString: " + s, s.contains("myZone"));
+        Assert.assertTrue("expected hex capabilities in toString: " + s, s.contains("0x1"));
         Assert.assertTrue("expected serverWallNs in toString: " + s, s.contains("1234"));
     }
 
     @Test
     public void testToStringHandlesUnknownRole() {
-        QwpServerInfo info = new QwpServerInfo((byte) 99, 0L, 0, 0L, "", "");
+        QwpServerInfo info = new QwpServerInfo((byte) 99, 0L, 0, 0L, "", "", null);
         Assert.assertTrue(info.toString().contains("UNKNOWN(99)"));
     }
 
     @Test
     public void testRoleMismatchExceptionGetters() {
         QwpServerInfo lastObserved = new QwpServerInfo(
-                QwpEgressMsgKind.ROLE_REPLICA, 1L, 0, 0L, "c", "n");
+                QwpEgressMsgKind.ROLE_REPLICA, 1L, 0, 0L, "c", "n", null);
         QwpRoleMismatchException ex = new QwpRoleMismatchException(
                 "primary", lastObserved, "no primary endpoint available");
 

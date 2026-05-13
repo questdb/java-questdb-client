@@ -595,14 +595,16 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         try {
             decoder.decode(buf, payloadPtr, payloadLen);
         } catch (QwpDecodeException e) {
-            // Same invariant as releaseBuffer: a slot is always free for a buf
-            // we took out of the pool moments ago. Close-on-failure is a
-            // defensive guard against future refactors breaking that invariant.
+            // Includes QwpProtocolVersionException: an out-of-range version
+            // byte mid-stream is frame corruption (the upgrade-time version
+            // is fixed for the connection), so it routes through the same
+            // transient transport-error path as any other decode failure.
+            // The connect loop reconnects elsewhere; per failover.md §6 a
+            // server that consistently emits garbage will surface as
+            // round-exhaustion eventually.
             if (!freeBuffers.offer(buf)) {
                 buf.close();
             }
-            // A decode failure leaves the client-side decoder out of step with
-            // the server's byte stream: the next frame cannot be trusted.
             emitTerminalTransportError("decode failure: " + e.getMessage());
             currentQueryDone = true;
             return;

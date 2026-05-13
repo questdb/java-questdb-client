@@ -47,6 +47,8 @@ import java.nio.charset.StandardCharsets;
  *  [HEADER_SIZE bytes] [msg_kind:u8] [role:u8] [epoch:u64] [capabilities:u32]
  *  [server_wall_ns:i64] [cluster_id_len:u16] [cluster_id_bytes]
  *  [node_id_len:u16] [node_id_bytes]
+ *  -- present iff (capabilities &amp; CAP_ZONE) != 0 --
+ *  [zone_id_len:u16] [zone_id_bytes]
  * </pre>
  */
 public class QwpServerInfoDecoderTest {
@@ -112,7 +114,10 @@ public class QwpServerInfoDecoderTest {
             int len = totalLen(clusterId, nodeId);
             long buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
             try {
-                writeFrame(buf, QwpEgressMsgKind.ROLE_REPLICA, 1L, 1, 1L, clusterId, nodeId);
+                // capabilities=2 keeps the bit pattern non-zero without setting
+                // CAP_ZONE (0x01); we don't want the decoder to expect a zone
+                // trailer here.
+                writeFrame(buf, QwpEgressMsgKind.ROLE_REPLICA, 1L, 2, 1L, clusterId, nodeId);
                 QwpServerInfo info = QwpServerInfoDecoder.decode(buf, len);
                 Assert.assertEquals(clusterId, info.getClusterId());
                 Assert.assertEquals(nodeId, info.getNodeId());
@@ -269,6 +274,112 @@ public class QwpServerInfoDecoderTest {
     }
 
     @Test
+    public void testZoneIdRoundTripWhenCapZoneSet() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String clusterId = "cluster-z";
+            String nodeId = "node-z";
+            String zoneId = "eu-west-1a";
+            int len = totalLenWithZone(clusterId, nodeId, zoneId);
+            long buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+            try {
+                writeFrameWithZone(buf, QwpEgressMsgKind.ROLE_REPLICA, 0L,
+                        QwpEgressMsgKind.CAP_ZONE, 0L, clusterId, nodeId, zoneId);
+                QwpServerInfo info = QwpServerInfoDecoder.decode(buf, len);
+                Assert.assertEquals(zoneId, info.getZoneId());
+                Assert.assertEquals(clusterId, info.getClusterId());
+                Assert.assertEquals(nodeId, info.getNodeId());
+            } finally {
+                Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testZoneIdEmptyStringWhenCapZoneSet() throws Exception {
+        // CAP_ZONE bit + zero-length zone is a legitimate state: the server
+        // advertises CAP_ZONE but the operator left zone unset on this node.
+        // The trailer is still present (length 0), so the decoder returns "".
+        TestUtils.assertMemoryLeak(() -> {
+            int len = totalLenWithZone("c", "n", "");
+            long buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+            try {
+                writeFrameWithZone(buf, QwpEgressMsgKind.ROLE_PRIMARY, 0L,
+                        QwpEgressMsgKind.CAP_ZONE, 0L, "c", "n", "");
+                QwpServerInfo info = QwpServerInfoDecoder.decode(buf, len);
+                Assert.assertEquals("", info.getZoneId());
+            } finally {
+                Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testZoneIdNullWhenCapZoneUnset() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // capabilities=0 keeps CAP_ZONE unset; decoder must skip the
+            // trailer and surface null on getZoneId().
+            int len = totalLen("c", "n");
+            long buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+            try {
+                writeFrame(buf, QwpEgressMsgKind.ROLE_STANDALONE, 0L, 0, 0L, "c", "n");
+                QwpServerInfo info = QwpServerInfoDecoder.decode(buf, len);
+                Assert.assertNull(info.getZoneId());
+            } finally {
+                Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testTruncatedBeforeZoneIdLengthRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // CAP_ZONE bit set but the buffer ends right after node_id, no
+            // u16 zone-len present. Decoder must throw rather than read past
+            // the end of the native buffer.
+            int payloadLen = totalLen("c", "n");
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                writeFrame(buf, QwpEgressMsgKind.ROLE_PRIMARY, 0L,
+                        QwpEgressMsgKind.CAP_ZONE, 0L, "c", "n");
+                QwpServerInfoDecoder.decode(buf, payloadLen);
+                Assert.fail("decoder must reject CAP_ZONE frame missing the zone trailer");
+            } catch (QwpDecodeException expected) {
+                Assert.assertTrue("error mentions zone_id: " + expected.getMessage(),
+                        expected.getMessage().contains("zone_id"));
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testZoneIdLengthOvershootsPayloadRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // CAP_ZONE set, valid cluster_id and node_id, then a zone length
+            // that overshoots the remainder by claiming 1234 bytes when only 2
+            // are present.
+            String clusterId = "c";
+            String nodeId = "n";
+            int payloadLen = totalLen(clusterId, nodeId) + 2 + 2;
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                writeFrame(buf, QwpEgressMsgKind.ROLE_PRIMARY, 0L,
+                        QwpEgressMsgKind.CAP_ZONE, 0L, clusterId, nodeId);
+                int zoneLenOff = totalLen(clusterId, nodeId);
+                Unsafe.getUnsafe().putShort(buf + zoneLenOff, (short) 1234);
+                QwpServerInfoDecoder.decode(buf, payloadLen);
+                Assert.fail("decoder must reject zone_id length that overshoots remainder");
+            } catch (QwpDecodeException expected) {
+                String msg = expected.getMessage();
+                Assert.assertTrue("error mentions zone_id: " + msg, msg.contains("zone_id"));
+                Assert.assertTrue("error mentions overshoot length: " + msg, msg.contains("1234"));
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testRoleByteIsCarriedThroughUnchanged() throws Exception {
         // Decoder is intentionally tolerant of unknown role bytes -- it surfaces
         // them via QwpServerInfo.roleName as UNKNOWN(n) rather than rejecting.
@@ -291,6 +402,24 @@ public class QwpServerInfoDecoderTest {
         return OFF_CLUSTER_ID_LEN
                 + 2 + clusterId.getBytes(StandardCharsets.UTF_8).length
                 + 2 + nodeId.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    private static int totalLenWithZone(String clusterId, String nodeId, String zoneId) {
+        return totalLen(clusterId, nodeId)
+                + 2 + zoneId.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    private static void writeFrameWithZone(long buf, byte role, long epoch, int capabilities,
+                                           long serverWallNs, String clusterId, String nodeId,
+                                           String zoneId) {
+        writeFrame(buf, role, epoch, capabilities, serverWallNs, clusterId, nodeId);
+        long p = buf + totalLen(clusterId, nodeId);
+        byte[] zBytes = zoneId.getBytes(StandardCharsets.UTF_8);
+        Unsafe.getUnsafe().putShort(p, (short) zBytes.length);
+        p += 2;
+        for (byte zByte : zBytes) {
+            Unsafe.getUnsafe().putByte(p++, zByte);
+        }
     }
 
     private static void writeFrame(long buf, byte role, long epoch, int capabilities,

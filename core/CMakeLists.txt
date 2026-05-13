@@ -53,6 +53,7 @@ set(
         src/main/c/share/cpprt_overrides.cpp
         src/main/c/share/byte_sink.cpp
         src/main/c/share/byte_sink.h
+        src/main/c/share/crc32c.c
 )
 
 # libzstd is included via a git submodule at src/main/c/share/zstd (pinned to

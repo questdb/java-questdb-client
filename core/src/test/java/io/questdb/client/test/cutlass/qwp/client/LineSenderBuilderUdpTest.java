@@ -73,7 +73,10 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
 
     @Test
     public void testUdpScheme_noAddr_throws() {
-        assertBadConfig("udp::foo=bar;", "addr is missing");
+        // sf-client.md §4.6 now rejects unknown keys, so a valid key
+        // (multicast_ttl=) is used to drive the parser past key parsing
+        // and surface the missing-addr error on its own.
+        assertBadConfig("udp::multicast_ttl=1;", "addr is missing");
     }
 
     @Test
@@ -156,15 +159,6 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
                         .address("localhost")
                         .httpToken("token"),
                 "not supported for UDP");
-    }
-
-    @Test
-    public void testUdp_inFlightWindowSizeNotSupported() {
-        assertThrowsAny(
-                () -> Sender.builder(Sender.Transport.UDP)
-                        .address("localhost")
-                        .inFlightWindowSize(1000),
-                "only supported for WebSocket");
     }
 
     @Test
@@ -276,11 +270,6 @@ public class LineSenderBuilderUdpTest extends AbstractTest {
                         .address("localhost")
                         .enableTls(),
                 "TLS is not supported for UDP");
-    }
-
-    @Test
-    public void testUdpScheme_inFlightWindow_fails() {
-        assertBadConfig("udp::addr=localhost:9007;in_flight_window=64;", "only supported for WebSocket");
     }
 
     @Test

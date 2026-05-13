@@ -25,11 +25,16 @@
 package io.questdb.client.test.cutlass.line;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.auth.AuthUtils;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Test;
 
+import javax.security.auth.DestroyFailedException;
+import java.security.PrivateKey;
+
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.fail;
 
 /**
@@ -44,7 +49,7 @@ public class LineSenderBuilderTest {
 
     @Test
     public void testAddressDoubleSet_firstAddressThenAddress() throws Exception {
-        assertMemoryLeak(() -> assertThrows("mismatch",
+        assertMemoryLeak(() -> assertThrows("only a single address",
                 Sender.builder(Sender.Transport.TCP).address(LOCALHOST).address("127.0.0.1")));
     }
 
@@ -165,6 +170,8 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost:8080;max_buf_size=notanumber;", "invalid max_buf_size [value=notanumber]");
             assertConfStrError("http::addr=localhost:8080;init_buf_size=notanumber;", "invalid init_buf_size [value=notanumber]");
             assertConfStrError("http::addr=localhost:8080;init_buf_size=-42;", "buffer capacity cannot be negative [capacity=-42]");
+            assertConfStrError("http::addr=localhost:8080;max_buf_size=4g;", "max_buf_size exceeds maximum [value=4g]");
+            assertConfStrError("http::addr=localhost:8080;init_buf_size=4g;", "init_buf_size exceeds maximum [value=4g]");
             assertConfStrError("http::addr=localhost:8080;auto_flush_rows=0;", "invalid auto_flush_rows [value=0]");
             assertConfStrError("http::addr=localhost:8080;auto_flush_rows=notanumber;", "invalid auto_flush_rows [value=notanumber]");
             assertConfStrError("http::addr=localhost:8080;auto_flush=invalid;", "invalid auto_flush [value=invalid, allowed-values=[on, off]]");
@@ -209,12 +216,33 @@ public class LineSenderBuilderTest {
             assertConfStrOk("addr=localhost:8080", "token=foo", "retry_timeout=1000", "max_buf_size=1000000", "protocol_version=2");
             assertConfStrOk("addr=localhost:8080", "token=foo", "retry_timeout=1000", "max_buf_size=1000000", "protocol_version=1");
             assertConfStrOk("http::addr=localhost:8080;token=foo;max_buf_size=1000000;retry_timeout=1000;protocol_version=2;");
+            assertConfStrOk("http::addr=localhost:8080;max_buf_size=100m;protocol_version=2;");
+            assertConfStrOk("http::addr=localhost:8080;max_buf_size=1G;protocol_version=2;");
+            assertConfStrOk("http::addr=localhost:8080;init_buf_size=64k;protocol_version=2;");
+            assertConfStrOk("http::addr=localhost:8080;init_buf_size=128KB;max_buf_size=2M;protocol_version=2;");
             assertConfStrOk("https::addr=localhost:8080;tls_verify=unsafe_off;auto_flush_rows=100;protocol_version=2;");
             assertConfStrOk("https::addr=localhost:8080;tls_verify=unsafe_off;auto_flush_rows=100;protocol_version=2;max_name_len=256;");
             assertConfStrOk("https::addr=localhost:8080;tls_verify=on;protocol_version=2;");
             assertConfStrOk("https::addr=localhost:8080;tls_verify=on;protocol_version=3;");
             assertConfStrError("https::addr=2001:0db8:85a3:0000:0000:8a2e:0370:7334;tls_verify=on;", "cannot parse a port from the address, use IPv4 address or a domain name [address=2001:0db8:85a3:0000:0000:8a2e:0370:7334]");
             assertConfStrError("https::addr=[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:9000;tls_verify=on;", "cannot parse a port from the address, use IPv4 address or a domain name [address=[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:9000]");
+
+            // sf-client.md §4.6: unknown keys must be rejected, not silently
+            // ignored. Forward-compat is via the spec, so silent ignore would
+            // let language clients drift on the same connect string.
+            assertConfStrError("http::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            assertConfStrError("tcp::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            assertConfStrError("ws::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            assertConfStrError("udp::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            // The unknown-key error must surface even when the value would
+            // itself be malformed -- the key is the reportable defect.
+            assertConfStrError("http::addr=localhost;not_a_real_key=", "unknown configuration key [key=not_a_real_key]");
+
+            // in_flight_window is silently accepted as a no-op for backward
+            // compatibility. The store-and-forward mechanism replaces it.
+            assertConfStrOk("http::addr=localhost;in_flight_window=10000;protocol_version=2;");
+            assertConfStrOk("udp::addr=localhost;in_flight_window=10000;");
+            assertConfStrOk("http::addr=localhost;in_flight_window=;protocol_version=2;");
         });
     }
 
@@ -306,12 +334,6 @@ public class LineSenderBuilderTest {
     }
 
     @Test
-    public void testHttpTokenNotSupportedForTcp() throws Exception {
-        assertMemoryLeak(() -> assertThrows("HTTP token authentication is not supported for TCP protocol",
-                Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpToken("foo")));
-    }
-
-    @Test
     public void testHttpPathNotSupportedForTcp() throws Exception {
         assertMemoryLeak(() -> assertThrows("HTTP path is not supported for TCP protocol",
                 () -> Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpPath("/custom/path")));
@@ -321,6 +343,12 @@ public class LineSenderBuilderTest {
     public void testHttpSettingPathNotSupportedForTcp() throws Exception {
         assertMemoryLeak(() -> assertThrows("HTTP settings path is not supported for TCP protocol",
                 () -> Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpSettingPath("/custom/settings")));
+    }
+
+    @Test
+    public void testHttpTokenNotSupportedForTcp() throws Exception {
+        assertMemoryLeak(() -> assertThrows("HTTP token authentication is not supported for TCP protocol",
+                Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpToken("foo")));
     }
 
     @Test
@@ -395,6 +423,34 @@ public class LineSenderBuilderTest {
     }
 
     @Test
+    public void testPlainPrivateKey_connectionRefused() throws Exception {
+        // privateKey(PrivateKey) is the bring-your-own-key alternative to
+        // authToken(String): the caller hands over a PrivateKey already in
+        // memory (e.g. fetched from an HSM/KMS) and retains ownership of
+        // its lifecycle. Verify the builder accepts it and walks all the
+        // way to the connect step (which fails -- nothing listens on
+        // 19003), and that the key is NOT destroyed by the builder
+        // (shouldDestroyPrivKey stays false on this path).
+        assertMemoryLeak(() -> {
+            PrivateKey key = AuthUtils.toPrivateKey(AUTH_TOKEN_KEY1);
+            try {
+                assertThrows("could not connect",
+                        Sender.builder(Sender.Transport.TCP)
+                                .enableAuth("foo")
+                                .privateKey(key)
+                                .address(LOCALHOST + ":19003"));
+                assertFalse("privateKey() must not destroy a caller-owned key", key.isDestroyed());
+            } finally {
+                try {
+                    key.destroy();
+                } catch (DestroyFailedException ignore) {
+                    // best-effort; some PrivateKey impls reject destroy()
+                }
+            }
+        });
+    }
+
+    @Test
     public void testPlain_connectionRefused() throws Exception {
         assertMemoryLeak(() -> assertThrows("could not connect",
                 Sender.builder(Sender.Transport.TCP).address(LOCALHOST + ":19003")));
@@ -456,6 +512,49 @@ public class LineSenderBuilderTest {
     public void testUsernamePasswordAuthNotSupportedForTcp() throws Exception {
         assertMemoryLeak(() -> assertThrows("username/password authentication is not supported for TCP protocol",
                 Sender.builder(Sender.Transport.TCP).address(LOCALHOST).httpUsernamePassword("foo", "bar")));
+    }
+
+    @Test
+    public void testZoneSilentlyAcceptedOnIngress() throws Exception {
+        // failover.md §1.1 / changelog 2026-05-08: zone= is egress-only effective.
+        // Ingress is zone-blind (pinned to v1) and silently accepts the key so
+        // the same connect string can be shared across ingress and egress
+        // clients without a per-startup WARN that would fire spuriously for a
+        // setting already working on its egress siblings. Exercise every
+        // ingress protocol -- HTTP/HTTPS, WebSocket, TCP, UDP -- and confirm
+        // the parser does not raise on the key. A connect-time failure is
+        // tolerated (these are unreachable test addresses) as long as the
+        // exception message does not point at zone= as the offender.
+        assertMemoryLeak(() -> {
+            // protocol_version is pinned on HTTP/HTTPS so fromConfig does not
+            // contact the server for auto-detection.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";zone=eu-west-1a;protocol_version=2;");
+            assertConfStrOk("https::addr=" + LOCALHOST + ";zone=eu-west-1a;tls_verify=unsafe_off;protocol_version=2;");
+            // UDP build is purely local; no I/O.
+            assertConfStrOk("udp::addr=" + LOCALHOST + ";zone=eu-west-1a;");
+            // WebSocket and TCP attempt synchronous connect at build time.
+            // Allow LineSenderException for connect failure but require the
+            // parser did not flag zone=.
+            assertConfStrAcceptsZoneKey("ws::addr=127.0.0.1:1;zone=eu-west-1a;");
+            assertConfStrAcceptsZoneKey("tcp::addr=127.0.0.1:1;zone=eu-west-1a;");
+            // Empty zone value is also accepted: an empty value after `=`
+            // is well-formed and the zone branch silently consumes it.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";zone=;protocol_version=2;");
+            // Mixed-case zone identifier is accepted verbatim by the ingress
+            // parser; case-insensitivity is the egress comparator's
+            // responsibility, not the parser's.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";zone=EU-West-1a;protocol_version=2;");
+        });
+    }
+
+    private static void assertConfStrAcceptsZoneKey(String conf) {
+        try {
+            Sender.fromConfig(conf).close();
+        } catch (LineSenderException e) {
+            if (e.getMessage().contains("zone")) {
+                fail("parser must not flag zone=, was: " + e.getMessage());
+            }
+        }
     }
 
     private static void assertConfStrError(String conf, String expectedError) {

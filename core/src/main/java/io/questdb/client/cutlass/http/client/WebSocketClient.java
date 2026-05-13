@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.http.client;
 
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketFrameParser;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketOpcode;
@@ -75,6 +76,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int PARSE_INCOMPLETE = 0;
     private static final int PARSE_NEED_MORE = -1;
     private static final int PARSE_OK = 1;
+    private static final String QUESTDB_ROLE_HEADER_NAME = "X-QuestDB-Role:";
+    private static final String QUESTDB_ZONE_HEADER_NAME = "X-QuestDB-Zone:";
+    private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
+    private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -124,7 +129,21 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int recvBufSize;
     private int recvPos;      // Write position
     private int recvReadPos;  // Read position
+    // Set during upgrade response validation when the server echoed
+    // X-QWP-Durable-Ack: enabled. Tells the sender it landed on a server that
+    // will actually emit STATUS_DURABLE_ACK frames, so its store-and-forward
+    // path can rely on durable-ack-driven trim. Absence (after opting in via
+    // setQwpRequestDurableAck) is the early-fail signal.
+    private boolean serverDurableAckEnabled;
     private int serverQwpVersion = 1;
+    private String upgradeRejectRole;
+    // Server-advertised zone identifier from the most recent rejected upgrade,
+    // captured from the X-QuestDB-Zone response header on a 421. Null when the
+    // header was absent or empty. Per failover.md §5 servers SHOULD emit this
+    // on every 421 reject so a client can record the host's zone tier without
+    // a successful upgrade. Reset to null on every upgrade() invocation.
+    private String upgradeRejectZone;
+    private int upgradeStatusCode;
     private boolean upgraded;
 
     public WebSocketClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
@@ -240,17 +259,6 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
-     * Closes the socket to force-unblock a thread blocked in send/recv.
-     * <p>
-     * Unlike {@link #disconnect()}, this method only closes the socket
-     * and does not reset client state. It is safe to call from a different
-     * thread than the one performing I/O.
-     */
-    public void forceDisconnect() {
-        Misc.free(socket);
-    }
-
-    /**
      * Returns the connected host.
      */
     public CharSequence getHost() {
@@ -289,10 +297,47 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Role from {@code X-QuestDB-Role} on the most recent rejected upgrade,
+     * or null when no such header was present.
+     */
+    public String getUpgradeRejectRole() {
+        return upgradeRejectRole;
+    }
+
+    /**
+     * Zone identifier from {@code X-QuestDB-Zone} on the most recent rejected
+     * upgrade, or null when the header was absent or empty (after trimming).
+     * Per {@code failover.md} §5 this is the upgrade-time companion to
+     * {@code SERVER_INFO.zone_id} so a client can classify a host's zone tier
+     * even when the upgrade did not succeed.
+     */
+    public String getUpgradeRejectZone() {
+        return upgradeRejectZone;
+    }
+
+    /**
+     * HTTP status code from the most recent rejected upgrade, or 0 if no
+     * upgrade rejection has been observed yet.
+     */
+    public int getUpgradeStatusCode() {
+        return upgradeStatusCode;
+    }
+
+    /**
      * Returns whether the WebSocket is connected and upgraded.
      */
     public boolean isConnected() {
         return upgraded && !closed && !socket.isClosed();
+    }
+
+    /**
+     * Returns true when the server echoed X-QWP-Durable-Ack: enabled in the
+     * 101 upgrade response. Meaningful only after {@link #upgrade} returns;
+     * always false when the client did not opt in via
+     * {@link #setQwpRequestDurableAck}.
+     */
+    public boolean isServerDurableAckEnabled() {
+        return serverDurableAckEnabled;
     }
 
     /**
@@ -486,6 +531,9 @@ public abstract class WebSocketClient implements QuietCloseable {
         if (upgraded) {
             return; // Already upgraded
         }
+        upgradeRejectRole = null;
+        upgradeRejectZone = null;
+        upgradeStatusCode = 0;
 
         // Generate random key
         byte[] keyBytes = new byte[16];
@@ -589,6 +637,23 @@ public abstract class WebSocketClient implements QuietCloseable {
         return true;
     }
 
+    private static boolean extractDurableAckEnabled(String response) {
+        int headerLen = QWP_DURABLE_ACK_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QWP_DURABLE_ACK_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                return value.equalsIgnoreCase(QWP_DURABLE_ACK_ENABLED_VALUE);
+            }
+        }
+        return false;
+    }
+
     private static int extractQwpVersion(String response) {
         int headerLen = QWP_VERSION_HEADER_NAME.length();
         int responseLen = response.length();
@@ -608,6 +673,64 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return 1;
+    }
+
+    private static String extractRoleHeader(String response) {
+        int headerLen = QUESTDB_ROLE_HEADER_NAME.length();
+        int responseLen = response.length();
+        int lineStart = response.indexOf("\r\n");
+        while (lineStart >= 0 && lineStart + 2 + headerLen <= responseLen) {
+            int hStart = lineStart + 2;
+            if (response.regionMatches(true, hStart, QUESTDB_ROLE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = hStart + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                return value.isEmpty() ? null : value;
+            }
+            lineStart = response.indexOf("\r\n", hStart);
+        }
+        return null;
+    }
+
+    private static String extractZoneHeader(String response) {
+        int headerLen = QUESTDB_ZONE_HEADER_NAME.length();
+        int responseLen = response.length();
+        int lineStart = response.indexOf("\r\n");
+        while (lineStart >= 0 && lineStart + 2 + headerLen <= responseLen) {
+            int hStart = lineStart + 2;
+            if (response.regionMatches(true, hStart, QUESTDB_ZONE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = hStart + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                return value.isEmpty() ? null : value;
+            }
+            lineStart = response.indexOf("\r\n", hStart);
+        }
+        return null;
+    }
+
+    private static int parseStatusCode(String statusLine) {
+        int sp1 = statusLine.indexOf(' ');
+        if (sp1 < 0 || sp1 + 4 > statusLine.length()) return 0;
+        if (sp1 + 4 < statusLine.length()) {
+            char afterCode = statusLine.charAt(sp1 + 4);
+            if (afterCode != ' ' && afterCode != '\r' && afterCode != '\n') {
+                return 0;
+            }
+        }
+        int code = 0;
+        for (int i = sp1 + 1; i < sp1 + 4; i++) {
+            char c = statusLine.charAt(i);
+            if (c < '0' || c > '9') return 0;
+            code = code * 10 + (c - '0');
+        }
+        return code;
     }
 
     private static int remainingTime(int timeoutMillis, long startTimeNanos) {
@@ -993,10 +1116,17 @@ public abstract class WebSocketClient implements QuietCloseable {
         }
         String response = new String(responseBytes, StandardCharsets.US_ASCII);
 
-        // Check status line
         if (!response.startsWith("HTTP/1.1 101")) {
             String statusLine = response.split("\r\n")[0];
-            throw new HttpClientException("WebSocket upgrade failed: ").put(statusLine);
+            upgradeStatusCode = parseStatusCode(statusLine);
+            if (upgradeStatusCode == 421) {
+                upgradeRejectRole = extractRoleHeader(response);
+                upgradeRejectZone = extractZoneHeader(response);
+            }
+            WebSocketUpgradeException ex = new WebSocketUpgradeException(
+                    upgradeStatusCode, upgradeRejectRole, "WebSocket upgrade failed: ");
+            ex.put(statusLine);
+            throw ex;
         }
 
         // Verify Upgrade: websocket (case-insensitive value per RFC 6455 Section 4.1)
@@ -1015,8 +1145,25 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("Invalid Sec-WebSocket-Accept header");
         }
 
-        // Extract X-QWP-Version (optional, defaults to 1 if absent)
+        // Extract X-QWP-Version (optional, defaults to 1 if absent).
+        // Reject a server-advertised version outside [1, qwpMaxVersion]: this
+        // is per-endpoint, not cluster-wide (a rolling upgrade can leave one
+        // node ahead of or behind its peers), so the connect loop classifies
+        // it as a transport error and walks to the next host. The typed
+        // QwpVersionMismatchException lets the cursor send loop's terminal
+        // classifier match by instanceof rather than message sniffing; see
+        // failover.md §6.
         serverQwpVersion = extractQwpVersion(response);
+        if (serverQwpVersion < 1 || serverQwpVersion > qwpMaxVersion) {
+            throw new QwpVersionMismatchException(serverQwpVersion, qwpMaxVersion);
+        }
+
+        // Extract X-QWP-Durable-Ack confirmation (optional, absent on servers
+        // without primary replication or when the client did not opt in).
+        // Only meaningful when qwpRequestDurableAck is true; the sender
+        // checks this value to fail at connect rather than silently
+        // missing trim signals.
+        serverDurableAckEnabled = extractDurableAckEnabled(response);
     }
 
     protected void dieWaiting(int n) {

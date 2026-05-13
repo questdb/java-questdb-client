@@ -32,6 +32,8 @@ open module io.questdb.test {
     requires org.slf4j;
     requires java.sql;
     requires org.postgresql.jdbc;
+    requires jmh.core;
+    requires ch.qos.logback.classic;
 
     exports io.questdb.client.test;
     exports io.questdb.client.test.cairo;

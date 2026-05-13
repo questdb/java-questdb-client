@@ -38,6 +38,15 @@ public final class QwpEgressMsgKind {
      */
     public static final byte CACHE_RESET = 0x17;
     public static final byte CANCEL = 0x14;
+    /**
+     * {@code SERVER_INFO.capabilities} bit advertising that the frame ends with
+     * an additional {@code zone_id:u16_len+utf8} field after {@code node_id}.
+     * Mirrors the server-side constant in
+     * {@code io.questdb.cutlass.qwp.codec.QwpEgressMsgKind#CAP_ZONE}; the
+     * decoder reads the trailer iff this bit is set, otherwise the frame ends
+     * after {@code node_id}.
+     */
+    public static final int CAP_ZONE = 0x00000001;
     public static final byte CREDIT = 0x15;
     /**
      * Server -> client. Ack for a successful non-SELECT query. Body:
@@ -81,8 +90,10 @@ public final class QwpEgressMsgKind {
      * Server -> client. Unsolicited frame delivered as the first QWP message
      * on every v2 WebSocket connection. Body (little-endian): {@code
      * msg_kind:u8, role:u8, epoch:u64, capabilities:u32, server_wall_ns:i64,
-     * cluster_id:u16_len+utf8, node_id:u16_len+utf8}. The byte-value 0x17 is
-     * claimed by {@link #CACHE_RESET}; SERVER_INFO lives at 0x18.
+     * cluster_id:u16_len+utf8, node_id:u16_len+utf8} followed by an optional
+     * {@code zone_id:u16_len+utf8} when the {@link #CAP_ZONE} bit is set in
+     * {@code capabilities}. The byte-value 0x17 is claimed by
+     * {@link #CACHE_RESET}; SERVER_INFO lives at 0x18.
      */
     public static final byte SERVER_INFO = 0x18;
 

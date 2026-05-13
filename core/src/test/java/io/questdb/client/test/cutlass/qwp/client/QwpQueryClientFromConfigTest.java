@@ -193,6 +193,31 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testAuthTimeoutMsAccepted() {
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;auth_timeout_ms=2500;")) {
+            Assert.assertEquals(2500, c.getAuthTimeoutMsForTest());
+        }
+    }
+
+    @Test
+    public void testAuthTimeoutMsDefaultIs15Seconds() {
+        // failover.md §1.1: default is 15_000.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;")) {
+            Assert.assertEquals(15_000, c.getAuthTimeoutMsForTest());
+        }
+    }
+
+    @Test
+    public void testAuthTimeoutMsNonIntegerRejected() {
+        assertReject("ws::addr=db:9000;auth_timeout_ms=fast;", "invalid auth_timeout_ms: fast");
+    }
+
+    @Test
+    public void testAuthTimeoutMsZeroRejected() {
+        assertReject("ws::addr=db:9000;auth_timeout_ms=0;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
     public void testBasicAuthAcceptedAlone() {
         assertParses("ws::addr=db:9000;username=alice;password=secret;");
     }
@@ -414,6 +439,41 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testFailoverMaxDurationMsAccepted() {
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;failover_max_duration_ms=12345;")) {
+            Assert.assertEquals(12345L, c.getFailoverMaxDurationMsForTest());
+        }
+    }
+
+    @Test
+    public void testFailoverMaxDurationMsDefaultIs30Seconds() {
+        // failover.md §1.3: default is 30_000.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;")) {
+            Assert.assertEquals(30_000L, c.getFailoverMaxDurationMsForTest());
+        }
+    }
+
+    @Test
+    public void testFailoverMaxDurationMsNegativeRejected() {
+        assertReject("ws::addr=db:9000;failover_max_duration_ms=-1;",
+                "failover_max_duration_ms must be >= 0");
+    }
+
+    @Test
+    public void testFailoverMaxDurationMsNonIntegerRejected() {
+        assertReject("ws::addr=db:9000;failover_max_duration_ms=forever;",
+                "invalid failover_max_duration_ms: forever");
+    }
+
+    @Test
+    public void testFailoverMaxDurationMsZeroIsUnbounded() {
+        // 0 means unbounded; the parser must accept it without complaint.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;failover_max_duration_ms=0;")) {
+            Assert.assertEquals(0L, c.getFailoverMaxDurationMsForTest());
+        }
+    }
+
+    @Test
     public void testFailoverOffAccepted() {
         assertParses("ws::addr=db:9000;failover=off;");
     }
@@ -436,6 +496,33 @@ public class QwpQueryClientFromConfigTest {
                 + "max_batch_rows=512;"
                 + "tls_verify=on;";
         assertParses(conf);
+    }
+
+    @Test
+    public void testLbStrategyKeyRejectedAsUnknown() {
+        // lb_strategy was removed: cluster-level load balancing is the
+        // server's concern, not the client's. The connect-string parser
+        // must surface its absence as an unknown-key error rather than
+        // silently swallowing the value.
+        assertReject("ws::addr=db:9000;lb_strategy=first;",
+                "unknown configuration key: lb_strategy");
+    }
+
+    @Test
+    public void testEndpointOrderPreserved() {
+        // The parser walks the declared host list in order and the client
+        // walks it in priority order. Three distinct hosts make the
+        // assertion robust against accidental rotation by any single step.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig(
+                "ws::addr=alpha:9000,bravo:9001,charlie:9002;")) {
+            Assert.assertEquals(3, c.getEndpointCountForTest());
+            Assert.assertEquals("alpha", c.getEndpointHostForTest(0));
+            Assert.assertEquals(9000, c.getEndpointPortForTest(0));
+            Assert.assertEquals("bravo", c.getEndpointHostForTest(1));
+            Assert.assertEquals(9001, c.getEndpointPortForTest(1));
+            Assert.assertEquals("charlie", c.getEndpointHostForTest(2));
+            Assert.assertEquals(9002, c.getEndpointPortForTest(2));
+        }
     }
 
     @Test
@@ -646,6 +733,49 @@ public class QwpQueryClientFromConfigTest {
         // parser's .isEmpty() check after trim(). The exact rejection message
         // is "empty addr entry".
         assertReject("ws::addr=a:9000, ,b:9000;", "empty addr entry");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_AcceptsZero() {
+        assertParses("ws::addr=a:9000;failover_max_duration_ms=0;");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_AcceptsPositive() {
+        assertParses("ws::addr=a:9000;failover_max_duration_ms=5000;");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_NegativeRejected() {
+        assertReject("ws::addr=a:9000;failover_max_duration_ms=-1;",
+                "failover_max_duration_ms must be >= 0");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_NonNumericRejected() {
+        assertReject("ws::addr=a:9000;failover_max_duration_ms=forever;",
+                "invalid failover_max_duration_ms: forever");
+    }
+
+    @Test
+    public void testAuthTimeout_AcceptsPositive() {
+        assertParses("ws::addr=a:9000;auth_timeout_ms=2500;");
+    }
+
+    @Test
+    public void testAuthTimeout_ZeroRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=0;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeout_NegativeRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=-50;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeout_NonNumericRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=forever;",
+                "invalid auth_timeout_ms: forever");
     }
 
     /**

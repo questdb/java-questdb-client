@@ -820,6 +820,26 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testBufferViewThrowsForUdpSender() throws Exception {
+        // The Sender public API exposes bufferView() but UDP has no
+        // accumulated request buffer to peek at -- the contract is to
+        // throw a LineSenderException naming the method.
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                try {
+                    sender.bufferView();
+                    Assert.fail("expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(
+                            "message should name bufferView, was: " + e.getMessage(),
+                            e.getMessage().contains("bufferView()"));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testCancelRowAfterMidRowSchemaChangeDoesNotLeakSchema() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();
@@ -1298,6 +1318,33 @@ public class QwpUdpSenderTest {
             RunResult result = runScenario(rows, 1024 * 1024);
             Assert.assertEquals(1, result.sendCount);
             assertRowsEqual(expectedRows(rows), decodeRows(result.packets));
+        });
+    }
+
+    @Test
+    public void testResetClearsBufferedRowsAndAllowsReuse() throws Exception {
+        // Sender.reset() is the public escape hatch from a partially-built
+        // batch. After it, the sender must accept a fresh table/row sequence
+        // and a subsequent flush must emit only the post-reset row -- the
+        // pre-reset accumulation must not leak into the wire.
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("scratch").longColumn("v", 1L).atNow();
+                sender.table("scratch").longColumn("v", 2L).atNow();
+
+                sender.reset();
+                Assert.assertEquals("reset() must not flush", 0, nf.sendCount);
+
+                sender.table("kept").longColumn("v", 99L).atNow();
+                sender.flush();
+                Assert.assertEquals(1, nf.sendCount);
+
+                List<DecodedRow> emitted = decodeRows(nf.packets);
+                Assert.assertEquals(1, emitted.size());
+                Assert.assertEquals("kept", emitted.get(0).table);
+                Assert.assertEquals(99L, emitted.get(0).values.get("v"));
+            }
         });
     }
 
