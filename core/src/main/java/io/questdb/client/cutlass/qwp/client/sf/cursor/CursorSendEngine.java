@@ -74,12 +74,6 @@ public final class CursorSendEngine implements QuietCloseable {
     // case close() also stops the manager. When the manager is shared across
     // many engines (one per Sender), the caller owns and closes it.
     private final boolean ownsManager;
-    // True when the constructor recovered an existing on-disk slot rather
-    // than starting fresh. Diagnostic accessor for tests and observability;
-    // cursor frames are self-sufficient (every frame carries full schema +
-    // full symbol-dict delta), so producer-side schema reset on recovery
-    // is not required.
-    private final boolean recoveredFromDisk;
     private final SegmentRing ring;
     private final long segmentSizeBytes;
     private final String sfDir;
@@ -87,6 +81,12 @@ public final class CursorSendEngine implements QuietCloseable {
     // mode (no slot, no lock). Released by {@link #close()}; the kernel
     // also drops it on hard process exit.
     private final SlotLock slotLock;
+    // True when the constructor recovered an existing on-disk slot rather
+    // than starting fresh. Diagnostic accessor for tests and observability;
+    // cursor frames are self-sufficient (every frame carries full schema +
+    // full symbol-dict delta), so producer-side schema reset on recovery
+    // is not required.
+    private final boolean wasRecoveredFromDisk;
     // Engine-owned mmap'd watermark file. {@code null} in memory mode and
     // in disk mode if open() failed (we proceed without it; recovery just
     // falls back to lowestBase - 1). Lifetime tied to the engine: opened
@@ -175,7 +175,7 @@ public final class CursorSendEngine implements QuietCloseable {
             // already on disk and corrupting ACK translation, trim, and replay.
             SegmentRing recovered = memoryMode ? null
                     : SegmentRing.openExisting(sfDir, segmentSizeBytes);
-            this.recoveredFromDisk = recovered != null;
+            this.wasRecoveredFromDisk = recovered != null;
             if (recovered != null) {
                 ringInProgress = recovered;
                 // Seed ackedFsn to one below the lowest segment's baseSeq.
@@ -582,7 +582,7 @@ public final class CursorSendEngine implements QuietCloseable {
      * needing a reset before the first send.
      */
     public boolean wasRecoveredFromDisk() {
-        return recoveredFromDisk;
+        return wasRecoveredFromDisk;
     }
 
     /**
