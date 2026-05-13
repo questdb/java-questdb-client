@@ -95,19 +95,24 @@ public class SenderConnectionDispatcherTest {
     }
 
     @Test
-    public void testFullInboxDropsAndCounts() throws Exception {
-        // Slow listener releases only when the test allows. Until then,
-        // every offer beyond capacity must be dropped (returning false) and
-        // counted via getDroppedNotifications.
+    public void testFullInboxDropsOldestAndCounts() throws Exception {
+        // Inherits sf-client.md section 14.6: on overflow, drop the OLDEST
+        // entry and admit the new one. Later connection events carry the
+        // freshest state, so dropping the head loses the least information.
         CountDownLatch unblock = new CountDownLatch(1);
-        AtomicInteger delivered = new AtomicInteger();
+        List<SenderConnectionEvent> received = new ArrayList<>();
+        Object lock = new Object();
+        CountDownLatch allDelivered = new CountDownLatch(5);
         try (SenderConnectionDispatcher d = new SenderConnectionDispatcher(ev -> {
             try {
                 unblock.await();
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
-            delivered.incrementAndGet();
+            synchronized (lock) {
+                received.add(ev);
+            }
+            allDelivered.countDown();
         }, /*capacity=*/ 4)) {
             // First offer starts the dispatcher and lands in the listener
             // immediately (and blocks there), freeing one slot. Now we can
@@ -118,10 +123,24 @@ public class SenderConnectionDispatcherTest {
                 Assert.assertTrue("inbox should accept offer " + i,
                         d.offer(buildEvent(i)));
             }
-            Assert.assertFalse("offer beyond capacity must drop",
+            // Inbox holds [1,2,3,4]. The next two offers each drop the head
+            // (1, then 2) to admit the new arrival, returning true.
+            Assert.assertTrue("offer beyond capacity must admit the new entry",
                     d.offer(buildEvent(5)));
-            Assert.assertFalse(d.offer(buildEvent(6)));
+            Assert.assertTrue(d.offer(buildEvent(6)));
             Assert.assertEquals(2L, d.getDroppedNotifications());
+
+            unblock.countDown();
+            Assert.assertTrue("all retained entries should deliver within 5s",
+                    allDelivered.await(5, TimeUnit.SECONDS));
+            synchronized (lock) {
+                long[] attempts = new long[received.size()];
+                for (int i = 0; i < received.size(); i++) {
+                    attempts[i] = received.get(i).getAttemptNumber();
+                }
+                Assert.assertArrayEquals("drop-oldest must retain the newest tail",
+                        new long[]{0, 3, 4, 5, 6}, attempts);
+            }
         } finally {
             unblock.countDown();
         }

@@ -94,19 +94,38 @@ public class SenderBuilderErrorApiTest {
     }
 
     @Test
-    public void testErrorInboxCapacityRejectsZeroAndNegative() {
-        try {
-            Sender.builder(Sender.Transport.WEBSOCKET).errorInboxCapacity(0);
-            Assert.fail("zero capacity must be rejected");
-        } catch (LineSenderException expected) {
-            Assert.assertTrue(expected.getMessage().contains("error_inbox_capacity"));
-            Assert.assertTrue(expected.getMessage().contains(">="));
+    public void testErrorInboxCapacityRejectsBelowSpecFloor() {
+        // sf-client.md section 4.4: minimum is 16. Values below the floor
+        // (including 0 and negative) must surface the floor in the message
+        // so users can fix their configuration.
+        int[] rejected = {-5, 0, 1, 2, 15};
+        for (int v : rejected) {
+            try {
+                Sender.builder(Sender.Transport.WEBSOCKET).errorInboxCapacity(v);
+                Assert.fail("capacity " + v + " must be rejected; spec floor is 16");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue("missing key in message: " + expected.getMessage(),
+                        expected.getMessage().contains("error_inbox_capacity"));
+                Assert.assertTrue("missing floor (16) in message: " + expected.getMessage(),
+                        expected.getMessage().contains(">= 16"));
+            }
         }
+        // The floor itself is accepted.
+        Sender.builder(Sender.Transport.WEBSOCKET).errorInboxCapacity(16);
+    }
+
+    @Test
+    public void testConnectStringRejectsErrorInboxCapacityBelowFloor() {
+        // The connect-string path delegates to the builder, so the floor
+        // applies there too. A value below 16 must surface the floor.
         try {
-            Sender.builder(Sender.Transport.WEBSOCKET).errorInboxCapacity(-5);
-            Assert.fail("negative capacity must be rejected");
+            Sender.builder("ws::addr=127.0.0.1:1;error_inbox_capacity=8;").build().close();
+            Assert.fail("capacity 8 must be rejected; spec floor is 16");
         } catch (LineSenderException expected) {
-            // ok
+            Assert.assertTrue("missing key in message: " + expected.getMessage(),
+                    expected.getMessage().contains("error_inbox_capacity"));
+            Assert.assertTrue("missing floor (16) in message: " + expected.getMessage(),
+                    expected.getMessage().contains(">= 16"));
         }
     }
 

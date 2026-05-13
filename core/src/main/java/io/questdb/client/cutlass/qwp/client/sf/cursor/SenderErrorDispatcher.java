@@ -30,8 +30,7 @@ import io.questdb.client.std.QuietCloseable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -48,11 +47,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * the daemon dispatcher takes from the queue and invokes the handler.
  *
  * <h2>Backpressure</h2>
- * The queue is bounded ({@code capacity}, default 256). When full,
- * {@link #offer} returns {@code false} immediately and bumps
+ * The inbox is bounded ({@code capacity}, default 256). When full, {@link #offer}
+ * drops the oldest entry to admit the new one and bumps
  * {@link #getDroppedNotifications()}. The I/O thread does NOT spin or block.
  * A non-zero dropped count means the handler is too slow to keep up — visible
- * to operators via the sender's accessor.
+ * to operators via the sender's accessor. Drop-oldest is mandated by
+ * sf-client.md section 14.6: watermarks are monotonic, so the latest entry is
+ * always the most informative and drops compress information rather than
+ * lose it.
  *
  * <h2>Lifecycle</h2>
  * The dispatcher thread is started lazily on the first successful
@@ -88,7 +90,11 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     // and reconfigurable apps install a new handler at any time without
     // tearing down the dispatcher thread.
     private volatile SenderErrorHandler handler;
-    private final BlockingQueue<SenderError> inbox;
+    // Deque (not plain queue) so offer() can drop the head when the inbox is
+    // full, per spec section 14.6. SPSC in steady state: the I/O thread is
+    // the sole producer, the dispatcher is the sole consumer; close() also
+    // enqueues POISON, but only once and under `lock`.
+    private final LinkedBlockingDeque<SenderError> inbox;
     // Threads are started lazily under this monitor; takes the same role as
     // SegmentManager.start() — first offer() that observes a null thread
     // wins the race to spawn it.
@@ -118,7 +124,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
             throw new IllegalArgumentException("capacity must be >= 1, was " + capacity);
         }
         this.handler = handler;
-        this.inbox = new ArrayBlockingQueue<>(capacity);
+        this.inbox = new LinkedBlockingDeque<>(capacity);
         this.threadName = threadName;
     }
 
@@ -170,10 +176,10 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     }
 
     /**
-     * Total errors delivered via inbox-overflow drop since startup. Non-zero
-     * means the user's handler is slower than the error rate — typically a
-     * symptom of a misbehaving handler or a misconfigured server. Reported by
-     * the sender for ops dashboards.
+     * Total errors discarded by the drop-oldest overflow policy since startup.
+     * Non-zero means the user's handler is slower than the error rate —
+     * typically a symptom of a misbehaving handler or a misconfigured server.
+     * Reported by the sender for ops dashboards.
      */
     public long getDroppedNotifications() {
         return dropped.get();
@@ -209,10 +215,14 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     }
 
     /**
-     * Non-blocking enqueue. Returns {@code true} if the error will be
-     * delivered to the handler (eventually, on the dispatcher thread). Returns
-     * {@code false} if the inbox was full or the dispatcher was closed —
-     * caller's only obligation is to not block.
+     * Non-blocking enqueue. Always admits the new error unless the dispatcher
+     * is closed or {@code error} is null. Returns {@code true} when the new
+     * error is enqueued for delivery, {@code false} when rejected outright.
+     *
+     * <p>When the inbox is full, drops the oldest pending entry to make room
+     * (sf-client.md section 14.6) and bumps {@link #getDroppedNotifications()}.
+     * The newest entry is always retained because it carries the most recent
+     * watermark information.
      *
      * <p>Lazy-starts the dispatcher thread on the first successful offer.
      */
@@ -220,10 +230,18 @@ public final class SenderErrorDispatcher implements QuietCloseable {
         if (closed || error == null) {
             return false;
         }
-        boolean accepted = inbox.offer(error);
-        if (!accepted) {
-            dropped.incrementAndGet();
-            return false;
+        // Drop-oldest overflow policy. The pollFirst()/offerLast() pair is
+        // not atomic with the consumer, but the consumer can only remove
+        // entries (never add). The retry loop converges in at most one extra
+        // iteration under SPSC; close()'s POISON enqueue widens the race
+        // briefly but the `closed` re-check exits cleanly.
+        while (!inbox.offerLast(error)) {
+            if (inbox.pollFirst() != null) {
+                dropped.incrementAndGet();
+            }
+            if (closed) {
+                return false;
+            }
         }
         // Common case after the first offer: thread already running, hot
         // path is one volatile read. Lazy start happens once per dispatcher

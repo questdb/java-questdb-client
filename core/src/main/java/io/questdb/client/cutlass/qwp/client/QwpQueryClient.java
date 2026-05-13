@@ -293,7 +293,9 @@ public class QwpQueryClient implements QuietCloseable {
      * <ul>
      *   <li>{@code addr=host[:port][,host[:port]...]} -- required. Comma-separated list of
      *       WebSocket endpoints; {@link #connect()} walks them in order and stops at the
-     *       first matching {@code target=}. Default port on each entry is {@value #DEFAULT_WS_PORT}.</li>
+     *       first matching {@code target=}. Default port on each entry is {@value #DEFAULT_WS_PORT}.
+     *       Per {@code failover.md} section 1, the comma form and repeated {@code addr=} keys
+     *       both accumulate into a single ordered list; empty entries are rejected.</li>
      *   <li>{@code target=any|primary|replica} -- endpoint filter applied against the role
      *       byte from the v2 {@code SERVER_INFO} frame. Default {@code any}. {@code primary}
      *       accepts {@code PRIMARY}, {@code PRIMARY_CATCHUP} and {@code STANDALONE}.</li>
@@ -359,7 +361,7 @@ public class QwpQueryClient implements QuietCloseable {
                     "unsupported schema [schema=" + sink + ", supported-schemas=[ws, wss]]");
         }
 
-        List<Endpoint> parsedEndpoints = null;
+        List<Endpoint> parsedEndpoints = new ArrayList<>();
         String path = DEFAULT_ENDPOINT_PATH;
         String target = TARGET_ANY;
         Boolean failover = null;
@@ -398,7 +400,9 @@ public class QwpQueryClient implements QuietCloseable {
             String value = sink.toString();
             switch (key) {
                 case "addr":
-                    parsedEndpoints = parseEndpointList(value);
+                    // failover.md §1: comma syntax and repeated addr= keys must
+                    // accumulate. parseEndpointList rejects empty entries.
+                    parsedEndpoints.addAll(parseEndpointList(value));
                     break;
                 case "target":
                     if (!TARGET_ANY.equals(value) && !TARGET_PRIMARY.equals(value) && !TARGET_REPLICA.equals(value)) {
@@ -551,7 +555,7 @@ public class QwpQueryClient implements QuietCloseable {
                     throw new IllegalArgumentException("unknown configuration key: " + key);
             }
         }
-        if (parsedEndpoints == null || parsedEndpoints.isEmpty()) {
+        if (parsedEndpoints.isEmpty()) {
             throw new IllegalArgumentException("missing required key: addr");
         }
         boolean hasBasic = username != null || password != null;
