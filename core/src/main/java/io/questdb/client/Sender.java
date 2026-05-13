@@ -328,7 +328,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Add a column with a Decimal128 value serialized using the binary format.
+     * Add a column with a Decimal64 value serialized using the binary format.
      *
      * @param name  name of the column
      * @param value value to add
@@ -1956,7 +1956,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Maximum bytes per segment file before rotation. Defaults to
          * {@code DEFAULT_SEGMENT_BYTES}
-         * (64 MiB). Smaller segments mean faster trim of acked data; larger
+         * (4 MiB). Smaller segments mean faster trim of acked data; larger
          * segments mean fewer rotations.
          */
         public LineSenderBuilder storeAndForwardMaxBytes(long maxBytes) {
