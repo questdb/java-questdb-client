@@ -51,7 +51,9 @@ public class QwpRoleRejectCloseRaceTest {
                     + ";close_flush_timeout_millis=0"
                     + ";initial_connect_retry=async;";
 
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            Sender sender = Sender.fromConfig(cfg);
+            long elapsed;
+            try {
                 // Push a row so the I/O thread starts attempting connect; the
                 // first attempt will hit the role reject and enter the parkNanos
                 // backoff branch.
@@ -59,12 +61,15 @@ public class QwpRoleRejectCloseRaceTest {
                 waitFor(() -> server.upgrades.get() >= 1, 5_000);
                 Thread.sleep(100);
             } finally {
+                // Bracket the close() so the timing assertion is meaningful;
+                // the race this test is named for lives entirely inside close().
                 long start = System.currentTimeMillis();
-                long elapsed = System.currentTimeMillis() - start;
-                Assert.assertTrue(
-                        "close() during role-reject backoff must return promptly (got " + elapsed + "ms)",
-                        elapsed < 2_000);
+                sender.close();
+                elapsed = System.currentTimeMillis() - start;
             }
+            Assert.assertTrue(
+                    "close() during role-reject backoff must return promptly (got " + elapsed + "ms)",
+                    elapsed < 2_000);
         }
     }
 
