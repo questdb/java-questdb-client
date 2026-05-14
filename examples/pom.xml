@@ -32,8 +32,9 @@
 
     <dependencies>
         <dependency>
-            <groupId>org.questdb</groupId>
-            <artifactId>questdb-client</artifactId>
+            <!-- Temporary Maven Central E2E test dependency. Production values: groupId=org.questdb artifactId=questdb-client. Revert before merge. -->
+            <groupId>io.github.sklarsa</groupId>
+            <artifactId>questdb-client-central-e2e</artifactId>
             <version>${project.version}</version>
         </dependency>
     </dependencies>

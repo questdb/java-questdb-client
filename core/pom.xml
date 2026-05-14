@@ -40,8 +40,9 @@
     </properties>
 
     <version>1.2.1-SNAPSHOT</version>
-    <groupId>org.questdb</groupId>
-    <artifactId>questdb-client</artifactId>
+    <!-- Temporary Maven Central E2E test coordinates. Production values: groupId=org.questdb artifactId=questdb-client. Revert before merge. -->
+    <groupId>io.github.sklarsa</groupId>
+    <artifactId>questdb-client-central-e2e</artifactId>
     <packaging>jar</packaging>
 
     <url>https://questdb.io/</url>
@@ -61,8 +62,9 @@
     </developers>
 
     <scm>
-        <url>scm:git:https://github.com/questdb/java-questdb-client.git</url>
+        <url>https://github.com/questdb/java-questdb-client</url>
         <connection>scm:git:https://github.com/questdb/java-questdb-client.git</connection>
+        <developerConnection>scm:git:https://github.com/questdb/java-questdb-client.git</developerConnection>
         <tag>HEAD</tag>
     </scm>
 
@@ -352,7 +354,7 @@
                     <plugin>
                         <groupId>org.sonatype.central</groupId>
                         <artifactId>central-publishing-maven-plugin</artifactId>
-                        <version>0.8.0</version>
+                        <version>0.9.0</version>
                         <extensions>true</extensions>
                         <configuration>
                             <publishingServerId>central</publishingServerId>
