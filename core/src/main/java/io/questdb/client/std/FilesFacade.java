@@ -36,17 +36,21 @@ public interface FilesFacade {
     FilesFacade INSTANCE = new DefaultFilesFacade();
 
     /**
-     * Reserves disk blocks for {@code fd} up to {@code size} bytes. On Linux
-     * uses {@code posix_fallocate}; on macOS uses {@code F_PREALLOCATE} with
-     * {@code F_ALLOCATEALL}; on Windows uses
-     * {@code SetFileInformationByHandle(FileAllocationInfo)}. Returns
-     * {@code true} on success, {@code false} on failure (most importantly
-     * ENOSPC). Test injection point: a wrapping facade can return
-     * {@code false} to simulate disk-full at create time so the caller's
-     * recovery path is exercised. Callers that observe {@code false} MUST
-     * close the fd and unlink the file — the partially created file would
-     * otherwise occupy its full logical size on disk. Default delegates to
-     * {@link Files#allocate(int, long)}.
+     * Extends the file to at least {@code size} bytes and reserves real
+     * disk blocks for the newly-extended range. Returns {@code true} on
+     * success, {@code false} on failure (most importantly {@code ENOSPC}
+     * / {@code ERROR_DISK_FULL}). Never shrinks; requests where
+     * {@code size <= currentSize} short-circuit as a no-op success. See
+     * {@link Files#allocate(int, long)} for the full cross-platform
+     * contract — sparse-fallback rules on Linux/macOS, the "pre-existing
+     * sparse holes are not filled" caveat, per-platform primitives.
+     *
+     * <p>Test injection point: a wrapping facade can return {@code false}
+     * to simulate disk-full at create time so the caller's recovery
+     * path is exercised. Callers that observe {@code false} MUST close
+     * the fd and unlink the partial file — the partially-extended file
+     * would otherwise occupy up to {@code max(size, currentSize)} bytes
+     * on disk. Default delegates to {@link Files#allocate(int, long)}.
      */
     boolean allocate(int fd, long size);
 
@@ -87,15 +91,15 @@ public interface FilesFacade {
 
     int mkdir(String path, int mode);
 
-    int openCleanRW(String path, long size);
+    int openCleanRW(String path);
 
     /**
-     * Variant of {@link #openCleanRW(String, long)} taking a pre-encoded
+     * Variant of {@link #openCleanRW(String)} taking a pre-encoded
      * native UTF-8 path pointer; lets callers in hot paths cache the encoded
      * path (e.g. via a reused {@code DirectUtf8Sink}) and skip the per-call
      * {@code byte[]} + native-malloc allocation.
      */
-    int openCleanRW(long pathPtr, long size);
+    int openCleanRW(long pathPtr);
 
     int openRW(String path);
 

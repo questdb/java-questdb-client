@@ -137,16 +137,23 @@ public final class AckWatermark implements QuietCloseable {
      */
     public static AckWatermark open(String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
-        // openCleanRW truncates, which would discard the previous
-        // session's watermark on every recovery and defeat the whole
-        // point. Decide by size: existing-and-correct -> openRW
-        // preserves the bytes; missing or wrong-sized -> openCleanRW
-        // creates/resizes (the resulting file has zero magic, which
-        // read() correctly reports as INVALID until the first write).
+        // Decide by size: existing-and-correct -> openRW preserves the
+        // previous session's watermark (defeating which is the whole
+        // point of NOT calling openCleanRW unconditionally); missing or
+        // wrong-sized -> openCleanRW + allocate creates a fresh
+        // FILE_SIZE-byte file (zero magic, read() reports INVALID until
+        // the first write).
         long existing = Files.exists(filePath) ? Files.length(filePath) : -1L;
-        int fd = existing == FILE_SIZE
-                ? Files.openRW(filePath)
-                : Files.openCleanRW(filePath, FILE_SIZE);
+        int fd;
+        if (existing == FILE_SIZE) {
+            fd = Files.openRW(filePath);
+        } else {
+            fd = Files.openCleanRW(filePath);
+            if (fd >= 0 && !Files.allocate(fd, FILE_SIZE)) {
+                Files.close(fd);
+                fd = -1;
+            }
+        }
         if (fd < 0) {
             LOG.warn("ack watermark {} could not be opened (rc={}); proceeding without it",
                     filePath, fd);

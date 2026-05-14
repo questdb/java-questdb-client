@@ -171,28 +171,29 @@ public final class Files {
 
     /**
      * Opens {@code path} for read-write access, truncating any existing
-     * content (mode 0644). When {@code size > 0} the new file is extended
-     * to exactly {@code size} bytes via {@code ftruncate}; when {@code size}
-     * is 0 the file is left empty. Returns a non-negative fd on success or
-     * -1 on failure (e.g. truncate failed due to ENOSPC).
+     * content (mode 0644). The new file is empty; callers that need a
+     * specific size should follow this with {@link #allocate(int, long)}
+     * (reserves real disk blocks, fails synchronously on ENOSPC) or
+     * {@link #truncate(int, long)} (sets logical size only, leaves blocks
+     * sparse). Returns a non-negative fd on success or -1 on failure.
      */
-    public static int openCleanRW(String path, long size) {
+    public static int openCleanRW(String path) {
         long ptr = pathPtr(path);
         try {
-            return openCleanRW0(ptr, size);
+            return openCleanRW0(ptr);
         } finally {
             freePathPtr(ptr);
         }
     }
 
     /**
-     * Variant of {@link #openCleanRW(String, long)} taking a pre-encoded
+     * Variant of {@link #openCleanRW(String)} taking a pre-encoded
      * native UTF-8 path pointer; lets callers cache the encoded path and
      * skip the per-call {@code byte[]} + native-malloc that
      * {@link #pathPtr(String)} incurs.
      */
-    public static int openCleanRW(long pathPtr, long size) {
-        return openCleanRW0(pathPtr, size);
+    public static int openCleanRW(long pathPtr) {
+        return openCleanRW0(pathPtr);
     }
 
     /**
@@ -415,16 +416,60 @@ public final class Files {
     public static native boolean truncate(int fd, long size);
 
     /**
-     * Reserves disk blocks for the file up to {@code size} bytes. On Linux
-     * uses {@code posix_fallocate}; on macOS uses {@code F_PREALLOCATE}
-     * with {@code F_ALLOCATEALL}; on Windows uses
-     * {@code SetFileInformationByHandle(FileAllocationInfo)}, which on
-     * NTFS reserves clusters synchronously and fails with
-     * {@code ERROR_DISK_FULL} when free space is insufficient. Never
-     * shrinks the file: requests smaller than the current logical size
-     * are rounded up. Falls back to {@code ftruncate} on Linux/macOS if
-     * pre-allocation isn't supported by the underlying filesystem (in
-     * which case the logical size is set but blocks remain sparse).
+     * Extends the file to at least {@code size} bytes and reserves real
+     * disk blocks for the newly-extended range. Lets the caller catch
+     * {@code ENOSPC} as a clean {@code false} return at this call site
+     * rather than as a runtime SIGBUS (POSIX) or in-page exception
+     * (Windows) on a later store into an mmap'd region.
+     *
+     * <p>Cross-platform contract — identical observable behaviour on
+     * Linux, macOS, and Windows for any caller that does not
+     * deliberately produce sparse files:
+     * <ul>
+     *   <li><b>Never shrinks.</b> Let {@code currentSize} be the file's
+     *       current logical size and {@code target = max(size, currentSize)}.
+     *       Requests where {@code size <= currentSize} short-circuit
+     *       as a no-op success — the file is left exactly as it was.</li>
+     *   <li><b>Reserves blocks for {@code [currentSize, target)}.</b>
+     *       Pre-existing sparse holes inside {@code [0, currentSize)}
+     *       are not retroactively filled. (Linux and macOS anchor the
+     *       reservation at {@code currentSize}; Windows'
+     *       {@code FILE_ALLOCATION_INFO} is file-scope and will
+     *       re-reserve the existing range too, but a caller relying on
+     *       hole-filling is writing non-portable code.)</li>
+     *   <li><b>Errors surface as {@code false}.</b> Notably
+     *       {@code ENOSPC} / {@code EFBIG} / {@code EIO} on POSIX and
+     *       {@code ERROR_DISK_FULL} on Windows. The caller is
+     *       responsible for closing the fd and unlinking the partial
+     *       file — the partially-extended file would otherwise occupy
+     *       up to {@code target} bytes on disk.</li>
+     *   <li><b>Sparse fallback (Linux / macOS only).</b> When the
+     *       reservation primitive itself reports the filesystem
+     *       doesn't support the operation — {@code EINVAL} /
+     *       {@code EOPNOTSUPP} on Linux, {@code ENOTSUP} /
+     *       {@code EOPNOTSUPP} on macOS — the call still extends the
+     *       logical size via {@code ftruncate} but leaves blocks
+     *       sparse. The SIGBUS risk re-emerges for that filesystem
+     *       only; operators should size requests conservatively
+     *       against free space. Windows has no equivalent fallback.</li>
+     * </ul>
+     *
+     * <p>Per-platform primitives (provided for the curious; not part
+     * of the observable contract above):
+     * <ul>
+     *   <li><b>Linux</b>:
+     *       {@code posix_fallocate(fd, currentSize, target - currentSize)}.</li>
+     *   <li><b>macOS</b>: {@code fcntl(F_PREALLOCATE)} with
+     *       {@code F_ALLOCATECONTIG | F_ALLOCATEALL} first, retrying
+     *       with just {@code F_ALLOCATEALL} on failure (relaxed
+     *       contiguity). Followed by {@code ftruncate(fd, target)} to
+     *       advance EOF — F_PREALLOCATE does not.</li>
+     *   <li><b>Windows</b>:
+     *       {@code SetFileInformationByHandle(FileAllocationInfo)} with
+     *       allocation target {@code target}, followed by
+     *       {@code SetFileInformationByHandle(FileEndOfFileInfo)} with
+     *       end-of-file {@code target}.</li>
+     * </ul>
      */
     public static native boolean allocate(int fd, long size);
 
@@ -516,7 +561,7 @@ public final class Files {
 
     static native int openAppend0(long lpszName);
 
-    static native int openCleanRW0(long lpszName, long size);
+    static native int openCleanRW0(long lpszName);
 
     static native long length0(long lpszName);
 

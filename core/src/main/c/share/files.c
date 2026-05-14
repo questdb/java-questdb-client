@@ -73,22 +73,9 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openAppend0
 }
 
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openCleanRW0
-        (JNIEnv *e, jclass cl, jlong lpszName, jlong size) {
+        (JNIEnv *e, jclass cl, jlong lpszName) {
     int fd;
     RESTARTABLE(open((const char *) (uintptr_t) lpszName, O_CREAT | O_TRUNC | O_RDWR, 0644), fd);
-    if (fd < 0) {
-        return -1;
-    }
-    if (size > 0) {
-        int rc;
-        RESTARTABLE(ftruncate(fd, (off_t) size), rc);
-        if (rc != 0) {
-            int saved = errno;
-            close(fd);
-            errno = saved;
-            return -1;
-        }
-    }
     return (jint) fd;
 }
 
@@ -146,8 +133,44 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_truncate
 
 JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
         (JNIEnv *e, jclass cl, jint fd, jlong size) {
+    /* Cross-platform contract — full version lives on
+     * Files.allocate's javadoc; key invariants restated here so the
+     * implementation reads on its own:
+     *   - Never shrinks: target = max(size, currentSize); if size <=
+     *     currentSize, return success without touching the file.
+     *   - Reserves real disk blocks for [currentSize, target). The
+     *     pre-existing range [0, currentSize) is left untouched so the
+     *     three platforms agree on what the call does — anchoring the
+     *     reservation at currentSize matches macOS's F_PEOFPOSMODE
+     *     semantics (which can only allocate beyond EOF without writes
+     *     that would corrupt mmap'd content).
+     *   - Real errors (ENOSPC, EFBIG, EIO, ...) surface as JNI_FALSE.
+     *     Filesystem-doesn't-support errnos degrade to a sparse
+     *     ftruncate fallback per sf-client.md §6. */
+    struct stat st;
+    if (fstat((int) fd, &st) != 0) {
+        return JNI_FALSE;
+    }
+    off_t target = (off_t) size;
+    if (st.st_size > target) {
+        target = st.st_size;
+    }
+    if (target == st.st_size) {
+        /* Nothing to extend, nothing to reserve. Returning here is what
+         * makes the never-shrinks property hold across the
+         * ftruncate-fallback path below. */
+        return JNI_TRUE;
+    }
+    off_t newBytes = target - st.st_size;
+
 #if defined(__linux__)
-    int res = posix_fallocate((int) fd, 0, (off_t) size);
+    /* posix_fallocate at offset=currentSize reserves only the
+     * newly-extended range [currentSize, target), matching macOS's
+     * F_PEOFPOSMODE behaviour and keeping the cross-platform contract
+     * consistent on whether pre-existing sparse holes get filled (they
+     * do not). On success the file's logical size is already target —
+     * we return early to skip the unnecessary ftruncate. */
+    int res = posix_fallocate((int) fd, st.st_size, newBytes);
     if (res == 0) {
         return JNI_TRUE;
     }
@@ -155,13 +178,20 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
         errno = res;
         return JNI_FALSE;
     }
-    /* fall through to ftruncate */
+    /* Filesystem doesn't support fallocate; fall through to ftruncate.
+     * That is the sparse-fallback path — extends to target but blocks
+     * remain sparse, so a later store past an unallocated page may
+     * still raise SIGBUS. Per the contract, ftruncate here only ever
+     * grows (target > st.st_size) so "never shrinks" still holds. */
 #elif defined(__APPLE__)
     fstore_t fst;
     fst.fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL;
     fst.fst_posmode = F_PEOFPOSMODE;
     fst.fst_offset = 0;
-    fst.fst_length = (off_t) size;
+    /* fst_length is the number of bytes to allocate BEYOND EOF — not the
+     * target total. Passing the full target would over-allocate by
+     * currentSize on a non-empty file. */
+    fst.fst_length = newBytes;
     fst.fst_bytesalloc = 0;
     if (fcntl((int) fd, F_PREALLOCATE, &fst) == -1) {
         /* Contiguous allocation failed (e.g. fragmented filesystem); retry
@@ -175,9 +205,11 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
             return JNI_FALSE;
         }
     }
+    /* F_PREALLOCATE never advances EOF, so ftruncate below is part of
+     * the normal path on macOS — it's NOT just a sparse-fallback. */
 #endif
     int res2;
-    RESTARTABLE(ftruncate((int) fd, (off_t) size), res2);
+    RESTARTABLE(ftruncate((int) fd, target), res2);
     return res2 == 0 ? JNI_TRUE : JNI_FALSE;
 }
 

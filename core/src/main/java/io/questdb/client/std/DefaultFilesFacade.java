@@ -102,13 +102,13 @@ final class DefaultFilesFacade implements FilesFacade {
     }
 
     @Override
-    public int openCleanRW(String path, long size) {
-        return Files.openCleanRW(path, size);
+    public int openCleanRW(String path) {
+        return Files.openCleanRW(path);
     }
 
     @Override
-    public int openCleanRW(long pathPtr, long size) {
-        return Files.openCleanRW(pathPtr, size);
+    public int openCleanRW(long pathPtr) {
+        return Files.openCleanRW(pathPtr);
     }
 
     @Override
