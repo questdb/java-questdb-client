@@ -32,10 +32,9 @@ jobs:
     steps:
       - name: Validate workflow configuration
         run: |
-          # Temporary Maven Central E2E test override: allow release runs from a non-default branch.
-          # Production behavior should fail here unless running from the default branch. Revert before merge.
           if [[ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]]; then
-            echo "::warning::Running from non-default branch ${GITHUB_REF_NAME}; production workflow should normally run from ${DEFAULT_BRANCH}."
+            echo "::error::Run this workflow from ${DEFAULT_BRANCH}."
+            exit 1
           fi
 
           if [[ "${{ inputs.release_version }}" == *-SNAPSHOT ]]; then

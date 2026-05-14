@@ -40,9 +40,8 @@
     </properties>
 
     <version>1.2.1-SNAPSHOT</version>
-    <!-- Temporary Maven Central E2E test coordinates. Production values: groupId=org.questdb artifactId=questdb-client. Revert before merge. -->
-    <groupId>io.github.sklarsa</groupId>
-    <artifactId>questdb-client-central-e2e</artifactId>
+    <groupId>org.questdb</groupId>
+    <artifactId>questdb-client</artifactId>
     <packaging>jar</packaging>
 
     <url>https://questdb.io/</url>
