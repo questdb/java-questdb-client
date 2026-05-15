@@ -117,7 +117,11 @@ import java.util.concurrent.atomic.AtomicReference;
 public class QwpWebSocketSender implements Sender {
 
     public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
-    public static final int DEFAULT_AUTO_FLUSH_BYTES = 0;
+    // Soft per-batch byte budget. Trips a flush when raw column-buffer bytes
+    // cross the threshold, well before the server's 16 MB wire cap. Wide-row
+    // senders need this trigger (not autoFlushRows alone) to avoid producing
+    // a batch the server will reject with STATUS_PARSE_ERROR.
+    public static final int DEFAULT_AUTO_FLUSH_BYTES = 8 * 1024 * 1024;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
     public static final int DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535;
@@ -190,6 +194,11 @@ public class QwpWebSocketSender implements Sender {
     // disables keepalive PINGs entirely.
     private long durableAckKeepaliveIntervalMillis =
             CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
+    // Effective per-batch soft-flush threshold in raw column-buffer bytes.
+    // Initially equals autoFlushBytes; lowered to fit under the server's
+    // advertised X-QWP-Max-Batch-Size at handshake so the wire payload stays
+    // under the server's cap even with encoding overhead.
+    private int effectiveAutoFlushBytes;
     private SenderErrorDispatcher errorDispatcher;
     // Async-delivery sink for SenderError notifications. Default-constructed
     // here with the loud-not-silent default handler; a builder hook can swap
@@ -239,6 +248,11 @@ public class QwpWebSocketSender implements Sender {
     // beginRound(true) call. roundSeq=1 is the first round; CONNECTED in the
     // first round indicates the initial connect.
     private long roundSeq;
+    // Server-advertised hard cap on QWP ingest payload bytes, captured from
+    // X-QWP-Max-Batch-Size on each successful handshake. 0 when the server
+    // did not advertise the header (older builds); the sender then falls back
+    // to its locally configured budget.
+    private int serverMaxBatchSize;
 
     private QwpWebSocketSender(
             List<Endpoint> endpoints,
@@ -264,6 +278,10 @@ public class QwpWebSocketSender implements Sender {
         this.closed = false;
         this.autoFlushRows = autoFlushRows;
         this.autoFlushBytes = autoFlushBytes;
+        // Until the handshake completes, honor the configured budget verbatim.
+        // applyServerBatchSizeLimit() clamps this on connect once the server's
+        // X-QWP-Max-Batch-Size is known.
+        this.effectiveAutoFlushBytes = autoFlushBytes;
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
         this.maxSchemasPerConnection = maxSchemasPerConnection;
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
@@ -2018,6 +2036,32 @@ public class QwpWebSocketSender implements Sender {
         sendRow();
     }
 
+    /**
+     * Clamps the soft-flush byte budget to fit under the server's advertised
+     * X-QWP-Max-Batch-Size minus a safety margin for encoding overhead
+     * (schema, dict deltas, framing). A 0 advertisement means the server did
+     * not send the header (older build) and the configured budget is kept
+     * verbatim. Called on every successful connect because a rolling upgrade
+     * can leave neighbouring endpoints with different caps.
+     */
+    private void applyServerBatchSizeLimit(int advertisedMaxBatchSize) {
+        serverMaxBatchSize = advertisedMaxBatchSize;
+        if (advertisedMaxBatchSize <= 0) {
+            effectiveAutoFlushBytes = autoFlushBytes;
+            return;
+        }
+        // Cap at 90% of the server's hard limit. Raw column-buffer bytes are
+        // a conservative proxy for wire size (compression usually shrinks the
+        // payload), but schema and dict-delta overhead can push the wire size
+        // above the raw total in pathological cases.
+        long safeBudget = (long) advertisedMaxBatchSize * 9 / 10;
+        if (autoFlushBytes > 0 && autoFlushBytes < safeBudget) {
+            effectiveAutoFlushBytes = autoFlushBytes;
+        } else {
+            effectiveAutoFlushBytes = (int) safeBudget;
+        }
+    }
+
     private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
         int previousIdx = ctx.previousIdx;
         if (previousIdx >= 0) {
@@ -2473,8 +2517,9 @@ public class QwpWebSocketSender implements Sender {
             String host = ep == null ? "<unbound>" : ep.host;
             int port = ep == null ? -1 : ep.port;
             encoder.setVersion((byte) client.getServerQwpVersion());
-            LOG.info("Connected to WebSocket [host={}, port={}, qwpVersion={}]",
-                    host, port, client.getServerQwpVersion());
+            applyServerBatchSizeLimit(client.getServerMaxBatchSize());
+            LOG.info("Connected to WebSocket [host={}, port={}, qwpVersion={}, serverMaxBatchSize={}, effectiveAutoFlushBytes={}]",
+                    host, port, client.getServerQwpVersion(), serverMaxBatchSize, effectiveAutoFlushBytes);
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
             // its default version (V1). Schema state still gets reset for
@@ -2700,18 +2745,35 @@ public class QwpWebSocketSender implements Sender {
      */
     private void sendRow() {
         ensureConnected();
-        if (autoFlushBytes > 0) {
-            long bytesBefore = currentTableBuffer.getBufferedBytes();
-            currentTableBuffer.nextRow();
-            pendingBytes += currentTableBuffer.getBufferedBytes() - bytesBefore;
-        } else {
-            currentTableBuffer.nextRow();
-        }
+        currentTableBuffer.nextRow();
 
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
         }
         pendingRowCount++;
+
+        // Recompute total buffered bytes across all tables. Tracking it as a
+        // running delta from inside nextRow() would only catch null-backfill
+        // bytes, since column setters wrote the row's own bytes directly into
+        // the column buffers before sendRow() was called. The full re-walk is
+        // cheap: the table-count is typically 1, and getBufferedBytes() sums
+        // column buffer sizes from cached fields.
+        pendingBytes = totalBufferedBytes();
+
+        // Hard guard: if a single row's raw bytes already exceed the server's
+        // hard cap, the wire frame will be rejected with STATUS_PARSE_ERROR.
+        // Detect it here so the caller sees a clear "row too large" error
+        // before we burn an I/O round-trip.
+        if (pendingRowCount == 1 && serverMaxBatchSize > 0 && pendingBytes > serverMaxBatchSize) {
+            long oversizeBytes = pendingBytes;
+            currentTableBuffer.reset();
+            pendingBytes = 0;
+            pendingRowCount = 0;
+            firstPendingRowTimeNanos = 0;
+            throw new LineSenderException("row too large for server batch cap")
+                    .put(" [rowBytes=").put(oversizeBytes)
+                    .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
+        }
 
         if (shouldAutoFlush()) {
             flushPendingRows();
@@ -2728,7 +2790,7 @@ public class QwpWebSocketSender implements Sender {
         if (autoFlushRows > 0 && pendingRowCount >= autoFlushRows) {
             return true;
         }
-        if (autoFlushBytes > 0 && getPendingBytes() >= autoFlushBytes) {
+        if (effectiveAutoFlushBytes > 0 && getPendingBytes() >= effectiveAutoFlushBytes) {
             return true;
         }
         if (autoFlushIntervalNanos > 0) {
@@ -2757,6 +2819,22 @@ public class QwpWebSocketSender implements Sender {
             default:
                 throw new LineSenderException("Unsupported time unit: " + unit);
         }
+    }
+
+    private long totalBufferedBytes() {
+        long total = 0;
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tb = tableBuffers.get(tableName);
+            if (tb != null) {
+                total += tb.getBufferedBytes();
+            }
+        }
+        return total;
     }
 
     private void validateTableName(CharSequence name) {

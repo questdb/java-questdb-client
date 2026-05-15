@@ -399,6 +399,86 @@ public class QwpWebSocketSenderTest {
         });
     }
 
+    @Test
+    public void testApplyServerBatchSizeLimit_advertisedClampsLargerConfigured() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ 32 * 1024 * 1024,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // Server advertises 16 MB. Configured 32 MB is over the cap,
+                // so the effective budget should drop to 90% of 16 MB.
+                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
+                int effective = getEffectiveAutoFlushBytes(sender);
+                Assert.assertEquals((long) (16 * 1024 * 1024) * 9 / 10, effective);
+                Assert.assertEquals(16 * 1024 * 1024, getServerMaxBatchSize(sender));
+            }
+        });
+    }
+
+    @Test
+    public void testApplyServerBatchSizeLimit_advertisedZeroKeepsConfigured() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ 2 * 1024 * 1024,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // 0 advertisement = older server. Effective budget must equal
+                // the configured value verbatim so the sender keeps working.
+                invokeApplyServerBatchSizeLimit(sender, 0);
+                Assert.assertEquals(2 * 1024 * 1024, getEffectiveAutoFlushBytes(sender));
+                Assert.assertEquals(0, getServerMaxBatchSize(sender));
+            }
+        });
+    }
+
+    @Test
+    public void testApplyServerBatchSizeLimit_configuredSmallerThanAdvertisedWins() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ 2 * 1024 * 1024,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // Server advertises 16 MB; configured 2 MB is well below.
+                // Keep the user's tighter budget rather than overriding it.
+                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
+                Assert.assertEquals(2 * 1024 * 1024, getEffectiveAutoFlushBytes(sender));
+            }
+        });
+    }
+
+    private static int getEffectiveAutoFlushBytes(QwpWebSocketSender sender) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField("effectiveAutoFlushBytes");
+        field.setAccessible(true);
+        return field.getInt(sender);
+    }
+
+    private static int getServerMaxBatchSize(QwpWebSocketSender sender) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField("serverMaxBatchSize");
+        field.setAccessible(true);
+        return field.getInt(sender);
+    }
+
+    private static void invokeApplyServerBatchSizeLimit(QwpWebSocketSender sender, int advertised) throws Exception {
+        Method m = QwpWebSocketSender.class.getDeclaredMethod("applyServerBatchSizeLimit", int.class);
+        m.setAccessible(true);
+        try {
+            m.invoke(sender, advertised);
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw new RuntimeException(cause);
+        }
+    }
+
     private static MicrobatchBuffer getActiveBuffer(QwpWebSocketSender sender) throws Exception {
         Field field = QwpWebSocketSender.class.getDeclaredField("activeBuffer");
         field.setAccessible(true);

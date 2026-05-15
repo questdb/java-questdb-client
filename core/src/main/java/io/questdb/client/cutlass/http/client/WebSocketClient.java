@@ -80,6 +80,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final String QUESTDB_ZONE_HEADER_NAME = "X-QuestDB-Zone:";
     private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
+    private static final String QWP_MAX_BATCH_SIZE_HEADER_NAME = "X-QWP-Max-Batch-Size:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -135,6 +136,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     // path can rely on durable-ack-driven trim. Absence (after opting in via
     // setQwpRequestDurableAck) is the early-fail signal.
     private boolean serverDurableAckEnabled;
+    // Server's hard cap on ingest QWP message payload bytes, extracted from
+    // X-QWP-Max-Batch-Size on the 101 upgrade response. 0 when the server did
+    // not advertise the header (older builds), in which case the sender falls
+    // back to its locally configured budget.
+    private int serverMaxBatchSize;
     private int serverQwpVersion = 1;
     private String upgradeRejectRole;
     // Server-advertised zone identifier from the most recent rejected upgrade,
@@ -287,6 +293,16 @@ public abstract class WebSocketClient implements QuietCloseable {
      */
     public WebSocketSendBuffer getSendBuffer() {
         return sendBuffer;
+    }
+
+    /**
+     * Server-advertised hard cap on QWP ingest payload bytes, taken from the
+     * {@code X-QWP-Max-Batch-Size} response header on the 101 upgrade. Returns
+     * {@code 0} when the server did not advertise the header, in which case
+     * the caller must fall back to its own configured budget.
+     */
+    public int getServerMaxBatchSize() {
+        return serverMaxBatchSize;
     }
 
     /**
@@ -652,6 +668,28 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return false;
+    }
+
+    private static int extractMaxBatchSize(String response) {
+        int headerLen = QWP_MAX_BATCH_SIZE_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QWP_MAX_BATCH_SIZE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                try {
+                    int parsed = Integer.parseInt(value);
+                    return parsed > 0 ? parsed : 0;
+                } catch (NumberFormatException e) {
+                    return 0;
+                }
+            }
+        }
+        return 0;
     }
 
     private static int extractQwpVersion(String response) {
@@ -1164,6 +1202,10 @@ public abstract class WebSocketClient implements QuietCloseable {
         // checks this value to fail at connect rather than silently
         // missing trim signals.
         serverDurableAckEnabled = extractDurableAckEnabled(response);
+
+        // Extract X-QWP-Max-Batch-Size (optional). Older servers omit it; the
+        // sender falls back to its locally configured byte budget in that case.
+        serverMaxBatchSize = extractMaxBatchSize(response);
     }
 
     protected void dieWaiting(int n) {
