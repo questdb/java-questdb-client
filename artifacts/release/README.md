@@ -3,6 +3,9 @@
 Steps to release `org.questdb:questdb-client` to Maven Central. Examples below use `1.2.2` (release) and
 `1.2.3-SNAPSHOT` (next snapshot); substitute the actual versions when running.
 
+**Prerequisite:** tag creation is restricted by an org-wide ruleset, so you must be a member of the `questdb/release`
+team to push the release tag. Confirm membership before starting.
+
 ## Edit release notes
 
 Create a draft release with the intended version and notes. Do not create the git tag up front -- pick the tag name
@@ -82,8 +85,6 @@ a tag matching `X.Y.Z` is pushed. No manual dispatch. It:
 - assumes an AWS IAM role via OIDC and reads the GPG key and Sonatype credentials from AWS Secrets Manager
 - verifies the tag matches the parent POM version and is not a snapshot
 - signs the artifacts and publishes them through the Sonatype Central Portal
-
-Push access to the repository is required to push the release tag.
 
 ## Merge the release branch to `main`
 
