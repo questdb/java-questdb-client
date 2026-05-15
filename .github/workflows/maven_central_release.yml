@@ -119,7 +119,7 @@ jobs:
 
       - name: Verify tag matches POM version
         run: |
-          POM_VERSION=$(mvn -B -q -DforceStdout help:evaluate -Dexpression=project.version)
+          POM_VERSION=$(mvn -B -q -N -DforceStdout help:evaluate -Dexpression=project.version)
           if [[ "${POM_VERSION}" == *-SNAPSHOT ]]; then
             echo "::error::Refusing to release SNAPSHOT version ${POM_VERSION}."
             exit 1

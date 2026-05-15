@@ -92,16 +92,15 @@ git push origin 1.2.2
 The jar publication to Maven Central is performed by the
 [`Release to Maven Central`](../../.github/workflows/maven_central_release.yml) GitHub Actions workflow added in this PR.
 
-Trigger the workflow manually (`workflow_dispatch`) from the default branch and provide:
+The workflow is triggered automatically when a release tag (matching `*.*.*`) is pushed in the previous step. No manual
+dispatch is required. The workflow:
 
-- `release_version`, for example `1.2.2`
-- `next_development_version`, for example `1.2.3-SNAPSHOT`
+- checks out the pushed tag
+- assumes an AWS IAM role via OIDC and reads the GPG key and Sonatype credentials from AWS Secrets Manager
+- verifies that the tag name matches the parent POM version and that the version is not a snapshot
+- signs the artifacts and publishes them through the Sonatype Central Portal
 
-The workflow assumes an AWS IAM role via OIDC, reads the GPG key and Sonatype credentials from AWS Secrets Manager,
-signs the artifacts, publishes them through the Sonatype Central Portal, and pushes the release commits and tag only
-after publication succeeds.
-
-You will need write access to the repository and to the configured AWS secret to trigger the workflow.
+You need push access to the repository to push the release tag, which is what triggers the workflow.
 
 ## Post-release
 
