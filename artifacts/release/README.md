@@ -92,7 +92,7 @@ git push origin 1.2.2
 The jar publication to Maven Central is performed by the
 [`Release to Maven Central`](../../.github/workflows/maven_central_release.yml) GitHub Actions workflow added in this PR.
 
-The workflow is triggered automatically when a release tag (matching `*.*.*`) is pushed in the previous step. No manual
+The workflow is triggered automatically when a release tag matching `X.Y.Z` (three numeric segments) is pushed in the previous step. No manual
 dispatch is required. The workflow:
 
 - checks out the pushed tag
