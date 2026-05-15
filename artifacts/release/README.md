@@ -84,12 +84,18 @@ a tag matching `X.Y.Z` is pushed. No manual dispatch. It:
 - checks out the pushed tag
 - assumes an AWS IAM role via OIDC and reads the GPG key and Sonatype credentials from AWS Secrets Manager
 - verifies the tag matches the parent POM version and is not a snapshot
-- signs the artifacts and publishes them through the Sonatype Central Portal
+- signs the artifacts and uploads them through the Sonatype Central Portal
+
+The workflow returns once Sonatype has validated the upload and taken ownership of the artifacts. Physical
+propagation to Maven Central happens asynchronously after the workflow finishes, so a green run does **not** mean the
+artifacts are visible on `central.sonatype.com` yet -- that step is covered under [Post-release](#post-release).
 
 ## Merge the release branch to `main`
 
-Once the workflow finishes and the artifacts appear on Maven Central, open a PR from `release/1.2.2` to `main` and
-squash-merge it after approval. Delete the release branch afterwards.
+Once the workflow finishes, open a PR from `release/1.2.2` to `main` and squash-merge it after approval. Delete the
+release branch afterwards. You do not need to wait for Maven Central propagation before merging -- once the workflow
+is green, Sonatype owns the artifacts and the next snapshot version on `main` is the source of truth for ongoing
+development.
 
 Squash-merge is the only merge method allowed by the org ruleset on `main`, so the original `[maven-release-plugin]`
 commits will not appear in `main`'s history. The tag remains the canonical pointer to the released code; `main`
@@ -97,6 +103,7 @@ carries a single squashed commit that bumps the snapshot version.
 
 ## Post-release
 
-Verify the version appears on
-[Maven Central](https://central.sonatype.com/artifact/org.questdb/questdb-client) (propagation can take a few
-minutes). Finalize the GitHub release draft against the new tag and add the release notes.
+After the workflow completes, Sonatype still has to propagate the artifacts to Maven Central. This typically takes a
+few minutes but can occasionally run longer. Check
+[Maven Central](https://central.sonatype.com/artifact/org.questdb/questdb-client) until the new version is listed,
+then finalize the GitHub release draft against the new tag and add the release notes.
