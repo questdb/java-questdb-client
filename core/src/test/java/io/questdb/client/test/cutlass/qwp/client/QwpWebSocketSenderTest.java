@@ -400,6 +400,24 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testApplyServerBatchSizeLimit_optOutPreservedDespiteAdvertisement() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ 0,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // User explicitly disabled the byte trigger. The server's
+                // advertised cap must update serverMaxBatchSize (for the
+                // single-row guard) but must not re-enable byte flushing.
+                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
+                Assert.assertEquals(0, getEffectiveAutoFlushBytes(sender));
+                Assert.assertEquals(16 * 1024 * 1024, getServerMaxBatchSize(sender));
+            }
+        });
+    }
+
+    @Test
     public void testApplyServerBatchSizeLimit_advertisedClampsLargerConfigured() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(

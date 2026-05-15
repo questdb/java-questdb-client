@@ -2043,9 +2043,23 @@ public class QwpWebSocketSender implements Sender {
      * not send the header (older build) and the configured budget is kept
      * verbatim. Called on every successful connect because a rolling upgrade
      * can leave neighbouring endpoints with different caps.
+     * <p>
+     * Always updates {@link #serverMaxBatchSize} so the single-row hard guard
+     * in {@link #sendRow} fires against the freshly advertised value. The
+     * byte trigger, however, is only adjusted when the user left it enabled:
+     * an explicit {@code auto_flush_bytes=off} (autoFlushBytes == 0) is
+     * preserved even when the server advertises a cap, so applications that
+     * opted out keep the contract they asked for.
      */
     private void applyServerBatchSizeLimit(int advertisedMaxBatchSize) {
         serverMaxBatchSize = advertisedMaxBatchSize;
+        if (autoFlushBytes <= 0) {
+            // User opted out of byte-based auto-flush; respect that even when
+            // the server advertises a cap. The single-row guard still protects
+            // against oversize individual rows via serverMaxBatchSize.
+            effectiveAutoFlushBytes = 0;
+            return;
+        }
         if (advertisedMaxBatchSize <= 0) {
             effectiveAutoFlushBytes = autoFlushBytes;
             return;
@@ -2055,7 +2069,7 @@ public class QwpWebSocketSender implements Sender {
         // payload), but schema and dict-delta overhead can push the wire size
         // above the raw total in pathological cases.
         long safeBudget = (long) advertisedMaxBatchSize * 9 / 10;
-        if (autoFlushBytes > 0 && autoFlushBytes < safeBudget) {
+        if (autoFlushBytes < safeBudget) {
             effectiveAutoFlushBytes = autoFlushBytes;
         } else {
             effectiveAutoFlushBytes = (int) safeBudget;
