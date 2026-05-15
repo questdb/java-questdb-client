@@ -1,23 +1,26 @@
 # Release steps
 
-This is a short guide to outline the steps involved in releasing `org.questdb:questdb-client` to Maven Central.
+Steps to release `org.questdb:questdb-client` to Maven Central. Examples below use `1.2.2` (release) and
+`1.2.3-SNAPSHOT` (next snapshot); substitute the actual versions when running.
 
 ## Edit release notes
 
-First step is to create a draft release with the intended release version number and release notes. The git tag should
-not be created up front — choose the intended tag name in the draft and let GitHub create it when the release is
-published. When crafting new release notes, please use previous release notes as style guidelines. Releases should not
-look too dissimilar.
+Create a draft release with the intended version and notes. Do not create the git tag up front -- pick the tag name
+in the draft and let GitHub create it when the release is published. Match the style of previous release notes.
 
-## Switch to `main`
+## Create a release branch
+
+Direct pushes to `main` are blocked by the org ruleset (one-approval squash-merged PR is the only path), so release
+commits live on a dedicated branch.
 
 ```bash
 git fetch
 git checkout main
 git pull
+git checkout -b release/1.2.2
 ```
 
-Releases must be cut from the latest `main`. Make sure your working tree is clean.
+Make sure your working tree is clean.
 
 ## Clear previous release "memory"
 
@@ -25,28 +28,17 @@ Releases must be cut from the latest `main`. Make sure your working tree is clea
 mvn release:clean
 ```
 
-This removes any `release.properties` and `*.releaseBackup` files left over from a previous attempt.
+Removes any `release.properties` and `*.releaseBackup` files left over from a previous attempt.
 
 ## Roll versions and create the tag
 
-This step will do the following:
+`release:prepare` will:
 
-- roll the parent and module versions from snapshot to release, e.g. from `1.2.2-SNAPSHOT` to `1.2.2`
+- roll parent and module versions from snapshot to release (`1.2.2-SNAPSHOT` -> `1.2.2`)
 - commit the release POMs
-- create the release tag in the local git repo
-- roll the versions to the next snapshot, e.g. `1.2.3-SNAPSHOT`
+- create the release tag locally
+- roll the versions to the next snapshot (`1.2.3-SNAPSHOT`)
 - commit the next-snapshot POMs
-
-```bash
-mvn -B release:prepare \
-  -DautoVersionSubmodules=true \
-  -DpushChanges=false \
-  -DreleaseVersion=<release-version> \
-  -DdevelopmentVersion=<next-snapshot-version> \
-  -Dtag=<release-version>
-```
-
-For example, when releasing `1.2.2`:
 
 ```bash
 mvn -B release:prepare \
@@ -57,56 +49,53 @@ mvn -B release:prepare \
   -Dtag=1.2.2
 ```
 
-The `-B` flag will make assumptions about the release version. Use it for routine releases. For a special version (for
-example a new major like `2.0`), drop `-B` and answer the interactive prompts.
+`-B` runs non-interactively; drop it for special versions (e.g. a new major) to get the prompts. `-DpushChanges=false`
+keeps the commits and tag local until you have verified them.
 
-`-DpushChanges=false` keeps both commits and the tag local until you have verified they look right.
-
-If `release:prepare` fails partway through, recover with:
+If `release:prepare` fails partway through:
 
 ```bash
 mvn release:rollback
+git tag -d 1.2.2
 ```
 
-This reverts the prepare commits and removes the backup files. If `release.properties` has already been cleaned up, you
-can reset the unwanted commits manually with `git reset --hard <previous-HEAD>` instead.
+`release:rollback` reverts the prepare commits and removes the backup files but does **not** delete the tag -- drop
+it manually or the next attempt at the same version fails. If `release.properties` is already gone, use
+`git reset --hard <previous-HEAD>` instead (and still drop the tag).
 
-## Push the branch and tag
-
-Once the local commits and tag look correct, publish them:
-
-```bash
-git push origin main
-git push origin <release-version>
-```
-
-For example:
+## Push the release branch and tag
 
 ```bash
-git push origin main
+git push origin release/1.2.2
 git push origin 1.2.2
 ```
 
+The tag push triggers the Maven Central workflow (see below). The branch is merged to `main` afterwards -- see
+[Merge the release branch to `main`](#merge-the-release-branch-to-main).
+
 ## Publish to Maven Central
 
-The jar publication to Maven Central is performed by the
-[`Release to Maven Central`](../../.github/workflows/maven_central_release.yml) GitHub Actions workflow added in this PR.
-
-The workflow is triggered automatically when a release tag matching `X.Y.Z` (three numeric segments) is pushed in the previous step. No manual
-dispatch is required. The workflow:
+The [`Release to Maven Central`](../../.github/workflows/maven_central_release.yml) workflow fires automatically when
+a tag matching `X.Y.Z` is pushed. No manual dispatch. It:
 
 - checks out the pushed tag
 - assumes an AWS IAM role via OIDC and reads the GPG key and Sonatype credentials from AWS Secrets Manager
-- verifies that the tag name matches the parent POM version and that the version is not a snapshot
+- verifies the tag matches the parent POM version and is not a snapshot
 - signs the artifacts and publishes them through the Sonatype Central Portal
 
-You need push access to the repository to push the release tag, which is what triggers the workflow.
+Push access to the repository is required to push the release tag.
+
+## Merge the release branch to `main`
+
+Once the workflow finishes and the artifacts appear on Maven Central, open a PR from `release/1.2.2` to `main` and
+squash-merge it after approval. Delete the release branch afterwards.
+
+Squash-merge is the only merge method allowed by the org ruleset on `main`, so the original `[maven-release-plugin]`
+commits will not appear in `main`'s history. The tag remains the canonical pointer to the released code; `main`
+carries a single squashed commit that bumps the snapshot version.
 
 ## Post-release
 
-Verify that the new version appears on
-[Maven Central](https://central.sonatype.com/artifact/org.questdb/questdb-client). Propagation may take some time after
-publishing.
-
-Finalize the GitHub release draft from the tag created by the release process and add the release notes for the
-version.
+Verify the version appears on
+[Maven Central](https://central.sonatype.com/artifact/org.questdb/questdb-client) (propagation can take a few
+minutes). Finalize the GitHub release draft against the new tag and add the release notes.
