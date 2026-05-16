@@ -239,10 +239,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal64 value) {
+        checkNotClosed();
         if (value == null || value.isNull()) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDecimal64ColumnValue(name, value);
@@ -255,10 +255,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal128 value) {
+        checkNotClosed();
         if (value == null || value.isNull()) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDecimal128ColumnValue(name, value);
@@ -271,10 +271,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal256 value) {
+        checkNotClosed();
         if (value == null || value.isNull()) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDecimal256ColumnValue(name, value);
@@ -287,10 +287,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, CharSequence value) {
+        checkNotClosed();
         if (value == null || value.length() == 0) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             currentDecimal256.ofString(value);
@@ -304,10 +304,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDoubleArrayColumnValue(name, values);
@@ -320,10 +320,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDoubleArrayColumnValue(name, values);
@@ -336,10 +336,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][][] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDoubleArrayColumnValue(name, values);
@@ -352,10 +352,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender doubleArray(CharSequence name, DoubleArray array) {
+        checkNotClosed();
         if (array == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDoubleArrayColumnValue(name, array);
@@ -405,6 +405,8 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender geoHashColumn(CharSequence name, CharSequence value) {
+        checkNotClosed();
+        checkTableSelected();
         if (value == null) {
             throw new LineSenderException(
                     "GEOHASH string cannot be null; mark the row null via the null bitmap instead");
@@ -427,10 +429,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageLongArrayColumnValue(name, values);
@@ -443,10 +445,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageLongArrayColumnValue(name, values);
@@ -459,10 +461,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][][] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageLongArrayColumnValue(name, values);
@@ -475,10 +477,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, LongArray array) {
+        checkNotClosed();
         if (array == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageLongArrayColumnValue(name, array);

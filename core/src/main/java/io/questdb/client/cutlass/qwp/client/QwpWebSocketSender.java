@@ -831,6 +831,23 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Overrides the {@link Sender} interface default so the closed-sender
+     * check fires before the null-slice check. Without this override, the
+     * default throws "BINARY slice cannot be null" on a closed sender,
+     * obscuring the canonical "Sender is closed" error.
+     */
+    @Override
+    public QwpWebSocketSender binaryColumn(CharSequence columnName, DirectByteSlice slice) {
+        checkNotClosed();
+        checkTableSelected();
+        if (slice == null) {
+            throw new LineSenderException(
+                    "BINARY slice cannot be null; mark the row null via the null bitmap instead");
+        }
+        return binaryColumn(columnName, slice.ptr(), slice.size());
+    }
+
+    /**
      * Zero-allocation BINARY overload: copies {@code len} bytes from native
      * memory at {@code ptr} into the column. See
      * {@link Sender#binaryColumn(CharSequence, long, long)} for the contract.
@@ -1126,8 +1143,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal64 value) {
-        if (value == null || value.isNull()) return this;
         checkNotClosed();
+        if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL64, true);
@@ -1143,8 +1160,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal128 value) {
-        if (value == null || value.isNull()) return this;
         checkNotClosed();
+        if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL128, true);
@@ -1160,8 +1177,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal256 value) {
-        if (value == null || value.isNull()) return this;
         checkNotClosed();
+        if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL256, true);
@@ -1177,8 +1194,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, CharSequence value) {
-        if (value == null || value.length() == 0) return this;
         checkNotClosed();
+        if (value == null || value.length() == 0) return this;
         checkTableSelected();
         try {
             currentDecimal256.ofString(value);
@@ -1195,8 +1212,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
@@ -1212,8 +1229,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
@@ -1229,8 +1246,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][][] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
@@ -1246,8 +1263,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender doubleArray(CharSequence name, DoubleArray array) {
-        if (array == null) return this;
         checkNotClosed();
+        if (array == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
@@ -1411,6 +1428,8 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public QwpWebSocketSender geoHashColumn(CharSequence columnName, CharSequence value) {
+        checkNotClosed();
+        checkTableSelected();
         if (value == null) {
             throw new LineSenderException(
                     "GEOHASH string cannot be null; mark the row null via the null bitmap instead");
@@ -1724,9 +1743,11 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public QwpWebSocketSender ipv4Column(CharSequence columnName, CharSequence address) {
+        checkNotClosed();
         if (address == null) {
             return this;
         }
+        checkTableSelected();
         if (Chars.equalsIgnoreCase("null", address) || Chars.equals("0.0.0.0", address)) {
             throw new LineSenderException(
                     "invalid IPv4 address: NULL sentinel inputs are rejected"
@@ -1776,8 +1797,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
@@ -1793,8 +1814,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
@@ -1810,8 +1831,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][][] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
@@ -1827,8 +1848,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, LongArray array) {
-        if (array == null) return this;
         checkNotClosed();
+        if (array == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);

@@ -25,8 +25,14 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.line.array.DoubleArray;
+import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.Decimal128;
+import io.questdb.client.std.Decimal256;
+import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.bytes.DirectByteSlice;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -458,6 +464,35 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testNullArgsAfterCloseAllThrowSenderClosed() throws Exception {
+        // Several column setters short-circuit (return this or throw "cannot
+        // be null") before delegating to an overload that calls
+        // checkNotClosed(). On a closed sender that means the user gets a
+        // null-flavoured error (or worse, a silent no-op) instead of the
+        // canonical "Sender is closed". This test pins the closed-sender
+        // precedence across the entire affected method surface.
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+            assertClosed(() -> sender.binaryColumn("x", (DirectByteSlice) null));
+            assertClosed(() -> sender.decimalColumn("x", (Decimal64) null));
+            assertClosed(() -> sender.decimalColumn("x", (Decimal128) null));
+            assertClosed(() -> sender.decimalColumn("x", (Decimal256) null));
+            assertClosed(() -> sender.decimalColumn("x", (CharSequence) null));
+            assertClosed(() -> sender.doubleArray("x", (double[]) null));
+            assertClosed(() -> sender.doubleArray("x", (double[][]) null));
+            assertClosed(() -> sender.doubleArray("x", (double[][][]) null));
+            assertClosed(() -> sender.doubleArray("x", (DoubleArray) null));
+            assertClosed(() -> sender.geoHashColumn("x", (CharSequence) null));
+            assertClosed(() -> sender.ipv4Column("x", (CharSequence) null));
+            assertClosed(() -> sender.longArray("x", (long[]) null));
+            assertClosed(() -> sender.longArray("x", (long[][]) null));
+            assertClosed(() -> sender.longArray("x", (long[][][]) null));
+            assertClosed(() -> sender.longArray("x", (LongArray) null));
+        });
+    }
+
+    @Test
     public void testNullArrayReturnsThis() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = createUnconnectedSender()) {
@@ -660,6 +695,17 @@ public class QwpWebSocketSenderTest {
                 Assert.assertTrue(e.getMessage().contains("closed"));
             }
         });
+    }
+
+    private static void assertClosed(Runnable r) {
+        try {
+            r.run();
+            Assert.fail("Expected LineSenderException with 'closed' message");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(
+                    "expected message to mention 'closed', got: " + e.getMessage(),
+                    e.getMessage() != null && e.getMessage().contains("closed"));
+        }
     }
 
     private static int getEffectiveAutoFlushBytes(QwpWebSocketSender sender) throws Exception {
