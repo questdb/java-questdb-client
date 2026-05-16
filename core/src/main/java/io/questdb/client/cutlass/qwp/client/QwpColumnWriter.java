@@ -88,6 +88,9 @@ class QwpColumnWriter {
                 writeGeoHashColumn(dataAddr, valueCount, col.getGeoHashPrecision());
                 break;
             case TYPE_VARCHAR:
+            case TYPE_BINARY:
+                // BINARY shares VARCHAR's wire layout (offsets + concatenated bytes);
+                // only the byte-stream contract differs (opaque vs UTF-8).
                 writeStringColumn(col, valueCount, stringDataSize);
                 break;
             case TYPE_SYMBOL:

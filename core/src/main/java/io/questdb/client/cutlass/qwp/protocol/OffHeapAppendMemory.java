@@ -106,6 +106,20 @@ public class OffHeapAppendMemory implements ArrayBufferAppender, QuietCloseable 
         appendAddress++;
     }
 
+    /**
+     * Appends a slice of a byte array verbatim. {@code offset} and {@code len}
+     * are not bounds-checked against the array; callers ensure validity.
+     */
+    public void putBytes(byte[] value, int offset, int len) {
+        if (len <= 0) {
+            return;
+        }
+        ensureCapacity(len);
+        Unsafe.getUnsafe().copyMemory(
+                value, Unsafe.BYTE_OFFSET + offset, null, appendAddress, len);
+        appendAddress += len;
+    }
+
     public void putBlockOfBytes(long from, long len) {
         if (len <= 0) {
             return;

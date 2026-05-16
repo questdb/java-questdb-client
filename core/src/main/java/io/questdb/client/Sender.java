@@ -263,6 +263,69 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
+     * Add a BINARY column value as a byte array. The bytes are written verbatim
+     * with no encoding or transformation. To mark the value NULL, do not call
+     * this method for the current row (the null bitmap path).
+     * <p>
+     * A {@code null} array reference is rejected to keep the NULL contract
+     * explicit; use the null bitmap instead. An empty array is accepted on the
+     * wire, but QuestDB's BINARY storage uses the same NULL sentinel for
+     * zero-length and absent values, so an empty payload round-trips as NULL
+     * on read.
+     *
+     * @param name  name of the column
+     * @param value the bytes to write; must not be null
+     * @return this instance for method chaining
+     * @throws LineSenderException if {@code value} is null or the configured
+     *                             protocol version does not support BINARY
+     */
+    default Sender binaryColumn(CharSequence name, byte[] value) {
+        throw new LineSenderException("current protocol version does not support binary");
+    }
+
+    /**
+     * Add a BINARY column value from off-heap memory. The bytes at {@code [ptr,
+     * ptr + len)} are copied verbatim into the sender's buffer; the caller's
+     * memory only needs to stay valid for the duration of this call.
+     * <p>
+     * {@code len} must be in {@code [0, Integer.MAX_VALUE]} (BINARY's wire
+     * offset entries are uint32). {@code ptr} must be non-zero when
+     * {@code len > 0}. To mark the value NULL, omit the column from the row.
+     * QuestDB's BINARY storage uses the same sentinel for empty and absent
+     * values, so {@code len == 0} round-trips as NULL on read.
+     *
+     * @param name name of the column
+     * @param ptr  native address of the first byte
+     * @param len  number of bytes to copy, 0..{@link Integer#MAX_VALUE}
+     * @return this instance for method chaining
+     * @throws LineSenderException on bad arguments or if the configured
+     *                             protocol version does not support BINARY
+     */
+    default Sender binaryColumn(CharSequence name, long ptr, long len) {
+        throw new LineSenderException("current protocol version does not support binary");
+    }
+
+    /**
+     * Add a BINARY column value from a {@link DirectByteSlice} view over
+     * off-heap memory. Equivalent to {@link #binaryColumn(CharSequence, long,
+     * long)} with the slice's {@code ptr()} and {@code size()}; the slice is
+     * not retained after the call returns.
+     *
+     * @param name  name of the column
+     * @param slice byte slice; must not be null
+     * @return this instance for method chaining
+     * @throws LineSenderException if {@code slice} is null or the configured
+     *                             protocol version does not support BINARY
+     */
+    default Sender binaryColumn(CharSequence name, DirectByteSlice slice) {
+        if (slice == null) {
+            throw new LineSenderException(
+                    "BINARY slice cannot be null; mark the row null via the null bitmap instead");
+        }
+        return binaryColumn(name, slice.ptr(), slice.size());
+    }
+
+    /**
      * Add a column with a boolean value.
      *
      * @param name  name of the column

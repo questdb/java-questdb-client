@@ -45,6 +45,153 @@ import static org.junit.Assert.*;
 public class QwpTableBufferTest {
 
     @Test
+    public void testAddBinaryEmptyArrayIsZeroLengthValue() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("b", QwpConstants.TYPE_BINARY, true);
+                col.addBinary(new byte[0]);
+                table.nextRow();
+
+                assertEquals(1, col.getSize());
+                assertEquals(1, col.getValueCount());
+                assertFalse(col.isNull(0));
+                // Zero bytes appended, so the cumulative offset for value[1] is still 0.
+                assertEquals(0L, col.getStringDataSize());
+                // Offset array seeded with [0, 0] -- 8 bytes total.
+                long offsetsAddr = col.getStringOffsetsAddress();
+                assertEquals(0, Unsafe.getUnsafe().getInt(offsetsAddr));
+                assertEquals(0, Unsafe.getUnsafe().getInt(offsetsAddr + 4));
+            }
+        });
+    }
+
+    @Test
+    public void testAddBinaryRejectsNullOnNonNullableColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("b", QwpConstants.TYPE_BINARY, false);
+                try {
+                    col.addBinary(null);
+                    fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("BINARY value cannot be null"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAddBinaryRoundTripsBytesAndOffsets() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("b", QwpConstants.TYPE_BINARY, true);
+                byte[] r0 = {0x00, 0x7F, (byte) 0x80, (byte) 0xFF};
+                byte[] r1 = {(byte) 0xCA, (byte) 0xFE};
+                col.addBinary(r0);
+                table.nextRow();
+                col.addBinary(r1);
+                table.nextRow();
+
+                assertEquals(2, col.getSize());
+                assertEquals(2, col.getValueCount());
+                assertEquals(r0.length + r1.length, col.getStringDataSize());
+
+                long offsetsAddr = col.getStringOffsetsAddress();
+                assertEquals(0, Unsafe.getUnsafe().getInt(offsetsAddr));
+                assertEquals(r0.length, Unsafe.getUnsafe().getInt(offsetsAddr + 4));
+                assertEquals(r0.length + r1.length, Unsafe.getUnsafe().getInt(offsetsAddr + 8));
+
+                long dataAddr = col.getStringDataAddress();
+                for (int i = 0; i < r0.length; i++) {
+                    assertEquals(r0[i], Unsafe.getUnsafe().getByte(dataAddr + i));
+                }
+                for (int i = 0; i < r1.length; i++) {
+                    assertEquals(r1[i], Unsafe.getUnsafe().getByte(dataAddr + r0.length + i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAddBinaryFromNativePointer() throws Exception {
+        assertMemoryLeak(() -> {
+            byte[] payload = {(byte) 0xDE, (byte) 0xAD, (byte) 0xBE, (byte) 0xEF};
+            long ptr = copyToNative(payload);
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("b", QwpConstants.TYPE_BINARY, true);
+                col.addBinary(ptr, payload.length);
+                table.nextRow();
+
+                assertEquals(1, col.getSize());
+                assertEquals(1, col.getValueCount());
+                assertEquals(payload.length, col.getStringDataSize());
+
+                long offsetsAddr = col.getStringOffsetsAddress();
+                assertEquals(0, Unsafe.getUnsafe().getInt(offsetsAddr));
+                assertEquals(payload.length, Unsafe.getUnsafe().getInt(offsetsAddr + 4));
+
+                long dataAddr = col.getStringDataAddress();
+                for (int i = 0; i < payload.length; i++) {
+                    assertEquals(payload[i], Unsafe.getUnsafe().getByte(dataAddr + i));
+                }
+            } finally {
+                Unsafe.free(ptr, payload.length, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testAddBinaryFromNativePointerRejectsBadArgs() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("b", QwpConstants.TYPE_BINARY, true);
+                try {
+                    col.addBinary(0L, -1L);
+                    fail("Expected LineSenderException for negative length");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("non-negative"));
+                }
+                try {
+                    col.addBinary(0L, 5L);
+                    fail("Expected LineSenderException for null pointer with non-zero length");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("pointer cannot be 0"));
+                }
+                // ptr == 0 && len == 0 is fine: writes a zero-length entry.
+                col.addBinary(0L, 0L);
+                table.nextRow();
+                assertEquals(1, col.getValueCount());
+            }
+        });
+    }
+
+    @Test
+    public void testAddBinaryWritesNullViaBitmap() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer col = table.getOrCreateColumn("b", QwpConstants.TYPE_BINARY, true);
+                col.addBinary(new byte[]{1, 2, 3});
+                table.nextRow();
+                col.addBinary(null);
+                table.nextRow();
+                col.addBinary(new byte[]{4});
+                table.nextRow();
+
+                assertEquals(3, col.getSize());
+                assertEquals(2, col.getValueCount());
+                assertFalse(col.isNull(0));
+                assertTrue(col.isNull(1));
+                assertFalse(col.isNull(2));
+
+                long offsetsAddr = col.getStringOffsetsAddress();
+                assertEquals(0, Unsafe.getUnsafe().getInt(offsetsAddr));
+                assertEquals(3, Unsafe.getUnsafe().getInt(offsetsAddr + 4));
+                assertEquals(4, Unsafe.getUnsafe().getInt(offsetsAddr + 8));
+            }
+        });
+    }
+
+    @Test
     public void testAddDecimal128PrecisionLoss() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {

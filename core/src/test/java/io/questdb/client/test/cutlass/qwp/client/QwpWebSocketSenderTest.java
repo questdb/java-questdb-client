@@ -25,7 +25,6 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.line.LineSenderException;
-import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import org.junit.Assert;
@@ -333,6 +332,51 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testBinaryColumnAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.binaryColumn("x", new byte[]{1, 2, 3});
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testBinaryColumnRejectsNullArray() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("t");
+                try {
+                    sender.binaryColumn("x", (byte[]) null);
+                    Assert.fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("BINARY value cannot be null"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testBinaryColumnRejectsNullDirectByteSlice() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("t");
+                try {
+                    sender.binaryColumn("x", (io.questdb.client.std.bytes.DirectByteSlice) null);
+                    Assert.fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("BINARY slice cannot be null"));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testStringColumnAfterCloseThrows() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = createUnconnectedSender();
@@ -525,37 +569,6 @@ public class QwpWebSocketSenderTest {
             }
             throw new RuntimeException(cause);
         }
-    }
-
-    private static MicrobatchBuffer getActiveBuffer(QwpWebSocketSender sender) throws Exception {
-        Field field = QwpWebSocketSender.class.getDeclaredField("activeBuffer");
-        field.setAccessible(true);
-        return (MicrobatchBuffer) field.get(sender);
-    }
-
-    private static void invokeSealAndSwapBuffer(QwpWebSocketSender sender) throws Exception {
-        Method method = QwpWebSocketSender.class.getDeclaredMethod("sealAndSwapBuffer");
-        method.setAccessible(true);
-        try {
-            method.invoke(sender);
-        } catch (InvocationTargetException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof Exception) {
-                throw (Exception) cause;
-            }
-            if (cause instanceof Error) {
-                throw (Error) cause;
-            }
-            throw new RuntimeException(cause);
-        }
-    }
-
-    /**
-     * Creates an async sender without connecting.
-     */
-    private QwpWebSocketSender createUnconnectedAsyncSender() {
-        return QwpWebSocketSender.createForTesting("localhost", 9000,
-                500, 0, 0L);  // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
     }
 
     /**

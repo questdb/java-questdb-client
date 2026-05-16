@@ -669,6 +669,52 @@ public class QwpTableBuffer implements QuietCloseable {
             }
         }
 
+        /**
+         * Adds a BINARY value. The bytes are appended verbatim to the column's data
+         * buffer and an offset entry is pushed. Shares the VARCHAR wire layout
+         * (offsets + concatenated bytes) but with no UTF-8 contract on the bytes.
+         * A null reference is rejected; callers should use the null bitmap instead.
+         */
+        public void addBinary(byte[] value) {
+            if (value == null) {
+                if (useNullBitmap) {
+                    ensureNullBitmapCapacity(size + 1);
+                    markNull(size);
+                    size++;
+                    return;
+                }
+                throw new LineSenderException(
+                        "BINARY value cannot be null; mark the row null via the null bitmap instead");
+            }
+            if (value.length > 0) {
+                stringData.putBytes(value, 0, value.length);
+            }
+            stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
+            valueCount++;
+            size++;
+        }
+
+        /**
+         * Adds a BINARY value from native memory at {@code [ptr, ptr + len)}.
+         * Bytes are copied into the column's data buffer; the caller's memory
+         * need only stay valid for the duration of this call.
+         */
+        public void addBinary(long ptr, long len) {
+            if (len < 0) {
+                throw new LineSenderException(
+                        "BINARY length must be non-negative; mark the row null via the null bitmap instead");
+            }
+            if (len > 0 && ptr == 0) {
+                throw new LineSenderException("BINARY pointer cannot be 0 for a non-empty value");
+            }
+            if (len > 0) {
+                stringData.putBlockOfBytes(ptr, len);
+            }
+            stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
+            valueCount++;
+            size++;
+        }
+
         public void addBoolean(boolean value) {
             dataBuffer.putByte(value ? (byte) 1 : (byte) 0);
             valueCount++;
@@ -1069,6 +1115,7 @@ public class QwpTableBuffer implements QuietCloseable {
                         dataBuffer.putDouble(Double.NaN);
                         break;
                     case TYPE_VARCHAR:
+                    case TYPE_BINARY:
                         stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
                         break;
                     case TYPE_SYMBOL:
@@ -1458,6 +1505,7 @@ public class QwpTableBuffer implements QuietCloseable {
 
             switch (type) {
                 case TYPE_VARCHAR:
+                case TYPE_BINARY:
                     retainStringValue(valueCountBefore);
                     break;
                 case TYPE_SYMBOL:
@@ -1611,6 +1659,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     dataBuffer = new OffHeapAppendMemory(512);
                     break;
                 case TYPE_VARCHAR:
+                case TYPE_BINARY:
                     stringOffsets = new OffHeapAppendMemory(64);
                     try {
                         stringOffsets.putInt(0); // seed initial 0 offset

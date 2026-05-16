@@ -788,6 +788,55 @@ public class QwpWebSocketSender implements Sender {
         return true;
     }
 
+    /**
+     * Adds a BINARY column value to the current row. The bytes are written
+     * verbatim with no encoding or transformation. A {@code null} array
+     * reference is rejected so the NULL contract stays explicit (use the null
+     * bitmap instead). An empty array is accepted on the wire but QuestDB's
+     * BINARY storage uses the same NULL sentinel for zero-length and absent
+     * values, so an empty payload round-trips as NULL on read.
+     */
+    @Override
+    public QwpWebSocketSender binaryColumn(CharSequence columnName, byte[] value) {
+        checkNotClosed();
+        checkTableSelected();
+        if (value == null) {
+            throw new LineSenderException(
+                    "BINARY value cannot be null; mark the row null via the null bitmap instead");
+        }
+        try {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BINARY, true);
+            if (col != null) {
+                col.addBinary(value);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackRow();
+            throw e;
+        }
+        return this;
+    }
+
+    /**
+     * Zero-allocation BINARY overload: copies {@code len} bytes from native
+     * memory at {@code ptr} into the column. See
+     * {@link Sender#binaryColumn(CharSequence, long, long)} for the contract.
+     */
+    @Override
+    public QwpWebSocketSender binaryColumn(CharSequence columnName, long ptr, long len) {
+        checkNotClosed();
+        checkTableSelected();
+        try {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BINARY, true);
+            if (col != null) {
+                col.addBinary(ptr, len);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackRow();
+            throw e;
+        }
+        return this;
+    }
+
     @Override
     public QwpWebSocketSender boolColumn(CharSequence columnName, boolean value) {
         checkNotClosed();
