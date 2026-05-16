@@ -346,6 +346,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     DirectByteSlice bufferView();
 
     /**
+     * Add a column with a single-byte signed integer value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support BYTE
+     */
+    default Sender byteColumn(CharSequence name, byte value) {
+        throw new LineSenderException("current protocol version does not support byte");
+    }
+
+    /**
      * Cancel the current row. This method is useful when you want to discard a row that you started, but
      * you don't want to send it to a server.
      * <br>
@@ -355,6 +367,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * communicating over TCP transport.
      */
     void cancelRow();
+
+    /**
+     * Add a column with a 16-bit Java {@code char} value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support CHAR
+     */
+    default Sender charColumn(CharSequence name, char value) {
+        throw new LineSenderException("current protocol version does not support char");
+    }
 
     /**
      * Close this Sender.
@@ -420,6 +444,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @return this instance for method chaining
      */
     Sender doubleColumn(CharSequence name, double value);
+
+    /**
+     * Add a column with a 32-bit floating point value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support FLOAT
+     */
+    default Sender floatColumn(CharSequence name, float value) {
+        throw new LineSenderException("current protocol version does not support float");
+    }
 
     /**
      * Force flushing internal buffers to a server.
@@ -488,6 +524,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Add a column with a 32-bit signed integer value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support INT
+     */
+    default Sender intColumn(CharSequence name, int value) {
+        throw new LineSenderException("current protocol version does not support int");
+    }
+
+    /**
      * Add an IPv4 column value, as a packed 32-bit address in host byte order
      * (e.g. 192.168.1.1 -> 0xC0A80101).
      * <p>
@@ -513,6 +561,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     default Sender ipv4Column(CharSequence name, CharSequence address) {
         throw new LineSenderException("current protocol version does not support ipv4");
+    }
+
+    /**
+     * Add a LONG256 column value, packed as four 64-bit words, least-significant first
+     * (so the 256-bit value is {@code (l3 << 192) | (l2 << 128) | (l1 << 64) | l0}).
+     *
+     * @param name name of the column
+     * @param l0   bits 0..63 (least significant)
+     * @param l1   bits 64..127
+     * @param l2   bits 128..191
+     * @param l3   bits 192..255 (most significant)
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support LONG256
+     */
+    default Sender long256Column(CharSequence name, long l0, long l1, long l2, long l3) {
+        throw new LineSenderException("current protocol version does not support long256");
     }
 
     /**
@@ -542,6 +606,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @see #flush()
      */
     void reset();
+
+    /**
+     * Add a column with a 16-bit signed integer value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support SHORT
+     */
+    default Sender shortColumn(CharSequence name, short value) {
+        throw new LineSenderException("current protocol version does not support short");
+    }
 
     /**
      * Add a column with a string value.
@@ -593,6 +669,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @return this instance for method chaining
      */
     Sender timestampColumn(CharSequence name, Instant value);
+
+    /**
+     * Add a UUID column value, packed as two 64-bit halves.
+     *
+     * @param name name of the column
+     * @param lo   low 64 bits of the UUID
+     * @param hi   high 64 bits of the UUID
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support UUID
+     */
+    default Sender uuidColumn(CharSequence name, long lo, long hi) {
+        throw new LineSenderException("current protocol version does not support uuid");
+    }
 
     /**
      * Configure TLS mode.
