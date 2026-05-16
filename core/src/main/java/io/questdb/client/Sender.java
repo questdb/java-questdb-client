@@ -376,6 +376,34 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void flush();
 
     /**
+     * Add an IPv4 column value, as a packed 32-bit address in host byte order
+     * (e.g. 192.168.1.1 -> 0xC0A80101).
+     * <p>
+     * Per QuestDB convention, the bit pattern 0 (i.e. 0.0.0.0) is the IPv4
+     * NULL sentinel and surfaces as NULL on read.
+     *
+     * @param name    name of the column
+     * @param address packed IPv4 address
+     * @return this instance for method chaining
+     */
+    default Sender ipv4Column(CharSequence name, int address) {
+        throw new LineSenderException("current protocol version does not support ipv4");
+    }
+
+    /**
+     * Add an IPv4 column value from a dotted-quad string (e.g. "192.168.1.1").
+     *
+     * @param name    name of the column
+     * @param address dotted-quad IPv4 address; must not be null
+     * @return this instance for method chaining
+     * @throws LineSenderException if the address fails to parse, or the
+     *                             configured protocol version does not support IPv4
+     */
+    default Sender ipv4Column(CharSequence name, CharSequence address) {
+        throw new LineSenderException("current protocol version does not support ipv4");
+    }
+
+    /**
      * Add a column with an integer value.
      *
      * @param name  name of the column

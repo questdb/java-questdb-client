@@ -71,6 +71,7 @@ class QwpColumnWriter {
                 buffer.putBlockOfBytes(dataAddr, (long) valueCount * 2);
                 break;
             case TYPE_INT:
+            case TYPE_IPv4:
             case TYPE_FLOAT:
                 buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
                 break;

@@ -668,6 +668,7 @@ public class QwpUdpSender implements Sender {
             case TYPE_CHAR:
                 return (long) missing * 2;
             case TYPE_INT:
+            case TYPE_IPv4:
             case TYPE_FLOAT:
             case TYPE_VARCHAR:
                 return (long) missing * 4;

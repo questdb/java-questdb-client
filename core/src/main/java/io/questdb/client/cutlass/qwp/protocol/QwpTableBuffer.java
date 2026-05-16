@@ -486,6 +486,7 @@ public class QwpTableBuffer implements QuietCloseable {
             case TYPE_CHAR:
                 return 2;
             case TYPE_INT:
+            case TYPE_IPv4:
             case TYPE_SYMBOL:
             case TYPE_FLOAT:
                 return 4;
@@ -907,6 +908,17 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
+        /**
+         * Adds a packed IPv4 address (4 bytes, little-endian on the wire). The bit
+         * pattern 0 (i.e. 0.0.0.0) is reserved by QuestDB as the IPv4 NULL sentinel
+         * and surfaces as NULL on read regardless of the null bitmap.
+         */
+        public void addIPv4(int address) {
+            dataBuffer.putInt(address);
+            valueCount++;
+            size++;
+        }
+
         public void addLong(long value) {
             dataBuffer.putLong(value);
             valueCount++;
@@ -1035,6 +1047,10 @@ public class QwpTableBuffer implements QuietCloseable {
                         dataBuffer.putShort((short) 0);
                         break;
                     case TYPE_INT:
+                        dataBuffer.putInt(0);
+                        break;
+                    case TYPE_IPv4:
+                        // QuestDB convention: 0.0.0.0 (bit pattern 0) is the NULL sentinel.
                         dataBuffer.putInt(0);
                         break;
                     case TYPE_GEOHASH:
@@ -1564,6 +1580,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     dataBuffer = new OffHeapAppendMemory(32);
                     break;
                 case TYPE_INT:
+                case TYPE_IPv4:
                 case TYPE_FLOAT:
                     dataBuffer = new OffHeapAppendMemory(64);
                     break;

@@ -55,6 +55,8 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Misc;
+import io.questdb.client.std.Numbers;
+import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
@@ -1527,6 +1529,60 @@ public class QwpWebSocketSender implements Sender {
             throw e;
         }
         return this;
+    }
+
+    /**
+     * Adds an IPv4 column value to the current row, as a packed 32-bit address
+     * in host byte order (e.g. 192.168.1.1 -> 0xC0A80101).
+     * <p>
+     * Use {@link Numbers#parseIPv4(CharSequence)} to parse a dotted-quad string,
+     * or call {@link #ipv4Column(CharSequence, CharSequence)}. Per QuestDB
+     * convention, the address 0.0.0.0 maps to IPv4 NULL on read, regardless of
+     * whether the row was marked null on the wire.
+     *
+     * @param columnName the column name
+     * @param address    the packed IPv4 address
+     * @return this sender for method chaining
+     */
+    @Override
+    public QwpWebSocketSender ipv4Column(CharSequence columnName, int address) {
+        checkNotClosed();
+        checkTableSelected();
+        try {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_IPv4, true);
+            if (col != null) {
+                col.addIPv4(address);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackRow();
+            throw e;
+        }
+        return this;
+    }
+
+    /**
+     * Adds an IPv4 column value from a dotted-quad string (e.g. "192.168.1.1").
+     * Equivalent to parsing the string via {@link Numbers#parseIPv4(CharSequence)}
+     * and calling {@link #ipv4Column(CharSequence, int)}.
+     *
+     * @param columnName the column name
+     * @param address    dotted-quad IPv4 address; must not be null
+     * @return this sender for method chaining
+     * @throws LineSenderException if the address fails to parse
+     */
+    @Override
+    public QwpWebSocketSender ipv4Column(CharSequence columnName, CharSequence address) {
+        if (address == null) {
+            throw new LineSenderException(
+                    "IPv4 address cannot be null; mark the row null via the null bitmap instead");
+        }
+        int packed;
+        try {
+            packed = Numbers.parseIPv4(address);
+        } catch (NumericException e) {
+            throw new LineSenderException("invalid IPv4 address: " + address);
+        }
+        return ipv4Column(columnName, packed);
     }
 
     /**
