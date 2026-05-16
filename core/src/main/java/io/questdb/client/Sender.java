@@ -376,6 +376,55 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void flush();
 
     /**
+     * Add a GEOHASH column value from pre-packed bits and an explicit bit precision.
+     * <p>
+     * The {@code bits} long carries the geohash in its low {@code precisionBits} bits;
+     * higher bits are masked off and never reach the wire. {@code precisionBits} must
+     * be in {@code [1, 60]}, matching {@code GEOHASH(Nb)} on the server.
+     * <p>
+     * Precision is locked the first time a value is added to the column: subsequent
+     * rows must use the same precision or a {@link LineSenderException} is thrown.
+     * To mark the value NULL, do not call this method for the current row.
+     *
+     * @param name          name of the column
+     * @param bits          packed geohash; low {@code precisionBits} bits significant
+     * @param precisionBits number of significant bits, 1..60
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support
+     *                             GEOHASH, {@code precisionBits} is out of range, or
+     *                             the precision does not match the column's previously
+     *                             locked precision
+     */
+    default Sender geoHashColumn(CharSequence name, long bits, int precisionBits) {
+        throw new LineSenderException("current protocol version does not support geohash");
+    }
+
+    /**
+     * Add a GEOHASH column value from a base32 geohash string (e.g. "u33d8").
+     * <p>
+     * The string is decoded as standard geohash base32 (lower- or upper-case;
+     * characters in {@code 0-9} and {@code b c d e f g h j k m n p q r s t u v w x
+     * y z}; {@code a, i, l, o} are not part of the alphabet). Each character
+     * contributes 5 bits, so a 4-character string produces a 20-bit geohash and
+     * the longest accepted input is 12 characters (60 bits).
+     * <p>
+     * The first call locks the column at {@code value.length() * 5} bits; all
+     * subsequent rows must supply strings of the same length.
+     *
+     * @param name  name of the column
+     * @param value base32 geohash string, 1..12 characters; must not be null or empty
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support
+     *                             GEOHASH, the string is null, empty, longer than 12
+     *                             characters, contains non-base32 characters, or its
+     *                             derived precision does not match the column's
+     *                             previously locked precision
+     */
+    default Sender geoHashColumn(CharSequence name, CharSequence value) {
+        throw new LineSenderException("current protocol version does not support geohash");
+    }
+
+    /**
      * Add an IPv4 column value, as a packed 32-bit address in host byte order
      * (e.g. 192.168.1.1 -> 0xC0A80101).
      * <p>

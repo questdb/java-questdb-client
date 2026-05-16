@@ -39,6 +39,8 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Misc;
+import io.questdb.client.std.Numbers;
+import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.bytes.DirectByteSlice;
@@ -385,6 +387,45 @@ public class QwpUdpSender implements Sender {
     }
 
     @Override
+    public Sender geoHashColumn(CharSequence name, long bits, int precisionBits) {
+        checkNotClosed();
+        checkTableSelected();
+        if (precisionBits < 1 || precisionBits > 60) {
+            throw new LineSenderException(
+                    "invalid GEOHASH precision: " + precisionBits + " (must be 1-60)");
+        }
+        try {
+            stageGeoHashColumnValue(name, maskGeoHashBits(bits, precisionBits), precisionBits);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
+        return this;
+    }
+
+    @Override
+    public Sender geoHashColumn(CharSequence name, CharSequence value) {
+        if (value == null) {
+            throw new LineSenderException(
+                    "GEOHASH string cannot be null; mark the row null via the null bitmap instead");
+        }
+        int len = value.length();
+        if (len == 0) {
+            throw new LineSenderException("GEOHASH string cannot be empty");
+        }
+        if (len > 12) {
+            throw new LineSenderException("GEOHASH string exceeds 12 characters: " + len);
+        }
+        long bits;
+        try {
+            bits = Numbers.parseGeoHashBase32(value, 0, len);
+        } catch (NumericException e) {
+            throw new LineSenderException("invalid GEOHASH string: ").put(value);
+        }
+        return geoHashColumn(name, bits, len * 5);
+    }
+
+    @Override
     public Sender longArray(@NotNull CharSequence name, long[] values) {
         if (values == null) {
             return this;
@@ -615,6 +656,16 @@ public class QwpUdpSender implements Sender {
             case TYPE_DOUBLE_ARRAY:
             case TYPE_LONG_ARRAY:
                 return estimateArrayPayloadBytes(col, state);
+            case TYPE_GEOHASH: {
+                int precision = col.getGeoHashPrecision();
+                int valueSize = (precision + 7) >>> 3;
+                long delta = (long) (valueCountAfter - valueCountBefore) * valueSize;
+                // varint precision prefix is written once per column block on the wire.
+                if (valueCountBefore == 0) {
+                    delta += NativeBufferWriter.varintSize(precision);
+                }
+                return delta;
+            }
             case TYPE_VARCHAR:
                 return 4L + (col.getStringDataSize() - state.stringDataSizeBefore);
             case TYPE_SYMBOL:
@@ -656,6 +707,10 @@ public class QwpUdpSender implements Sender {
 
         delta += NativeBufferWriter.varintSize(dictSizeAfter - 1);
         return delta;
+    }
+
+    private static long maskGeoHashBits(long value, int precisionBits) {
+        return precisionBits >= 64 ? value : value & ((1L << precisionBits) - 1L);
     }
 
     private static long nonNullablePaddingCost(byte type, int valuesBefore, int missing) {
@@ -1277,6 +1332,13 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DOUBLE, false);
         beginColumnWrite(col, name);
         col.addDouble(value);
+        completeColumnWrite();
+    }
+
+    private void stageGeoHashColumnValue(CharSequence name, long maskedBits, int precisionBits) {
+        QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_GEOHASH, true);
+        beginColumnWrite(col, name);
+        col.addGeoHash(maskedBits, precisionBits);
         completeColumnWrite();
     }
 

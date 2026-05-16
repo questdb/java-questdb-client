@@ -1299,6 +1299,77 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Adds a GEOHASH column value to the current row from pre-packed bits and
+     * an explicit bit precision. Bits above {@code precisionBits} are masked
+     * off and never reach the wire, so callers may pass an unmasked long.
+     * <p>
+     * Precision is locked the first time a value is added to the column: every
+     * subsequent row must use the same precision. Precision must be in
+     * {@code [1, 60]}.
+     *
+     * @param columnName    the column name
+     * @param bits          packed geohash; low {@code precisionBits} bits significant
+     * @param precisionBits number of significant bits, 1..60
+     * @return this sender for method chaining
+     */
+    @Override
+    public QwpWebSocketSender geoHashColumn(CharSequence columnName, long bits, int precisionBits) {
+        checkNotClosed();
+        checkTableSelected();
+        if (precisionBits < 1 || precisionBits > 60) {
+            throw new LineSenderException(
+                    "invalid GEOHASH precision: " + precisionBits + " (must be 1-60)");
+        }
+        try {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_GEOHASH, true);
+            if (col != null) {
+                col.addGeoHash(maskGeoHashBits(bits, precisionBits), precisionBits);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackRow();
+            throw e;
+        }
+        return this;
+    }
+
+    /**
+     * Adds a GEOHASH column value from a base32 geohash string (e.g. "u33d8").
+     * The string is decoded as 5 bits per character; precision is set to
+     * {@code value.length() * 5} and locked at the column on first use. The
+     * accepted alphabet is digits {@code 0-9} plus {@code b c d e f g h j k m n
+     * p q r s t u v w x y z}, case insensitive ({@code a, i, l, o} are
+     * reserved). Maximum 12 characters (60 bits).
+     *
+     * @param columnName the column name
+     * @param value      base32 geohash string, 1..12 characters; must not be null
+     * @return this sender for method chaining
+     * @throws LineSenderException if the string is null, empty, too long, or
+     *                             contains a non-base32 character
+     */
+    @Override
+    public QwpWebSocketSender geoHashColumn(CharSequence columnName, CharSequence value) {
+        if (value == null) {
+            throw new LineSenderException(
+                    "GEOHASH string cannot be null; mark the row null via the null bitmap instead");
+        }
+        int len = value.length();
+        if (len == 0) {
+            throw new LineSenderException("GEOHASH string cannot be empty");
+        }
+        if (len > 12) {
+            throw new LineSenderException(
+                    "GEOHASH string exceeds 12 characters: " + len);
+        }
+        long bits;
+        try {
+            bits = Numbers.parseGeoHashBase32(value, 0, len);
+        } catch (NumericException e) {
+            throw new LineSenderException("invalid GEOHASH string: ").put(value);
+        }
+        return geoHashColumn(columnName, bits, len * 5);
+    }
+
+    /**
      * Highest FSN that has been server-acknowledged (or skipped past on a
      * {@link SenderError.Policy#DROP_AND_CONTINUE} rejection). {@code -1} if
      * the I/O loop has not yet started or no batch has been published.
@@ -2048,6 +2119,10 @@ public class QwpWebSocketSender implements Sender {
             terminalError.addSuppressed(t);
         }
         return terminalError;
+    }
+
+    private static long maskGeoHashBits(long value, int precisionBits) {
+        return precisionBits >= 64 ? value : value & ((1L << precisionBits) - 1L);
     }
 
     private static void rethrowTerminal(Throwable t) {
