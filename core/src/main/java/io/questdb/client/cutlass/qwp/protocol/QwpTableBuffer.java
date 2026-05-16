@@ -1432,7 +1432,11 @@ public class QwpTableBuffer implements QuietCloseable {
             arrayShapeOffset = 0;
             arrayDataOffset = 0;
             decimalScale = -1;
-            geohashPrecision = -1;
+            // geohashPrecision is intentionally NOT cleared here. It is a
+            // schema property, locked on first write and matched by the
+            // server's auto-created GEOHASH(Nb) type, so preserving it across
+            // batches lets a later all-null batch encode the column with the
+            // correct varint instead of falling back to precision=1.
         }
 
         public void retainTailRow(
@@ -1538,7 +1542,12 @@ public class QwpTableBuffer implements QuietCloseable {
             }
 
             // When all values are removed, reset type-specific metadata so the
-            // column behaves as freshly created (matches what reset() does).
+            // column behaves as freshly created. truncateTo is reached from
+            // cancelCurrentRow, where newly-added in-progress columns must be
+            // free to re-acquire a different precision/scale on the next row
+            // (the server has not seen them yet). The between-batch path goes
+            // through ColumnBuffer.reset() and intentionally preserves
+            // geohashPrecision there to keep its server-locked value.
             if (newValueCount == 0) {
                 decimalScale = -1;
                 geohashPrecision = -1;

@@ -211,6 +211,36 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testGeoHashColumnLongAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.geoHashColumn("g", 0xFL, 5);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testGeoHashColumnStringAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.geoHashColumn("g", "u33d");
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
     public void testGorillaEnabledByDefault() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = createUnconnectedSender()) {
