@@ -179,6 +179,14 @@ public class QwpWebSocketSender implements Sender {
     private int currentBatchMaxSymbolId = -1;
     private volatile int currentEndpointIdx = -1;
     private QwpTableBuffer currentTableBuffer;
+    // Tracks currentTableBuffer.getBufferedBytes() at the last point pendingBytes
+    // was made consistent (end of sendRow(), or right after a table switch).
+    // sendRow() advances pendingBytes by (now - snapshot) and re-snaps, which
+    // keeps pendingBytes correct without re-walking every table per row.
+    // The invariant holds because column setters and rollbackRow/cancelRow
+    // only ever touch currentTableBuffer between the consistency points, and
+    // table() bans switches while a row is in progress.
+    private long currentTableBufferSnapshotBytes;
     private String currentTableName;
     // Cursor SF engine: the producer (user thread) writes encoded QWP frames
     // into the engine's mmap'd ring; the cursorSendLoop is the I/O thread
@@ -199,8 +207,11 @@ public class QwpWebSocketSender implements Sender {
     // Effective per-batch soft-flush threshold in raw column-buffer bytes.
     // Initially equals autoFlushBytes; lowered to fit under the server's
     // advertised X-QWP-Max-Batch-Size at handshake so the wire payload stays
-    // under the server's cap even with encoding overhead.
-    private int effectiveAutoFlushBytes;
+    // under the server's cap even with encoding overhead. Volatile because the
+    // I/O thread writes this inside buildAndConnect on every successful
+    // (re)connect while the producer thread reads it from sendRow without
+    // holding the sender monitor.
+    private volatile int effectiveAutoFlushBytes;
     private SenderErrorDispatcher errorDispatcher;
     // Async-delivery sink for SenderError notifications. Default-constructed
     // here with the loud-not-silent default handler; a builder hook can swap
@@ -253,8 +264,10 @@ public class QwpWebSocketSender implements Sender {
     // Server-advertised hard cap on QWP ingest payload bytes, captured from
     // X-QWP-Max-Batch-Size on each successful handshake. 0 when the server
     // did not advertise the header (older builds); the sender then falls back
-    // to its locally configured budget.
-    private int serverMaxBatchSize;
+    // to its locally configured budget. Volatile because buildAndConnect can
+    // refresh this from the cursor I/O thread on a mid-stream reconnect while
+    // sendRow reads it on the producer thread with no synchronization.
+    private volatile int serverMaxBatchSize;
 
     private QwpWebSocketSender(
             List<Endpoint> endpoints,
@@ -275,6 +288,7 @@ public class QwpWebSocketSender implements Sender {
         this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
         this.tableBuffers = new CharSequenceObjHashMap<>();
         this.currentTableBuffer = null;
+        this.currentTableBufferSnapshotBytes = 0;
         this.currentTableName = null;
         this.connected = false;
         this.closed = false;
@@ -1497,6 +1511,7 @@ public class QwpWebSocketSender implements Sender {
             tableBuffers.put(tableName, buffer);
         }
         currentTableBuffer = buffer;
+        currentTableBufferSnapshotBytes = buffer.getBufferedBytes();
         currentTableName = tableName;
         return buffer;
     }
@@ -1682,25 +1697,47 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Adds an IPv4 column value from a dotted-quad string (e.g. "192.168.1.1").
-     * Equivalent to parsing the string via {@link Numbers#parseIPv4(CharSequence)}
-     * and calling {@link #ipv4Column(CharSequence, int)}.
+     * <p>
+     * NULL handling on this overload is stricter than the underlying
+     * {@link Numbers#parseIPv4(CharSequence)} contract:
+     * <ul>
+     *   <li>A {@code null} reference is a no-op: the column is skipped for
+     *       this row and gets null-padded on commit (same shape as
+     *       omitting the setter entirely).</li>
+     *   <li>The literal string {@code "null"} (case-insensitive) is
+     *       rejected with {@link LineSenderException}, even though
+     *       {@code parseIPv4} would coerce it to the IPv4 NULL sentinel.</li>
+     *   <li>The dotted-quad {@code "0.0.0.0"} is rejected for the same
+     *       reason: its bit pattern is the IPv4 NULL sentinel and the
+     *       value would silently round-trip as SQL NULL on read.</li>
+     * </ul>
+     * Pass a null reference (or omit the setter) when you want to mark a
+     * row null; otherwise pass a real dotted-quad address.
      *
      * @param columnName the column name
-     * @param address    dotted-quad IPv4 address; must not be null
+     * @param address    dotted-quad IPv4 address; null reference is treated
+     *                   as "skip this column for the current row"
      * @return this sender for method chaining
-     * @throws LineSenderException if the address fails to parse
+     * @throws LineSenderException if the address fails to parse, equals
+     *                             {@code "null"} (case-insensitive), or
+     *                             equals {@code "0.0.0.0"}
      */
     @Override
     public QwpWebSocketSender ipv4Column(CharSequence columnName, CharSequence address) {
         if (address == null) {
+            return this;
+        }
+        if (Chars.equalsIgnoreCase("null", address) || Chars.equals("0.0.0.0", address)) {
             throw new LineSenderException(
-                    "IPv4 address cannot be null; mark the row null via the null bitmap instead");
+                    "invalid IPv4 address: NULL sentinel inputs are rejected"
+                            + "; pass a null reference or omit the setter to mark the row null [address=")
+                    .put(address).put(']');
         }
         int packed;
         try {
             packed = Numbers.parseIPv4(address);
         } catch (NumericException e) {
-            throw new LineSenderException("invalid IPv4 address: " + address);
+            throw new LineSenderException("invalid IPv4 address: ").put(address);
         }
         return ipv4Column(columnName, packed);
     }
@@ -1847,6 +1884,7 @@ public class QwpWebSocketSender implements Sender {
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
         currentTableBuffer = null;
+        currentTableBufferSnapshotBytes = 0;
         currentTableName = null;
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
@@ -2078,6 +2116,11 @@ public class QwpWebSocketSender implements Sender {
             currentTableBuffer = new QwpTableBuffer(currentTableName, this);
             tableBuffers.put(currentTableName, currentTableBuffer);
         }
+        // Re-snap so sendRow()'s delta math is anchored to this table's
+        // current byte count. The prior current table's bytes already match
+        // its last-snapped value (the in-progress-row guard above ensures
+        // no column setters ran on it since the last consistency point).
+        currentTableBufferSnapshotBytes = currentTableBuffer.getBufferedBytes();
         // Both modes accumulate rows until flush
         return this;
     }
@@ -2402,6 +2445,13 @@ public class QwpWebSocketSender implements Sender {
             dispatchConnectionEvent(
                     successKind, ep.host, ep.port, prevHost, prevPort,
                     attemptNumber, roundSeq, null);
+            // Refresh the cap-derived state before returning the new client so
+            // the producer thread observes the new endpoint's advertised
+            // X-QWP-Max-Batch-Size from the next sendRow onwards. Skipping this
+            // on a mid-stream failover leaves the sender sized for the prior
+            // endpoint's cap; an oversize row then escapes the producer-side
+            // guard and trips a wire-level ws-close[1009] downstream.
+            applyServerBatchSizeLimit(newClient.getServerMaxBatchSize());
             return newClient;
         }
         // Round walked every endpoint without a success. Surface
@@ -2711,7 +2761,9 @@ public class QwpWebSocketSender implements Sender {
             String host = ep == null ? "<unbound>" : ep.host;
             int port = ep == null ? -1 : ep.port;
             encoder.setVersion((byte) client.getServerQwpVersion());
-            applyServerBatchSizeLimit(client.getServerMaxBatchSize());
+            // serverMaxBatchSize / effectiveAutoFlushBytes were already
+            // refreshed by buildAndConnect just before it returned this
+            // client; same path runs on every reconnect.
             LOG.info("Connected to WebSocket [host={}, port={}, qwpVersion={}, serverMaxBatchSize={}, effectiveAutoFlushBytes={}]",
                     host, port, client.getServerQwpVersion(), serverMaxBatchSize, effectiveAutoFlushBytes);
         } else {
@@ -2759,6 +2811,8 @@ public class QwpWebSocketSender implements Sender {
         int tableCount = countNonEmptyTables(keys);
         if (tableCount == 0) {
             pendingBytes = 0;
+            currentTableBufferSnapshotBytes = currentTableBuffer == null
+                    ? 0 : currentTableBuffer.getBufferedBytes();
             pendingRowCount = 0;
             firstPendingRowTimeNanos = 0;
             return;
@@ -2810,6 +2864,42 @@ public class QwpWebSocketSender implements Sender {
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
 
+        // Defensive flush-time cap check: the per-row guard in sendRow()
+        // catches individual oversize rows, but schema and dict-delta
+        // bytes the encoder adds at message-build time can push a batch
+        // of legitimately-sized rows above the wire cap. Without this
+        // check the frame would be sent and the server would close the
+        // connection with ws-close[1009 Message Too Big], surfacing the
+        // failure asynchronously on a later op rather than from this
+        // flush() call. Reset all pending state so the sender stays
+        // usable -- the caller's pending rows are dropped; they must
+        // re-batch with fewer rows per flush. close()'s drain path
+        // also relies on this being a clean reset to avoid re-throwing.
+        if (serverMaxBatchSize > 0 && messageSize > serverMaxBatchSize) {
+            int oversize = messageSize;
+            int droppedRows = pendingRowCount;
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                CharSequence tableName = keys.getQuick(i);
+                if (tableName == null) {
+                    continue;
+                }
+                QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+                if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                    continue;
+                }
+                tableBuffer.reset();
+            }
+            currentBatchMaxSymbolId = -1;
+            pendingBytes = 0;
+            currentTableBufferSnapshotBytes = 0;
+            pendingRowCount = 0;
+            firstPendingRowTimeNanos = 0;
+            throw new LineSenderException("batch too large for server batch cap")
+                    .put(" [messageSize=").put(oversize)
+                    .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
+                    .put(", droppedRows=").put(droppedRows).put(']');
+        }
+
         activeBuffer.ensureCapacity(messageSize);
         activeBuffer.write(buffer.getBufferPtr(), messageSize);
         activeBuffer.incrementRowCount();
@@ -2835,6 +2925,7 @@ public class QwpWebSocketSender implements Sender {
 
         // Reset pending count
         pendingBytes = 0;
+        currentTableBufferSnapshotBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
     }
@@ -2939,6 +3030,24 @@ public class QwpWebSocketSender implements Sender {
      */
     private void sendRow() {
         ensureConnected();
+
+        // Hard guard: if THIS row's bytes already exceed the server's wire
+        // cap, the flush would produce an oversize WS frame the server
+        // closes with ws-close[1009]. Check the per-row delta before
+        // nextRow() commits the row, so the at()/atNow() error path can
+        // roll back via rollbackRow() and prior committed rows in the
+        // batch stay intact. (The check ignores the null-padding bytes
+        // nextRow() will add; that's bounded by numColumns * elemSize and
+        // far below any realistic cap.)
+        if (serverMaxBatchSize > 0) {
+            long rowBytes = currentTableBuffer.getBufferedBytes() - currentTableBufferSnapshotBytes;
+            if (rowBytes > serverMaxBatchSize) {
+                throw new LineSenderException("row too large for server batch cap")
+                        .put(" [rowBytes=").put(rowBytes)
+                        .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
+            }
+        }
+
         currentTableBuffer.nextRow();
 
         if (pendingRowCount == 0) {
@@ -2946,28 +3055,15 @@ public class QwpWebSocketSender implements Sender {
         }
         pendingRowCount++;
 
-        // Recompute total buffered bytes across all tables. Tracking it as a
-        // running delta from inside nextRow() would only catch null-backfill
-        // bytes, since column setters wrote the row's own bytes directly into
-        // the column buffers before sendRow() was called. The full re-walk is
-        // cheap: the table-count is typically 1, and getBufferedBytes() sums
-        // column buffer sizes from cached fields.
-        pendingBytes = totalBufferedBytes();
-
-        // Hard guard: if a single row's raw bytes already exceed the server's
-        // hard cap, the wire frame will be rejected with STATUS_PARSE_ERROR.
-        // Detect it here so the caller sees a clear "row too large" error
-        // before we burn an I/O round-trip.
-        if (pendingRowCount == 1 && serverMaxBatchSize > 0 && pendingBytes > serverMaxBatchSize) {
-            long oversizeBytes = pendingBytes;
-            currentTableBuffer.reset();
-            pendingBytes = 0;
-            pendingRowCount = 0;
-            firstPendingRowTimeNanos = 0;
-            throw new LineSenderException("row too large for server batch cap")
-                    .put(" [rowBytes=").put(oversizeBytes)
-                    .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
-        }
+        // Advance pendingBytes by the bytes the just-committed row added to
+        // the current table, then re-snap. Column setters and nextRow()
+        // only ever touch currentTableBuffer between consistency points, so
+        // the per-row work stays O(numColumns of the current table) -- no
+        // map walk, no scaling with the number of tables this sender has
+        // seen across its lifetime.
+        long bufferedNow = currentTableBuffer.getBufferedBytes();
+        pendingBytes += bufferedNow - currentTableBufferSnapshotBytes;
+        currentTableBufferSnapshotBytes = bufferedNow;
 
         if (shouldAutoFlush()) {
             flushPendingRows();
