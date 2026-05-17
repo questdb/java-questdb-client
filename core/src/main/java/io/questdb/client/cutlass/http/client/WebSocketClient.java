@@ -112,7 +112,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int port;
     // QWP version negotiation
     // Verbatim header value sent as X-QWP-Accept-Encoding during upgrade, e.g.
-    // "zstd;level=3,raw". When null, the header is omitted and the server ships
+    // "zstd;level=1,raw". When null, the header is omitted and the server ships
     // batches uncompressed. The echoed X-QWP-Content-Encoding response header
     // is intentionally not parsed: the RESULT_BATCH decoder branches on
     // FLAG_ZSTD in every frame, which is the authoritative signal.
@@ -451,7 +451,7 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     /**
      * Sets the value sent as the {@code X-QWP-Accept-Encoding} upgrade header,
-     * e.g. {@code "zstd;level=3,raw"}. Pass {@code null} to omit the header
+     * e.g. {@code "zstd;level=1,raw"}. Pass {@code null} to omit the header
      * entirely (server ships uncompressed batches). Must be called before
      * {@link #upgrade}.
      */
@@ -683,7 +683,7 @@ public abstract class WebSocketClient implements QuietCloseable {
                 String value = response.substring(valueStart, lineEnd).trim();
                 try {
                     int parsed = Integer.parseInt(value);
-                    return parsed > 0 ? parsed : 0;
+                    return Math.max(parsed, 0);
                 } catch (NumberFormatException e) {
                     return 0;
                 }

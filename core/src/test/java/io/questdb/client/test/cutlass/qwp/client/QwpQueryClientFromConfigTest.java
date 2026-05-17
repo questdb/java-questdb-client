@@ -343,6 +343,31 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testCompressionLevelDefaultIsOneWhenOmitted() {
+        // Pinned: compression=zstd without an explicit compression_level
+        // resolves to level 1 -- the cheapest server-side CPU. Bumping this
+        // default silently would inflate per-connection compress cost for
+        // opt-in clients that don't pin the level themselves.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;compression=zstd;")) {
+            Assert.assertEquals(1, c.getCompressionLevelForTest());
+        }
+    }
+
+    @Test
+    public void testCompressionLevelDefaultIsOneWhenCompressionAlsoOmitted() {
+        // Defense-in-depth: the level default must also be 1 when the
+        // user did not opt in to compression at all. compression=raw means
+        // the X-QWP-Accept-Encoding header is omitted entirely, so the
+        // level value is unreachable on the wire -- but pinning it here
+        // guards against the parser-local default drifting away from the
+        // field-init default and surprising callers that flip to zstd
+        // via the programmatic builder afterwards.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;")) {
+            Assert.assertEquals(1, c.getCompressionLevelForTest());
+        }
+    }
+
+    @Test
     public void testCompressionLevelAtUpperBoundAccepted() {
         // Parse-time cap is [1, 22]; server-side runtime clamp to [1, 9] is a separate concern.
         assertParses("ws::addr=db:9000;compression=zstd;compression_level=22;");

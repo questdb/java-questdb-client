@@ -173,7 +173,7 @@ public class QwpQueryClient implements QuietCloseable {
     // upgrade header. Ignored when target=primary (writers must be followed
     // across zones).
     private String clientZone;
-    private int compressionLevel = 3;
+    private int compressionLevel = 1;
     // User-facing compression preference from the connection string. "raw" is
     // the library default -- no compression, no handshake header, no server-
     // side CPU burn on payloads where the network isn't the bottleneck
@@ -320,7 +320,9 @@ public class QwpQueryClient implements QuietCloseable {
      *       (default) advertises {@code zstd,raw} so the server picks zstd
      *       when it supports it and falls back to raw otherwise.</li>
      *   <li>{@code compression_level=N} -- zstd level hint, clamped server-side
-     *       to [1, 9]. Default 3. Ignored when {@code compression=raw}.</li>
+     *       to [1, 9]. Default 1 (cheapest server-side CPU; compression ratio
+     *       gain at higher levels is small for typical columnar payloads).
+     *       Ignored when {@code compression=raw}.</li>
      *   <li>{@code tls_verify=on|unsafe_off} -- TLS certificate validation. Default is {@code on}.
      *       Only allowed with the {@code wss::} schema. {@code unsafe_off} disables hostname and
      *       certificate chain validation; use only for testing.</li>
@@ -379,7 +381,7 @@ public class QwpQueryClient implements QuietCloseable {
         // Default matches the field initializer in QwpQueryClient: raw wire,
         // zstd opt-in.
         String compression = "raw";
-        int compressionLevel = 3;
+        int compressionLevel = 1;
         int maxBatchRows = 0;  // 0 = omit header, server uses its default
         // TLS validation mode: null means "unset in config". Explicit values kick in only when tls is true.
         Integer tlsValidation = null;
@@ -922,6 +924,16 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public String getCompressionPreference() {
         return compressionPreference;
+    }
+
+    /**
+     * Returns the zstd level the client will advertise on the
+     * {@code X-QWP-Accept-Encoding} header. Exposed so tests can pin the
+     * default and the parser's accepted range; any drift here changes what
+     * the server sees on the wire.
+     */
+    public int getCompressionLevelForTest() {
+        return compressionLevel;
     }
 
     public int getEndpointCountForTest() {

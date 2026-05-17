@@ -28,8 +28,9 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  * {@code compression_level=N} is a hint passed to the server; the server
  * clamps it to {@code [1, 9]} because zstd levels 10 and above drop below
  * ~20 MB/s compress speed and would pin a worker thread under a heavy load.
- * The default is 3 -- roughly 400 MB/s compress, halves DOUBLE / LONG
- * traffic on typical time-series data.
+ * The default is 1 -- minimal server-side CPU; compression ratio gain at
+ * higher levels is usually small for typical columnar payloads, so raise
+ * the level only when you measure a real improvement and have the headroom.
  * <p>
  * When to turn it on:
  * <ul>
