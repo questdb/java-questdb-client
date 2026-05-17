@@ -245,6 +245,12 @@ public class QwpQueryClient implements QuietCloseable {
     // rows. Server may clamp down to its own hard cap.
     private int maxBatchRows;
     private int negotiatedQwpVersion;
+    // Zstd compression level the server actually applied for this connection,
+    // parsed from the echoed X-QWP-Content-Encoding response header. 0 means
+    // "no zstd" -- the server picked raw or the header was absent. Non-zero
+    // values are surfaced as the server wrote them on the wire (no client-side
+    // re-clamp) so a misconfigured server is observable from user code.
+    private int negotiatedZstdLevel;
     private long nextRequestId = 1;
     // Decoded SERVER_INFO from the current connection's handshake. Null before
     // connect() has succeeded, and on connections that negotiated v1 (which
@@ -957,6 +963,25 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Zstd compression level the server actually applied for this connection,
+     * parsed from the echoed {@code X-QWP-Content-Encoding} response header.
+     * <p>
+     * Returns {@code 0} when no zstd is in use -- the server picked raw, the
+     * client never asked for zstd, or the header was absent on the wire
+     * (older servers). A non-zero return is what the server wrote on the
+     * wire verbatim, not what this client requested via
+     * {@code compression_level=N}; the two differ when the server has
+     * {@code qwp.egress.compression.force.level} set or when the server
+     * clamped a client request to its {@code [1, 9]} accepted range.
+     * <p>
+     * Refreshed after every successful reconnect, so a forced-level change
+     * on the server side picks up on the next round of failover.
+     */
+    public int getNegotiatedZstdLevel() {
+        return negotiatedZstdLevel;
+    }
+
+    /**
      * Returns the {@link QwpServerInfo} decoded from the currently-bound
      * server's {@code SERVER_INFO} frame, or {@code null} if the server
      * negotiated the v1 protocol (no frame sent) or the client is not
@@ -1494,6 +1519,7 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.setQwpMaxBatchRows(maxBatchRows);
         runUpgradeWithTimeout(ep);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
+        negotiatedZstdLevel = webSocketClient.getServerNegotiatedZstdLevel();
 
         // v2 servers send SERVER_INFO as the first WebSocket frame after the
         // upgrade response. Consume it synchronously on the user thread before
