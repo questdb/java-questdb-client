@@ -143,9 +143,10 @@ public class InitialConnectRetryTest {
 
     @Test
     public void testWithoutRetryFailsImmediately() {
-        // No server on this port. With initial_connect_retry off (default),
-        // fromConfig must throw on the first connect failure rather than enter
-        // the retry loop. We assert the structural shape of the error: the
+        // No server on this port. With no reconnect_* knob set and no
+        // initial_connect_retry, the resolved mode is OFF, so fromConfig
+        // must throw on the first connect failure rather than enter the
+        // retry loop. We assert the structural shape of the error: the
         // raw "Failed to connect" message from buildAndConnect, NOT the
         // "initial connect ... attempts" message connectWithRetry produces.
         int port = TestPorts.findUnusedPort();
@@ -159,6 +160,57 @@ public class InitialConnectRetryTest {
             Assert.assertTrue("error must be the raw connect-refused: " + msg,
                     msg.contains("Failed to connect"));
             Assert.assertFalse("error must NOT mention the retry loop: " + msg,
+                    msg.contains("attempts"));
+        }
+    }
+
+    @Test
+    public void testReconnectKnobImplicitlyPromotesInitialConnectToSync() {
+        // No initial_connect_retry on the conf string, but the user did set
+        // reconnect_max_duration_millis. The resolution rule on InitialConnectMode
+        // promotes that to SYNC so the budget the user wrote actually applies
+        // to the first connect. We prove SYNC ran by asserting the error message
+        // is the connectWithRetry-shaped one ("initial connect ... attempts"),
+        // not the raw single-attempt "Failed to connect" surface.
+        int port = TestPorts.findUnusedPort();
+        String sfDir = makeSfDir();
+        try {
+            String cfg = "ws::addr=127.0.0.1:" + port
+                    + ";sf_dir=" + sfDir
+                    + ";reconnect_max_duration_millis=400"
+                    + ";reconnect_initial_backoff_millis=10"
+                    + ";reconnect_max_backoff_millis=50;";
+            try (Sender ignored = Sender.fromConfig(cfg)) {
+                Assert.fail("expected give-up after implicit-SYNC cap");
+            } catch (Exception expected) {
+                String msg = expected.getMessage();
+                Assert.assertNotNull("error must have a message", msg);
+                Assert.assertTrue("implicit SYNC must drive the retry loop: " + msg,
+                        msg.contains("initial connect") && msg.contains("attempts"));
+            }
+        } finally {
+            rmDirRecursive(sfDir);
+        }
+    }
+
+    @Test
+    public void testExplicitOffSuppressesImplicitSync() {
+        // Tuning a reconnect_* knob would normally promote initial connect to
+        // SYNC, but an explicit initial_connect_retry=off opts back out. The
+        // failure surface here must be the raw single-attempt "Failed to
+        // connect", proving the explicit OFF won over the implicit upgrade.
+        int port = TestPorts.findUnusedPort();
+        String cfg = "ws::addr=127.0.0.1:" + port
+                + ";reconnect_max_duration_millis=400"
+                + ";initial_connect_retry=off;";
+        try (Sender ignored = Sender.fromConfig(cfg)) {
+            Assert.fail("expected immediate connect failure when initial_connect_retry=off");
+        } catch (Exception expected) {
+            String msg = expected.getMessage();
+            Assert.assertNotNull("error must have a message", msg);
+            Assert.assertTrue("explicit off must yield raw connect failure: " + msg,
+                    msg.contains("Failed to connect"));
+            Assert.assertFalse("explicit off must suppress the retry loop: " + msg,
                     msg.contains("attempts"));
         }
     }

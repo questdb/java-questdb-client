@@ -766,9 +766,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * Initial-connect behavior for the WebSocket cursor SF transport.
      * <ul>
      *   <li>{@link #OFF} — single attempt on the user thread; a startup
-     *       failure throws immediately. Default; correct for fail-fast
-     *       deployments where a misconfigured host should not stall app
-     *       startup.</li>
+     *       failure throws immediately. Correct for fail-fast deployments
+     *       where a misconfigured host should not stall app startup.</li>
      *   <li>{@link #SYNC} — same retry loop the in-flight reconnect path
      *       uses, but it runs on the user thread inside {@code fromConfig}.
      *       Blocks up to {@code reconnect_max_duration_millis}. Auth/upgrade
@@ -785,6 +784,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       throw on the user call site). Wire {@code error_handler=...}
      *       to observe these.</li>
      * </ul>
+     * <p>
+     * Default resolution when the caller does not pick a value:
+     * {@link #SYNC} if any {@code reconnect_*} knob was tuned explicitly
+     * (so the budget the user wrote actually applies to the first connect),
+     * otherwise {@link #OFF}. Pass an explicit value to override -- an
+     * explicit {@link #OFF} alongside a tuned {@code reconnect_*} budget
+     * still gets {@link #OFF}.
      */
     enum InitialConnectMode {
         OFF,
@@ -965,11 +971,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
         private boolean gorillaEnabled = true;
-        // Drives the initial-connect strategy. OFF is fail-fast (default).
-        // SYNC retries on the user thread up to the reconnect cap. ASYNC
-        // returns immediately and lets the I/O thread retry in the
-        // background, surfacing terminal failures via the error inbox.
-        private InitialConnectMode initialConnectMode = InitialConnectMode.OFF;
+        // Drives the initial-connect strategy. null means "not set
+        // explicitly", which build() resolves to SYNC when any reconnect_*
+        // knob was tuned by the user, otherwise OFF. SYNC retries on the
+        // user thread up to the reconnect cap. ASYNC returns immediately
+        // and lets the I/O thread retry in the background, surfacing
+        // terminal failures via the error inbox.
+        private InitialConnectMode initialConnectMode = null;
         // Per-append deadline for SF appendBlocking spin-then-throw. Used to
         // be a hardcoded 30s constant; expose so tight-SLA users can lower
         // and offline-tolerant users can raise.
@@ -1370,6 +1378,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         reconnectMaxBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
                                 ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS
                                 : reconnectMaxBackoffMillis;
+                // Resolve the initial-connect mode. An explicit user choice
+                // (via initialConnectMode/initialConnectRetry, or the
+                // initial_connect_retry conf key) wins unconditionally --
+                // including initial_connect_retry=off paired with a tuned
+                // reconnect budget. When the user left it unset and tuned
+                // any reconnect_* knob, promote to SYNC so the budget they
+                // wrote actually applies to the first connect: the knob
+                // name reads as a generic retry budget but the underlying
+                // path only governs reconnects from an established
+                // connection, and silently ignoring the budget on the
+                // initial connect is the canonical footgun this implicit
+                // upgrade removes.
+                InitialConnectMode actualInitialConnectMode;
+                if (initialConnectMode != null) {
+                    actualInitialConnectMode = initialConnectMode;
+                } else if (reconnectMaxDurationMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        || reconnectInitialBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        || reconnectMaxBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                    actualInitialConnectMode = InitialConnectMode.SYNC;
+                } else {
+                    actualInitialConnectMode = InitialConnectMode.OFF;
+                }
                 long actualDurableAckKeepaliveIntervalMillis =
                         durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
                                 ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
@@ -1431,7 +1461,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualReconnectMaxDurationMillis,
                             actualReconnectInitialBackoffMillis,
                             actualReconnectMaxBackoffMillis,
-                            initialConnectMode,
+                            actualInitialConnectMode,
                             errorHandler,
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
@@ -2354,12 +2384,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Opt in to retrying the initial connect with the same backoff /
-         * cap / auth-terminal policy as in-flight reconnect. Default
-         * {@code false}: a startup connect failure throws immediately,
-         * which is what most users want — a misconfigured host shouldn't
-         * sit retrying for 5 minutes. Set true if your deployment expects
-         * the server to come up shortly after the sender. Auth failures
-         * (HTTP 401/403/non-101) stay terminal in either mode.
+         * cap / auth-terminal policy as in-flight reconnect. Set true if
+         * your deployment expects the server to come up shortly after the
+         * sender. Auth failures (HTTP 401/403/non-101) stay terminal in
+         * either mode.
+         * <p>
+         * When this method is not called, the resolution rule documented
+         * on {@link InitialConnectMode} applies: SYNC implicitly when any
+         * {@code reconnect_*} knob was tuned, otherwise OFF. Calling this
+         * with either {@code true} or {@code false} pins the mode and
+         * suppresses the implicit upgrade.
          * <p>
          * For non-blocking startup (the producer thread returns immediately
          * and the I/O thread retries in the background), use
@@ -2384,9 +2418,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Three-way control over initial-connect behavior — see
-         * {@link InitialConnectMode} for the value semantics. WebSocket
-         * transport only. Replaces {@link #initialConnectRetry(boolean)}
-         * for users who want the {@link InitialConnectMode#ASYNC} mode.
+         * {@link InitialConnectMode} for the value semantics, including
+         * the default-resolution rule when this method is not called.
+         * Calling this pins the mode and suppresses the implicit upgrade
+         * to SYNC that otherwise fires when a {@code reconnect_*} knob is
+         * tuned. WebSocket transport only. Replaces
+         * {@link #initialConnectRetry(boolean)} for users who want the
+         * {@link InitialConnectMode#ASYNC} mode.
          */
         public LineSenderBuilder initialConnectMode(InitialConnectMode mode) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
