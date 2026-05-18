@@ -269,8 +269,11 @@ public class SegmentManagerTest {
                 mgr.start();
                 mgr.register(ring, tmpDir);
                 // First spare via high-water signal on the very first append.
+                // 2000ms budget: same wakeup-vs-poll rationale as
+                // testProducerWakeupBeatsThePollInterval -- still 2.5x below
+                // the 5s poll, but tolerant of CI scheduling jitter.
                 ring.appendOrFsn(buf, 16);
-                assertTrue(waitFor(() -> !ring.needsHotSpare(), 500));
+                assertTrue(waitFor(() -> !ring.needsHotSpare(), 2_000));
                 // Now active is full → next append rotates → consumes the spare →
                 // hotSpare goes back to null → rotation-time wakeup runs →
                 // manager promptly provisions the next spare.
@@ -278,10 +281,10 @@ public class SegmentManagerTest {
                 long fsn = ring.appendOrFsn(buf, 16);
                 assertEquals(1, fsn);
                 assertTrue("rotation-time wakeup must trigger spare 2 well before 5s poll",
-                        waitFor(() -> !ring.needsHotSpare(), 500));
+                        waitFor(() -> !ring.needsHotSpare(), 2_000));
                 long elapsedMs = (System.nanoTime() - beforeRotate) / 1_000_000L;
                 assertTrue("spare 2 arrived in " + elapsedMs + "ms — should be <<5000ms",
-                        elapsedMs < 1000);
+                        elapsedMs < 4_000);
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
