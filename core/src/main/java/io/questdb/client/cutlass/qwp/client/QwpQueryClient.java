@@ -378,6 +378,7 @@ public class QwpQueryClient implements QuietCloseable {
         Long failoverBackoffMaxMs = null;
         Long failoverMaxDurationMs = null;
         Long authTimeoutMs = null;
+        Long initialCredit = null;
         String auth = null;
         String username = null;
         String password = null;
@@ -512,6 +513,16 @@ public class QwpQueryClient implements QuietCloseable {
                         throw new IllegalArgumentException("buffer_pool_size must be >= 1");
                     }
                     break;
+                case "initial_credit":
+                    try {
+                        initialCredit = Long.parseLong(value);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("invalid initial_credit: " + value);
+                    }
+                    if (initialCredit < 0L) {
+                        throw new IllegalArgumentException("initial_credit must be >= 0");
+                    }
+                    break;
                 case "compression":
                     if (!"zstd".equals(value) && !"raw".equals(value) && !"auto".equals(value)) {
                         throw new IllegalArgumentException(
@@ -558,6 +569,48 @@ public class QwpQueryClient implements QuietCloseable {
                     break;
                 case "zone":
                     zone = value;
+                    break;
+                // connect-string.md "Auto-flushing", "Buffer sizing", "Store-and-forward",
+                // "Durable ACK", "Reconnect and failover", "Error handling", and
+                // legacy ILP aliases: these keys configure the Sender (ingress) only.
+                // The QwpQueryClient silently consumes them so the same connect string
+                // can be shared between the Sender and the QwpQueryClient without an
+                // "unknown configuration key" error. Validation and effect are the
+                // Sender parser's job; the egress parser does not interpret the value.
+                case "auto_flush":
+                case "auto_flush_bytes":
+                case "auto_flush_interval":
+                case "auto_flush_rows":
+                case "close_flush_timeout_millis":
+                case "connection_listener_inbox_capacity":
+                case "drain_orphans":
+                case "durable_ack_keepalive_interval_millis":
+                case "error_inbox_capacity":
+                case "in_flight_window":
+                case "init_buf_size":
+                case "initial_connect_retry":
+                case "max_background_drainers":
+                case "max_buf_size":
+                case "max_datagram_size":
+                case "max_name_len":
+                case "max_schemas_per_connection":
+                case "multicast_ttl":
+                case "pass":
+                case "protocol_version":
+                case "reconnect_initial_backoff_millis":
+                case "reconnect_max_backoff_millis":
+                case "reconnect_max_duration_millis":
+                case "request_durable_ack":
+                case "request_min_throughput":
+                case "request_timeout":
+                case "retry_timeout":
+                case "sender_id":
+                case "sf_append_deadline_millis":
+                case "sf_dir":
+                case "sf_durability":
+                case "sf_max_bytes":
+                case "sf_max_total_bytes":
+                case "user":
                     break;
                 default:
                     throw new IllegalArgumentException("unknown configuration key: " + key);
@@ -615,6 +668,9 @@ public class QwpQueryClient implements QuietCloseable {
         }
         if (authTimeoutMs != null) {
             client.withAuthTimeout(authTimeoutMs);
+        }
+        if (initialCredit != null) {
+            client.withInitialCredit(initialCredit);
         }
         client.withEndpointPath(path);
         client.withBufferPoolSize(poolSize);
@@ -923,16 +979,6 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Returns the current compression preference: one of {@code raw} (the
-     * library default, no compression), {@code zstd} (demand zstd), or
-     * {@code auto} (advertise zstd and raw, let the server pick). Useful for
-     * introspection and for tests that pin the default.
-     */
-    public String getCompressionPreference() {
-        return compressionPreference;
-    }
-
-    /**
      * Returns the zstd level the client will advertise on the
      * {@code X-QWP-Accept-Encoding} header. Exposed so tests can pin the
      * default and the parser's accepted range; any drift here changes what
@@ -940,6 +986,16 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public int getCompressionLevelForTest() {
         return compressionLevel;
+    }
+
+    /**
+     * Returns the current compression preference: one of {@code raw} (the
+     * library default, no compression), {@code zstd} (demand zstd), or
+     * {@code auto} (advertise zstd and raw, let the server pick). Useful for
+     * introspection and for tests that pin the default.
+     */
+    public String getCompressionPreference() {
+        return compressionPreference;
     }
 
     public int getEndpointCountForTest() {

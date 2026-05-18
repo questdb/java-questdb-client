@@ -260,6 +260,27 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testAuthTimeout_AcceptsPositive() {
+        assertParses("ws::addr=a:9000;auth_timeout_ms=2500;");
+    }
+
+    @Test
+    public void testAuthTimeout_NegativeRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=-50;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
+    public void testAuthTimeout_NonNumericRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=forever;",
+                "invalid auth_timeout_ms: forever");
+    }
+
+    @Test
+    public void testAuthTimeout_ZeroRejected() {
+        assertReject("ws::addr=a:9000;auth_timeout_ms=0;", "auth_timeout_ms must be > 0");
+    }
+
+    @Test
     public void testBasicAuthAcceptedAlone() {
         assertParses("ws::addr=db:9000;username=alice;password=secret;");
     }
@@ -343,14 +364,9 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testCompressionLevelDefaultIsOneWhenOmitted() {
-        // Pinned: compression=zstd without an explicit compression_level
-        // resolves to level 1 -- the cheapest server-side CPU. Bumping this
-        // default silently would inflate per-connection compress cost for
-        // opt-in clients that don't pin the level themselves.
-        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;compression=zstd;")) {
-            Assert.assertEquals(1, c.getCompressionLevelForTest());
-        }
+    public void testCompressionLevelAtUpperBoundAccepted() {
+        // Parse-time cap is [1, 22]; server-side runtime clamp to [1, 9] is a separate concern.
+        assertParses("ws::addr=db:9000;compression=zstd;compression_level=22;");
     }
 
     @Test
@@ -368,9 +384,14 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testCompressionLevelAtUpperBoundAccepted() {
-        // Parse-time cap is [1, 22]; server-side runtime clamp to [1, 9] is a separate concern.
-        assertParses("ws::addr=db:9000;compression=zstd;compression_level=22;");
+    public void testCompressionLevelDefaultIsOneWhenOmitted() {
+        // Pinned: compression=zstd without an explicit compression_level
+        // resolves to level 1 -- the cheapest server-side CPU. Bumping this
+        // default silently would inflate per-connection compress cost for
+        // opt-in clients that don't pin the level themselves.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig("ws::addr=db:9000;compression=zstd;")) {
+            Assert.assertEquals(1, c.getCompressionLevelForTest());
+        }
     }
 
     @Test
@@ -410,6 +431,23 @@ public class QwpQueryClientFromConfigTest {
     @Test
     public void testEmptyStringRejected() {
         assertReject("", "configuration string cannot be empty");
+    }
+
+    @Test
+    public void testEndpointOrderPreserved() {
+        // The parser walks the declared host list in order and the client
+        // walks it in priority order. Three distinct hosts make the
+        // assertion robust against accidental rotation by any single step.
+        try (QwpQueryClient c = QwpQueryClient.fromConfig(
+                "ws::addr=alpha:9000,bravo:9001,charlie:9002;")) {
+            Assert.assertEquals(3, c.getEndpointCountForTest());
+            Assert.assertEquals("alpha", c.getEndpointHostForTest(0));
+            Assert.assertEquals(9000, c.getEndpointPortForTest(0));
+            Assert.assertEquals("bravo", c.getEndpointHostForTest(1));
+            Assert.assertEquals(9001, c.getEndpointPortForTest(1));
+            Assert.assertEquals("charlie", c.getEndpointHostForTest(2));
+            Assert.assertEquals(9002, c.getEndpointPortForTest(2));
+        }
     }
 
     @Test
@@ -541,6 +579,28 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testFailoverMaxDuration_AcceptsPositive() {
+        assertParses("ws::addr=a:9000;failover_max_duration_ms=5000;");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_AcceptsZero() {
+        assertParses("ws::addr=a:9000;failover_max_duration_ms=0;");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_NegativeRejected() {
+        assertReject("ws::addr=a:9000;failover_max_duration_ms=-1;",
+                "failover_max_duration_ms must be >= 0");
+    }
+
+    @Test
+    public void testFailoverMaxDuration_NonNumericRejected() {
+        assertReject("ws::addr=a:9000;failover_max_duration_ms=forever;",
+                "invalid failover_max_duration_ms: forever");
+    }
+
+    @Test
     public void testFailoverOffAccepted() {
         assertParses("ws::addr=db:9000;failover=off;");
     }
@@ -566,6 +626,97 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testIngressOnlyKeysSilentlyAcceptedOnEgress() {
+        // connect-string.md: these keys configure the Sender (ingress) only.
+        // QwpQueryClient.fromConfig silently consumes them so a single connect
+        // string can be shared between the Sender and the QwpQueryClient
+        // without an "unknown configuration key" error. The egress parser does
+        // not interpret the value -- range, enum, and type checks are the
+        // ingress parser's job. A malformed value at the egress parser is
+        // still consumed.
+
+        // Each ingress-only key on its own with a representative happy-path
+        // value. Covers all categories: auto-flush, buffer sizing, store-and-
+        // forward, durable ACK, reconnect, error inbox, ingress aliases.
+        String[] keys = {
+                "auto_flush=on",
+                "auto_flush_bytes=8m",
+                "auto_flush_interval=100",
+                "auto_flush_rows=1000",
+                "close_flush_timeout_millis=5000",
+                "connection_listener_inbox_capacity=64",
+                "drain_orphans=on",
+                "durable_ack_keepalive_interval_millis=200",
+                "error_inbox_capacity=256",
+                "in_flight_window=10000",
+                "init_buf_size=65536",
+                "initial_connect_retry=on",
+                "max_background_drainers=4",
+                "max_buf_size=100m",
+                "max_datagram_size=1400",
+                "max_name_len=127",
+                "max_schemas_per_connection=65535",
+                "multicast_ttl=1",
+                "pass=secret",
+                "protocol_version=2",
+                "reconnect_initial_backoff_millis=100",
+                "reconnect_max_backoff_millis=5000",
+                "reconnect_max_duration_millis=300000",
+                "request_durable_ack=on",
+                "request_min_throughput=102400",
+                "request_timeout=10000",
+                "retry_timeout=10000",
+                "sender_id=ingest-1",
+                "sf_append_deadline_millis=30000",
+                "sf_dir=/var/lib/qdb-sf",
+                "sf_durability=memory",
+                "sf_max_bytes=4m",
+                "sf_max_total_bytes=10g",
+                "user=alice",
+        };
+        StringBuilder all = new StringBuilder("ws::addr=db:9000;");
+        for (String kv : keys) {
+            assertParses("ws::addr=db:9000;" + kv + ";");
+            all.append(kv).append(';');
+        }
+        // All 35 keys at once -- a typical shared-config connect string.
+        assertParses(all.toString());
+
+        // Out-of-range / malformed values are silently consumed too -- the
+        // egress parser does not validate ingress-only keys.
+        assertParses("ws::addr=db:9000;auto_flush_rows=-1;");
+        assertParses("ws::addr=db:9000;init_buf_size=garbage;");
+        assertParses("ws::addr=db:9000;reconnect_max_duration_millis=banana;");
+        assertParses("ws::addr=db:9000;max_schemas_per_connection=0;");
+
+        // Empty values are well-formed and silently consumed.
+        assertParses("ws::addr=db:9000;auto_flush=;");
+        assertParses("ws::addr=db:9000;sf_dir=;");
+    }
+
+    @Test
+    public void testInitialCredit_AcceptsPositive() {
+        assertParses("ws::addr=a:9000;initial_credit=1048576;");
+    }
+
+    @Test
+    public void testInitialCredit_AcceptsZero() {
+        // 0 is the documented default and means "unbounded" -- the byte-credit
+        // flow-control loop is disabled entirely. Must be parseable.
+        assertParses("ws::addr=a:9000;initial_credit=0;");
+    }
+
+    @Test
+    public void testInitialCredit_NegativeRejected() {
+        assertReject("ws::addr=a:9000;initial_credit=-1;", "initial_credit must be >= 0");
+    }
+
+    @Test
+    public void testInitialCredit_NonNumericRejected() {
+        assertReject("ws::addr=a:9000;initial_credit=lots;", "invalid initial_credit: lots");
+    }
+
+    @Test
     public void testLbStrategyKeyRejectedAsUnknown() {
         // lb_strategy was removed: cluster-level load balancing is the
         // server's concern, not the client's. The connect-string parser
@@ -573,23 +724,6 @@ public class QwpQueryClientFromConfigTest {
         // silently swallowing the value.
         assertReject("ws::addr=db:9000;lb_strategy=first;",
                 "unknown configuration key: lb_strategy");
-    }
-
-    @Test
-    public void testEndpointOrderPreserved() {
-        // The parser walks the declared host list in order and the client
-        // walks it in priority order. Three distinct hosts make the
-        // assertion robust against accidental rotation by any single step.
-        try (QwpQueryClient c = QwpQueryClient.fromConfig(
-                "ws::addr=alpha:9000,bravo:9001,charlie:9002;")) {
-            Assert.assertEquals(3, c.getEndpointCountForTest());
-            Assert.assertEquals("alpha", c.getEndpointHostForTest(0));
-            Assert.assertEquals(9000, c.getEndpointPortForTest(0));
-            Assert.assertEquals("bravo", c.getEndpointHostForTest(1));
-            Assert.assertEquals(9001, c.getEndpointPortForTest(1));
-            Assert.assertEquals("charlie", c.getEndpointHostForTest(2));
-            Assert.assertEquals(9002, c.getEndpointPortForTest(2));
-        }
     }
 
     @Test
@@ -800,49 +934,6 @@ public class QwpQueryClientFromConfigTest {
         // parser's .isEmpty() check after trim(). The exact rejection message
         // is "empty addr entry".
         assertReject("ws::addr=a:9000, ,b:9000;", "empty addr entry");
-    }
-
-    @Test
-    public void testFailoverMaxDuration_AcceptsZero() {
-        assertParses("ws::addr=a:9000;failover_max_duration_ms=0;");
-    }
-
-    @Test
-    public void testFailoverMaxDuration_AcceptsPositive() {
-        assertParses("ws::addr=a:9000;failover_max_duration_ms=5000;");
-    }
-
-    @Test
-    public void testFailoverMaxDuration_NegativeRejected() {
-        assertReject("ws::addr=a:9000;failover_max_duration_ms=-1;",
-                "failover_max_duration_ms must be >= 0");
-    }
-
-    @Test
-    public void testFailoverMaxDuration_NonNumericRejected() {
-        assertReject("ws::addr=a:9000;failover_max_duration_ms=forever;",
-                "invalid failover_max_duration_ms: forever");
-    }
-
-    @Test
-    public void testAuthTimeout_AcceptsPositive() {
-        assertParses("ws::addr=a:9000;auth_timeout_ms=2500;");
-    }
-
-    @Test
-    public void testAuthTimeout_ZeroRejected() {
-        assertReject("ws::addr=a:9000;auth_timeout_ms=0;", "auth_timeout_ms must be > 0");
-    }
-
-    @Test
-    public void testAuthTimeout_NegativeRejected() {
-        assertReject("ws::addr=a:9000;auth_timeout_ms=-50;", "auth_timeout_ms must be > 0");
-    }
-
-    @Test
-    public void testAuthTimeout_NonNumericRejected() {
-        assertReject("ws::addr=a:9000;auth_timeout_ms=forever;",
-                "invalid auth_timeout_ms: forever");
     }
 
     /**
