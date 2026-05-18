@@ -17,7 +17,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     environment: maven-release
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       MAVEN_RELEASE_AWS_REGION: ${{ vars.MAVEN_RELEASE_AWS_REGION }}
       MAVEN_RELEASE_AWS_ROLE_ARN: ${{ secrets.MAVEN_RELEASE_AWS_ROLE_ARN }}
@@ -59,6 +59,18 @@ jobs:
           distribution: temurin
           java-version: "11"
           cache: maven
+
+      - name: Verify tag matches POM version
+        run: |
+          POM_VERSION=$(mvn -B -q -N -DforceStdout help:evaluate -Dexpression=project.version)
+          if [[ "${POM_VERSION}" == *-SNAPSHOT ]]; then
+            echo "::error::Refusing to release SNAPSHOT version ${POM_VERSION}."
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_NAME}" != "${POM_VERSION}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match POM version ${POM_VERSION}."
+            exit 1
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
@@ -117,18 +129,6 @@ jobs:
           chmod 700 "$GNUPGHOME"
           printf '%s\n' "$MAVEN_GPG_PRIVATE_KEY" | gpg --batch --import
           echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
-
-      - name: Verify tag matches POM version
-        run: |
-          POM_VERSION=$(mvn -B -q -N -DforceStdout help:evaluate -Dexpression=project.version)
-          if [[ "${POM_VERSION}" == *-SNAPSHOT ]]; then
-            echo "::error::Refusing to release SNAPSHOT version ${POM_VERSION}."
-            exit 1
-          fi
-          if [[ "${GITHUB_REF_NAME}" != "${POM_VERSION}" ]]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match POM version ${POM_VERSION}."
-            exit 1
-          fi
 
       - name: Publish release to Maven Central
         run: |
