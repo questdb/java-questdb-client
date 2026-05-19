@@ -150,7 +150,10 @@ public final class AckWatermark implements QuietCloseable {
         } else {
             fd = Files.openCleanRW(filePath);
             if (fd >= 0 && !Files.allocate(fd, FILE_SIZE)) {
+                // FilesFacade.allocate contract on a false return:
+                // close the fd AND unlink the partial file.
                 Files.close(fd);
+                Files.remove(filePath);
                 fd = -1;
             }
         }
