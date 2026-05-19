@@ -486,6 +486,7 @@ public class QwpTableBuffer implements QuietCloseable {
             case TYPE_CHAR:
                 return 2;
             case TYPE_INT:
+            case TYPE_IPv4:
             case TYPE_SYMBOL:
             case TYPE_FLOAT:
                 return 4;
@@ -666,6 +667,52 @@ public class QwpTableBuffer implements QuietCloseable {
                 close();
                 throw t;
             }
+        }
+
+        /**
+         * Adds a BINARY value. The bytes are appended verbatim to the column's data
+         * buffer and an offset entry is pushed. Shares the VARCHAR wire layout
+         * (offsets + concatenated bytes) but with no UTF-8 contract on the bytes.
+         * A null reference is rejected; callers should use the null bitmap instead.
+         */
+        public void addBinary(byte[] value) {
+            if (value == null) {
+                if (useNullBitmap) {
+                    ensureNullBitmapCapacity(size + 1);
+                    markNull(size);
+                    size++;
+                    return;
+                }
+                throw new LineSenderException(
+                        "BINARY value cannot be null; mark the row null via the null bitmap instead");
+            }
+            if (value.length > 0) {
+                stringData.putBytes(value, 0, value.length);
+            }
+            stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
+            valueCount++;
+            size++;
+        }
+
+        /**
+         * Adds a BINARY value from native memory at {@code [ptr, ptr + len)}.
+         * Bytes are copied into the column's data buffer; the caller's memory
+         * need only stay valid for the duration of this call.
+         */
+        public void addBinary(long ptr, long len) {
+            if (len < 0) {
+                throw new LineSenderException(
+                        "BINARY length must be non-negative; mark the row null via the null bitmap instead");
+            }
+            if (len > 0 && ptr == 0) {
+                throw new LineSenderException("BINARY pointer cannot be 0 for a non-empty value");
+            }
+            if (len > 0) {
+                stringData.putBlockOfBytes(ptr, len);
+            }
+            stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
+            valueCount++;
+            size++;
         }
 
         public void addBoolean(boolean value) {
@@ -907,6 +954,17 @@ public class QwpTableBuffer implements QuietCloseable {
             size++;
         }
 
+        /**
+         * Adds a packed IPv4 address (4 bytes, little-endian on the wire). The bit
+         * pattern 0 (i.e. 0.0.0.0) is reserved by QuestDB as the IPv4 NULL sentinel
+         * and surfaces as NULL on read regardless of the null bitmap.
+         */
+        public void addIPv4(int address) {
+            dataBuffer.putInt(address);
+            valueCount++;
+            size++;
+        }
+
         public void addLong(long value) {
             dataBuffer.putLong(value);
             valueCount++;
@@ -1037,6 +1095,10 @@ public class QwpTableBuffer implements QuietCloseable {
                     case TYPE_INT:
                         dataBuffer.putInt(0);
                         break;
+                    case TYPE_IPv4:
+                        // QuestDB convention: 0.0.0.0 (bit pattern 0) is the NULL sentinel.
+                        dataBuffer.putInt(0);
+                        break;
                     case TYPE_GEOHASH:
                         dataBuffer.putLong(-1L);
                         break;
@@ -1053,6 +1115,7 @@ public class QwpTableBuffer implements QuietCloseable {
                         dataBuffer.putDouble(Double.NaN);
                         break;
                     case TYPE_VARCHAR:
+                    case TYPE_BINARY:
                         stringOffsets.putInt(checkedStringOffset(stringData.getAppendOffset()));
                         break;
                     case TYPE_SYMBOL:
@@ -1416,7 +1479,11 @@ public class QwpTableBuffer implements QuietCloseable {
             arrayShapeOffset = 0;
             arrayDataOffset = 0;
             decimalScale = -1;
-            geohashPrecision = -1;
+            // geohashPrecision is intentionally NOT cleared here. It is a
+            // schema property, locked on first write and matched by the
+            // server's auto-created GEOHASH(Nb) type, so preserving it across
+            // batches lets a later all-null batch encode the column with the
+            // correct varint instead of falling back to precision=1.
         }
 
         public void retainTailRow(
@@ -1438,6 +1505,7 @@ public class QwpTableBuffer implements QuietCloseable {
 
             switch (type) {
                 case TYPE_VARCHAR:
+                case TYPE_BINARY:
                     retainStringValue(valueCountBefore);
                     break;
                 case TYPE_SYMBOL:
@@ -1522,7 +1590,12 @@ public class QwpTableBuffer implements QuietCloseable {
             }
 
             // When all values are removed, reset type-specific metadata so the
-            // column behaves as freshly created (matches what reset() does).
+            // column behaves as freshly created. truncateTo is reached from
+            // cancelCurrentRow, where newly-added in-progress columns must be
+            // free to re-acquire a different precision/scale on the next row
+            // (the server has not seen them yet). The between-batch path goes
+            // through ColumnBuffer.reset() and intentionally preserves
+            // geohashPrecision there to keep its server-locked value.
             if (newValueCount == 0) {
                 decimalScale = -1;
                 geohashPrecision = -1;
@@ -1564,6 +1637,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     dataBuffer = new OffHeapAppendMemory(32);
                     break;
                 case TYPE_INT:
+                case TYPE_IPv4:
                 case TYPE_FLOAT:
                     dataBuffer = new OffHeapAppendMemory(64);
                     break;
@@ -1585,6 +1659,7 @@ public class QwpTableBuffer implements QuietCloseable {
                     dataBuffer = new OffHeapAppendMemory(512);
                     break;
                 case TYPE_VARCHAR:
+                case TYPE_BINARY:
                     stringOffsets = new OffHeapAppendMemory(64);
                     try {
                         stringOffsets.putInt(0); // seed initial 0 offset

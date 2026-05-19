@@ -78,8 +78,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final int PARSE_OK = 1;
     private static final String QUESTDB_ROLE_HEADER_NAME = "X-QuestDB-Role:";
     private static final String QUESTDB_ZONE_HEADER_NAME = "X-QuestDB-Zone:";
+    private static final String QWP_CONTENT_ENCODING_HEADER_NAME = "X-QWP-Content-Encoding:";
     private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
+    private static final String QWP_MAX_BATCH_SIZE_HEADER_NAME = "X-QWP-Max-Batch-Size:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -111,10 +113,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     private int port;
     // QWP version negotiation
     // Verbatim header value sent as X-QWP-Accept-Encoding during upgrade, e.g.
-    // "zstd;level=3,raw". When null, the header is omitted and the server ships
-    // batches uncompressed. The echoed X-QWP-Content-Encoding response header
-    // is intentionally not parsed: the RESULT_BATCH decoder branches on
-    // FLAG_ZSTD in every frame, which is the authoritative signal.
+    // "zstd;level=1,raw". When null, the header is omitted and the server ships
+    // batches uncompressed. The RESULT_BATCH decoder branches on FLAG_ZSTD in
+    // every frame -- that's the authoritative signal for whether a given
+    // payload is compressed. The echoed X-QWP-Content-Encoding response header
+    // is parsed in addition (into {@link #serverNegotiatedZstdLevel}) so user
+    // code and tests can observe the level the server actually applied, which
+    // matters when the server uses qwp.egress.compression.force.level to cap
+    // or pin the level regardless of the client's request.
     private String qwpAcceptEncoding;
     private String qwpClientId;
     // Client-requested per-batch row cap advertised via X-QWP-Max-Batch-Rows.
@@ -135,6 +141,18 @@ public abstract class WebSocketClient implements QuietCloseable {
     // path can rely on durable-ack-driven trim. Absence (after opting in via
     // setQwpRequestDurableAck) is the early-fail signal.
     private boolean serverDurableAckEnabled;
+    // Server's hard cap on ingest QWP message payload bytes, extracted from
+    // X-QWP-Max-Batch-Size on the 101 upgrade response. 0 when the server did
+    // not advertise the header (older builds), in which case the sender falls
+    // back to its locally configured budget.
+    private int serverMaxBatchSize;
+    // Zstd compression level the server actually applied for this connection,
+    // extracted from the echoed X-QWP-Content-Encoding response header.
+    // 0 means "no zstd" -- either the server picked raw, the header was absent
+    // (older builds), or the value didn't match the "zstd;level=N" shape.
+    // Non-zero values are clamped server-side to [1, 9] but we surface what
+    // the wire said without re-clamping so a misconfigured server is observable.
+    private int serverNegotiatedZstdLevel;
     private int serverQwpVersion = 1;
     private String upgradeRejectRole;
     // Server-advertised zone identifier from the most recent rejected upgrade,
@@ -290,6 +308,36 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Server-advertised hard cap on QWP ingest payload bytes, taken from the
+     * {@code X-QWP-Max-Batch-Size} response header on the 101 upgrade. Returns
+     * {@code 0} when the server did not advertise the header, in which case
+     * the caller must fall back to its own configured budget.
+     */
+    public int getServerMaxBatchSize() {
+        return serverMaxBatchSize;
+    }
+
+    /**
+     * Zstd level the server actually applied for this connection, parsed
+     * from the echoed {@code X-QWP-Content-Encoding} response header.
+     * <p>
+     * Returns {@code 0} when the server picked raw transport (no compression),
+     * the header was absent (older servers), or the value did not match the
+     * {@code zstd;level=N} shape. Non-zero values are returned as the server
+     * wrote them on the wire; this client does not re-clamp to {@code [1, 9]}
+     * so a misconfigured server is observable rather than silently smoothed
+     * over.
+     * <p>
+     * Useful for diagnostics and for tests that pin operator-side overrides
+     * (see {@code qwp.egress.compression.force.level}) -- the level the
+     * client requested via {@link #setQwpAcceptEncoding} is what it asked
+     * for; this is what it actually got.
+     */
+    public int getServerNegotiatedZstdLevel() {
+        return serverNegotiatedZstdLevel;
+    }
+
+    /**
      * Returns the QWP version selected by the server during the upgrade handshake.
      */
     public int getServerQwpVersion() {
@@ -435,7 +483,7 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     /**
      * Sets the value sent as the {@code X-QWP-Accept-Encoding} upgrade header,
-     * e.g. {@code "zstd;level=3,raw"}. Pass {@code null} to omit the header
+     * e.g. {@code "zstd;level=1,raw"}. Pass {@code null} to omit the header
      * entirely (server ships uncompressed batches). Must be called before
      * {@link #upgrade}.
      */
@@ -637,6 +685,51 @@ public abstract class WebSocketClient implements QuietCloseable {
         return true;
     }
 
+    /**
+     * Extracts the zstd level the server applied from the echoed
+     * {@code X-QWP-Content-Encoding} response header. Returns 0 when the
+     * header is absent (older servers, or the server picked raw transport)
+     * or the value does not match the {@code zstd;level=N} shape. The
+     * returned value is intentionally not re-clamped to {@code [1, 9]} so
+     * a misconfigured server is observable from the client.
+     */
+    private static int extractContentEncodingZstdLevel(String response) {
+        int headerLen = QWP_CONTENT_ENCODING_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QWP_CONTENT_ENCODING_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                // Expected shape: "zstd;level=N". Anything else -> 0 (treat as raw / unknown).
+                int semi = value.indexOf(';');
+                if (semi < 0) {
+                    return 0;
+                }
+                if (!value.regionMatches(true, 0, "zstd", 0, 4) || semi != 4) {
+                    return 0;
+                }
+                int eq = value.indexOf('=', semi + 1);
+                if (eq < 0) {
+                    return 0;
+                }
+                if (!value.regionMatches(true, semi + 1, "level", 0, 5) || eq != semi + 6) {
+                    return 0;
+                }
+                try {
+                    int parsed = Integer.parseInt(value.substring(eq + 1).trim());
+                    return Math.max(parsed, 0);
+                } catch (NumberFormatException e) {
+                    return 0;
+                }
+            }
+        }
+        return 0;
+    }
+
     private static boolean extractDurableAckEnabled(String response) {
         int headerLen = QWP_DURABLE_ACK_HEADER_NAME.length();
         int responseLen = response.length();
@@ -652,6 +745,28 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return false;
+    }
+
+    private static int extractMaxBatchSize(String response) {
+        int headerLen = QWP_MAX_BATCH_SIZE_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QWP_MAX_BATCH_SIZE_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd).trim();
+                try {
+                    int parsed = Integer.parseInt(value);
+                    return Math.max(parsed, 0);
+                } catch (NumberFormatException e) {
+                    return 0;
+                }
+            }
+        }
+        return 0;
     }
 
     private static int extractQwpVersion(String response) {
@@ -1164,6 +1279,18 @@ public abstract class WebSocketClient implements QuietCloseable {
         // checks this value to fail at connect rather than silently
         // missing trim signals.
         serverDurableAckEnabled = extractDurableAckEnabled(response);
+
+        // Extract X-QWP-Max-Batch-Size (optional). Older servers omit it; the
+        // sender falls back to its locally configured byte budget in that case.
+        serverMaxBatchSize = extractMaxBatchSize(response);
+
+        // Extract X-QWP-Content-Encoding (optional). Surfaces what level the
+        // server actually applied -- which may differ from what this client
+        // asked for if the server has qwp.egress.compression.force.level set
+        // or the server clamped a client request outside the wire range.
+        // 0 means "no zstd" (raw transport, or header absent on older
+        // servers); non-zero is the applied level.
+        serverNegotiatedZstdLevel = extractContentEncodingZstdLevel(response);
     }
 
     protected void dieWaiting(int n) {

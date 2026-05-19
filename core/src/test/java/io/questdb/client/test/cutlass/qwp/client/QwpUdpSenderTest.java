@@ -1901,6 +1901,44 @@ public class QwpUdpSenderTest {
         });
     }
 
+    @Test
+    public void testNullArgsAfterCloseAllThrowSenderClosed() throws Exception {
+        // Mirror of QwpWebSocketSenderTest's equivalent test: every column
+        // setter that null-short-circuits or null-throws before delegating
+        // must run checkNotClosed() first so a closed sender + null arg
+        // produces the canonical "Sender is closed" error, not a
+        // null-flavoured message (or a silent no-op).
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024);
+            sender.close();
+            assertClosedUdp(() -> sender.decimalColumn("x", (Decimal64) null));
+            assertClosedUdp(() -> sender.decimalColumn("x", (Decimal128) null));
+            assertClosedUdp(() -> sender.decimalColumn("x", (Decimal256) null));
+            assertClosedUdp(() -> sender.decimalColumn("x", (CharSequence) null));
+            assertClosedUdp(() -> sender.doubleArray("x", (double[]) null));
+            assertClosedUdp(() -> sender.doubleArray("x", (double[][]) null));
+            assertClosedUdp(() -> sender.doubleArray("x", (double[][][]) null));
+            assertClosedUdp(() -> sender.doubleArray("x", (DoubleArray) null));
+            assertClosedUdp(() -> sender.geoHashColumn("x", (CharSequence) null));
+            assertClosedUdp(() -> sender.longArray("x", (long[]) null));
+            assertClosedUdp(() -> sender.longArray("x", (long[][]) null));
+            assertClosedUdp(() -> sender.longArray("x", (long[][][]) null));
+            assertClosedUdp(() -> sender.longArray("x", (LongArray) null));
+        });
+    }
+
+    private static void assertClosedUdp(Runnable r) {
+        try {
+            r.run();
+            Assert.fail("Expected LineSenderException with 'closed' message");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(
+                    "expected message to mention 'closed', got: " + e.getMessage(),
+                    e.getMessage() != null && e.getMessage().contains("closed"));
+        }
+    }
+
     private static void assertEstimateAtLeastActual(List<ScenarioRow> rows) {
         CapturingNetworkFacade nf = new CapturingNetworkFacade();
         try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {

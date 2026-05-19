@@ -173,7 +173,7 @@ public class QwpQueryClient implements QuietCloseable {
     // upgrade header. Ignored when target=primary (writers must be followed
     // across zones).
     private String clientZone;
-    private int compressionLevel = 3;
+    private int compressionLevel = 1;
     // User-facing compression preference from the connection string. "raw" is
     // the library default -- no compression, no handshake header, no server-
     // side CPU burn on payloads where the network isn't the bottleneck
@@ -245,6 +245,12 @@ public class QwpQueryClient implements QuietCloseable {
     // rows. Server may clamp down to its own hard cap.
     private int maxBatchRows;
     private int negotiatedQwpVersion;
+    // Zstd compression level the server actually applied for this connection,
+    // parsed from the echoed X-QWP-Content-Encoding response header. 0 means
+    // "no zstd" -- the server picked raw or the header was absent. Non-zero
+    // values are surfaced as the server wrote them on the wire (no client-side
+    // re-clamp) so a misconfigured server is observable from user code.
+    private int negotiatedZstdLevel;
     private long nextRequestId = 1;
     // Decoded SERVER_INFO from the current connection's handshake. Null before
     // connect() has succeeded, and on connections that negotiated v1 (which
@@ -320,7 +326,9 @@ public class QwpQueryClient implements QuietCloseable {
      *       (default) advertises {@code zstd,raw} so the server picks zstd
      *       when it supports it and falls back to raw otherwise.</li>
      *   <li>{@code compression_level=N} -- zstd level hint, clamped server-side
-     *       to [1, 9]. Default 3. Ignored when {@code compression=raw}.</li>
+     *       to [1, 9]. Default 1 (cheapest server-side CPU; compression ratio
+     *       gain at higher levels is small for typical columnar payloads).
+     *       Ignored when {@code compression=raw}.</li>
      *   <li>{@code tls_verify=on|unsafe_off} -- TLS certificate validation. Default is {@code on}.
      *       Only allowed with the {@code wss::} schema. {@code unsafe_off} disables hostname and
      *       certificate chain validation; use only for testing.</li>
@@ -370,6 +378,7 @@ public class QwpQueryClient implements QuietCloseable {
         Long failoverBackoffMaxMs = null;
         Long failoverMaxDurationMs = null;
         Long authTimeoutMs = null;
+        Long initialCredit = null;
         String auth = null;
         String username = null;
         String password = null;
@@ -379,7 +388,7 @@ public class QwpQueryClient implements QuietCloseable {
         // Default matches the field initializer in QwpQueryClient: raw wire,
         // zstd opt-in.
         String compression = "raw";
-        int compressionLevel = 3;
+        int compressionLevel = 1;
         int maxBatchRows = 0;  // 0 = omit header, server uses its default
         // TLS validation mode: null means "unset in config". Explicit values kick in only when tls is true.
         Integer tlsValidation = null;
@@ -504,6 +513,16 @@ public class QwpQueryClient implements QuietCloseable {
                         throw new IllegalArgumentException("buffer_pool_size must be >= 1");
                     }
                     break;
+                case "initial_credit":
+                    try {
+                        initialCredit = Long.parseLong(value);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("invalid initial_credit: " + value);
+                    }
+                    if (initialCredit < 0L) {
+                        throw new IllegalArgumentException("initial_credit must be >= 0");
+                    }
+                    break;
                 case "compression":
                     if (!"zstd".equals(value) && !"raw".equals(value) && !"auto".equals(value)) {
                         throw new IllegalArgumentException(
@@ -550,6 +569,48 @@ public class QwpQueryClient implements QuietCloseable {
                     break;
                 case "zone":
                     zone = value;
+                    break;
+                // connect-string.md "Auto-flushing", "Buffer sizing", "Store-and-forward",
+                // "Durable ACK", "Reconnect and failover", "Error handling", and
+                // legacy ILP aliases: these keys configure the Sender (ingress) only.
+                // The QwpQueryClient silently consumes them so the same connect string
+                // can be shared between the Sender and the QwpQueryClient without an
+                // "unknown configuration key" error. Validation and effect are the
+                // Sender parser's job; the egress parser does not interpret the value.
+                case "auto_flush":
+                case "auto_flush_bytes":
+                case "auto_flush_interval":
+                case "auto_flush_rows":
+                case "close_flush_timeout_millis":
+                case "connection_listener_inbox_capacity":
+                case "drain_orphans":
+                case "durable_ack_keepalive_interval_millis":
+                case "error_inbox_capacity":
+                case "in_flight_window":
+                case "init_buf_size":
+                case "initial_connect_retry":
+                case "max_background_drainers":
+                case "max_buf_size":
+                case "max_datagram_size":
+                case "max_name_len":
+                case "max_schemas_per_connection":
+                case "multicast_ttl":
+                case "pass":
+                case "protocol_version":
+                case "reconnect_initial_backoff_millis":
+                case "reconnect_max_backoff_millis":
+                case "reconnect_max_duration_millis":
+                case "request_durable_ack":
+                case "request_min_throughput":
+                case "request_timeout":
+                case "retry_timeout":
+                case "sender_id":
+                case "sf_append_deadline_millis":
+                case "sf_dir":
+                case "sf_durability":
+                case "sf_max_bytes":
+                case "sf_max_total_bytes":
+                case "user":
                     break;
                 default:
                     throw new IllegalArgumentException("unknown configuration key: " + key);
@@ -607,6 +668,9 @@ public class QwpQueryClient implements QuietCloseable {
         }
         if (authTimeoutMs != null) {
             client.withAuthTimeout(authTimeoutMs);
+        }
+        if (initialCredit != null) {
+            client.withInitialCredit(initialCredit);
         }
         client.withEndpointPath(path);
         client.withBufferPoolSize(poolSize);
@@ -915,6 +979,16 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Returns the zstd level the client will advertise on the
+     * {@code X-QWP-Accept-Encoding} header. Exposed so tests can pin the
+     * default and the parser's accepted range; any drift here changes what
+     * the server sees on the wire.
+     */
+    public int getCompressionLevelForTest() {
+        return compressionLevel;
+    }
+
+    /**
      * Returns the current compression preference: one of {@code raw} (the
      * library default, no compression), {@code zstd} (demand zstd), or
      * {@code auto} (advertise zstd and raw, let the server pick). Useful for
@@ -942,6 +1016,25 @@ public class QwpQueryClient implements QuietCloseable {
 
     public int getNegotiatedQwpVersion() {
         return negotiatedQwpVersion;
+    }
+
+    /**
+     * Zstd compression level the server actually applied for this connection,
+     * parsed from the echoed {@code X-QWP-Content-Encoding} response header.
+     * <p>
+     * Returns {@code 0} when no zstd is in use -- the server picked raw, the
+     * client never asked for zstd, or the header was absent on the wire
+     * (older servers). A non-zero return is what the server wrote on the
+     * wire verbatim, not what this client requested via
+     * {@code compression_level=N}; the two differ when the server has
+     * {@code qwp.egress.compression.force.level} set or when the server
+     * clamped a client request to its {@code [1, 9]} accepted range.
+     * <p>
+     * Refreshed after every successful reconnect, so a forced-level change
+     * on the server side picks up on the next round of failover.
+     */
+    public int getNegotiatedZstdLevel() {
+        return negotiatedZstdLevel;
     }
 
     /**
@@ -1482,6 +1575,7 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.setQwpMaxBatchRows(maxBatchRows);
         runUpgradeWithTimeout(ep);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
+        negotiatedZstdLevel = webSocketClient.getServerNegotiatedZstdLevel();
 
         // v2 servers send SERVER_INFO as the first WebSocket frame after the
         // upgrade response. Consume it synchronously on the user thread before

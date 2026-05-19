@@ -25,9 +25,14 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.line.LineSenderException;
-import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
+import io.questdb.client.cutlass.line.array.DoubleArray;
+import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.Decimal128;
+import io.questdb.client.std.Decimal256;
+import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.bytes.DirectByteSlice;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -44,6 +49,75 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * These tests focus on state management and API validation without requiring a live server.
  */
 public class QwpWebSocketSenderTest {
+
+    @Test
+    public void testApplyServerBatchSizeLimit_advertisedClampsLargerConfigured() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ 32 * 1024 * 1024,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // Server advertises 16 MB. Configured 32 MB is over the cap,
+                // so the effective budget should drop to 90% of 16 MB.
+                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
+                int effective = getEffectiveAutoFlushBytes(sender);
+                Assert.assertEquals((long) (16 * 1024 * 1024) * 9 / 10, effective);
+                Assert.assertEquals(16 * 1024 * 1024, getServerMaxBatchSize(sender));
+            }
+        });
+    }
+
+    @Test
+    public void testApplyServerBatchSizeLimit_advertisedZeroKeepsConfigured() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ 2 * 1024 * 1024,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // 0 advertisement = older server. Effective budget must equal
+                // the configured value verbatim so the sender keeps working.
+                invokeApplyServerBatchSizeLimit(sender, 0);
+                Assert.assertEquals(2 * 1024 * 1024, getEffectiveAutoFlushBytes(sender));
+                Assert.assertEquals(0, getServerMaxBatchSize(sender));
+            }
+        });
+    }
+
+    @Test
+    public void testApplyServerBatchSizeLimit_configuredSmallerThanAdvertisedWins() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ 2 * 1024 * 1024,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // Server advertises 16 MB; configured 2 MB is well below.
+                // Keep the user's tighter budget rather than overriding it.
+                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
+                Assert.assertEquals(2 * 1024 * 1024, getEffectiveAutoFlushBytes(sender));
+            }
+        });
+    }
+
+    @Test
+    public void testApplyServerBatchSizeLimit_optOutPreservedDespiteAdvertisement() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ 1000,
+                    /*autoFlushBytes*/ 0,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // User explicitly disabled the byte trigger. The server's
+                // advertised cap must update serverMaxBatchSize (for the
+                // single-row guard) but must not re-enable byte flushing.
+                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
+                Assert.assertEquals(0, getEffectiveAutoFlushBytes(sender));
+                Assert.assertEquals(16 * 1024 * 1024, getServerMaxBatchSize(sender));
+            }
+        });
+    }
 
     @Test
     public void testAtAfterCloseThrows() throws Exception {
@@ -86,6 +160,51 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testBinaryColumnAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.binaryColumn("x", new byte[]{1, 2, 3});
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testBinaryColumnRejectsNullArray() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("t");
+                try {
+                    sender.binaryColumn("x", (byte[]) null);
+                    Assert.fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("BINARY value cannot be null"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testBinaryColumnRejectsNullDirectByteSlice() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("t");
+                try {
+                    sender.binaryColumn("x", (io.questdb.client.std.bytes.DirectByteSlice) null);
+                    Assert.fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("BINARY slice cannot be null"));
+                }
             }
         });
     }
@@ -211,10 +330,105 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testGeoHashColumnLongAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.geoHashColumn("g", 0xFL, 5);
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testGeoHashColumnStringAfterCloseThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+
+            try {
+                sender.geoHashColumn("g", "u33d");
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
     public void testGorillaEnabledByDefault() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = createUnconnectedSender()) {
                 Assert.assertTrue(sender.isGorillaEnabled());
+            }
+        });
+    }
+
+    @Test
+    public void testIpv4ColumnStringNullReturnsThis() throws Exception {
+        // A null reference is the explicit "skip the setter for this row"
+        // signal -- the column gets null-padded by nextRow() if it already
+        // exists in the table buffer, or stays undeclared otherwise. Either
+        // way it round-trips as SQL NULL. The call must not throw and must
+        // return the sender so chained builders keep working.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("t");
+                Assert.assertSame(sender, sender.ipv4Column("addr", (CharSequence) null));
+            }
+        });
+    }
+
+    @Test
+    public void testIpv4ColumnStringRejectsNullLiteral() throws Exception {
+        // The literal string "null" (case-insensitive) parses to the IPv4
+        // NULL sentinel via Numbers.parseIPv4. Accepting it silently would
+        // sneak a NULL through an API the user expects to mean "give me a
+        // real IPv4". Reject it as an invalid IPv4 address; the user can
+        // pass a null reference (or omit the setter) to mark the row null.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("t");
+                for (String input : new String[]{"null", "NULL", "Null", "nUlL"}) {
+                    try {
+                        sender.ipv4Column("addr", input);
+                        Assert.fail("Expected LineSenderException for input: " + input);
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(
+                                "expected error to mention 'invalid IPv4' or 'NULL sentinel'"
+                                        + " for input " + input + ", got: " + e.getMessage(),
+                                e.getMessage().contains("invalid IPv4")
+                                        || e.getMessage().contains("NULL sentinel"));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testIpv4ColumnStringRejectsZeroAddress() throws Exception {
+        // "0.0.0.0" parses to the bit pattern 0, which the storage layer
+        // treats as the IPv4 NULL sentinel. Accepting it would silently
+        // round-trip as SQL NULL even though the user wrote a syntactically
+        // valid dotted-quad. Reject it on the client so the user gets a
+        // clear error instead of a value that disappears on read.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("t");
+                try {
+                    sender.ipv4Column("addr", "0.0.0.0");
+                    Assert.fail("Expected LineSenderException for 0.0.0.0");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(
+                            "expected error to mention 'invalid IPv4' or 'NULL sentinel', got: "
+                                    + e.getMessage(),
+                            e.getMessage().contains("invalid IPv4")
+                                    || e.getMessage().contains("NULL sentinel"));
+                }
             }
         });
     }
@@ -250,6 +464,35 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testNullArgsAfterCloseAllThrowSenderClosed() throws Exception {
+        // Several column setters short-circuit (return this or throw "cannot
+        // be null") before delegating to an overload that calls
+        // checkNotClosed(). On a closed sender that means the user gets a
+        // null-flavoured error (or worse, a silent no-op) instead of the
+        // canonical "Sender is closed". This test pins the closed-sender
+        // precedence across the entire affected method surface.
+        assertMemoryLeak(() -> {
+            QwpWebSocketSender sender = createUnconnectedSender();
+            sender.close();
+            assertClosed(() -> sender.binaryColumn("x", (DirectByteSlice) null));
+            assertClosed(() -> sender.decimalColumn("x", (Decimal64) null));
+            assertClosed(() -> sender.decimalColumn("x", (Decimal128) null));
+            assertClosed(() -> sender.decimalColumn("x", (Decimal256) null));
+            assertClosed(() -> sender.decimalColumn("x", (CharSequence) null));
+            assertClosed(() -> sender.doubleArray("x", (double[]) null));
+            assertClosed(() -> sender.doubleArray("x", (double[][]) null));
+            assertClosed(() -> sender.doubleArray("x", (double[][][]) null));
+            assertClosed(() -> sender.doubleArray("x", (DoubleArray) null));
+            assertClosed(() -> sender.geoHashColumn("x", (CharSequence) null));
+            assertClosed(() -> sender.ipv4Column("x", (CharSequence) null));
+            assertClosed(() -> sender.longArray("x", (long[]) null));
+            assertClosed(() -> sender.longArray("x", (long[][]) null));
+            assertClosed(() -> sender.longArray("x", (long[][][]) null));
+            assertClosed(() -> sender.longArray("x", (LongArray) null));
+        });
+    }
+
+    @Test
     public void testNullArrayReturnsThis() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = createUnconnectedSender()) {
@@ -271,6 +514,61 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testPendingBytesMatchesGroundTruthAcrossTableSwitches() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ Integer.MAX_VALUE,
+                    /*autoFlushBytes*/ 0,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                // Bypass ensureConnected: sendRow only short-circuits on
+                // connected==true and we don't drive any path that touches
+                // the cursor engine in this test.
+                setConnected(sender);
+
+                // Round-robin three tables to exercise the per-row delta
+                // logic across switches. The running pendingBytes must
+                // always equal what a full re-walk would return.
+                for (int i = 0; i < 30; i++) {
+                    sender.table("t" + (i % 3));
+                    sender.longColumn("a", i);
+                    sender.longColumn("b", i * 7L);
+                    sender.atNow();
+                    Assert.assertEquals(
+                            "row " + i + ": pendingBytes diverged from ground truth",
+                            invokeTotalBufferedBytes(sender),
+                            getPendingBytes(sender));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPendingBytesUnchangedByCancelRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ Integer.MAX_VALUE,
+                    /*autoFlushBytes*/ 0,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                setConnected(sender);
+
+                sender.table("t0").longColumn("a", 1).longColumn("b", 2).atNow();
+                long committed = getPendingBytes(sender);
+                Assert.assertEquals(invokeTotalBufferedBytes(sender), committed);
+
+                // Begin a row, then cancel. The committed bytes must not
+                // change and pendingBytes must still match ground truth.
+                sender.table("t0").longColumn("a", 99);
+                sender.cancelRow();
+
+                Assert.assertEquals(committed, getPendingBytes(sender));
+                Assert.assertEquals(invokeTotalBufferedBytes(sender), getPendingBytes(sender));
             }
         });
     }
@@ -399,17 +697,40 @@ public class QwpWebSocketSenderTest {
         });
     }
 
-    private static MicrobatchBuffer getActiveBuffer(QwpWebSocketSender sender) throws Exception {
-        Field field = QwpWebSocketSender.class.getDeclaredField("activeBuffer");
-        field.setAccessible(true);
-        return (MicrobatchBuffer) field.get(sender);
+    private static void assertClosed(Runnable r) {
+        try {
+            r.run();
+            Assert.fail("Expected LineSenderException with 'closed' message");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(
+                    "expected message to mention 'closed', got: " + e.getMessage(),
+                    e.getMessage() != null && e.getMessage().contains("closed"));
+        }
     }
 
-    private static void invokeSealAndSwapBuffer(QwpWebSocketSender sender) throws Exception {
-        Method method = QwpWebSocketSender.class.getDeclaredMethod("sealAndSwapBuffer");
-        method.setAccessible(true);
+    private static int getEffectiveAutoFlushBytes(QwpWebSocketSender sender) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField("effectiveAutoFlushBytes");
+        field.setAccessible(true);
+        return field.getInt(sender);
+    }
+
+    private static long getPendingBytes(QwpWebSocketSender sender) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField("pendingBytes");
+        field.setAccessible(true);
+        return field.getLong(sender);
+    }
+
+    private static int getServerMaxBatchSize(QwpWebSocketSender sender) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField("serverMaxBatchSize");
+        field.setAccessible(true);
+        return field.getInt(sender);
+    }
+
+    private static void invokeApplyServerBatchSizeLimit(QwpWebSocketSender sender, int advertised) throws Exception {
+        Method m = QwpWebSocketSender.class.getDeclaredMethod("applyServerBatchSizeLimit", int.class);
+        m.setAccessible(true);
         try {
-            method.invoke(sender);
+            m.invoke(sender, advertised);
         } catch (InvocationTargetException e) {
             Throwable cause = e.getCause();
             if (cause instanceof Exception) {
@@ -422,12 +743,27 @@ public class QwpWebSocketSenderTest {
         }
     }
 
-    /**
-     * Creates an async sender without connecting.
-     */
-    private QwpWebSocketSender createUnconnectedAsyncSender() {
-        return QwpWebSocketSender.createForTesting("localhost", 9000,
-                500, 0, 0L);  // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
+    private static long invokeTotalBufferedBytes(QwpWebSocketSender sender) throws Exception {
+        Method m = QwpWebSocketSender.class.getDeclaredMethod("totalBufferedBytes");
+        m.setAccessible(true);
+        try {
+            return (long) m.invoke(sender);
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            throw new RuntimeException(cause);
+        }
+    }
+
+    private static void setConnected(QwpWebSocketSender sender) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField("connected");
+        field.setAccessible(true);
+        field.setBoolean(sender, true);
     }
 
     /**

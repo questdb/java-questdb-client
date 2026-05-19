@@ -263,6 +263,69 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
+     * Add a BINARY column value as a byte array. The bytes are written verbatim
+     * with no encoding or transformation. To mark the value NULL, do not call
+     * this method for the current row (the null bitmap path).
+     * <p>
+     * A {@code null} array reference is rejected to keep the NULL contract
+     * explicit; use the null bitmap instead. An empty array is accepted on the
+     * wire, but QuestDB's BINARY storage uses the same NULL sentinel for
+     * zero-length and absent values, so an empty payload round-trips as NULL
+     * on read.
+     *
+     * @param name  name of the column
+     * @param value the bytes to write; must not be null
+     * @return this instance for method chaining
+     * @throws LineSenderException if {@code value} is null or the configured
+     *                             protocol version does not support BINARY
+     */
+    default Sender binaryColumn(CharSequence name, byte[] value) {
+        throw new LineSenderException("current protocol version does not support binary");
+    }
+
+    /**
+     * Add a BINARY column value from off-heap memory. The bytes at {@code [ptr,
+     * ptr + len)} are copied verbatim into the sender's buffer; the caller's
+     * memory only needs to stay valid for the duration of this call.
+     * <p>
+     * {@code len} must be in {@code [0, Integer.MAX_VALUE]} (BINARY's wire
+     * offset entries are uint32). {@code ptr} must be non-zero when
+     * {@code len > 0}. To mark the value NULL, omit the column from the row.
+     * QuestDB's BINARY storage uses the same sentinel for empty and absent
+     * values, so {@code len == 0} round-trips as NULL on read.
+     *
+     * @param name name of the column
+     * @param ptr  native address of the first byte
+     * @param len  number of bytes to copy, 0..{@link Integer#MAX_VALUE}
+     * @return this instance for method chaining
+     * @throws LineSenderException on bad arguments or if the configured
+     *                             protocol version does not support BINARY
+     */
+    default Sender binaryColumn(CharSequence name, long ptr, long len) {
+        throw new LineSenderException("current protocol version does not support binary");
+    }
+
+    /**
+     * Add a BINARY column value from a {@link DirectByteSlice} view over
+     * off-heap memory. Equivalent to {@link #binaryColumn(CharSequence, long,
+     * long)} with the slice's {@code ptr()} and {@code size()}; the slice is
+     * not retained after the call returns.
+     *
+     * @param name  name of the column
+     * @param slice byte slice; must not be null
+     * @return this instance for method chaining
+     * @throws LineSenderException if {@code slice} is null or the configured
+     *                             protocol version does not support BINARY
+     */
+    default Sender binaryColumn(CharSequence name, DirectByteSlice slice) {
+        if (slice == null) {
+            throw new LineSenderException(
+                    "BINARY slice cannot be null; mark the row null via the null bitmap instead");
+        }
+        return binaryColumn(name, slice.ptr(), slice.size());
+    }
+
+    /**
      * Add a column with a boolean value.
      *
      * @param name  name of the column
@@ -283,6 +346,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     DirectByteSlice bufferView();
 
     /**
+     * Add a column with a single-byte signed integer value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support BYTE
+     */
+    default Sender byteColumn(CharSequence name, byte value) {
+        throw new LineSenderException("current protocol version does not support byte");
+    }
+
+    /**
      * Cancel the current row. This method is useful when you want to discard a row that you started, but
      * you don't want to send it to a server.
      * <br>
@@ -292,6 +367,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * communicating over TCP transport.
      */
     void cancelRow();
+
+    /**
+     * Add a column with a 16-bit Java {@code char} value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support CHAR
+     */
+    default Sender charColumn(CharSequence name, char value) {
+        throw new LineSenderException("current protocol version does not support char");
+    }
 
     /**
      * Close this Sender.
@@ -359,6 +446,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     Sender doubleColumn(CharSequence name, double value);
 
     /**
+     * Add a column with a 32-bit floating point value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support FLOAT
+     */
+    default Sender floatColumn(CharSequence name, float value) {
+        throw new LineSenderException("current protocol version does not support float");
+    }
+
+    /**
      * Force flushing internal buffers to a server.
      * <br>
      * You should also call this method when you expect a period of quiescence during which no data will be written.
@@ -374,6 +473,111 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @see LineSenderBuilder#autoFlushRows(int)
      */
     void flush();
+
+    /**
+     * Add a GEOHASH column value from pre-packed bits and an explicit bit precision.
+     * <p>
+     * The {@code bits} long carries the geohash in its low {@code precisionBits} bits;
+     * higher bits are masked off and never reach the wire. {@code precisionBits} must
+     * be in {@code [1, 60]}, matching {@code GEOHASH(Nb)} on the server.
+     * <p>
+     * Precision is locked the first time a value is added to the column: subsequent
+     * rows must use the same precision or a {@link LineSenderException} is thrown.
+     * To mark the value NULL, do not call this method for the current row.
+     *
+     * @param name          name of the column
+     * @param bits          packed geohash; low {@code precisionBits} bits significant
+     * @param precisionBits number of significant bits, 1..60
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support
+     *                             GEOHASH, {@code precisionBits} is out of range, or
+     *                             the precision does not match the column's previously
+     *                             locked precision
+     */
+    default Sender geoHashColumn(CharSequence name, long bits, int precisionBits) {
+        throw new LineSenderException("current protocol version does not support geohash");
+    }
+
+    /**
+     * Add a GEOHASH column value from a base32 geohash string (e.g. "u33d8").
+     * <p>
+     * The string is decoded as standard geohash base32 (lower- or upper-case;
+     * characters in {@code 0-9} and {@code b c d e f g h j k m n p q r s t u v w x
+     * y z}; {@code a, i, l, o} are not part of the alphabet). Each character
+     * contributes 5 bits, so a 4-character string produces a 20-bit geohash and
+     * the longest accepted input is 12 characters (60 bits).
+     * <p>
+     * The first call locks the column at {@code value.length() * 5} bits; all
+     * subsequent rows must supply strings of the same length.
+     *
+     * @param name  name of the column
+     * @param value base32 geohash string, 1..12 characters; must not be null or empty
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support
+     *                             GEOHASH, the string is null, empty, longer than 12
+     *                             characters, contains non-base32 characters, or its
+     *                             derived precision does not match the column's
+     *                             previously locked precision
+     */
+    default Sender geoHashColumn(CharSequence name, CharSequence value) {
+        throw new LineSenderException("current protocol version does not support geohash");
+    }
+
+    /**
+     * Add a column with a 32-bit signed integer value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support INT
+     */
+    default Sender intColumn(CharSequence name, int value) {
+        throw new LineSenderException("current protocol version does not support int");
+    }
+
+    /**
+     * Add an IPv4 column value, as a packed 32-bit address in host byte order
+     * (e.g. 192.168.1.1 -> 0xC0A80101).
+     * <p>
+     * Per QuestDB convention, the bit pattern 0 (i.e. 0.0.0.0) is the IPv4
+     * NULL sentinel and surfaces as NULL on read.
+     *
+     * @param name    name of the column
+     * @param address packed IPv4 address
+     * @return this instance for method chaining
+     */
+    default Sender ipv4Column(CharSequence name, int address) {
+        throw new LineSenderException("current protocol version does not support ipv4");
+    }
+
+    /**
+     * Add an IPv4 column value from a dotted-quad string (e.g. "192.168.1.1").
+     *
+     * @param name    name of the column
+     * @param address dotted-quad IPv4 address; must not be null
+     * @return this instance for method chaining
+     * @throws LineSenderException if the address fails to parse, or the
+     *                             configured protocol version does not support IPv4
+     */
+    default Sender ipv4Column(CharSequence name, CharSequence address) {
+        throw new LineSenderException("current protocol version does not support ipv4");
+    }
+
+    /**
+     * Add a LONG256 column value, packed as four 64-bit words, least-significant first
+     * (so the 256-bit value is {@code (l3 << 192) | (l2 << 128) | (l1 << 64) | l0}).
+     *
+     * @param name name of the column
+     * @param l0   bits 0..63 (least significant)
+     * @param l1   bits 64..127
+     * @param l2   bits 128..191
+     * @param l3   bits 192..255 (most significant)
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support LONG256
+     */
+    default Sender long256Column(CharSequence name, long l0, long l1, long l2, long l3) {
+        throw new LineSenderException("current protocol version does not support long256");
+    }
 
     /**
      * Add a column with an integer value.
@@ -402,6 +606,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @see #flush()
      */
     void reset();
+
+    /**
+     * Add a column with a 16-bit signed integer value.
+     *
+     * @param name  name of the column
+     * @param value value to add
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support SHORT
+     */
+    default Sender shortColumn(CharSequence name, short value) {
+        throw new LineSenderException("current protocol version does not support short");
+    }
 
     /**
      * Add a column with a string value.
@@ -453,6 +669,76 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @return this instance for method chaining
      */
     Sender timestampColumn(CharSequence name, Instant value);
+
+    /**
+     * Add a UUID column value, packed as two 64-bit halves.
+     *
+     * @param name name of the column
+     * @param lo   low 64 bits of the UUID
+     * @param hi   high 64 bits of the UUID
+     * @return this instance for method chaining
+     * @throws LineSenderException if the configured protocol version does not support UUID
+     */
+    default Sender uuidColumn(CharSequence name, long lo, long hi) {
+        throw new LineSenderException("current protocol version does not support uuid");
+    }
+
+    /**
+     * Initial-connect behavior for the WebSocket cursor SF transport.
+     * <ul>
+     *   <li>{@link #OFF} — single attempt on the user thread; a startup
+     *       failure throws immediately. Correct for fail-fast deployments
+     *       where a misconfigured host should not stall app startup.</li>
+     *   <li>{@link #SYNC} — same retry loop the in-flight reconnect path
+     *       uses, but it runs on the user thread inside {@code fromConfig}.
+     *       Blocks up to {@code reconnect_max_duration_millis}. Auth/upgrade
+     *       failures stay terminal. Useful when the server is expected to
+     *       come up shortly after the producer and the producer is willing
+     *       to wait.</li>
+     *   <li>{@link #ASYNC} — {@code fromConfig} returns immediately with an
+     *       unconnected sender; the I/O thread runs the same retry loop in
+     *       the background. The user thread can call {@code at()} /
+     *       {@code flush()} immediately; rows accumulate in the cursor SF
+     *       engine until the wire is up. A connect-budget exhaustion or a
+     *       terminal upgrade failure is delivered to the async error inbox
+     *       as a {@link io.questdb.client.SenderError} (no synchronous
+     *       throw on the user call site). Wire {@code error_handler=...}
+     *       to observe these.</li>
+     * </ul>
+     * <p>
+     * Default resolution when the caller does not pick a value:
+     * {@link #SYNC} if any {@code reconnect_*} knob was tuned explicitly
+     * (so the budget the user wrote actually applies to the first connect),
+     * otherwise {@link #OFF}. Pass an explicit value to override -- an
+     * explicit {@link #OFF} alongside a tuned {@code reconnect_*} budget
+     * still gets {@link #OFF}.
+     */
+    enum InitialConnectMode {
+        OFF,
+        SYNC,
+        ASYNC
+    }
+
+    /**
+     * Durability contract for the store-and-forward write path. Selects when
+     * the SF segment file is fsynced; trades latency / throughput for
+     * crash-survival of unacked frames.
+     * <ul>
+     *   <li>{@link #MEMORY} — never fsync explicitly. Bytes live in the OS
+     *       page cache; survive a JVM crash but not an OS crash. Default
+     *       and the lowest-latency setting.</li>
+     *   <li>{@link #FLUSH} — fsync the active segment at every
+     *       {@code Sender.flush()} (and at the implicit close-flush). One
+     *       fsync per user flush, regardless of frame count.</li>
+     *   <li>{@link #APPEND} — fsync after every individual frame append.
+     *       Strongest guarantee, slowest path; pay a disk fsync per row.</li>
+     * </ul>
+     */
+    enum SfDurability {
+        MEMORY,
+        FLUSH,
+        APPEND
+    }
 
     /**
      * Configure TLS mode.
@@ -513,57 +799,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Durability contract for the store-and-forward write path. Selects when
-     * the SF segment file is fsynced; trades latency / throughput for
-     * crash-survival of unacked frames.
-     * <ul>
-     *   <li>{@link #MEMORY} — never fsync explicitly. Bytes live in the OS
-     *       page cache; survive a JVM crash but not an OS crash. Default
-     *       and the lowest-latency setting.</li>
-     *   <li>{@link #FLUSH} — fsync the active segment at every
-     *       {@code Sender.flush()} (and at the implicit close-flush). One
-     *       fsync per user flush, regardless of frame count.</li>
-     *   <li>{@link #APPEND} — fsync after every individual frame append.
-     *       Strongest guarantee, slowest path; pay a disk fsync per row.</li>
-     * </ul>
-     */
-    enum SfDurability {
-        MEMORY,
-        FLUSH,
-        APPEND
-    }
-
-    /**
-     * Initial-connect behavior for the WebSocket cursor SF transport.
-     * <ul>
-     *   <li>{@link #OFF} — single attempt on the user thread; a startup
-     *       failure throws immediately. Default; correct for fail-fast
-     *       deployments where a misconfigured host should not stall app
-     *       startup.</li>
-     *   <li>{@link #SYNC} — same retry loop the in-flight reconnect path
-     *       uses, but it runs on the user thread inside {@code fromConfig}.
-     *       Blocks up to {@code reconnect_max_duration_millis}. Auth/upgrade
-     *       failures stay terminal. Useful when the server is expected to
-     *       come up shortly after the producer and the producer is willing
-     *       to wait.</li>
-     *   <li>{@link #ASYNC} — {@code fromConfig} returns immediately with an
-     *       unconnected sender; the I/O thread runs the same retry loop in
-     *       the background. The user thread can call {@code at()} /
-     *       {@code flush()} immediately; rows accumulate in the cursor SF
-     *       engine until the wire is up. A connect-budget exhaustion or a
-     *       terminal upgrade failure is delivered to the async error inbox
-     *       as a {@link io.questdb.client.SenderError} (no synchronous
-     *       throw on the user call site). Wire {@code error_handler=...}
-     *       to observe these.</li>
-     * </ul>
-     */
-    enum InitialConnectMode {
-        OFF,
-        SYNC,
-        ASYNC
-    }
-
-    /**
      * Builder class to construct a new instance of a Sender.
      * <br>
      * Example usage for HTTP transport:
@@ -602,23 +837,58 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
+        // close() drain timeout. Default applied at build() time. 0 or -1
+        // means "fast close" (skip the drain entirely); any positive value
+        // bounds the wait for ackedFsn to catch up to publishedFsn. Uses
+        // its own sentinel because -1 is a documented user-facing value
+        // and would otherwise collide with PARAMETER_NOT_SET_EXPLICITLY.
+        private static final long CLOSE_FLUSH_TIMEOUT_NOT_SET = Long.MIN_VALUE;
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
         private static final int DEFAULT_AUTO_FLUSH_ROWS = 75_000;
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
+        // Default close() drain timeout: block up to 5s waiting for the
+        // server to ACK everything published into the engine before
+        // shutting down the I/O loop.
+        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = 5_000L;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
+        private static final int DEFAULT_MAX_BACKGROUND_DRAINERS = 4;
         private static final int DEFAULT_MAX_BACKOFF_MILLIS = 1_000;
+        // Default ceiling on cursor-allocated bytes (active + spare + sealed).
+        // RAM is precious; if you're not persisting to disk, you don't get
+        // to balloon. Memory mode = 128 MiB (32 segments at default size).
+        private static final long DEFAULT_MAX_BYTES_MEMORY = 128L * 1024 * 1024;
+        // Disk is cheap and SF's job is to absorb backpressure during wire
+        // outages — the cap should be large enough that normal traffic
+        // never approaches it. SF mode = 10 GiB (2560 segments at default
+        // size). Users can lower this on space-constrained hosts.
+        private static final long DEFAULT_MAX_BYTES_SF = 10L * 1024 * 1024 * 1024;
         private static final int DEFAULT_MAX_DATAGRAM_SIZE = 1400;
         private static final int DEFAULT_MAX_NAME_LEN = 127;
         private static final long DEFAULT_MAX_RETRY_NANOS = TimeUnit.SECONDS.toNanos(10); // keep sync with the contract of the configuration method
         private static final long DEFAULT_MIN_REQUEST_THROUGHPUT = 100 * 1024; // 100KB/s, keep in sync with the contract of the configuration method
+        // Default per-segment size for the cursor SF/memory-mode ring (4 MiB).
+        // Smaller than the legacy 64 MiB default — cursor has no per-rotation
+        // syscall cost so smaller segments give finer trim granularity and
+        // make the cap arithmetic friendlier (cap / segment >> 2).
+        private static final long DEFAULT_SEGMENT_BYTES = 4L * 1024 * 1024;
+        // Slot identity within sfDir. Each sender owns <sfDir>/<senderId>/ and
+        // takes an advisory exclusive lock there. Default "default" is fine for
+        // single-sender deployments; multi-sender setups must set this explicitly
+        // or the second sender will fail with "sf slot already in use".
+        private static final String DEFAULT_SENDER_ID = "default";
         private static final int DEFAULT_TCP_PORT = 9009;
         private static final int DEFAULT_UDP_PORT = 9007;
         private static final int DEFAULT_WEBSOCKET_PORT = 9000;
         private static final int DEFAULT_WS_AUTO_FLUSH_BYTES = 0;
         private static final long DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
         private static final int DEFAULT_WS_AUTO_FLUSH_ROWS = 1_000;
+        // Cadence at which the SF cursor I/O loop sends a keepalive PING
+        // while waiting on STATUS_DURABLE_ACK frames. Default applied at
+        // build() time. 0 or negative is a documented "disable" value, so
+        // a Long.MIN_VALUE sentinel keeps it distinguishable from "unset".
+        private static final long DURABLE_ACK_KEEPALIVE_NOT_SET = Long.MIN_VALUE;
         private static final int MIN_BUFFER_SIZE = AuthUtils.CHALLENGE_LEN + 1; // challenge size + 1;
         // sf-client.md section 4.4: the inbox capacity must accommodate the
         // distinct error categories in a bursty error stream so that drop-oldest
@@ -636,15 +906,47 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_WEBSOCKET = 2;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
+        private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
         private int autoFlushBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
         private int bufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        private long closeFlushTimeoutMillis = CLOSE_FLUSH_TIMEOUT_NOT_SET;
+        // Optional user-supplied async connection-event listener. When null,
+        // the sender uses DefaultSenderConnectionListener.INSTANCE
+        // (loud-not-silent log of every transition).
+        private io.questdb.client.SenderConnectionListener connectionListener;
+        // Bounded inbox capacity for the async connection-event dispatcher.
+        // PARAMETER_NOT_SET_EXPLICITLY → spec default (64).
+        private int connectionListenerInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        // Orphan adoption: when true, the foreground sender scans
+        // <sf_dir>/*/ at startup for sibling slots that hold unacked data
+        // and reports them. Default false. Spec calls for spawning
+        // background drainers to actually empty those slots; the drainer
+        // runtime lands in a follow-up commit. For now we surface the
+        // count via logging so users can confirm orphans are being seen.
+        private boolean drainOrphans = false;
+        private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
+        // Optional user-supplied async error handler. When null, the sender
+        // uses DefaultSenderErrorHandler.INSTANCE (loud-not-silent log).
+        private io.questdb.client.SenderErrorHandler errorHandler;
+        // Bounded inbox capacity for the async error dispatcher.
+        // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
+        private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean gorillaEnabled = true;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpToken;
+        // Drives the initial-connect strategy. null means "not set
+        // explicitly", which build() resolves to SYNC when any reconnect_*
+        // knob was tuned by the user, otherwise OFF. SYNC retries on the
+        // user thread up to the reconnect cap. ASYNC returns immediately
+        // and lets the I/O thread retry in the background, surfacing
+        // terminal failures via the error inbox.
+        private InitialConnectMode initialConnectMode = null;
         private String keyId;
+        private int maxBackgroundDrainers = DEFAULT_MAX_BACKGROUND_DRAINERS;
         private int maxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxDatagramSize = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxNameLength = PARAMETER_NOT_SET_EXPLICITLY;
@@ -677,96 +979,31 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private PrivateKey privateKey;
         private int protocol = PARAMETER_NOT_SET_EXPLICITLY;
         private int protocolVersion = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean requestDurableAck;
-        private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean shouldDestroyPrivKey;
-        // Default per-segment size for the cursor SF/memory-mode ring (4 MiB).
-        // Smaller than the legacy 64 MiB default — cursor has no per-rotation
-        // syscall cost so smaller segments give finer trim granularity and
-        // make the cap arithmetic friendlier (cap / segment >> 2).
-        private static final long DEFAULT_SEGMENT_BYTES = 4L * 1024 * 1024;
-        // Default ceiling on cursor-allocated bytes (active + spare + sealed).
-        // RAM is precious; if you're not persisting to disk, you don't get
-        // to balloon. Memory mode = 128 MiB (32 segments at default size).
-        private static final long DEFAULT_MAX_BYTES_MEMORY = 128L * 1024 * 1024;
-        // Disk is cheap and SF's job is to absorb backpressure during wire
-        // outages — the cap should be large enough that normal traffic
-        // never approaches it. SF mode = 10 GiB (2560 segments at default
-        // size). Users can lower this on space-constrained hosts.
-        private static final long DEFAULT_MAX_BYTES_SF = 10L * 1024 * 1024 * 1024;
-        // Default close() drain timeout: block up to 5s waiting for the
-        // server to ACK everything published into the engine before
-        // shutting down the I/O loop.
-        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = 5_000L;
-        // Store-and-forward (WebSocket only). SF is enabled iff sfDir is non-null —
-        // there is no separate on/off flag (presence of the directory is the switch).
-        // null sfDir → memory-only async ingest (same lock-free architecture, no disk).
-        private String sfDir;
-        // Slot identity within sfDir. Each sender owns <sfDir>/<senderId>/ and
-        // takes an advisory exclusive lock there. Default "default" is fine for
-        // single-sender deployments; multi-sender setups must set this explicitly
-        // or the second sender will fail with "sf slot already in use".
-        private static final String DEFAULT_SENDER_ID = "default";
-        private String senderId = DEFAULT_SENDER_ID;
-        private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
-        private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
-        // Durability contract for SF append/flush. Today only MEMORY is
-        // implemented; FLUSH and APPEND are deferred follow-ups (cursor needs
-        // to learn fsync first).
-        private SfDurability sfDurability = SfDurability.MEMORY;
-        // close() drain timeout. Default applied at build() time. 0 or -1
-        // means "fast close" (skip the drain entirely); any positive value
-        // bounds the wait for ackedFsn to catch up to publishedFsn. Uses
-        // its own sentinel because -1 is a documented user-facing value
-        // and would otherwise collide with PARAMETER_NOT_SET_EXPLICITLY.
-        private static final long CLOSE_FLUSH_TIMEOUT_NOT_SET = Long.MIN_VALUE;
-        private long closeFlushTimeoutMillis = CLOSE_FLUSH_TIMEOUT_NOT_SET;
+        private long reconnectInitialBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private long reconnectMaxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         // Reconnect policy. Defaults applied at build() time. Per-outage
         // time cap (default 300_000), initial backoff (default 100), and
         // max backoff (default 5_000) for the cursor I/O loop's exponential
         // retry-with-jitter loop.
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        private long reconnectInitialBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        private long reconnectMaxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        // Cadence at which the SF cursor I/O loop sends a keepalive PING
-        // while waiting on STATUS_DURABLE_ACK frames. Default applied at
-        // build() time. 0 or negative is a documented "disable" value, so
-        // a Long.MIN_VALUE sentinel keeps it distinguishable from "unset".
-        private static final long DURABLE_ACK_KEEPALIVE_NOT_SET = Long.MIN_VALUE;
-        private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
-        private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
-        private boolean gorillaEnabled = true;
-        // Drives the initial-connect strategy. OFF is fail-fast (default).
-        // SYNC retries on the user thread up to the reconnect cap. ASYNC
-        // returns immediately and lets the I/O thread retry in the
-        // background, surfacing terminal failures via the error inbox.
-        private InitialConnectMode initialConnectMode = InitialConnectMode.OFF;
+        private boolean requestDurableAck;
+        private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private String senderId = DEFAULT_SENDER_ID;
         // Per-append deadline for SF appendBlocking spin-then-throw. Used to
         // be a hardcoded 30s constant; expose so tight-SLA users can lower
         // and offline-tolerant users can raise.
         private long sfAppendDeadlineMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        // Orphan adoption: when true, the foreground sender scans
-        // <sf_dir>/*/ at startup for sibling slots that hold unacked data
-        // and reports them. Default false. Spec calls for spawning
-        // background drainers to actually empty those slots; the drainer
-        // runtime lands in a follow-up commit. For now we surface the
-        // count via logging so users can confirm orphans are being seen.
-        private boolean drainOrphans = false;
-        private int maxBackgroundDrainers = DEFAULT_MAX_BACKGROUND_DRAINERS;
-        private static final int DEFAULT_MAX_BACKGROUND_DRAINERS = 4;
-        // Optional user-supplied async connection-event listener. When null,
-        // the sender uses DefaultSenderConnectionListener.INSTANCE
-        // (loud-not-silent log of every transition).
-        private io.questdb.client.SenderConnectionListener connectionListener;
-        // Bounded inbox capacity for the async connection-event dispatcher.
-        // PARAMETER_NOT_SET_EXPLICITLY → spec default (64).
-        private int connectionListenerInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
-        // Optional user-supplied async error handler. When null, the sender
-        // uses DefaultSenderErrorHandler.INSTANCE (loud-not-silent log).
-        private io.questdb.client.SenderErrorHandler errorHandler;
-        // Bounded inbox capacity for the async error dispatcher.
-        // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
-        private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        // Store-and-forward (WebSocket only). SF is enabled iff sfDir is non-null —
+        // there is no separate on/off flag (presence of the directory is the switch).
+        // null sfDir → memory-only async ingest (same lock-free architecture, no disk).
+        private String sfDir;
+        // Durability contract for SF append/flush. Today only MEMORY is
+        // implemented; FLUSH and APPEND are deferred follow-ups (cursor needs
+        // to learn fsync first).
+        private SfDurability sfDurability = SfDurability.MEMORY;
+        private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean shouldDestroyPrivKey;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
         private char[] trustStorePassword;
@@ -839,64 +1076,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
-        private void addAddressEntry(CharSequence src, int start, int end, int defaultPort) {
-            int colon = Chars.indexOf(src, start, end, ':');
-            if (colon == end - 1) {
-                throw new LineSenderException("invalid address, use IPv4 address or a domain name [address=")
-                        .put(src.subSequence(start, end)).put("]");
-            }
-            int hostEnd = colon < 0 ? end : colon;
-            int portStart = colon < 0 ? end : colon + 1;
-            while (hostEnd > start && Character.isWhitespace(src.charAt(hostEnd - 1))) hostEnd--;
-            while (portStart < end && Character.isWhitespace(src.charAt(portStart))) portStart++;
-            int parsedPort = -1;
-            if (colon >= 0) {
-                try {
-                    parsedPort = Numbers.parseInt(src, portStart, end);
-                    if (parsedPort < 1 || parsedPort > 65535) {
-                        throw new LineSenderException("invalid port [port=").put(parsedPort).put("]");
-                    }
-                } catch (NumericException e) {
-                    throw new LineSenderException("cannot parse a port from the address, use IPv4 address or a domain name")
-                            .put(" [address=").put(src.subSequence(start, end)).put("]");
-                }
-            }
-            if (hostEnd == start) {
-                throw new LineSenderException("empty host in addr entry [address=")
-                        .put(src.subSequence(start, end)).put("]");
-            }
-            int effectivePort = parsedPort != -1 ? parsedPort : defaultPort;
-            for (int i = 0, n = hosts.size(); i < n; i++) {
-                String storedHost = hosts.get(i);
-                if (charsEqualsRange(storedHost, src, start, hostEnd)) {
-                    int storedEffectivePort = ports.size() > i && ports.getQuick(i) != PORT_NOT_SET
-                            ? ports.getQuick(i) : defaultPort;
-                    if (storedEffectivePort == effectivePort) {
-                        throw new LineSenderException("duplicated addresses are not allowed [address=")
-                                .put(src.subSequence(start, end)).put("]");
-                    }
-                }
-            }
-            while (ports.size() < hosts.size()) {
-                ports.add(defaultPort);
-            }
-            hosts.add(src.subSequence(start, hostEnd).toString());
-            ports.add(effectivePort);
-        }
-
-        private static boolean charsEqualsRange(CharSequence a, CharSequence b, int bStart, int bEnd) {
-            int len = bEnd - bStart;
-            if (a.length() != len) {
-                return false;
-            }
-            for (int i = 0; i < len; i++) {
-                if (a.charAt(i) != b.charAt(bStart + i)) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
         /**
          * Advanced TLS configuration. Most users should not need to use this.
          *
@@ -911,6 +1090,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("TLS validation was already disabled");
             }
             return new AdvancedTlsSettings();
+        }
+
+        /**
+         * Per-endpoint timeout on the WebSocket upgrade response read. Default
+         * {@value QwpWebSocketSender#DEFAULT_AUTH_TIMEOUT_MS} ms.
+         */
+        public LineSenderBuilder authTimeoutMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException(
+                        "auth_timeout_ms is only supported for WebSocket transport");
+            }
+            if (millis <= 0L) {
+                throw new LineSenderException("auth_timeout_ms must be > 0: ").put(millis);
+            }
+            this.authTimeoutMillis = millis;
+            return this;
         }
 
         /**
@@ -1141,6 +1336,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         reconnectMaxBackoffMillis == PARAMETER_NOT_SET_EXPLICITLY
                                 ? CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS
                                 : reconnectMaxBackoffMillis;
+                // Resolve the initial-connect mode. An explicit user choice
+                // (via initialConnectMode/initialConnectRetry, or the
+                // initial_connect_retry conf key) wins unconditionally --
+                // including initial_connect_retry=off paired with a tuned
+                // reconnect budget. When the user left it unset and tuned
+                // any reconnect_* knob, promote to SYNC so the budget they
+                // wrote actually applies to the first connect: the knob
+                // name reads as a generic retry budget but the underlying
+                // path only governs reconnects from an established
+                // connection, and silently ignoring the budget on the
+                // initial connect is the canonical footgun this implicit
+                // upgrade removes.
+                InitialConnectMode actualInitialConnectMode;
+                if (initialConnectMode != null) {
+                    actualInitialConnectMode = initialConnectMode;
+                } else if (reconnectMaxDurationMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        || reconnectInitialBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        || reconnectMaxBackoffMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                    actualInitialConnectMode = InitialConnectMode.SYNC;
+                } else {
+                    actualInitialConnectMode = InitialConnectMode.OFF;
+                }
                 long actualDurableAckKeepaliveIntervalMillis =
                         durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
                                 ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
@@ -1202,7 +1419,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualReconnectMaxDurationMillis,
                             actualReconnectInitialBackoffMillis,
                             actualReconnectMaxBackoffMillis,
-                            initialConnectMode,
+                            actualInitialConnectMode,
                             errorHandler,
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
@@ -1328,6 +1545,70 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * close() drain timeout in milliseconds. The sender's {@code close()}
+         * method blocks up to this many millis waiting for the server to ACK
+         * every batch already published into the engine before shutting down
+         * the I/O loop. Default {@code 5000}.
+         * <p>
+         * Set to {@code 0} or {@code -1} to opt out — close() will not wait
+         * at all (fast close). Pending data is then lost in memory mode and
+         * recovered by the next sender in SF mode.
+         * <p>
+         * WebSocket transport only.
+         */
+        public LineSenderBuilder closeFlushTimeoutMillis(long timeoutMillis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("close_flush_timeout_millis is only supported for WebSocket transport");
+            }
+            this.closeFlushTimeoutMillis = timeoutMillis;
+            return this;
+        }
+
+        /**
+         * Sets the async listener invoked on every connection-state transition:
+         * initial connect, primary failover, individual endpoint attempt
+         * failures, the full address list being unreachable, and terminal
+         * auth/budget rejections. The listener runs on a dedicated daemon
+         * dispatcher thread, never on the I/O thread or producer thread; slow
+         * listeners cannot stall publishing or reconnect. If the bounded inbox
+         * fills up, surplus events are dropped (visible via
+         * {@code QwpWebSocketSender.getDroppedConnectionNotifications()}).
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param listener the listener; {@code null} resets to the loud-not-silent default
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder connectionListener(io.questdb.client.SenderConnectionListener listener) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("connection_listener is only supported for WebSocket transport");
+            }
+            this.connectionListener = listener;
+            return this;
+        }
+
+        /**
+         * Sets the bounded inbox capacity used by the async connection-event
+         * dispatcher. When the inbox fills up, additional events are dropped
+         * and counted. Default 64.
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param capacity must be {@code >= 1}
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder connectionListenerInboxCapacity(int capacity) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("connection_listener_inbox_capacity is only supported for WebSocket transport");
+            }
+            if (capacity < 1) {
+                throw new LineSenderException("connection_listener_inbox_capacity must be >= 1, was " + capacity);
+            }
+            this.connectionListenerInboxCapacity = capacity;
+            return this;
+        }
+
+        /**
          * Disables automatic flushing of buffered data.
          * <p>
          * The Sender buffers data locally before flushing it to a server. This method disables automatic flushing, requiring
@@ -1359,6 +1640,58 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
             this.autoFlushRows = AUTO_FLUSH_DISABLED;
             this.autoFlushIntervalMillis = Integer.MAX_VALUE;
+            return this;
+        }
+
+        /**
+         * Opt in to adopting sibling slots under {@code <sf_dir>/*} at
+         * startup that hold unacked data left behind by a crashed sender or
+         * a different sender_id. Default {@code false}. WebSocket only;
+         * requires {@code sf_dir} to be set.
+         * <p>
+         * On startup, after the foreground sender has acquired its own slot
+         * lock, the scan walks every sibling slot directory and dispatches a
+         * background drainer for each candidate orphan. Each drainer takes
+         * the slot's exclusive lock, replays the slot's unacked frames over
+         * its own WebSocket connection to the same target, and unlinks the
+         * slot once fully drained. Concurrency is capped by
+         * {@link #maxBackgroundDrainers(int)} (default {@code 4}).
+         * <p>
+         * Slots flagged with the {@code .failed} sentinel are skipped
+         * (manual reset required), and the foreground sender's own slot is
+         * never adopted.
+         */
+        public LineSenderBuilder drainOrphans(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("drain_orphans is only supported for WebSocket transport");
+            }
+            this.drainOrphans = enabled;
+            return this;
+        }
+
+        /**
+         * Cadence (in millis) at which the SF cursor I/O loop sends a
+         * keepalive PING while waiting on STATUS_DURABLE_ACK frames. The
+         * server only flushes pending durable-ack frames in response to
+         * inbound recv events, so an idle opted-in client needs to prod
+         * the server periodically. Effective only when
+         * {@link #requestDurableAck(boolean) request_durable_ack=on}.
+         * <p>
+         * Pass {@code 0} or negative to disable keepalive PINGs entirely
+         * — the caller then accepts that durable-ack frames may not
+         * arrive on idle connections (e.g. they are sending data
+         * continuously, or have their own ping driver).
+         * <p>
+         * Default
+         * {@value io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS}
+         * ms. WebSocket transport only.
+         */
+        public LineSenderBuilder durableAckKeepaliveIntervalMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException(
+                        "durable_ack_keepalive_interval_millis is only supported for WebSocket transport");
+            }
+            this.durableAckKeepaliveIntervalMillis = millis;
             return this;
         }
 
@@ -1395,6 +1728,60 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("tls was already enabled");
             }
             tlsEnabled = true;
+            return this;
+        }
+
+        /**
+         * Sets the async error handler invoked for every server-side rejection.
+         * The handler runs on a dedicated daemon dispatcher thread, never on the
+         * I/O thread or producer thread. Slow handlers do not stall publishing;
+         * if the bounded inbox fills up, surplus notifications are dropped
+         * (visible via {@code QwpWebSocketSender.getDroppedErrorNotifications()}).
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param handler the handler; {@code null} resets to the loud-not-silent default
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder errorHandler(io.questdb.client.SenderErrorHandler handler) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("error_handler is only supported for WebSocket transport");
+            }
+            this.errorHandler = handler;
+            return this;
+        }
+
+        /**
+         * Sets the bounded inbox capacity used by the async error dispatcher.
+         * When the inbox fills up, additional notifications are dropped and
+         * counted. Default 256.
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param capacity must be {@code >= 16} (sf-client.md section 4.4).
+         *                 The floor exists because overflow drops the oldest
+         *                 entry and watermarks are monotonic, so the inbox
+         *                 must be wide enough to keep a useful trailing
+         *                 window of categories under bursty errors.
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder errorInboxCapacity(int capacity) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("error_inbox_capacity is only supported for WebSocket transport");
+            }
+            if (capacity < MIN_ERROR_INBOX_CAPACITY) {
+                throw new LineSenderException("error_inbox_capacity must be >= "
+                        + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
+            }
+            this.errorInboxCapacity = capacity;
+            return this;
+        }
+
+        public LineSenderBuilder gorilla(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("gorilla is only supported for WebSocket transport");
+            }
+            this.gorillaEnabled = enabled;
             return this;
         }
 
@@ -1546,6 +1933,79 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             this.username = username;
             this.password = password;
+            return this;
+        }
+
+        /**
+         * Three-way control over initial-connect behavior — see
+         * {@link InitialConnectMode} for the value semantics, including
+         * the default-resolution rule when this method is not called.
+         * Calling this pins the mode and suppresses the implicit upgrade
+         * to SYNC that otherwise fires when a {@code reconnect_*} knob is
+         * tuned. WebSocket transport only. Replaces
+         * {@link #initialConnectRetry(boolean)} for users who want the
+         * {@link InitialConnectMode#ASYNC} mode.
+         */
+        public LineSenderBuilder initialConnectMode(InitialConnectMode mode) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("initial_connect_mode is only supported for WebSocket transport");
+            }
+            if (mode == null) {
+                throw new LineSenderException("initial_connect_mode cannot be null");
+            }
+            this.initialConnectMode = mode;
+            return this;
+        }
+
+        /**
+         * Opt in to retrying the initial connect with the same backoff /
+         * cap / auth-terminal policy as in-flight reconnect. Set true if
+         * your deployment expects the server to come up shortly after the
+         * sender. Auth failures (HTTP 401/403/non-101) stay terminal in
+         * either mode.
+         * <p>
+         * When this method is not called, the resolution rule documented
+         * on {@link InitialConnectMode} applies: SYNC implicitly when any
+         * {@code reconnect_*} knob was tuned, otherwise OFF. Calling this
+         * with either {@code true} or {@code false} pins the mode and
+         * suppresses the implicit upgrade.
+         * <p>
+         * For non-blocking startup (the producer thread returns immediately
+         * and the I/O thread retries in the background), use
+         * {@link #initialConnectMode(InitialConnectMode)} with
+         * {@link InitialConnectMode#ASYNC}.
+         *
+         * @deprecated Superseded by {@link #initialConnectMode(InitialConnectMode)},
+         * which exposes the third {@link InitialConnectMode#ASYNC} mode this
+         * boolean cannot reach. {@code initialConnectRetry(true)} is equivalent to
+         * {@code initialConnectMode(InitialConnectMode.SYNC)};
+         * {@code initialConnectRetry(false)} is equivalent to
+         * {@code initialConnectMode(InitialConnectMode.OFF)}.
+         */
+        @Deprecated
+        public LineSenderBuilder initialConnectRetry(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
+            }
+            this.initialConnectMode = enabled ? InitialConnectMode.SYNC : InitialConnectMode.OFF;
+            return this;
+        }
+
+        /**
+         * Cap on concurrent background drainer threads when
+         * {@link #drainOrphans(boolean)} is on. Default {@code 4}. Each
+         * drainer carries one segment-manager thread + one I/O thread +
+         * one socket, so users running many senders per JVM should set
+         * this low.
+         */
+        public LineSenderBuilder maxBackgroundDrainers(int n) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("max_background_drainers is only supported for WebSocket transport");
+            }
+            if (n < 0) {
+                throw new LineSenderException("max_background_drainers must be >= 0: ").put(n);
+            }
+            this.maxBackgroundDrainers = n;
             return this;
         }
 
@@ -1780,318 +2240,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Opts the connection in for STATUS_DURABLE_ACK frames. When enabled,
-         * servers with primary replication will emit per-table durable-upload
-         * watermarks as WAL data reaches the object store.
-         * <p>
-         * This setting is only supported for WebSocket transport.
-         *
-         * @param enabled true to request durable ACKs
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder requestDurableAck(boolean enabled) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
-            }
-            this.requestDurableAck = enabled;
-            return this;
-        }
-
-        /**
-         * Sets the async listener invoked on every connection-state transition:
-         * initial connect, primary failover, individual endpoint attempt
-         * failures, the full address list being unreachable, and terminal
-         * auth/budget rejections. The listener runs on a dedicated daemon
-         * dispatcher thread, never on the I/O thread or producer thread; slow
-         * listeners cannot stall publishing or reconnect. If the bounded inbox
-         * fills up, surplus events are dropped (visible via
-         * {@code QwpWebSocketSender.getDroppedConnectionNotifications()}).
-         *
-         * <p>WebSocket transport only; setting on other transports throws.
-         *
-         * @param listener the listener; {@code null} resets to the loud-not-silent default
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder connectionListener(io.questdb.client.SenderConnectionListener listener) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("connection_listener is only supported for WebSocket transport");
-            }
-            this.connectionListener = listener;
-            return this;
-        }
-
-        /**
-         * Sets the bounded inbox capacity used by the async connection-event
-         * dispatcher. When the inbox fills up, additional events are dropped
-         * and counted. Default 64.
-         *
-         * <p>WebSocket transport only; setting on other transports throws.
-         *
-         * @param capacity must be {@code >= 1}
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder connectionListenerInboxCapacity(int capacity) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("connection_listener_inbox_capacity is only supported for WebSocket transport");
-            }
-            if (capacity < 1) {
-                throw new LineSenderException("connection_listener_inbox_capacity must be >= 1, was " + capacity);
-            }
-            this.connectionListenerInboxCapacity = capacity;
-            return this;
-        }
-
-        /**
-         * Sets the async error handler invoked for every server-side rejection.
-         * The handler runs on a dedicated daemon dispatcher thread, never on the
-         * I/O thread or producer thread. Slow handlers do not stall publishing;
-         * if the bounded inbox fills up, surplus notifications are dropped
-         * (visible via {@code QwpWebSocketSender.getDroppedErrorNotifications()}).
-         *
-         * <p>WebSocket transport only; setting on other transports throws.
-         *
-         * @param handler the handler; {@code null} resets to the loud-not-silent default
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder errorHandler(io.questdb.client.SenderErrorHandler handler) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("error_handler is only supported for WebSocket transport");
-            }
-            this.errorHandler = handler;
-            return this;
-        }
-
-        /**
-         * Sets the bounded inbox capacity used by the async error dispatcher.
-         * When the inbox fills up, additional notifications are dropped and
-         * counted. Default 256.
-         *
-         * <p>WebSocket transport only; setting on other transports throws.
-         *
-         * @param capacity must be {@code >= 16} (sf-client.md section 4.4).
-         *                 The floor exists because overflow drops the oldest
-         *                 entry and watermarks are monotonic, so the inbox
-         *                 must be wide enough to keep a useful trailing
-         *                 window of categories under bursty errors.
-         * @return this instance for method chaining
-         */
-        public LineSenderBuilder errorInboxCapacity(int capacity) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("error_inbox_capacity is only supported for WebSocket transport");
-            }
-            if (capacity < MIN_ERROR_INBOX_CAPACITY) {
-                throw new LineSenderException("error_inbox_capacity must be >= "
-                        + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
-            }
-            this.errorInboxCapacity = capacity;
-            return this;
-        }
-
-        /**
-         * Enables store-and-forward and sets its directory. Setting the SF
-         * directory <i>is</i> the on-switch — there is no separate
-         * enable/disable flag. SF is off iff {@code dir} was never set.
-         * <p>
-         * Every batch is persisted to disk before it leaves the wire and is
-         * reclaimed as soon as the server acknowledges it. On restart the
-         * sender replays only batches whose acknowledgement had not been
-         * received before the previous sender shut down — typically the last
-         * in-flight batches at close time. Acknowledged batches are not
-         * replayed: their disk space is freed during normal operation by an
-         * automatic per-frame trim that force-rotates the active segment
-         * once every frame in it has been acknowledged.
-         * <p>
-         * Note that {@link io.questdb.client.cutlass.qwp.client.QwpWebSocketSender#close()}
-         * under SF returns once data is on disk, not on server-ack, so a
-         * sender closed immediately after a flush may still have unacked
-         * batches in flight; those will be replayed by the next sender
-         * against the same directory. WebSocket transport only.
-         * <p>
-         * The sender takes ownership of the underlying SF storage and closes
-         * it when the sender itself is closed.
-         *
-         * @param dir filesystem directory; created if it doesn't exist
-         */
-        public LineSenderBuilder storeAndForwardDir(String dir) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
-            }
-            if (dir == null || dir.isEmpty()) {
-                throw new LineSenderException("store_and_forward dir cannot be empty");
-            }
-            this.sfDir = dir;
-            return this;
-        }
-
-        /**
-         * Names this sender's slot inside the SF group root (see
-         * {@link #storeAndForwardDir(String)}). The actual on-disk slot is
-         * {@code <sf_dir>/<sender_id>/}, locked exclusively for the sender's
-         * lifetime via {@code flock}. Default is {@code "default"}.
-         * <p>
-         * Multi-sender deployments writing to the same group root MUST set
-         * this to a distinct value per sender; the second sender to start
-         * with a colliding id fails fast with "sf slot already in use".
-         * <p>
-         * Allowed characters: letters, digits, {@code _ -}. No path
-         * separators, no {@code .}, no spaces — the id is used verbatim as
-         * a directory name.
-         */
-        public LineSenderBuilder senderId(String id) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("sender_id is only supported for WebSocket transport");
-            }
-            validateSenderId(id);
-            this.senderId = id;
-            return this;
-        }
-
-        private static void validateSenderId(String id) {
-            if (id == null || id.isEmpty()) {
-                throw new LineSenderException("sender_id must not be empty");
-            }
-            for (int i = 0, n = id.length(); i < n; i++) {
-                char c = id.charAt(i);
-                boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                        || (c >= '0' && c <= '9') || c == '_' || c == '-';
-                if (!ok) {
-                    throw new LineSenderException(
-                            "sender_id contains invalid character: '" + c
-                                    + "' (allowed: letters, digits, _ -)");
-                }
-            }
-        }
-
-        /**
-         * Maximum bytes per segment file before rotation. Defaults to
-         * {@code DEFAULT_SEGMENT_BYTES}
-         * (4 MiB). Smaller segments mean faster trim of acked data; larger
-         * segments mean fewer rotations.
-         */
-        public LineSenderBuilder storeAndForwardMaxBytes(long maxBytes) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
-            }
-            if (maxBytes <= 0) {
-                throw new LineSenderException("sf_max_bytes must be positive: ").put(maxBytes);
-            }
-            this.sfMaxBytes = maxBytes;
-            return this;
-        }
-
-        /**
-         * Hard cap on cursor-allocated bytes (active + spare + sealed
-         * segments). When the cap is reached, the producer's
-         * {@code Sender.flush()} blocks until ACK-driven trim frees space;
-         * if the cap is exhausted past the configured deadline (default 30 s),
-         * {@code flush()} throws. Default: {@code 128 MiB}, which applies to
-         * both memory-mode and SF-mode rings — for SF deployments with
-         * cheap disk, raise this knob explicitly. WebSocket transport only.
-         */
-        public LineSenderBuilder storeAndForwardMaxTotalBytes(long maxTotalBytes) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
-            }
-            if (maxTotalBytes <= 0) {
-                throw new LineSenderException("sf_max_total_bytes must be positive: ").put(maxTotalBytes);
-            }
-            this.sfMaxTotalBytes = maxTotalBytes;
-            return this;
-        }
-
-        /**
-         * close() drain timeout in milliseconds. The sender's {@code close()}
-         * method blocks up to this many millis waiting for the server to ACK
-         * every batch already published into the engine before shutting down
-         * the I/O loop. Default {@code 5000}.
-         * <p>
-         * Set to {@code 0} or {@code -1} to opt out — close() will not wait
-         * at all (fast close). Pending data is then lost in memory mode and
-         * recovered by the next sender in SF mode.
-         * <p>
-         * WebSocket transport only.
-         */
-        public LineSenderBuilder closeFlushTimeoutMillis(long timeoutMillis) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("close_flush_timeout_millis is only supported for WebSocket transport");
-            }
-            this.closeFlushTimeoutMillis = timeoutMillis;
-            return this;
-        }
-
-        /**
-         * Cadence (in millis) at which the SF cursor I/O loop sends a
-         * keepalive PING while waiting on STATUS_DURABLE_ACK frames. The
-         * server only flushes pending durable-ack frames in response to
-         * inbound recv events, so an idle opted-in client needs to prod
-         * the server periodically. Effective only when
-         * {@link #requestDurableAck(boolean) request_durable_ack=on}.
-         * <p>
-         * Pass {@code 0} or negative to disable keepalive PINGs entirely
-         * — the caller then accepts that durable-ack frames may not
-         * arrive on idle connections (e.g. they are sending data
-         * continuously, or have their own ping driver).
-         * <p>
-         * Default
-         * {@value io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS}
-         * ms. WebSocket transport only.
-         */
-        public LineSenderBuilder durableAckKeepaliveIntervalMillis(long millis) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException(
-                        "durable_ack_keepalive_interval_millis is only supported for WebSocket transport");
-            }
-            this.durableAckKeepaliveIntervalMillis = millis;
-            return this;
-        }
-
-        /**
-         * Per-endpoint timeout on the WebSocket upgrade response read. Default
-         * {@value QwpWebSocketSender#DEFAULT_AUTH_TIMEOUT_MS} ms.
-         */
-        public LineSenderBuilder authTimeoutMillis(long millis) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException(
-                        "auth_timeout_ms is only supported for WebSocket transport");
-            }
-            if (millis <= 0L) {
-                throw new LineSenderException("auth_timeout_ms must be > 0: ").put(millis);
-            }
-            this.authTimeoutMillis = millis;
-            return this;
-        }
-
-        public LineSenderBuilder gorilla(boolean enabled) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("gorilla is only supported for WebSocket transport");
-            }
-            this.gorillaEnabled = enabled;
-            return this;
-        }
-
-        /**
-         * Per-outage cap on the cursor I/O loop's reconnect retry budget.
-         * Once a wire failure occurs, the loop retries with exponential
-         * backoff until either reconnect succeeds (timer resets) or this
-         * many millis elapse since the first failure of this outage —
-         * whichever comes first. On budget exhaustion, the next user
-         * thread API call throws.
-         * <p>
-         * Default {@code 300_000} (5 minutes). Lower for fail-fast services;
-         * higher for tolerating long maintenance windows. WebSocket only.
-         */
-        public LineSenderBuilder reconnectMaxDurationMillis(long millis) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
-            }
-            if (millis < 0) {
-                throw new LineSenderException("reconnect_max_duration_millis must be >= 0: ").put(millis);
-            }
-            this.reconnectMaxDurationMillis = millis;
-            return this;
-        }
-
-        /**
          * Initial reconnect backoff in millis. Doubled (with jitter) each
          * failed attempt, capped at {@link #reconnectMaxBackoffMillis(long)}.
          * Default {@code 100}. WebSocket only.
@@ -2124,133 +2272,44 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Opt in to retrying the initial connect with the same backoff /
-         * cap / auth-terminal policy as in-flight reconnect. Default
-         * {@code false}: a startup connect failure throws immediately,
-         * which is what most users want — a misconfigured host shouldn't
-         * sit retrying for 5 minutes. Set true if your deployment expects
-         * the server to come up shortly after the sender. Auth failures
-         * (HTTP 401/403/non-101) stay terminal in either mode.
+         * Per-outage cap on the cursor I/O loop's reconnect retry budget.
+         * Once a wire failure occurs, the loop retries with exponential
+         * backoff until either reconnect succeeds (timer resets) or this
+         * many millis elapse since the first failure of this outage —
+         * whichever comes first. On budget exhaustion, the next user
+         * thread API call throws.
          * <p>
-         * For non-blocking startup (the producer thread returns immediately
-         * and the I/O thread retries in the background), use
-         * {@link #initialConnectMode(InitialConnectMode)} with
-         * {@link InitialConnectMode#ASYNC}.
+         * Default {@code 300_000} (5 minutes). Lower for fail-fast services;
+         * higher for tolerating long maintenance windows. WebSocket only.
+         */
+        public LineSenderBuilder reconnectMaxDurationMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
+            }
+            if (millis < 0) {
+                throw new LineSenderException("reconnect_max_duration_millis must be >= 0: ").put(millis);
+            }
+            this.reconnectMaxDurationMillis = millis;
+            return this;
+        }
+
+        /**
+         * Opts the connection in for STATUS_DURABLE_ACK frames. When enabled,
+         * servers with primary replication will emit per-table durable-upload
+         * watermarks as WAL data reaches the object store.
+         * <p>
+         * This setting is only supported for WebSocket transport.
          *
-         * @deprecated Superseded by {@link #initialConnectMode(InitialConnectMode)},
-         * which exposes the third {@link InitialConnectMode#ASYNC} mode this
-         * boolean cannot reach. {@code initialConnectRetry(true)} is equivalent to
-         * {@code initialConnectMode(InitialConnectMode.SYNC)};
-         * {@code initialConnectRetry(false)} is equivalent to
-         * {@code initialConnectMode(InitialConnectMode.OFF)}.
+         * @param enabled true to request durable ACKs
+         * @return this instance for method chaining
          */
-        @Deprecated
-        public LineSenderBuilder initialConnectRetry(boolean enabled) {
+        public LineSenderBuilder requestDurableAck(boolean enabled) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
+                throw new LineSenderException("request_durable_ack is only supported for WebSocket transport");
             }
-            this.initialConnectMode = enabled ? InitialConnectMode.SYNC : InitialConnectMode.OFF;
+            this.requestDurableAck = enabled;
             return this;
         }
-
-        /**
-         * Three-way control over initial-connect behavior — see
-         * {@link InitialConnectMode} for the value semantics. WebSocket
-         * transport only. Replaces {@link #initialConnectRetry(boolean)}
-         * for users who want the {@link InitialConnectMode#ASYNC} mode.
-         */
-        public LineSenderBuilder initialConnectMode(InitialConnectMode mode) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("initial_connect_mode is only supported for WebSocket transport");
-            }
-            if (mode == null) {
-                throw new LineSenderException("initial_connect_mode cannot be null");
-            }
-            this.initialConnectMode = mode;
-            return this;
-        }
-
-        /**
-         * Per-call deadline for {@code Sender.flush()} spinning on a full
-         * cursor segment ring waiting for ACKs to drain space. Default
-         * 30 s. Lower for fail-fast services that prefer surfacing
-         * backpressure as an error; raise for offline-tolerant pipelines
-         * that should ride out long server pauses.
-         */
-        public LineSenderBuilder sfAppendDeadlineMillis(long millis) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("sf_append_deadline_millis is only supported for WebSocket transport");
-            }
-            if (millis <= 0) {
-                throw new LineSenderException("sf_append_deadline_millis must be > 0: ").put(millis);
-            }
-            this.sfAppendDeadlineMillis = millis;
-            return this;
-        }
-
-        /**
-         * Opt in to adopting sibling slots under {@code <sf_dir>/*} at
-         * startup that hold unacked data left behind by a crashed sender or
-         * a different sender_id. Default {@code false}. WebSocket only;
-         * requires {@code sf_dir} to be set.
-         * <p>
-         * On startup, after the foreground sender has acquired its own slot
-         * lock, the scan walks every sibling slot directory and dispatches a
-         * background drainer for each candidate orphan. Each drainer takes
-         * the slot's exclusive lock, replays the slot's unacked frames over
-         * its own WebSocket connection to the same target, and unlinks the
-         * slot once fully drained. Concurrency is capped by
-         * {@link #maxBackgroundDrainers(int)} (default {@code 4}).
-         * <p>
-         * Slots flagged with the {@code .failed} sentinel are skipped
-         * (manual reset required), and the foreground sender's own slot is
-         * never adopted.
-         */
-        public LineSenderBuilder drainOrphans(boolean enabled) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("drain_orphans is only supported for WebSocket transport");
-            }
-            this.drainOrphans = enabled;
-            return this;
-        }
-
-        /**
-         * Cap on concurrent background drainer threads when
-         * {@link #drainOrphans(boolean)} is on. Default {@code 4}. Each
-         * drainer carries one segment-manager thread + one I/O thread +
-         * one socket, so users running many senders per JVM should set
-         * this low.
-         */
-        public LineSenderBuilder maxBackgroundDrainers(int n) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("max_background_drainers is only supported for WebSocket transport");
-            }
-            if (n < 0) {
-                throw new LineSenderException("max_background_drainers must be >= 0: ").put(n);
-            }
-            this.maxBackgroundDrainers = n;
-            return this;
-        }
-
-        /**
-         * Selects the durability contract for SF appends and flushes. See
-         * {@link SfDurability} for the value semantics.
-         * <p>
-         * Replaces the prior pair of independent {@code sf_fsync} and
-         * {@code sf_fsync_on_flush} booleans — they were three states
-         * crammed into two flags. WebSocket transport only.
-         */
-        public LineSenderBuilder storeAndForwardDurability(SfDurability durability) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
-            }
-            if (durability == null) {
-                throw new LineSenderException("sf_durability cannot be null");
-            }
-            this.sfDurability = durability;
-            return this;
-        }
-
 
         /**
          * Configures the maximum time the Sender will spend retrying upon receiving a recoverable error from the server.
@@ -2291,11 +2350,165 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
+        /**
+         * Names this sender's slot inside the SF group root (see
+         * {@link #storeAndForwardDir(String)}). The actual on-disk slot is
+         * {@code <sf_dir>/<sender_id>/}, locked exclusively for the sender's
+         * lifetime via {@code flock}. Default is {@code "default"}.
+         * <p>
+         * Multi-sender deployments writing to the same group root MUST set
+         * this to a distinct value per sender; the second sender to start
+         * with a colliding id fails fast with "sf slot already in use".
+         * <p>
+         * Allowed characters: letters, digits, {@code _ -}. No path
+         * separators, no {@code .}, no spaces — the id is used verbatim as
+         * a directory name.
+         */
+        public LineSenderBuilder senderId(String id) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("sender_id is only supported for WebSocket transport");
+            }
+            validateSenderId(id);
+            this.senderId = id;
+            return this;
+        }
+
+        /**
+         * Per-call deadline for {@code Sender.flush()} spinning on a full
+         * cursor segment ring waiting for ACKs to drain space. Default
+         * 30 s. Lower for fail-fast services that prefer surfacing
+         * backpressure as an error; raise for offline-tolerant pipelines
+         * that should ride out long server pauses.
+         */
+        public LineSenderBuilder sfAppendDeadlineMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("sf_append_deadline_millis is only supported for WebSocket transport");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("sf_append_deadline_millis must be > 0: ").put(millis);
+            }
+            this.sfAppendDeadlineMillis = millis;
+            return this;
+        }
+
+        /**
+         * Enables store-and-forward and sets its directory. Setting the SF
+         * directory <i>is</i> the on-switch — there is no separate
+         * enable/disable flag. SF is off iff {@code dir} was never set.
+         * <p>
+         * Every batch is persisted to disk before it leaves the wire and is
+         * reclaimed as soon as the server acknowledges it. On restart the
+         * sender replays only batches whose acknowledgement had not been
+         * received before the previous sender shut down — typically the last
+         * in-flight batches at close time. Acknowledged batches are not
+         * replayed: their disk space is freed during normal operation by an
+         * automatic per-frame trim that force-rotates the active segment
+         * once every frame in it has been acknowledged.
+         * <p>
+         * Note that {@link io.questdb.client.cutlass.qwp.client.QwpWebSocketSender#close()}
+         * under SF returns once data is on disk, not on server-ack, so a
+         * sender closed immediately after a flush may still have unacked
+         * batches in flight; those will be replayed by the next sender
+         * against the same directory. WebSocket transport only.
+         * <p>
+         * The sender takes ownership of the underlying SF storage and closes
+         * it when the sender itself is closed.
+         *
+         * @param dir filesystem directory; created if it doesn't exist
+         */
+        public LineSenderBuilder storeAndForwardDir(String dir) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            if (dir == null || dir.isEmpty()) {
+                throw new LineSenderException("store_and_forward dir cannot be empty");
+            }
+            this.sfDir = dir;
+            return this;
+        }
+
+        /**
+         * Selects the durability contract for SF appends and flushes. See
+         * {@link SfDurability} for the value semantics.
+         * <p>
+         * Replaces the prior pair of independent {@code sf_fsync} and
+         * {@code sf_fsync_on_flush} booleans — they were three states
+         * crammed into two flags. WebSocket transport only.
+         */
+        public LineSenderBuilder storeAndForwardDurability(SfDurability durability) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            if (durability == null) {
+                throw new LineSenderException("sf_durability cannot be null");
+            }
+            this.sfDurability = durability;
+            return this;
+        }
+
+        /**
+         * Maximum bytes per segment file before rotation. Defaults to
+         * {@code DEFAULT_SEGMENT_BYTES}
+         * (4 MiB). Smaller segments mean faster trim of acked data; larger
+         * segments mean fewer rotations.
+         */
+        public LineSenderBuilder storeAndForwardMaxBytes(long maxBytes) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            if (maxBytes <= 0) {
+                throw new LineSenderException("sf_max_bytes must be positive: ").put(maxBytes);
+            }
+            this.sfMaxBytes = maxBytes;
+            return this;
+        }
+
+        /**
+         * Hard cap on cursor-allocated bytes (active + spare + sealed
+         * segments). When the cap is reached, the producer's
+         * {@code Sender.flush()} blocks until ACK-driven trim frees space;
+         * if the cap is exhausted past the configured deadline (default 30 s),
+         * {@code flush()} throws. Default: {@code 128 MiB}, which applies to
+         * both memory-mode and SF-mode rings — for SF deployments with
+         * cheap disk, raise this knob explicitly. WebSocket transport only.
+         */
+        public LineSenderBuilder storeAndForwardMaxTotalBytes(long maxTotalBytes) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            if (maxTotalBytes <= 0) {
+                throw new LineSenderException("sf_max_total_bytes must be positive: ").put(maxTotalBytes);
+            }
+            this.sfMaxTotalBytes = maxTotalBytes;
+            return this;
+        }
+
+        private static boolean charsEqualsRange(CharSequence a, CharSequence b, int bStart, int bEnd) {
+            int len = bEnd - bStart;
+            if (a.length() != len) {
+                return false;
+            }
+            for (int i = 0; i < len; i++) {
+                if (a.charAt(i) != b.charAt(bStart + i)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         private static int getValue(CharSequence configurationString, int pos, StringSink sink, String name) {
             if ((pos = ConfStringParser.value(configurationString, pos, sink)) < 0) {
                 throw new LineSenderException("invalid ").put(name).put(" [error=").put(sink).put("]");
             }
             return pos;
+        }
+
+        private static SfDurability parseDurabilityValue(@NotNull StringSink value) {
+            if (Chars.equalsIgnoreCase("memory", value)) return SfDurability.MEMORY;
+            if (Chars.equalsIgnoreCase("flush", value)) return SfDurability.FLUSH;
+            if (Chars.equalsIgnoreCase("append", value)) return SfDurability.APPEND;
+            throw new LineSenderException("invalid sf_durability [value=").put(value)
+                    .put(", allowed-values=[memory, flush, append]]");
         }
 
         private static int parseIntValue(@NotNull StringSink value, @NotNull String name) {
@@ -2356,10 +2569,26 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (end > 0) {
                 char unit = value.charAt(end - 1);
                 switch (unit) {
-                    case 'k': case 'K': multiplier = 1024L;                    end--; break;
-                    case 'm': case 'M': multiplier = 1024L * 1024;             end--; break;
-                    case 'g': case 'G': multiplier = 1024L * 1024 * 1024;      end--; break;
-                    case 't': case 'T': multiplier = 1024L * 1024 * 1024 * 1024; end--; break;
+                    case 'k':
+                    case 'K':
+                        multiplier = 1024L;
+                        end--;
+                        break;
+                    case 'm':
+                    case 'M':
+                        multiplier = 1024L * 1024;
+                        end--;
+                        break;
+                    case 'g':
+                    case 'G':
+                        multiplier = 1024L * 1024 * 1024;
+                        end--;
+                        break;
+                    case 't':
+                    case 'T':
+                        multiplier = 1024L * 1024 * 1024 * 1024;
+                        end--;
+                        break;
                     default: // no unit suffix — treat as raw bytes
                 }
             }
@@ -2382,14 +2611,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
         }
 
-        private static SfDurability parseDurabilityValue(@NotNull StringSink value) {
-            if (Chars.equalsIgnoreCase("memory", value)) return SfDurability.MEMORY;
-            if (Chars.equalsIgnoreCase("flush", value))  return SfDurability.FLUSH;
-            if (Chars.equalsIgnoreCase("append", value)) return SfDurability.APPEND;
-            throw new LineSenderException("invalid sf_durability [value=").put(value)
-                    .put(", allowed-values=[memory, flush, append]]");
-        }
-
         private static int resolveIPv4(String host) {
             try {
                 byte[] addr = InetAddress.getByName(host).getAddress();
@@ -2410,6 +2631,67 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw (LineSenderException) t;
             }
             throw new LineSenderException(t);
+        }
+
+        private static void validateSenderId(String id) {
+            if (id == null || id.isEmpty()) {
+                throw new LineSenderException("sender_id must not be empty");
+            }
+            for (int i = 0, n = id.length(); i < n; i++) {
+                char c = id.charAt(i);
+                boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                        || (c >= '0' && c <= '9') || c == '_' || c == '-';
+                if (!ok) {
+                    throw new LineSenderException(
+                            "sender_id contains invalid character: '" + c
+                                    + "' (allowed: letters, digits, _ -)");
+                }
+            }
+        }
+
+        private void addAddressEntry(CharSequence src, int start, int end, int defaultPort) {
+            int colon = Chars.indexOf(src, start, end, ':');
+            if (colon == end - 1) {
+                throw new LineSenderException("invalid address, use IPv4 address or a domain name [address=")
+                        .put(src.subSequence(start, end)).put("]");
+            }
+            int hostEnd = colon < 0 ? end : colon;
+            int portStart = colon < 0 ? end : colon + 1;
+            while (hostEnd > start && Character.isWhitespace(src.charAt(hostEnd - 1))) hostEnd--;
+            while (portStart < end && Character.isWhitespace(src.charAt(portStart))) portStart++;
+            int parsedPort = -1;
+            if (colon >= 0) {
+                try {
+                    parsedPort = Numbers.parseInt(src, portStart, end);
+                    if (parsedPort < 1 || parsedPort > 65535) {
+                        throw new LineSenderException("invalid port [port=").put(parsedPort).put("]");
+                    }
+                } catch (NumericException e) {
+                    throw new LineSenderException("cannot parse a port from the address, use IPv4 address or a domain name")
+                            .put(" [address=").put(src.subSequence(start, end)).put("]");
+                }
+            }
+            if (hostEnd == start) {
+                throw new LineSenderException("empty host in addr entry [address=")
+                        .put(src.subSequence(start, end)).put("]");
+            }
+            int effectivePort = parsedPort != -1 ? parsedPort : defaultPort;
+            for (int i = 0, n = hosts.size(); i < n; i++) {
+                String storedHost = hosts.get(i);
+                if (charsEqualsRange(storedHost, src, start, hostEnd)) {
+                    int storedEffectivePort = ports.size() > i && ports.getQuick(i) != PORT_NOT_SET
+                            ? ports.getQuick(i) : defaultPort;
+                    if (storedEffectivePort == effectivePort) {
+                        throw new LineSenderException("duplicated addresses are not allowed [address=")
+                                .put(src.subSequence(start, end)).put("]");
+                    }
+                }
+            }
+            while (ports.size() < hosts.size()) {
+                ports.add(defaultPort);
+            }
+            hosts.add(src.subSequence(start, hostEnd).toString());
+            ports.add(effectivePort);
         }
 
         private String buildWebSocketAuthHeader() {
@@ -2558,8 +2840,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "address");
                     int defaultPort = protocol == PROTOCOL_HTTP ? DEFAULT_HTTP_PORT
                             : protocol == PROTOCOL_UDP ? DEFAULT_UDP_PORT
-                            : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
-                            : DEFAULT_TCP_PORT;
+                              : protocol == PROTOCOL_WEBSOCKET ? DEFAULT_WEBSOCKET_PORT
+                                : DEFAULT_TCP_PORT;
                     int valLen = sink.length();
                     int entryStart = 0;
                     for (int i = 0; i <= valLen; i++) {
@@ -2899,6 +3181,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // zone-blind (pinned to v1) and silently accepts the key so
                     // the same connect string works on both sides.
                     pos = getValue(configurationString, pos, sink, "zone");
+                } else if (Chars.equals("auth", sink)
+                        || Chars.equals("buffer_pool_size", sink)
+                        || Chars.equals("client_id", sink)
+                        || Chars.equals("compression", sink)
+                        || Chars.equals("compression_level", sink)
+                        || Chars.equals("failover", sink)
+                        || Chars.equals("failover_backoff_initial_ms", sink)
+                        || Chars.equals("failover_backoff_max_ms", sink)
+                        || Chars.equals("failover_max_attempts", sink)
+                        || Chars.equals("failover_max_duration_ms", sink)
+                        || Chars.equals("initial_credit", sink)
+                        || Chars.equals("max_batch_rows", sink)
+                        || Chars.equals("path", sink)
+                        || Chars.equals("target", sink)) {
+                    // connect-string.md "Query client keys" and "Multi-host failover":
+                    // these keys configure the QwpQueryClient (egress) only. The
+                    // Sender silently consumes them so the same connect string can be
+                    // shared between the Sender and the QwpQueryClient without an
+                    // "unknown configuration key" error. Validation is the egress
+                    // parser's job; the ingress parser does not interpret the value.
+                    // Capture the key name before getValue clears the sink so a
+                    // genuine value-parse error names the offending key.
+                    String egressKey = Chars.toString(sink);
+                    pos = getValue(configurationString, pos, sink, egressKey);
                 } else if (Chars.equals("in_flight_window", sink)) {
                     // Accepted as a no-op for backward compatibility. The
                     // store-and-forward mechanism replaces the in-flight window.

@@ -45,6 +45,23 @@ public final class Numbers {
     private static final int EXP_SHIFT = SIGNIFICAND_WIDTH - 1;
     static final long EXP_ONE = ((long) EXP_BIAS) << EXP_SHIFT; // exponent of 1.0
     private static final long FRACT_HOB = (1L << EXP_SHIFT); // assumed High-Order bit
+    // Maps ASCII chars in [48, 122] (i.e. '0'..'z'), shifted by -48, to the
+    // 5-bit base32 digit, or -1 if not a valid geohash character. Matches the
+    // server-side alphabet in io.questdb.cairo.GeoHashes#base32Indexes: digits
+    // 0-9 plus consonants/vowels b c d e f g h j k m n p q r s t u v w x y z
+    // (case insensitive); 'a', 'i', 'l', 'o' are reserved and decode to -1.
+    private static final byte[] GEOHASH_BASE32_INDEXES = {
+            0, 1, 2, 3, 4, 5, 6, 7,         // '0'..'7'
+            8, 9, -1, -1, -1, -1, -1, -1,   // '8','9',':',';','<','=','>','?'
+            -1, -1, 10, 11, 12, 13, 14, 15, // '@','A','B'..'G'
+            16, -1, 17, 18, -1, 19, 20, -1, // 'H','I','J','K','L','M','N','O'
+            21, 22, 23, 24, 25, 26, 27, 28, // 'P'..'W'
+            29, 30, 31, -1, -1, -1, -1, -1, // 'X','Y','Z','[','\\',']','^','_'
+            -1, -1, 10, 11, 12, 13, 14, 15, // '`','a','b'..'g'
+            16, -1, 17, 18, -1, 19, 20, -1, // 'h','i','j','k','l','m','n','o'
+            21, 22, 23, 24, 25, 26, 27, 28, // 'p'..'w'
+            29, 30, 31                      // 'x','y','z'
+    };
     private static final long[] LONG_5_POW = new long[]{1L, 5L, 25L, 125L, 625L, 3125L, 15625L, 78125L, 390625L, 1953125L, 9765625L, 48828125L, 244140625L, 1220703125L, 6103515625L, 30517578125L, 152587890625L, 762939453125L, 3814697265625L, 19073486328125L, 95367431640625L, 476837158203125L, 2384185791015625L, 11920928955078125L, 59604644775390625L, 298023223876953125L, 1490116119384765625L};
     private static final int MAX_SMALL_BIN_EXP = 62;
     private static final int MIN_SMALL_BIN_EXP = -(63 / 3);
@@ -260,6 +277,47 @@ public final class Numbers {
 
     public static double parseDouble(CharSequence sequence) throws NumericException {
         return FastDoubleParser.parseDouble(sequence, true);
+    }
+
+    /**
+     * Decodes a geohash string in standard base32 alphabet into a packed long.
+     * Each character contributes 5 bits (most significant first), so the result
+     * occupies the low {@code 5 * sequence.length()} bits. Length must be in
+     * {@code [1, 12]} — i.e. at most {@code GEOLONG_MAX_BITS} (60) bits of
+     * precision. The alphabet matches the server-side parser: digits
+     * {@code 0-9} and consonants/vowels {@code b c d e f g h j k m n p q r s t
+     * u v w x y z}, case insensitive; {@code a, i, l, o} are not valid.
+     *
+     * @throws NumericException if {@code sequence} is null/empty, longer than 12
+     *                          characters, or contains a non-base32 character.
+     */
+    public static long parseGeoHashBase32(CharSequence sequence) throws NumericException {
+        if (sequence == null) {
+            throw NumericException.instance().put("null geohash string");
+        }
+        return parseGeoHashBase32(sequence, 0, sequence.length());
+    }
+
+    public static long parseGeoHashBase32(CharSequence sequence, int lo, int hi) throws NumericException {
+        if (hi <= lo) {
+            throw NumericException.instance().put("empty geohash string");
+        }
+        if (hi - lo > 12) {
+            throw NumericException.instance()
+                    .put("geohash string exceeds 12 characters: ").put(hi - lo);
+        }
+        long bits = 0;
+        for (int i = lo; i < hi; i++) {
+            int c = sequence.charAt(i);
+            int idx = (c > 47 && c < 123) ? GEOHASH_BASE32_INDEXES[c - 48] : -1;
+            if (idx < 0) {
+                throw NumericException.instance()
+                        .put("invalid geohash character at index ").put(i - lo)
+                        .put(": ").put(sequence);
+            }
+            bits = (bits << 5) | idx;
+        }
+        return bits;
     }
 
     public static int parseHexInt(CharSequence sequence) throws NumericException {

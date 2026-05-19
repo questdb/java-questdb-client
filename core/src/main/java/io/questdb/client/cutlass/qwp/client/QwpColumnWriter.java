@@ -71,6 +71,7 @@ class QwpColumnWriter {
                 buffer.putBlockOfBytes(dataAddr, (long) valueCount * 2);
                 break;
             case TYPE_INT:
+            case TYPE_IPv4:
             case TYPE_FLOAT:
                 buffer.putBlockOfBytes(dataAddr, (long) valueCount * 4);
                 break;
@@ -87,6 +88,9 @@ class QwpColumnWriter {
                 writeGeoHashColumn(dataAddr, valueCount, col.getGeoHashPrecision());
                 break;
             case TYPE_VARCHAR:
+            case TYPE_BINARY:
+                // BINARY shares VARCHAR's wire layout (offsets + concatenated bytes);
+                // only the byte-stream contract differs (opaque vs UTF-8).
                 writeStringColumn(col, valueCount, stringDataSize);
                 break;
             case TYPE_SYMBOL:

@@ -214,11 +214,22 @@ public class SegmentManagerTest {
     }
 
     @Test
-    public void testProducerWakeupBeatsThePollInterval() throws Exception {
+    public void testFirstSpareLandsBeforeFirstPoll() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // Pick a poll interval long enough that any spare arriving "fast"
-            // could only have been triggered by the producer's wakeup, not by
-            // the manager's own polling tick.
+            // pollNanos is intentionally long enough that the 5s park can be
+            // ruled out as the mechanism by which the first spare arrives.
+            // The worker thread enters workerLoop on start(), takes the lock,
+            // sees the just-registered ring with needsHotSpare()==true, and
+            // provisions the spare BEFORE parking. The spare must therefore
+            // land within seconds of register(), not minutes -- the 5s park is
+            // never reached on the first iteration.
+            //
+            // The append below is incidental to the contract under test; it
+            // does NOT cross the SegmentRing high-water mark for this 4-frame
+            // segment (HEADER_SIZE 24 + FRAME_HEADER_SIZE 8 + 16 = 48 vs
+            // signalAtBytes = (120 >> 2) * 3 = 90), so no producer-side wakeup
+            // fires. The rotation/high-water wakeup paths are covered by
+            // testRotationWakeupTriggersImmediateSparePrep.
             long pollNanos = 5_000_000_000L; // 5 seconds
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
@@ -228,26 +239,17 @@ public class SegmentManagerTest {
                  SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
                 mgr.start();
                 mgr.register(ring, tmpDir);
-                // First spare lands via the cold-start path: producer hasn't
-                // appended yet, but register() doesn't itself unpark, so we
-                // rely on the manager's first tick. Instead of waiting 5s,
-                // append once and let the high-water-mark wakeup signal it.
-                // (signalAtBytes = 3/4 of segSize; one frame is ~24 bytes which
-                // crosses the threshold easily on this tiny segment.)
                 long t0 = System.nanoTime();
-                ring.appendOrFsn(buf, 16); // crosses high-water → wakeup → manager creates spare
-                // The discriminating fact is wakeup-vs-poll, not an absolute
-                // latency: a fired wakeup installs the spare in tens of ms,
-                // whereas the poll path would take ~5000ms. A 2000ms budget
-                // stays 2.5x below the poll interval (so a pass still proves
-                // the wakeup fired) while tolerating cross-thread scheduling
-                // jitter on a loaded CI agent — open + allocate + mmap plus
-                // the unpark hop can blow a 200ms budget there even when the
-                // wakeup did fire.
-                assertTrue("manager must install spare via producer wakeup, not the 5s poll tick",
-                        waitFor(() -> !ring.needsHotSpare(), 2_000));
+                ring.appendOrFsn(buf, 16);
+                // 2s is the budget used across the other manager tests; it
+                // tolerates the slower file-open + truncate + mmap that runs
+                // under JaCoCo coverage instrumentation while still being
+                // orders of magnitude below the 5s poll interval.
+                assertTrue("first spare must land without waiting for the 5s poll tick",
+                        waitFor(() -> !ring.needsHotSpare(), 2000));
                 long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                assertTrue("spare arrived in " + elapsedMs + "ms — should be <<5000ms", elapsedMs < 4_000);
+                assertTrue("spare arrived in " + elapsedMs + "ms -- should be <<5000ms",
+                        elapsedMs < 4000);
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }

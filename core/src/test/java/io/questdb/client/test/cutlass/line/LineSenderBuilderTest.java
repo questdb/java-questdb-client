@@ -136,6 +136,42 @@ public class LineSenderBuilderTest {
     }
 
     @Test
+    public void testBufferPoolSizeSilentlyAcceptedOnIngress() throws Exception {
+        // connect-string.md "Query client keys": buffer_pool_size is egress-only
+        // (it sizes the QwpQueryClient I/O thread's decoded-batch buffer pool).
+        // Ingress silently accepts the key so the same connect string can be
+        // shared between the Sender and the QwpQueryClient without an "unknown
+        // configuration key" error. Exercise every ingress protocol
+        // -- HTTP/HTTPS, WebSocket, TCP, UDP -- and confirm the parser does not
+        // raise on the key. A connect-time failure is tolerated (these are
+        // unreachable test addresses) as long as the exception message does
+        // not point at buffer_pool_size= as the offender.
+        assertMemoryLeak(() -> {
+            // protocol_version is pinned on HTTP/HTTPS so fromConfig does not
+            // contact the server for auto-detection.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";buffer_pool_size=8;protocol_version=2;");
+            assertConfStrOk("https::addr=" + LOCALHOST + ";buffer_pool_size=8;tls_verify=unsafe_off;protocol_version=2;");
+            // UDP build is purely local; no I/O.
+            assertConfStrOk("udp::addr=" + LOCALHOST + ";buffer_pool_size=8;");
+            // WebSocket and TCP attempt synchronous connect at build time.
+            // Allow LineSenderException for connect failure but require the
+            // parser did not flag buffer_pool_size=.
+            assertConfStrAcceptsBufferPoolSizeKey("ws::addr=127.0.0.1:1;buffer_pool_size=8;");
+            assertConfStrAcceptsBufferPoolSizeKey("tcp::addr=127.0.0.1:1;buffer_pool_size=8;");
+            // Empty value is also accepted: an empty value after `=` is
+            // well-formed and the silent-consume branch does not parse it.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";buffer_pool_size=;protocol_version=2;");
+            // The Sender does not validate the value either -- range checking
+            // is the QwpQueryClient parser's responsibility, not the Sender's.
+            // A value the egress parser would reject (0, negative, non-numeric)
+            // is still silently consumed here.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";buffer_pool_size=0;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";buffer_pool_size=-1;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";buffer_pool_size=big;protocol_version=2;");
+        });
+    }
+
+    @Test
     public void testBufferSizeDoubleSet() throws Exception {
         assertMemoryLeak(() -> assertThrows("already configured",
                 () -> Sender.builder(Sender.Transport.TCP).bufferCapacity(1024).bufferCapacity(1024)));
@@ -308,6 +344,57 @@ public class LineSenderBuilderTest {
         assertMemoryLeak(() -> {
             Sender.builder(Sender.Transport.TCP).address("localhost:9000").address("localhost");
             Sender.builder(Sender.Transport.TCP).address("localhost").address("localhost:9000");
+        });
+    }
+
+    @Test
+    public void testEgressOnlyQueryClientKeysSilentlyAcceptedOnIngress() throws Exception {
+        // connect-string.md "Query client keys" and "Multi-host failover":
+        // these keys configure the QwpQueryClient only. The Sender silently
+        // consumes them so a single connect string is portable between Sender
+        // and QwpQueryClient. Same rationale as buffer_pool_size (covered
+        // separately) and zone. The Sender does not interpret the value --
+        // range, enum, and type checks are the egress parser's job. A
+        // malformed value at the ingress parser is still consumed.
+        assertMemoryLeak(() -> {
+            // Each egress-only key on its own with a representative happy-path
+            // value. Covers query-client knobs and per-Execute failover knobs.
+            String[] keys = {
+                    "auth=Bearer xyz",
+                    "client_id=batch-job/42",
+                    "compression=zstd",
+                    "compression_level=5",
+                    "failover=on",
+                    "failover_backoff_initial_ms=50",
+                    "failover_backoff_max_ms=1000",
+                    "failover_max_attempts=8",
+                    "failover_max_duration_ms=30000",
+                    "initial_credit=1048576",
+                    "max_batch_rows=10000",
+                    "path=/api/v2/query",
+                    "target=primary",
+            };
+            StringBuilder all = new StringBuilder("http::addr=").append(LOCALHOST).append(";protocol_version=2;");
+            for (String kv : keys) {
+                assertConfStrOk("http::addr=" + LOCALHOST + ";" + kv + ";protocol_version=2;");
+                all.append(kv).append(';');
+            }
+            // All 13 keys at once -- a typical shared-config connect string.
+            assertConfStrOk(all.toString());
+
+            // Out-of-range / malformed values are silently consumed too -- the
+            // ingress parser does not validate egress-only keys.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";compression=bogus;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";compression_level=-1;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";max_batch_rows=0;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";failover=maybe;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";target=somewhere;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";failover_max_attempts=-3;protocol_version=2;");
+
+            // Empty values are well-formed and silently consumed.
+            assertConfStrOk("http::addr=" + LOCALHOST + ";compression=;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";target=;protocol_version=2;");
+            assertConfStrOk("http::addr=" + LOCALHOST + ";path=;protocol_version=2;");
         });
     }
 
@@ -545,6 +632,16 @@ public class LineSenderBuilderTest {
             // responsibility, not the parser's.
             assertConfStrOk("http::addr=" + LOCALHOST + ";zone=EU-West-1a;protocol_version=2;");
         });
+    }
+
+    private static void assertConfStrAcceptsBufferPoolSizeKey(String conf) {
+        try {
+            Sender.fromConfig(conf).close();
+        } catch (LineSenderException e) {
+            if (e.getMessage().contains("buffer_pool_size")) {
+                fail("parser must not flag buffer_pool_size=, was: " + e.getMessage());
+            }
+        }
     }
 
     private static void assertConfStrAcceptsZoneKey(String conf) {

@@ -35,10 +35,52 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class WebSocketClientTest {
+
+    @Test
+    public void testExtractMaxBatchSizeAbsentHeaderReturnsZero() throws Exception {
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "Upgrade: websocket\r\n"
+                + "Connection: Upgrade\r\n"
+                + "Sec-WebSocket-Accept: x\r\n"
+                + "X-QWP-Version: 1\r\n"
+                + "\r\n";
+        Assert.assertEquals(0, invokeExtractMaxBatchSize(response));
+    }
+
+    @Test
+    public void testExtractMaxBatchSizeMalformedReturnsZero() throws Exception {
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "X-QWP-Max-Batch-Size: not-a-number\r\n"
+                + "\r\n";
+        Assert.assertEquals(0, invokeExtractMaxBatchSize(response));
+    }
+
+    @Test
+    public void testExtractMaxBatchSizeNegativeReturnsZero() throws Exception {
+        // Negative or zero is a server bug; clamp to 0 so the sender falls
+        // back to its configured budget instead of producing a nonsense limit.
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "X-QWP-Max-Batch-Size: -1\r\n"
+                + "\r\n";
+        Assert.assertEquals(0, invokeExtractMaxBatchSize(response));
+    }
+
+    @Test
+    public void testExtractMaxBatchSizeParsesPositive() throws Exception {
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "Upgrade: websocket\r\n"
+                + "Connection: Upgrade\r\n"
+                + "Sec-WebSocket-Accept: x\r\n"
+                + "X-QWP-Version: 1\r\n"
+                + "X-QWP-Max-Batch-Size: 16777216\r\n"
+                + "\r\n";
+        Assert.assertEquals(16 * 1024 * 1024, invokeExtractMaxBatchSize(response));
+    }
 
     @Test
     public void testRecvOrTimeoutPropagatesNonTimeoutError() throws Exception {
@@ -163,6 +205,12 @@ public class WebSocketClientTest {
                 );
             }
         });
+    }
+
+    private static int invokeExtractMaxBatchSize(String response) throws Exception {
+        Method m = WebSocketClient.class.getDeclaredMethod("extractMaxBatchSize", String.class);
+        m.setAccessible(true);
+        return (int) m.invoke(null, response);
     }
 
     private static void setUpgradedTrue(Object obj) throws Exception {

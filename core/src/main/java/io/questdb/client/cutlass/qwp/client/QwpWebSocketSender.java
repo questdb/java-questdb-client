@@ -55,6 +55,8 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Misc;
+import io.questdb.client.std.Numbers;
+import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
@@ -117,7 +119,11 @@ import java.util.concurrent.atomic.AtomicReference;
 public class QwpWebSocketSender implements Sender {
 
     public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
-    public static final int DEFAULT_AUTO_FLUSH_BYTES = 0;
+    // Soft per-batch byte budget. Trips a flush when raw column-buffer bytes
+    // cross the threshold, well before the server's 16 MB wire cap. Wide-row
+    // senders need this trigger (not autoFlushRows alone) to avoid producing
+    // a batch the server will reject with STATUS_PARSE_ERROR.
+    public static final int DEFAULT_AUTO_FLUSH_BYTES = 8 * 1024 * 1024;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
     public static final int DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535;
@@ -173,6 +179,14 @@ public class QwpWebSocketSender implements Sender {
     private int currentBatchMaxSymbolId = -1;
     private volatile int currentEndpointIdx = -1;
     private QwpTableBuffer currentTableBuffer;
+    // Tracks currentTableBuffer.getBufferedBytes() at the last point pendingBytes
+    // was made consistent (end of sendRow(), or right after a table switch).
+    // sendRow() advances pendingBytes by (now - snapshot) and re-snaps, which
+    // keeps pendingBytes correct without re-walking every table per row.
+    // The invariant holds because column setters and rollbackRow/cancelRow
+    // only ever touch currentTableBuffer between the consistency points, and
+    // table() bans switches while a row is in progress.
+    private long currentTableBufferSnapshotBytes;
     private String currentTableName;
     // Cursor SF engine: the producer (user thread) writes encoded QWP frames
     // into the engine's mmap'd ring; the cursorSendLoop is the I/O thread
@@ -190,6 +204,14 @@ public class QwpWebSocketSender implements Sender {
     // disables keepalive PINGs entirely.
     private long durableAckKeepaliveIntervalMillis =
             CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS;
+    // Effective per-batch soft-flush threshold in raw column-buffer bytes.
+    // Initially equals autoFlushBytes; lowered to fit under the server's
+    // advertised X-QWP-Max-Batch-Size at handshake so the wire payload stays
+    // under the server's cap even with encoding overhead. Volatile because the
+    // I/O thread writes this inside buildAndConnect on every successful
+    // (re)connect while the producer thread reads it from sendRow without
+    // holding the sender monitor.
+    private volatile int effectiveAutoFlushBytes;
     private SenderErrorDispatcher errorDispatcher;
     // Async-delivery sink for SenderError notifications. Default-constructed
     // here with the loud-not-silent default handler; a builder hook can swap
@@ -239,6 +261,13 @@ public class QwpWebSocketSender implements Sender {
     // beginRound(true) call. roundSeq=1 is the first round; CONNECTED in the
     // first round indicates the initial connect.
     private long roundSeq;
+    // Server-advertised hard cap on QWP ingest payload bytes, captured from
+    // X-QWP-Max-Batch-Size on each successful handshake. 0 when the server
+    // did not advertise the header (older builds); the sender then falls back
+    // to its locally configured budget. Volatile because buildAndConnect can
+    // refresh this from the cursor I/O thread on a mid-stream reconnect while
+    // sendRow reads it on the producer thread with no synchronization.
+    private volatile int serverMaxBatchSize;
 
     private QwpWebSocketSender(
             List<Endpoint> endpoints,
@@ -259,11 +288,16 @@ public class QwpWebSocketSender implements Sender {
         this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
         this.tableBuffers = new CharSequenceObjHashMap<>();
         this.currentTableBuffer = null;
+        this.currentTableBufferSnapshotBytes = 0;
         this.currentTableName = null;
         this.connected = false;
         this.closed = false;
         this.autoFlushRows = autoFlushRows;
         this.autoFlushBytes = autoFlushBytes;
+        // Until the handshake completes, honor the configured budget verbatim.
+        // applyServerBatchSizeLimit() clamps this on connect once the server's
+        // X-QWP-Max-Batch-Size is known.
+        this.effectiveAutoFlushBytes = autoFlushBytes;
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
         this.maxSchemasPerConnection = maxSchemasPerConnection;
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
@@ -768,6 +802,72 @@ public class QwpWebSocketSender implements Sender {
         return true;
     }
 
+    /**
+     * Adds a BINARY column value to the current row. The bytes are written
+     * verbatim with no encoding or transformation. A {@code null} array
+     * reference is rejected so the NULL contract stays explicit (use the null
+     * bitmap instead). An empty array is accepted on the wire but QuestDB's
+     * BINARY storage uses the same NULL sentinel for zero-length and absent
+     * values, so an empty payload round-trips as NULL on read.
+     */
+    @Override
+    public QwpWebSocketSender binaryColumn(CharSequence columnName, byte[] value) {
+        checkNotClosed();
+        checkTableSelected();
+        if (value == null) {
+            throw new LineSenderException(
+                    "BINARY value cannot be null; mark the row null via the null bitmap instead");
+        }
+        try {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BINARY, true);
+            if (col != null) {
+                col.addBinary(value);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackRow();
+            throw e;
+        }
+        return this;
+    }
+
+    /**
+     * Overrides the {@link Sender} interface default so the closed-sender
+     * check fires before the null-slice check. Without this override, the
+     * default throws "BINARY slice cannot be null" on a closed sender,
+     * obscuring the canonical "Sender is closed" error.
+     */
+    @Override
+    public QwpWebSocketSender binaryColumn(CharSequence columnName, DirectByteSlice slice) {
+        checkNotClosed();
+        checkTableSelected();
+        if (slice == null) {
+            throw new LineSenderException(
+                    "BINARY slice cannot be null; mark the row null via the null bitmap instead");
+        }
+        return binaryColumn(columnName, slice.ptr(), slice.size());
+    }
+
+    /**
+     * Zero-allocation BINARY overload: copies {@code len} bytes from native
+     * memory at {@code ptr} into the column. See
+     * {@link Sender#binaryColumn(CharSequence, long, long)} for the contract.
+     */
+    @Override
+    public QwpWebSocketSender binaryColumn(CharSequence columnName, long ptr, long len) {
+        checkNotClosed();
+        checkTableSelected();
+        try {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_BINARY, true);
+            if (col != null) {
+                col.addBinary(ptr, len);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackRow();
+            throw e;
+        }
+        return this;
+    }
+
     @Override
     public QwpWebSocketSender boolColumn(CharSequence columnName, boolean value) {
         checkNotClosed();
@@ -1043,8 +1143,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal64 value) {
-        if (value == null || value.isNull()) return this;
         checkNotClosed();
+        if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL64, true);
@@ -1060,8 +1160,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal128 value) {
-        if (value == null || value.isNull()) return this;
         checkNotClosed();
+        if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL128, true);
@@ -1077,8 +1177,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal256 value) {
-        if (value == null || value.isNull()) return this;
         checkNotClosed();
+        if (value == null || value.isNull()) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DECIMAL256, true);
@@ -1094,8 +1194,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, CharSequence value) {
-        if (value == null || value.length() == 0) return this;
         checkNotClosed();
+        if (value == null || value.length() == 0) return this;
         checkTableSelected();
         try {
             currentDecimal256.ofString(value);
@@ -1112,8 +1212,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
@@ -1129,8 +1229,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
@@ -1146,8 +1246,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][][] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
@@ -1163,8 +1263,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender doubleArray(CharSequence name, DoubleArray array) {
-        if (array == null) return this;
         checkNotClosed();
+        if (array == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_DOUBLE_ARRAY, true);
@@ -1279,6 +1379,79 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Adds a GEOHASH column value to the current row from pre-packed bits and
+     * an explicit bit precision. Bits above {@code precisionBits} are masked
+     * off and never reach the wire, so callers may pass an unmasked long.
+     * <p>
+     * Precision is locked the first time a value is added to the column: every
+     * subsequent row must use the same precision. Precision must be in
+     * {@code [1, 60]}.
+     *
+     * @param columnName    the column name
+     * @param bits          packed geohash; low {@code precisionBits} bits significant
+     * @param precisionBits number of significant bits, 1..60
+     * @return this sender for method chaining
+     */
+    @Override
+    public QwpWebSocketSender geoHashColumn(CharSequence columnName, long bits, int precisionBits) {
+        checkNotClosed();
+        checkTableSelected();
+        if (precisionBits < 1 || precisionBits > 60) {
+            throw new LineSenderException(
+                    "invalid GEOHASH precision: " + precisionBits + " (must be 1-60)");
+        }
+        try {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_GEOHASH, true);
+            if (col != null) {
+                col.addGeoHash(maskGeoHashBits(bits, precisionBits), precisionBits);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackRow();
+            throw e;
+        }
+        return this;
+    }
+
+    /**
+     * Adds a GEOHASH column value from a base32 geohash string (e.g. "u33d8").
+     * The string is decoded as 5 bits per character; precision is set to
+     * {@code value.length() * 5} and locked at the column on first use. The
+     * accepted alphabet is digits {@code 0-9} plus {@code b c d e f g h j k m n
+     * p q r s t u v w x y z}, case insensitive ({@code a, i, l, o} are
+     * reserved). Maximum 12 characters (60 bits).
+     *
+     * @param columnName the column name
+     * @param value      base32 geohash string, 1..12 characters; must not be null
+     * @return this sender for method chaining
+     * @throws LineSenderException if the string is null, empty, too long, or
+     *                             contains a non-base32 character
+     */
+    @Override
+    public QwpWebSocketSender geoHashColumn(CharSequence columnName, CharSequence value) {
+        checkNotClosed();
+        checkTableSelected();
+        if (value == null) {
+            throw new LineSenderException(
+                    "GEOHASH string cannot be null; mark the row null via the null bitmap instead");
+        }
+        int len = value.length();
+        if (len == 0) {
+            throw new LineSenderException("GEOHASH string cannot be empty");
+        }
+        if (len > 12) {
+            throw new LineSenderException(
+                    "GEOHASH string exceeds 12 characters: " + len);
+        }
+        long bits;
+        try {
+            bits = Numbers.parseGeoHashBase32(value, 0, len);
+        } catch (NumericException e) {
+            throw new LineSenderException("invalid GEOHASH string: ").put(value);
+        }
+        return geoHashColumn(columnName, bits, len * 5);
+    }
+
+    /**
      * Highest FSN that has been server-acknowledged (or skipped past on a
      * {@link SenderError.Policy#DROP_AND_CONTINUE} rejection). {@code -1} if
      * the I/O loop has not yet started or no batch has been published.
@@ -1357,6 +1530,7 @@ public class QwpWebSocketSender implements Sender {
             tableBuffers.put(tableName, buffer);
         }
         currentTableBuffer = buffer;
+        currentTableBufferSnapshotBytes = buffer.getBufferedBytes();
         currentTableName = tableName;
         return buffer;
     }
@@ -1512,6 +1686,84 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Adds an IPv4 column value to the current row, as a packed 32-bit address
+     * in host byte order (e.g. 192.168.1.1 -> 0xC0A80101).
+     * <p>
+     * Use {@link Numbers#parseIPv4(CharSequence)} to parse a dotted-quad string,
+     * or call {@link #ipv4Column(CharSequence, CharSequence)}. Per QuestDB
+     * convention, the address 0.0.0.0 maps to IPv4 NULL on read, regardless of
+     * whether the row was marked null on the wire.
+     *
+     * @param columnName the column name
+     * @param address    the packed IPv4 address
+     * @return this sender for method chaining
+     */
+    @Override
+    public QwpWebSocketSender ipv4Column(CharSequence columnName, int address) {
+        checkNotClosed();
+        checkTableSelected();
+        try {
+            QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(columnName, QwpConstants.TYPE_IPv4, true);
+            if (col != null) {
+                col.addIPv4(address);
+            }
+        } catch (RuntimeException | Error e) {
+            rollbackRow();
+            throw e;
+        }
+        return this;
+    }
+
+    /**
+     * Adds an IPv4 column value from a dotted-quad string (e.g. "192.168.1.1").
+     * <p>
+     * NULL handling on this overload is stricter than the underlying
+     * {@link Numbers#parseIPv4(CharSequence)} contract:
+     * <ul>
+     *   <li>A {@code null} reference is a no-op: the column is skipped for
+     *       this row and gets null-padded on commit (same shape as
+     *       omitting the setter entirely).</li>
+     *   <li>The literal string {@code "null"} (case-insensitive) is
+     *       rejected with {@link LineSenderException}, even though
+     *       {@code parseIPv4} would coerce it to the IPv4 NULL sentinel.</li>
+     *   <li>The dotted-quad {@code "0.0.0.0"} is rejected for the same
+     *       reason: its bit pattern is the IPv4 NULL sentinel and the
+     *       value would silently round-trip as SQL NULL on read.</li>
+     * </ul>
+     * Pass a null reference (or omit the setter) when you want to mark a
+     * row null; otherwise pass a real dotted-quad address.
+     *
+     * @param columnName the column name
+     * @param address    dotted-quad IPv4 address; null reference is treated
+     *                   as "skip this column for the current row"
+     * @return this sender for method chaining
+     * @throws LineSenderException if the address fails to parse, equals
+     *                             {@code "null"} (case-insensitive), or
+     *                             equals {@code "0.0.0.0"}
+     */
+    @Override
+    public QwpWebSocketSender ipv4Column(CharSequence columnName, CharSequence address) {
+        checkNotClosed();
+        if (address == null) {
+            return this;
+        }
+        checkTableSelected();
+        if (Chars.equalsIgnoreCase("null", address) || Chars.equals("0.0.0.0", address)) {
+            throw new LineSenderException(
+                    "invalid IPv4 address: NULL sentinel inputs are rejected"
+                            + "; pass a null reference or omit the setter to mark the row null [address=")
+                    .put(address).put(']');
+        }
+        int packed;
+        try {
+            packed = Numbers.parseIPv4(address);
+        } catch (NumericException e) {
+            throw new LineSenderException("invalid IPv4 address: ").put(address);
+        }
+        return ipv4Column(columnName, packed);
+    }
+
+    /**
      * Returns whether Gorilla encoding is enabled.
      */
     public boolean isGorillaEnabled() {
@@ -1545,8 +1797,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
@@ -1562,8 +1814,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
@@ -1579,8 +1831,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][][] values) {
-        if (values == null) return this;
         checkNotClosed();
+        if (values == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
@@ -1596,8 +1848,8 @@ public class QwpWebSocketSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, LongArray array) {
-        if (array == null) return this;
         checkNotClosed();
+        if (array == null) return this;
         checkTableSelected();
         try {
             QwpTableBuffer.ColumnBuffer col = currentTableBuffer.getOrCreateColumn(name, QwpConstants.TYPE_LONG_ARRAY, true);
@@ -1653,6 +1905,7 @@ public class QwpWebSocketSender implements Sender {
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
         currentTableBuffer = null;
+        currentTableBufferSnapshotBytes = 0;
         currentTableName = null;
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
@@ -1884,6 +2137,11 @@ public class QwpWebSocketSender implements Sender {
             currentTableBuffer = new QwpTableBuffer(currentTableName, this);
             tableBuffers.put(currentTableName, currentTableBuffer);
         }
+        // Re-snap so sendRow()'s delta math is anchored to this table's
+        // current byte count. The prior current table's bytes already match
+        // its last-snapped value (the in-progress-row guard above ensures
+        // no column setters ran on it since the last consistency point).
+        currentTableBufferSnapshotBytes = currentTableBuffer.getBufferedBytes();
         // Both modes accumulate rows until flush
         return this;
     }
@@ -1976,6 +2234,10 @@ public class QwpWebSocketSender implements Sender {
         return terminalError;
     }
 
+    private static long maskGeoHashBits(long value, int precisionBits) {
+        return precisionBits >= 64 ? value : value & ((1L << precisionBits) - 1L);
+    }
+
     private static void rethrowTerminal(Throwable t) {
         if (t == null) {
             return;
@@ -2016,6 +2278,46 @@ public class QwpWebSocketSender implements Sender {
         }
         cachedTimestampNanosColumn.addLong(timestampNanos);
         sendRow();
+    }
+
+    /**
+     * Clamps the soft-flush byte budget to fit under the server's advertised
+     * X-QWP-Max-Batch-Size minus a safety margin for encoding overhead
+     * (schema, dict deltas, framing). A 0 advertisement means the server did
+     * not send the header (older build) and the configured budget is kept
+     * verbatim. Called on every successful connect because a rolling upgrade
+     * can leave neighbouring endpoints with different caps.
+     * <p>
+     * Always updates {@link #serverMaxBatchSize} so the single-row hard guard
+     * in {@link #sendRow} fires against the freshly advertised value. The
+     * byte trigger, however, is only adjusted when the user left it enabled:
+     * an explicit {@code auto_flush_bytes=off} (autoFlushBytes == 0) is
+     * preserved even when the server advertises a cap, so applications that
+     * opted out keep the contract they asked for.
+     */
+    private void applyServerBatchSizeLimit(int advertisedMaxBatchSize) {
+        serverMaxBatchSize = advertisedMaxBatchSize;
+        if (autoFlushBytes <= 0) {
+            // User opted out of byte-based auto-flush; respect that even when
+            // the server advertises a cap. The single-row guard still protects
+            // against oversize individual rows via serverMaxBatchSize.
+            effectiveAutoFlushBytes = 0;
+            return;
+        }
+        if (advertisedMaxBatchSize <= 0) {
+            effectiveAutoFlushBytes = autoFlushBytes;
+            return;
+        }
+        // Cap at 90% of the server's hard limit. Raw column-buffer bytes are
+        // a conservative proxy for wire size (compression usually shrinks the
+        // payload), but schema and dict-delta overhead can push the wire size
+        // above the raw total in pathological cases.
+        long safeBudget = (long) advertisedMaxBatchSize * 9 / 10;
+        if (autoFlushBytes < safeBudget) {
+            effectiveAutoFlushBytes = autoFlushBytes;
+        } else {
+            effectiveAutoFlushBytes = (int) safeBudget;
+        }
     }
 
     private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
@@ -2164,6 +2466,13 @@ public class QwpWebSocketSender implements Sender {
             dispatchConnectionEvent(
                     successKind, ep.host, ep.port, prevHost, prevPort,
                     attemptNumber, roundSeq, null);
+            // Refresh the cap-derived state before returning the new client so
+            // the producer thread observes the new endpoint's advertised
+            // X-QWP-Max-Batch-Size from the next sendRow onwards. Skipping this
+            // on a mid-stream failover leaves the sender sized for the prior
+            // endpoint's cap; an oversize row then escapes the producer-side
+            // guard and trips a wire-level ws-close[1009] downstream.
+            applyServerBatchSizeLimit(newClient.getServerMaxBatchSize());
             return newClient;
         }
         // Round walked every endpoint without a success. Surface
@@ -2473,8 +2782,11 @@ public class QwpWebSocketSender implements Sender {
             String host = ep == null ? "<unbound>" : ep.host;
             int port = ep == null ? -1 : ep.port;
             encoder.setVersion((byte) client.getServerQwpVersion());
-            LOG.info("Connected to WebSocket [host={}, port={}, qwpVersion={}]",
-                    host, port, client.getServerQwpVersion());
+            // serverMaxBatchSize / effectiveAutoFlushBytes were already
+            // refreshed by buildAndConnect just before it returned this
+            // client; same path runs on every reconnect.
+            LOG.info("Connected to WebSocket [host={}, port={}, qwpVersion={}, serverMaxBatchSize={}, effectiveAutoFlushBytes={}]",
+                    host, port, client.getServerQwpVersion(), serverMaxBatchSize, effectiveAutoFlushBytes);
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
             // its default version (V1). Schema state still gets reset for
@@ -2520,6 +2832,8 @@ public class QwpWebSocketSender implements Sender {
         int tableCount = countNonEmptyTables(keys);
         if (tableCount == 0) {
             pendingBytes = 0;
+            currentTableBufferSnapshotBytes = currentTableBuffer == null
+                    ? 0 : currentTableBuffer.getBufferedBytes();
             pendingRowCount = 0;
             firstPendingRowTimeNanos = 0;
             return;
@@ -2571,6 +2885,42 @@ public class QwpWebSocketSender implements Sender {
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
 
+        // Defensive flush-time cap check: the per-row guard in sendRow()
+        // catches individual oversize rows, but schema and dict-delta
+        // bytes the encoder adds at message-build time can push a batch
+        // of legitimately-sized rows above the wire cap. Without this
+        // check the frame would be sent and the server would close the
+        // connection with ws-close[1009 Message Too Big], surfacing the
+        // failure asynchronously on a later op rather than from this
+        // flush() call. Reset all pending state so the sender stays
+        // usable -- the caller's pending rows are dropped; they must
+        // re-batch with fewer rows per flush. close()'s drain path
+        // also relies on this being a clean reset to avoid re-throwing.
+        if (serverMaxBatchSize > 0 && messageSize > serverMaxBatchSize) {
+            int oversize = messageSize;
+            int droppedRows = pendingRowCount;
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                CharSequence tableName = keys.getQuick(i);
+                if (tableName == null) {
+                    continue;
+                }
+                QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+                if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                    continue;
+                }
+                tableBuffer.reset();
+            }
+            currentBatchMaxSymbolId = -1;
+            pendingBytes = 0;
+            currentTableBufferSnapshotBytes = 0;
+            pendingRowCount = 0;
+            firstPendingRowTimeNanos = 0;
+            throw new LineSenderException("batch too large for server batch cap")
+                    .put(" [messageSize=").put(oversize)
+                    .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
+                    .put(", droppedRows=").put(droppedRows).put(']');
+        }
+
         activeBuffer.ensureCapacity(messageSize);
         activeBuffer.write(buffer.getBufferPtr(), messageSize);
         activeBuffer.incrementRowCount();
@@ -2596,6 +2946,7 @@ public class QwpWebSocketSender implements Sender {
 
         // Reset pending count
         pendingBytes = 0;
+        currentTableBufferSnapshotBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
     }
@@ -2700,18 +3051,40 @@ public class QwpWebSocketSender implements Sender {
      */
     private void sendRow() {
         ensureConnected();
-        if (autoFlushBytes > 0) {
-            long bytesBefore = currentTableBuffer.getBufferedBytes();
-            currentTableBuffer.nextRow();
-            pendingBytes += currentTableBuffer.getBufferedBytes() - bytesBefore;
-        } else {
-            currentTableBuffer.nextRow();
+
+        // Hard guard: if THIS row's bytes already exceed the server's wire
+        // cap, the flush would produce an oversize WS frame the server
+        // closes with ws-close[1009]. Check the per-row delta before
+        // nextRow() commits the row, so the at()/atNow() error path can
+        // roll back via rollbackRow() and prior committed rows in the
+        // batch stay intact. (The check ignores the null-padding bytes
+        // nextRow() will add; that's bounded by numColumns * elemSize and
+        // far below any realistic cap.)
+        if (serverMaxBatchSize > 0) {
+            long rowBytes = currentTableBuffer.getBufferedBytes() - currentTableBufferSnapshotBytes;
+            if (rowBytes > serverMaxBatchSize) {
+                throw new LineSenderException("row too large for server batch cap")
+                        .put(" [rowBytes=").put(rowBytes)
+                        .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
+            }
         }
+
+        currentTableBuffer.nextRow();
 
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
         }
         pendingRowCount++;
+
+        // Advance pendingBytes by the bytes the just-committed row added to
+        // the current table, then re-snap. Column setters and nextRow()
+        // only ever touch currentTableBuffer between consistency points, so
+        // the per-row work stays O(numColumns of the current table) -- no
+        // map walk, no scaling with the number of tables this sender has
+        // seen across its lifetime.
+        long bufferedNow = currentTableBuffer.getBufferedBytes();
+        pendingBytes += bufferedNow - currentTableBufferSnapshotBytes;
+        currentTableBufferSnapshotBytes = bufferedNow;
 
         if (shouldAutoFlush()) {
             flushPendingRows();
@@ -2728,7 +3101,7 @@ public class QwpWebSocketSender implements Sender {
         if (autoFlushRows > 0 && pendingRowCount >= autoFlushRows) {
             return true;
         }
-        if (autoFlushBytes > 0 && getPendingBytes() >= autoFlushBytes) {
+        if (effectiveAutoFlushBytes > 0 && getPendingBytes() >= effectiveAutoFlushBytes) {
             return true;
         }
         if (autoFlushIntervalNanos > 0) {
@@ -2757,6 +3130,22 @@ public class QwpWebSocketSender implements Sender {
             default:
                 throw new LineSenderException("Unsupported time unit: " + unit);
         }
+    }
+
+    private long totalBufferedBytes() {
+        long total = 0;
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tb = tableBuffers.get(tableName);
+            if (tb != null) {
+                total += tb.getBufferedBytes();
+            }
+        }
+        return total;
     }
 
     private void validateTableName(CharSequence name) {

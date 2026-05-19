@@ -20,9 +20,7 @@ stages:
     jobs:
       - job: Javadoc
         displayName: "Javadoc"
-        pool:
-          name: "Azure Pipelines"
-          vmImage: "ubuntu-latest"
+        pool: hetzner-incus
         variables:
           jdkArch: "x64"
           imageName: "ubuntu-latest"
@@ -50,7 +48,7 @@ stages:
           matrix:
             linux-x64:
               imageName: "ubuntu-latest"
-              poolName: "Azure Pipelines"
+              poolName: "hetzner-incus"
               jdkArch: "x64"
             mac-aarch64:
               imageName: "macos-15-arm64"
@@ -130,9 +128,7 @@ stages:
     jobs:
       - job: CoverageReport
         displayName: "Coverage Report"
-        pool:
-          name: "Azure Pipelines"
-          vmImage: "ubuntu-latest"
+        pool: hetzner-incus
         variables:
           JAVA_SOURCE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.JAVA_SOURCE_CHANGED']]
           jdkArch: "x64"

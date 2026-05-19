@@ -39,6 +39,8 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Misc;
+import io.questdb.client.std.Numbers;
+import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.bytes.DirectByteSlice;
@@ -237,10 +239,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal64 value) {
+        checkNotClosed();
         if (value == null || value.isNull()) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDecimal64ColumnValue(name, value);
@@ -253,10 +255,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal128 value) {
+        checkNotClosed();
         if (value == null || value.isNull()) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDecimal128ColumnValue(name, value);
@@ -269,10 +271,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, Decimal256 value) {
+        checkNotClosed();
         if (value == null || value.isNull()) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDecimal256ColumnValue(name, value);
@@ -285,10 +287,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender decimalColumn(CharSequence name, CharSequence value) {
+        checkNotClosed();
         if (value == null || value.length() == 0) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             currentDecimal256.ofString(value);
@@ -302,10 +304,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDoubleArrayColumnValue(name, values);
@@ -318,10 +320,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDoubleArrayColumnValue(name, values);
@@ -334,10 +336,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender doubleArray(@NotNull CharSequence name, double[][][] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDoubleArrayColumnValue(name, values);
@@ -350,10 +352,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender doubleArray(CharSequence name, DoubleArray array) {
+        checkNotClosed();
         if (array == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageDoubleArrayColumnValue(name, array);
@@ -385,11 +387,52 @@ public class QwpUdpSender implements Sender {
     }
 
     @Override
+    public Sender geoHashColumn(CharSequence name, long bits, int precisionBits) {
+        checkNotClosed();
+        checkTableSelected();
+        if (precisionBits < 1 || precisionBits > 60) {
+            throw new LineSenderException(
+                    "invalid GEOHASH precision: " + precisionBits + " (must be 1-60)");
+        }
+        try {
+            stageGeoHashColumnValue(name, maskGeoHashBits(bits, precisionBits), precisionBits);
+        } catch (RuntimeException | Error e) {
+            rollbackCurrentRowToCommittedState();
+            throw e;
+        }
+        return this;
+    }
+
+    @Override
+    public Sender geoHashColumn(CharSequence name, CharSequence value) {
+        checkNotClosed();
+        checkTableSelected();
+        if (value == null) {
+            throw new LineSenderException(
+                    "GEOHASH string cannot be null; mark the row null via the null bitmap instead");
+        }
+        int len = value.length();
+        if (len == 0) {
+            throw new LineSenderException("GEOHASH string cannot be empty");
+        }
+        if (len > 12) {
+            throw new LineSenderException("GEOHASH string exceeds 12 characters: " + len);
+        }
+        long bits;
+        try {
+            bits = Numbers.parseGeoHashBase32(value, 0, len);
+        } catch (NumericException e) {
+            throw new LineSenderException("invalid GEOHASH string: ").put(value);
+        }
+        return geoHashColumn(name, bits, len * 5);
+    }
+
+    @Override
     public Sender longArray(@NotNull CharSequence name, long[] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageLongArrayColumnValue(name, values);
@@ -402,10 +445,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageLongArrayColumnValue(name, values);
@@ -418,10 +461,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, long[][][] values) {
+        checkNotClosed();
         if (values == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageLongArrayColumnValue(name, values);
@@ -434,10 +477,10 @@ public class QwpUdpSender implements Sender {
 
     @Override
     public Sender longArray(@NotNull CharSequence name, LongArray array) {
+        checkNotClosed();
         if (array == null) {
             return this;
         }
-        checkNotClosed();
         checkTableSelected();
         try {
             stageLongArrayColumnValue(name, array);
@@ -615,6 +658,16 @@ public class QwpUdpSender implements Sender {
             case TYPE_DOUBLE_ARRAY:
             case TYPE_LONG_ARRAY:
                 return estimateArrayPayloadBytes(col, state);
+            case TYPE_GEOHASH: {
+                int precision = col.getGeoHashPrecision();
+                int valueSize = (precision + 7) >>> 3;
+                long delta = (long) (valueCountAfter - valueCountBefore) * valueSize;
+                // varint precision prefix is written once per column block on the wire.
+                if (valueCountBefore == 0) {
+                    delta += NativeBufferWriter.varintSize(precision);
+                }
+                return delta;
+            }
             case TYPE_VARCHAR:
                 return 4L + (col.getStringDataSize() - state.stringDataSizeBefore);
             case TYPE_SYMBOL:
@@ -658,6 +711,10 @@ public class QwpUdpSender implements Sender {
         return delta;
     }
 
+    private static long maskGeoHashBits(long value, int precisionBits) {
+        return precisionBits >= 64 ? value : value & ((1L << precisionBits) - 1L);
+    }
+
     private static long nonNullablePaddingCost(byte type, int valuesBefore, int missing) {
         switch (type) {
             case TYPE_BOOLEAN:
@@ -668,6 +725,7 @@ public class QwpUdpSender implements Sender {
             case TYPE_CHAR:
                 return (long) missing * 2;
             case TYPE_INT:
+            case TYPE_IPv4:
             case TYPE_FLOAT:
             case TYPE_VARCHAR:
                 return (long) missing * 4;
@@ -1276,6 +1334,13 @@ public class QwpUdpSender implements Sender {
         QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_DOUBLE, false);
         beginColumnWrite(col, name);
         col.addDouble(value);
+        completeColumnWrite();
+    }
+
+    private void stageGeoHashColumnValue(CharSequence name, long maskedBits, int precisionBits) {
+        QwpTableBuffer.ColumnBuffer col = acquireColumn(name, TYPE_GEOHASH, true);
+        beginColumnWrite(col, name);
+        col.addGeoHash(maskedBits, precisionBits);
         completeColumnWrite();
     }
 

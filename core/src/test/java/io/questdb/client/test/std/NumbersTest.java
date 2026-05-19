@@ -415,6 +415,60 @@ public class NumbersTest {
     }
 
     @Test
+    public void testParseGeoHashBase32() throws NumericException {
+        // 1 char = 5 bits. "u" is the 27th letter in QuestDB's base32 alphabet
+        // (after 0..9 + b c d e f g h j k m n p q r s t u): 26 -> 11010.
+        assertEquals(0b11010L, Numbers.parseGeoHashBase32("u"));
+        // 7 chars = 35 bits. "s24se0g" is the canonical example used in the
+        // server-side e2e tests; the long form encodes the chars verbatim.
+        assertEquals(0b11000_00010_00100_11000_01101_00000_01111L,
+                Numbers.parseGeoHashBase32("s24se0g"));
+        // Case insensitivity.
+        assertEquals(Numbers.parseGeoHashBase32("u33d8"), Numbers.parseGeoHashBase32("U33D8"));
+        // Two characters that differ only by case yield identical bits.
+        assertEquals(Numbers.parseGeoHashBase32("z"), Numbers.parseGeoHashBase32("Z"));
+    }
+
+    @Test
+    public void testParseGeoHashBase32_explicitBounds() throws NumericException {
+        // Bounds form decodes a substring without allocating.
+        assertEquals(Numbers.parseGeoHashBase32("u33d8"),
+                Numbers.parseGeoHashBase32("XXu33d8YY", 2, 7));
+    }
+
+    @Test(expected = NumericException.class)
+    public void testParseGeoHashBase32_invalidChar_a() throws NumericException {
+        // 'a' is reserved in the geohash base32 alphabet.
+        Numbers.parseGeoHashBase32("ua");
+    }
+
+    @Test(expected = NumericException.class)
+    public void testParseGeoHashBase32_invalidChar_i() throws NumericException {
+        Numbers.parseGeoHashBase32("ui");
+    }
+
+    @Test(expected = NumericException.class)
+    public void testParseGeoHashBase32_invalidChar_punct() throws NumericException {
+        Numbers.parseGeoHashBase32("u!");
+    }
+
+    @Test(expected = NumericException.class)
+    public void testParseGeoHashBase32_null() throws NumericException {
+        Numbers.parseGeoHashBase32(null);
+    }
+
+    @Test(expected = NumericException.class)
+    public void testParseGeoHashBase32_empty() throws NumericException {
+        Numbers.parseGeoHashBase32("");
+    }
+
+    @Test(expected = NumericException.class)
+    public void testParseGeoHashBase32_tooLong() throws NumericException {
+        // 13 chars -> 65 bits exceeds the 60-bit geohash cap.
+        Numbers.parseGeoHashBase32("0123456789bcd");
+    }
+
+    @Test
     public void testParseIPv4() {
         assertEquals(84413540, Numbers.parseIPv4("5.8.12.100"));
         assertEquals(204327201, Numbers.parseIPv4("12.45.201.33"));
