@@ -77,7 +77,7 @@ public class FilesTest {
     public void testWriteReadRoundtrip() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/test.bin";
-            int fd = Files.openCleanRW(path, 0);
+            int fd = Files.openCleanRW(path);
             assertTrue("expected fd >= 0, got " + fd, fd >= 0);
             try {
                 long buf = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
@@ -109,8 +109,9 @@ public class FilesTest {
     public void testTruncate() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/trunc.bin";
-            int fd = Files.openCleanRW(path, 1024);
+            int fd = Files.openCleanRW(path);
             try {
+                assertTrue(Files.truncate(fd, 1024));
                 assertEquals(1024, Files.length(fd));
                 assertTrue(Files.truncate(fd, 0));
                 assertEquals(0, Files.length(fd));
@@ -130,6 +131,55 @@ public class FilesTest {
             try {
                 assertTrue(Files.allocate(fd, 65536));
                 assertTrue(Files.length(fd) >= 65536);
+            } finally {
+                Files.close(fd);
+            }
+        });
+    }
+
+    /** Pins the cross-platform contract on `Files.allocate`:
+     * never-shrinks, short-circuits on size <= currentSize, extends on
+     * size > currentSize. All four assertions must hold identically on
+     * Linux, macOS, and Windows — see Files.allocate javadoc. */
+    @Test
+    public void testAllocateNeverShrinks() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/alloc-shrink.bin";
+            int fd = Files.openRW(path);
+            try {
+                // Grow to 64 KiB.
+                assertTrue(Files.allocate(fd, 65536));
+                assertEquals(65536, Files.length(fd));
+
+                // Smaller request: must not shrink the file.
+                assertTrue(Files.allocate(fd, 4096));
+                assertEquals(65536, Files.length(fd));
+
+                // Equal request: no-op success, size unchanged.
+                assertTrue(Files.allocate(fd, 65536));
+                assertEquals(65536, Files.length(fd));
+
+                // Larger request: extends to the new target.
+                assertTrue(Files.allocate(fd, 131072));
+                assertEquals(131072, Files.length(fd));
+            } finally {
+                Files.close(fd);
+            }
+        });
+    }
+
+    /** A size=0 allocate on a fresh file is a no-op success — exercises
+     * the same short-circuit as testAllocateNeverShrinks but with the
+     * edge case of an empty file (no fallocate / F_PREALLOCATE syscall
+     * should reach the kernel). */
+    @Test
+    public void testAllocateZeroOnFreshFile() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/alloc-zero.bin";
+            int fd = Files.openRW(path);
+            try {
+                assertTrue(Files.allocate(fd, 0));
+                assertEquals(0, Files.length(fd));
             } finally {
                 Files.close(fd);
             }
@@ -162,7 +212,7 @@ public class FilesTest {
         TestUtils.assertMemoryLeak(() -> {
             String a = tmpDir + "/a";
             String b = tmpDir + "/b";
-            int fd = Files.openCleanRW(a, 0);
+            int fd = Files.openCleanRW(a);
             Files.close(fd);
             assertTrue(Files.exists(a));
             assertEquals(0, Files.rename(a, b));
@@ -176,7 +226,7 @@ public class FilesTest {
         TestUtils.assertMemoryLeak(() -> {
             String[] names = {"alpha", "beta", "gamma"};
             for (String n : names) {
-                int fd = Files.openCleanRW(tmpDir + "/" + n, 0);
+                int fd = Files.openCleanRW(tmpDir + "/" + n);
                 Files.close(fd);
             }
             long find = Files.findFirst(tmpDir);
@@ -207,7 +257,7 @@ public class FilesTest {
     public void testLockExclusive() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/lock.bin";
-            int fd1 = Files.openCleanRW(path, 0);
+            int fd1 = Files.openCleanRW(path);
             int fd2 = Files.openRW(path);
             try {
                 assertEquals(0, Files.lock(fd1));
@@ -224,7 +274,7 @@ public class FilesTest {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/x";
             assertFalse(Files.exists(path));
-            int fd = Files.openCleanRW(path, 0);
+            int fd = Files.openCleanRW(path);
             Files.close(fd);
             assertTrue(Files.exists(path));
             assertTrue(Files.remove(path));
@@ -243,8 +293,9 @@ public class FilesTest {
     public void testMmapRoundtrip() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/mmap.bin";
-            int fd = Files.openCleanRW(path, 8192);
+            int fd = Files.openCleanRW(path);
             try {
+                assertTrue(Files.allocate(fd, 8192));
                 long addr = Files.mmap(fd, 8192, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
                 assertNotEquals("mmap returned FAILED", Files.FAILED_MMAP_ADDRESS, addr);
                 try {

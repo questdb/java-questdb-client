@@ -326,7 +326,7 @@ public class MmapSegmentTest {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/seg-bad-magic.sfa";
             // Build a file with the right size but the wrong magic.
-            int fd = Files.openCleanRW(path, MmapSegment.HEADER_SIZE);
+            int fd = Files.openCleanRW(path);
             long bufHdr = Unsafe.malloc(MmapSegment.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
             try {
                 Unsafe.getUnsafe().putInt(bufHdr, 0xBAD0FACE);
@@ -596,21 +596,21 @@ public class MmapSegmentTest {
         }
 
         @Override
-        public int openCleanRW(String path, long size) {
+        public int openCleanRW(String path) {
             openCleanRWCalls++;
             if (failOnOpenCleanRW) {
                 return -1;
             }
-            return INSTANCE.openCleanRW(path, size);
+            return INSTANCE.openCleanRW(path);
         }
 
         @Override
-        public int openCleanRW(long pathPtr, long size) {
+        public int openCleanRW(long pathPtr) {
             openCleanRWCalls++;
             if (failOnOpenCleanRW) {
                 return -1;
             }
-            return INSTANCE.openCleanRW(pathPtr, size);
+            return INSTANCE.openCleanRW(pathPtr);
         }
 
         @Override

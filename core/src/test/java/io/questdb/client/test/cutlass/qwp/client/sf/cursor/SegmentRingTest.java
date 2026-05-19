@@ -370,7 +370,7 @@ public class SegmentRingTest {
                 s0.tryAppend(buf, 16);
                 s0.close();
                 // One stray .sfa with no proper header — must be ignored.
-                int fd = Files.openCleanRW(tmpDir + "/stray.sfa", 64);
+                int fd = Files.openCleanRW(tmpDir + "/stray.sfa");
                 long hdr = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
                 try {
                     Unsafe.getUnsafe().putLong(hdr, 0xBADBADBADBADBADBL);

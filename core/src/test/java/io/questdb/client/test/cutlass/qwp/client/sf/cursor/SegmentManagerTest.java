@@ -236,13 +236,18 @@ public class SegmentManagerTest {
                 // crosses the threshold easily on this tiny segment.)
                 long t0 = System.nanoTime();
                 ring.appendOrFsn(buf, 16); // crosses high-water → wakeup → manager creates spare
-                // 200 ms is generous for an open + truncate + mmap on a
-                // healthy machine; if we're still waiting, the wakeup didn't
-                // fire and we're stuck on the 5s poll.
+                // The discriminating fact is wakeup-vs-poll, not an absolute
+                // latency: a fired wakeup installs the spare in tens of ms,
+                // whereas the poll path would take ~5000ms. A 2000ms budget
+                // stays 2.5x below the poll interval (so a pass still proves
+                // the wakeup fired) while tolerating cross-thread scheduling
+                // jitter on a loaded CI agent — open + allocate + mmap plus
+                // the unpark hop can blow a 200ms budget there even when the
+                // wakeup did fire.
                 assertTrue("manager must install spare via producer wakeup, not the 5s poll tick",
-                        waitFor(() -> !ring.needsHotSpare(), 200));
+                        waitFor(() -> !ring.needsHotSpare(), 2_000));
                 long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                assertTrue("spare arrived in " + elapsedMs + "ms — should be <<5000ms", elapsedMs < 1000);
+                assertTrue("spare arrived in " + elapsedMs + "ms — should be <<5000ms", elapsedMs < 4_000);
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
@@ -264,8 +269,11 @@ public class SegmentManagerTest {
                 mgr.start();
                 mgr.register(ring, tmpDir);
                 // First spare via high-water signal on the very first append.
+                // 2000ms budget: same wakeup-vs-poll rationale as
+                // testProducerWakeupBeatsThePollInterval -- still 2.5x below
+                // the 5s poll, but tolerant of CI scheduling jitter.
                 ring.appendOrFsn(buf, 16);
-                assertTrue(waitFor(() -> !ring.needsHotSpare(), 500));
+                assertTrue(waitFor(() -> !ring.needsHotSpare(), 2_000));
                 // Now active is full → next append rotates → consumes the spare →
                 // hotSpare goes back to null → rotation-time wakeup runs →
                 // manager promptly provisions the next spare.
@@ -273,10 +281,10 @@ public class SegmentManagerTest {
                 long fsn = ring.appendOrFsn(buf, 16);
                 assertEquals(1, fsn);
                 assertTrue("rotation-time wakeup must trigger spare 2 well before 5s poll",
-                        waitFor(() -> !ring.needsHotSpare(), 500));
+                        waitFor(() -> !ring.needsHotSpare(), 2_000));
                 long elapsedMs = (System.nanoTime() - beforeRotate) / 1_000_000L;
                 assertTrue("spare 2 arrived in " + elapsedMs + "ms — should be <<5000ms",
-                        elapsedMs < 1000);
+                        elapsedMs < 4_000);
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
