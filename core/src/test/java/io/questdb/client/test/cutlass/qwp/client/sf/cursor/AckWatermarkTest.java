@@ -142,8 +142,9 @@ public class AckWatermarkTest {
         // write.
         TestUtils.assertMemoryLeak(() -> {
             String path = slotDir + "/" + AckWatermark.FILE_NAME;
-            int fd = Files.openCleanRW(path, 4);
+            int fd = Files.openCleanRW(path);
             assertTrue(fd >= 0);
+            assertTrue(Files.truncate(fd, 4));
             Files.close(fd);
             assertEquals("precondition: file exists at wrong size",
                     4L, Files.length(path));

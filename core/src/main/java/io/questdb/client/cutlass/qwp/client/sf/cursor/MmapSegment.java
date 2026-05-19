@@ -165,17 +165,15 @@ public final class MmapSegment implements QuietCloseable {
             throw new IllegalArgumentException(
                     "sizeBytes too small for header + one minimal frame: " + sizeBytes);
         }
-        int fd = ff.openCleanRW(pathPtr, sizeBytes);
+        int fd = ff.openCleanRW(pathPtr);
         if (fd < 0) {
             throw new MmapSegmentException("openCleanRW failed for " + displayPath);
         }
-        // Reserve real disk blocks so ENOSPC surfaces here, before the
-        // producer thread starts writing frames into the mapping. The
-        // openCleanRW call above only sets the logical file size via
-        // ftruncate; the blocks remain sparse until something writes them.
-        // Calling allocate immediately after promotes ENOSPC from a
-        // SIGBUS-on-mmap-store (which aborts the JVM) to a clean failure
-        // path the caller can recover from.
+        // Reserve real disk blocks and advance EOF to sizeBytes in one
+        // call. ENOSPC surfaces here, before the producer thread starts
+        // writing frames into the mapping — a clean false return
+        // instead of a SIGBUS-on-mmap-store later (which would abort
+        // the JVM).
         if (!ff.allocate(fd, sizeBytes)) {
             ff.close(fd);
             // Unlink the partially-created file so a sf_max_bytes-sized

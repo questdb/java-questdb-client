@@ -40,7 +40,7 @@ import java.util.concurrent.locks.LockSupport;
  * Background worker that keeps every registered {@link SegmentRing} supplied
  * with a hot-spare segment and trims segments after their frames have been
  * ACK'd by the server. Off the user-thread / I/O-thread hot path entirely:
- * the expensive {@code openCleanRW + truncate + mmap} for spare creation and
+ * the expensive {@code openCleanRW + allocate + mmap} for spare creation and
  * {@code munmap + unlink} for trim happen on this thread, never on the
  * latency-sensitive paths.
  * <p>

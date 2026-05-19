@@ -124,25 +124,12 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openAppend0
 }
 
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openCleanRW0
-        (JNIEnv *e, jclass cl, jlong lpszName, jlong size) {
-    jint fd = open_file((const char *) (uintptr_t) lpszName,
-                        GENERIC_READ | GENERIC_WRITE,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                        CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL);
-    if (fd < 0) {
-        return fd;
-    }
-    if (size > 0) {
-        FILE_END_OF_FILE_INFO eof;
-        eof.EndOfFile.QuadPart = size;
-        if (!SetFileInformationByHandle(FD_TO_HANDLE(fd), FileEndOfFileInfo, &eof, sizeof(eof))) {
-            SaveLastError();
-            CloseHandle(FD_TO_HANDLE(fd));
-            return -1;
-        }
-    }
-    return fd;
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    return open_file((const char *) (uintptr_t) lpszName,
+                     GENERIC_READ | GENERIC_WRITE,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     CREATE_ALWAYS,
+                     FILE_ATTRIBUTE_NORMAL);
 }
 
 /* ReadFile/WriteFile take a DWORD (uint32) byte count, but the JNI signature
@@ -241,18 +228,20 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_truncate
 
 JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
         (JNIEnv *e, jclass cl, jint fd, jlong size) {
-    /* SetEndOfFile alone leaves the file sparse on NTFS: clusters are
-     * allocated lazily as writes occur. If the disk fills up between
-     * create and write, the cache manager raises an in-page exception
-     * on the writing thread when it flushes a mapped page — a
-     * SIGBUS-class failure that tears down the JVM. FILE_ALLOCATION_INFO
-     * instructs NTFS to physically reserve clusters now and returns
-     * ERROR_DISK_FULL synchronously on the call site, matching the
-     * posix_fallocate contract.
-     *
-     * Match the POSIX behaviour of posix_fallocate(fd, 0, size): round
-     * the request up to the existing logical size so an allocate call
-     * never shrinks a file that the caller already extended. */
+    /* Cross-platform contract — full version lives on
+     * Files.allocate's javadoc; key invariants restated here so the
+     * implementation reads on its own:
+     *   - Never shrinks: target = max(size, currentSize); if size <=
+     *     currentSize, return success without touching the file.
+     *   - Reserves real disk clusters for [currentSize, target). On NTFS
+     *     FILE_ALLOCATION_INFO is file-scope (no per-range API), so it
+     *     implicitly re-reserves [0, currentSize) as well — visible only
+     *     to a caller who deliberately created sparse holes inside that
+     *     range, and that caller should treat hole-filling as
+     *     non-portable behaviour.
+     *   - ERROR_DISK_FULL surfaces as JNI_FALSE. There is no
+     *     sparse-fallback equivalent — Windows always reserves or
+     *     fails; spec-compliant fallback only applies on Linux/macOS. */
     HANDLE handle = FD_TO_HANDLE(fd);
 
     LARGE_INTEGER current;
@@ -261,6 +250,12 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
         return JNI_FALSE;
     }
     jlong target = size > current.QuadPart ? size : (jlong) current.QuadPart;
+    if (target == current.QuadPart) {
+        /* Nothing to extend, nothing to reserve. The early-return is
+         * what makes "never shrinks" hold and keeps behaviour aligned
+         * with the Linux/macOS short-circuit. */
+        return JNI_TRUE;
+    }
 
     FILE_ALLOCATION_INFO alloc;
     alloc.AllocationSize.QuadPart = target;
@@ -270,14 +265,13 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_allocate
     }
 
     /* FILE_ALLOCATION_INFO reserves clusters but does not advance EOF.
-     * Extend the logical size separately when growing the file. */
-    if (size > current.QuadPart) {
-        FILE_END_OF_FILE_INFO eof;
-        eof.EndOfFile.QuadPart = size;
-        if (!SetFileInformationByHandle(handle, FileEndOfFileInfo, &eof, sizeof(eof))) {
-            SaveLastError();
-            return JNI_FALSE;
-        }
+     * We've already ruled out target == current above, so the file
+     * always needs its logical size pushed out to target. */
+    FILE_END_OF_FILE_INFO eof;
+    eof.EndOfFile.QuadPart = target;
+    if (!SetFileInformationByHandle(handle, FileEndOfFileInfo, &eof, sizeof(eof))) {
+        SaveLastError();
+        return JNI_FALSE;
     }
     return JNI_TRUE;
 }
