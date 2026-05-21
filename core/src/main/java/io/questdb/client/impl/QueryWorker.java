@@ -1,0 +1,168 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.impl;
+
+import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Pairs one {@link QwpQueryClient} with one dedicated thread. The worker thread
+ * loops, waiting for {@link #dispatch} to hand it a {@link QueryImpl}, then
+ * runs {@code execute()} synchronously and releases itself back to the pool
+ * when the call returns.
+ * <p>
+ * The pooled query client's own I/O thread continues to drive the wire; the
+ * worker thread exists only to keep {@code execute()} off the application's
+ * submitting thread. Handler callbacks ({@code onBatch}, {@code onEnd},
+ * {@code onError}) still run on the client's I/O thread.
+ */
+public final class QueryWorker {
+
+    static final long SHUTDOWN_JOIN_MILLIS = 5_000;
+    private final QwpQueryClient client;
+    private final long createdAtMillis;
+    private final QueryClientPool pool;
+    private final Condition signalCondition;
+    private final ReentrantLock signalLock = new ReentrantLock();
+    private final Thread thread;
+    private volatile QueryImpl current;
+    private volatile long idleSinceMillis;
+    private volatile boolean shuttingDown;
+
+    public QueryWorker(QwpQueryClient client, QueryClientPool pool, int slotIndex) {
+        this.client = client;
+        this.pool = pool;
+        this.signalCondition = signalLock.newCondition();
+        this.thread = new Thread(this::runLoop, "questdb-query-worker-" + slotIndex);
+        this.thread.setDaemon(true);
+        this.createdAtMillis = System.currentTimeMillis();
+        this.idleSinceMillis = this.createdAtMillis;
+    }
+
+    long createdAtMillis() {
+        return createdAtMillis;
+    }
+
+    long idleSinceMillis() {
+        return idleSinceMillis;
+    }
+
+    void markIdleAt(long nowMillis) {
+        idleSinceMillis = nowMillis;
+    }
+
+    /**
+     * Cancels the in-flight query on this worker's client. Safe to call from
+     * any thread; harmless if the worker is idle.
+     */
+    void cancelInFlight() {
+        try {
+            client.cancel();
+        } catch (RuntimeException ignored) {
+            // cancel() is best-effort; an already-completed query is fine.
+        }
+    }
+
+    /**
+     * Returns the {@link QwpQueryClient} this worker drives. Exposed for
+     * introspection and tests; callers must not invoke {@code execute()} on
+     * it directly because that would race the worker's own dispatch loop.
+     */
+    public QwpQueryClient client() {
+        return client;
+    }
+
+    void shutdown() {
+        shuttingDown = true;
+        signalLock.lock();
+        try {
+            signalCondition.signalAll();
+        } finally {
+            signalLock.unlock();
+        }
+        // If a query is in flight on this worker, ask the client to abort so
+        // execute() returns promptly and the thread can exit before join times
+        // out. cancel() is documented as thread-safe and is a no-op when idle.
+        try {
+            client.cancel();
+        } catch (RuntimeException ignored) {
+        }
+        try {
+            thread.join(SHUTDOWN_JOIN_MILLIS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        try {
+            client.close();
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    void start() {
+        thread.start();
+    }
+
+    /**
+     * Hands a configured {@link QueryImpl} to this worker. The caller must
+     * have just acquired this worker via QueryClientPool#acquire(long).
+     */
+    void dispatch(QueryImpl q) {
+        signalLock.lock();
+        try {
+            current = q;
+            signalCondition.signal();
+        } finally {
+            signalLock.unlock();
+        }
+    }
+
+    private void runLoop() {
+        while (!shuttingDown) {
+            QueryImpl q;
+            signalLock.lock();
+            try {
+                while (current == null && !shuttingDown) {
+                    signalCondition.awaitUninterruptibly();
+                }
+                if (shuttingDown) {
+                    return;
+                }
+                q = current;
+            } finally {
+                signalLock.unlock();
+            }
+            try {
+                q.runOn(client);
+            } catch (Throwable t) {
+                q.signalUnexpected(t);
+            } finally {
+                current = null;
+                pool.release(this);
+            }
+        }
+    }
+}

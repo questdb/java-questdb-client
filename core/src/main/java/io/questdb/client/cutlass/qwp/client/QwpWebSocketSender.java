@@ -39,6 +39,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionListener;
@@ -66,7 +67,6 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -196,8 +196,7 @@ public class QwpWebSocketSender implements Sender {
     // Orphan-slot drainer pool. Non-null only when the builder requested
     // drain_orphans=true AND we have a slot path to scan against. Closed
     // alongside the cursor send loop in close().
-    private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool
-            drainerPool;
+    private BackgroundDrainerPool drainerPool;
     // Keepalive PING cadence used by the I/O loop while
     // request_durable_ack=on AND there are pending durable-ack
     // confirmations. Default mirrors the loop's spec value; 0 or negative
@@ -281,7 +280,7 @@ public class QwpWebSocketSender implements Sender {
         if (endpoints == null || endpoints.isEmpty()) {
             throw new IllegalArgumentException("endpoints must be non-empty");
         }
-        this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
+        this.endpoints = List.copyOf(endpoints);
         this.hostTracker = new QwpHostHealthTracker(this.endpoints.size());
         this.authorizationHeader = authorizationHeader;
         this.tlsConfig = tlsConfig;
@@ -770,6 +769,7 @@ public class QwpWebSocketSender implements Sender {
      * @return {@code true} if {@code ackedFsn() >= targetFsn} on return, {@code false} on timeout
      * @throws LineSenderException if the I/O loop has latched a terminal error
      */
+    @Override
     public boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
         checkNotClosed();
         if (cursorEngine == null) {
@@ -1360,6 +1360,7 @@ public class QwpWebSocketSender implements Sender {
      *
      * @return highest FSN published into the engine, or {@code -1} if no data
      */
+    @Override
     public long flushAndGetSequence() {
         checkNotClosed();
         ensureNoInProgressRow();
@@ -1459,6 +1460,7 @@ public class QwpWebSocketSender implements Sender {
      * Snapshot accessor — for a bounded wait, use
      * {@link #awaitAckedFsn(long, long)}.
      */
+    @Override
     public long getAckedFsn() {
         return cursorEngine != null ? cursorEngine.ackedFsn() : -1L;
     }
@@ -1471,7 +1473,7 @@ public class QwpWebSocketSender implements Sender {
      * moments ago may still count for a few ms.
      */
     public int getActiveBackgroundDrainers() {
-        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool pool = drainerPool;
+        BackgroundDrainerPool pool = drainerPool;
         return pool == null ? 0 : pool.getActiveCount();
     }
 
@@ -1494,6 +1496,28 @@ public class QwpWebSocketSender implements Sender {
      */
     public int getAutoFlushRows() {
         return autoFlushRows;
+    }
+
+    /**
+     * Number of {@link SenderConnectionEvent} notifications dropped because
+     * the bounded inbox was full. Non-zero means the user-supplied
+     * {@link SenderConnectionListener} cannot keep up. Returns 0 if the
+     * dispatcher has not been allocated yet.
+     */
+    public long getDroppedConnectionNotifications() {
+        SenderConnectionDispatcher d = connectionDispatcher;
+        return d == null ? 0L : d.getDroppedNotifications();
+    }
+
+    /**
+     * Number of {@link SenderError} notifications dropped because the
+     * bounded inbox was full. Non-zero means the user-supplied
+     * {@link SenderErrorHandler} cannot keep up. Returns 0 if the error
+     * dispatcher has not been allocated yet.
+     */
+    public long getDroppedErrorNotifications() {
+        SenderErrorDispatcher d = errorDispatcher;
+        return d == null ? 0L : d.getDroppedNotifications();
     }
 
     /**
@@ -1536,38 +1560,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Number of {@link SenderConnectionEvent} notifications dropped because
-     * the bounded inbox was full. Non-zero means the user-supplied
-     * {@link SenderConnectionListener} cannot keep up. Returns 0 if the
-     * dispatcher has not been allocated yet.
-     */
-    public long getDroppedConnectionNotifications() {
-        SenderConnectionDispatcher d = connectionDispatcher;
-        return d == null ? 0L : d.getDroppedNotifications();
-    }
-
-    /**
-     * Number of {@link SenderError} notifications dropped because the
-     * bounded inbox was full. Non-zero means the user-supplied
-     * {@link SenderErrorHandler} cannot keep up. Returns 0 if the error
-     * dispatcher has not been allocated yet.
-     */
-    public long getDroppedErrorNotifications() {
-        SenderErrorDispatcher d = errorDispatcher;
-        return d == null ? 0L : d.getDroppedNotifications();
-    }
-
-    /**
-     * Number of {@link SenderConnectionEvent} notifications delivered to the
-     * user listener since this sender started. Counts every delivery attempt,
-     * including those where the listener threw.
-     */
-    public long getTotalConnectionEventsDelivered() {
-        SenderConnectionDispatcher d = connectionDispatcher;
-        return d == null ? 0L : d.getTotalDelivered();
-    }
-
-    /**
      * Total binary frames whose ACKs have been received and applied.
      */
     public long getTotalAcks() {
@@ -1582,7 +1574,7 @@ public class QwpWebSocketSender implements Sender {
      * slots were discovered at startup.
      */
     public long getTotalBackgroundDrainersFailed() {
-        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool pool = drainerPool;
+        BackgroundDrainerPool pool = drainerPool;
         return pool == null ? 0L : pool.getTotalFailed();
     }
 
@@ -1593,7 +1585,7 @@ public class QwpWebSocketSender implements Sender {
      * slots were discovered at startup.
      */
     public long getTotalBackgroundDrainersSucceeded() {
-        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool pool = drainerPool;
+        BackgroundDrainerPool pool = drainerPool;
         return pool == null ? 0L : pool.getTotalSucceeded();
     }
 
@@ -1606,6 +1598,16 @@ public class QwpWebSocketSender implements Sender {
     public long getTotalBackpressureStalls() {
         CursorSendEngine e = cursorEngine;
         return e == null ? 0L : e.getTotalBackpressureStalls();
+    }
+
+    /**
+     * Number of {@link SenderConnectionEvent} notifications delivered to the
+     * user listener since this sender started. Counts every delivery attempt,
+     * including those where the listener threw.
+     */
+    public long getTotalConnectionEventsDelivered() {
+        SenderConnectionDispatcher d = connectionDispatcher;
+        return d == null ? 0L : d.getTotalDelivered();
     }
 
     /**
@@ -1912,22 +1914,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Attach a {@link CursorSendEngine} for store-and-forward. Must be called
-     * before the first send.
-     */
-    public void setCursorEngine(CursorSendEngine engine, boolean takeOwnership) {
-        if (closed) {
-            throw new LineSenderException("Sender is closed");
-        }
-        if (connected) {
-            throw new LineSenderException(
-                    "setCursorEngine must be called before the first send");
-        }
-        this.cursorEngine = engine;
-        this.ownsCursorEngine = takeOwnership && engine != null;
-    }
-
-    /**
      * Register an async listener for connection-state transitions: initial
      * connect, primary failover, endpoint attempt failures, the full address
      * list being unreachable, and terminal auth/budget rejections.
@@ -1961,6 +1947,22 @@ public class QwpWebSocketSender implements Sender {
             throw new IllegalArgumentException("connectionListenerInboxCapacity must be >= 1, was " + capacity);
         }
         this.connectionListenerInboxCapacity = capacity;
+    }
+
+    /**
+     * Attach a {@link CursorSendEngine} for store-and-forward. Must be called
+     * before the first send.
+     */
+    public void setCursorEngine(CursorSendEngine engine, boolean takeOwnership) {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        if (connected) {
+            throw new LineSenderException(
+                    "setCursorEngine must be called before the first send");
+        }
+        this.cursorEngine = engine;
+        this.ownsCursorEngine = takeOwnership && engine != null;
     }
 
     /**
@@ -2260,26 +2262,6 @@ public class QwpWebSocketSender implements Sender {
         return Collections.singletonList(new Endpoint(host, port));
     }
 
-    private void atMicros(long timestampMicros) {
-        // Add designated timestamp column (empty name for designated timestamp)
-        // Use cached reference to avoid hashmap lookup per row
-        if (cachedTimestampColumn == null) {
-            cachedTimestampColumn = currentTableBuffer.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP);
-        }
-        cachedTimestampColumn.addLong(timestampMicros);
-        sendRow();
-    }
-
-    private void atNanos(long timestampNanos) {
-        // Add designated timestamp column (empty name for designated timestamp)
-        // Use cached reference to avoid hashmap lookup per row
-        if (cachedTimestampNanosColumn == null) {
-            cachedTimestampNanosColumn = currentTableBuffer.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP_NANOS);
-        }
-        cachedTimestampNanosColumn.addLong(timestampNanos);
-        sendRow();
-    }
-
     /**
      * Clamps the soft-flush byte budget to fit under the server's advertised
      * X-QWP-Max-Batch-Size minus a safety margin for encoding overhead
@@ -2318,6 +2300,26 @@ public class QwpWebSocketSender implements Sender {
         } else {
             effectiveAutoFlushBytes = (int) safeBudget;
         }
+    }
+
+    private void atMicros(long timestampMicros) {
+        // Add designated timestamp column (empty name for designated timestamp)
+        // Use cached reference to avoid hashmap lookup per row
+        if (cachedTimestampColumn == null) {
+            cachedTimestampColumn = currentTableBuffer.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP);
+        }
+        cachedTimestampColumn.addLong(timestampMicros);
+        sendRow();
+    }
+
+    private void atNanos(long timestampNanos) {
+        // Add designated timestamp column (empty name for designated timestamp)
+        // Use cached reference to avoid hashmap lookup per row
+        if (cachedTimestampNanosColumn == null) {
+            cachedTimestampNanosColumn = currentTableBuffer.getOrCreateDesignatedTimestampColumn(QwpConstants.TYPE_TIMESTAMP_NANOS);
+        }
+        cachedTimestampNanosColumn.addLong(timestampNanos);
+        sendRow();
     }
 
     private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
@@ -2403,7 +2405,7 @@ public class QwpWebSocketSender implements Sender {
                 if (terminalUpgradeError == null && (
                         classified instanceof QwpVersionMismatchException
                                 || (classified instanceof WebSocketUpgradeException
-                                        && !((WebSocketUpgradeException) classified).isRoleMismatch()))) {
+                                && !((WebSocketUpgradeException) classified).isRoleMismatch()))) {
                     terminalUpgradeError = classified;
                 }
                 hostTracker.recordTransportError(idx);
@@ -2897,7 +2899,6 @@ public class QwpWebSocketSender implements Sender {
         // re-batch with fewer rows per flush. close()'s drain path
         // also relies on this being a clean reset to avoid re-throwing.
         if (serverMaxBatchSize > 0 && messageSize > serverMaxBatchSize) {
-            int oversize = messageSize;
             int droppedRows = pendingRowCount;
             for (int i = 0, n = keys.size(); i < n; i++) {
                 CharSequence tableName = keys.getQuick(i);
@@ -2916,7 +2917,7 @@ public class QwpWebSocketSender implements Sender {
             pendingRowCount = 0;
             firstPendingRowTimeNanos = 0;
             throw new LineSenderException("batch too large for server batch cap")
-                    .put(" [messageSize=").put(oversize)
+                    .put(" [messageSize=").put(messageSize)
                     .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
                     .put(", droppedRows=").put(droppedRows).put(']');
         }
@@ -3130,22 +3131,6 @@ public class QwpWebSocketSender implements Sender {
             default:
                 throw new LineSenderException("Unsupported time unit: " + unit);
         }
-    }
-
-    private long totalBufferedBytes() {
-        long total = 0;
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tb = tableBuffers.get(tableName);
-            if (tb != null) {
-                total += tb.getBufferedBytes();
-            }
-        }
-        return total;
     }
 
     private void validateTableName(CharSequence name) {

@@ -1629,12 +1629,12 @@ public class QwpQueryClient implements QuietCloseable {
                 return;
             }
             if (!failoverEnabled) {
-                handler.onError(probe.interceptedStatus, probe.interceptedMessage);
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus, probe.interceptedMessage);
                 return;
             }
             if (attempt >= failoverMaxAttempts || System.nanoTime() - failoverDeadlineNanos >= 0) {
                 int failovers = Math.max(0, attempt - 1);
-                handler.onError(probe.interceptedStatus,
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
                         "transport failure after " + attempt + " execute attempt"
                                 + (attempt == 1 ? "" : "s") + " ("
                                 + failovers + " failover reconnect"
@@ -1664,7 +1664,7 @@ public class QwpQueryClient implements QuietCloseable {
                 long remaining = remainingNanos <= 0L ? 0L : remainingNanos / 1_000_000L;
                 if (remainingNanos <= 0L) {
                     int failovers = Math.max(0, attempt - 1);
-                    handler.onError(probe.interceptedStatus,
+                    handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
                             "transport failure after " + attempt + " execute attempt"
                                     + (attempt == 1 ? "" : "s") + " ("
                                     + failovers + " failover reconnect"
@@ -1680,7 +1680,7 @@ public class QwpQueryClient implements QuietCloseable {
                         Thread.sleep(delay);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
-                        handler.onError(probe.interceptedStatus,
+                        handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
                                 "failover interrupted while backing off after attempt "
                                         + attempt + "; last error: " + probe.interceptedMessage);
                         return;
@@ -1694,21 +1694,21 @@ public class QwpQueryClient implements QuietCloseable {
                 // Credentials are cluster-wide, so retrying floods server logs
                 // without recovery. Surface a distinct message so monitoring
                 // can pull auth incidents apart from generic transport failures.
-                handler.onError(probe.interceptedStatus,
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
                         "auth failure during failover reconnect [host="
                                 + authErr.getHost() + ':' + authErr.getPort()
                                 + ", status=" + authErr.getStatusCode()
                                 + ", last error: " + probe.interceptedMessage + ']');
                 return;
             } catch (RuntimeException reconnectErr) {
-                handler.onError(probe.interceptedStatus,
+                handler.onError(probe.interceptedRequestId, probe.interceptedStatus,
                         "failover reconnect failed after " + attempt + " attempt"
                                 + (attempt == 1 ? "" : "s") + " [last error: "
                                 + probe.interceptedMessage + ", reconnect error: "
                                 + reconnectErr.getMessage() + ']');
                 return;
             }
-            handler.onFailoverReset(serverInfo);
+            handler.onFailoverReset(probe.interceptedRequestId, serverInfo);
         }
     }
 
@@ -1725,13 +1725,13 @@ public class QwpQueryClient implements QuietCloseable {
         // before close() returns.
         QwpEgressIoThread io = ioThread;
         if (io == null) {
-            probe.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "QwpQueryClient is closed");
+            probe.onError(-1L, WebSocketResponse.STATUS_INTERNAL_ERROR, "QwpQueryClient is closed");
             return;
         }
         GenerationListener listener = currentGenerationListener;
         TerminalFailure tf = listener != null ? listener.get() : null;
         if (tf != null) {
-            probe.markTransportFailure(tf.status, tf.message);
+            probe.markTransportFailure(-1L, tf.status, tf.message);
             return;
         }
         bindValues.reset();
@@ -1746,7 +1746,7 @@ public class QwpQueryClient implements QuietCloseable {
                 // transport failures -- they're deterministic on the user thread --
                 // so they must not trigger failover.
                 bindValues.reset();
-                probe.deliverFinal(
+                probe.deliverFinal(-1L,
                         "bind encoding failed: " + e.getMessage());
                 return;
             }
@@ -1767,19 +1767,19 @@ public class QwpQueryClient implements QuietCloseable {
                             }
                             break;
                         case QueryEvent.KIND_END:
-                            probe.onEnd(ev.totalRows);
+                            probe.onEnd(requestId, ev.totalRows);
                             return;
                         case QueryEvent.KIND_EXEC_DONE:
-                            probe.onExecDone(ev.opType, ev.rowsAffected);
+                            probe.onExecDone(requestId, ev.opType, ev.rowsAffected);
                             return;
                         case QueryEvent.KIND_ERROR:
-                            probe.onError(ev.errorStatus, ev.errorMessage);
+                            probe.onError(requestId, ev.errorStatus, ev.errorMessage);
                             return;
                         case QueryEvent.KIND_TRANSPORT_ERROR:
-                            probe.markTransportFailure(ev.errorStatus, ev.errorMessage);
+                            probe.markTransportFailure(requestId, ev.errorStatus, ev.errorMessage);
                             return;
                         default:
-                            probe.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind);
+                            probe.onError(requestId, WebSocketResponse.STATUS_INTERNAL_ERROR, "unknown event kind " + ev.kind);
                             return;
                     }
                 } finally {
@@ -1793,7 +1793,7 @@ public class QwpQueryClient implements QuietCloseable {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             // Interrupt on the user thread is not a transport failure; surface directly.
-            probe.deliverFinal("interrupted while waiting for server response");
+            probe.deliverFinal(requestId, "interrupted while waiting for server response");
         } finally {
             currentRequestId = -1L;
         }
@@ -2021,6 +2021,7 @@ public class QwpQueryClient implements QuietCloseable {
     private static final class FailoverProbeHandler implements QwpColumnBatchHandler {
         final QwpColumnBatchHandler delegate;
         String interceptedMessage;
+        long interceptedRequestId = -1L;
         byte interceptedStatus;
         boolean transportFailureIntercepted;
 
@@ -2039,6 +2040,11 @@ public class QwpQueryClient implements QuietCloseable {
         }
 
         @Override
+        public void onEnd(long requestId, long totalRows) {
+            delegate.onEnd(requestId, totalRows);
+        }
+
+        @Override
         public void onError(byte status, String message) {
             // Server-emitted QUERY_ERROR. Pass straight through. Transport
             // failures are delivered via markTransportFailure, not here.
@@ -2046,8 +2052,28 @@ public class QwpQueryClient implements QuietCloseable {
         }
 
         @Override
+        public void onError(long requestId, byte status, String message) {
+            delegate.onError(requestId, status, message);
+        }
+
+        @Override
         public void onExecDone(short opType, long rowsAffected) {
             delegate.onExecDone(opType, rowsAffected);
+        }
+
+        @Override
+        public void onExecDone(long requestId, short opType, long rowsAffected) {
+            delegate.onExecDone(requestId, opType, rowsAffected);
+        }
+
+        @Override
+        public void onFailoverReset(QwpServerInfo newNode) {
+            delegate.onFailoverReset(newNode);
+        }
+
+        @Override
+        public void onFailoverReset(long requestId, QwpServerInfo newNode) {
+            delegate.onFailoverReset(requestId, newNode);
         }
 
         /**
@@ -2055,8 +2081,8 @@ public class QwpQueryClient implements QuietCloseable {
          * user. Used for failures that are not transport-related (bind-encode
          * errors, interrupts) so they don't trigger a spurious failover.
          */
-        void deliverFinal(String message) {
-            delegate.onError(WebSocketResponse.STATUS_INTERNAL_ERROR, message);
+        void deliverFinal(long requestId, String message) {
+            delegate.onError(requestId, WebSocketResponse.STATUS_INTERNAL_ERROR, message);
         }
 
         /**
@@ -2066,8 +2092,9 @@ public class QwpQueryClient implements QuietCloseable {
          * (failover=on + reconnect succeeds) or a single final {@code onError}
          * (failover=off or reconnect exhausted).
          */
-        void markTransportFailure(byte status, String message) {
+        void markTransportFailure(long requestId, byte status, String message) {
             transportFailureIntercepted = true;
+            interceptedRequestId = requestId;
             interceptedStatus = status;
             interceptedMessage = message;
         }

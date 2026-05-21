@@ -263,6 +263,27 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
+     * Block until the server has acknowledged every frame up to {@code targetFsn},
+     * or until {@code timeoutMillis} elapses. Pair with {@link #flushAndGetSequence()}
+     * to obtain {@code targetFsn} for a specific flush.
+     * <br>
+     * When {@code request_durable_ack=on} (Enterprise primary replication), {@code targetFsn}
+     * advances after durable upload to object storage, not on the ordinary commit ACK.
+     * <br>
+     * Only the WebSocket QWP transport tracks frame sequence numbers. On other transports
+     * (HTTP, TCP, UDP) the call returns immediately: {@code true} when {@code targetFsn < 0}
+     * (nothing to wait for), {@code false} otherwise.
+     *
+     * @param targetFsn     FSN to wait for; typically the return value of {@link #flushAndGetSequence()}
+     * @param timeoutMillis upper bound on the wait; {@code <= 0} returns the current state without blocking
+     * @return {@code true} if the server has acknowledged up to {@code targetFsn} on return, {@code false} on timeout
+     * @throws LineSenderException if the transport has latched a terminal error
+     */
+    default boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
+        return targetFsn < 0L;
+    }
+
+    /**
      * Add a BINARY column value as a byte array. The bytes are written verbatim
      * with no encoding or transformation. To mark the value NULL, do not call
      * this method for the current row (the null bitmap path).
@@ -475,6 +496,26 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void flush();
 
     /**
+     * Same as {@link #flush()} but returns the highest frame sequence number (FSN) the
+     * call published. Producer-side correlation handle: log
+     * {@code (returnedFsn, domainContext)} alongside the data, then join to the
+     * {@link SenderError#getFromFsn()} / {@link SenderError#getToFsn()} span when an
+     * async error is delivered, or pass it to {@link #awaitAckedFsn(long, long)} for
+     * a bounded blocking wait.
+     * <br>
+     * Returns {@code -1} when nothing was published by this call, and on transports that
+     * do not track frame sequence numbers (HTTP, TCP, UDP).
+     *
+     * @return highest FSN published by this call, or {@code -1} if no data was published
+     *         or the transport does not expose FSNs
+     * @throws LineSenderException under the same conditions as {@link #flush()}
+     */
+    default long flushAndGetSequence() {
+        flush();
+        return -1L;
+    }
+
+    /**
      * Add a GEOHASH column value from pre-packed bits and an explicit bit precision.
      * <p>
      * The {@code bits} long carries the geohash in its low {@code precisionBits} bits;
@@ -521,6 +562,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     default Sender geoHashColumn(CharSequence name, CharSequence value) {
         throw new LineSenderException("current protocol version does not support geohash");
+    }
+
+    /**
+     * Highest frame sequence number (FSN) the server has acknowledged, or that the sender
+     * has skipped past on a {@link SenderError.Policy#DROP_AND_CONTINUE} rejection.
+     * Returns {@code -1} when no batch has been published yet, and on transports that
+     * do not track FSNs (HTTP, TCP, UDP).
+     * <br>
+     * Snapshot accessor: for a bounded blocking wait, use
+     * {@link #awaitAckedFsn(long, long)}.
+     *
+     * @return highest acknowledged FSN, or {@code -1} if none or unsupported
+     */
+    default long getAckedFsn() {
+        return -1L;
     }
 
     /**

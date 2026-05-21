@@ -1,0 +1,301 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.impl;
+
+import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Elastic pool of {@link Sender} instances, each wrapped in a
+ * {@link PooledSender} decorator. The pool keeps at least {@code minSize}
+ * connections warm, grows on demand up to {@code maxSize}, and lets the
+ * housekeeper reap slots that have idled longer than {@code idleTimeoutMillis}
+ * or aged past {@code maxLifetimeMillis} (with {@code minSize} respected at
+ * all times).
+ * <p>
+ * The hot borrow / return path takes a {@link ReentrantLock} but does no
+ * per-call allocation; the underlying {@link ArrayDeque} of free decorators
+ * is pre-sized to {@code maxSize}.
+ * <p>
+ * Connection creation happens outside the lock so a slow connect (TLS
+ * handshake, DNS) does not block other borrowers or the housekeeper. The
+ * pool tracks in-flight creations via {@code inFlightCreations} so the cap
+ * check ({@code allSize + inFlightCreations < maxSize}) stays correct under
+ * concurrent borrows.
+ */
+public final class SenderPool implements AutoCloseable {
+
+    private final long acquireTimeoutMillis;
+    private final ArrayList<PooledSender> all;
+    private final ArrayDeque<PooledSender> available;
+    private final String configurationString;
+    private final long idleTimeoutMillis;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final long maxLifetimeMillis;
+    private final int maxSize;
+    private final int minSize;
+    private final Condition slotReleased;
+    private final ThreadLocal<PooledSender> threadAffine = new ThreadLocal<>();
+    private volatile boolean closed;
+    private int inFlightCreations;
+
+    public SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis
+    ) {
+        if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
+            throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
+        }
+        this.configurationString = configurationString;
+        this.minSize = minSize;
+        this.maxSize = maxSize;
+        this.acquireTimeoutMillis = acquireTimeoutMillis;
+        this.idleTimeoutMillis = idleTimeoutMillis;
+        this.maxLifetimeMillis = maxLifetimeMillis;
+        this.all = new ArrayList<>(maxSize);
+        this.available = new ArrayDeque<>(maxSize);
+        this.slotReleased = lock.newCondition();
+        // Pre-warm minSize connections.
+        int built = 0;
+        try {
+            for (int i = 0; i < minSize; i++) {
+                PooledSender ps = createUnlocked();
+                all.add(ps);
+                available.add(ps);
+                built++;
+            }
+        } catch (RuntimeException e) {
+            for (int i = 0; i < built; i++) {
+                try {
+                    all.get(i).delegate().close();
+                } catch (RuntimeException ignored) {
+                }
+            }
+            throw e;
+        }
+    }
+
+    public PooledSender borrow() {
+        // Track remaining wait via awaitNanos's return value (canonical pattern):
+        // awaitNanos consumes from the budget on each wait and reports what is
+        // left; <= 0 means the budget is exhausted.
+        long remainingNanos = TimeUnit.MILLISECONDS.toNanos(acquireTimeoutMillis);
+        lock.lock();
+        try {
+            while (true) {
+                if (closed) {
+                    throw new LineSenderException("QuestDB handle is closed");
+                }
+                if (!available.isEmpty()) {
+                    PooledSender s = available.pollFirst();
+                    s.markInUse();
+                    return s;
+                }
+                if (all.size() + inFlightCreations < maxSize) {
+                    inFlightCreations++;
+                    lock.unlock();
+                    PooledSender created;
+                    try {
+                        created = createUnlocked();
+                    } catch (RuntimeException e) {
+                        lock.lock();
+                        inFlightCreations--;
+                        slotReleased.signal();
+                        lock.unlock();
+                        throw e;
+                    }
+                    lock.lock();
+                    inFlightCreations--;
+                    if (closed) {
+                        // Pool was closed mid-creation -- destroy the new connection
+                        // rather than leaking it. Other waiters have been signaled
+                        // by close() already.
+                        try {
+                            created.delegate().close();
+                        } catch (RuntimeException ignored) {
+                        }
+                        throw new LineSenderException("QuestDB handle is closed");
+                    }
+                    all.add(created);
+                    created.markInUse();
+                    return created;
+                }
+                if (remainingNanos <= 0) {
+                    throw new LineSenderException(
+                            "timed out waiting for a Sender from the pool after " + acquireTimeoutMillis + "ms");
+                }
+                try {
+                    remainingNanos = slotReleased.awaitNanos(remainingNanos);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new LineSenderException("interrupted while waiting for a Sender from the pool");
+                }
+            }
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    @Override
+    public void close() {
+        lock.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            threadAffine.remove();
+            slotReleased.signalAll();
+        } finally {
+            lock.unlock();
+        }
+        // Snapshot of underlying Senders to close, taken outside the lock so
+        // a slow real-close() doesn't keep the pool latched.
+        for (int i = 0; i < all.size(); i++) {
+            try {
+                all.get(i).delegate().close();
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
+    public void giveBack(PooledSender s) {
+        long now = System.currentTimeMillis();
+        s.markIdleAt(now);
+        lock.lock();
+        try {
+            if (closed) {
+                // Pool already shut down: don't requeue; let close() finish destroying.
+                return;
+            }
+            available.addLast(s);
+            slotReleased.signal();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public PooledSender pinToCurrentThread() {
+        PooledSender pinned = threadAffine.get();
+        if (pinned != null) {
+            return pinned;
+        }
+        PooledSender s = borrow();
+        threadAffine.set(s);
+        return s;
+    }
+
+    /**
+     * Closes idle slots that have exceeded {@code idleTimeoutMillis} or that
+     * have aged past {@code maxLifetimeMillis}. Never shrinks below
+     * {@code minSize}. Called by the {@link PoolHousekeeper} on its tick.
+     */
+    public void reapIdle() {
+        if (closed) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        ArrayList<PooledSender> toClose = null;
+        lock.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            Iterator<PooledSender> it = available.iterator();
+            while (it.hasNext() && all.size() > minSize) {
+                PooledSender s = it.next();
+                boolean idleExpired = idleTimeoutMillis < Long.MAX_VALUE
+                        && (now - s.idleSinceMillis()) >= idleTimeoutMillis;
+                boolean overAge = maxLifetimeMillis < Long.MAX_VALUE
+                        && (now - s.createdAtMillis()) >= maxLifetimeMillis;
+                if (idleExpired || overAge) {
+                    it.remove();
+                    all.remove(s);
+                    if (toClose == null) {
+                        toClose = new ArrayList<>();
+                    }
+                    toClose.add(s);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (toClose != null) {
+            for (int i = 0, n = toClose.size(); i < n; i++) {
+                try {
+                    toClose.get(i).delegate().close();
+                } catch (RuntimeException ignored) {
+                }
+            }
+        }
+    }
+
+    /** Snapshot of the number of idle slots. For tests and introspection. */
+    public int availableSize() {
+        lock.lock();
+        try {
+            return available.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Snapshot of the total number of live slots (idle + in-use). For tests and introspection. */
+    public int totalSize() {
+        lock.lock();
+        try {
+            return all.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void releaseCurrentThread() {
+        PooledSender pinned = threadAffine.get();
+        if (pinned == null) {
+            return;
+        }
+        threadAffine.remove();
+        pinned.close();
+    }
+
+    private PooledSender createUnlocked() {
+        Sender raw = Sender.fromConfig(configurationString);
+        return new PooledSender(raw, this);
+    }
+}
