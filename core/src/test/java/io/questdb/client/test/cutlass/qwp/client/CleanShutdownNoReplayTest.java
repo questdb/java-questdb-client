@@ -71,7 +71,7 @@ public class CleanShutdownNoReplayTest {
     @Test
     public void testFullyAckedActiveDoesNotReplayAfterCleanRestart() throws Exception {
         // Phase 1: server ACKs every frame. Sender writes a few rows,
-        // flushes, then close() blocks for the default 5s drain — by the
+        // flushes, then close() blocks for the default drain — by the
         // time close returns, every frame has been ACK'd.
         int port1 = TestPorts.findUnusedPort();
         AckHandler ack1 = new AckHandler();
@@ -87,7 +87,7 @@ public class CleanShutdownNoReplayTest {
                     sender.flush();
                 }
                 // Wait until the server has ACK'd everything we sent. The
-                // close() drain timeout is 5s by default but we want a
+                // close() drain timeout is 60s by default but we want a
                 // tighter assert that the precondition really holds.
                 long deadline = System.currentTimeMillis() + 3_000L;
                 while (System.currentTimeMillis() < deadline

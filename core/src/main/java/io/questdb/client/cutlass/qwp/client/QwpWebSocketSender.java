@@ -126,6 +126,7 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_AUTO_FLUSH_BYTES = 8 * 1024 * 1024;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
+    public static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MS = 60_000L;
     public static final int DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
@@ -165,7 +166,7 @@ public class QwpWebSocketSender implements Sender {
     // close() drain timeout in millis. Default applied at construction.
     // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
     // up to this many millis for ackedFsn to catch up to publishedFsn.
-    private long closeFlushTimeoutMillis = 5_000L;
+    private long closeFlushTimeoutMillis = DEFAULT_CLOSE_FLUSH_TIMEOUT_MS;
     private volatile boolean closed;
     private boolean connected;
     private SenderConnectionDispatcher connectionDispatcher;
@@ -382,7 +383,7 @@ public class QwpWebSocketSender implements Sender {
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 authorizationHeader, maxSchemasPerConnection,
-                requestDurableAck, cursorEngine, 5_000L);
+                requestDurableAck, cursorEngine, DEFAULT_CLOSE_FLUSH_TIMEOUT_MS);
     }
 
     /**
@@ -800,6 +801,38 @@ public class QwpWebSocketSender implements Sender {
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }
         return true;
+    }
+
+    /**
+     * Flushes all buffered rows into the cursor engine and blocks until the
+     * server has ACKed everything published so far, or until
+     * {@code timeoutMillis} elapses.
+     * <p>
+     * Unlike {@link #close()}, this call does not shut the sender down and does
+     * not use {@code close_flush_timeout_millis}; the caller supplies the wait
+     * budget for this specific drain point. {@code timeoutMillis <= 0} performs
+     * a non-blocking check and throws if the published FSN is not already ACKed.
+     *
+     * @param timeoutMillis upper bound on the ACK wait
+     * @throws LineSenderException if the sender is closed, a row is still in
+     *                             progress, a terminal WebSocket failure is
+     *                             observed, or the timeout elapses before all
+     *                             published batches are ACKed
+     */
+    @Override
+    public void drain(long timeoutMillis) {
+        long target = flushAndGetSequence();
+        if (!awaitAckedFsn(target, timeoutMillis)) {
+            long acked = getAckedFsn();
+            LOG.warn("drain() timed out after {}ms [target={} acked={}], pending data is still in flight",
+                    timeoutMillis, target, acked);
+            throw new LineSenderException("drain() timed out after ")
+                    .put(timeoutMillis).put(" ms [publishedFsn=")
+                    .put(target).put(", ackedFsn=").put(acked)
+                    .put("] - server did not acknowledge ")
+                    .put(target - acked)
+                    .put(" pending batches");
+        }
     }
 
     /**

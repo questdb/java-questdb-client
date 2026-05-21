@@ -475,6 +475,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void flush();
 
     /**
+     * Force flushing internal buffers to the server, then wait until the server
+     * acknowledges everything published so far, or until {@code timeoutMillis}
+     * elapses.
+     * <p>
+     * This acknowledgement drain is currently supported only by the WebSocket
+     * transport. It is useful for call sites that need an explicit durability
+     * checkpoint without closing the sender. The close-time drain budget is
+     * configured separately with {@link LineSenderBuilder#closeFlushTimeoutMillis(long)}.
+     *
+     * @param timeoutMillis upper bound on the acknowledgement wait
+     */
+    default void drain(long timeoutMillis) {
+        throw new LineSenderException("drain(timeoutMillis) is only supported for WebSocket transport");
+    }
+
+    /**
      * Add a GEOHASH column value from pre-packed bits and an explicit bit precision.
      * <p>
      * The {@code bits} long carries the geohash in its low {@code precisionBits} bits;
@@ -846,10 +862,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
         private static final int DEFAULT_AUTO_FLUSH_ROWS = 75_000;
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
-        // Default close() drain timeout: block up to 5s waiting for the
+        // Default close() drain timeout: block up to 60s waiting for the
         // server to ACK everything published into the engine before
         // shutting down the I/O loop.
-        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = 5_000L;
+        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = QwpWebSocketSender.DEFAULT_CLOSE_FLUSH_TIMEOUT_MS;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
@@ -1548,7 +1564,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * close() drain timeout in milliseconds. The sender's {@code close()}
          * method blocks up to this many millis waiting for the server to ACK
          * every batch already published into the engine before shutting down
-         * the I/O loop. Default {@code 5000}.
+         * the I/O loop. Default {@code 60000}.
          * <p>
          * Set to {@code 0} or {@code -1} to opt out — close() will not wait
          * at all (fast close). Pending data is then lost in memory mode and

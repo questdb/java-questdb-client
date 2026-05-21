@@ -52,7 +52,7 @@ public class CloseDrainTest {
     @Test
     public void testCloseBlocksUntilAckArrives() throws Exception {
         // Server delays every ACK by 800ms. With the default
-        // close_flush_timeout_millis=5000, close() must wait for that ACK
+        // close_flush_timeout_millis=60000, close() must wait for that ACK
         // before returning. Pre-fix close() returned within milliseconds.
         int port = TestPorts.findUnusedPort();
         long ackDelayMs = 800;
@@ -106,15 +106,72 @@ public class CloseDrainTest {
     }
 
     @Test
+    public void testDrainBlocksUntilAckArrives() throws Exception {
+        int port = TestPorts.findUnusedPort();
+        long ackDelayMs = 800;
+        DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + port
+                    + ";close_flush_timeout_millis=0;";
+            long elapsedMs;
+            try (Sender sender = Sender.fromConfig(cfg)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                long t0 = System.nanoTime();
+                sender.drain(5_000);
+                elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+            }
+            Assert.assertTrue(
+                    "drain() took only " + elapsedMs + "ms — did not wait for ACK",
+                    elapsedMs >= ackDelayMs / 2);
+        }
+    }
+
+    @Test
+    public void testDrainTimesOutWhenAcksNeverArrive() throws Exception {
+        int port = TestPorts.findUnusedPort();
+        long timeoutMs = 500;
+        SilentHandler handler = new SilentHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + port
+                    + ";close_flush_timeout_millis=0;";
+            long elapsedMs;
+            Sender sender = Sender.fromConfig(cfg);
+            try {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                long t0 = System.nanoTime();
+                try {
+                    sender.drain(timeoutMs);
+                    Assert.fail("drain() should have thrown a timeout error");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue("expected drain-timeout message, got: " + e.getMessage(),
+                            e.getMessage().contains("drain() timed out"));
+                }
+                elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+            } finally {
+                sender.close();
+            }
+            Assert.assertTrue("drain() returned too early: " + elapsedMs + "ms",
+                    elapsedMs >= timeoutMs);
+            Assert.assertTrue("drain() exceeded the bounded timeout by too much: " + elapsedMs + "ms",
+                    elapsedMs < timeoutMs * 4);
+        }
+    }
+
+    @Test
     public void testCloseFastWhenTimeoutIsMinusOne() throws Exception {
         // Documented contract: close_flush_timeout_millis=-1 opts out of the
         // drain (fast close), same as 0. See LineSenderBuilder#closeFlushTimeoutMillis
         // Javadoc — "Set to 0 or -1 to opt out — close() will not wait at all".
         //
-        // Currently fails because -1 collides with the PARAMETER_NOT_SET_EXPLICITLY
-        // sentinel in LineSenderBuilder, so the build path silently substitutes
-        // DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS (5000ms) and close() blocks for the
-        // full ACK delay instead of returning fast.
+        // Regression guard: -1 must not collide with LineSenderBuilder's
+        // "parameter not set" sentinel and silently substitute the default
+        // close flush timeout.
         int port = TestPorts.findUnusedPort();
         long ackDelayMs = 1500;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
