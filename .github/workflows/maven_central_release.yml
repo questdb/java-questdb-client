@@ -90,7 +90,6 @@ jobs:
         run: |
           required_vars=(
             MAVEN_GPG_PRIVATE_KEY
-            MAVEN_GPG_PASSPHRASE
             MAVEN_CENTRAL_USERNAME
             MAVEN_CENTRAL_PASSWORD
           )
@@ -104,6 +103,9 @@ jobs:
 
       - name: Configure Maven settings.xml
         run: |
+          if [[ -z "${MAVEN_GPG_PASSPHRASE+x}" ]]; then
+            echo "MAVEN_GPG_PASSPHRASE=" >> "$GITHUB_ENV"
+          fi
           mkdir -p "$HOME/.m2"
           cat > "$HOME/.m2/settings.xml" <<'EOF'
           <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
