@@ -565,10 +565,10 @@ public class SegmentRingTest {
                     }
                 }
 
-                long startMs = System.currentTimeMillis();
+                SegmentRing.resetSortComparisons();
                 try (SegmentRing ring = SegmentRing.openExisting(tmpDir,
                         MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 16)) {
-                    long elapsed = System.currentTimeMillis() - startMs;
+                    long comparisons = SegmentRing.getSortComparisons();
                     assertNotNull("recovery must produce a ring", ring);
                     // After recovery, the ring's nextSeqHint is one past the
                     // last frame on disk. With one frame per segment numbered
@@ -577,14 +577,22 @@ public class SegmentRingTest {
                             n, ring.nextSeqHint());
                     // publishedFsn = n - 1 (last frame visible).
                     assertEquals(n - 1, ring.publishedFsn());
-                    // 5s is comfortably above the quicksort path (sub-second on
-                    // any modern machine) and well below the seconds-of-CPU the
-                    // production-ceiling O(N²) regression would produce. Tight
-                    // enough to fire if the algorithm regresses, loose enough
-                    // to survive a slow CI runner.
-                    assertTrue("recovery took " + elapsed + " ms (expected < 5000); "
-                                    + "regression suggests the segment sort is back to O(N²)",
-                            elapsed < 5_000);
+                    // O(N log N) quicksort with good pivots does ~2-3 * N * log2(N)
+                    // comparisons; the partition-pass + median-of-three counter we
+                    // increment per recursive frame upper-bounds this at roughly
+                    // 3 N log2(N). The naive O(N²) regression on already-sorted
+                    // input would do ~N(N-1)/2 -- 2.1M at N=2048 vs the ~67k a
+                    // healthy sort produces. The 5x N log2(N) bound below sits
+                    // about 30x below the O(N²) value and 1.5x above the
+                    // expected count, so it fires on a real regression without
+                    // flapping on harmless implementation drift. Comparison
+                    // counts are deterministic across CI hardware, unlike the
+                    // wall-clock bound this assertion used to carry.
+                    long bound = 5L * n * (long) (Math.log(n) / Math.log(2));
+                    assertTrue("sort took " + comparisons + " comparisons (expected < " + bound
+                                    + " = 5 * N * log2(N) for N=" + n + "); "
+                                    + "regression suggests the segment sort is back to O(N^2)",
+                            comparisons < bound);
                 }
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
