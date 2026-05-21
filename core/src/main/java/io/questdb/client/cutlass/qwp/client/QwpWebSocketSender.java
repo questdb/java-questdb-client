@@ -1520,6 +1520,12 @@ public class QwpWebSocketSender implements Sender {
         return d == null ? 0L : d.getDroppedNotifications();
     }
 
+    /** Returns the live byte budget the auto-flush path actually enforces. */
+    @TestOnly
+    public int getEffectiveAutoFlushBytes() {
+        return effectiveAutoFlushBytes;
+    }
+
     /**
      * Snapshot of the typed payload for the latched terminal server-rejection error,
      * or {@code null} if the I/O loop has not latched a server-rejection terminal
@@ -1544,6 +1550,26 @@ public class QwpWebSocketSender implements Sender {
             currentBatchMaxSymbolId = globalId;
         }
         return globalId;
+    }
+
+    /**
+     * Running tally the row builder maintains so auto-flush thresholds can be
+     * evaluated without re-walking every table per row. Exposed for tests
+     * that compare this incremental counter against a ground-truth walk.
+     */
+    @TestOnly
+    public long getPendingBytes() {
+        return pendingBytes;
+    }
+
+    /**
+     * Server-advertised cap on the per-batch raw byte size. Zero before the
+     * first connect; updated by every successful reconnect via
+     * {@link #applyServerBatchSizeLimit(int)}.
+     */
+    @TestOnly
+    public int getServerMaxBatchSize() {
+        return serverMaxBatchSize;
     }
 
     @TestOnly
@@ -1928,6 +1954,17 @@ public class QwpWebSocketSender implements Sender {
      * publishing or reconnect. See {@link SenderConnectionListener} for the
      * full delivery contract.
      */
+    /**
+     * Forces the {@code connected} flag without going through the real
+     * connect handshake. Lets unit tests exercise post-connect code paths
+     * (auto-flush bookkeeping, batch-size guards, ack tracking) on a
+     * sender that never opened a socket. Never call from production code.
+     */
+    @TestOnly
+    public void setConnectedForTest(boolean connected) {
+        this.connected = connected;
+    }
+
     public void setConnectionListener(SenderConnectionListener listener) {
         SenderConnectionListener effective = listener != null ? listener : DefaultSenderConnectionListener.INSTANCE;
         this.connectionListener = effective;
@@ -2277,7 +2314,8 @@ public class QwpWebSocketSender implements Sender {
      * preserved even when the server advertises a cap, so applications that
      * opted out keep the contract they asked for.
      */
-    private void applyServerBatchSizeLimit(int advertisedMaxBatchSize) {
+    @TestOnly
+    public void applyServerBatchSizeLimit(int advertisedMaxBatchSize) {
         serverMaxBatchSize = advertisedMaxBatchSize;
         if (autoFlushBytes <= 0) {
             // User opted out of byte-based auto-flush; respect that even when
@@ -2952,10 +2990,6 @@ public class QwpWebSocketSender implements Sender {
         firstPendingRowTimeNanos = 0;
     }
 
-    private long getPendingBytes() {
-        return pendingBytes;
-    }
-
     private void resetSchemaStateForNewConnection() {
         maxSentSchemaId = -1;
         nextSchemaId = 0;
@@ -3131,6 +3165,32 @@ public class QwpWebSocketSender implements Sender {
             default:
                 throw new LineSenderException("Unsupported time unit: " + unit);
         }
+    }
+
+    /**
+     * Total buffered bytes across every per-table column buffer. Sums the
+     * tableBuffers map with the same null-tolerant walk the old sendRow path
+     * used. Currently dead in production code (the sendRow accounting was
+     * inlined for tighter bookkeeping) but kept so
+     * {@code QwpWebSocketSenderTest} can exercise the walk shape directly
+     * and {@code QwpTotalBufferedBytesBenchmark} can quote it as the
+     * baseline it benchmarks. Removing it would break both.
+     */
+    @TestOnly
+    public long totalBufferedBytes() {
+        long total = 0;
+        ObjList<CharSequence> keys = tableBuffers.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tb = tableBuffers.get(tableName);
+            if (tb != null) {
+                total += tb.getBufferedBytes();
+            }
+        }
+        return total;
     }
 
     private void validateTableName(CharSequence name) {

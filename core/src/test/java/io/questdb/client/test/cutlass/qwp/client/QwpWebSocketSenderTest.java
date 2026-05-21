@@ -36,9 +36,6 @@ import io.questdb.client.std.bytes.DirectByteSlice;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
@@ -60,10 +57,10 @@ public class QwpWebSocketSenderTest {
                     /*autoFlushIntervalNanos*/ 0L)) {
                 // Server advertises 16 MB. Configured 32 MB is over the cap,
                 // so the effective budget should drop to 90% of 16 MB.
-                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
-                int effective = getEffectiveAutoFlushBytes(sender);
+                sender.applyServerBatchSizeLimit(16 * 1024 * 1024);
+                int effective = sender.getEffectiveAutoFlushBytes();
                 Assert.assertEquals((long) (16 * 1024 * 1024) * 9 / 10, effective);
-                Assert.assertEquals(16 * 1024 * 1024, getServerMaxBatchSize(sender));
+                Assert.assertEquals(16 * 1024 * 1024, sender.getServerMaxBatchSize());
             }
         });
     }
@@ -78,9 +75,9 @@ public class QwpWebSocketSenderTest {
                     /*autoFlushIntervalNanos*/ 0L)) {
                 // 0 advertisement = older server. Effective budget must equal
                 // the configured value verbatim so the sender keeps working.
-                invokeApplyServerBatchSizeLimit(sender, 0);
-                Assert.assertEquals(2 * 1024 * 1024, getEffectiveAutoFlushBytes(sender));
-                Assert.assertEquals(0, getServerMaxBatchSize(sender));
+                sender.applyServerBatchSizeLimit(0);
+                Assert.assertEquals(2 * 1024 * 1024, sender.getEffectiveAutoFlushBytes());
+                Assert.assertEquals(0, sender.getServerMaxBatchSize());
             }
         });
     }
@@ -95,8 +92,8 @@ public class QwpWebSocketSenderTest {
                     /*autoFlushIntervalNanos*/ 0L)) {
                 // Server advertises 16 MB; configured 2 MB is well below.
                 // Keep the user's tighter budget rather than overriding it.
-                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
-                Assert.assertEquals(2 * 1024 * 1024, getEffectiveAutoFlushBytes(sender));
+                sender.applyServerBatchSizeLimit(16 * 1024 * 1024);
+                Assert.assertEquals(2 * 1024 * 1024, sender.getEffectiveAutoFlushBytes());
             }
         });
     }
@@ -112,9 +109,9 @@ public class QwpWebSocketSenderTest {
                 // User explicitly disabled the byte trigger. The server's
                 // advertised cap must update serverMaxBatchSize (for the
                 // single-row guard) but must not re-enable byte flushing.
-                invokeApplyServerBatchSizeLimit(sender, 16 * 1024 * 1024);
-                Assert.assertEquals(0, getEffectiveAutoFlushBytes(sender));
-                Assert.assertEquals(16 * 1024 * 1024, getServerMaxBatchSize(sender));
+                sender.applyServerBatchSizeLimit(16 * 1024 * 1024);
+                Assert.assertEquals(0, sender.getEffectiveAutoFlushBytes());
+                Assert.assertEquals(16 * 1024 * 1024, sender.getServerMaxBatchSize());
             }
         });
     }
@@ -529,7 +526,7 @@ public class QwpWebSocketSenderTest {
                 // Bypass ensureConnected: sendRow only short-circuits on
                 // connected==true and we don't drive any path that touches
                 // the cursor engine in this test.
-                setConnected(sender);
+                sender.setConnectedForTest(true);
 
                 // Round-robin three tables to exercise the per-row delta
                 // logic across switches. The running pendingBytes must
@@ -541,8 +538,8 @@ public class QwpWebSocketSenderTest {
                     sender.atNow();
                     Assert.assertEquals(
                             "row " + i + ": pendingBytes diverged from ground truth",
-                            invokeTotalBufferedBytes(sender),
-                            getPendingBytes(sender));
+                            sender.totalBufferedBytes(),
+                            sender.getPendingBytes());
                 }
             }
         });
@@ -556,19 +553,19 @@ public class QwpWebSocketSenderTest {
                     /*autoFlushRows*/ Integer.MAX_VALUE,
                     /*autoFlushBytes*/ 0,
                     /*autoFlushIntervalNanos*/ 0L)) {
-                setConnected(sender);
+                sender.setConnectedForTest(true);
 
                 sender.table("t0").longColumn("a", 1).longColumn("b", 2).atNow();
-                long committed = getPendingBytes(sender);
-                Assert.assertEquals(invokeTotalBufferedBytes(sender), committed);
+                long committed = sender.getPendingBytes();
+                Assert.assertEquals(sender.totalBufferedBytes(), committed);
 
                 // Begin a row, then cancel. The committed bytes must not
                 // change and pendingBytes must still match ground truth.
                 sender.table("t0").longColumn("a", 99);
                 sender.cancelRow();
 
-                Assert.assertEquals(committed, getPendingBytes(sender));
-                Assert.assertEquals(invokeTotalBufferedBytes(sender), getPendingBytes(sender));
+                Assert.assertEquals(committed, sender.getPendingBytes());
+                Assert.assertEquals(sender.totalBufferedBytes(), sender.getPendingBytes());
             }
         });
     }
@@ -706,64 +703,6 @@ public class QwpWebSocketSenderTest {
                     "expected message to mention 'closed', got: " + e.getMessage(),
                     e.getMessage() != null && e.getMessage().contains("closed"));
         }
-    }
-
-    private static int getEffectiveAutoFlushBytes(QwpWebSocketSender sender) throws Exception {
-        Field field = QwpWebSocketSender.class.getDeclaredField("effectiveAutoFlushBytes");
-        field.setAccessible(true);
-        return field.getInt(sender);
-    }
-
-    private static long getPendingBytes(QwpWebSocketSender sender) throws Exception {
-        Field field = QwpWebSocketSender.class.getDeclaredField("pendingBytes");
-        field.setAccessible(true);
-        return field.getLong(sender);
-    }
-
-    private static int getServerMaxBatchSize(QwpWebSocketSender sender) throws Exception {
-        Field field = QwpWebSocketSender.class.getDeclaredField("serverMaxBatchSize");
-        field.setAccessible(true);
-        return field.getInt(sender);
-    }
-
-    private static void invokeApplyServerBatchSizeLimit(QwpWebSocketSender sender, int advertised) throws Exception {
-        Method m = QwpWebSocketSender.class.getDeclaredMethod("applyServerBatchSizeLimit", int.class);
-        m.setAccessible(true);
-        try {
-            m.invoke(sender, advertised);
-        } catch (InvocationTargetException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof Exception) {
-                throw (Exception) cause;
-            }
-            if (cause instanceof Error) {
-                throw (Error) cause;
-            }
-            throw new RuntimeException(cause);
-        }
-    }
-
-    private static long invokeTotalBufferedBytes(QwpWebSocketSender sender) throws Exception {
-        Method m = QwpWebSocketSender.class.getDeclaredMethod("totalBufferedBytes");
-        m.setAccessible(true);
-        try {
-            return (long) m.invoke(sender);
-        } catch (InvocationTargetException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof Exception) {
-                throw (Exception) cause;
-            }
-            if (cause instanceof Error) {
-                throw (Error) cause;
-            }
-            throw new RuntimeException(cause);
-        }
-    }
-
-    private static void setConnected(QwpWebSocketSender sender) throws Exception {
-        Field field = QwpWebSocketSender.class.getDeclaredField("connected");
-        field.setAccessible(true);
-        field.setBoolean(sender, true);
     }
 
     /**
