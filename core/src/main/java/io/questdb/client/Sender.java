@@ -467,6 +467,29 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     Sender doubleColumn(CharSequence name, double value);
 
     /**
+     * Convenience: flush every buffered row and block until the server has
+     * acknowledged the resulting frame, or until {@code timeoutMillis} elapses.
+     * Equivalent to {@code awaitAckedFsn(flushAndGetSequence(), timeoutMillis)},
+     * which is the same shape as the implicit drain {@link #close()} runs --
+     * with the caller controlling the timeout per call-site rather than
+     * relying on the builder-time {@code close_flush_timeout_millis}.
+     * <br>
+     * Returns immediately on transports that do not track frame sequence
+     * numbers ({@code HTTP}, {@code TCP}, {@code UDP}): the flush still
+     * happens, the wait is a no-op, and the return value is {@code true}.
+     *
+     * @param timeoutMillis upper bound on the wait; {@code <= 0} returns the
+     *                      current state without blocking (the flush still
+     *                      happens before the check)
+     * @return {@code true} if the server has acknowledged every published
+     *         frame on return, {@code false} on timeout
+     * @throws LineSenderException if the transport has latched a terminal error
+     */
+    default boolean drain(long timeoutMillis) {
+        return awaitAckedFsn(flushAndGetSequence(), timeoutMillis);
+    }
+
+    /**
      * Add a column with a 32-bit floating point value.
      *
      * @param name  name of the column

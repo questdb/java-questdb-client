@@ -178,6 +178,95 @@ public class CloseDrainTest {
     }
 
     @Test
+    public void testDrainBlocksUntilAckArrivesAndReturnsTrue() throws Exception {
+        // Public drain(timeoutMillis): explicit pre-close drain that the
+        // caller controls per call-site. Same delayed-ACK server as
+        // testCloseBlocksUntilAckArrives, but the wait happens inside the
+        // explicit drain() call. The subsequent close() should be a near-
+        // instant no-op because everything is already acked.
+        int port = TestPorts.findUnusedPort();
+        long ackDelayMs = 600;
+        DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + port + ";";
+            try (Sender sender = Sender.fromConfig(cfg)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                long t0 = System.nanoTime();
+                boolean drained = sender.drain(5_000);
+                long drainElapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                Assert.assertTrue("drain(5000) must return true when the ACK arrives within budget",
+                        drained);
+                Assert.assertTrue("drain returned too fast (no actual wait): " + drainElapsedMs + "ms",
+                        drainElapsedMs >= ackDelayMs / 2);
+
+                long c0 = System.nanoTime();
+                sender.close();
+                long closeElapsedMs = (System.nanoTime() - c0) / 1_000_000;
+                Assert.assertTrue("close() after drained sender should be near-instant, was "
+                        + closeElapsedMs + "ms",
+                        closeElapsedMs < ackDelayMs);
+            }
+        }
+    }
+
+    @Test
+    public void testDrainReturnsFalseOnTimeoutAndSenderStillUsable() throws Exception {
+        // Server never ACKs. drain() with a small timeout must return false
+        // rather than throw (unlike close()'s implicit drain, which
+        // converts a timeout into a LineSenderException). The sender stays
+        // usable for further row writes after a false return; the
+        // outstanding frames remain pending and close()'s own drain still
+        // runs.
+        int port = TestPorts.findUnusedPort();
+        SilentHandler handler = new SilentHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + port + ";close_flush_timeout_millis=0;";
+            try (Sender sender = Sender.fromConfig(cfg)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                long t0 = System.nanoTime();
+                boolean drained = sender.drain(200);
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                Assert.assertFalse("drain must return false when the server never acks", drained);
+                Assert.assertTrue("drain returned far past the timeout: " + elapsedMs + "ms",
+                        elapsedMs >= 150 && elapsedMs < 2_000);
+                // Sender must still be usable: write another row and flush
+                // without observing the latched error from the silent peer.
+                sender.table("foo").longColumn("v", 2L).atNow();
+                sender.flush();
+            }
+        }
+    }
+
+    @Test
+    public void testDrainNonZeroTimeoutOnFastServerReturnsImmediately() throws Exception {
+        // Fast server: every frame is acked promptly. drain(longTimeout)
+        // must return true quickly -- no spurious wait when there is
+        // nothing to wait for.
+        int port = TestPorts.findUnusedPort();
+        DelayingAckHandler handler = new DelayingAckHandler(0);
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + port + ";";
+            try (Sender sender = Sender.fromConfig(cfg)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                long t0 = System.nanoTime();
+                Assert.assertTrue(sender.drain(5_000));
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                Assert.assertTrue("drain on a fast server must return promptly, took " + elapsedMs + "ms",
+                        elapsedMs < 2_000);
+            }
+        }
+    }
+
+    @Test
     public void testAsyncCloseDrainSucceedsWhenServerStartsDuringDrain() throws Exception {
         int port = TestPorts.findUnusedPort();
         DelayingAckHandler handler = new DelayingAckHandler(0);

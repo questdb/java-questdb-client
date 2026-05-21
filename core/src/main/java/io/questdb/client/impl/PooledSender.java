@@ -215,6 +215,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public boolean drain(long timeoutMillis) {
+        return delegate.drain(timeoutMillis);
+    }
+
+    @Override
     public Sender floatColumn(CharSequence name, float value) {
         delegate.floatColumn(name, value);
         return this;
