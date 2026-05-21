@@ -179,6 +179,14 @@ public final class SenderPool implements AutoCloseable {
                 return;
             }
             closed = true;
+            // Mark every pooled wrapper invalidated so pinToCurrentThread()
+            // on other threads -- which never takes this lock -- can detect
+            // that its cached entry no longer wraps a live delegate. Removing
+            // the calling thread's ThreadLocal only clears one slot; other
+            // threads' slots survive until they read the flag.
+            for (int i = 0; i < all.size(); i++) {
+                all.get(i).markInvalidated();
+            }
             threadAffine.remove();
             slotReleased.signalAll();
         } finally {
@@ -191,6 +199,32 @@ public final class SenderPool implements AutoCloseable {
                 all.get(i).delegate().close();
             } catch (RuntimeException ignored) {
             }
+        }
+    }
+
+    /**
+     * Evicts a slot whose delegate has failed (typically a {@code flush()}
+     * failure observed in {@link PooledSender#close()}). The wrapper is
+     * marked invalidated so any thread-pinned reference gets rejected on the
+     * next {@link #pinToCurrentThread()} call; the slot is removed from
+     * {@code all} so the pool can grow back into a fresh slot on demand. The
+     * underlying delegate is closed outside the lock so a slow real-close
+     * does not stall other borrowers.
+     */
+    void discardBroken(PooledSender s) {
+        s.markInvalidated();
+        lock.lock();
+        try {
+            all.remove(s);
+            // Wake one waiter -- the cap check in borrow() uses all.size(),
+            // so a freed slot may now allow a creation attempt.
+            slotReleased.signal();
+        } finally {
+            lock.unlock();
+        }
+        try {
+            s.delegate().close();
+        } catch (RuntimeException ignored) {
         }
     }
 
@@ -212,8 +246,11 @@ public final class SenderPool implements AutoCloseable {
 
     public PooledSender pinToCurrentThread() {
         PooledSender pinned = threadAffine.get();
-        if (pinned != null) {
+        if (pinned != null && !pinned.isInvalidated()) {
             return pinned;
+        }
+        if (pinned != null) {
+            threadAffine.remove();
         }
         PooledSender s = borrow();
         threadAffine.set(s);
@@ -291,6 +328,10 @@ public final class SenderPool implements AutoCloseable {
             return;
         }
         threadAffine.remove();
+        if (pinned.isInvalidated()) {
+            // Pool was closed: delegate is already closed, skip flush/giveBack.
+            return;
+        }
         pinned.close();
     }
 

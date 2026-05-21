@@ -52,6 +52,7 @@ public final class PooledSender implements Sender {
     private final SenderPool pool;
     private volatile long idleSinceMillis;
     private volatile boolean inUse;
+    private volatile boolean invalidated;
 
     PooledSender(Sender delegate, SenderPool pool) {
         this.delegate = delegate;
@@ -138,11 +139,24 @@ public final class PooledSender implements Sender {
         if (!inUse) {
             return;
         }
+        boolean broken = false;
         try {
             delegate.flush();
+        } catch (RuntimeException e) {
+            // Sender does not clear its buffer on flush failure (see
+            // Sender Javadoc), and WebSocket transport latches the failure
+            // for good. Either way, the wrapper is unsafe to recycle: the
+            // next borrower would inherit the failed rows or a dead
+            // connection.
+            broken = true;
+            throw e;
         } finally {
             inUse = false;
-            pool.giveBack(this);
+            if (broken) {
+                pool.discardBroken(this);
+            } else {
+                pool.giveBack(this);
+            }
         }
     }
 
@@ -350,11 +364,19 @@ public final class PooledSender implements Sender {
         return inUse;
     }
 
+    boolean isInvalidated() {
+        return invalidated;
+    }
+
     void markIdleAt(long nowMillis) {
         idleSinceMillis = nowMillis;
     }
 
     void markInUse() {
         inUse = true;
+    }
+
+    void markInvalidated() {
+        invalidated = true;
     }
 }

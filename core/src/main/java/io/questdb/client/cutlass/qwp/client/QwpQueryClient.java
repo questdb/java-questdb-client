@@ -35,6 +35,7 @@ import io.questdb.client.std.Chars;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Zstd;
 import io.questdb.client.std.str.StringSink;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -252,6 +253,14 @@ public class QwpQueryClient implements QuietCloseable {
     // re-clamp) so a misconfigured server is observable from user code.
     private int negotiatedZstdLevel;
     private long nextRequestId = 1;
+    // Cancel intent latched between {@link #cancel} and the point where
+    // {@link #executeOnce} assigns {@link #currentRequestId}. Without this
+    // latch, a cancel arriving in the dispatch window (after the user thread's
+    // submit() returned but before the worker reached the requestId write) is
+    // dropped silently because cancel()'s wire-send is gated on a non-negative
+    // currentRequestId. Volatile so a cancel from any thread is visible to the
+    // worker thread's post-requestId read.
+    private volatile boolean pendingCancel;
     // Decoded SERVER_INFO from the current connection's handshake. Null before
     // connect() has succeeded, and on connections that negotiated v1 (which
     // doesn't emit the frame). Volatile so the I/O thread's read on the
@@ -713,6 +722,13 @@ public class QwpQueryClient implements QuietCloseable {
      * handler's {@code onError} (on the execute-ing thread) will see it.
      */
     public void cancel() {
+        // Latch FIRST so a cancel arriving in the dispatch window (after
+        // execute() cleared the latch but before executeOnce() wrote
+        // currentRequestId) is observed on the worker thread's
+        // post-requestId read. Without this, cancel() reads
+        // currentRequestId == -1, the wire-send is skipped, and the user's
+        // intent is silently dropped.
+        pendingCancel = true;
         QwpEgressIoThread io = ioThread;
         long id = currentRequestId;
         if (io != null && id >= 0L) {
@@ -967,6 +983,12 @@ public class QwpQueryClient implements QuietCloseable {
             throw new IllegalStateException(
                     "QwpQueryClient.execute called while another execute is in flight; one query at a time per client");
         }
+        // Drop any cancel latched between calls (e.g., a watchdog that fired
+        // while no request was in flight, or a previous pooled user that
+        // released the client without ever calling execute). Failover retries
+        // inside this execute() must still honor a fresh cancel, so the latch
+        // is intentionally NOT cleared inside executeOnce().
+        pendingCancel = false;
         try {
             executeImpl(sql, binds, handler);
         } finally {
@@ -1049,6 +1071,17 @@ public class QwpQueryClient implements QuietCloseable {
 
     public boolean isConnected() {
         return connected;
+    }
+
+    /**
+     * Test-only view of the dispatch-window cancel latch. Returns {@code true}
+     * when {@link #cancel} was invoked after the outermost {@link #execute}
+     * cleared the latch and before {@link #execute} has consumed it on the
+     * {@code currentRequestId = requestId} write.
+     */
+    @TestOnly
+    public boolean isPendingCancelForTest() {
+        return pendingCancel;
     }
 
     /**
@@ -1753,6 +1786,13 @@ public class QwpQueryClient implements QuietCloseable {
         }
         long requestId = nextRequestId++;
         currentRequestId = requestId;
+        // Honor a cancel that arrived during the dispatch window. The latch
+        // is intentionally not cleared here: if this attempt fails over,
+        // the retry must also be cancelled. The latch is cleared once at
+        // the outermost execute() entry.
+        if (pendingCancel) {
+            io.requestCancel(requestId);
+        }
         try {
             io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen());
             while (true) {

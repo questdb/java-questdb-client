@@ -63,6 +63,35 @@ public class SenderPoolTest {
     }
 
     @Test
+    public void testBrokenSenderIsNotReturnedToPool() {
+        // Borrowing, buffering a row, and then closing forces flush() against
+        // the unreachable address, which throws. The broken wrapper must not
+        // be returned to the pool: its delegate's buffer still holds the
+        // failed row, and on transports with terminal-failure semantics the
+        // delegate is also unusable. Either way, the next borrower must get
+        // a fresh wrapper.
+        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+            Sender first = pool.borrow();
+            first.table("t").longColumn("v", 1).atNow();
+            try {
+                first.close();
+                Assert.fail("close() with buffered rows against an unreachable host must throw");
+            } catch (LineSenderException ignored) {
+                // expected
+            }
+            Sender second = pool.borrow();
+            try {
+                Assert.assertNotSame("broken sender must not be handed back to next borrower",
+                        first, second);
+            } finally {
+                if (second != first) {
+                    second.close();
+                }
+            }
+        }
+    }
+
+    @Test
     public void testCloseIdempotent() {
         SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
         pool.close();
@@ -228,6 +257,70 @@ public class SenderPoolTest {
             Thread.sleep(100);
             pool.reapIdle();
             Assert.assertEquals("min=2 must be preserved", 2, pool.totalSize());
+        }
+    }
+
+    @Test
+    public void testPinAfterCloseRejectsStaleEntry() throws Exception {
+        // Pin from a worker thread, close the pool from main. The worker's
+        // ThreadLocal still references its PooledSender, but the underlying
+        // delegate has been closed. The next pinToCurrentThread() on the
+        // worker must reject the stale entry instead of handing it back.
+        SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
+        CountDownLatch pinned = new CountDownLatch(1);
+        CountDownLatch closed = new CountDownLatch(1);
+        AtomicReference<Throwable> secondCallError = new AtomicReference<>();
+        Thread worker = new Thread(() -> {
+            try {
+                pool.pinToCurrentThread();
+                pinned.countDown();
+                Assert.assertTrue(closed.await(2, TimeUnit.SECONDS));
+                try {
+                    pool.pinToCurrentThread();
+                    secondCallError.set(new AssertionError("pinToCurrentThread after close must throw"));
+                } catch (LineSenderException e) {
+                    // expected
+                }
+            } catch (Throwable t) {
+                secondCallError.set(t);
+            }
+        });
+        worker.start();
+        Assert.assertTrue(pinned.await(2, TimeUnit.SECONDS));
+        pool.close();
+        closed.countDown();
+        worker.join(2_000);
+        if (secondCallError.get() != null) {
+            throw new AssertionError(secondCallError.get());
+        }
+    }
+
+    @Test
+    public void testReleaseAfterCloseIsSafe() throws Exception {
+        // Same setup as the pin test, but exercise releaseCurrentThread()
+        // instead. With a closed delegate underneath, the release path must
+        // not invoke flush() on the dead Sender.
+        SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
+        CountDownLatch pinned = new CountDownLatch(1);
+        CountDownLatch closed = new CountDownLatch(1);
+        AtomicReference<Throwable> releaseError = new AtomicReference<>();
+        Thread worker = new Thread(() -> {
+            try {
+                pool.pinToCurrentThread();
+                pinned.countDown();
+                Assert.assertTrue(closed.await(2, TimeUnit.SECONDS));
+                pool.releaseCurrentThread();
+            } catch (Throwable t) {
+                releaseError.set(t);
+            }
+        });
+        worker.start();
+        Assert.assertTrue(pinned.await(2, TimeUnit.SECONDS));
+        pool.close();
+        closed.countDown();
+        worker.join(2_000);
+        if (releaseError.get() != null) {
+            throw new AssertionError(releaseError.get());
         }
     }
 

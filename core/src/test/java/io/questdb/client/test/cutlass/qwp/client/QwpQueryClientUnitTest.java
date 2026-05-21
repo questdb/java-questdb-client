@@ -125,6 +125,46 @@ public class QwpQueryClientUnitTest {
     }
 
     @Test
+    public void testCancelDuringDispatchWindowLatchesPendingIntent() {
+        // The dispatch window is the gap between the user thread's submit()
+        // returning and the worker thread reaching the
+        // `currentRequestId = requestId` write inside executeOnce(). A cancel()
+        // during that window currently sees currentRequestId == -1 and returns
+        // silently; the user's intent is lost. With the latch in place,
+        // cancel() must record the pending intent so executeOnce() honors it
+        // as soon as the request id is assigned.
+        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)) {
+            Assert.assertFalse("a fresh client must not start with a pending cancel",
+                    c.isPendingCancelForTest());
+            c.cancel();
+            Assert.assertTrue("cancel() before currentRequestId is assigned must latch the intent",
+                    c.isPendingCancelForTest());
+        }
+    }
+
+    @Test
+    public void testExecuteEntryClearsStalePendingCancel() {
+        // A cancel latched on this client (e.g., by a previous user that
+        // returned the client to a pool without ever submitting) must not
+        // bleed into the next execute() call. execute() must clear the latch
+        // at entry, even when the call ultimately fails on the
+        // "not connected" guard inside executeImpl().
+        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)) {
+            c.cancel();
+            Assert.assertTrue("precondition: latch is set",
+                    c.isPendingCancelForTest());
+            try {
+                c.execute("SELECT 1", NOOP_HANDLER);
+                Assert.fail("execute() before connect() must throw");
+            } catch (IllegalStateException expected) {
+                // expected: client never connected
+            }
+            Assert.assertFalse("execute() entry must clear stale pending cancel",
+                    c.isPendingCancelForTest());
+        }
+    }
+
+    @Test
     public void testCancelOnFreshClientIsNoOp() {
         // cancel() must be safe to call before connect (e.g., a watchdog timer
         // that fires before the connect handshake completed). Documented on
