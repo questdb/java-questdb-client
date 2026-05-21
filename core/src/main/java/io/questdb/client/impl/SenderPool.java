@@ -173,6 +173,7 @@ public final class SenderPool implements AutoCloseable {
 
     @Override
     public void close() {
+        PooledSender[] snapshot;
         lock.lock();
         try {
             if (closed) {
@@ -187,16 +188,23 @@ public final class SenderPool implements AutoCloseable {
             for (int i = 0; i < all.size(); i++) {
                 all.get(i).markInvalidated();
             }
+            // Snapshot under the lock so the delegate-close loop below is
+            // immune to concurrent mutation of `all`. discardBroken running
+            // on another thread can still bail thanks to the `closed` check
+            // it now performs; the snapshot is belt-and-braces for any
+            // future code path that mutates `all` outside this lock's
+            // happens-before chain.
+            snapshot = all.toArray(new PooledSender[0]);
             threadAffine.remove();
             slotReleased.signalAll();
         } finally {
             lock.unlock();
         }
-        // Snapshot of underlying Senders to close, taken outside the lock so
-        // a slow real-close() doesn't keep the pool latched.
-        for (int i = 0; i < all.size(); i++) {
+        // Close each delegate from the snapshot, outside the lock so a slow
+        // real-close() doesn't keep the pool latched.
+        for (int i = 0; i < snapshot.length; i++) {
             try {
-                all.get(i).delegate().close();
+                snapshot[i].delegate().close();
             } catch (RuntimeException ignored) {
             }
         }
@@ -210,11 +218,20 @@ public final class SenderPool implements AutoCloseable {
      * {@code all} so the pool can grow back into a fresh slot on demand. The
      * underlying delegate is closed outside the lock so a slow real-close
      * does not stall other borrowers.
+     * <p>
+     * Bails when the pool is already closed: {@link #close()} owns the
+     * teardown of every delegate via its snapshot loop, so mutating
+     * {@code all} here would race that iteration on a non-thread-safe
+     * {@code ArrayList} and the {@code delegate.close()} below would be a
+     * double-close on a delegate {@code close()} has already shut down.
      */
     void discardBroken(PooledSender s) {
         s.markInvalidated();
         lock.lock();
         try {
+            if (closed) {
+                return;
+            }
             all.remove(s);
             // Wake one waiter -- the cap check in borrow() uses all.size(),
             // so a freed slot may now allow a creation attempt.

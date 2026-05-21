@@ -99,6 +99,60 @@ public class SenderPoolTest {
     }
 
     @Test
+    public void testDiscardBrokenAfterCloseDoesNotMutatePool() {
+        // Race: pool.close() iterates `all` outside the lock to close each
+        // delegate. Concurrently, a borrower's PooledSender.close() sees its
+        // delegate already closed (closed by pool.close()), the flush throws,
+        // broken=true routes to SenderPool.discardBroken -- which previously
+        // called all.remove(s) and delegate.close() unconditionally,
+        // racing the iteration in pool.close() on a non-thread-safe
+        // ArrayList. Possible outcomes: IndexOutOfBoundsException out of
+        // pool.close(), skipped delegate close (native handle leak), or
+        // two threads simultaneously inside delegate.close().
+        //
+        // The fix gates discardBroken on `closed`: once the pool is shutting
+        // down, close()'s teardown loop owns the delegate close and
+        // discardBroken bails before touching `all`.
+        //
+        // Deterministic reproduction: serialise the race onto one thread by
+        // calling pool.close() first (which closes the delegate of every
+        // pooled wrapper), then driving sender.close() second. Without the
+        // fix, sender.close() routes to discardBroken, which removes the
+        // wrapper from `all` post-close -- visible as totalSize dropping
+        // from 1 to 0. With the fix, discardBroken sees closed=true and
+        // bails, leaving `all` untouched.
+        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+            Sender s = pool.borrow();
+            // A row in the buffer forces flush() to attempt a real HTTP
+            // request on close(); against the unreachable DEAD_HTTP target
+            // (and now also against the closed delegate below) flush throws
+            // and routes the wrapper to discardBroken.
+            s.table("t").longColumn("v", 1L).atNow();
+
+            pool.close();
+            Assert.assertEquals(
+                    "pool.close() must not clear `all` -- the teardown loop closes delegates in place",
+                    1, pool.totalSize()
+            );
+
+            // sender.close() now hits a closed delegate; flush throws; the
+            // PooledSender.close() finally routes to discardBroken.
+            try {
+                s.close();
+            } catch (LineSenderException expected) {
+                // expected: flush against a closed delegate throws.
+            } catch (RuntimeException expected) {
+                // some Sender implementations wrap differently; either is fine.
+            }
+
+            Assert.assertEquals(
+                    "discardBroken called after pool close must NOT mutate `all`",
+                    1, pool.totalSize()
+            );
+        }
+    }
+
+    @Test
     public void testCloseRejectsSubsequentBorrow() {
         SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
         pool.close();
