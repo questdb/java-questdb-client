@@ -925,10 +925,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
         private static final int DEFAULT_AUTO_FLUSH_ROWS = 75_000;
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
-        // Default close() drain timeout: block up to 5s waiting for the
+        // Default close() drain timeout: block up to 60s waiting for the
         // server to ACK everything published into the engine before
-        // shutting down the I/O loop.
-        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = 5_000L;
+        // shutting down the I/O loop. The wide default reflects what real
+        // workloads need on the close path -- catch-up replicas, slow
+        // consumers, and small server send buffers under chunky payloads
+        // all routinely take tens of seconds to acknowledge a backlog,
+        // and silently dropping unacked rows in close() is a much worse
+        // default than spending the wall-clock to wait. Callers who want
+        // a tighter close budget either set close_flush_timeout_millis
+        // explicitly or call the new drain(timeoutMillis) before close().
+        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = 60_000L;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
@@ -1627,7 +1634,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * close() drain timeout in milliseconds. The sender's {@code close()}
          * method blocks up to this many millis waiting for the server to ACK
          * every batch already published into the engine before shutting down
-         * the I/O loop. Default {@code 5000}.
+         * the I/O loop. Default {@code 60000} (60 s) -- generous enough to
+         * survive real-workload backlogs (slow consumers, catch-up replicas,
+         * chunky payloads on small server send buffers) without silently
+         * dropping unacked rows; callers that need a longer pre-close wait
+         * for a specific submission can call
+         * {@link Sender#drain(long)} explicitly before close().
          * <p>
          * Set to {@code 0} or {@code -1} to opt out — close() will not wait
          * at all (fast close). Pending data is then lost in memory mode and

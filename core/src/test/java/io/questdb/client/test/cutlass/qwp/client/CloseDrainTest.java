@@ -52,8 +52,8 @@ public class CloseDrainTest {
     @Test
     public void testCloseBlocksUntilAckArrives() throws Exception {
         // Server delays every ACK by 800ms. With the default
-        // close_flush_timeout_millis=5000, close() must wait for that ACK
-        // before returning. Pre-fix close() returned within milliseconds.
+        // close_flush_timeout_millis=60000, close() must wait for that
+        // ACK before returning. Pre-fix close() returned within milliseconds.
         int port = TestPorts.findUnusedPort();
         long ackDelayMs = 800;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
@@ -113,7 +113,7 @@ public class CloseDrainTest {
         //
         // Currently fails because -1 collides with the PARAMETER_NOT_SET_EXPLICITLY
         // sentinel in LineSenderBuilder, so the build path silently substitutes
-        // DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS (5000ms) and close() blocks for the
+        // DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS (60s) and close() blocks for the
         // full ACK delay instead of returning fast.
         int port = TestPorts.findUnusedPort();
         long ackDelayMs = 1500;
