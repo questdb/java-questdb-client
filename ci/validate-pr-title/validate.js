@@ -16,6 +16,7 @@ const allowedSubTypes = [
   "log",
   "core",
   "ilp",
+  "qwp",
   "http",
   "conf",
   "utils",
