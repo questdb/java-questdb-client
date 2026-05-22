@@ -113,14 +113,14 @@ public interface QwpBufferWriter extends ArrayBufferAppender {
      *
      * @param value the string to write (may be null or empty)
      */
-    void putString(String value);
+    void putString(CharSequence value);
 
     /**
      * Writes UTF-8 encoded bytes directly without length prefix.
      *
      * @param value the string to encode (may be null or empty)
      */
-    void putUtf8(String value);
+    void putUtf8(CharSequence value);
 
     /**
      * Writes an unsigned variable-length integer (LEB128 encoding).

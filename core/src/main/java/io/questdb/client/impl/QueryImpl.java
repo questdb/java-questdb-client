@@ -55,16 +55,16 @@ final class QueryImpl implements Query {
     private final Condition doneCondition;
     private final ReentrantLock doneLock = new ReentrantLock();
     private final QueryClientPool pool;
-    private final QwpBindSetter wireBinds = this::applyBinds;
-    private final WrappingHandler wrappingHandler = new WrappingHandler();
     private final StringSink sqlBuffer = new StringSink();
-    private QwpBindSetter userBinds;
-    private QwpColumnBatchHandler userHandler;
+    private final WrappingHandler wrappingHandler = new WrappingHandler();
     private volatile QueryWorker currentWorker;
     private volatile boolean done = true;
     private volatile String resultMessage;
     private volatile byte resultStatus;
     private volatile Throwable unexpectedError;
+    private QwpBindSetter userBinds;
+    private final QwpBindSetter wireBinds = this::applyBinds;
+    private QwpColumnBatchHandler userHandler;
 
     QueryImpl(QueryClientPool pool) {
         this.pool = pool;
@@ -128,18 +128,6 @@ final class QueryImpl implements Query {
         return completion;
     }
 
-    void runOn(QwpQueryClient client) {
-        client.execute(sqlBuffer.toString(), wireBinds, wrappingHandler);
-    }
-
-    /**
-     * Signals an unexpected error from the worker thread (for example, an
-     * exception escaping {@code execute()} before any handler callback).
-     */
-    void signalUnexpected(Throwable t) {
-        signalDone((byte) 0, t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName(), t);
-    }
-
     private void applyBinds(QwpBindValues binds) {
         QwpBindSetter setter = userBinds;
         if (setter != null) {
@@ -162,6 +150,39 @@ final class QueryImpl implements Query {
         } finally {
             doneLock.unlock();
         }
+    }
+
+    /**
+     * Drops any prior builder state (SQL, binds, handler) if no submit is
+     * currently in flight. {@link QuestDBImpl#query()} invokes this before
+     * returning the per-thread instance so callers see the "reset to empty"
+     * contract documented on {@link io.questdb.client.Query} regardless of
+     * whether the previous use ended at a terminal handler callback or at
+     * {@link #abandon()}.
+     */
+    void resetIfDone() {
+        if (done) {
+            userBinds = null;
+            userHandler = null;
+            sqlBuffer.clear();
+        }
+    }
+
+    void runOn(QwpQueryClient client) {
+        // Pass the StringSink directly as a CharSequence -- the wire encoder
+        // reads chars and writes UTF-8 bytes straight into the send buffer.
+        // sqlBuffer is stable for the duration of execute(): the calling
+        // worker thread is blocked here until a terminal event arrives, and
+        // sql(...) cannot be invoked again until done==true.
+        client.execute(sqlBuffer, wireBinds, wrappingHandler);
+    }
+
+    /**
+     * Signals an unexpected error from the worker thread (for example, an
+     * exception escaping {@code execute()} before any handler callback).
+     */
+    void signalUnexpected(Throwable t) {
+        signalDone((byte) 0, t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName(), t);
     }
 
     private final class InnerCompletion implements Completion {

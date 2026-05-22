@@ -312,8 +312,8 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
      * Writes a length-prefixed UTF-8 string.
      */
     @Override
-    public void putString(String value) {
-        if (value == null || value.isEmpty()) {
+    public void putString(CharSequence value) {
+        if (value == null || value.length() == 0) {
             putVarint(0);
             return;
         }
@@ -326,8 +326,8 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
      * Writes UTF-8 encoded bytes directly without length prefix.
      */
     @Override
-    public void putUtf8(String value) {
-        if (value == null || value.isEmpty()) {
+    public void putUtf8(CharSequence value) {
+        if (value == null || value.length() == 0) {
             return;
         }
 

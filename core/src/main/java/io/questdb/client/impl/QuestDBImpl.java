@@ -114,7 +114,9 @@ public final class QuestDBImpl implements QuestDB {
 
     @Override
     public Query query() {
-        return queryThreadLocal.get();
+        QueryImpl q = queryThreadLocal.get();
+        q.resetIfDone();
+        return q;
     }
 
     @Override

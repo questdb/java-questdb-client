@@ -963,7 +963,7 @@ public class QwpQueryClient implements QuietCloseable {
      * batches begin arriving on the new connection, and any rows delivered
      * before the reset should be discarded by the handler.
      */
-    public void execute(String sql, QwpColumnBatchHandler handler) {
+    public void execute(CharSequence sql, QwpColumnBatchHandler handler) {
         execute(sql, null, handler);
     }
 
@@ -978,7 +978,7 @@ public class QwpQueryClient implements QuietCloseable {
      * supply the per-call values. Interpolating values into the SQL string
      * defeats this reuse.
      */
-    public void execute(String sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+    public void execute(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
         if (!executing.compareAndSet(false, true)) {
             throw new IllegalStateException(
                     "QwpQueryClient.execute called while another execute is in flight; one query at a time per client");
@@ -1633,7 +1633,7 @@ public class QwpQueryClient implements QuietCloseable {
         }
     }
 
-    private void executeImpl(String sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+    private void executeImpl(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
         if (closedFlag.get()) {
             throw new IllegalStateException("QwpQueryClient is closed");
         }
@@ -1750,7 +1750,7 @@ public class QwpQueryClient implements QuietCloseable {
      * the user's handler in a {@link FailoverProbeHandler} so that the outer
      * loop can intercept transport failures before they reach the user.
      */
-    private void executeOnce(String sql, QwpBindSetter binds, FailoverProbeHandler probe) {
+    private void executeOnce(CharSequence sql, QwpBindSetter binds, FailoverProbeHandler probe) {
         // Cache the I/O thread reference at entry: close() may null the field while
         // we are inside this loop, so reading the field per-iteration would NPE
         // exactly when the user is mid-execute() and close() races. The queue and

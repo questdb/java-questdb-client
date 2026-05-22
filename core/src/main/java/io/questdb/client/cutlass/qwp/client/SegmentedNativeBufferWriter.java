@@ -139,12 +139,12 @@ final class SegmentedNativeBufferWriter implements QwpBufferWriter, QuietCloseab
     }
 
     @Override
-    public void putString(String value) {
+    public void putString(CharSequence value) {
         currentChunk.putString(value);
     }
 
     @Override
-    public void putUtf8(String value) {
+    public void putUtf8(CharSequence value) {
         currentChunk.putUtf8(value);
     }
 
