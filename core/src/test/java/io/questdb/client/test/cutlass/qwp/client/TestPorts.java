@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 
 public final class TestPorts {
@@ -33,33 +34,10 @@ public final class TestPorts {
     }
 
     public static int findUnusedPort() {
-        try (ServerSocket s = new ServerSocket(0)) {
+        try (ServerSocket s = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
             return s.getLocalPort();
         } catch (IOException e) {
             throw new RuntimeException("failed to allocate an ephemeral port", e);
         }
-    }
-
-    public static int[] findUnusedPorts(int n) {
-        ServerSocket[] sockets = new ServerSocket[n];
-        int[] ports = new int[n];
-        try {
-            for (int i = 0; i < n; i++) {
-                sockets[i] = new ServerSocket(0);
-                ports[i] = sockets[i].getLocalPort();
-            }
-        } catch (IOException e) {
-            throw new RuntimeException("failed to allocate ephemeral ports", e);
-        } finally {
-            for (ServerSocket s : sockets) {
-                if (s != null) {
-                    try {
-                        s.close();
-                    } catch (IOException ignore) {
-                    }
-                }
-            }
-        }
-        return ports;
     }
 }

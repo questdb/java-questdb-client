@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
 import java.util.concurrent.locks.Condition;
@@ -133,6 +134,13 @@ public final class QueryWorker {
     void dispatch(QueryImpl q) {
         signalLock.lock();
         try {
+            if (shuttingDown) {
+                // shutdown() has already flipped the flag and signalled the
+                // worker thread, so the run loop will not pick this up. Signal
+                // the caller directly so its Completion.await() does not hang.
+                q.signalUnexpected(new QueryException((byte) 0, "QuestDB handle is closed"));
+                return;
+            }
             current = q;
             signalCondition.signal();
         } finally {
@@ -149,6 +157,15 @@ public final class QueryWorker {
                     signalCondition.awaitUninterruptibly();
                 }
                 if (shuttingDown) {
+                    // shutdown() raced an in-flight dispatch(): current was set
+                    // by a caller but the loop never got to runOn(). Signal the
+                    // caller so its Completion.await() does not hang.
+                    QueryImpl stranded = current;
+                    current = null;
+                    if (stranded != null) {
+                        stranded.signalUnexpected(
+                                new QueryException((byte) 0, "QuestDB handle is closed"));
+                    }
                     return;
                 }
                 q = current;

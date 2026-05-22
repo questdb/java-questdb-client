@@ -101,15 +101,14 @@ public class ReconnectTest {
     }
 
     @Test
-    public void testReconnectGivesUpAfterCap() throws Exception {
+    public void testReconnectGivesUpAfterCap() {
         // Server is up at first (initial connect succeeds + ACKs batch 1),
         // then we tear it down — subsequent reconnect attempts get TCP
         // connection-refused and accumulate against the budget. With a
         // 500ms cap, the loop should give up well inside the test's 5s
         // poll window and the next user-thread flush() must throw.
         int port = TestPorts.findUnusedPort();
-        TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler());
-        try {
+        try (TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler())) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -118,8 +117,7 @@ public class ReconnectTest {
                     + ";reconnect_initial_backoff_millis=10"
                     + ";reconnect_max_backoff_millis=50"
                     + ";close_flush_timeout_millis=0;";
-            Sender sender = Sender.fromConfig(cfg);
-            try {
+            try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
 
@@ -131,7 +129,7 @@ public class ReconnectTest {
                 Throwable observed = null;
                 long deadline = System.currentTimeMillis() + 5_000;
                 long iter = 0;
-                while (System.currentTimeMillis() < deadline && observed == null) {
+                while (System.currentTimeMillis() < deadline) {
                     iter++;
                     try {
                         sender.table("foo").longColumn("v", iter).atNow();
@@ -151,20 +149,12 @@ public class ReconnectTest {
                         msg.contains("reconnect failed")
                                 || msg.contains("I/O thread failed")
                                 || msg.contains("Failed to connect"));
-            } finally {
-                // close() rethrows the latched terminal reconnect-cap error
-                // (commit 052f6ee). Already observed and asserted above.
-                try {
-                    sender.close();
-                } catch (LineSenderException ignored) {
-                }
+            } catch (LineSenderException ignored) {
             }
-        } finally {
-            try {
-                server.close();
-            } catch (Exception ignored) {
-                // already closed
-            }
+            // close() rethrows the latched terminal reconnect-cap error
+            // (commit 052f6ee). Already observed and asserted above.
+        } catch (Exception ignored) {
+            // already closed
         }
     }
 
@@ -184,8 +174,7 @@ public class ReconnectTest {
             String cfg = "ws::addr=localhost:" + port
                     + ";reconnect_max_duration_millis=10000"
                     + ";close_flush_timeout_millis=0;";
-            Sender sender = Sender.fromConfig(cfg);
-            try {
+            try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
                 // Wait for first connection to ACK + close
@@ -194,7 +183,7 @@ public class ReconnectTest {
                 long t0 = System.nanoTime();
                 Throwable observed = null;
                 long deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline && observed == null) {
+                while (System.currentTimeMillis() < deadline) {
                     try {
                         sender.table("foo").longColumn("v", 2L).atNow();
                         sender.flush();
@@ -217,14 +206,10 @@ public class ReconnectTest {
                         msg.contains("WebSocket upgrade failed")
                                 || msg.contains("I/O thread failed")
                                 || msg.contains("401"));
-            } finally {
-                // close() rethrows the latched terminal upgrade error
-                // (commit 052f6ee). Already observed and asserted above.
-                try {
-                    sender.close();
-                } catch (LineSenderException ignored) {
-                }
+            } catch (LineSenderException ignored) {
             }
+            // close() rethrows the latched terminal upgrade error
+            // (commit 052f6ee). Already observed and asserted above.
         }
     }
 
@@ -427,7 +412,7 @@ public class ReconnectTest {
                 BufferedReader in = new BufferedReader(new InputStreamReader(
                         s.getInputStream(), StandardCharsets.US_ASCII));
                 OutputStream out = s.getOutputStream();
-                String requestLine = in.readLine();
+                in.readLine();
                 String secKey = null;
                 String line;
                 while ((line = in.readLine()) != null && !line.isEmpty()) {
@@ -531,19 +516,6 @@ public class ReconnectTest {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-            }
-        }
-    }
-
-    /** Closes every connection right after receiving the first frame. */
-    private static class AlwaysDisconnectHandler implements TestWebSocketServer.WebSocketServerHandler {
-        @Override
-        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            try {
-                Thread.sleep(10);
-                client.close();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
             }
         }
     }
