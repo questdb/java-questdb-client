@@ -1030,6 +1030,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * (legacy behavior).
      */
     private void fail(Throwable initial) {
+        qwpDiag("fail entering reconnect [ackedFsn=" + engine.ackedFsn()
+                + ", publishedFsn=" + engine.publishedFsn()
+                + ", fsnAtZero=" + fsnAtZero
+                + ", nextWireSeq=" + nextWireSeq
+                + ", totalFramesSent=" + totalFramesSent.get()
+                + ", error=" + initial + ']');
         connectLoop(initial, "reconnect");
     }
 
@@ -1256,6 +1262,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (frameEnd > pub) {
             return false; // payload not fully published yet
         }
+        long wireSeq = nextWireSeq;
+        long fsnSent = fsnAtZero + wireSeq;
+        long sendOffsetBefore = sendOffset;
         try {
             client.sendBinary(base + sendOffset + MmapSegment.FRAME_HEADER_SIZE, payloadLen);
         } catch (Throwable t) {
@@ -1264,9 +1273,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         lastFrameOrPingNanos = System.nanoTime();
         sendOffset = frameEnd;
-        long fsnSent = fsnAtZero + nextWireSeq;
         nextWireSeq++;
         totalFramesSent.incrementAndGet();
+        qwpDiag("send frame [wireSeq=" + wireSeq
+                + ", fsn=" + fsnSent
+                + ", payloadLen=" + payloadLen
+                + ", offsetBefore=" + sendOffsetBefore
+                + ", offsetAfter=" + sendOffset
+                + ", publishedOffset=" + pub
+                + ", ackedFsn=" + engine.ackedFsn()
+                + ", publishedFsn=" + engine.publishedFsn()
+                + ", replayTargetFsn=" + replayTargetFsn
+                + ", totalFramesSent=" + totalFramesSent.get()
+                + ']');
         if (replayTargetFsn >= 0) {
             totalFramesReplayed.incrementAndGet();
             if (fsnSent >= replayTargetFsn) {
@@ -1287,6 +1306,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
         positionCursorAt(replayStart);
+    }
+
+    private static void qwpDiag(String message) {
+        System.err.println("QWP_DIAG client " + message);
     }
 
     /**
@@ -1353,7 +1376,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // server response would force trim of segments the new
                 // server hasn't seen.
                 long highestSent = nextWireSeq - 1;
-                if (highestSent < 0) return; // ACK before any send — ignore
+                if (highestSent < 0) {
+                    qwpDiag("ack ignored before send [wireSeq=" + wireSeq
+                            + ", ackedFsn=" + engine.ackedFsn()
+                            + ", publishedFsn=" + engine.publishedFsn()
+                            + ']');
+                    return; // ACK before any send — ignore
+                }
                 long capped = Math.min(wireSeq, highestSent);
                 if (capped < wireSeq) {
                     LOG.warn("server ACK wire seq {} exceeds highest sent {}, clamping",
@@ -1375,8 +1404,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     drainPendingDurable();
                     return;
                 }
-                if (engine.acknowledge(fsnAtZero + capped)) {
-                    dispatchProgress(fsnAtZero + capped);
+                long fsn = fsnAtZero + capped;
+                long ackedBefore = engine.ackedFsn();
+                boolean advanced = engine.acknowledge(fsn);
+                long ackedAfter = engine.ackedFsn();
+                qwpDiag("ack frame [wireSeq=" + wireSeq
+                        + ", cappedSeq=" + capped
+                        + ", highestSent=" + highestSent
+                        + ", fsn=" + fsn
+                        + ", ackedBefore=" + ackedBefore
+                        + ", ackedAfter=" + ackedAfter
+                        + ", publishedFsn=" + engine.publishedFsn()
+                        + ", advanced=" + advanced
+                        + ']');
+                if (advanced) {
+                    dispatchProgress(fsn);
                 }
                 return;
             }
@@ -1403,6 +1445,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
         @Override
         public void onClose(int code, String reason) {
+            qwpDiag("close frame [code=" + code
+                    + ", reason=" + reason
+                    + ", ackedFsn=" + engine.ackedFsn()
+                    + ", publishedFsn=" + engine.publishedFsn()
+                    + ", fsnAtZero=" + fsnAtZero
+                    + ", nextWireSeq=" + nextWireSeq
+                    + ", totalFramesSent=" + totalFramesSent.get()
+                    + ']');
             // Terminal close codes signal the server has rejected the wire
             // bytes themselves — reconnecting and replaying the same bytes
             // produces the same close. Stash a typed PROTOCOL_VIOLATION
@@ -1440,6 +1490,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         private void handlePreSendRejection(long wireSeq, byte status,
                                             SenderError.Category category,
                                             SenderError.Policy policy) {
+            qwpDiag("rejection before send [wireSeq=" + wireSeq
+                    + ", status=0x" + Integer.toHexString(status & 0xFF)
+                    + ", category=" + category
+                    + ", policy=" + policy
+                    + ", ackedFsn=" + engine.ackedFsn()
+                    + ", publishedFsn=" + engine.publishedFsn()
+                    + ", fsnAtZero=" + fsnAtZero
+                    + ", nextWireSeq=" + nextWireSeq
+                    + ']');
             LOG.warn("server rejection wire seq {} (category={}, status=0x{}) before any send -- skipping ack advance",
                     wireSeq, category, Integer.toHexString(status & 0xFF));
             // Use the same [ackedFsn+1, publishedFsn] span the
@@ -1543,6 +1602,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 LOG.warn("server rejected wire seq {} (category={}, status=0x{}) -- dropping batch and continuing",
                         wireSeq, category, Integer.toHexString(status & 0xFF));
                 totalAcks.incrementAndGet();
+                long ackedBefore = engine.ackedFsn();
+                boolean advanced = false;
                 if (durableAckMode) {
                     // A rejected batch never reaches the WAL, so the server
                     // will not emit a durable-ack for it. Stash an empty
@@ -1551,13 +1612,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // past unfilled durable slots would corrupt SF semantics.
                     enqueuePendingOk(cappedSeq);
                     drainPendingDurable();
+                    advanced = engine.ackedFsn() > ackedBefore;
                 } else if (engine.acknowledge(fsn)) {
+                    advanced = true;
                     // DROP_AND_CONTINUE on the non-durable path advanced the
                     // watermark past the rejected FSN; observers waiting on
                     // a target FSN should see that advance, even though it
                     // represents a drop rather than a successful commit.
                     dispatchProgress(fsn);
                 }
+                qwpDiag("rejection dropped [wireSeq=" + wireSeq
+                        + ", cappedSeq=" + cappedSeq
+                        + ", fsn=" + fsn
+                        + ", status=0x" + Integer.toHexString(status & 0xFF)
+                        + ", category=" + category
+                        + ", policy=" + policy
+                        + ", ackedBefore=" + ackedBefore
+                        + ", ackedAfter=" + engine.ackedFsn()
+                        + ", publishedFsn=" + engine.publishedFsn()
+                        + ", highestSent=" + highestSent
+                        + ", advanced=" + advanced
+                        + ']');
                 dispatchError(err);
             }
         }
