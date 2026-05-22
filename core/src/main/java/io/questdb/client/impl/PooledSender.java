@@ -133,6 +133,15 @@ public final class PooledSender implements Sender {
      * the owning {@code QuestDB} is closed.
      * <p>
      * Idempotent: a second call after a return is a no-op.
+     * <p>
+     * Clears the current thread's pin (if any) before the slot becomes
+     * borrowable again. Without this step a thread that pinned this
+     * wrapper and then closed it via the public {@link Sender#close()}
+     * (the natural try-with-resources idiom) would still hold the pin
+     * in its {@link ThreadLocal}; a subsequent {@code QuestDB.sender()}
+     * call on that thread would return the cached wrapper even though
+     * another consumer has since borrowed the slot, and the two
+     * consumers would write to the same underlying delegate.
      */
     @Override
     public void close() {
@@ -152,6 +161,12 @@ public final class PooledSender implements Sender {
             throw e;
         } finally {
             inUse = false;
+            // Clear the pin BEFORE returning the slot. If we cleared
+            // after giveBack(), a concurrent borrower could grab the
+            // slot while this thread's pin still references it, and a
+            // re-pin on this thread would return the (now in-use)
+            // wrapper -- the same race this clear is meant to close.
+            pool.clearPinIfCurrent(this);
             if (broken) {
                 pool.discardBroken(this);
             } else {
