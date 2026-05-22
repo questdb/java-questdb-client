@@ -62,7 +62,7 @@ public final class QueryClientPool {
     private volatile boolean closed;
     private int inFlightCreations;
 
-    QueryClientPool(
+    public QueryClientPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -102,7 +102,7 @@ public final class QueryClientPool {
         }
     }
 
-    QueryWorker acquire() {
+    public QueryWorker acquire() {
         // Track remaining wait via awaitNanos's return value (canonical pattern):
         // awaitNanos consumes from the budget on each wait and reports what is
         // left; <= 0 means the budget is exhausted.
@@ -241,7 +241,20 @@ public final class QueryClientPool {
 
     private QueryWorker createUnlocked() {
         QwpQueryClient client = QwpQueryClient.fromConfig(configurationString);
-        client.connect();
+        try {
+            client.connect();
+        } catch (RuntimeException e) {
+            // connect() may throw after QwpQueryClient.fromConfig() has already
+            // allocated native scratch (the QwpBindValues NativeBufferWriter is
+            // field-initialised). Close the half-built client so its allocations
+            // are released, otherwise every connect failure during pool growth
+            // leaks NATIVE_DEFAULT bytes.
+            try {
+                client.close();
+            } catch (RuntimeException ignored) {
+            }
+            throw e;
+        }
         return new QueryWorker(client, this, nextSlotIndex.getAndIncrement());
     }
 }

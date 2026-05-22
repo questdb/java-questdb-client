@@ -211,6 +211,20 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
+     * Clears the current thread's pin if it currently references {@code s}.
+     * Invoked from {@link PooledSender#close()} before the wrapper is
+     * returned to the pool, so a subsequent {@link #pinToCurrentThread()}
+     * on this thread cannot hand the wrapper back after another consumer
+     * has borrowed the slot. No-op when the caller never pinned, or pinned
+     * a different wrapper.
+     */
+    void clearPinIfCurrent(PooledSender s) {
+        if (threadAffine.get() == s) {
+            threadAffine.remove();
+        }
+    }
+
+    /**
      * Evicts a slot whose delegate has failed (typically a {@code flush()}
      * failure observed in {@link PooledSender#close()}). The wrapper is
      * marked invalidated so any thread-pinned reference gets rejected on the
