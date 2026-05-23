@@ -27,17 +27,22 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.bytes.DirectByteSlice;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.lang.reflect.Field;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.concurrent.TimeUnit;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -322,6 +327,54 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
+            }
+        });
+    }
+
+    @Test
+    public void testFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse() throws Exception {
+        assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            try (TestWebSocketServer server = new TestWebSocketServer(port, new TestWebSocketServer.WebSocketServerHandler() {
+            })) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Memory-only engine with a 33-byte budget and a 1 ns append
+                // deadline guarantees every appendBlocking() call trips the
+                // backpressure deadline and throws.
+                CursorSendEngine engine = new CursorSendEngine(null, 33, 33, 1L);
+                QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
+                        QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION, false, engine, 0L);
+                try {
+                    sender.table("t").longColumn("v", 1L).atNow();
+
+                    try {
+                        sender.flushAndGetSequence();
+                        Assert.fail("Expected LineSenderException");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage().contains("cursor SF append failed"));
+                    }
+
+                    MicrobatchBuffer buffer0 = getMicrobatchBuffer(sender, "buffer0");
+                    MicrobatchBuffer buffer1 = getMicrobatchBuffer(sender, "buffer1");
+                    Assert.assertFalse(
+                            "failed append must not leave any buffer in use [buffer0="
+                                    + MicrobatchBuffer.stateName(buffer0.getState())
+                                    + ", buffer1=" + MicrobatchBuffer.stateName(buffer1.getState()) + "]",
+                            buffer0.isInUse() || buffer1.isInUse());
+                } finally {
+                    // close() drains pending rows, which appendBlocking still
+                    // rejects because the engine is permanently wedged in this
+                    // test. The bug under test is about microbatch buffer
+                    // state, not about close() being lenient toward residual
+                    // unflushed rows — swallow the predictable rethrow here.
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                    }
+                }
             }
         });
     }
@@ -703,6 +756,12 @@ public class QwpWebSocketSenderTest {
                     "expected message to mention 'closed', got: " + e.getMessage(),
                     e.getMessage() != null && e.getMessage().contains("closed"));
         }
+    }
+
+    private static MicrobatchBuffer getMicrobatchBuffer(QwpWebSocketSender sender, String fieldName) throws Exception {
+        Field field = QwpWebSocketSender.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return (MicrobatchBuffer) field.get(sender);
     }
 
     /**
