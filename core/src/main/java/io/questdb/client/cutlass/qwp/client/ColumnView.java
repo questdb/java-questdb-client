@@ -25,6 +25,9 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.std.Decimal128;
+import io.questdb.client.std.Decimal256;
+import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Long256Sink;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Uuid;
@@ -179,6 +182,13 @@ public class ColumnView {
     }
 
     /**
+     * @see QwpColumnBatch#getDecimal128(int, int, Decimal128)
+     */
+    public boolean getDecimal128(int row, Decimal128 sink) {
+        return batch.getDecimal128(col, row, sink);
+    }
+
+    /**
      * @see QwpColumnBatch#getDecimal128High(int, int)
      */
     public long getDecimal128High(int row) {
@@ -192,6 +202,20 @@ public class ColumnView {
     public long getDecimal128Low(int row) {
         if (QwpColumnBatch.isLayoutNull(layout, row)) return 0L;
         return Unsafe.getUnsafe().getLong(layout.valuesAddr + 16L * layout.denseIndex(row));
+    }
+
+    /**
+     * @see QwpColumnBatch#getDecimal256(int, int, Decimal256)
+     */
+    public boolean getDecimal256(int row, Decimal256 sink) {
+        return batch.getDecimal256(col, row, sink);
+    }
+
+    /**
+     * @see QwpColumnBatch#getDecimal64(int, int, Decimal64)
+     */
+    public boolean getDecimal64(int row, Decimal64 sink) {
+        return batch.getDecimal64(col, row, sink);
     }
 
     /**

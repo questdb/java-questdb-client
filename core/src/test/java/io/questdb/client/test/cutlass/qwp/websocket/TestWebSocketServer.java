@@ -61,10 +61,6 @@ public class TestWebSocketServer implements Closeable {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final CountDownLatch startLatch = new CountDownLatch(1);
     private Thread acceptThread;
-    // X-QWP-Max-Batch-Size value to emit on the 101 handshake response.
-    // 0 = omit the header (legacy behavior). Tests that exercise the
-    // batch-size-clamp path on the client set this to a positive value.
-    private volatile int advertisedMaxBatchSize;
     // X-QuestDB-Role value to emit on handshake responses. null = omit the
     // header (legacy behavior for tests written before role-aware failover).
     // The server emits the header on both the 101 success path and (when
@@ -149,14 +145,6 @@ public class TestWebSocketServer implements Closeable {
     }
 
     /**
-     * Sets the X-QWP-Max-Batch-Size header value emitted on subsequent
-     * handshake responses. 0 (the default) omits the header.
-     */
-    public void setAdvertisedMaxBatchSize(int maxBatchSize) {
-        this.advertisedMaxBatchSize = maxBatchSize;
-    }
-
-    /**
      * Replaces the advertised role for subsequent handshakes (live update).
      */
     public void setAdvertisedRole(String role) {
@@ -190,7 +178,13 @@ public class TestWebSocketServer implements Closeable {
             return;
         }
 
-        serverSocket = new ServerSocket(port);
+        // Bind explicitly to the loopback address. The wildcard 0.0.0.0
+        // default lets a leftover process holding 127.0.0.1:port coexist
+        // on the same port under BSD/macOS SO_REUSEADDR semantics, and
+        // client connections to "localhost" then route to the more-specific
+        // listener instead of this mock. Pinning to loopback forces the
+        // kernel to detect the conflict and pick a different ephemeral port.
+        serverSocket = new ServerSocket(port, 50, java.net.InetAddress.getLoopbackAddress());
         serverSocket.setSoTimeout(100);
 
         acceptThread = new Thread(() -> {
@@ -267,10 +261,6 @@ public class TestWebSocketServer implements Closeable {
             payload[1] = (byte) (code & 0xFF);
             System.arraycopy(reasonBytes, 0, payload, 2, reasonBytes.length);
             writeFrame(WebSocketOpcode.CLOSE, payload, payload.length);
-        }
-
-        public synchronized void sendPing(byte[] data) throws IOException {
-            writeFrame(WebSocketOpcode.PING, data, data.length);
         }
 
         private String computeAcceptKey(String key) {
@@ -438,10 +428,6 @@ public class TestWebSocketServer implements Closeable {
             String role = advertisedRole;
             if (role != null) {
                 sb.append("X-QuestDB-Role: ").append(role).append("\r\n");
-            }
-            int maxBatch = advertisedMaxBatchSize;
-            if (maxBatch > 0) {
-                sb.append("X-QWP-Max-Batch-Size: ").append(maxBatch).append("\r\n");
             }
             sb.append("\r\n");
             out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));

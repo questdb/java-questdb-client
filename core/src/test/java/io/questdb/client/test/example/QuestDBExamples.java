@@ -1,0 +1,199 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.example;
+
+import io.questdb.client.Completion;
+import io.questdb.client.QuestDB;
+import io.questdb.client.Query;
+import io.questdb.client.Sender;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Examples for the {@link QuestDB} facade -- the high-level handle that
+ * pools both Senders (ingest) and query clients (egress).
+ * <p>
+ * Create one {@code QuestDB} per deployment, share it across threads, and
+ * close it at shutdown. Borrows and releases are zero-allocation at steady
+ * state; the per-thread {@link Query} handle is cached in a ThreadLocal.
+ */
+public class QuestDBExamples {
+
+    public static void main(String[] args) throws Exception {
+        // 1. Connect with a single configuration string. The same server list
+        //    serves both ingest (HTTP) and egress (WebSocket on the same port);
+        //    QuestDB derives the egress URL automatically.
+        try (QuestDB db = QuestDB.connect("http::addr=localhost:9000;")) {
+            ingestWithBorrowedSender(db);
+            ingestWithThreadAffineSender(db);
+            queryOneShot(db);
+            queryWithBinds(db);
+            cancelExample(db);
+        }
+
+        // 2. Authenticated connect: token auth is translated to a Bearer
+        //    Authorization header on the egress side.
+        try (QuestDB db = QuestDB.connect(
+                "http::addr=db.questdb.cloud:9000;token=YOUR_TOKEN_HERE;")) {
+            // ... use db ...
+            db.executeSql("SELECT 1", new PrintingHandler()).await();
+        }
+
+        // 3. Custom pool sizing and timeouts via the builder. Use this when
+        //    ingest and egress configs differ (different transports, separate
+        //    address lists), or when you need to override defaults.
+        try (QuestDB db = QuestDB.builder()
+                .ingestConfig("http::addr=ingest.cluster:9000;")
+                .queryConfig("ws::addr=read-replica.cluster:9000;")
+                .senderPoolSize(8)
+                .queryPoolSize(4)
+                .acquireTimeoutMillis(10_000)
+                .build()) {
+            // ... use db ...
+            db.executeSql("SELECT 1", new PrintingHandler()).await();
+        }
+    }
+
+    /**
+     * Cancel mid-query: the handler observes {@code onError} with the cancel
+     * status, and {@code await()} throws {@code QueryException} with that
+     * status. If the query completed before cancel landed, {@code await()}
+     * returns normally; either way the Completion reaches a terminal state.
+     */
+    static void cancelExample(QuestDB db) {
+        Completion c = db.executeSql(
+                "SELECT * FROM big_table ORDER BY ts",
+                new PrintingHandler());
+        // ... some condition decides to abort ...
+        c.cancel();
+        try {
+            c.await();
+        } catch (Exception cancelled) {
+            // expected when cancel won the race
+        }
+    }
+
+    /**
+     * Borrowed Sender: leases one from the pool, flushes pending rows on
+     * close(), returns to the pool. Use this for short-lived or event-loop
+     * callers where pinning a Sender to a thread is not appropriate.
+     */
+    static void ingestWithBorrowedSender(QuestDB db) {
+        try (Sender s = db.borrowSender()) {
+            s.table("trades")
+                    .symbol("symbol", "BTC-USD")
+                    .doubleColumn("price", 42_500.50)
+                    .longColumn("size", 100)
+                    .atNow();
+            // close() flushes -- no need to call flush() yourself.
+        }
+    }
+
+    /**
+     * Thread-affine Sender: the first call on a thread leases one and pins it;
+     * subsequent calls on the same thread return the same instance with zero
+     * borrow overhead. Best for long-lived dedicated producer threads.
+     * <p>
+     * Call {@link QuestDB#releaseSender()} on threads borrowed from pools you
+     * don't own (Netty event loops, etc.) before they're recycled.
+     */
+    static void ingestWithThreadAffineSender(QuestDB db) {
+        Sender s = db.sender();
+        for (int i = 0; i < 1_000; i++) {
+            s.table("trades")
+                    .symbol("symbol", "BTC-USD")
+                    .doubleColumn("price", 42_500.50 + i)
+                    .longColumn("size", 100)
+                    .atNow();
+        }
+        s.flush();
+        // Not strictly required: db.close() reaps pinned Senders. Call it
+        // only when handing this thread back to a foreign pool.
+        // db.releaseSender();
+    }
+
+    /**
+     * One-shot query, no bind parameters. {@link QuestDB#executeSql} returns
+     * a {@link Completion} that you can {@code await()} synchronously, time
+     * out on, or cancel.
+     */
+    static void queryOneShot(QuestDB db) throws InterruptedException {
+        Completion c = db.executeSql(
+                "SELECT price FROM trades WHERE symbol = 'BTC-USD' LIMIT 10",
+                new PrintingHandler());
+        c.await();
+    }
+
+    /**
+     * Query with bind parameters. Use {@link QuestDB#query()} to get the
+     * per-thread Query builder, then set SQL, binds (via QwpBindSetter), and
+     * handler.
+     * <p>
+     * The same SQL text reuses the server's compiled-factory cache -- bind
+     * values supply the per-call inputs. Interpolating values into the SQL
+     * string defeats that cache.
+     */
+    static void queryWithBinds(QuestDB db) throws InterruptedException {
+        Query q = db.query()
+                .sql("SELECT price FROM trades WHERE symbol = $1 LIMIT $2")
+                .binds(binds -> {
+                    binds.setVarchar(0, "BTC-USD");
+                    binds.setLong(1, 10L);
+                })
+                .handler(new PrintingHandler());
+        Completion c = q.submit();
+        // Optional timeout: returns false if the query is still in flight.
+        if (!c.await(5, TimeUnit.SECONDS)) {
+            c.cancel();
+            c.await();
+        }
+    }
+
+    /**
+     * Minimal handler: prints each row's first column. Real applications
+     * implement a stateful handler that aggregates batches; the same
+     * instance can be reused across submits for zero allocation.
+     */
+    private static final class PrintingHandler implements QwpColumnBatchHandler {
+        @Override
+        public void onBatch(QwpColumnBatch batch) {
+            for (int r = 0; r < batch.getRowCount(); r++) {
+                System.out.println(batch.getDoubleValue(0, r));
+            }
+        }
+
+        @Override
+        public void onEnd(long totalRows) {
+            System.out.println("done: " + totalRows + " rows");
+        }
+
+        @Override
+        public void onError(byte status, String message) {
+            System.err.println("egress error: status=" + status + ", message=" + message);
+        }
+    }
+}

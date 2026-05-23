@@ -84,6 +84,14 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
     // the I/O thread typically parks on this for the duration of the user's
     // onBatch callback, which is microseconds for a no-op consumer.
     private final QwpSpscQueue<Object> pendingRelease = new QwpSpscQueue<>(1);
+    // Reusable request holder. The user thread mutates fields and offers the
+    // same instance into {@link #requests} on every submit; the I/O thread
+    // reads the fields synchronously in {@link #sendQueryRequest} and does not
+    // retain a reference past that call. Reuse avoids a per-submit allocation
+    // -- one in-flight query per client makes this safe: the worker that
+    // mutates pendingRequest is blocked on the events queue until the I/O
+    // thread has finished consuming the previous instance.
+    private final QueryRequest pendingRequest = new QueryRequest();
     // Single-slot request queue (Phase-1 allows one in-flight query).
     private final BlockingQueue<QueryRequest> requests = new ArrayBlockingQueue<>(1);
     private final NativeBufferWriter sendScratch = new NativeBufferWriter();
@@ -368,14 +376,20 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * payload contains; zero when the user supplied no binds.
      */
     public void submitQuery(
-            String sql,
+            CharSequence sql,
             long requestId,
             long initialCredit,
             int bindCount,
             long bindPayloadPtr,
             long bindPayloadLen
     ) throws InterruptedException {
-        requests.put(new QueryRequest(sql, requestId, initialCredit, bindCount, bindPayloadPtr, bindPayloadLen));
+        pendingRequest.sql = sql;
+        pendingRequest.requestId = requestId;
+        pendingRequest.initialCredit = initialCredit;
+        pendingRequest.bindCount = bindCount;
+        pendingRequest.bindPayloadPtr = bindPayloadPtr;
+        pendingRequest.bindPayloadLen = bindPayloadLen;
+        requests.put(pendingRequest);
     }
 
     /**
@@ -687,14 +701,12 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
      * happens on this thread.
      */
     private void sendQueryRequest(QueryRequest req) {
-        byte[] sqlBytes = req.sql.getBytes(StandardCharsets.UTF_8);
         sendScratch.reset();
         sendScratch.putByte(QwpEgressMsgKind.QUERY_REQUEST);
         sendScratch.putLong(req.requestId);
-        sendScratch.putVarint(sqlBytes.length);
-        for (byte b : sqlBytes) {
-            sendScratch.putByte(b);
-        }
+        // putString writes varint(utf8 length) + utf8 bytes in one pass,
+        // straight into the native send buffer -- no intermediate byte[].
+        sendScratch.putString(req.sql);
         sendScratch.putVarint(req.initialCredit); // 0 = unbounded (Phase-1 default)
         sendScratch.putVarint(req.bindCount);
         if (req.bindCount > 0 && req.bindPayloadLen > 0) {
@@ -746,21 +758,19 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         void onTerminalFailure(byte status, String message);
     }
 
+    /**
+     * Mutable request holder reused across submits. Safe to reuse because at
+     * most one query is in flight per client: the worker thread mutates fields
+     * and offers the instance into {@link #requests}, then blocks on the events
+     * queue until the I/O thread has fully consumed the previous instance and
+     * delivered a terminal event.
+     */
     private static final class QueryRequest {
-        final int bindCount;
-        final long bindPayloadLen;
-        final long bindPayloadPtr;
-        final long initialCredit;
-        final long requestId;
-        final String sql;
-
-        QueryRequest(String sql, long requestId, long initialCredit, int bindCount, long bindPayloadPtr, long bindPayloadLen) {
-            this.sql = sql;
-            this.requestId = requestId;
-            this.initialCredit = initialCredit;
-            this.bindCount = bindCount;
-            this.bindPayloadPtr = bindPayloadPtr;
-            this.bindPayloadLen = bindPayloadLen;
-        }
+        int bindCount;
+        long bindPayloadLen;
+        long bindPayloadPtr;
+        long initialCredit;
+        long requestId;
+        CharSequence sql;
     }
 }

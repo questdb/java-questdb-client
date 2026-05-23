@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,6 +63,13 @@ public final class SegmentRing implements QuietCloseable {
     /** Sentinel: append failed because the payload doesn't fit in a fresh segment. */
     public static final long PAYLOAD_TOO_LARGE = -2L;
     private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
+    // Tally of baseSeq comparisons performed by sortByBaseSeq across every
+    // openExisting() recovery on this JVM. Used by SegmentRingTest to
+    // assert the sort stays O(N log N) without relying on wall-clock time
+    // (CI runner variance makes elapsed-millisecond bounds flaky). Cheap
+    // in production: one volatile-free add per partition pass, dwarfed by
+    // the mmap I/O the recovery does on every segment.
+    private static long sortComparisons;
     private final long maxBytesPerSegment;
     // Sealed segments in baseSeq order, oldest first. Active is held separately.
     // Single-writer (producer thread, on rotation); single-reader at trim time
@@ -653,6 +661,27 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * Returns the cumulative count of baseSeq comparisons performed by
+     * {@link #sortByBaseSeq} since the last {@link #resetSortComparisons()}
+     * (or process start). The count is incremented once per partition pass
+     * for the median-of-three pivot pick plus once per element compared
+     * against the pivot, so a clean run on N segments adds roughly
+     * {@code 3 + (hi - lo - 1)} per recursive frame, summing to O(N log N).
+     * Exposed for {@code SegmentRingTest} to detect O(N²) regressions
+     * deterministically.
+     */
+    @TestOnly
+    public static long getSortComparisons() {
+        return sortComparisons;
+    }
+
+    /** Zeroes the counter exposed via {@link #getSortComparisons()}. */
+    @TestOnly
+    public static void resetSortComparisons() {
+        sortComparisons = 0;
+    }
+
+    /**
      * In-place quicksort over {@code list[lo, hi)} keyed by ascending
      * {@code baseSeq}. Median-of-three pivot avoids the pathological O(N²)
      * on already-sorted input that lexicographic readdir produces (our
@@ -666,7 +695,11 @@ public final class SegmentRing implements QuietCloseable {
             long a = list.get(lo).baseSeq();
             long b = list.get(mid).baseSeq();
             long c = list.get(hi - 1).baseSeq();
-            // Median of {a, b, c} → pivot index.
+            // Median of {a, b, c} → pivot index. Three compareUnsigned calls
+            // worst case; bumping by a constant 3 keeps the counter cheap and
+            // still strictly upper-bounds the true work (some short-circuit
+            // out after 1-2 compares).
+            sortComparisons += 3L + (hi - lo - 1);
             int pivotIdx;
             if (Long.compareUnsigned(a, b) < 0) {
                 if (Long.compareUnsigned(b, c) < 0) pivotIdx = mid;

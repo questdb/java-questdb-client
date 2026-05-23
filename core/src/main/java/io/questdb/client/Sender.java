@@ -263,6 +263,27 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
+     * Block until the server has acknowledged every frame up to {@code targetFsn},
+     * or until {@code timeoutMillis} elapses. Pair with {@link #flushAndGetSequence()}
+     * to obtain {@code targetFsn} for a specific flush.
+     * <br>
+     * When {@code request_durable_ack=on} (Enterprise primary replication), {@code targetFsn}
+     * advances after durable upload to object storage, not on the ordinary commit ACK.
+     * <br>
+     * Only the WebSocket QWP transport tracks frame sequence numbers. On other transports
+     * (HTTP, TCP, UDP) the call returns immediately: {@code true} when {@code targetFsn < 0}
+     * (nothing to wait for), {@code false} otherwise.
+     *
+     * @param targetFsn     FSN to wait for; typically the return value of {@link #flushAndGetSequence()}
+     * @param timeoutMillis upper bound on the wait; {@code <= 0} returns the current state without blocking
+     * @return {@code true} if the server has acknowledged up to {@code targetFsn} on return, {@code false} on timeout
+     * @throws LineSenderException if the transport has latched a terminal error
+     */
+    default boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
+        return targetFsn < 0L;
+    }
+
+    /**
      * Add a BINARY column value as a byte array. The bytes are written verbatim
      * with no encoding or transformation. To mark the value NULL, do not call
      * this method for the current row (the null bitmap path).
@@ -446,6 +467,29 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     Sender doubleColumn(CharSequence name, double value);
 
     /**
+     * Convenience: flush every buffered row and block until the server has
+     * acknowledged the resulting frame, or until {@code timeoutMillis} elapses.
+     * Equivalent to {@code awaitAckedFsn(flushAndGetSequence(), timeoutMillis)},
+     * which is the same shape as the implicit drain {@link #close()} runs --
+     * with the caller controlling the timeout per call-site rather than
+     * relying on the builder-time {@code close_flush_timeout_millis}.
+     * <br>
+     * Returns immediately on transports that do not track frame sequence
+     * numbers ({@code HTTP}, {@code TCP}, {@code UDP}): the flush still
+     * happens, the wait is a no-op, and the return value is {@code true}.
+     *
+     * @param timeoutMillis upper bound on the wait; {@code <= 0} returns the
+     *                      current state without blocking (the flush still
+     *                      happens before the check)
+     * @return {@code true} if the server has acknowledged every published
+     *         frame on return, {@code false} on timeout
+     * @throws LineSenderException if the transport has latched a terminal error
+     */
+    default boolean drain(long timeoutMillis) {
+        return awaitAckedFsn(flushAndGetSequence(), timeoutMillis);
+    }
+
+    /**
      * Add a column with a 32-bit floating point value.
      *
      * @param name  name of the column
@@ -473,6 +517,26 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @see LineSenderBuilder#autoFlushRows(int)
      */
     void flush();
+
+    /**
+     * Same as {@link #flush()} but returns the highest frame sequence number (FSN) the
+     * call published. Producer-side correlation handle: log
+     * {@code (returnedFsn, domainContext)} alongside the data, then join to the
+     * {@link SenderError#getFromFsn()} / {@link SenderError#getToFsn()} span when an
+     * async error is delivered, or pass it to {@link #awaitAckedFsn(long, long)} for
+     * a bounded blocking wait.
+     * <br>
+     * Returns {@code -1} when nothing was published by this call, and on transports that
+     * do not track frame sequence numbers (HTTP, TCP, UDP).
+     *
+     * @return highest FSN published by this call, or {@code -1} if no data was published
+     *         or the transport does not expose FSNs
+     * @throws LineSenderException under the same conditions as {@link #flush()}
+     */
+    default long flushAndGetSequence() {
+        flush();
+        return -1L;
+    }
 
     /**
      * Add a GEOHASH column value from pre-packed bits and an explicit bit precision.
@@ -521,6 +585,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     default Sender geoHashColumn(CharSequence name, CharSequence value) {
         throw new LineSenderException("current protocol version does not support geohash");
+    }
+
+    /**
+     * Highest frame sequence number (FSN) the server has acknowledged, or that the sender
+     * has skipped past on a {@link SenderError.Policy#DROP_AND_CONTINUE} rejection.
+     * Returns {@code -1} when no batch has been published yet, and on transports that
+     * do not track FSNs (HTTP, TCP, UDP).
+     * <br>
+     * Snapshot accessor: for a bounded blocking wait, use
+     * {@link #awaitAckedFsn(long, long)}.
+     *
+     * @return highest acknowledged FSN, or {@code -1} if none or unsupported
+     */
+    default long getAckedFsn() {
+        return -1L;
     }
 
     /**
@@ -846,10 +925,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int DEFAULT_AUTO_FLUSH_INTERVAL_MILLIS = 1_000;
         private static final int DEFAULT_AUTO_FLUSH_ROWS = 75_000;
         private static final int DEFAULT_BUFFER_CAPACITY = 64 * 1024;
-        // Default close() drain timeout: block up to 5s waiting for the
+        // Default close() drain timeout: block up to 60s waiting for the
         // server to ACK everything published into the engine before
-        // shutting down the I/O loop.
-        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = 5_000L;
+        // shutting down the I/O loop. The wide default reflects what real
+        // workloads need on the close path -- catch-up replicas, slow
+        // consumers, and small server send buffers under chunky payloads
+        // all routinely take tens of seconds to acknowledge a backlog,
+        // and silently dropping unacked rows in close() is a much worse
+        // default than spending the wall-clock to wait. Callers who want
+        // a tighter close budget either set close_flush_timeout_millis
+        // explicitly or call the new drain(timeoutMillis) before close().
+        private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS = 60_000L;
         private static final int DEFAULT_HTTP_PORT = 9000;
         private static final int DEFAULT_HTTP_TIMEOUT = 30_000;
         private static final int DEFAULT_MAXIMUM_BUFFER_CAPACITY = 100 * 1024 * 1024;
@@ -1548,7 +1634,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * close() drain timeout in milliseconds. The sender's {@code close()}
          * method blocks up to this many millis waiting for the server to ACK
          * every batch already published into the engine before shutting down
-         * the I/O loop. Default {@code 5000}.
+         * the I/O loop. Default {@code 60000} (60 s) -- generous enough to
+         * survive real-workload backlogs (slow consumers, catch-up replicas,
+         * chunky payloads on small server send buffers) without silently
+         * dropping unacked rows; callers that need a longer pre-close wait
+         * for a specific submission can call
+         * {@link Sender#drain(long)} explicitly before close().
          * <p>
          * Set to {@code 0} or {@code -1} to opt out — close() will not wait
          * at all (fast close). Pending data is then lost in memory mode and

@@ -25,6 +25,9 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.std.Decimal128;
+import io.questdb.client.std.Decimal256;
+import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Long256Sink;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
@@ -268,6 +271,24 @@ public class QwpColumnBatch {
     }
 
     /**
+     * Zero-allocation read of a DECIMAL128 value into a caller-supplied
+     * {@link Decimal128} sink. Sets the sink's high, low, and scale in a single
+     * call. Returns {@code true} on a hit, {@code false} for NULL rows (the
+     * sink is left untouched).
+     */
+    public boolean getDecimal128(int col, int row, Decimal128 sink) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return false;
+        long base = l.valuesAddr + 16L * l.denseIndex(row);
+        sink.of(
+                Unsafe.getUnsafe().getLong(base + 8L),
+                Unsafe.getUnsafe().getLong(base),
+                columns.getQuick(col).scale
+        );
+        return true;
+    }
+
+    /**
      * Returns the high 64 bits of a DECIMAL128 value. Combine with {@link #getDecimal128Low}.
      */
     public long getDecimal128High(int col, int row) {
@@ -283,6 +304,40 @@ public class QwpColumnBatch {
         QwpColumnLayout l = columnLayouts.getQuick(col);
         if (isLayoutNull(l, row)) return 0L;
         return Unsafe.getUnsafe().getLong(l.valuesAddr + 16L * l.denseIndex(row));
+    }
+
+    /**
+     * Zero-allocation read of a DECIMAL256 value into a caller-supplied
+     * {@link Decimal256} sink. Sets all four 64-bit words and the scale in a
+     * single call. Returns {@code true} on a hit, {@code false} for NULL rows
+     * (the sink is left untouched).
+     */
+    public boolean getDecimal256(int col, int row, Decimal256 sink) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return false;
+        long base = l.valuesAddr + 32L * l.denseIndex(row);
+        sink.of(
+                Unsafe.getUnsafe().getLong(base + 24L),
+                Unsafe.getUnsafe().getLong(base + 16L),
+                Unsafe.getUnsafe().getLong(base + 8L),
+                Unsafe.getUnsafe().getLong(base),
+                columns.getQuick(col).scale
+        );
+        return true;
+    }
+
+    /**
+     * Zero-allocation read of a DECIMAL64 value into a caller-supplied
+     * {@link Decimal64} sink. Sets the unscaled value and scale in a single
+     * call. Returns {@code true} on a hit, {@code false} for NULL rows (the
+     * sink is left untouched).
+     */
+    public boolean getDecimal64(int col, int row, Decimal64 sink) {
+        QwpColumnLayout l = columnLayouts.getQuick(col);
+        if (isLayoutNull(l, row)) return false;
+        long value = Unsafe.getUnsafe().getLong(l.valuesAddr + 8L * l.denseIndex(row));
+        sink.of(value, columns.getQuick(col).scale);
+        return true;
     }
 
     /**

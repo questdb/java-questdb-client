@@ -58,6 +58,20 @@ public interface QwpColumnBatchHandler {
     void onEnd(long totalRows);
 
     /**
+     * Correlation-aware overload of {@link #onEnd(long)}. Receives the
+     * client-assigned request id of the just-completed query so callers can
+     * join completion records to earlier {@code onBatch} or log entries.
+     * The default delegates to {@link #onEnd(long)} for backwards
+     * compatibility; override this method when you need the request id.
+     *
+     * @param requestId client-assigned request id (matches {@link QwpColumnBatch#requestId()})
+     * @param totalRows server-reported total row count (0 if not tracked)
+     */
+    default void onEnd(long requestId, long totalRows) {
+        onEnd(totalRows);
+    }
+
+    /**
      * Invoked exactly once if the query fails at any point, instead of
      * {@link #onEnd} / {@link #onExecDone}.
      *
@@ -65,6 +79,26 @@ public interface QwpColumnBatchHandler {
      * @param message server-supplied error message (may be empty)
      */
     void onError(byte status, String message);
+
+    /**
+     * Correlation-aware overload of {@link #onError(byte, String)}. Receives
+     * the client-assigned request id of the failed query so callers can join
+     * the error to earlier {@code onBatch} or log entries without having to
+     * stash the id from a prior callback. The default delegates to
+     * {@link #onError(byte, String)} for backwards compatibility; override
+     * this method when you need the request id.
+     * <p>
+     * {@code requestId} is {@code -1} when the failure is raised before a
+     * request was assigned -- e.g. a {@code QwpQueryClient} that is already
+     * closed.
+     *
+     * @param requestId client-assigned request id, or {@code -1} if no request was in flight
+     * @param status    one of the QWP status codes (e.g., {@code STATUS_PARSE_ERROR})
+     * @param message   server-supplied error message (may be empty)
+     */
+    default void onError(long requestId, byte status, String message) {
+        onError(status, message);
+    }
 
     /**
      * Invoked when {@link QwpQueryClient#execute} has transparently reconnected
@@ -87,6 +121,19 @@ public interface QwpColumnBatchHandler {
     }
 
     /**
+     * Correlation-aware overload of {@link #onFailoverReset(QwpServerInfo)}.
+     * Receives the client-assigned request id of the query that is about to
+     * be re-submitted. The default delegates to
+     * {@link #onFailoverReset(QwpServerInfo)} for backwards compatibility.
+     *
+     * @param requestId client-assigned request id of the query being replayed
+     * @param newNode   the endpoint just bound to, or {@code null} if the new server negotiated v1
+     */
+    default void onFailoverReset(long requestId, QwpServerInfo newNode) {
+        onFailoverReset(newNode);
+    }
+
+    /**
      * Invoked in place of {@link #onBatch} + {@link #onEnd} when the query was
      * a non-SELECT (DDL, INSERT, UPDATE, etc.). No batches are delivered for
      * such queries -- the server executes the statement and replies with a
@@ -102,5 +149,19 @@ public interface QwpColumnBatchHandler {
      * @param rowsAffected rows inserted / updated / deleted; 0 for pure DDL
      */
     default void onExecDone(short opType, long rowsAffected) {
+    }
+
+    /**
+     * Correlation-aware overload of {@link #onExecDone(short, long)}. Receives
+     * the client-assigned request id of the completed non-SELECT query. The
+     * default delegates to {@link #onExecDone(short, long)} for backwards
+     * compatibility.
+     *
+     * @param requestId    client-assigned request id (matches {@link QwpColumnBatch#requestId()})
+     * @param opType       server-side opType constant (CompiledQuery.SELECT / INSERT / UPDATE / CREATE_TABLE / etc.)
+     * @param rowsAffected rows inserted / updated / deleted; 0 for pure DDL
+     */
+    default void onExecDone(long requestId, short opType, long rowsAffected) {
+        onExecDone(opType, rowsAffected);
     }
 }
