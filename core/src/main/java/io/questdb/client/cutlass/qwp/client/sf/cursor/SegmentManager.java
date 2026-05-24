@@ -247,6 +247,17 @@ public final class SegmentManager implements QuietCloseable {
             }
         }
         ring.setManagerWakeup(this::wakeWorker);
+        // Nudge the worker so it picks up the new ring on its very next
+        // iteration. Without this, register-after-start has a race window:
+        // start() schedules the worker thread, and if that thread reaches
+        // workerLoop and takes `lock` before this method does, it observes
+        // an empty `rings` snapshot, services nothing, then parkNanos
+        // (potentially seconds). A new ring whose first append does not
+        // cross the high-water mark fires no producer-side wakeup either,
+        // leaving the ring without a spare for the full poll interval.
+        // wakeWorker is cheap (a single LockSupport.unpark) and a no-op
+        // when the worker has not been started yet.
+        wakeWorker();
     }
 
     public synchronized void start() {

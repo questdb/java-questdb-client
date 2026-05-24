@@ -3072,6 +3072,18 @@ public class QwpWebSocketSender implements Sender {
             cursorEngine.appendBlocking(toSend.getBufferPtr(), toSend.getBufferPos());
             toSend.markRecycled();
         } catch (Throwable t) {
+            // appendBlocking failed synchronously on the user thread — the
+            // payload never reached the engine, so no I/O thread will
+            // recycle toSend. Recycle it here so a later flush can swap
+            // back to it; flushPendingRows aborts its post-enqueue state
+            // updates after this throw, so the source rows and the
+            // sent-schema watermark stay intact and the next batch re-emits
+            // the same rows along with the full schema + symbol-dict delta.
+            if (toSend.isSending()) {
+                toSend.markRecycled();
+            } else if (toSend.isSealed()) {
+                toSend.rollbackSealForRetry();
+            }
             // Surface any I/O thread error first — appendBlocking itself only
             // throws on PAYLOAD_TOO_LARGE / backpressure deadline, but the
             // I/O loop can have failed independently.

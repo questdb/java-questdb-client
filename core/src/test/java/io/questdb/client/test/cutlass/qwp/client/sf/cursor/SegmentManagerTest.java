@@ -218,18 +218,20 @@ public class SegmentManagerTest {
         TestUtils.assertMemoryLeak(() -> {
             // pollNanos is intentionally long enough that the 5s park can be
             // ruled out as the mechanism by which the first spare arrives.
-            // The worker thread enters workerLoop on start(), takes the lock,
-            // sees the just-registered ring with needsHotSpare()==true, and
-            // provisions the spare BEFORE parking. The spare must therefore
-            // land within seconds of register(), not minutes -- the 5s park is
-            // never reached on the first iteration.
+            // register() unparks the worker after publishing the new ring,
+            // so the worker re-iterates and provisions the spare even when
+            // its first loop snapshot ran before register() acquired `lock`.
+            // The spare must therefore land within seconds of register(),
+            // not minutes -- the 5s park is never reached.
             //
             // The append below is incidental to the contract under test; it
             // does NOT cross the SegmentRing high-water mark for this 4-frame
             // segment (HEADER_SIZE 24 + FRAME_HEADER_SIZE 8 + 16 = 48 vs
             // signalAtBytes = (120 >> 2) * 3 = 90), so no producer-side wakeup
             // fires. The rotation/high-water wakeup paths are covered by
-            // testRotationWakeupTriggersImmediateSparePrep.
+            // testRotationWakeupTriggersImmediateSparePrep, and the
+            // deterministic register-after-park case is covered by
+            // testRegisterAfterWorkerParkedWakesWorker.
             long pollNanos = 5_000_000_000L; // 5 seconds
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
@@ -252,6 +254,40 @@ public class SegmentManagerTest {
                         elapsedMs < 4000);
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testRegisterAfterWorkerParkedWakesWorker() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Deterministic version of testFirstSpareLandsBeforeFirstPoll:
+            // sleep between start() and register() long enough for the worker
+            // to definitely complete its first (empty) iteration and enter
+            // parkNanos. Without register()'s wakeWorker() the spare would
+            // not land for the full 5s poll interval; with it the spare lands
+            // promptly because register() unparks the worker out of its park.
+            // No append at all, so no producer-side wakeup can mask a missing
+            // register-side wakeup.
+            long pollNanos = 5_000_000_000L; // 5 seconds
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
+            try (SegmentRing ring = new SegmentRing(seg0, segSize);
+                 SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
+                mgr.start();
+                // Give the worker plenty of time to enter workerLoop, snapshot
+                // an empty rings list, and reach parkNanos. 250ms is far more
+                // than the OS scheduling + thread startup cost on any sane
+                // CI runner, and still well below the 5s poll interval.
+                Thread.sleep(250);
+                long t0 = System.nanoTime();
+                mgr.register(ring, tmpDir);
+                assertTrue("register must wake a worker that has already parked",
+                        waitFor(() -> !ring.needsHotSpare(), 2000));
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+                assertTrue("spare arrived in " + elapsedMs + "ms -- should be <<5000ms",
+                        elapsedMs < 4000);
             }
         });
     }
