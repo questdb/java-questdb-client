@@ -344,10 +344,9 @@ public class QwpWebSocketSenderTest {
                 // deadline guarantees every appendBlocking() call trips the
                 // backpressure deadline and throws.
                 CursorSendEngine engine = new CursorSendEngine(null, 33, 33, 1L);
-                QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
                         "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
-                        QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION, false, engine, 0L);
-                try {
+                        QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION, false, engine, 0L)) {
                     sender.table("t").longColumn("v", 1L).atNow();
 
                     try {
@@ -364,17 +363,13 @@ public class QwpWebSocketSenderTest {
                                     + MicrobatchBuffer.stateName(buffer0.getState())
                                     + ", buffer1=" + MicrobatchBuffer.stateName(buffer1.getState()) + "]",
                             buffer0.isInUse() || buffer1.isInUse());
-                } finally {
-                    // close() drains pending rows, which appendBlocking still
-                    // rejects because the engine is permanently wedged in this
-                    // test. The bug under test is about microbatch buffer
-                    // state, not about close() being lenient toward residual
-                    // unflushed rows — swallow the predictable rethrow here.
-                    try {
-                        sender.close();
-                    } catch (LineSenderException ignored) {
-                    }
+                } catch (LineSenderException ignored) {
                 }
+                // close() drains pending rows, which appendBlocking still
+                // rejects because the engine is permanently wedged in this
+                // test. The bug under test is about microbatch buffer
+                // state, not about close() being lenient toward residual
+                // unflushed rows — swallow the predictable rethrow here.
             }
         });
     }

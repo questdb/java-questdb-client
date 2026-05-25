@@ -113,7 +113,7 @@ public class CleanShutdownNoReplayTest {
 
             String cfg2 = "ws::addr=localhost:" + port2
                     + ";sf_dir=" + sfDir + ";";
-            try (Sender sender = Sender.fromConfig(cfg2)) {
+            try (Sender ignored = Sender.fromConfig(cfg2)) {
                 // No new appends — purely observe whether recovery replays
                 // anything. Give the I/O loop ample room to push any
                 // replayed bytes onto the wire.
