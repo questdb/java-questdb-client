@@ -1965,12 +1965,6 @@ public class QwpWebSocketSender implements Sender {
      * publishing or reconnect. See {@link SenderConnectionListener} for the
      * full delivery contract.
      */
-    /**
-     * Forces the {@code connected} flag without going through the real
-     * connect handshake. Lets unit tests exercise post-connect code paths
-     * (auto-flush bookkeeping, batch-size guards, ack tracking) on a
-     * sender that never opened a socket. Never call from production code.
-     */
     @TestOnly
     public void setConnectedForTest(boolean connected) {
         this.connected = connected;
