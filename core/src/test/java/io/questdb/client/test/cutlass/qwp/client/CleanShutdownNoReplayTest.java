@@ -83,7 +83,7 @@ public class CleanShutdownNoReplayTest {
                     + ";sf_dir=" + sfDir + ";";
             try (Sender sender = Sender.fromConfig(cfg1)) {
                 for (int i = 0; i < 5; i++) {
-                    sender.table("foo").longColumn("v", (long) i).atNow();
+                    sender.table("foo").longColumn("v", i).atNow();
                     sender.flush();
                 }
                 // Wait until the server has ACK'd everything we sent. The

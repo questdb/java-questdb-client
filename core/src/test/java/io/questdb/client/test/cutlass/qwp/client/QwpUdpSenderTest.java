@@ -1920,7 +1920,7 @@ public class QwpUdpSenderTest {
             assertClosedUdp(() -> sender.doubleArray("x", (double[][]) null));
             assertClosedUdp(() -> sender.doubleArray("x", (double[][][]) null));
             assertClosedUdp(() -> sender.doubleArray("x", (DoubleArray) null));
-            assertClosedUdp(() -> sender.geoHashColumn("x", (CharSequence) null));
+            assertClosedUdp(() -> sender.geoHashColumn("x", null));
             assertClosedUdp(() -> sender.longArray("x", (long[]) null));
             assertClosedUdp(() -> sender.longArray("x", (long[][]) null));
             assertClosedUdp(() -> sender.longArray("x", (long[][][]) null));

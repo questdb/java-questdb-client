@@ -254,7 +254,7 @@ class QwpColumnWriter {
         long dataAddr = col.getDataAddress();
         buffer.putVarint(dictionarySize);
         for (int i = 0; i < dictionarySize; i++) {
-            buffer.putString((String) col.getSymbolValue(i));
+            buffer.putString(col.getSymbolValue(i));
         }
 
         for (int i = 0; i < count; i++) {

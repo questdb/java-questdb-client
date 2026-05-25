@@ -106,7 +106,7 @@ public class SfFromConfigTest {
                 try (Sender sender = Sender.fromConfig(config)) {
                     // Write enough data that segments rotate at ~128 KiB boundary.
                     for (int i = 0; i < 50; i++) {
-                        sender.table("foo").longColumn("v", (long) i).atNow();
+                        sender.table("foo").longColumn("v", i).atNow();
                     }
                     sender.flush();
                 }

@@ -428,7 +428,7 @@ public class QwpWebSocketSenderTest {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = createUnconnectedSender()) {
                 sender.table("t");
-                Assert.assertSame(sender, sender.ipv4Column("addr", (CharSequence) null));
+                Assert.assertSame(sender, sender.ipv4Column("addr", null));
             }
         });
     }
@@ -533,8 +533,8 @@ public class QwpWebSocketSenderTest {
             assertClosed(() -> sender.doubleArray("x", (double[][]) null));
             assertClosed(() -> sender.doubleArray("x", (double[][][]) null));
             assertClosed(() -> sender.doubleArray("x", (DoubleArray) null));
-            assertClosed(() -> sender.geoHashColumn("x", (CharSequence) null));
-            assertClosed(() -> sender.ipv4Column("x", (CharSequence) null));
+            assertClosed(() -> sender.geoHashColumn("x", null));
+            assertClosed(() -> sender.ipv4Column("x", null));
             assertClosed(() -> sender.longArray("x", (long[]) null));
             assertClosed(() -> sender.longArray("x", (long[][]) null));
             assertClosed(() -> sender.longArray("x", (long[][][]) null));

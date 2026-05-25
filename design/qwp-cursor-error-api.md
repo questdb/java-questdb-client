@@ -82,16 +82,17 @@ User overrides via builder (`errorPolicy(Category, Policy)` or full `errorPolicy
 ## `SenderError` (public, immutable)
 
 ```java
-public final class SenderError {
-    public final Category category;
-    public final Policy   appliedPolicy;     // what the loop actually did
-    public final int      serverStatusByte;  // raw byte (0x03/0x05/...); -1 for PROTOCOL_VIOLATION
-    public final String   serverMessage;     // ≤1024 UTF-8 from frame, or WS close reason
-    public final long     messageSequence;   // server's per-frame seq (mirrors what server logs); -1 for PROTOCOL_VIOLATION
-    public final long     fromFsn;           // client-side FSN span — load-bearing for correlation
-    public final long     toFsn;             // inclusive
-    public final String   tableName;         // best-effort; null if multi-table batch
-    public final long     detectedAtNanos;   // System.nanoTime() at I/O thread receipt
+/**
+ * @param appliedPolicy  what the loop actually did
+ * @param serverStatusByte  raw byte (0x03/0x05/...); -1 for PROTOCOL_VIOLATION
+ * @param serverMessage  ≤1024 UTF-8 from frame, or WS close reason
+ * @param messageSequence  server's per-frame seq (mirrors what server logs); -1 for PROTOCOL_VIOLATION
+ * @param fromFsn  client-side FSN span — load-bearing for correlation
+ * @param toFsn  inclusive
+ * @param tableName  best-effort; null if multi-table batch
+ * @param detectedAtNanos  System.nanoTime() at I/O thread receipt */
+public record SenderError(Category category, Policy appliedPolicy, int serverStatusByte, String serverMessage,
+                          long messageSequence, long fromFsn, long toFsn, String tableName, long detectedAtNanos) {
     // accessors only; no mutation
 }
 ```

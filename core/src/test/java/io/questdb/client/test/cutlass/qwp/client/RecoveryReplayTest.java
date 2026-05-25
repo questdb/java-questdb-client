@@ -89,7 +89,7 @@ public class RecoveryReplayTest {
                     + ";close_flush_timeout_millis=0;";
             try (Sender s1 = Sender.fromConfig(cfg1)) {
                 for (int i = 0; i < 50; i++) {
-                    s1.table("foo").stringColumn("p", pad).longColumn("v", (long) i).atNow();
+                    s1.table("foo").stringColumn("p", pad).longColumn("v", i).atNow();
                     s1.flush();
                 }
             }

@@ -85,7 +85,7 @@ public class BackgroundDrainerEndToEndTest {
                         + ";close_flush_timeout_millis=0;";
                 try (Sender g = Sender.fromConfig(cfg1)) {
                     for (int i = 0; i < 30; i++) {
-                        g.table("foo").longColumn("v", (long) i).atNow();
+                        g.table("foo").longColumn("v", i).atNow();
                         g.flush();
                     }
                 }
