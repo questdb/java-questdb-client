@@ -37,6 +37,11 @@ public final class QwpConstants {
      */
     public static final String CLIENT_ID = "java/1.0.2";
     /**
+     * Flag bit: defer WAL commit. The server appends rows to WAL writers
+     * but skips the commit until a subsequent message without this flag.
+     */
+    public static final byte FLAG_DEFER_COMMIT = 0x01;
+    /**
      * Flag bit: Delta symbol dictionary encoding enabled.
      * When set, symbol columns use global IDs and send only new dictionary entries.
      */

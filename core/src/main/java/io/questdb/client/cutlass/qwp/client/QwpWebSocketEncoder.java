@@ -126,6 +126,14 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return (flags & FLAG_GORILLA) != 0;
     }
 
+    public void setDeferCommit(boolean defer) {
+        if (defer) {
+            flags |= FLAG_DEFER_COMMIT;
+        } else {
+            flags &= ~FLAG_DEFER_COMMIT;
+        }
+    }
+
     public void setGorillaEnabled(boolean enabled) {
         if (enabled) {
             flags |= FLAG_GORILLA;
