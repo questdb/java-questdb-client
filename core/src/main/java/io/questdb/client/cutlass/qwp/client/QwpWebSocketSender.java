@@ -980,8 +980,8 @@ public class QwpWebSocketSender implements Sender {
                     //    rows -> mmap'd / malloc'd ring). After this, the
                     //    cursor engine's publishedFsn reflects the final
                     //    target the I/O loop must drive ackedFsn up to.
-                    flushPendingRows(false);
-                    if (hasDeferredMessages) {
+                    flushPendingRows(deferCommit);
+                    if (!deferCommit && hasDeferredMessages) {
                         sendCommitMessage();
                     }
                     if (activeBuffer != null && activeBuffer.hasData()) {
