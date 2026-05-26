@@ -193,6 +193,7 @@ public class QwpWebSocketSender implements Sender {
     // that walks the ring and sends frames.
     private CursorSendEngine cursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
+    private boolean deferCommit;
     // Orphan-slot drainer pool. Non-null only when the builder requested
     // drain_orphans=true AND we have a slot path to scan against. Closed
     // alongside the cursor send loop in close().
@@ -1378,8 +1379,8 @@ public class QwpWebSocketSender implements Sender {
         // sealAndSwapBuffer, so by the time we reach here every encoded
         // batch is durable on its mmap'd segment. No processingCount to
         // drain, no awaitPendingAcks. Just surface any I/O thread error.
-        flushPendingRows(false);
-        if (hasDeferredMessages) {
+        flushPendingRows(deferCommit);
+        if (!deferCommit && hasDeferredMessages) {
             sendCommitMessage();
         }
         if (activeBuffer != null && activeBuffer.hasData()) {
@@ -1968,6 +1969,10 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setConnectedForTest(boolean connected) {
         this.connected = connected;
+    }
+
+    public void setDeferCommit(boolean enabled) {
+        this.deferCommit = enabled;
     }
 
     public void setConnectionListener(SenderConnectionListener listener) {
