@@ -43,6 +43,9 @@ Removes any `release.properties` and `*.releaseBackup` files left over from a pr
 - roll the versions to the next snapshot (`1.2.3-SNAPSHOT`)
 - commit the next-snapshot POMs
 
+Do not create or push the release tag before this step. A tag pushed from `main` while the POMs still contain
+`-SNAPSHOT` will trigger the Maven Central workflow and be rejected.
+
 ```bash
 mvn -B release:prepare \
   -DautoVersionSubmodules=true \
@@ -54,6 +57,9 @@ mvn -B release:prepare \
 
 `-B` runs non-interactively; drop it for special versions (e.g. a new major) to get the prompts. `-DpushChanges=false`
 keeps the commits and tag local until you have verified them.
+
+Do not run `release:perform` or `mvn deploy` locally during the normal release path. Publishing is owned by the
+GitHub Actions workflow that runs from the release tag.
 
 If `release:prepare` fails partway through:
 
@@ -67,6 +73,13 @@ it manually or the next attempt at the same version fails. If `release.propertie
 `git reset --hard <previous-HEAD>` instead (and still drop the tag).
 
 ## Push the release branch and tag
+
+Before pushing, verify the tag points at the release commit and that the tagged POM version is not a snapshot:
+
+```bash
+git show --no-patch --oneline 1.2.2
+git show 1.2.2:pom.xml | grep '<version>1.2.2</version>'
+```
 
 ```bash
 git push origin release/1.2.2
@@ -84,6 +97,7 @@ a tag matching `X.Y.Z` is pushed. No manual dispatch. It:
 - checks out the pushed tag
 - assumes an AWS IAM role via OIDC and reads the GPG key and Sonatype credentials from AWS Secrets Manager
 - verifies the tag matches the parent POM version and is not a snapshot
+- skips publishing if the same version is already present on Maven Central
 - signs the artifacts and uploads them through the Sonatype Central Portal
 
 The workflow returns once Sonatype has validated the upload and taken ownership of the artifacts. Physical

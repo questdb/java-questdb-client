@@ -238,6 +238,40 @@ cd java-questdb-client
 mvn clean package -DskipTests
 ```
 
+## Releasing
+
+Maven Central publishing is owned by the tag-triggered GitHub Actions workflow. Do not publish from a local machine in
+the normal release path.
+
+Release tags must be created by `maven-release-plugin release:prepare` after it has committed the non-SNAPSHOT release
+POMs. Do not manually create or push a version tag from `main` while the POMs still contain `-SNAPSHOT`; that tag will
+trigger the release workflow and the workflow will reject it.
+
+Normal release flow:
+
+```bash
+VERSION=1.2.2
+NEXT_VERSION=1.2.3
+
+mvn release:clean
+mvn -B release:prepare \
+  -DautoVersionSubmodules=true \
+  -DpushChanges=false \
+  -DreleaseVersion="$VERSION" \
+  -DdevelopmentVersion="$NEXT_VERSION-SNAPSHOT" \
+  -Dtag="$VERSION"
+git show --no-patch --oneline "$VERSION"
+git show "$VERSION:pom.xml" | grep "<version>$VERSION</version>"
+git push origin "release/$VERSION"
+git push origin "$VERSION"
+```
+
+Do not run `mvn release:perform` or `mvn deploy` unless you are intentionally bypassing the GitHub Actions release
+workflow. Running a local deploy while the tag workflow is also publishing creates competing Sonatype deployments for
+the same coordinate.
+
+Full release procedure: [artifacts/release/README.md](artifacts/release/README.md).
+
 ### Building Native Libraries
 
 The client includes native libraries (C/C++ and assembly) for performance-critical operations. Pre-built binaries are included in the repository, but you can rebuild them locally if needed.
