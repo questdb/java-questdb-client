@@ -97,7 +97,6 @@ a tag matching `X.Y.Z` is pushed. No manual dispatch. It:
 - checks out the pushed tag
 - assumes an AWS IAM role via OIDC and reads the GPG key and Sonatype credentials from AWS Secrets Manager
 - verifies the tag matches the parent POM version and is not a snapshot
-- skips publishing if the same version is already present on Maven Central
 - signs the artifacts and uploads them through the Sonatype Central Portal
 
 The workflow returns once Sonatype has validated the upload and taken ownership of the artifacts. Physical
