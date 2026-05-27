@@ -193,6 +193,7 @@ public class QwpWebSocketSender implements Sender {
     // that walks the ring and sends frames.
     private CursorSendEngine cursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
+    private boolean deferCommit;
     // Orphan-slot drainer pool. Non-null only when the builder requested
     // drain_orphans=true AND we have a slot path to scan against. Closed
     // alongside the cursor send loop in close().
@@ -219,6 +220,7 @@ public class QwpWebSocketSender implements Sender {
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
     private boolean gorillaEnabled = true;
+    private boolean hasDeferredMessages;
     // Stickys true once any successful connect has happened. Drives the
     // CONNECTED-vs-RECONNECTED-vs-FAILED_OVER classification at the success
     // point in buildAndConnect.
@@ -260,6 +262,10 @@ public class QwpWebSocketSender implements Sender {
     // beginRound(true) call. roundSeq=1 is the first round; CONNECTED in the
     // first round indicates the initial connect.
     private long roundSeq;
+    // When true, auto-flush sends messages with FLAG_DEFER_COMMIT and only
+    // explicit flush() triggers the server-side commit. Enables accumulating
+    // arbitrarily large datasets that exceed the server's recv buffer.
+    private boolean transactional;
     // Server-advertised hard cap on QWP ingest payload bytes, captured from
     // X-QWP-Max-Batch-Size on each successful handshake. 0 when the server
     // did not advertise the header (older builds); the sender then falls back
@@ -974,7 +980,10 @@ public class QwpWebSocketSender implements Sender {
                     //    rows -> mmap'd / malloc'd ring). After this, the
                     //    cursor engine's publishedFsn reflects the final
                     //    target the I/O loop must drive ackedFsn up to.
-                    flushPendingRows();
+                    flushPendingRows(deferCommit);
+                    if (!deferCommit && hasDeferredMessages) {
+                        sendCommitMessage();
+                    }
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
@@ -1370,7 +1379,10 @@ public class QwpWebSocketSender implements Sender {
         // sealAndSwapBuffer, so by the time we reach here every encoded
         // batch is durable on its mmap'd segment. No processingCount to
         // drain, no awaitPendingAcks. Just surface any I/O thread error.
-        flushPendingRows();
+        flushPendingRows(deferCommit);
+        if (!deferCommit && hasDeferredMessages) {
+            sendCommitMessage();
+        }
         if (activeBuffer != null && activeBuffer.hasData()) {
             sealAndSwapBuffer();
         }
@@ -1954,15 +1966,13 @@ public class QwpWebSocketSender implements Sender {
      * publishing or reconnect. See {@link SenderConnectionListener} for the
      * full delivery contract.
      */
-    /**
-     * Forces the {@code connected} flag without going through the real
-     * connect handshake. Lets unit tests exercise post-connect code paths
-     * (auto-flush bookkeeping, batch-size guards, ack tracking) on a
-     * sender that never opened a socket. Never call from production code.
-     */
     @TestOnly
     public void setConnectedForTest(boolean connected) {
         this.connected = connected;
+    }
+
+    public void setDeferCommit(boolean enabled) {
+        this.deferCommit = enabled;
     }
 
     public void setConnectionListener(SenderConnectionListener listener) {
@@ -2037,6 +2047,10 @@ public class QwpWebSocketSender implements Sender {
     public void setGorillaEnabled(boolean enabled) {
         this.gorillaEnabled = enabled;
         this.encoder.setGorillaEnabled(enabled);
+    }
+
+    public void setTransactional(boolean transactional) {
+        this.transactional = transactional;
     }
 
     /**
@@ -2858,9 +2872,18 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Flushes pending rows by encoding and sending them.
-     * All non-empty tables are encoded into a single QWP v1 message and sent as one WebSocket frame.
+     * When all tables fit in a single message, the encoder produces one
+     * WebSocket frame. When the encoded size exceeds {@code serverMaxBatchSize},
+     * the method splits tables across multiple messages using
+     * {@code FLAG_DEFER_COMMIT}: all but the last message carry the flag so
+     * the server appends rows without committing, and the final message
+     * triggers the commit.
+     *
+     * @param deferCommit when true, the message carries FLAG_DEFER_COMMIT
+     *                    so the server appends rows but does not commit.
+     *                    Used by auto-flush in transactional mode.
      */
-    private void flushPendingRows() {
+    private void flushPendingRows(boolean deferCommit) {
         if (pendingRowCount <= 0) {
             return;
         }
@@ -2880,7 +2903,7 @@ public class QwpWebSocketSender implements Sender {
         }
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Flushing pending rows [count={}, tables={}]", pendingRowCount, tableCount);
+            LOG.debug("Flushing pending rows [count={}, tables={}, defer={}]", pendingRowCount, tableCount, deferCommit);
         }
 
         ensureActiveBufferReady();
@@ -2894,6 +2917,7 @@ public class QwpWebSocketSender implements Sender {
         // self-sufficient frames there's no encode-vs-reconnect race
         // to defend against: the bytes are valid against any server.
         int batchMaxSchemaId = maxSentSchemaId;
+        encoder.setDeferCommit(deferCommit);
         encoder.beginMessage(tableCount, globalSymbolDictionary,
                 /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
         for (int i = 0, n = keys.size(); i < n; i++) {
@@ -2925,39 +2949,9 @@ public class QwpWebSocketSender implements Sender {
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
 
-        // Defensive flush-time cap check: the per-row guard in sendRow()
-        // catches individual oversize rows, but schema and dict-delta
-        // bytes the encoder adds at message-build time can push a batch
-        // of legitimately-sized rows above the wire cap. Without this
-        // check the frame would be sent and the server would close the
-        // connection with ws-close[1009 Message Too Big], surfacing the
-        // failure asynchronously on a later op rather than from this
-        // flush() call. Reset all pending state so the sender stays
-        // usable -- the caller's pending rows are dropped; they must
-        // re-batch with fewer rows per flush. close()'s drain path
-        // also relies on this being a clean reset to avoid re-throwing.
         if (serverMaxBatchSize > 0 && messageSize > serverMaxBatchSize) {
-            int droppedRows = pendingRowCount;
-            for (int i = 0, n = keys.size(); i < n; i++) {
-                CharSequence tableName = keys.getQuick(i);
-                if (tableName == null) {
-                    continue;
-                }
-                QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-                if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                    continue;
-                }
-                tableBuffer.reset();
-            }
-            currentBatchMaxSymbolId = -1;
-            pendingBytes = 0;
-            currentTableBufferSnapshotBytes = 0;
-            pendingRowCount = 0;
-            firstPendingRowTimeNanos = 0;
-            throw new LineSenderException("batch too large for server batch cap")
-                    .put(" [messageSize=").put(messageSize)
-                    .put(", serverMaxBatchSize=").put(serverMaxBatchSize)
-                    .put(", droppedRows=").put(droppedRows).put(']');
+            flushPendingRowsSplit(keys, batchMaxSchemaId, deferCommit);
+            return;
         }
 
         activeBuffer.ensureCapacity(messageSize);
@@ -2965,11 +2959,89 @@ public class QwpWebSocketSender implements Sender {
         activeBuffer.incrementRowCount();
         sealAndSwapBuffer();
 
+        hasDeferredMessages = deferCommit;
+
         // Update sent state only after successful enqueue.
         // If sealAndSwapBuffer() threw, these remain unchanged so the
         // next batch's delta dictionary will correctly re-include the
         // symbols and schema that the server never received.
         maxSentSchemaId = batchMaxSchemaId;
+        resetTableBuffersAfterFlush(keys);
+    }
+
+    /**
+     * Splitting path: the full batch exceeds serverMaxBatchSize, so
+     * flushPendingRows() delegates here. Each non-empty table gets its
+     * own message. All messages except the last carry FLAG_DEFER_COMMIT
+     * so the server appends rows without committing until the final
+     * message arrives.
+     *
+     * @param deferCommit when true, ALL messages (including the last)
+     *                    carry FLAG_DEFER_COMMIT. When false, only the
+     *                    last message omits the flag.
+     */
+    private void flushPendingRowsSplit(ObjList<CharSequence> keys, int batchMaxSchemaId, boolean deferCommit) {
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Splitting flush across multiple messages [serverMaxBatchSize={}, defer={}]", serverMaxBatchSize, deferCommit);
+        }
+
+        // Collect non-empty table indices so we know which is last.
+        int nonEmptyCount = 0;
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
+                nonEmptyCount++;
+            }
+        }
+
+        int sent = 0;
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            CharSequence tableName = keys.getQuick(i);
+            if (tableName == null) {
+                continue;
+            }
+            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
+            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                continue;
+            }
+
+            sent++;
+            boolean isLast = (sent == nonEmptyCount);
+            boolean deferThis = deferCommit || !isLast;
+
+            encoder.setDeferCommit(deferThis);
+            encoder.beginMessage(1, globalSymbolDictionary,
+                    /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
+            encoder.addTable(tableBuffer, /*useSchemaRef=*/ false);
+            int messageSize = encoder.finishMessage();
+            QwpBufferWriter buffer = encoder.getBuffer();
+
+            if (messageSize > serverMaxBatchSize) {
+                resetTableBuffersAfterFlush(keys);
+                throw new LineSenderException("single table batch too large for server batch cap")
+                        .put(" [table=").put(tableName)
+                        .put(", messageSize=").put(messageSize)
+                        .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
+            }
+
+            ensureActiveBufferReady();
+            activeBuffer.ensureCapacity(messageSize);
+            activeBuffer.write(buffer.getBufferPtr(), messageSize);
+            activeBuffer.incrementRowCount();
+            sealAndSwapBuffer();
+        }
+
+        encoder.setDeferCommit(false);
+        hasDeferredMessages = deferCommit;
+        maxSentSchemaId = batchMaxSchemaId;
+        resetTableBuffersAfterFlush(keys);
+    }
+
+    private void resetTableBuffersAfterFlush(ObjList<CharSequence> keys) {
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -2982,12 +3054,31 @@ public class QwpWebSocketSender implements Sender {
             tableBuffer.reset();
         }
         currentBatchMaxSymbolId = -1;
-
-        // Reset pending count
         pendingBytes = 0;
         currentTableBufferSnapshotBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
+    }
+
+    /**
+     * Sends an empty QWP message without FLAG_DEFER_COMMIT to trigger
+     * the server-side commit of all previously deferred rows.
+     */
+    private void sendCommitMessage() {
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Sending commit message for deferred batch");
+        }
+        encoder.setDeferCommit(false);
+        encoder.beginMessage(0, globalSymbolDictionary,
+                /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
+        int messageSize = encoder.finishMessage();
+        QwpBufferWriter buffer = encoder.getBuffer();
+        ensureActiveBufferReady();
+        activeBuffer.ensureCapacity(messageSize);
+        activeBuffer.write(buffer.getBufferPtr(), messageSize);
+        activeBuffer.incrementRowCount();
+        sealAndSwapBuffer();
+        hasDeferredMessages = false;
     }
 
     private void resetSchemaStateForNewConnection() {
@@ -3134,7 +3225,7 @@ public class QwpWebSocketSender implements Sender {
         currentTableBufferSnapshotBytes = bufferedNow;
 
         if (shouldAutoFlush()) {
-            flushPendingRows();
+            flushPendingRows(transactional);
         }
     }
 

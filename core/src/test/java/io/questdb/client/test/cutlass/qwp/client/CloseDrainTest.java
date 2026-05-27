@@ -154,8 +154,7 @@ public class CloseDrainTest {
             String cfg = "ws::addr=localhost:" + port
                     + ";close_flush_timeout_millis=" + timeoutMs + ";";
             long elapsedMs;
-            Sender sender = Sender.fromConfig(cfg);
-            try {
+            try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
                 long t0 = System.nanoTime();
@@ -167,9 +166,8 @@ public class CloseDrainTest {
                             e.getMessage().contains("drain timed out"));
                 }
                 elapsedMs = (System.nanoTime() - t0) / 1_000_000;
-            } finally {
-                sender.close(); // idempotent — closed flag is set on first call
             }
+            // idempotent — closed flag is set on first call
             Assert.assertTrue("close() returned too early: " + elapsedMs + "ms",
                     elapsedMs >= timeoutMs);
             Assert.assertTrue("close() exceeded the bounded timeout by too much: " + elapsedMs + "ms",
@@ -321,7 +319,7 @@ public class CloseDrainTest {
                         + ";close_flush_timeout_millis=3000;";
                 long t0 = System.nanoTime();
                 try (Sender sender = Sender.fromConfig(cfg)) {
-                    sender.table("foo").longColumn("v", (long) i).atNow();
+                    sender.table("foo").longColumn("v", i).atNow();
                     sender.flush();
                 }
                 long elapsedMs = (System.nanoTime() - t0) / 1_000_000;

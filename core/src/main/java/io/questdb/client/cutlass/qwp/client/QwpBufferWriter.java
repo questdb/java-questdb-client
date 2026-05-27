@@ -87,6 +87,14 @@ public interface QwpBufferWriter extends ArrayBufferAppender {
     int getWritableBytes();
 
     /**
+     * Patches a byte value at the specified offset in the buffer.
+     *
+     * @param offset the byte offset from buffer start
+     * @param value  the byte value to write
+     */
+    void patchByte(int offset, byte value);
+
+    /**
      * Patches an int value at the specified offset in the buffer.
      * <p>
      * Used for updating length fields after writing content.

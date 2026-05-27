@@ -225,6 +225,11 @@ public class WebSocketSendBuffer implements QwpBufferWriter, QuietCloseable {
         return writePos;
     }
 
+    @Override
+    public void patchByte(int offset, byte value) {
+        Unsafe.getUnsafe().putByte(bufPtr + offset, value);
+    }
+
     /**
      * Patches an int value at the specified offset.
      */

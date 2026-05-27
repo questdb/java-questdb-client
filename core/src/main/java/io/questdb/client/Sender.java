@@ -1074,6 +1074,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private long reconnectMaxDurationMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean requestDurableAck;
         private int retryTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean transactional;
         private String senderId = DEFAULT_SENDER_ID;
         // Per-append deadline for SF appendBlocking spin-then-throw. Used to
         // be a hardcoded 30s constant; expose so tight-SLA users can lower
@@ -1531,6 +1532,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // closing the engine alone would leak the I/O thread,
                 // dispatcher daemon, drainer pool, microbatch buffers and
                 // WebSocketClient inside the abandoned `connected`.
+                connected.setTransactional(transactional);
                 try {
                     // Once the foreground sender is up, dispatch drainers
                     // for any sibling orphan slots. Scan AFTER we acquire
@@ -2403,6 +2405,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Enables transactional mode. Auto-flush sends data to the server
+         * with {@code FLAG_DEFER_COMMIT}; only an explicit {@code flush()}
+         * triggers the server-side WAL commit. This allows accumulating
+         * datasets larger than the server's recv buffer while committing
+         * atomically per table.
+         *
+         * @param enabled true to enable transactional mode
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder transactional(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("transactional is only supported for WebSocket transport");
+            }
+            this.transactional = enabled;
+            return this;
+        }
+
+        /**
          * Configures the maximum time the Sender will spend retrying upon receiving a recoverable error from the server.
          * <br>
          * This setting is applicable only when communicating over the HTTP transport, and it is illegal to invoke this
@@ -3121,6 +3141,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         requestDurableAck(false);
                     } else {
                         throw new LineSenderException("invalid request_durable_ack [value=").put(sink).put(", allowed-values=[on, off]]");
+                    }
+                } else if (Chars.equals("transaction", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("transaction is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "transaction");
+                    if (Chars.equalsIgnoreCase("on", sink)) {
+                        transactional(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink)) {
+                        transactional(false);
+                    } else {
+                        throw new LineSenderException("invalid transaction [value=").put(sink).put(", allowed-values=[on, off]]");
                     }
                 } else if (Chars.equals("max_schemas_per_connection", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {

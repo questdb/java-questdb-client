@@ -138,6 +138,11 @@ public class NativeBufferWriter implements QwpBufferWriter, QuietCloseable {
         return capacity - position;
     }
 
+    @Override
+    public void patchByte(int offset, byte value) {
+        Unsafe.getUnsafe().putByte(bufferPtr + offset, value);
+    }
+
     /**
      * Patches an int value at the specified offset.
      * Used for updating length fields after writing content.

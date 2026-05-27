@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.After;
@@ -89,7 +90,7 @@ public class RecoveryReplayTest {
                     + ";close_flush_timeout_millis=0;";
             try (Sender s1 = Sender.fromConfig(cfg1)) {
                 for (int i = 0; i < 50; i++) {
-                    s1.table("foo").stringColumn("p", pad).longColumn("v", (long) i).atNow();
+                    s1.table("foo").stringColumn("p", pad).longColumn("v", i).atNow();
                     s1.flush();
                 }
             }
@@ -118,7 +119,7 @@ public class RecoveryReplayTest {
 
             String cfg2 = "ws::addr=localhost:" + port2
                     + ";sf_dir=" + sfDir + ";";
-            try (Sender s2 = Sender.fromConfig(cfg2)) {
+            try (Sender ignored = Sender.fromConfig(cfg2)) {
                 // No new appends — purely replay.
                 long deadline = System.currentTimeMillis() + 5_000;
                 while (System.currentTimeMillis() < deadline
@@ -135,24 +136,6 @@ public class RecoveryReplayTest {
                     "every distinct row written by sender 1 must replay through to server 2",
                     50, ack.distinctPayloadHashes.size());
         }
-    }
-
-    private static int countSegmentFiles(String dir) {
-        if (!Files.exists(dir)) return 0;
-        long find = Files.findFirst(dir);
-        if (find <= 0) return 0;
-        int n = 0;
-        try {
-            int rc = 1;
-            while (rc > 0) {
-                String name = Files.utf8ToString(Files.findName(find));
-                if (name != null && name.endsWith(".sfa")) n++;
-                rc = Files.findNext(find);
-            }
-        } finally {
-            Files.findClose(find);
-        }
-        return n;
     }
 
     /**
@@ -173,13 +156,8 @@ public class RecoveryReplayTest {
                 String name = Files.utf8ToString(Files.findName(find));
                 if (name != null && name.endsWith(".sfa")) {
                     try {
-                        io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment seg =
-                                io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment
-                                        .openExisting(dir + "/" + name);
-                        try {
+                        try (MmapSegment seg = MmapSegment.openExisting(dir + "/" + name)) {
                             if (seg.frameCount() > 0) n++;
-                        } finally {
-                            seg.close();
                         }
                     } catch (Throwable ignored) {
                         // best-effort
@@ -194,9 +172,7 @@ public class RecoveryReplayTest {
     }
 
     private static String repeat(String c, int n) {
-        StringBuilder sb = new StringBuilder(n);
-        for (int i = 0; i < n; i++) sb.append(c);
-        return sb.toString();
+        return String.valueOf(c).repeat(Math.max(0, n));
     }
 
     private static void rmDirRec(String dir) {
@@ -220,15 +196,9 @@ public class RecoveryReplayTest {
         Files.remove(dir);
     }
 
-    /** Receives binary frames but never acks. Sender drops them on close. */
-    private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
-        @Override
-        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            // intentionally empty
-        }
-    }
-
-    /** Acks every binary frame and tracks distinct payloads. */
+    /**
+     * Acks every binary frame and tracks distinct payloads.
+     */
     private static class AckHandler implements TestWebSocketServer.WebSocketServerHandler {
         // Distinct *payload bytes* — each row carries a unique long value
         // so every frame's bytes differ. Counts unique frames received,
@@ -254,6 +224,16 @@ public class RecoveryReplayTest {
             bb.putLong(seq);
             bb.putShort((short) 0);
             return buf;
+        }
+    }
+
+    /**
+     * Receives binary frames but never acks. Sender drops them on close.
+     */
+    private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            // intentionally empty
         }
     }
 }

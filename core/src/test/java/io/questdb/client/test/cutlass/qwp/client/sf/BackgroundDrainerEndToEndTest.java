@@ -85,7 +85,7 @@ public class BackgroundDrainerEndToEndTest {
                         + ";close_flush_timeout_millis=0;";
                 try (Sender g = Sender.fromConfig(cfg1)) {
                     for (int i = 0; i < 30; i++) {
-                        g.table("foo").longColumn("v", (long) i).atNow();
+                        g.table("foo").longColumn("v", i).atNow();
                         g.flush();
                     }
                 }
@@ -106,7 +106,7 @@ public class BackgroundDrainerEndToEndTest {
                         + ";sender_id=primary"
                         + ";drain_orphans=true"
                         + ";max_background_drainers=2;";
-                try (Sender foreground = Sender.fromConfig(cfg2)) {
+                try (Sender ignored = Sender.fromConfig(cfg2)) {
                     // Drainer runs in the background. Wait for the ghost slot
                     // to drain through. 30 distinct rows expected at the ack
                     // server (drainer's contribution; the foreground sender
@@ -195,24 +195,6 @@ public class BackgroundDrainerEndToEndTest {
             // unreachable-drainer scenario.
             Assert.assertTrue(unreachablePort > 0);
         });
-    }
-
-    private static int countSegmentFiles(String dir) {
-        if (!Files.exists(dir)) return 0;
-        long find = Files.findFirst(dir);
-        if (find <= 0) return 0;
-        int n = 0;
-        try {
-            int rc = 1;
-            while (rc > 0) {
-                String name = Files.utf8ToString(Files.findName(find));
-                if (name != null && name.endsWith(".sfa")) n++;
-                rc = Files.findNext(find);
-            }
-        } finally {
-            Files.findClose(find);
-        }
-        return n;
     }
 
     private static void rmDirRec(String dir) {
