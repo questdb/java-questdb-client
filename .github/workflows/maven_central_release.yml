@@ -1,23 +1,525 @@
 name: Release to Maven Central
 
 on:
-  push:
-    tags:
-      - '[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch/ref to release from"
+        required: true
+        default: "main"
+        type: string
+      release_version_override:
+        description: "Optional release version override; normally inferred from the current -SNAPSHOT POM"
+        required: false
+        type: string
+      next_development_version_override:
+        description: "Optional next development version override; normally inferred by maven-release-plugin"
+        required: false
+        type: string
+      dry_run:
+        description: "Exercise prepare, native builds, and local deploy without pushing or publishing"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: maven-central-release
   cancel-in-progress: false
 
 jobs:
-  release:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.release-tag.outputs.release_tag }}
+    env:
+      SOURCE_REF: ${{ inputs.source_ref }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      RELEASE_VERSION_OVERRIDE: ${{ inputs.release_version_override }}
+      NEXT_DEVELOPMENT_VERSION_OVERRIDE: ${{ inputs.next_development_version_override }}
+    steps:
+      - name: Check out source ref
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          submodules: true
+
+      - name: Set up Java 11
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Prepare release
+        run: |
+          git config user.name "GitHub Actions - Maven Release"
+          git config user.email "actions@github.com"
+
+          mvn -B -ntp release:clean
+
+          release_args=(
+            -DautoVersionSubmodules=true
+            -DpushChanges=false
+          )
+
+          if [[ -n "${RELEASE_VERSION_OVERRIDE}" ]]; then
+            release_args+=("-DreleaseVersion=${RELEASE_VERSION_OVERRIDE}")
+          fi
+
+          if [[ -n "${NEXT_DEVELOPMENT_VERSION_OVERRIDE}" ]]; then
+            release_args+=("-DdevelopmentVersion=${NEXT_DEVELOPMENT_VERSION_OVERRIDE}")
+          fi
+
+          mvn -B -ntp release:prepare "${release_args[@]}"
+
+      - name: Capture and verify release tag
+        id: release-tag
+        run: |
+          release_tag="$(sed -n 's/^scm.tag=//p' release.properties | tail -n 1)"
+          if [[ -z "${release_tag}" ]]; then
+            echo "::error::release.properties did not contain scm.tag."
+            exit 1
+          fi
+
+          pom_version="$(git show "${release_tag}:pom.xml" | sed -n 's:.*<version>\(.*\)</version>.*:\1:p' | head -n 1)"
+          if [[ -z "${pom_version}" ]]; then
+            echo "::error::Could not read project version from tag ${release_tag}."
+            exit 1
+          fi
+          if [[ "${pom_version}" == *-SNAPSHOT ]]; then
+            echo "::error::Refusing to release SNAPSHOT version ${pom_version}."
+            exit 1
+          fi
+          if [[ "${release_tag}" != "${pom_version}" ]]; then
+            echo "::error::Generated tag ${release_tag} does not match POM version ${pom_version}."
+            exit 1
+          fi
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Push release commits and tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git push origin "HEAD:${SOURCE_REF}"
+          git push origin "refs/tags/${{ steps.release-tag.outputs.release_tag }}"
+
+      - name: Archive dry-run release source
+        if: ${{ inputs.dry_run }}
+        run: |
+          git checkout "${{ steps.release-tag.outputs.release_tag }}"
+          git submodule update --init --recursive
+          mkdir -p /tmp/release-source
+          tar --exclude-vcs --exclude=target -cf /tmp/release-source/release-source.tar .
+
+      - name: Upload dry-run release source
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-source
+          path: /tmp/release-source/release-source.tar
+          if-no-files-found: error
+
+  build-macos:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin-aarch64
+          - os: macos-15-intel
+            platform: darwin-x86-64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out release tag
+        if: ${{ !inputs.dry_run }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.prepare.outputs.release_tag }}
+          submodules: true
+
+      - name: Download dry-run release source
+        if: ${{ inputs.dry_run }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: target/release-source
+
+      - name: Extract dry-run release source
+        if: ${{ inputs.dry_run }}
+        run: |
+          tar -xf target/release-source/release-source.tar
+
+      - name: Install toolchains
+        run: |
+          brew uninstall cmake || true
+          brew install make cmake gcc nasm
+
+      - name: Build native library
+        run: |
+          cd core
+          export MACOSX_DEPLOYMENT_TARGET=13.0
+          cmake -B build/release -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/release --config Release
+
+      - name: Stage native library
+        run: |
+          mkdir -p native-artifacts/${{ matrix.platform }}
+          cp core/target/classes/io/questdb/client/bin-local/libquestdb.dylib native-artifacts/${{ matrix.platform }}/libquestdb.dylib
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: native-artifacts/${{ matrix.platform }}/libquestdb.dylib
+          if-no-files-found: error
+
+  build-linux-x86-64:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: quay.io/pypa/manylinux2014_x86_64
+      volumes:
+        - /node20217:/node20217
+        - /node20217:/__e/node20
+    steps:
+      - name: Install tools
+        run: |
+          ldd --version
+          yum update -y
+          yum install 'perl(Env)' perl-Font-TTF perl-Sort-Versions gcc wget perf asciidoc xmlto ghostscript adobe-source-sans-pro-fonts adobe-source-code-pro-fonts rpm-build zstd curl -y
+
+      - name: Build nasm
+        run: |
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/linux/nasm-2.16.03-0.fc39.src.rpm
+          rpmbuild --rebuild ./nasm-2.16.03-0.fc39.src.rpm
+          rpm -i ~/rpmbuild/RPMS/x86_64/nasm-2.16.03-0.el7.x86_64.rpm
+
+      - name: Install Node.js 20 glibc2.17
+        run: |
+          curl -LO https://unofficial-builds.nodejs.org/download/release/v20.9.0/node-v20.9.0-linux-x64-glibc-217.tar.xz
+          tar -xf node-v20.9.0-linux-x64-glibc-217.tar.xz --strip-components 1 -C /node20217
+          ldd /__e/node20/bin/node
+
+      - name: Check out release tag
+        if: ${{ !inputs.dry_run }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.prepare.outputs.release_tag }}
+          submodules: true
+
+      - name: Download dry-run release source
+        if: ${{ inputs.dry_run }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: target/release-source
+
+      - name: Extract dry-run release source
+        if: ${{ inputs.dry_run }}
+        run: |
+          tar -xf target/release-source/release-source.tar
+
+      - name: Install up-to-date CMake
+        run: |
+          wget -nv https://github.com/Kitware/CMake/releases/download/v3.29.2/cmake-3.29.2-linux-x86_64.tar.gz
+          tar -zxf cmake-3.29.2-linux-x86_64.tar.gz
+          echo "PATH=`pwd`/cmake-3.29.2-linux-x86_64/bin/:$PATH" >> "$GITHUB_ENV"
+
+      - name: Install GraalVM JDK 25
+        run: |
+          wget -nv -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz
+          mkdir graalvm
+          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
+          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
+
+      - name: Build native library
+        run: |
+          cd core
+          cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S.
+          cmake --build cmake-build-release --config Release
+
+      - name: Stage native library
+        run: |
+          mkdir -p native-artifacts/linux-x86-64
+          cp core/target/classes/io/questdb/client/bin-local/libquestdb.so native-artifacts/linux-x86-64/libquestdb.so
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-x86-64
+          path: native-artifacts/linux-x86-64/libquestdb.so
+          if-no-files-found: error
+
+  build-linux-aarch64:
+    needs: prepare
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
+    container:
+      image: quay.io/pypa/manylinux_2_28_aarch64
+    steps:
+      - name: Check out release tag
+        if: ${{ !inputs.dry_run }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.prepare.outputs.release_tag }}
+          submodules: true
+
+      - name: Download dry-run release source
+        if: ${{ inputs.dry_run }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: target/release-source
+
+      - name: Extract dry-run release source
+        if: ${{ inputs.dry_run }}
+        run: |
+          tar -xf target/release-source/release-source.tar
+
+      - name: Install tooling
+        run: |
+          yum update -y
+          yum install wget nasm zstd -y
+
+      - name: Install GraalVM JDK 25
+        run: |
+          wget -v --timeout=180 -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-aarch64_bin.tar.gz
+          mkdir graalvm
+          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
+          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
+
+      - name: Build native library
+        run: |
+          cd core
+          cmake -DCMAKE_TOOLCHAIN_FILE=./src/main/c/toolchains/linux-arm64.cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release-arm64 -S.
+          cmake --build cmake-build-release-arm64 --config Release
+
+      - name: Stage native library
+        run: |
+          mkdir -p native-artifacts/linux-aarch64
+          cp core/target/classes/io/questdb/client/bin-local/libquestdb.so native-artifacts/linux-aarch64/libquestdb.so
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-aarch64
+          path: native-artifacts/linux-aarch64/libquestdb.so
+          if-no-files-found: error
+
+  build-windows-x86-64:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out release tag
+        if: ${{ !inputs.dry_run }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.prepare.outputs.release_tag }}
+          submodules: true
+
+      - name: Download dry-run release source
+        if: ${{ inputs.dry_run }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: target/release-source
+
+      - name: Extract dry-run release source
+        if: ${{ inputs.dry_run }}
+        run: |
+          tar -xf target/release-source/release-source.tar
+
+      - name: Install tooling
+        run: |
+          sudo sysctl -w fs.file-max=500000
+          sudo apt-get update -y
+          sudo apt-get install -y nasm gcc-mingw-w64 g++-mingw-w64
+
+      - name: Install GraalVM JDK 25
+        run: |
+          wget -nv -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz
+          mkdir graalvm
+          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
+          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
+
+      - name: Download Windows jni_md.h from JDK 25
+        run: |
+          cd core
+          curl https://raw.githubusercontent.com/openjdk/jdk25u/master/src/java.base/windows/native/include/jni_md.h > "$JAVA_HOME/include/jni_md.h"
+
+      - name: Build native library
+        run: |
+          cd core
+          cmake -DCMAKE_TOOLCHAIN_FILE=./src/main/c/toolchains/windows-x86_64.cmake -DCMAKE_CROSSCOMPILING=True -DCMAKE_BUILD_TYPE=Release -B cmake-build-release-win64
+          cmake --build cmake-build-release-win64 --config Release
+
+      - name: Check CXX runtime dependency
+        run: |
+          if x86_64-w64-mingw32-objdump -p ./core/target/classes/io/questdb/client/bin-local/libquestdb.dll | grep -q libstdc++; then
+            echo "Failure: CXX runtime dependency detected"
+            exit 1
+          fi
+
+      - name: Stage native library
+        run: |
+          mkdir -p native-artifacts/windows-x86-64
+          cp core/target/classes/io/questdb/client/bin-local/libquestdb.dll native-artifacts/windows-x86-64/libquestdb.dll
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-x86-64
+          path: native-artifacts/windows-x86-64/libquestdb.dll
+          if-no-files-found: error
+
+  dry-run-package:
+    if: ${{ inputs.dry_run }}
+    needs:
+      - prepare
+      - build-macos
+      - build-linux-x86-64
+      - build-linux-aarch64
+      - build-windows-x86-64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download dry-run release source
+        uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: target/release-source
+
+      - name: Extract dry-run release source
+        run: |
+          tar -xf target/release-source/release-source.tar
+
+      - name: Set up Java 11
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: core/target/downloaded-native-artifacts
+          merge-multiple: false
+
+      - name: Stage native artifacts for Maven
+        run: |
+          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-aarch64
+          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-x86-64
+          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-aarch64
+          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-x86-64
+          mkdir -p core/target/native-libs/io/questdb/client/bin/windows-x86-64
+          cp core/target/downloaded-native-artifacts/native-darwin-aarch64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
+          cp core/target/downloaded-native-artifacts/native-darwin-x86-64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
+          cp core/target/downloaded-native-artifacts/native-linux-aarch64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
+          cp core/target/downloaded-native-artifacts/native-linux-x86-64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
+          cp core/target/downloaded-native-artifacts/native-windows-x86-64/libquestdb.dll core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
+
+          expected=(
+            core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
+            core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
+            core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
+            core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
+            core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
+          )
+
+          for file_name in "${expected[@]}"; do
+            if [[ ! -s "${file_name}" ]]; then
+              echo "::error::Missing native artifact ${file_name}."
+              exit 1
+            fi
+          done
+
+      - name: Generate dry-run signing key
+        run: |
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          cat > keyparams <<'EOF'
+          Key-Type: RSA
+          Key-Length: 3072
+          Name-Real: QuestDB Maven Release Dry Run
+          Name-Email: dry-run@questdb.io
+          Expire-Date: 0
+          %no-protection
+          %commit
+          EOF
+          gpg --batch --generate-key keyparams
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "MAVEN_GPG_PASSPHRASE=" >> "$GITHUB_ENV"
+
+      - name: Configure Maven settings.xml
+        run: |
+          mkdir -p "$HOME/.m2"
+          cat > "$HOME/.m2/settings.xml" <<'EOF'
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+            <servers>
+              <server>
+                <id>gpg.passphrase</id>
+                <passphrase>${env.MAVEN_GPG_PASSPHRASE}</passphrase>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      - name: Dry-run release packaging and deploy
+        run: |
+          mvn -B -ntp deploy -P release-artifacts,release-dry-run-deploy,include-native-artifacts -DskipTests
+
+      - name: Upload dry-run Maven repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-maven-repository
+          path: core/target/dry-run-repo
+          if-no-files-found: error
+
+      - name: Upload dry-run built artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-core-target-artifacts
+          path: |
+            core/target/*.jar
+            core/target/*.pom
+            core/target/*.asc
+          if-no-files-found: warn
+
+      - name: Remove imported signing key
+        if: always()
+        run: |
+          if [[ -n "${GNUPGHOME:-}" && -d "${GNUPGHOME}" ]]; then
+            rm -rf "$GNUPGHOME"
+          fi
+
+  publish-central:
+    if: ${{ !inputs.dry_run }}
+    needs:
+      - prepare
+      - build-macos
+      - build-linux-x86-64
+      - build-linux-aarch64
+      - build-windows-x86-64
     runs-on: ubuntu-latest
     environment: maven-release
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
     env:
       MAVEN_RELEASE_AWS_REGION: ${{ vars.MAVEN_RELEASE_AWS_REGION }}
       MAVEN_RELEASE_AWS_ROLE_ARN: ${{ secrets.MAVEN_RELEASE_AWS_ROLE_ARN }}
@@ -48,10 +550,10 @@ jobs:
             fi
           done
 
-      - name: Check out tag
+      - name: Check out release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ needs.prepare.outputs.release_tag }}
 
       - name: Set up Java 11
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
@@ -60,17 +562,40 @@ jobs:
           java-version: "11"
           cache: maven
 
-      - name: Verify tag matches POM version
+      - name: Download native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: core/target/downloaded-native-artifacts
+          merge-multiple: false
+
+      - name: Stage native artifacts for Maven
         run: |
-          POM_VERSION=$(mvn -B -q -N -DforceStdout help:evaluate -Dexpression=project.version)
-          if [[ "${POM_VERSION}" == *-SNAPSHOT ]]; then
-            echo "::error::Refusing to release SNAPSHOT version ${POM_VERSION}. Create the release tag only after maven-release-plugin has committed the non-SNAPSHOT release POMs."
-            exit 1
-          fi
-          if [[ "${GITHUB_REF_NAME}" != "${POM_VERSION}" ]]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match POM version ${POM_VERSION}."
-            exit 1
-          fi
+          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-aarch64
+          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-x86-64
+          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-aarch64
+          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-x86-64
+          mkdir -p core/target/native-libs/io/questdb/client/bin/windows-x86-64
+          cp core/target/downloaded-native-artifacts/native-darwin-aarch64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
+          cp core/target/downloaded-native-artifacts/native-darwin-x86-64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
+          cp core/target/downloaded-native-artifacts/native-linux-aarch64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
+          cp core/target/downloaded-native-artifacts/native-linux-x86-64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
+          cp core/target/downloaded-native-artifacts/native-windows-x86-64/libquestdb.dll core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
+
+          expected=(
+            core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
+            core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
+            core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
+            core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
+            core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
+          )
+
+          for file_name in "${expected[@]}"; do
+            if [[ ! -s "${file_name}" ]]; then
+              echo "::error::Missing native artifact ${file_name}."
+              exit 1
+            fi
+          done
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
@@ -134,7 +659,7 @@ jobs:
 
       - name: Publish release to Maven Central
         run: |
-          mvn -B -ntp deploy -P maven-central-release -DskipTests
+          mvn -B -ntp deploy -P release-artifacts,maven-central-publish,include-native-artifacts -DskipTests
 
       - name: Remove imported signing key
         if: always()

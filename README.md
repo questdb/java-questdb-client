@@ -240,34 +240,22 @@ mvn clean package -DskipTests
 
 ## Releasing
 
-Maven Central publishing is owned by the tag-triggered GitHub Actions workflow. Do not publish from a local machine in
-the normal release path.
+Maven Central publishing is owned by the manually triggered `Release to Maven Central` GitHub Actions workflow. Do not
+publish from a local machine in the normal release path.
 
-Release tags must be created by `maven-release-plugin release:prepare` after it has committed the non-SNAPSHOT release
-POMs. Do not manually create or push a version tag from `main` while the POMs still contain `-SNAPSHOT`; that tag will
-trigger the release workflow and the workflow will reject it.
+The workflow runs `mvn release:prepare`, lets Maven infer the release version from the current `-SNAPSHOT` POM, builds
+all native libraries from the generated release tag, stores them as GitHub Actions artifacts, downloads them into the
+Maven build, and publishes the final JAR to Maven Central.
 
-Normal release flow:
+Run the workflow from the Actions tab with `dry_run=true` first. Dry run creates the local Maven release state, builds
+native artifacts, and deploys to a local file repository inside the workflow; it does not push commits, push tags, or
+contact Maven Central. For the real release, rerun with `dry_run=false`.
 
-```bash
-VERSION=1.2.2
-NEXT_VERSION=1.2.3
-
-mvn release:clean
-mvn -B release:prepare \
-  -DautoVersionSubmodules=true \
-  -DpushChanges=false \
-  -DreleaseVersion="$VERSION" \
-  -DdevelopmentVersion="$NEXT_VERSION-SNAPSHOT" \
-  -Dtag="$VERSION"
-git show --no-patch --oneline "$VERSION"
-git show "$VERSION:pom.xml" | grep "<version>$VERSION</version>"
-git push origin "release/$VERSION"
-git push origin "$VERSION"
-```
+The real Maven Central publish job uses the `maven-release` GitHub environment, so configure that environment with
+required reviewers to pause before immutable Central publishing.
 
 Do not run `mvn release:perform` or `mvn deploy` unless you are intentionally bypassing the GitHub Actions release
-workflow. Running a local deploy while the tag workflow is also publishing creates competing Sonatype deployments for
+workflow. Running a local deploy while the workflow is also publishing creates competing Sonatype deployments for
 the same coordinate.
 
 Full release procedure: [artifacts/release/README.md](artifacts/release/README.md).
