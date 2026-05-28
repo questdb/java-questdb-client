@@ -21,6 +21,11 @@ on:
         required: true
         default: true
         type: boolean
+      confirm_publish:
+        description: "Type 'PUBLISH' to confirm an immutable Maven Central upload. Ignored when dry_run=true."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -410,40 +415,8 @@ jobs:
           java-version: "11"
           cache: maven
 
-      - name: Download native artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: native-*
-          path: core/target/downloaded-native-artifacts
-          merge-multiple: false
-
-      - name: Stage native artifacts for Maven
-        run: |
-          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-aarch64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-x86-64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-aarch64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-x86-64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/windows-x86-64
-          cp core/target/downloaded-native-artifacts/native-darwin-aarch64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
-          cp core/target/downloaded-native-artifacts/native-darwin-x86-64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
-          cp core/target/downloaded-native-artifacts/native-linux-aarch64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
-          cp core/target/downloaded-native-artifacts/native-linux-x86-64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
-          cp core/target/downloaded-native-artifacts/native-windows-x86-64/libquestdb.dll core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
-
-          expected=(
-            core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
-            core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
-            core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
-            core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
-            core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
-          )
-
-          for file_name in "${expected[@]}"; do
-            if [[ ! -s "${file_name}" ]]; then
-              echo "::error::Missing native artifact ${file_name}."
-              exit 1
-            fi
-          done
+      - name: Stage native libraries for Maven
+        uses: ./.github/actions/stage-native-libs
 
       - name: Generate dry-run signing key
         run: |
@@ -451,7 +424,7 @@ jobs:
           chmod 700 "$GNUPGHOME"
           cat > keyparams <<'EOF'
           Key-Type: RSA
-          Key-Length: 3072
+          Key-Length: 2048
           Name-Real: QuestDB Maven Release Dry Run
           Name-Email: dry-run@questdb.io
           Expire-Date: 0
@@ -525,6 +498,15 @@ jobs:
       MAVEN_RELEASE_AWS_ROLE_ARN: ${{ secrets.MAVEN_RELEASE_AWS_ROLE_ARN }}
       MAVEN_RELEASE_AWS_SECRET_ARN: ${{ secrets.MAVEN_RELEASE_AWS_SECRET_ARN }}
     steps:
+      - name: Verify confirm_publish input
+        env:
+          CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+        run: |
+          if [[ "${CONFIRM_PUBLISH}" != "PUBLISH" ]]; then
+            echo "::error::Maven Central publish requires confirm_publish=PUBLISH. Got: '${CONFIRM_PUBLISH}'."
+            exit 1
+          fi
+
       - name: Validate workflow configuration
         run: |
           required_vars=(
@@ -562,40 +544,26 @@ jobs:
           java-version: "11"
           cache: maven
 
-      - name: Download native artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: native-*
-          path: core/target/downloaded-native-artifacts
-          merge-multiple: false
-
-      - name: Stage native artifacts for Maven
+      - name: Verify checked-out tag matches POM version
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-aarch64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-x86-64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-aarch64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-x86-64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/windows-x86-64
-          cp core/target/downloaded-native-artifacts/native-darwin-aarch64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
-          cp core/target/downloaded-native-artifacts/native-darwin-x86-64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
-          cp core/target/downloaded-native-artifacts/native-linux-aarch64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
-          cp core/target/downloaded-native-artifacts/native-linux-x86-64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
-          cp core/target/downloaded-native-artifacts/native-windows-x86-64/libquestdb.dll core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
+          pom_version="$(mvn -B -q -N -DforceStdout help:evaluate -Dexpression=project.version)"
+          if [[ -z "${pom_version}" ]]; then
+            echo "::error::Could not read project version from checked-out tag."
+            exit 1
+          fi
+          if [[ "${pom_version}" == *-SNAPSHOT ]]; then
+            echo "::error::Refusing to release SNAPSHOT version ${pom_version}."
+            exit 1
+          fi
+          if [[ "${RELEASE_TAG}" != "${pom_version}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} does not match POM version ${pom_version}."
+            exit 1
+          fi
 
-          expected=(
-            core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
-            core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
-            core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
-            core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
-            core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
-          )
-
-          for file_name in "${expected[@]}"; do
-            if [[ ! -s "${file_name}" ]]; then
-              echo "::error::Missing native artifact ${file_name}."
-              exit 1
-            fi
-          done
+      - name: Stage native libraries for Maven
+        uses: ./.github/actions/stage-native-libs
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
@@ -628,7 +596,7 @@ jobs:
 
       - name: Configure Maven settings.xml
         run: |
-          if [[ -z "${MAVEN_GPG_PASSPHRASE+x}" ]]; then
+          if [[ -z "${MAVEN_GPG_PASSPHRASE:-}" ]]; then
             echo "MAVEN_GPG_PASSPHRASE=" >> "$GITHUB_ENV"
           fi
           mkdir -p "$HOME/.m2"

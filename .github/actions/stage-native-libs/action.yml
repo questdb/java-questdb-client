@@ -1,0 +1,44 @@
+name: Stage native libraries for Maven
+description: >
+  Download the per-platform native library artifacts uploaded by the build-* jobs
+  and stage them under core/target/native-libs/io/questdb/client/bin/<platform>/
+  in the layout the include-native-artifacts Maven profile expects.
+
+runs:
+  using: composite
+  steps:
+    - name: Download native artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: native-*
+        path: core/target/downloaded-native-artifacts
+        merge-multiple: false
+
+    - name: Stage native artifacts for Maven
+      shell: bash
+      run: |
+        mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-aarch64
+        mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-x86-64
+        mkdir -p core/target/native-libs/io/questdb/client/bin/linux-aarch64
+        mkdir -p core/target/native-libs/io/questdb/client/bin/linux-x86-64
+        mkdir -p core/target/native-libs/io/questdb/client/bin/windows-x86-64
+        cp core/target/downloaded-native-artifacts/native-darwin-aarch64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
+        cp core/target/downloaded-native-artifacts/native-darwin-x86-64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
+        cp core/target/downloaded-native-artifacts/native-linux-aarch64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
+        cp core/target/downloaded-native-artifacts/native-linux-x86-64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
+        cp core/target/downloaded-native-artifacts/native-windows-x86-64/libquestdb.dll core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
+
+        expected=(
+          core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
+          core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
+          core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
+          core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
+          core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
+        )
+
+        for file_name in "${expected[@]}"; do
+          if [[ ! -s "${file_name}" ]]; then
+            echo "::error::Missing native artifact ${file_name}."
+            exit 1
+          fi
+        done

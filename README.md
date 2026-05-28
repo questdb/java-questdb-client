@@ -249,10 +249,11 @@ Maven build, and publishes the final JAR to Maven Central.
 
 Run the workflow from the Actions tab with `dry_run=true` first. Dry run creates the local Maven release state, builds
 native artifacts, and deploys to a local file repository inside the workflow; it does not push commits, push tags, or
-contact Maven Central. For the real release, rerun with `dry_run=false`.
+contact Maven Central. For the real release, rerun with `dry_run=false` and `confirm_publish=PUBLISH` (the publish job
+refuses to run without the literal string).
 
-The real Maven Central publish job uses the `maven-release` GitHub environment, so configure that environment with
-required reviewers to pause before immutable Central publishing.
+The real Maven Central publish job uses the `maven-release` GitHub environment as an additional gate; configure that
+environment with required reviewers so the workflow also pauses for human approval before immutable Central publishing.
 
 Do not run `mvn release:perform` or `mvn deploy` unless you are intentionally bypassing the GitHub Actions release
 workflow. Running a local deploy while the workflow is also publishing creates competing Sonatype deployments for

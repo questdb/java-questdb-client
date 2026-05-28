@@ -49,6 +49,7 @@ After the dry run has been reviewed, rerun the same workflow with:
 
 - the same `source_ref`
 - `dry_run`: `false`
+- `confirm_publish`: `PUBLISH` (literal string; the publish job fails fast on any other value)
 - override inputs still blank unless intentionally needed
 
 The real release path uses the generated Maven tag as the source of truth. It pushes the `mvn release:prepare` commits
@@ -56,8 +57,8 @@ back to `source_ref`, pushes the generated release tag, builds native libraries 
 artifacts into the Maven build, signs the release artifacts, and uploads through the Sonatype Central Portal.
 
 The final Central upload runs in the `publish-central` job, which is attached to the `maven-release` GitHub
-environment. Configure that environment with required reviewers so the workflow pauses before the immutable Maven
-Central publish step.
+environment. As a second layer of protection, configure that environment with required reviewers so the workflow also
+pauses for human approval before the immutable Maven Central publish step.
 
 The workflow returns once Sonatype has validated the upload and taken ownership of the artifacts. Physical propagation
 to Maven Central happens asynchronously after the workflow finishes, so a green run does not guarantee the artifacts
