@@ -240,23 +240,18 @@ mvn clean package -DskipTests
 
 ## Releasing
 
-Maven Central publishing is owned by the manually triggered `Release to Maven Central` GitHub Actions workflow. Do not
-publish from a local machine in the normal release path.
+Maven Central publishing is owned by the manually triggered `Release to Maven Central` GitHub Actions workflow, run
+from the Actions tab. Do not publish from a local machine and do not run `mvn deploy` in the normal release path.
 
-The workflow runs `mvn release:prepare`, lets Maven infer the release version from the current `-SNAPSHOT` POM, builds
-all native libraries from the generated release tag, stores them as GitHub Actions artifacts, downloads them into the
-Maven build, and publishes the final JAR to Maven Central.
+The workflow builds every platform's native library, runs the full test suite against those freshly built binaries,
+and validates the signed bundle with the Central Portal **before** it pushes a git tag or publishes anything, so
+nothing irreversible happens until the release is proven good. The release tag is pushed last and the next-development
+version bump lands as a follow-up pull request, so `main` keeps its PR-only protection.
 
-Run the workflow from the Actions tab.
+The `publish` step is gated by the `maven-release` GitHub environment; configure it with required reviewers so the
+workflow pauses for human approval before any credentials are used or anything is published.
 
-The Maven Central publish job uses the `maven-release` GitHub environment as an additional gate; configure that
-environment with required reviewers so the workflow also pauses for human approval before immutable Central publishing.
-
-Do not run `mvn release:perform` or `mvn deploy` unless you are intentionally bypassing the GitHub Actions release
-workflow. Running a local deploy while the workflow is also publishing creates competing Sonatype deployments for
-the same coordinate.
-
-Full release procedure: [artifacts/release/README.md](artifacts/release/README.md).
+Full release procedure, one-time setup, and failure handling: [artifacts/release/README.md](artifacts/release/README.md).
 
 ### Building Native Libraries
 

@@ -1,5 +1,25 @@
 name: Release to Maven Central
 
+# Release model (immutable-safe, verify-before-push):
+#
+#   resolve -> build x5 -> verify -> publish (gated) -> open-bump-pr
+#
+#   * Nothing irreversible (git tag push, Maven Central publish) happens until
+#     the full test suite has passed against the freshly built native libraries
+#     AND the signed bundle has been validated by the Central Portal.
+#   * The release tag is the LAST thing created and points at the exact verified
+#     tree. We never push commits to `main` -- the next-development snapshot bump
+#     lands as a normal pull request (main is PR-only by org ruleset).
+#
+# Org-settings prerequisites (one-time, NOT enforceable from this file):
+#   * `restrict-tag-pushing` ruleset: add `github-actions[bot]` as a bypass actor
+#     so the publish job can push the release tag. (The branch ruleset on `main`
+#     is intentionally NOT bypassed -- the snapshot bump goes through a PR.)
+#   * AWS secret referenced by MAVEN_RELEASE_AWS_SECRET_ARN must expose these
+#     JSON keys (parse-json-secrets turns them into env vars of the same name):
+#       MAVEN_GPG_PRIVATE_KEY, MAVEN_CENTRAL_USERNAME, MAVEN_CENTRAL_PASSWORD,
+#       and optionally MAVEN_GPG_PASSPHRASE (omit/empty for a passphrase-less key).
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,7 +33,7 @@ on:
         required: false
         type: string
       next_development_version_override:
-        description: "Optional next development version override; normally inferred by maven-release-plugin"
+        description: "Optional next development version override; normally the release version with the patch bumped"
         required: false
         type: string
 
@@ -24,25 +44,27 @@ concurrency:
   group: maven-central-release
   cancel-in-progress: false
 
+defaults:
+  run:
+    # Explicit `bash` runs as `bash --noprofile --norc -eo pipefail {0}`, i.e. it
+    # adds `pipefail` on top of errexit. Without this, a failing command on the
+    # left of a pipe (sed/objdump/git) is masked by a succeeding tail/grep/head.
+    shell: bash
+
 jobs:
-  prepare:
+  resolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
+    timeout-minutes: 15
     outputs:
-      release_tag: ${{ steps.release-tag.outputs.release_tag }}
-    env:
-      SOURCE_REF: ${{ inputs.source_ref }}
-      RELEASE_VERSION_OVERRIDE: ${{ inputs.release_version_override }}
-      NEXT_DEVELOPMENT_VERSION_OVERRIDE: ${{ inputs.next_development_version_override }}
+      release_version: ${{ steps.versions.outputs.release_version }}
+      next_development_version: ${{ steps.versions.outputs.next_development_version }}
+      source_sha: ${{ steps.versions.outputs.source_sha }}
     steps:
       - name: Check out source ref
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
-          submodules: true
 
       - name: Set up Java 11
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
@@ -51,61 +73,76 @@ jobs:
           java-version: "11"
           cache: maven
 
-      - name: Prepare release
+      - name: Resolve versions and guard against re-release
+        id: versions
+        env:
+          RELEASE_VERSION_OVERRIDE: ${{ inputs.release_version_override }}
+          NEXT_DEVELOPMENT_VERSION_OVERRIDE: ${{ inputs.next_development_version_override }}
         run: |
-          git config user.name "GitHub Actions - Maven Release"
-          git config user.email "actions@github.com"
+          set -euo pipefail
 
-          mvn -B -ntp release:clean
-
-          release_args=(
-            -DautoVersionSubmodules=true
-            -DpushChanges=false
-          )
+          pom_version="$(mvn -B -q -N -DforceStdout help:evaluate -Dexpression=project.version)"
+          if [[ -z "${pom_version}" ]]; then
+            echo "::error::Could not read project version from ${{ inputs.source_ref }}."
+            exit 1
+          fi
 
           if [[ -n "${RELEASE_VERSION_OVERRIDE}" ]]; then
-            release_args+=("-DreleaseVersion=${RELEASE_VERSION_OVERRIDE}")
+            release_version="${RELEASE_VERSION_OVERRIDE}"
+          else
+            release_version="${pom_version%-SNAPSHOT}"
+          fi
+
+          if [[ "${release_version}" == *-SNAPSHOT ]]; then
+            echo "::error::Refusing to release a SNAPSHOT version (${release_version})."
+            exit 1
+          fi
+          if [[ ! "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release version '${release_version}' is not in X.Y.Z form."
+            exit 1
           fi
 
           if [[ -n "${NEXT_DEVELOPMENT_VERSION_OVERRIDE}" ]]; then
-            release_args+=("-DdevelopmentVersion=${NEXT_DEVELOPMENT_VERSION_OVERRIDE}")
+            next_development_version="${NEXT_DEVELOPMENT_VERSION_OVERRIDE}"
+          else
+            IFS='.' read -r v_major v_minor v_patch <<< "${release_version}"
+            next_development_version="${v_major}.${v_minor}.$((v_patch + 1))-SNAPSHOT"
           fi
-
-          mvn -B -ntp release:prepare "${release_args[@]}"
-
-      - name: Capture and verify release tag
-        id: release-tag
-        run: |
-          release_tag="$(sed -n 's/^scm.tag=//p' release.properties | tail -n 1)"
-          if [[ -z "${release_tag}" ]]; then
-            echo "::error::release.properties did not contain scm.tag."
+          if [[ "${next_development_version}" != *-SNAPSHOT ]]; then
+            echo "::error::Next development version '${next_development_version}' must end in -SNAPSHOT."
             exit 1
           fi
 
-          pom_version="$(git show "${release_tag}:pom.xml" | sed -n 's:.*<version>\(.*\)</version>.*:\1:p' | head -n 1)"
-          if [[ -z "${pom_version}" ]]; then
-            echo "::error::Could not read project version from tag ${release_tag}."
-            exit 1
-          fi
-          if [[ "${pom_version}" == *-SNAPSHOT ]]; then
-            echo "::error::Refusing to release SNAPSHOT version ${pom_version}."
-            exit 1
-          fi
-          if [[ "${release_tag}" != "${pom_version}" ]]; then
-            echo "::error::Generated tag ${release_tag} does not match POM version ${pom_version}."
+          # Guard 1: the release tag must not already exist. If a previous release's
+          # snapshot-bump PR was never merged, `main` is still at the old -SNAPSHOT
+          # and we would otherwise try to re-release a shipped version. Fail loudly.
+          if git ls-remote --exit-code --tags origin "refs/tags/${release_version}" >/dev/null 2>&1; then
+            echo "::error::Tag ${release_version} already exists. Merge the snapshot-bump PR (or bump the version) before releasing."
             exit 1
           fi
 
-          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          # Guard 2: the version must not already be on Maven Central.
+          central_pom="https://repo1.maven.org/maven2/org/questdb/questdb-client/${release_version}/questdb-client-${release_version}.pom"
+          http_code="$(curl -sS -o /dev/null -w '%{http_code}' "${central_pom}" || echo "000")"
+          if [[ "${http_code}" == "200" ]]; then
+            echo "::error::questdb-client ${release_version} is already published to Maven Central."
+            exit 1
+          fi
 
-      - name: Push release commits and tag
-        run: |
-          git push origin "HEAD:${SOURCE_REF}"
-          git push origin "refs/tags/${{ steps.release-tag.outputs.release_tag }}"
+          source_sha="$(git rev-parse HEAD)"
+
+          {
+            echo "release_version=${release_version}"
+            echo "next_development_version=${next_development_version}"
+            echo "source_sha=${source_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Release ${release_version} from ${source_sha}; next development version ${next_development_version}."
 
   build-macos:
-    needs: prepare
+    needs: resolve
     strategy:
+      fail-fast: true
       matrix:
         include:
           - os: macos-14
@@ -115,10 +152,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - name: Check out release tag
+      - name: Check out release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ needs.prepare.outputs.release_tag }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           submodules: true
 
       - name: Set up Java 11
@@ -139,10 +176,28 @@ jobs:
           cmake -B cmake-build-release -DCMAKE_BUILD_TYPE=Release
           cmake --build cmake-build-release --config Release
 
+      - name: Smoke-test native library
+        run: |
+          lib="core/target/classes/io/questdb/client/bin-local/libquestdb.dylib"
+          test -f "$lib"
+          otool -L "$lib"
+          # Loading the library proves the dynamic linker can resolve every
+          # dependency on the build platform before we ever ship it.
+          cat > LoadCheck.java <<'EOF'
+          public class LoadCheck {
+              public static void main(String[] args) {
+                  System.load(new java.io.File(args[0]).getAbsolutePath());
+                  System.out.println("OK: loaded " + args[0]);
+              }
+          }
+          EOF
+          javac LoadCheck.java
+          java LoadCheck "$lib"
+
       - name: Stage native library
         run: |
-          mkdir -p native-artifacts/${{ matrix.platform }}
-          cp core/target/classes/io/questdb/client/bin-local/libquestdb.dylib native-artifacts/${{ matrix.platform }}/libquestdb.dylib
+          mkdir -p "native-artifacts/${{ matrix.platform }}"
+          cp core/target/classes/io/questdb/client/bin-local/libquestdb.dylib "native-artifacts/${{ matrix.platform }}/libquestdb.dylib"
 
       - name: Upload native library
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -152,7 +207,7 @@ jobs:
           if-no-files-found: error
 
   build-linux-x86-64:
-    needs: prepare
+    needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
@@ -179,30 +234,51 @@ jobs:
           tar -xf node-v20.9.0-linux-x64-glibc-217.tar.xz --strip-components 1 -C /node20217
           ldd /__e/node20/bin/node
 
-      - name: Check out release tag
+      - name: Check out release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ needs.prepare.outputs.release_tag }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           submodules: true
 
       - name: Install up-to-date CMake
         run: |
           wget -nv https://github.com/Kitware/CMake/releases/download/v3.29.2/cmake-3.29.2-linux-x86_64.tar.gz
           tar -zxf cmake-3.29.2-linux-x86_64.tar.gz
-          echo "PATH=`pwd`/cmake-3.29.2-linux-x86_64/bin/:$PATH" >> "$GITHUB_ENV"
+          echo "PATH=$(pwd)/cmake-3.29.2-linux-x86_64/bin/:$PATH" >> "$GITHUB_ENV"
 
       - name: Install GraalVM JDK 25
         run: |
+          # TODO(pin): replace /25/latest/ with an exact GraalVM build URL and verify a sha256.
           wget -nv -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz
           mkdir graalvm
           tar xfz graalvm.tar.gz -C graalvm --strip-components=1
-          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$(pwd)/graalvm" >> "$GITHUB_ENV"
 
       - name: Build native library
         run: |
           cd core
           cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S.
           cmake --build cmake-build-release --config Release
+
+      - name: Smoke-test native library
+        run: |
+          lib="core/target/classes/io/questdb/client/bin-local/libquestdb.so"
+          test -f "$lib"
+          # Fail if the linker reports any unresolved dependency.
+          if ldd "$lib" | grep -i "not found"; then
+            echo "::error::libquestdb.so has unresolved dependencies."
+            exit 1
+          fi
+          cat > LoadCheck.java <<'EOF'
+          public class LoadCheck {
+              public static void main(String[] args) {
+                  System.load(new java.io.File(args[0]).getAbsolutePath());
+                  System.out.println("OK: loaded " + args[0]);
+              }
+          }
+          EOF
+          "$JAVA_HOME/bin/javac" LoadCheck.java
+          "$JAVA_HOME/bin/java" LoadCheck "$lib"
 
       - name: Stage native library
         run: |
@@ -217,16 +293,16 @@ jobs:
           if-no-files-found: error
 
   build-linux-aarch64:
-    needs: prepare
+    needs: resolve
     runs-on: ubuntu-22.04-arm
     timeout-minutes: 60
     container:
       image: quay.io/pypa/manylinux_2_28_aarch64
     steps:
-      - name: Check out release tag
+      - name: Check out release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ needs.prepare.outputs.release_tag }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           submodules: true
 
       - name: Install tooling
@@ -236,16 +312,36 @@ jobs:
 
       - name: Install GraalVM JDK 25
         run: |
+          # TODO(pin): replace /25/latest/ with an exact GraalVM build URL and verify a sha256.
           wget -v --timeout=180 -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-aarch64_bin.tar.gz
           mkdir graalvm
           tar xfz graalvm.tar.gz -C graalvm --strip-components=1
-          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$(pwd)/graalvm" >> "$GITHUB_ENV"
 
       - name: Build native library
         run: |
           cd core
           cmake -DCMAKE_TOOLCHAIN_FILE=./src/main/c/toolchains/linux-arm64.cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release-arm64 -S.
           cmake --build cmake-build-release-arm64 --config Release
+
+      - name: Smoke-test native library
+        run: |
+          lib="core/target/classes/io/questdb/client/bin-local/libquestdb.so"
+          test -f "$lib"
+          if ldd "$lib" | grep -i "not found"; then
+            echo "::error::libquestdb.so has unresolved dependencies."
+            exit 1
+          fi
+          cat > LoadCheck.java <<'EOF'
+          public class LoadCheck {
+              public static void main(String[] args) {
+                  System.load(new java.io.File(args[0]).getAbsolutePath());
+                  System.out.println("OK: loaded " + args[0]);
+              }
+          }
+          EOF
+          "$JAVA_HOME/bin/javac" LoadCheck.java
+          "$JAVA_HOME/bin/java" LoadCheck "$lib"
 
       - name: Stage native library
         run: |
@@ -260,14 +356,14 @@ jobs:
           if-no-files-found: error
 
   build-windows-x86-64:
-    needs: prepare
+    needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: Check out release tag
+      - name: Check out release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ needs.prepare.outputs.release_tag }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           submodules: true
 
       - name: Install tooling
@@ -278,14 +374,16 @@ jobs:
 
       - name: Install GraalVM JDK 25
         run: |
+          # TODO(pin): replace /25/latest/ with an exact GraalVM build URL and verify a sha256.
           wget -nv -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz
           mkdir graalvm
           tar xfz graalvm.tar.gz -C graalvm --strip-components=1
-          echo "JAVA_HOME=`pwd`/graalvm" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$(pwd)/graalvm" >> "$GITHUB_ENV"
 
       - name: Download Windows jni_md.h from JDK 25
         run: |
           cd core
+          # TODO(pin): pin to a jdk25u tag/commit instead of the moving `master` branch.
           curl -fsSL https://raw.githubusercontent.com/openjdk/jdk25u/master/src/java.base/windows/native/include/jni_md.h > "$JAVA_HOME/include/jni_md.h"
 
       - name: Build native library
@@ -296,8 +394,13 @@ jobs:
 
       - name: Check CXX runtime dependency
         run: |
-          if x86_64-w64-mingw32-objdump -p ./core/target/classes/io/questdb/client/bin-local/libquestdb.dll | grep -q libstdc++; then
-            echo "Failure: CXX runtime dependency detected"
+          lib="./core/target/classes/io/questdb/client/bin-local/libquestdb.dll"
+          test -f "$lib"
+          # Capture objdump output first so a failing objdump trips errexit instead
+          # of being silently swallowed by `| grep -q` (which would falsely pass).
+          deps="$(x86_64-w64-mingw32-objdump -p "$lib")"
+          if printf '%s\n' "$deps" | grep -q 'libstdc++'; then
+            echo "::error::Failure: CXX runtime dependency detected"
             exit 1
           fi
 
@@ -313,53 +416,22 @@ jobs:
           path: native-artifacts/windows-x86-64/libquestdb.dll
           if-no-files-found: error
 
-  publish-central:
+  verify:
     needs:
-      - prepare
+      - resolve
       - build-macos
       - build-linux-x86-64
       - build-linux-aarch64
       - build-windows-x86-64
     runs-on: ubuntu-latest
-    environment: maven-release
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      id-token: write
+    timeout-minutes: 45
     env:
-      MAVEN_RELEASE_AWS_REGION: ${{ vars.MAVEN_RELEASE_AWS_REGION }}
-      MAVEN_RELEASE_AWS_ROLE_ARN: ${{ secrets.MAVEN_RELEASE_AWS_ROLE_ARN }}
-      MAVEN_RELEASE_AWS_SECRET_ARN: ${{ secrets.MAVEN_RELEASE_AWS_SECRET_ARN }}
+      RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
     steps:
-      - name: Validate workflow configuration
-        run: |
-          required_vars=(
-            MAVEN_RELEASE_AWS_REGION
-          )
-
-          for var_name in "${required_vars[@]}"; do
-            if [[ -z "${!var_name:-}" ]]; then
-              echo "::error::Repository variable ${var_name} is required."
-              exit 1
-            fi
-          done
-
-          required_secrets=(
-            MAVEN_RELEASE_AWS_ROLE_ARN
-            MAVEN_RELEASE_AWS_SECRET_ARN
-          )
-
-          for secret_name in "${required_secrets[@]}"; do
-            if [[ -z "${!secret_name:-}" ]]; then
-              echo "::error::GitHub secret ${secret_name} is required."
-              exit 1
-            fi
-          done
-
-      - name: Check out release tag
+      - name: Check out release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ needs.prepare.outputs.release_tag }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
 
       - name: Set up Java 11
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
@@ -367,24 +439,6 @@ jobs:
           distribution: temurin
           java-version: "11"
           cache: maven
-
-      - name: Verify checked-out tag matches POM version
-        env:
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-        run: |
-          pom_version="$(mvn -B -q -N -DforceStdout help:evaluate -Dexpression=project.version)"
-          if [[ -z "${pom_version}" ]]; then
-            echo "::error::Could not read project version from checked-out tag."
-            exit 1
-          fi
-          if [[ "${pom_version}" == *-SNAPSHOT ]]; then
-            echo "::error::Refusing to release SNAPSHOT version ${pom_version}."
-            exit 1
-          fi
-          if [[ "${RELEASE_TAG}" != "${pom_version}" ]]; then
-            echo "::error::Release tag ${RELEASE_TAG} does not match POM version ${pom_version}."
-            exit 1
-          fi
 
       - name: Download native artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -394,32 +448,81 @@ jobs:
           merge-multiple: false
 
       - name: Stage native artifacts for Maven
+        run: ./.github/scripts/stage-native-artifacts.sh
+
+      - name: Set release version
         run: |
-          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-aarch64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/darwin-x86-64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-aarch64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/linux-x86-64
-          mkdir -p core/target/native-libs/io/questdb/client/bin/windows-x86-64
-          cp core/target/downloaded-native-artifacts/native-darwin-aarch64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
-          cp core/target/downloaded-native-artifacts/native-darwin-x86-64/libquestdb.dylib core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
-          cp core/target/downloaded-native-artifacts/native-linux-aarch64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
-          cp core/target/downloaded-native-artifacts/native-linux-x86-64/libquestdb.so core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
-          cp core/target/downloaded-native-artifacts/native-windows-x86-64/libquestdb.dll core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
+          mvn -B -ntp org.codehaus.mojo:versions-maven-plugin:2.16.2:set -DnewVersion="${RELEASE_VERSION}" -DprocessAllModules=true -DgenerateBackupPoms=false
 
-          expected=(
-            core/target/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib
-            core/target/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib
-            core/target/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so
-            core/target/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so
-            core/target/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll
-          )
+      - name: Verify release artifact (full test suite, native libs bundled)
+        run: |
+          # Tests on -- this is the gate. The bundled linux-x86-64 native library
+          # is exercised by the real test suite before anyone approves the publish.
+          mvn -B -ntp verify -P include-native-artifacts
 
-          for file_name in "${expected[@]}"; do
-            if [[ ! -s "${file_name}" ]]; then
-              echo "::error::Missing native artifact ${file_name}."
+  publish:
+    needs:
+      - resolve
+      - verify
+    runs-on: ubuntu-latest
+    environment: maven-release
+    timeout-minutes: 45
+    permissions:
+      contents: write   # push the release tag (requires github-actions[bot] tag-ruleset bypass)
+      id-token: write   # AWS OIDC
+    env:
+      RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      MAVEN_RELEASE_AWS_REGION: ${{ vars.MAVEN_RELEASE_AWS_REGION }}
+      MAVEN_RELEASE_AWS_ROLE_ARN: ${{ secrets.MAVEN_RELEASE_AWS_ROLE_ARN }}
+      MAVEN_RELEASE_AWS_SECRET_ARN: ${{ secrets.MAVEN_RELEASE_AWS_SECRET_ARN }}
+    steps:
+      - name: Validate workflow configuration
+        run: |
+          required_vars=(MAVEN_RELEASE_AWS_REGION)
+          for var_name in "${required_vars[@]}"; do
+            if [[ -z "${!var_name:-}" ]]; then
+              echo "::error::Repository variable ${var_name} is required."
               exit 1
             fi
           done
+          required_secrets=(MAVEN_RELEASE_AWS_ROLE_ARN MAVEN_RELEASE_AWS_SECRET_ARN)
+          for secret_name in "${required_secrets[@]}"; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "::error::GitHub secret ${secret_name} is required."
+              exit 1
+            fi
+          done
+
+      - name: Check out release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Re-assert the tag is still free
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag ${RELEASE_VERSION} appeared since resolve. Aborting."
+            exit 1
+          fi
+
+      - name: Set up Java 11
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Download native artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: native-*
+          path: core/target/downloaded-native-artifacts
+          merge-multiple: false
+
+      - name: Stage native artifacts for Maven
+        run: ./.github/scripts/stage-native-artifacts.sh
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885 # v6.1.1
@@ -437,12 +540,7 @@ jobs:
 
       - name: Validate release credentials
         run: |
-          required_vars=(
-            MAVEN_GPG_PRIVATE_KEY
-            MAVEN_CENTRAL_USERNAME
-            MAVEN_CENTRAL_PASSWORD
-          )
-
+          required_vars=(MAVEN_GPG_PRIVATE_KEY MAVEN_CENTRAL_USERNAME MAVEN_CENTRAL_PASSWORD)
           for var_name in "${required_vars[@]}"; do
             if [[ -z "${!var_name:-}" ]]; then
               echo "::error::AWS secret ${MAVEN_RELEASE_AWS_SECRET_ARN} must define ${var_name}."
@@ -481,9 +579,79 @@ jobs:
           printf '%s\n' "$MAVEN_GPG_PRIVATE_KEY" | gpg --batch --import
           echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
 
-      - name: Publish release to Maven Central
+      - name: Set release version
         run: |
-          mvn -B -ntp deploy -P release-artifacts,maven-central-publish,include-native-artifacts -DskipTests
+          mvn -B -ntp org.codehaus.mojo:versions-maven-plugin:2.16.2:set -DnewVersion="${RELEASE_VERSION}" -DprocessAllModules=true -DgenerateBackupPoms=false
+
+      - name: Upload signed bundle to Central (validate only, droppable)
+        id: upload
+        run: |
+          # autoPublish=false + waitUntil=validated (set in core/pom.xml) makes the
+          # build block ONLY on validation (VALIDATING -> VALIDATED, a few minutes;
+          # the plugin's waitMaxTime ceiling is 1800s). It does NOT block on the
+          # actual publish to Maven Central. The deployment is left in a droppable
+          # VALIDATED state. Tests already ran in `verify` against this exact source
+          # + native libs, so skip them here.
+          mvn -B -ntp deploy \
+            -P include-native-artifacts,release-artifacts,maven-central-publish \
+            -DskipTests | tee deploy.log
+
+          deployment_id="$(grep -oE 'deploymentId: [0-9a-fA-F-]{36}' deploy.log | head -n1 | awk '{print $2}')"
+          if [[ -z "${deployment_id}" ]]; then
+            echo "::error::Could not capture the Central deployment id from the build output."
+            exit 1
+          fi
+          echo "deployment_id=${deployment_id}" >> "$GITHUB_OUTPUT"
+          echo "Validated deployment ${deployment_id}."
+
+      - name: Publish the validated deployment to Maven Central
+        id: central-publish
+        env:
+          DEPLOYMENT_ID: ${{ steps.upload.outputs.deployment_id }}
+        run: |
+          token="$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 | tr -d '\n')"
+
+          # Commit point: flip VALIDATED -> PUBLISHING. A 2xx means Sonatype has
+          # accepted the deployment and WILL publish it. The actual upload to Maven
+          # Central (PUBLISHING -> PUBLISHED) and index propagation then proceed
+          # ASYNCHRONOUSLY -- typically 5-10 minutes, occasionally much longer. We
+          # deliberately do NOT block on PUBLISHED; a green run means "accepted for
+          # publishing", and Central visibility follows on its own schedule.
+          http_code="$(curl -sS -o publish-resp.txt -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${token}" \
+            "https://central.sonatype.com/api/v1/publisher/deployment/${DEPLOYMENT_ID}")"
+          if [[ "${http_code}" != 2* ]]; then
+            echo "::error::Publish request for ${DEPLOYMENT_ID} returned HTTP ${http_code}."
+            cat publish-resp.txt || true
+            exit 1
+          fi
+          echo "Publish accepted for ${DEPLOYMENT_ID} (HTTP ${http_code})."
+
+          # Short, bounded peek (<= 2 min) only to catch an IMMEDIATE failure before
+          # we tag. A timeout here is NOT an error -- it just means publishing is
+          # still in progress, which is the normal slow path.
+          for _ in $(seq 1 8); do
+            state="$(curl -sS -X POST -H "Authorization: Bearer ${token}" \
+              "https://central.sonatype.com/api/v1/publisher/status?id=${DEPLOYMENT_ID}" \
+              | jq -r '.deploymentState // "UNKNOWN"')"
+            echo "Deployment ${DEPLOYMENT_ID} state: ${state}"
+            case "${state}" in
+              PUBLISHING|PUBLISHED) break ;;
+              FAILED) echo "::error::Central reported FAILED for ${DEPLOYMENT_ID}."; exit 1 ;;
+              *) sleep 15 ;;
+            esac
+          done
+          echo "Publishing is in progress; Maven Central propagation completes asynchronously."
+
+      - name: Create and push release tag
+        run: |
+          # Reached only after Central owns the artifact: the tag pins the exact
+          # verified, published tree. We push ONLY the tag (never a commit to main).
+          git config user.name "GitHub Actions - Maven Release"
+          git config user.email "actions@github.com"
+          git commit -am "Release questdb-client ${RELEASE_VERSION}"
+          git tag -a "${RELEASE_VERSION}" -m "questdb-client ${RELEASE_VERSION}"
+          git push origin "refs/tags/${RELEASE_VERSION}"
 
       - name: Remove imported signing key
         if: always()
@@ -491,3 +659,48 @@ jobs:
           if [[ -n "${GNUPGHOME:-}" && -d "${GNUPGHOME}" ]]; then
             rm -rf "$GNUPGHOME"
           fi
+
+  open-bump-pr:
+    needs:
+      - resolve
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      NEXT_DEVELOPMENT_VERSION: ${{ needs.resolve.outputs.next_development_version }}
+      RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out source ref
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Set up Java 11
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Open next-development-version bump PR
+        run: |
+          branch="chore/bump-${NEXT_DEVELOPMENT_VERSION}"
+          mvn -B -ntp org.codehaus.mojo:versions-maven-plugin:2.16.2:set -DnewVersion="${NEXT_DEVELOPMENT_VERSION}" -DprocessAllModules=true -DgenerateBackupPoms=false
+
+          git config user.name "GitHub Actions - Maven Release"
+          git config user.email "actions@github.com"
+          git checkout -b "${branch}"
+          git commit -am "Bump version to ${NEXT_DEVELOPMENT_VERSION}"
+          git push origin "${branch}"
+
+          gh pr create \
+            --base "${SOURCE_REF}" \
+            --head "${branch}" \
+            --title "Bump version to ${NEXT_DEVELOPMENT_VERSION}" \
+            --body "Post-release housekeeping after publishing questdb-client ${RELEASE_VERSION}. Merge before the next release."

@@ -398,7 +398,11 @@
                         <extensions>true</extensions>
                         <configuration>
                             <publishingServerId>central</publishingServerId>
-                            <autoPublish>true</autoPublish>
+                            <!-- Upload only to a droppable VALIDATED deployment; the release
+                                 workflow flips it to PUBLISHED via the Portal API after the
+                                 git tag is pushed, so nothing immutable is created until the
+                                 release is proven good. -->
+                            <autoPublish>false</autoPublish>
                             <waitUntil>validated</waitUntil>
                         </configuration>
                     </plugin>
