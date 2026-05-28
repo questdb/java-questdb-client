@@ -81,7 +81,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          pom_version="$(mvn -B -q -N -DforceStdout help:evaluate -Dexpression=project.version)"
+          # Read the version of the published artifact (core/questdb-client), not the
+          # aggregator root -- core has its own <version> and is what ships.
+          pom_version="$(mvn -B -q -N -f core/pom.xml -DforceStdout help:evaluate -Dexpression=project.version)"
           if [[ -z "${pom_version}" ]]; then
             echo "::error::Could not read project version from ${{ inputs.source_ref }}."
             exit 1
@@ -142,7 +144,9 @@ jobs:
   build-macos:
     needs: resolve
     strategy:
-      fail-fast: true
+      # Build both macOS targets to completion so a failure reports per-arch instead
+      # of cancelling the sibling; publish needs both anyway.
+      fail-fast: false
       matrix:
         include:
           - os: macos-14
@@ -500,10 +504,18 @@ jobs:
           ref: ${{ needs.resolve.outputs.source_sha }}
           fetch-depth: 0
 
-      - name: Re-assert the tag is still free
+      - name: Re-assert the tag and Central version are still free
         run: |
+          # The environment gate can hold this job for a long time; re-check both
+          # guards just before we touch anything irreversible.
           if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_VERSION}" >/dev/null 2>&1; then
             echo "::error::Tag ${RELEASE_VERSION} appeared since resolve. Aborting."
+            exit 1
+          fi
+          central_pom="https://repo1.maven.org/maven2/org/questdb/questdb-client/${RELEASE_VERSION}/questdb-client-${RELEASE_VERSION}.pom"
+          http_code="$(curl -sS -o /dev/null -w '%{http_code}' "${central_pom}" || echo "000")"
+          if [[ "${http_code}" == "200" ]]; then
+            echo "::error::questdb-client ${RELEASE_VERSION} is already on Maven Central. Aborting."
             exit 1
           fi
 
@@ -596,13 +608,33 @@ jobs:
             -P include-native-artifacts,release-artifacts,maven-central-publish \
             -DskipTests | tee deploy.log
 
-          deployment_id="$(grep -oE 'deploymentId: [0-9a-fA-F-]{36}' deploy.log | head -n1 | awk '{print $2}')"
+          # `|| true` so a no-match does not abort under errexit before the friendly
+          # message (which also flags a plugin log-format change to whoever runs this).
+          deployment_id="$(grep -oE 'deploymentId: [0-9a-fA-F-]{36}' deploy.log | head -n1 | awk '{print $2}' || true)"
           if [[ -z "${deployment_id}" ]]; then
             echo "::error::Could not capture the Central deployment id from the build output."
             exit 1
           fi
           echo "deployment_id=${deployment_id}" >> "$GITHUB_OUTPUT"
           echo "Validated deployment ${deployment_id}."
+
+      - name: Create and push release tag
+        run: |
+          # The bundle is VALIDATED but not yet published. Push the tag now, BEFORE the
+          # irreversible publish: a tag is deletable (a bypass actor can drop it), so a
+          # tag-push failure (e.g. the github-actions[bot] tag-ruleset bypass was not
+          # configured) leaves NOTHING published -- a clean, rerunnable state. The
+          # publish POST below is the single irreversible action and runs last.
+          git config user.name "GitHub Actions - Maven Release"
+          git config user.email "actions@github.com"
+          # versions:set normally rewrote the poms (SNAPSHOT -> release); only a version
+          # override matching the current poms makes it a no-op, so commit only if there
+          # is a change. Either way the tag pins the release-versioned tree.
+          if ! git diff --quiet; then
+            git commit -am "Release questdb-client ${RELEASE_VERSION}"
+          fi
+          git tag -a "${RELEASE_VERSION}" -m "questdb-client ${RELEASE_VERSION}"
+          git push origin "refs/tags/${RELEASE_VERSION}"
 
       - name: Publish the validated deployment to Maven Central
         id: central-publish
@@ -611,9 +643,9 @@ jobs:
         run: |
           token="$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 | tr -d '\n')"
 
-          # Commit point: flip VALIDATED -> PUBLISHING. A 2xx means Sonatype has
-          # accepted the deployment and WILL publish it. The actual upload to Maven
-          # Central (PUBLISHING -> PUBLISHED) and index propagation then proceed
+          # The single irreversible step: flip VALIDATED -> PUBLISHING. A 2xx means
+          # Sonatype has accepted the deployment and WILL publish it. The actual upload
+          # to Maven Central (PUBLISHING -> PUBLISHED) and index propagation then proceed
           # ASYNCHRONOUSLY -- typically 5-10 minutes, occasionally much longer. We
           # deliberately do NOT block on PUBLISHED; a green run means "accepted for
           # publishing", and Central visibility follows on its own schedule.
@@ -627,13 +659,14 @@ jobs:
           fi
           echo "Publish accepted for ${DEPLOYMENT_ID} (HTTP ${http_code})."
 
-          # Short, bounded peek (<= 2 min) only to catch an IMMEDIATE failure before
-          # we tag. A timeout here is NOT an error -- it just means publishing is
-          # still in progress, which is the normal slow path.
+          # Best-effort peek to surface an IMMEDIATE failure. A transient curl/jq error
+          # or a still-in-progress state is NOT fatal here -- we never wait out the
+          # (possibly hour-long) asynchronous publish/propagation.
           for _ in $(seq 1 8); do
             state="$(curl -sS -X POST -H "Authorization: Bearer ${token}" \
               "https://central.sonatype.com/api/v1/publisher/status?id=${DEPLOYMENT_ID}" \
-              | jq -r '.deploymentState // "UNKNOWN"')"
+              | jq -r '.deploymentState // "UNKNOWN"' 2>/dev/null || true)"
+            [[ -n "${state}" ]] || state="UNKNOWN"
             echo "Deployment ${DEPLOYMENT_ID} state: ${state}"
             case "${state}" in
               PUBLISHING|PUBLISHED) break ;;
@@ -642,16 +675,6 @@ jobs:
             esac
           done
           echo "Publishing is in progress; Maven Central propagation completes asynchronously."
-
-      - name: Create and push release tag
-        run: |
-          # Reached only after Central owns the artifact: the tag pins the exact
-          # verified, published tree. We push ONLY the tag (never a commit to main).
-          git config user.name "GitHub Actions - Maven Release"
-          git config user.email "actions@github.com"
-          git commit -am "Release questdb-client ${RELEASE_VERSION}"
-          git tag -a "${RELEASE_VERSION}" -m "questdb-client ${RELEASE_VERSION}"
-          git push origin "refs/tags/${RELEASE_VERSION}"
 
       - name: Remove imported signing key
         if: always()
@@ -691,16 +714,29 @@ jobs:
       - name: Open next-development-version bump PR
         run: |
           branch="chore/bump-${NEXT_DEVELOPMENT_VERSION}"
-          mvn -B -ntp org.codehaus.mojo:versions-maven-plugin:2.16.2:set -DnewVersion="${NEXT_DEVELOPMENT_VERSION}" -DprocessAllModules=true -DgenerateBackupPoms=false
-
           git config user.name "GitHub Actions - Maven Release"
           git config user.email "actions@github.com"
-          git checkout -b "${branch}"
-          git commit -am "Bump version to ${NEXT_DEVELOPMENT_VERSION}"
-          git push origin "${branch}"
+          git checkout -B "${branch}"
 
-          gh pr create \
-            --base "${SOURCE_REF}" \
-            --head "${branch}" \
-            --title "Bump version to ${NEXT_DEVELOPMENT_VERSION}" \
-            --body "Post-release housekeeping after publishing questdb-client ${RELEASE_VERSION}. Merge before the next release."
+          mvn -B -ntp org.codehaus.mojo:versions-maven-plugin:2.16.2:set -DnewVersion="${NEXT_DEVELOPMENT_VERSION}" -DprocessAllModules=true -DgenerateBackupPoms=false
+
+          # Idempotent: if ${SOURCE_REF} is already at the next version (e.g. this job
+          # is being re-run), there is nothing to bump.
+          if git diff --quiet; then
+            echo "${SOURCE_REF} is already at ${NEXT_DEVELOPMENT_VERSION}; nothing to bump."
+            exit 0
+          fi
+
+          git commit -am "Bump version to ${NEXT_DEVELOPMENT_VERSION}"
+          git push --force-with-lease origin "${branch}"
+
+          # Don't fail if a bump PR for this branch already exists (re-run case).
+          if [[ -z "$(gh pr list --head "${branch}" --state open --json number --jq '.[].number')" ]]; then
+            gh pr create \
+              --base "${SOURCE_REF}" \
+              --head "${branch}" \
+              --title "Bump version to ${NEXT_DEVELOPMENT_VERSION}" \
+              --body "Post-release housekeeping after publishing questdb-client ${RELEASE_VERSION}. Merge before the next release."
+          else
+            echo "A bump PR for ${branch} already exists."
+          fi

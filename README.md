@@ -5,7 +5,7 @@
 
 <div align="center">
 
-[![Maven Central](https://img.shields.io/maven-central/v/org.questdb/client.svg)](https://central.sonatype.com/artifact/org.questdb/client)
+[![Maven Central](https://img.shields.io/maven-central/v/org.questdb/questdb-client.svg)](https://central.sonatype.com/artifact/org.questdb/questdb-client)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
 </div>
@@ -31,7 +31,7 @@ The client uses the [InfluxDB Line Protocol](https://questdb.com/docs/reference/
 ```xml
 <dependency>
     <groupId>org.questdb</groupId>
-    <artifactId>client</artifactId>
+    <artifactId>questdb-client</artifactId>
     <version>1.0.0</version>
 </dependency>
 ```
@@ -39,10 +39,10 @@ The client uses the [InfluxDB Line Protocol](https://questdb.com/docs/reference/
 **Gradle:**
 
 ```groovy
-implementation 'org.questdb:client:1.0.0'
+implementation 'org.questdb:questdb-client:1.0.0'
 ```
 
-Replace `1.0.0` with the latest version from [Maven Central](https://central.sonatype.com/artifact/org.questdb/client).
+Replace `1.0.0` with the latest version from [Maven Central](https://central.sonatype.com/artifact/org.questdb/questdb-client).
 
 ### Start QuestDB
 
@@ -243,10 +243,10 @@ mvn clean package -DskipTests
 Maven Central publishing is owned by the manually triggered `Release to Maven Central` GitHub Actions workflow, run
 from the Actions tab. Do not publish from a local machine and do not run `mvn deploy` in the normal release path.
 
-The workflow builds every platform's native library, runs the full test suite against those freshly built binaries,
-and validates the signed bundle with the Central Portal **before** it pushes a git tag or publishes anything, so
-nothing irreversible happens until the release is proven good. The release tag is pushed last and the next-development
-version bump lands as a follow-up pull request, so `main` keeps its PR-only protection.
+The workflow builds every platform's native library, runs the full test suite with those freshly built binaries
+bundled, and validates the signed bundle with the Central Portal **before** it pushes a git tag or publishes anything.
+The Central publish is the single irreversible step and runs last; the next-development version bump lands as a
+follow-up pull request, so `main` keeps its PR-only protection.
 
 The `publish` step is gated by the `maven-release` GitHub environment; configure it with required reviewers so the
 workflow pauses for human approval before any credentials are used or anything is published.

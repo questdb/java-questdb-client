@@ -7,9 +7,9 @@ The release is owned by the manually triggered
 by hand and do not run `mvn deploy` locally during the normal release path.
 
 The workflow is built so that nothing irreversible happens until the release has been proven good: it builds every
-native library, runs the full test suite against those freshly built binaries, and validates the signed bundle with
-the Central Portal **before** it ever pushes a git tag or publishes to Maven Central. The release tag is created last
-and points at the exact tree that was verified and published.
+native library, runs the full test suite with those freshly built binaries bundled, and validates the signed bundle
+with the Central Portal **before** it pushes a git tag or publishes to Maven Central. The tag is pushed only after
+validation and points at the exact verified tree; the Central publish is the single irreversible step and runs last.
 
 ## One-time setup
 
@@ -47,10 +47,12 @@ The workflow runs as a pipeline:
    the tag already exists or the version is already on Maven Central.
 2. **build (5 jobs)** -- builds the native library for each platform (darwin-aarch64, darwin-x86-64, linux-x86-64,
    linux-aarch64, windows-x86-64) from the resolved source commit, and smoke-loads each one.
-3. **verify** -- bundles all five native libraries and runs the full test suite against them with the release version
-   applied. This is the quality gate; it requires no credentials.
+3. **verify** -- bundles all five native libraries and runs the full test suite with the release version applied. The
+   suite runs on a Linux runner, so it exercises the Linux x86-64 library directly; the other four libraries were
+   smoke-loaded on their own platforms in the build step. This is the quality gate; it requires no credentials.
 4. **publish** (gated by the `maven-release` environment) -- after approval: signs and uploads the bundle to the
-   Central Portal as a droppable `VALIDATED` deployment, then publishes it, then pushes the release tag.
+   Central Portal as a droppable `VALIDATED` deployment, pushes the release tag, then performs the single irreversible
+   step of publishing the deployment.
 5. **open-bump-pr** -- opens the next-development-version bump PR (post-release, see below).
 
 Approve the `publish` job when prompted. The run is green once the Central Portal has accepted the deployment for
@@ -84,12 +86,16 @@ The pipeline is ordered so failures are clean:
 - A failure in `resolve`, any `build`, or `verify` happens **before** anything is tagged or published. Fix the cause
   and rerun; nothing was mutated.
 - In `publish`, the bundle is uploaded as a droppable `VALIDATED` deployment first. If validation fails, nothing is
-  published and the deployment can be dropped from the Central Portal. The release tag is pushed only **after** the
-  Central Portal has accepted the deployment for publishing.
+  published and the deployment can be dropped from the Central Portal.
+- The release tag is pushed next, while the deployment is still only `VALIDATED`. If the tag push fails (for example
+  the `restrict-tag-pushing` bypass for `github-actions[bot]` was not configured), nothing has been published yet --
+  fix the cause and rerun.
+- The Central publish runs last. If the run fails at this step after the tag was already pushed, the deployment is
+  still `VALIDATED` on the Central Portal: re-publish it from the Portal UI (the run logged its `deploymentId`), or
+  drop it and rerun after deleting the tag.
 
-If a run fails inside `publish` after the Central Portal accepted the deployment, the artifact is on its way to Maven
-Central and the coordinate is immutable -- do not reuse the version. If the tag push is what failed, create the tag
-manually on the published commit; do not start a fresh release for the same version.
+Once the Central Portal has accepted the deployment for publishing, the coordinate is immutable -- do not reuse the
+version.
 
 ## Post-release
 
