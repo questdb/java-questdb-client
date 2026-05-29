@@ -732,6 +732,15 @@ jobs:
 
       - name: Open next-development-version bump PR
         run: |
+          # The bump PR needs a branch to target. If the release was run from a tag or
+          # SHA (a non-standard path), there is no branch to open a PR against -- skip
+          # gracefully rather than fail this post-release housekeeping job and redden a
+          # run whose release already succeeded.
+          if ! git ls-remote --exit-code --heads origin "${SOURCE_REF}" >/dev/null 2>&1; then
+            echo "::notice::source_ref '${SOURCE_REF}' is not a branch; skipping the automatic snapshot bump. Bump the development version manually."
+            exit 0
+          fi
+
           branch="chore/bump-${NEXT_DEVELOPMENT_VERSION}"
           git config user.name "GitHub Actions - Maven Release"
           git config user.email "actions@github.com"

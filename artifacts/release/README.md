@@ -24,6 +24,12 @@ The AWS secret referenced by `MAVEN_RELEASE_AWS_SECRET_ARN` must expose these JS
 variables of the same name): `MAVEN_GPG_PRIVATE_KEY`, `MAVEN_CENTRAL_USERNAME`, `MAVEN_CENTRAL_PASSWORD`, and
 optionally `MAVEN_GPG_PASSPHRASE` (omit or leave empty for a passphrase-less signing key).
 
+Store `MAVEN_GPG_PRIVATE_KEY` as the **ASCII-armored** private key inside the JSON string value, with the newlines
+encoded as `\n` (i.e. a normal JSON-escaped string). `parse-json-secrets` decodes those `\n` back into real newlines
+when it sets the environment variable, so `gpg --import` receives a valid armored key. A key stored with literal
+backslash-n, or pasted as a raw multi-line blob that breaks the JSON, imports as garbage and signing fails during
+`mvn deploy` -- the most common cause of a failed release. Verify with a test run before relying on it.
+
 Configure the `maven-release` GitHub environment with required reviewers. The `publish` job is attached to that
 environment, so the workflow pauses for human approval before any credentials are used and before anything is
 published.
