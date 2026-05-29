@@ -48,8 +48,9 @@ The workflow runs as a pipeline:
 2. **build (5 jobs)** -- builds the native library for each platform (darwin-aarch64, darwin-x86-64, linux-x86-64,
    linux-aarch64, windows-x86-64) from the resolved source commit, and smoke-loads each one.
 3. **verify** -- bundles all five native libraries and runs the full test suite with the release version applied. The
-   suite runs on a Linux runner, so it exercises the Linux x86-64 library directly; the other four libraries were
-   smoke-loaded on their own platforms in the build step. This is the quality gate; it requires no credentials.
+   suite runs on a Linux runner, so it exercises the Linux x86-64 library directly. The macOS and Linux aarch64
+   libraries are load-tested in their own build jobs; the Windows DLL is cross-compiled on Linux and so is only checked
+   for unwanted runtime dependencies (`objdump`), not loaded. This is the quality gate; it requires no credentials.
 4. **publish** (gated by the `maven-release` environment) -- after approval: signs and uploads the bundle to the
    Central Portal as a droppable `VALIDATED` deployment, pushes the release tag, then performs the single irreversible
    step of publishing the deployment.

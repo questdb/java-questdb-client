@@ -676,6 +676,16 @@ jobs:
           done
           echo "Publishing is in progress; Maven Central propagation completes asynchronously."
 
+      - name: Roll back release tag if nothing was published
+        if: failure()
+        run: |
+          # This job fails only when nothing reached Maven Central: validation failed,
+          # the publish POST was rejected, or Central reported FAILED. In every such
+          # case the tag (if it was pushed) points at an unpublished release, so drop it
+          # to keep reruns clean. Best-effort: a no-op if the tag was never pushed.
+          # (A successful POST exits 0, so this never deletes a tag for a real publish.)
+          git push origin ":refs/tags/${RELEASE_VERSION}" || true
+
       - name: Remove imported signing key
         if: always()
         run: |
@@ -728,7 +738,10 @@ jobs:
           fi
 
           git commit -am "Bump version to ${NEXT_DEVELOPMENT_VERSION}"
-          git push --force-with-lease origin "${branch}"
+          # Plain --force: this branch is a throwaway owned solely by this workflow,
+          # and the job never fetches it, so --force-with-lease has no lease ref and
+          # would be rejected ("stale info") when the branch already exists.
+          git push --force origin "${branch}"
 
           # Don't fail if a bump PR for this branch already exists (re-run case).
           if [[ -z "$(gh pr list --head "${branch}" --state open --json number --jq '.[].number')" ]]; then
