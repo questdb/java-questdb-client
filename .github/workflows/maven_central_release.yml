@@ -658,6 +658,11 @@ jobs:
             exit 1
           fi
           echo "Publish accepted for ${DEPLOYMENT_ID} (HTTP ${http_code})."
+          # Mark the publish as committed BEFORE the peek loop. From here the deployment
+          # is irreversibly Sonatype's, so the release tag must NEVER be rolled back --
+          # even if a later status read, an exit on FAILED, or a job timeout marks this
+          # step/job failed. Outputs written here persist even if the step later exits 1.
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
           # Best-effort peek to surface an IMMEDIATE failure. A transient curl/jq error
           # or a still-in-progress state is NOT fatal here -- we never wait out the
@@ -677,14 +682,18 @@ jobs:
           echo "Publishing is in progress; Maven Central propagation completes asynchronously."
 
       - name: Roll back release tag if nothing was published
-        if: failure()
+        # Gated on the publish marker, NOT just failure(): once the POST is accepted
+        # (published=true) the deployment is irreversibly Sonatype's, so the tag must
+        # survive even if a later status read, timeout, or cleanup fails. This step runs
+        # only for failures BEFORE the publish was accepted -- where nothing reached
+        # Central and the tag (if it was pushed) is safe to drop, keeping reruns clean.
+        if: failure() && steps.central-publish.outputs.published != 'true'
         run: |
-          # This job fails only when nothing reached Maven Central: validation failed,
-          # the publish POST was rejected, or Central reported FAILED. In every such
-          # case the tag (if it was pushed) points at an unpublished release, so drop it
-          # to keep reruns clean. Best-effort: a no-op if the tag was never pushed.
-          # (A successful POST exits 0, so this never deletes a tag for a real publish.)
-          git push origin ":refs/tags/${RELEASE_VERSION}" || true
+          if git push origin ":refs/tags/${RELEASE_VERSION}"; then
+            echo "Rolled back tag ${RELEASE_VERSION} (nothing was published)."
+          else
+            echo "::warning::Could not delete tag ${RELEASE_VERSION} (it may never have been pushed). Remove it manually before rerunning."
+          fi
 
       - name: Remove imported signing key
         if: always()
