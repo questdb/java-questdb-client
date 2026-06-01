@@ -13,9 +13,16 @@ validation and points at the exact verified tree; the Central publish is the sin
 
 ## One-time setup
 
-The `publish` job pushes the release tag using the built-in `GITHUB_TOKEN` (`github-actions[bot]`). The org-wide
-`restrict-tag-pushing` ruleset blocks tag creation by default, so `github-actions[bot]` must be added as a **bypass
-actor** on that ruleset (Organization settings -> Rules -> `restrict-tag-pushing` -> Bypass list).
+The `publish` job pushes and, on pre-publish failure, deletes the release tag using a dedicated GitHub App installation
+token. The org-wide `restrict-tag-pushing` ruleset blocks tag changes by default, and GitHub does not expose the
+built-in `GITHUB_TOKEN` identity (`github-actions[bot]`) as a usable bypass actor. Create a dedicated Maven release
+GitHub App instead, install it on this repository, grant it **Contents: read/write**, and add that app as a **bypass
+actor** on the ruleset (Organization settings -> Rules -> `restrict-tag-pushing` -> Bypass list).
+
+Store the app credentials for the workflow:
+
+- repository variable `MAVEN_RELEASE_GITHUB_APP_CLIENT_ID`: the app's client ID
+- `maven-release` environment secret `MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY`: a private key for the app
 
 The branch ruleset on `main` is intentionally **not** bypassed. The next-development snapshot bump lands as an ordinary
 pull request, so `main` keeps its "PR-only, squash, one approval" protection.
@@ -95,8 +102,8 @@ The pipeline is ordered so failures are clean:
 - In `publish`, the bundle is uploaded as a droppable `VALIDATED` deployment first. If validation fails, nothing is
   published and the deployment can be dropped from the Central Portal.
 - The release tag is pushed next, while the deployment is still only `VALIDATED`. If the tag push fails (for example
-  the `restrict-tag-pushing` bypass for `github-actions[bot]` was not configured), nothing has been published yet --
-  fix the cause and rerun.
+  the `restrict-tag-pushing` bypass for the Maven release GitHub App was not configured), nothing has been published
+  yet -- fix the cause and rerun.
 - The Central publish runs last. If the run fails at this step after the tag was already pushed, the deployment is
   still `VALIDATED` on the Central Portal: re-publish it from the Portal UI (the run logged its `deploymentId`), or
   drop it and rerun after deleting the tag.

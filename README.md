@@ -251,6 +251,9 @@ follow-up pull request, so `main` keeps its PR-only protection.
 The `publish` step is gated by the `maven-release` GitHub environment; configure it with required reviewers so the
 workflow pauses for human approval before any credentials are used or anything is published.
 
+The release tag push uses a dedicated Maven release GitHub App that must be allowed to bypass the org
+`restrict-tag-pushing` ruleset; the built-in `GITHUB_TOKEN`/`github-actions[bot]` cannot be added for that bypass.
+
 Full release procedure, one-time setup, and failure handling: [artifacts/release/README.md](artifacts/release/README.md).
 
 ### Building Native Libraries

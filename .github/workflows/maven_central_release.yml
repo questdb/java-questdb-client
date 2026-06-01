@@ -12,9 +12,15 @@ name: Release to Maven Central
 #     lands as a normal pull request (main is PR-only by org ruleset).
 #
 # Org-settings prerequisites (one-time, NOT enforceable from this file):
-#   * `restrict-tag-pushing` ruleset: add `github-actions[bot]` as a bypass actor
-#     so the publish job can push the release tag. (The branch ruleset on `main`
-#     is intentionally NOT bypassed -- the snapshot bump goes through a PR.)
+#   * `restrict-tag-pushing` ruleset: add the dedicated Maven release GitHub App
+#     as a bypass actor so the publish job can push/delete the release tag. The
+#     built-in `GITHUB_TOKEN` (`github-actions[bot]`) is not usable for this bypass.
+#     The branch ruleset on `main` is intentionally NOT bypassed -- the snapshot
+#     bump goes through a PR.
+#   * Repository variable MAVEN_RELEASE_GITHUB_APP_CLIENT_ID and `maven-release`
+#     environment secret MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY must identify that
+#     GitHub App. The app must be installed on this repository with
+#     Contents: read/write.
 #   * AWS secret referenced by MAVEN_RELEASE_AWS_SECRET_ARN must expose these
 #     JSON keys (parse-json-secrets turns them into env vars of the same name):
 #       MAVEN_GPG_PRIVATE_KEY, MAVEN_CENTRAL_USERNAME, MAVEN_CENTRAL_PASSWORD,
@@ -472,7 +478,7 @@ jobs:
     environment: maven-release
     timeout-minutes: 45
     permissions:
-      contents: write   # push the release tag (requires github-actions[bot] tag-ruleset bypass)
+      contents: read    # GITHUB_TOKEN only; tag push uses the release GitHub App token.
       id-token: write   # AWS OIDC
     env:
       RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
@@ -482,15 +488,18 @@ jobs:
       MAVEN_RELEASE_AWS_SECRET_ARN: ${{ secrets.MAVEN_RELEASE_AWS_SECRET_ARN }}
     steps:
       - name: Validate workflow configuration
+        env:
+          MAVEN_RELEASE_GITHUB_APP_CLIENT_ID: ${{ vars.MAVEN_RELEASE_GITHUB_APP_CLIENT_ID }}
+          MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY }}
         run: |
-          required_vars=(MAVEN_RELEASE_AWS_REGION)
+          required_vars=(MAVEN_RELEASE_AWS_REGION MAVEN_RELEASE_GITHUB_APP_CLIENT_ID)
           for var_name in "${required_vars[@]}"; do
             if [[ -z "${!var_name:-}" ]]; then
               echo "::error::Repository variable ${var_name} is required."
               exit 1
             fi
           done
-          required_secrets=(MAVEN_RELEASE_AWS_ROLE_ARN MAVEN_RELEASE_AWS_SECRET_ARN)
+          required_secrets=(MAVEN_RELEASE_AWS_ROLE_ARN MAVEN_RELEASE_AWS_SECRET_ARN MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY)
           for secret_name in "${required_secrets[@]}"; do
             if [[ -z "${!secret_name:-}" ]]; then
               echo "::error::GitHub secret ${secret_name} is required."
@@ -498,11 +507,20 @@ jobs:
             fi
           done
 
+      - name: Create release GitHub App token
+        id: release-app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MAVEN_RELEASE_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          permission-contents: write
+
       - name: Check out release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           fetch-depth: 0
+          token: ${{ steps.release-app-token.outputs.token }}
 
       - name: Re-assert the tag and Central version are still free
         run: |
@@ -622,9 +640,9 @@ jobs:
         run: |
           # The bundle is VALIDATED but not yet published. Push the tag now, BEFORE the
           # irreversible publish: a tag is deletable (a bypass actor can drop it), so a
-          # tag-push failure (e.g. the github-actions[bot] tag-ruleset bypass was not
-          # configured) leaves NOTHING published -- a clean, rerunnable state. The
-          # publish POST below is the single irreversible action and runs last.
+          # tag-push failure (e.g. the release GitHub App tag-ruleset bypass was not
+          # configured) leaves NOTHING published -- a clean, rerunnable state. The publish
+          # POST below is the single irreversible action and runs last.
           git config user.name "GitHub Actions - Maven Release"
           git config user.email "actions@github.com"
           # versions:set normally rewrote the poms (SNAPSHOT -> release); only a version
