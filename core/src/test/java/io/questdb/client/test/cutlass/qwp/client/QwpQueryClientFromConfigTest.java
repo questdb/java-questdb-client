@@ -655,7 +655,6 @@ public class QwpQueryClientFromConfigTest {
                 "max_buf_size=100m",
                 "max_datagram_size=1400",
                 "max_name_len=127",
-                "max_schemas_per_connection=65535",
                 "multicast_ttl=1",
                 "pass=secret",
                 "protocol_version=2",
@@ -679,7 +678,7 @@ public class QwpQueryClientFromConfigTest {
             assertParses("ws::addr=db:9000;" + kv + ";");
             all.append(kv).append(';');
         }
-        // All 35 keys at once -- a typical shared-config connect string.
+        // All ingress-only keys at once -- a typical shared-config connect string.
         assertParses(all.toString());
 
         // Out-of-range / malformed values are silently consumed too -- the
@@ -687,7 +686,6 @@ public class QwpQueryClientFromConfigTest {
         assertParses("ws::addr=db:9000;auto_flush_rows=-1;");
         assertParses("ws::addr=db:9000;init_buf_size=garbage;");
         assertParses("ws::addr=db:9000;reconnect_max_duration_millis=banana;");
-        assertParses("ws::addr=db:9000;max_schemas_per_connection=0;");
 
         // Empty values are well-formed and silently consumed.
         assertParses("ws::addr=db:9000;auto_flush=;");

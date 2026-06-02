@@ -109,7 +109,7 @@ public class QwpQueryClient implements QuietCloseable {
      * sanity bound.
      */
     public static final int MAX_BATCH_ROWS_UPPER_BOUND = 1_048_576;
-    public static final int QWP_MAX_VERSION = QwpConstants.MAX_SUPPORTED_VERSION;
+    public static final int QWP_MAX_VERSION = QwpConstants.VERSION;
     public static final String TARGET_ANY = "any";
     public static final String TARGET_PRIMARY = "primary";
     public static final String TARGET_REPLICA = "replica";
@@ -602,7 +602,6 @@ public class QwpQueryClient implements QuietCloseable {
                 case "max_buf_size":
                 case "max_datagram_size":
                 case "max_name_len":
-                case "max_schemas_per_connection":
                 case "multicast_ttl":
                 case "pass":
                 case "protocol_version":
@@ -855,7 +854,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
         QwpServerInfo lastObservedMismatch = null;
         QwpIngressRoleRejectedException lastUpgradeRoleReject = null;
-        boolean sawV1Mismatch = false;
         Throwable lastTransportError = null;
         while (true) {
             int i = hostTracker.pickNext();
@@ -888,14 +886,6 @@ public class QwpQueryClient implements QuietCloseable {
             if (info != null && (info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
                 hostTracker.recordZone(i, info.getZoneId());
             }
-            if (!TARGET_ANY.equals(target) && info == null) {
-                sawV1Mismatch = true;
-                hostTracker.recordRoleReject(i, false);
-                LOG.info("QwpQueryClient {}:{} negotiated v1 (no SERVER_INFO) and target={} requires v2; trying next",
-                        ep.host, ep.port, target);
-                cleanupFailedConnect();
-                continue;
-            }
             if (info != null && !matchesTarget(info.getRole(), target)) {
                 lastObservedMismatch = info;
                 boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
@@ -918,14 +908,6 @@ public class QwpQueryClient implements QuietCloseable {
                     "no endpoint matches target=" + target + "; last observed role="
                             + QwpServerInfo.roleName(lastObservedMismatch.getRole())
                             + " cluster=" + lastObservedMismatch.getClusterId()
-            );
-        }
-        if (sawV1Mismatch) {
-            throw new QwpRoleMismatchException(
-                    target,
-                    null,
-                    "no endpoint matches target=" + target
-                            + "; at least one endpoint negotiated v1 and cannot supply a role"
             );
         }
         if (lastUpgradeRoleReject != null) {
@@ -1061,8 +1043,7 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * Returns the {@link QwpServerInfo} decoded from the currently-bound
-     * server's {@code SERVER_INFO} frame, or {@code null} if the server
-     * negotiated the v1 protocol (no frame sent) or the client is not
+     * server's {@code SERVER_INFO} frame, or {@code null} if the client is not
      * connected. The value is refreshed on every successful failover reconnect.
      */
     public QwpServerInfo getServerInfo() {
@@ -1610,16 +1591,12 @@ public class QwpQueryClient implements QuietCloseable {
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
         negotiatedZstdLevel = webSocketClient.getServerNegotiatedZstdLevel();
 
-        // v2 servers send SERVER_INFO as the first WebSocket frame after the
+        // The server sends SERVER_INFO as the first WebSocket frame after the
         // upgrade response. Consume it synchronously on the user thread before
         // spawning the I/O thread, so the role filter can run without any
         // cross-thread synchronisation and so a mismatched role doesn't waste
         // the I/O thread setup + teardown.
-        if (negotiatedQwpVersion >= QwpConstants.VERSION_2) {
-            serverInfo = receiveServerInfoSync();
-        } else {
-            serverInfo = null;
-        }
+        serverInfo = receiveServerInfoSync();
 
         // Early probe: if we told the server we can accept zstd, make sure the
         // bundled native library actually provides the decompression symbols
@@ -1926,7 +1903,6 @@ public class QwpQueryClient implements QuietCloseable {
         lastCloseTimedOut = false;
         hostTracker.beginRound(false);
         QwpServerInfo lastMismatch = null;
-        boolean sawV1Mismatch = false;
         Throwable lastError = null;
         boolean retriedAfterReset = false;
         while (true) {
@@ -1961,12 +1937,6 @@ public class QwpQueryClient implements QuietCloseable {
             if (info != null && (info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
                 hostTracker.recordZone(i, info.getZoneId());
             }
-            if (!TARGET_ANY.equals(target) && info == null) {
-                sawV1Mismatch = true;
-                hostTracker.recordRoleReject(i, false);
-                cleanupFailedConnect();
-                continue;
-            }
             if (info != null && !matchesTarget(info.getRole(), target)) {
                 lastMismatch = info;
                 boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
@@ -1984,11 +1954,6 @@ public class QwpQueryClient implements QuietCloseable {
             throw new QwpRoleMismatchException(target, lastMismatch,
                     "no endpoint matches target=" + target + " on failover; last observed role="
                             + QwpServerInfo.roleName(lastMismatch.getRole()));
-        }
-        if (sawV1Mismatch) {
-            throw new QwpRoleMismatchException(target, null,
-                    "no endpoint matches target=" + target
-                            + " on failover; at least one endpoint negotiated v1 and cannot supply a role");
         }
         throw new HttpClientException(
                 "all QWP endpoints unreachable on failover [count=" + total

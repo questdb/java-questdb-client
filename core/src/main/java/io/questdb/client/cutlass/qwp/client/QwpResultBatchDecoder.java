@@ -83,16 +83,8 @@ public class QwpResultBatchDecoder implements QuietCloseable {
      * to leave head-room for future server-side batch enlargement without breaking clients.
      */
     private static final int MAX_ROWS_PER_BATCH = 1_048_576;
-    /**
-     * Hard cap on registered schema ids per connection. Matches
-     * {@code QwpConstants.DEFAULT_MAX_SCHEMAS_PER_CONNECTION} on the server side.
-     * Capping protects the client from a hostile or buggy server that could
-     * otherwise force unbounded {@code schemaRegistry} growth (or AIOOBE on a
-     * negative schema id) by encoding {@code schemaId = Integer.MAX_VALUE} (or
-     * a negative varint that long-to-int casts negative).
-     */
-    private static final int MAX_SCHEMAS_PER_CONNECTION = 65_535;
-    // Reusable scratch for decoding column names during SCHEMA_MODE_FULL parsing.
+    // Reusable scratch for decoding column names from the first batch's inline
+    // schema (batch_seq == 0).
     // Sized to the wire-level cap so {@link #readColumnName} can copy bytes
     // without allocating a fresh {@code byte[]} per column. The returned
     // {@code String} is still a fresh allocation (immutable + retained
@@ -115,9 +107,12 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     // Storing offsets (rather than absolute addresses) means heap reallocs don't
     // invalidate entries; the hot-path accessor does one 64-bit load + base add,
     // no object dereferences. Grows but never shrinks; freed on {@link #close}.
-    // Registry indexed by schemaId. null = not registered. Schema ids are server-assigned
-    // and small (monotonic from 0).
-    private final ObjList<ObjList<QwpEgressColumnInfo>> schemaRegistry = new ObjList<>();
+    // Per-query column schema. The full column list rides only the first
+    // RESULT_BATCH of a query (batch_seq == 0); continuation batches carry rows
+    // against it. Reused across queries (slots pooled); the IoThread invalidates
+    // it via resetQuerySchema() when a new query starts, so a stray continuation
+    // frame can't bind rows to a stale schema.
+    private final ObjList<QwpEgressColumnInfo> querySchema = new ObjList<>();
     private long connDictEntriesAddr;
     private int connDictEntriesCapacity;
     // Monotonic generation counter for the connection-scoped dict. Incremented
@@ -145,19 +140,21 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     // TIMESTAMP / TIMESTAMP_NANOS / DATE columns are prefixed by a 1-byte
     // encoding discriminator (0x00 raw, 0x01 Gorilla).
     private boolean gorillaMode;
+    // True once the schema-bearing batch_seq == 0 of the current query has been
+    // parsed into {@link #querySchema}. Reset by {@link #resetQuerySchema()} when
+    // a new query starts, so a continuation batch can never bind to a stale schema.
+    private boolean querySchemaValid;
     // Reusable varint decode state: value in varintValue, new position in varintPos.
     // Instance-level so no {@code long[2]} scratch is allocated per call.
     private long varintPos;
     private long varintValue;
 
     /**
-     * Clears the caches indicated by {@code resetMask} (bitwise OR of
-     * {@link QwpEgressMsgKind#RESET_MASK_DICT} and
-     * {@link QwpEgressMsgKind#RESET_MASK_SCHEMAS}). Drives the client-side
-     * state machine when the server emits a {@code CACHE_RESET} frame after
-     * hitting a connection-level soft cap: discards the SYMBOL dict and / or
-     * schema-fingerprint cache so the next batch's {@code deltaStart} and
-     * schema-reference ids line up with the server's fresh counter.
+     * Clears the caches indicated by {@code resetMask}. The only bit defined is
+     * {@link QwpEgressMsgKind#RESET_MASK_DICT}: the server emits a
+     * {@code CACHE_RESET} frame after hitting the connection-level SYMBOL dict
+     * soft cap, and dropping the dict here keeps the next batch's
+     * {@code deltaStart} aligned with the server's fresh counter.
      * <p>
      * The native dict buffers are reused (positions reset to 0, capacity
      * retained) so a workload that churns just above the cap does not reallocate
@@ -171,9 +168,6 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             // against the pre-reset dict detects the change on its next lookup
             // and wipes before reading.
             connDictGeneration++;
-        }
-        if ((resetMask & QwpEgressMsgKind.RESET_MASK_SCHEMAS) != 0) {
-            schemaRegistry.clear();
         }
     }
 
@@ -220,6 +214,16 @@ public class QwpResultBatchDecoder implements QuietCloseable {
      */
     public void decode(QwpBatchBuffer buffer, long payloadPtr, int payloadLen) throws QwpDecodeException {
         decodePayload(buffer, payloadPtr, payloadLen);
+    }
+
+    /**
+     * Invalidates the per-query schema captured from the last {@code batch_seq == 0}.
+     * The IoThread calls this when a new query starts so the next query's
+     * continuation batches can't bind rows to a stale schema; the underlying
+     * {@link QwpEgressColumnInfo} slots are retained for reuse.
+     */
+    public void resetQuerySchema() {
+        querySchemaValid = false;
     }
 
     // Pool helpers
@@ -297,7 +301,7 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             throw new QwpDecodeException("bad magic 0x" + Integer.toHexString(magic));
         }
         byte version = Unsafe.getUnsafe().getByte(payload + 4);
-        if (version < QwpConstants.VERSION_1 || version > QwpConstants.MAX_SUPPORTED_VERSION) {
+        if (version != QwpConstants.VERSION) {
             throw QwpProtocolVersionException.unsupported(version & 0xFF);
         }
         byte flags = Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS);
@@ -411,7 +415,11 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             p = parseDeltaSymbolDict(p, limit);
         }
 
-        // Table block: name_length, name, row_count, column_count, schema, columns
+        // Table block. The schema (column_count + inline column descriptors)
+        // rides only the first batch of a query (batch_seq == 0); continuation
+        // batches carry rows against the schema parsed there:
+        //   batch_seq == 0: name_length, name, row_count, column_count, columns
+        //   batch_seq  > 0: name_length, name, row_count
         decodeVarint(p, limit);
         long nameLen = varintValue;
         p = varintPos;
@@ -433,29 +441,19 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         }
         int rowCount = (int) varintValue;
         p = varintPos;
-        decodeVarint(p, limit);
-        if (varintValue < 0 || varintValue > QwpConstants.MAX_COLUMNS_PER_TABLE) {
-            throw new QwpDecodeException("column_count out of range: " + varintValue);
-        }
-        int columnCount = (int) varintValue;
-        p = varintPos;
-
-        // Schema section
-        if (p >= limit) throw new QwpDecodeException("truncated schema mode");
-        byte schemaMode = Unsafe.getUnsafe().getByte(p++);
-        decodeVarint(p, limit);
-        // Reject schema ids that wouldn't fit in our registry (or that cast negative
-        // from a hostile high varint). Without this guard, ensureSchemaSlot would
-        // either OOM appending billions of nulls or AIOOBE on a negative index.
-        if (varintValue < 0 || varintValue >= MAX_SCHEMAS_PER_CONNECTION) {
-            throw new QwpDecodeException("schema_id out of range: " + varintValue);
-        }
-        int schemaId = (int) varintValue;
-        p = varintPos;
 
         ObjList<QwpEgressColumnInfo> columns;
-        if (schemaMode == QwpConstants.SCHEMA_MODE_FULL) {
-            columns = ensureSchemaSlot(schemaId, columnCount);
+        int columnCount;
+        if (batchSeq == 0) {
+            // First batch carries the full schema: column_count then one
+            // (name_length, name, wire_type) descriptor per column.
+            decodeVarint(p, limit);
+            if (varintValue < 0 || varintValue > QwpConstants.MAX_COLUMNS_PER_TABLE) {
+                throw new QwpDecodeException("column_count out of range: " + varintValue);
+            }
+            columnCount = (int) varintValue;
+            p = varintPos;
+            columns = ensureQuerySchema(columnCount);
             for (int i = 0; i < columnCount; i++) {
                 decodeVarint(p, limit);
                 // Same negative / out-of-range guard as nameLen above; without
@@ -472,16 +470,17 @@ public class QwpResultBatchDecoder implements QuietCloseable {
                 byte wireType = Unsafe.getUnsafe().getByte(p++);
                 columns.getQuick(i).of(colName, wireType);
             }
-        } else if (schemaMode == QwpConstants.SCHEMA_MODE_REFERENCE) {
-            if (schemaId >= schemaRegistry.size() || schemaRegistry.getQuick(schemaId) == null) {
-                throw new QwpDecodeException("schema id " + schemaId + " not registered on this connection");
-            }
-            columns = schemaRegistry.getQuick(schemaId);
-            if (columns.size() != columnCount) {
-                throw new QwpDecodeException("schema id " + schemaId + " column count mismatch");
-            }
+            querySchemaValid = true;
         } else {
-            throw new QwpDecodeException("unknown schema mode 0x" + Integer.toHexString(schemaMode & 0xFF));
+            // Continuation batch: reuse the schema delivered on batch_seq == 0.
+            // A continuation that arrives before any schema-bearing batch (a
+            // malformed or hostile server) must not bind rows to a stale schema.
+            if (!querySchemaValid) {
+                throw new QwpDecodeException("RESULT_BATCH batch_seq=" + batchSeq
+                        + " arrived before the schema-bearing batch_seq=0");
+            }
+            columns = querySchema;
+            columnCount = querySchema.size();
         }
 
         // Reset batch view and parse columns into per-column layouts owned by the buffer.
@@ -550,27 +549,19 @@ public class QwpResultBatchDecoder implements QuietCloseable {
         // addresses, so the hot-path accessor resolves against the current heap base.
     }
 
-    private ObjList<QwpEgressColumnInfo> ensureSchemaSlot(int schemaId, int columnCount) {
-        while (schemaRegistry.size() <= schemaId) {
-            schemaRegistry.add(null);
-        }
-        ObjList<QwpEgressColumnInfo> slot = schemaRegistry.getQuick(schemaId);
-        if (slot == null) {
-            slot = new ObjList<>();
-            schemaRegistry.setQuick(schemaId, slot);
-        }
-        int currentPos = slot.size();
+    private ObjList<QwpEgressColumnInfo> ensureQuerySchema(int columnCount) {
+        int currentPos = querySchema.size();
         if (columnCount > currentPos) {
-            slot.setPos(columnCount);
+            querySchema.setPos(columnCount);
             for (int i = currentPos; i < columnCount; i++) {
-                if (slot.getQuick(i) == null) {
-                    slot.setQuick(i, new QwpEgressColumnInfo());
+                if (querySchema.getQuick(i) == null) {
+                    querySchema.setQuick(i, new QwpEgressColumnInfo());
                 }
             }
         } else {
-            slot.setPos(columnCount);
+            querySchema.setPos(columnCount);
         }
-        return slot;
+        return querySchema;
     }
 
     private long parseArrayColumn(QwpColumnLayout layout, int rowCount, long p, long limit) throws QwpDecodeException {

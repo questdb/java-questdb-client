@@ -80,6 +80,7 @@ public class QwpQueryClientWalkTrackerTest {
         TestWebSocketServer notFound = new TestWebSocketServer(port404, NOOP_HANDLER);
         notFound.setRejectWithStatus(404, "Not Found");
         TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        ok.setSendServerInfo(true);
         try {
             notFound.start();
             ok.start();
@@ -106,6 +107,7 @@ public class QwpQueryClientWalkTrackerTest {
         TestWebSocketServer rejecting = new TestWebSocketServer(port426, NOOP_HANDLER);
         rejecting.setRejectWithStatus(426, "Upgrade Required");
         TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        ok.setSendServerInfo(true);
         try {
             rejecting.start();
             ok.start();
@@ -266,6 +268,7 @@ public class QwpQueryClientWalkTrackerTest {
         int portB = TestPorts.findUnusedPort();
         TestWebSocketServer a = new TestWebSocketServer(portA, NOOP_HANDLER);
         a.setRejectWithRole("REPLICA");
+        a.setSendServerInfo(true);
         TestWebSocketServer b = new TestWebSocketServer(portB, NOOP_HANDLER);
         b.setRejectWithRole("REPLICA");
         try {
@@ -305,6 +308,7 @@ public class QwpQueryClientWalkTrackerTest {
         TestWebSocketServer rep = new TestWebSocketServer(portReplica, NOOP_HANDLER);
         rep.setRejectWithRole("REPLICA");
         TestWebSocketServer prim = new TestWebSocketServer(portPrimary, NOOP_HANDLER, false, "PRIMARY");
+        prim.setSendServerInfo(true);
         try {
             rep.start();
             prim.start();
@@ -330,6 +334,7 @@ public class QwpQueryClientWalkTrackerTest {
         int portDead = TestPorts.findUnusedPort();
         int portOk = TestPorts.findUnusedPort();
         try (TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER)) {
+            ok.setSendServerInfo(true);
             ok.start();
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 

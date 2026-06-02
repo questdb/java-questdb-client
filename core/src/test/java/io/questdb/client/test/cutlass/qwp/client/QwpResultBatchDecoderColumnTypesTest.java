@@ -47,7 +47,7 @@ import java.nio.charset.StandardCharsets;
  * pins the rejection paths for malformed frames, this file pins the
  * happy-path decoders for every wire type plus the connection-scoped state
  * machines (delta SYMBOL dict, FLAG_GORILLA TIMESTAMP, FLAG_DELTA_SYMBOL_DICT,
- * CACHE_RESET, SCHEMA_MODE_REFERENCE). Each test crafts a single-column or
+ * CACHE_RESET, batch_seq schema reuse). Each test crafts a single-column or
  * minimal multi-column RESULT_BATCH in native memory and verifies the values
  * surface correctly through {@link io.questdb.client.cutlass.qwp.client.QwpColumnBatch}
  * accessors, mirroring the production end-to-end flow without a server.
@@ -137,8 +137,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
                 p = putVarint(p, 1L);
-                p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-                p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
                 p = putByte(p, (byte) 's');
                 p = putByte(p, QwpConstants.TYPE_SYMBOL);
@@ -157,7 +155,7 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 p = writeHeader(p, QwpConstants.FLAG_DELTA_SYMBOL_DICT);
                 p = putByte(p, (byte) 0x11);
                 p = putLong(p, 1L);
-                p = putVarint(p, 1L);
+                p = putVarint(p, 0L);                          // batch_seq = 0 (independent batch)
                 p = putVarint(p, 0L);                          // deltaStart = 0 after reset
                 p = putVarint(p, 1L);
                 byte[] bbb = "bbb".getBytes(StandardCharsets.UTF_8);
@@ -166,8 +164,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
                 p = putVarint(p, 1L);
-                p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-                p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
                 p = putByte(p, (byte) 's');
                 p = putByte(p, QwpConstants.TYPE_SYMBOL);
@@ -179,48 +175,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 Assert.assertEquals("bbb", batchOf(buffer).getSymbol(0, 0));
             } finally {
                 Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
-                buffer.close();
-                decoder.close();
-            }
-        });
-    }
-
-    @Test
-    public void testCacheResetSchemasMaskClearsRegistry() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
-            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
-            try {
-                // Register schema_id=3 with one INT column, then CACHE_RESET schemas,
-                // then attempt to reference schema_id=3 -- decoder must reject.
-                long p = startSingleColumnFrame(staging, "n", QwpConstants.TYPE_INT, 1, 3L);
-                p = putByte(p, (byte) 0);
-                p = putInt(p, 1);
-                buffer.copyFromPayload(staging, (int) (p - staging));
-                decoder.decode(buffer);
-
-                decoder.applyCacheReset(QwpEgressMsgKind.RESET_MASK_SCHEMAS);
-
-                p = staging;
-                p = writeHeader(p, (byte) 0);
-                p = putByte(p, (byte) 0x11);
-                p = putLong(p, 1L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 1L);
-                p = putByte(p, QwpConstants.SCHEMA_MODE_REFERENCE);
-                p = putVarint(p, 3L);
-                buffer.copyFromPayload(staging, (int) (p - staging));
-                try {
-                    decoder.decode(buffer);
-                    Assert.fail("schema ref must be rejected after CACHE_RESET schemas mask");
-                } catch (QwpDecodeException expected) {
-                    Assert.assertTrue(expected.getMessage().contains("not registered"));
-                }
-            } finally {
-                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
                 buffer.close();
                 decoder.close();
             }
@@ -292,8 +246,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
             p = putVarint(p, 0L);                        // table_name_len
             p = putVarint(p, 0L);                        // row_count = 0
             p = putVarint(p, 0L);                        // column_count = 0
-            p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-            p = putVarint(p, 0L);                        // schema_id
 
             buffer.copyFromPayload(staging, (int) (p - staging));
             decoder.decode(buffer);
@@ -434,31 +386,62 @@ public class QwpResultBatchDecoderColumnTypesTest {
     }
 
     @Test
-    public void testSchemaReferenceModeReusesEarlierSchema() throws Exception {
+    public void testSchemaMissingOnContinuationRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // A continuation batch (batch_seq > 0) arriving before any
+                // schema-bearing batch_seq == 0 must be rejected, not bound to a
+                // stale schema.
+                long p = staging;
+                p = writeHeader(p, (byte) 0);
+                p = putByte(p, (byte) 0x11);
+                p = putLong(p, 1L);
+                p = putVarint(p, 1L);                          // batch_seq = 1 (continuation)
+                p = putVarint(p, 0L);                          // table_name_len
+                p = putVarint(p, 0L);                          // row_count
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject a continuation batch with no prior schema");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error mentions the missing schema batch: " + expected.getMessage(),
+                            expected.getMessage().contains("batch_seq"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSchemaReusedAcrossContinuationBatches() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
             QwpBatchBuffer buffer = new QwpBatchBuffer(512);
             long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
             try {
-                // Batch 1 registers schema_id=7 with one INT column.
-                long p = startSingleColumnFrame(staging, "n", QwpConstants.TYPE_INT, 1, /*schemaId=*/ 7L);
+                // Batch 1 (batch_seq == 0) carries the schema: one INT column "n".
+                long p = startSingleColumnFrame(staging, "n", QwpConstants.TYPE_INT, 1);
                 p = putByte(p, (byte) 0);
                 p = putInt(p, 99);
                 buffer.copyFromPayload(staging, (int) (p - staging));
                 decoder.decode(buffer);
                 Assert.assertEquals(99, batchOf(buffer).getIntValue(0, 0));
 
-                // Batch 2 references schema_id=7 (REFERENCE mode) -- no schema bytes inline.
+                // Batch 2 (batch_seq == 1) carries rows only and reuses the schema
+                // parsed from batch 0 -- no column_count / column descriptors inline.
                 p = staging;
                 p = writeHeader(p, /*flags=*/ (byte) 0);
                 p = putByte(p, (byte) 0x11);
                 p = putLong(p, 1L);
-                p = putVarint(p, 1L);
-                p = putVarint(p, 0L);
+                p = putVarint(p, 1L);                          // batch_seq = 1 (continuation)
+                p = putVarint(p, 0L);                          // table_name_len
                 p = putVarint(p, 1L);                          // row_count
-                p = putVarint(p, 1L);                          // column_count
-                p = putByte(p, QwpConstants.SCHEMA_MODE_REFERENCE);
-                p = putVarint(p, 7L);                          // schema_id
                 p = putByte(p, (byte) 0);                      // null_flag
                 p = putInt(p, 1234);                           // value
                 buffer.copyFromPayload(staging, (int) (p - staging));
@@ -467,39 +450,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 Assert.assertEquals("n", batchOf(buffer).getColumnName(0));
             } finally {
                 Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
-                buffer.close();
-                decoder.close();
-            }
-        });
-    }
-
-    @Test
-    public void testSchemaReferenceModeUnregisteredRejected() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
-            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
-            try {
-                long p = staging;
-                p = writeHeader(p, (byte) 0);
-                p = putByte(p, (byte) 0x11);
-                p = putLong(p, 1L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 0L);
-                p = putByte(p, QwpConstants.SCHEMA_MODE_REFERENCE);
-                p = putVarint(p, 99L);                          // never registered
-                buffer.copyFromPayload(staging, (int) (p - staging));
-                try {
-                    decoder.decode(buffer);
-                    Assert.fail("decoder must reject unregistered schema reference");
-                } catch (QwpDecodeException expected) {
-                    Assert.assertTrue("error mentions schema id: " + expected.getMessage(),
-                            expected.getMessage().contains("not registered"));
-                }
-            } finally {
-                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
                 buffer.close();
                 decoder.close();
             }
@@ -532,8 +482,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 p = putVarint(p, 0L);                          // table_name_len
                 p = putVarint(p, 2L);                          // row_count
                 p = putVarint(p, 1L);                          // column_count
-                p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-                p = putVarint(p, 0L);                          // schema_id
                 p = putVarint(p, 1L);                          // colName length
                 p = putByte(p, (byte) 's');
                 p = putByte(p, QwpConstants.TYPE_SYMBOL);
@@ -560,12 +508,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 for (byte b : gamma) p = putByte(p, b);
                 p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
-                p = putVarint(p, 1L);
-                p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 1L);
-                p = putByte(p, (byte) 's');
-                p = putByte(p, QwpConstants.TYPE_SYMBOL);
                 p = putByte(p, (byte) 0);
                 p = putVarint(p, 2L);                          // row 0 -> "gamma" (id=2)
 
@@ -591,8 +533,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
             p = putVarint(p, 0L);
             p = putVarint(p, 3L);                          // row_count
             p = putVarint(p, 1L);                          // column_count
-            p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-            p = putVarint(p, 0L);
             p = putVarint(p, 1L);
             p = putByte(p, (byte) 's');
             p = putByte(p, QwpConstants.TYPE_SYMBOL);
@@ -632,8 +572,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
                 p = putVarint(p, 1L);
-                p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-                p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
                 p = putByte(p, (byte) 's');
                 p = putByte(p, QwpConstants.TYPE_SYMBOL);
@@ -689,8 +627,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 p = putVarint(p, 0L);
                 p = putVarint(p, values.length);
                 p = putVarint(p, 1L);
-                p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-                p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
                 p = putByte(p, (byte) 't');
                 p = putByte(p, QwpConstants.TYPE_TIMESTAMP);
@@ -745,8 +681,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 p = putVarint(p, 0L);
                 p = putVarint(p, 3L);
                 p = putVarint(p, 1L);
-                p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-                p = putVarint(p, 0L);
                 p = putVarint(p, 1L);
                 p = putByte(p, (byte) 't');
                 p = putByte(p, QwpConstants.TYPE_TIMESTAMP);
@@ -816,39 +750,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 } catch (QwpDecodeException expected) {
                     Assert.assertTrue("error mentions truncation: " + expected.getMessage(),
                             expected.getMessage().contains("truncated"));
-                }
-            } finally {
-                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
-                buffer.close();
-                decoder.close();
-            }
-        });
-    }
-
-    @Test
-    public void testUnknownSchemaModeRejected() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
-            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
-            try {
-                long p = staging;
-                p = writeHeader(p, (byte) 0);
-                p = putByte(p, (byte) 0x11);
-                p = putLong(p, 1L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 0L);
-                p = putVarint(p, 0L);
-                p = putByte(p, (byte) 0x42);                    // unknown schema_mode
-                p = putVarint(p, 0L);
-                buffer.copyFromPayload(staging, (int) (p - staging));
-                try {
-                    decoder.decode(buffer);
-                    Assert.fail("decoder must reject unknown schema mode");
-                } catch (QwpDecodeException expected) {
-                    Assert.assertTrue("error mentions schema mode: " + expected.getMessage(),
-                            expected.getMessage().contains("schema mode"));
                 }
             } finally {
                 Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
@@ -1043,10 +944,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
      * returned position points at where the column body starts.
      */
     private static long startSingleColumnFrame(long buf, String colName, byte wireType, int rowCount) {
-        return startSingleColumnFrame(buf, colName, wireType, rowCount, 0L);
-    }
-
-    private static long startSingleColumnFrame(long buf, String colName, byte wireType, int rowCount, long schemaId) {
         long p = buf;
         p = writeHeader(p, (byte) 0);
         p = putByte(p, (byte) 0x11);
@@ -1055,8 +952,6 @@ public class QwpResultBatchDecoderColumnTypesTest {
         p = putVarint(p, 0L);                      // table_name_len
         p = putVarint(p, rowCount);
         p = putVarint(p, 1L);                      // column_count
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        p = putVarint(p, schemaId);
         byte[] nameBytes = colName.getBytes(StandardCharsets.UTF_8);
         p = putVarint(p, nameBytes.length);
         for (byte b : nameBytes) p = putByte(p, b);
@@ -1087,7 +982,7 @@ public class QwpResultBatchDecoderColumnTypesTest {
         // the table-block parser then advances over -- producing inscrutable
         // "unknown schema mode 0x..." errors mid-frame.
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, flags);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);

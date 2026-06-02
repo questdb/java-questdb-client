@@ -1005,9 +1005,7 @@ public class QwpUdpSender implements Sender {
                 prefixStringDataSizeBefore,
                 prefixSymbolDictionarySizeBefore,
                 false,
-                false,
-                false,
-                0
+                false
         );
         payloadWriter.finish();
         return payloadWriter.getPosition();
@@ -1016,7 +1014,7 @@ public class QwpUdpSender implements Sender {
     private int encodeTablePayloadForUdp(QwpTableBuffer tableBuffer) {
         payloadWriter.reset();
         columnWriter.setBuffer(payloadWriter);
-        columnWriter.encodeTable(tableBuffer, false, false, false);
+        columnWriter.encodeTable(tableBuffer, false, false);
         payloadWriter.finish();
         return payloadWriter.getPosition();
     }
@@ -1091,8 +1089,6 @@ public class QwpUdpSender implements Sender {
         estimate += NativeBufferWriter.varintSize(tableNameUtf8) + tableNameUtf8;
         estimate += VARINT_INT_UPPER_BOUND;
         estimate += VARINT_INT_UPPER_BOUND;
-        estimate += 1; // schema mode byte
-        estimate += VARINT_INT_UPPER_BOUND; // schemaId
 
         QwpColumnDef[] defs = currentTableBuffer.getColumnDefs();
         for (int i = 0, n = defs.length; i < n; i++) {
@@ -1231,7 +1227,7 @@ public class QwpUdpSender implements Sender {
         headerBuffer.putByte((byte) 'W');
         headerBuffer.putByte((byte) 'P');
         headerBuffer.putByte((byte) '1');
-        headerBuffer.putByte(VERSION_1);
+        headerBuffer.putByte(VERSION);
         headerBuffer.putByte((byte) 0);
         headerBuffer.putShort((short) 1);
         headerBuffer.putInt(payloadLength);

@@ -223,7 +223,7 @@ public class QwpInPlaceDecodeAliasingTest {
         byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);                     // flags
         p = putByte(p, (byte) 1);                     // table_count
@@ -234,8 +234,6 @@ public class QwpInPlaceDecodeAliasingTest {
         p = putVarint(p, 0L);                         // table_name_len
         p = putVarint(p, 1L);                         // row_count = 1
         p = putVarint(p, 1L);                         // column_count = 1
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        p = putVarint(p, 0L);                         // schema_id
         p = putVarint(p, 1L);                         // column name length
         p = putByte(p, (byte) 's');
         p = putByte(p, QwpConstants.TYPE_VARCHAR);

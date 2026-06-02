@@ -59,10 +59,6 @@ public final class QwpEgressMsgKind {
      * Reset mask bit: clear the connection-scoped SYMBOL dict.
      */
     public static final byte RESET_MASK_DICT = 0x01;
-    /**
-     * Reset mask bit: clear the connection-scoped schema-fingerprint cache.
-     */
-    public static final byte RESET_MASK_SCHEMAS = 0x02;
     public static final byte RESULT_BATCH = 0x11;
     public static final byte RESULT_END = 0x12;
     /**
