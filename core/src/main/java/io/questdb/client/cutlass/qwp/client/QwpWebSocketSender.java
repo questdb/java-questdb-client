@@ -2720,12 +2720,12 @@ public class QwpWebSocketSender implements Sender {
             case ASYNC:
                 // Defer the actual connect to the I/O thread. The user thread
                 // returns immediately; rows accumulate in the cursor SF engine.
-                // Encoder stays at its default (V1 — the only supported wire
-                // version today). When v2+ ships, frames written before the
-                // first successful connect will commit to V1 because cursor
-                // segments are immutable. Auth/upgrade rejects and budget
-                // exhaustion are surfaced via the error inbox by the I/O
-                // thread, not thrown here.
+                // Encoder stays at its default (V1 -- the only supported wire
+                // version today). Frames written before the first successful
+                // connect commit to V1 because cursor segments are immutable;
+                // a future version bump must account for that. Auth/upgrade
+                // rejects and budget exhaustion are surfaced via the error
+                // inbox by the I/O thread, not thrown here.
                 client = null;
                 break;
             case OFF:

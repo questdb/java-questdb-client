@@ -60,7 +60,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  * <p>
  * Each {@link #flush()} encodes all buffered table data into self-contained
  * datagrams (one per table) and sends them via UDP. Datagrams use local
- * symbol dictionaries (no global/delta dict) and full schema (no schema refs).
+ * symbol dictionaries (no global/delta dict) and inline column schemas.
  * <p>
  * When {@code maxDatagramSize > 0}, the sender automatically flushes before
  * a datagram exceeds the size limit. The in-progress row stays staged in sender

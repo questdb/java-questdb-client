@@ -112,6 +112,17 @@ public class QwpResultBatchDecoder implements QuietCloseable {
     // against it. Reused across queries (slots pooled); the IoThread invalidates
     // it via resetQuerySchema() when a new query starts, so a stray continuation
     // frame can't bind rows to a stale schema.
+    //
+    // Dropping the old connection-scoped schema registry means every query's
+    // batch_seq == 0 re-parses the inline schema and allocates a fresh
+    // column-name String per column, even when the same query shape repeats --
+    // the trade-off for not carrying schema ids on the wire.
+    //
+    // A single slot is correct only because the IoThread runs one query at a
+    // time (one pendingRequest, one currentRequestId). If client-side
+    // pipelining is ever enabled so batches from different request_ids
+    // interleave, this must become a map keyed by request_id; the single
+    // querySchemaValid flag would otherwise mis-bind rows across queries.
     private final ObjList<QwpEgressColumnInfo> querySchema = new ObjList<>();
     private long connDictEntriesAddr;
     private int connDictEntriesCapacity;

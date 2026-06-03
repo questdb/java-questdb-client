@@ -63,7 +63,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Multi-endpoint routing: the connection string accepts a comma-separated list
  * of {@code addr=host:port[,host:port...]} endpoints plus a {@code target=}
  * filter ({@code any} | {@code primary} | {@code replica}). {@link #connect()}
- * walks the list in order, reads the server's role from the v2
+ * walks the list in order, reads the server's role from the
  * {@code SERVER_INFO} frame, and picks the first endpoint matching the target.
  * When every endpoint reports a role the filter rejects, {@link #connect()}
  * throws {@link QwpRoleMismatchException} with the last observed info attached
@@ -76,7 +76,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@link QwpColumnBatchHandler#onFailoverReset} callback just before replayed
  * batches start arriving (batch_seq restarts at 0 on the new node), so
  * accumulating handlers can discard rows the old connection already delivered.
- * {@code failover=off} restores the pre-v2 behaviour -- terminal failures
+ * {@code failover=off} disables this -- terminal failures
  * surface immediately through {@link QwpColumnBatchHandler#onError}.
  * <p>
  * Terminal-failure latching: transport- or protocol-level faults detected by
@@ -141,7 +141,7 @@ public class QwpQueryClient implements QuietCloseable {
     private static final long DEFAULT_FAILOVER_MAX_DURATION_MS = 30_000L;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
     /**
-     * How long {@link #connect()} waits to read the v2 {@code SERVER_INFO} frame
+     * How long {@link #connect()} waits to read the {@code SERVER_INFO} frame
      * from each endpoint before giving up and moving to the next. 5 seconds is
      * comfortable on a WAN; the server writes SERVER_INFO into the same send
      * buffer as the 101 upgrade response so under normal conditions the frame
@@ -312,7 +312,7 @@ public class QwpQueryClient implements QuietCloseable {
      *       Per {@code failover.md} section 1, the comma form and repeated {@code addr=} keys
      *       both accumulate into a single ordered list; empty entries are rejected.</li>
      *   <li>{@code target=any|primary|replica} -- endpoint filter applied against the role
-     *       byte from the v2 {@code SERVER_INFO} frame. Default {@code any}. {@code primary}
+     *       byte from the {@code SERVER_INFO} frame. Default {@code any}. {@code primary}
      *       accepts {@code PRIMARY}, {@code PRIMARY_CATCHUP} and {@code STANDALONE}.</li>
      *   <li>{@code failover=on|off} -- default {@code on}. On transport failure during
      *       {@link #execute}, reconnect to another endpoint and re-submit the query.
@@ -825,7 +825,7 @@ public class QwpQueryClient implements QuietCloseable {
      * performs the WebSocket upgrade. Must be called before any query is submitted.
      * <p>
      * Walks the endpoint list in order: for each entry it opens the TCP socket,
-     * runs the HTTP upgrade, reads the v2 {@code SERVER_INFO} frame, and accepts
+     * runs the HTTP upgrade, reads the {@code SERVER_INFO} frame, and accepts
      * the endpoint if the server's role matches the configured target. An
      * endpoint that matches becomes the bound connection and the I/O thread is
      * spawned. An endpoint whose role doesn't match is closed and the walk
@@ -1290,7 +1290,7 @@ public class QwpQueryClient implements QuietCloseable {
      * Useful for latency-sensitive streaming consumers that want to start
      * processing the first row as soon as possible -- a smaller cap flushes
      * the first batch sooner, at the cost of more per-batch overhead (WS
-     * header, send syscall, schema-reference decode). The server clamps down
+     * header, send syscall). The server clamps down
      * to its own hard limit; a value of {@code 0} (default) omits the header
      * and the server uses its own cap.
      * <p>
@@ -1307,7 +1307,7 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Overrides the {@link #DEFAULT_SERVER_INFO_TIMEOUT_MS} wait for the v2
+     * Overrides the {@link #DEFAULT_SERVER_INFO_TIMEOUT_MS} wait for the
      * {@code SERVER_INFO} frame. Must be called before {@link #connect}.
      */
     public void withServerInfoTimeout(int ms) {
