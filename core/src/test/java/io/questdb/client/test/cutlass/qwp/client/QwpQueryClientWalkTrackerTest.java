@@ -57,7 +57,7 @@ import java.util.concurrent.TimeUnit;
  *       from "all unreachable" ({@link HttpClientException}).</li>
  * </ul>
  * <p>
- * SERVER_INFO-driven role checks (target=primary against a v2 server
+ * SERVER_INFO-driven role checks (target=primary against a server
  * advertising REPLICA via the SERVER_INFO frame) belong to the parent
  * QuestDB egress integration suite -- TestWebSocketServer here only
  * covers the upgrade-time {@code X-QuestDB-Role} header path which is
@@ -260,10 +260,11 @@ public class QwpQueryClientWalkTrackerTest {
         // see every host TopologyReject (priority 5) and walk past the
         // now-healthy A only to fail.
         //
-        // target=any keeps this v1-friendly: the spec defines
-        // target=primary as requiring v2 SERVER_INFO, which the test
-        // server doesn't emit. A separate integration test in the
-        // parent QuestDB repo covers the SERVER_INFO path.
+        // target=any so the rehabilitated host A binds regardless of the
+        // role it advertises in its SERVER_INFO frame -- this test
+        // exercises the fall-through reset, not the role filter. The
+        // SERVER_INFO-driven role filter (target=primary/replica) is
+        // covered by a separate integration test in the parent QuestDB repo.
         int portA = TestPorts.findUnusedPort();
         int portB = TestPorts.findUnusedPort();
         TestWebSocketServer a = new TestWebSocketServer(portA, NOOP_HANDLER);

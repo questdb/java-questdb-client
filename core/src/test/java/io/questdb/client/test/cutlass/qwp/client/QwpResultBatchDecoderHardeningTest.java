@@ -45,8 +45,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * Hardening tests for {@link QwpResultBatchDecoder} against malformed RESULT_BATCH
  * frames from a hostile or buggy server. Each test crafts a wire payload directly
  * in native memory and asserts that the decoder rejects it cleanly with a
- * {@link QwpDecodeException} rather than reading out of bounds, growing the
- * schema registry without bound, or returning negative offsets that propagate
+ * {@link QwpDecodeException} rather than reading out of bounds, accepting an
+ * out-of-range column_count, or returning negative offsets that propagate
  * into accessors.
  */
 public class QwpResultBatchDecoderHardeningTest {

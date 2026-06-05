@@ -245,7 +245,7 @@ public class QwpQueryClientUnitTest {
     @Test
     public void testGetServerInfoNullableBeforeConnect() {
         // The accessor is documented as returning null before connect(); a
-        // QwpServerInfo instance materialises only after the v2 SERVER_INFO
+        // QwpServerInfo instance materialises only after the SERVER_INFO
         // frame is decoded during connect().
         try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)) {
             QwpServerInfo info = c.getServerInfo();
