@@ -205,6 +205,10 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             dctx = 0;
         }
         connDictSize = 0;
+        // Invalidate any per-query schema captured before close(). The decoder is
+        // single-use per connection today, but resetting here keeps a future
+        // reuse from binding a continuation batch to a prior connection's schema.
+        querySchemaValid = false;
     }
 
     /**
