@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -324,6 +325,78 @@ public class QwpQueryClientWalkTrackerTest {
         } finally {
             rep.close();
             prim.close();
+        }
+    }
+
+    @Test
+    public void testWalk_ServerInfoReplicaRejectedForTargetPrimary() throws Exception {
+        // A node that completes a clean 101 upgrade and then advertises REPLICA
+        // only in its SERVER_INFO frame (not via the 421 X-QuestDB-Role header
+        // path the other role tests use) must be rejected by the role filter
+        // when target=primary. Pins matchesTarget(info.getRole(), target) where
+        // info is the decoded SERVER_INFO -- the branch that outlived the
+        // v1-mismatch removal. A clean 101 ignores the upgrade-time role header,
+        // so the rejection here is driven purely by the SERVER_INFO role.
+        int port = TestPorts.findUnusedPort();
+        TestWebSocketServer replica = new TestWebSocketServer(port, NOOP_HANDLER);
+        replica.setAdvertisedRole("REPLICA");
+        replica.setSendServerInfo(true);
+        try {
+            replica.start();
+            Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                    "ws::addr=localhost:" + port + ";target=primary;auth_timeout_ms=2000;")) {
+                try {
+                    client.connect();
+                    Assert.fail("expected QwpRoleMismatchException for a REPLICA SERVER_INFO under target=primary");
+                } catch (QwpRoleMismatchException expected) {
+                    Assert.assertFalse("a role mismatch must not leave the client connected", client.isConnected());
+                    Assert.assertEquals("primary", expected.getTargetRole());
+                    // The rejected role is taken from the decoded SERVER_INFO frame.
+                    Assert.assertNotNull("observed SERVER_INFO must be attached", expected.getLastObserved());
+                    Assert.assertEquals(QwpEgressMsgKind.ROLE_REPLICA, expected.getLastObserved().getRole());
+                    Assert.assertTrue("message must mention target=primary: " + expected.getMessage(),
+                            expected.getMessage().contains("target=primary"));
+                }
+            }
+        } finally {
+            replica.close();
+        }
+    }
+
+    @Test
+    public void testWalk_ServerInfoRoleFilterSkipsReplicaBindsPrimary() throws Exception {
+        // Both endpoints complete a clean 101 and advertise their role only via
+        // the SERVER_INFO frame. With target=primary the walk must skip the
+        // REPLICA endpoint -- a SERVER_INFO role mismatch is a skip, not a
+        // terminal failure -- and bind the PRIMARY one. Exercises the
+        // walk-continues side of matchesTarget(info.getRole(), target).
+        int portReplica = TestPorts.findUnusedPort();
+        int portPrimary = TestPorts.findUnusedPort();
+        TestWebSocketServer replica = new TestWebSocketServer(portReplica, NOOP_HANDLER);
+        replica.setAdvertisedRole("REPLICA");
+        replica.setSendServerInfo(true);
+        TestWebSocketServer primary = new TestWebSocketServer(portPrimary, NOOP_HANDLER);
+        primary.setAdvertisedRole("PRIMARY");
+        primary.setSendServerInfo(true);
+        try {
+            replica.start();
+            primary.start();
+            Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(primary.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                    "ws::addr=localhost:" + portReplica + ",localhost:" + portPrimary
+                            + ";target=primary;auth_timeout_ms=2000;")) {
+                client.connect();
+                Assert.assertTrue("client must skip the REPLICA and bind the PRIMARY", client.isConnected());
+                Assert.assertNotNull("bound connection must carry SERVER_INFO", client.getServerInfo());
+                Assert.assertEquals(QwpEgressMsgKind.ROLE_PRIMARY, client.getServerInfo().getRole());
+            }
+        } finally {
+            replica.close();
+            primary.close();
         }
     }
 
