@@ -2809,19 +2809,19 @@ public class QwpWebSocketSender implements Sender {
                     host, port, client.getServerQwpVersion(), serverMaxBatchSize, effectiveAutoFlushBytes);
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
-            // its default version (V1). Schema state still gets reset for
-            // consistency with the sync path; the post-connect replay path
-            // does not need a producer-side reset signal because every
+            // its default version (V1). The symbol-dict watermark still gets
+            // reset for consistency with the sync path; the post-connect replay
+            // path does not need a producer-side reset signal because every
             // cursor frame is self-sufficient.
             Endpoint ep = endpoints.get(0);
             LOG.info("Async initial connect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}]",
                     ep.host, ep.port, endpoints.size());
         }
-        // Server starts fresh on each connection — discard any schema IDs
-        // retained from prior state. Cursor frames are self-sufficient (every
-        // frame carries full schema + full symbol-dict delta from id 0), so
-        // post-reconnect replay needs no producer-side schema-reset signal.
-        resetSchemaStateForNewConnection();
+        // Server starts fresh on each connection, so reset the symbol-dict
+        // watermark. Cursor frames are self-sufficient (every frame carries its
+        // full inline schema + a symbol-dict delta from id 0), so post-reconnect
+        // replay needs no producer-side reset signal.
+        resetSymbolDictStateForNewConnection();
         connectionError.set(null);
 
         connected = true;
@@ -3027,7 +3027,7 @@ public class QwpWebSocketSender implements Sender {
         hasDeferredMessages = false;
     }
 
-    private void resetSchemaStateForNewConnection() {
+    private void resetSymbolDictStateForNewConnection() {
         // The new server has an empty symbol dictionary, so the next batch
         // must ship a delta starting at id 0. beginMessage() always passes
         // confirmedMaxId = -1; resetting the batch watermark here keeps a
@@ -3095,9 +3095,9 @@ public class QwpWebSocketSender implements Sender {
             // payload never reached the engine, so no I/O thread will
             // recycle toSend. Recycle it here so a later flush can swap
             // back to it; flushPendingRows aborts its post-enqueue state
-            // updates after this throw, so the source rows and the
-            // sent-schema watermark stay intact and the next batch re-emits
-            // the same rows along with the full schema + symbol-dict delta.
+            // updates after this throw, so the source rows stay intact and the
+            // next batch re-emits the same rows along with the full inline
+            // schema and symbol-dict delta from id 0.
             if (toSend.isSending()) {
                 toSend.markRecycled();
             } else if (toSend.isSealed()) {

@@ -262,9 +262,9 @@ public class QwpQueryClient implements QuietCloseable {
     // worker thread's post-requestId read.
     private volatile boolean pendingCancel;
     // Decoded SERVER_INFO from the current connection's handshake. Null before
-    // connect() has succeeded, and on connections that negotiated v1 (which
-    // doesn't emit the frame). Volatile so the I/O thread's read on the
-    // {@code onFailoverReset} path sees the latest reconnect.
+    // connect() has succeeded; non-null on every established connection (the
+    // server always emits the frame). Volatile so getServerInfo(), callable
+    // from any thread, observes the latest reconnect's value.
     private volatile QwpServerInfo serverInfo;
     private int serverInfoTimeoutMs = DEFAULT_SERVER_INFO_TIMEOUT_MS;
     // Maximum time close() will wait for the I/O thread to exit before giving up
@@ -882,11 +882,13 @@ public class QwpQueryClient implements QuietCloseable {
                 cleanupFailedConnect();
                 continue;
             }
+            // info is non-null: connectToEndpoint() returns only after
+            // receiveServerInfoSync() set serverInfo (it returns non-null or throws).
             QwpServerInfo info = serverInfo;
-            if (info != null && (info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
+            if ((info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
                 hostTracker.recordZone(i, info.getZoneId());
             }
-            if (info != null && !matchesTarget(info.getRole(), target)) {
+            if (!matchesTarget(info.getRole(), target)) {
                 lastObservedMismatch = info;
                 boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
                 hostTracker.recordRoleReject(i, isTransient);
@@ -1933,11 +1935,13 @@ public class QwpQueryClient implements QuietCloseable {
                 cleanupFailedConnect();
                 continue;
             }
+            // info is non-null: connectToEndpoint() returns only after
+            // receiveServerInfoSync() set serverInfo (it returns non-null or throws).
             QwpServerInfo info = serverInfo;
-            if (info != null && (info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
+            if ((info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
                 hostTracker.recordZone(i, info.getZoneId());
             }
-            if (info != null && !matchesTarget(info.getRole(), target)) {
+            if (!matchesTarget(info.getRole(), target)) {
                 lastMismatch = info;
                 boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
                 hostTracker.recordRoleReject(i, isTransient);

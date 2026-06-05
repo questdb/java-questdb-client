@@ -980,7 +980,7 @@ public class QwpResultBatchDecoderColumnTypesTest {
         // the decoder see flags == 0 and silently take the non-delta / non-gorilla
         // / non-zstd path, leaving the delta/gorilla payload bytes at the position
         // the table-block parser then advances over -- producing inscrutable
-        // "unknown schema mode 0x..." errors mid-frame.
+        // table-block parse errors (bad varint, out-of-range column_count) mid-frame.
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
         p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, flags);
