@@ -326,6 +326,38 @@ public class QwpQueryClientWalkTrackerTest {
         }
     }
 
+    @Test(timeout = 15_000)
+    public void testWalk_ServerInfoTimeoutIsTransportNotTerminal() throws Exception {
+        // A node that completes the 101 upgrade but never sends the mandatory
+        // SERVER_INFO frame must be treated as a transport error so the walk
+        // continues, not a terminal failure. receiveServerInfoSync() now runs on
+        // every connect, so a silent post-upgrade peer would otherwise stall the
+        // client until the server-info timeout; bound it short here and verify
+        // the walk falls through to a healthy node.
+        int portSilent = TestPorts.findUnusedPort();
+        int portOk = TestPorts.findUnusedPort();
+        TestWebSocketServer silent = new TestWebSocketServer(portSilent, NOOP_HANDLER);
+        // sendServerInfo left off: the 101 upgrade succeeds, then the node stays silent.
+        TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        ok.setSendServerInfo(true);
+        try {
+            silent.start();
+            ok.start();
+            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                    "ws::addr=localhost:" + portSilent + ",localhost:" + portOk + ";auth_timeout_ms=2000;")) {
+                client.withServerInfoTimeout(300);
+                client.connect();
+                Assert.assertTrue("client must walk past the SERVER_INFO-silent node", client.isConnected());
+            }
+        } finally {
+            silent.close();
+            ok.close();
+        }
+    }
+
     @Test
     public void testWalk_TransportFailureContinuesWalk() throws Exception {
         // First port has no server (TCP refused); second is reachable.

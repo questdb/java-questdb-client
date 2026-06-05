@@ -110,6 +110,50 @@ public class QwpResultBatchDecoderHardeningTest {
         });
     }
 
+    /**
+     * Regression for the surviving table-block guard: a {@code column_count}
+     * above {@link QwpConstants#MAX_COLUMNS_PER_TABLE} on the schema-bearing
+     * batch_seq == 0 must be rejected before the decoder tries to parse that
+     * many column descriptors. This guard moved into the batch_seq == 0 branch
+     * when schema-reference mode was removed; the old schema_id range check that
+     * used to sit beside it is gone, so this is the only remaining bound here.
+     */
+    @Test
+    public void testColumnCountOutOfRangeIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(64);
+            long staging = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                long p = staging;
+                p = putInt(p, QwpConstants.MAGIC_MESSAGE);
+                p = putByte(p, QwpConstants.VERSION);
+                p = putByte(p, (byte) 0);                     // flags
+                p = putByte(p, (byte) 0);                     // msg_kind in header (unused)
+                p = putByte(p, (byte) 1);                     // table_count
+                p = putInt(p, 0);                             // payload_length (unused)
+                p = putByte(p, (byte) 0x11);                  // RESULT_BATCH
+                p = putLong(p, 1L);                           // request_id
+                p = putVarint(p, 0L);                         // batch_seq = 0 (schema-bearing)
+                p = putVarint(p, 0L);                         // table_name_len
+                p = putVarint(p, 0L);                         // row_count
+                p = putVarint(p, 1_000_000_000L);            // column_count: far above the cap
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject an out-of-range column_count");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error must reference column_count: " + expected.getMessage(),
+                            expected.getMessage().contains("column_count out of range"));
+                }
+            } finally {
+                Unsafe.free(staging, 64, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
     @Test
     public void testUnsupportedVersionThrowsProtocolVersionException() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -123,6 +167,39 @@ public class QwpResultBatchDecoderHardeningTest {
                 try {
                     decoder.decode(buffer);
                     Assert.fail("decoder must throw on unsupported version");
+                } catch (QwpProtocolVersionException expected) {
+                    Assert.assertTrue("error must reference unsupported version: " + expected.getMessage(),
+                            expected.getMessage().contains("unsupported version"));
+                    Assert.assertTrue("must extend QwpDecodeException",
+                            expected instanceof QwpDecodeException);
+                }
+            } finally {
+                Unsafe.free(staging, 128, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
+     * The protocol collapsed to a single version. Version 2 -- accepted by the
+     * pre-collapse range check ({@code >= VERSION_1 && <= MAX_SUPPORTED_VERSION})
+     * -- must now be rejected by the flattened {@code != VERSION} check, the same
+     * as any other non-1 version byte. Pins the boundary that actually changed.
+     */
+    @Test
+    public void testVersionTwoIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(128);
+            long staging = Unsafe.malloc(128, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int len = writeMinimalResultBatch(staging);
+                Unsafe.getUnsafe().putByte(staging + 4, (byte) 2);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject protocol version 2");
                 } catch (QwpProtocolVersionException expected) {
                     Assert.assertTrue("error must reference unsupported version: " + expected.getMessage(),
                             expected.getMessage().contains("unsupported version"));

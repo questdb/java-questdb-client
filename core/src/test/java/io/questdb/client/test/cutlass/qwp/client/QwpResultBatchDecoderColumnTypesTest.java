@@ -184,7 +184,7 @@ public class QwpResultBatchDecoderColumnTypesTest {
     @Test
     public void testCharColumnDecodes() throws Exception {
         TestUtils.assertMemoryLeak(() -> withDecoder(256, (decoder, buffer, staging) -> {
-            char[] values = {'a', 'Z', '0', ' ', '￿'};
+            char[] values = {'a', 'Z', '0', '\u0000', '\uffff'};
             long p = startSingleColumnFrame(staging, "c", QwpConstants.TYPE_CHAR, values.length);
             p = putByte(p, (byte) 0);
             for (char v : values) p = putShort(p, (short) v);
@@ -251,6 +251,39 @@ public class QwpResultBatchDecoderColumnTypesTest {
             decoder.decode(buffer);
             Assert.assertEquals(0, batchOf(buffer).getRowCount());
             Assert.assertEquals(0, batchOf(buffer).getColumnCount());
+        }));
+    }
+
+    @Test
+    public void testEmptyResultSetCarriesSchema() throws Exception {
+        TestUtils.assertMemoryLeak(() -> withDecoder(128, (decoder, buffer, staging) -> {
+            // Realistic empty result: batch_seq == 0, row_count == 0, but the schema
+            // is present (column_count > 0 with descriptors, no row bodies). The
+            // server always ships the schema on batch 0 even when the result is empty.
+            long p = staging;
+            p = writeHeader(p, (byte) 0);
+            p = putByte(p, (byte) 0x11);                  // RESULT_BATCH
+            p = putLong(p, 1L);                           // request_id
+            p = putVarint(p, 0L);                         // batch_seq = 0
+            p = putVarint(p, 0L);                         // table_name_len
+            p = putVarint(p, 0L);                         // row_count = 0
+            p = putVarint(p, 2L);                         // column_count = 2
+            p = putVarint(p, 1L);
+            p = putByte(p, (byte) 'a');
+            p = putByte(p, QwpConstants.TYPE_INT);
+            p = putVarint(p, 1L);
+            p = putByte(p, (byte) 'b');
+            p = putByte(p, QwpConstants.TYPE_LONG);
+            // Each column still carries its null-flag byte even at row_count == 0
+            // (no nulls -> 0x00); the decoder reads one per column. No row bodies.
+            p = putByte(p, (byte) 0);                    // col "a" null_flag
+            p = putByte(p, (byte) 0);                    // col "b" null_flag
+            buffer.copyFromPayload(staging, (int) (p - staging));
+            decoder.decode(buffer);
+            Assert.assertEquals(0, batchOf(buffer).getRowCount());
+            Assert.assertEquals(2, batchOf(buffer).getColumnCount());
+            Assert.assertEquals("a", batchOf(buffer).getColumnName(0));
+            Assert.assertEquals("b", batchOf(buffer).getColumnName(1));
         }));
     }
 
@@ -386,6 +419,52 @@ public class QwpResultBatchDecoderColumnTypesTest {
     }
 
     @Test
+    public void testResetQuerySchemaRejectsContinuationFromPriorQuery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Query A delivers its schema on batch_seq == 0.
+                long p = startSingleColumnFrame(staging, "n", QwpConstants.TYPE_INT, 1);
+                p = putByte(p, (byte) 0);
+                p = putInt(p, 99);
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                decoder.decode(buffer);
+                Assert.assertEquals(99, batchOf(buffer).getIntValue(0, 0));
+
+                // The IoThread calls resetQuerySchema() when the next query starts.
+                // After that, query A's schema must no longer satisfy a continuation:
+                // a batch_seq > 0 arriving before the new query's batch_seq == 0 must
+                // be rejected, not bound to the prior query's schema.
+                decoder.resetQuerySchema();
+
+                p = staging;
+                p = writeHeader(p, (byte) 0);
+                p = putByte(p, (byte) 0x11);
+                p = putLong(p, 1L);
+                p = putVarint(p, 1L);                          // batch_seq = 1 (continuation)
+                p = putVarint(p, 0L);                          // table_name_len
+                p = putVarint(p, 1L);                          // row_count
+                p = putByte(p, (byte) 0);                      // null_flag
+                p = putInt(p, 1234);                           // value
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject a continuation after resetQuerySchema()");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error mentions the missing schema batch: " + expected.getMessage(),
+                            expected.getMessage().contains("batch_seq"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    @Test
     public void testSchemaMissingOnContinuationRejected() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
@@ -448,6 +527,132 @@ public class QwpResultBatchDecoderColumnTypesTest {
                 decoder.decode(buffer);
                 Assert.assertEquals(1234, batchOf(buffer).getIntValue(0, 0));
                 Assert.assertEquals("n", batchOf(buffer).getColumnName(0));
+            } finally {
+                Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSchemaSlotsReusedAcrossQueriesWithDifferentTypes() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(512);
+            long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Query A: one INT column "i". Seeds pooled schema slot 0 with
+                // name "i" / wire-type INT.
+                long p = startSingleColumnFrame(staging, "i", QwpConstants.TYPE_INT, 1);
+                p = putByte(p, (byte) 0);
+                p = putInt(p, 5);
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                decoder.decode(buffer);
+                Assert.assertEquals(5, batchOf(buffer).getIntValue(0, 0));
+
+                decoder.resetQuerySchema();
+
+                // Query B batch_seq == 0: two columns LONG "p", INT "q". Slot 0 is
+                // reused from query A and must be fully overwritten (name "p",
+                // wire-type LONG), not retain A's "i"/INT; slot 1 is freshly grown.
+                p = staging;
+                p = writeHeader(p, (byte) 0);
+                p = putByte(p, (byte) 0x11);
+                p = putLong(p, 1L);
+                p = putVarint(p, 0L);                          // batch_seq = 0
+                p = putVarint(p, 0L);                          // table_name_len
+                p = putVarint(p, 1L);                          // row_count
+                p = putVarint(p, 2L);                          // column_count
+                p = putVarint(p, 1L);                          // col 0 name length
+                p = putByte(p, (byte) 'p');
+                p = putByte(p, QwpConstants.TYPE_LONG);
+                p = putVarint(p, 1L);                          // col 1 name length
+                p = putByte(p, (byte) 'q');
+                p = putByte(p, QwpConstants.TYPE_INT);
+                p = putByte(p, (byte) 0);                      // col 0 null_flag
+                p = putLong(p, 9_876_543_210L);               // col 0 value (LONG)
+                p = putByte(p, (byte) 0);                      // col 1 null_flag
+                p = putInt(p, 42);                             // col 1 value (INT)
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                decoder.decode(buffer);
+
+                Assert.assertEquals(2, batchOf(buffer).getColumnCount());
+                Assert.assertEquals("p", batchOf(buffer).getColumnName(0));
+                Assert.assertEquals(QwpConstants.TYPE_LONG, batchOf(buffer).getColumnWireType(0));
+                Assert.assertEquals(9_876_543_210L, batchOf(buffer).getLongValue(0, 0));
+                Assert.assertEquals("q", batchOf(buffer).getColumnName(1));
+                Assert.assertEquals(42, batchOf(buffer).getIntValue(1, 0));
+            } finally {
+                Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    @Test
+    public void testSchemaSwitchesAcrossQueriesWithDifferentColumnCount() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(512);
+            long staging = Unsafe.malloc(512, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Query A batch_seq == 0: two INT columns "a", "b" -- grows the
+                // pooled schema to 2 slots.
+                long p = staging;
+                p = writeHeader(p, (byte) 0);
+                p = putByte(p, (byte) 0x11);
+                p = putLong(p, 1L);
+                p = putVarint(p, 0L);                          // batch_seq = 0
+                p = putVarint(p, 0L);                          // table_name_len
+                p = putVarint(p, 1L);                          // row_count
+                p = putVarint(p, 2L);                          // column_count
+                p = putVarint(p, 1L);
+                p = putByte(p, (byte) 'a');
+                p = putByte(p, QwpConstants.TYPE_INT);
+                p = putVarint(p, 1L);
+                p = putByte(p, (byte) 'b');
+                p = putByte(p, QwpConstants.TYPE_INT);
+                p = putByte(p, (byte) 0);                      // col a null_flag
+                p = putInt(p, 10);
+                p = putByte(p, (byte) 0);                      // col b null_flag
+                p = putInt(p, 20);
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                decoder.decode(buffer);
+                Assert.assertEquals(2, batchOf(buffer).getColumnCount());
+                Assert.assertEquals(10, batchOf(buffer).getIntValue(0, 0));
+                Assert.assertEquals(20, batchOf(buffer).getIntValue(1, 0));
+
+                decoder.resetQuerySchema();
+
+                // Query B batch_seq == 0: a single INT column "x" -- shrinks the
+                // pooled schema back to 1 slot.
+                p = startSingleColumnFrame(staging, "x", QwpConstants.TYPE_INT, 1);
+                p = putByte(p, (byte) 0);
+                p = putInt(p, 77);
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                decoder.decode(buffer);
+                Assert.assertEquals(1, batchOf(buffer).getColumnCount());
+                Assert.assertEquals(77, batchOf(buffer).getIntValue(0, 0));
+
+                // Query B continuation (batch_seq == 1): rows only. It binds to
+                // query B's 1-column schema -- columnCount derives from
+                // querySchema.size(), which must have shrunk to 1 (not stale at 2).
+                p = staging;
+                p = writeHeader(p, (byte) 0);
+                p = putByte(p, (byte) 0x11);
+                p = putLong(p, 1L);
+                p = putVarint(p, 1L);                          // batch_seq = 1
+                p = putVarint(p, 0L);                          // table_name_len
+                p = putVarint(p, 1L);                          // row_count
+                p = putByte(p, (byte) 0);                      // null_flag
+                p = putInt(p, 88);
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                decoder.decode(buffer);
+                Assert.assertEquals(1, batchOf(buffer).getColumnCount());
+                Assert.assertEquals("x", batchOf(buffer).getColumnName(0));
+                Assert.assertEquals(88, batchOf(buffer).getIntValue(0, 0));
             } finally {
                 Unsafe.free(staging, 512, MemoryTag.NATIVE_DEFAULT);
                 buffer.close();
