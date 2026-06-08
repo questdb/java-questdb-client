@@ -822,6 +822,15 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_withMaxSchemasPerConnection_fails() {
+        // max_schemas_per_connection was removed with the QWP schema-reference
+        // mechanism. The connection string used to accept it; it must now be
+        // rejected as an unknown key rather than silently swallowed.
+        assertBadConfig("ws::addr=localhost:9000;max_schemas_per_connection=1024;",
+                "unknown configuration key [key=max_schemas_per_connection]");
+    }
+
+    @Test
     public void testWsConfigString_withToken() throws Exception {
         assertMemoryLeak(() -> {
             Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;token=mytoken;");

@@ -772,6 +772,16 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testMaxSchemasPerConnectionRejected() {
+        // max_schemas_per_connection was removed with the QWP schema-reference
+        // mechanism. It used to be silently accepted on egress (an ingress-only
+        // key); now the parser must surface it as an unknown-key error rather
+        // than swallowing it, matching the ingress Sender's rejection.
+        assertReject("ws::addr=db:9000;max_schemas_per_connection=1024;",
+                "unknown configuration key: max_schemas_per_connection");
+    }
+
+    @Test
     public void testMinimalWsConfigAccepted() {
         assertParses("ws::addr=localhost:9000;");
     }
