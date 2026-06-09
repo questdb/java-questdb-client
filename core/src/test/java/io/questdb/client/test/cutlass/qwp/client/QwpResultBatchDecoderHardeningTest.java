@@ -45,8 +45,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * Hardening tests for {@link QwpResultBatchDecoder} against malformed RESULT_BATCH
  * frames from a hostile or buggy server. Each test crafts a wire payload directly
  * in native memory and asserts that the decoder rejects it cleanly with a
- * {@link QwpDecodeException} rather than reading out of bounds, growing the
- * schema registry without bound, or returning negative offsets that propagate
+ * {@link QwpDecodeException} rather than reading out of bounds, accepting an
+ * out-of-range column_count, or returning negative offsets that propagate
  * into accessors.
  */
 public class QwpResultBatchDecoderHardeningTest {
@@ -110,6 +110,50 @@ public class QwpResultBatchDecoderHardeningTest {
         });
     }
 
+    /**
+     * Regression for the surviving table-block guard: a {@code column_count}
+     * above {@link QwpConstants#MAX_COLUMNS_PER_TABLE} on the schema-bearing
+     * batch_seq == 0 must be rejected before the decoder tries to parse that
+     * many column descriptors. This guard moved into the batch_seq == 0 branch
+     * when schema-reference mode was removed; the old schema_id range check that
+     * used to sit beside it is gone, so this is the only remaining bound here.
+     */
+    @Test
+    public void testColumnCountOutOfRangeIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(64);
+            long staging = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                long p = staging;
+                p = putInt(p, QwpConstants.MAGIC_MESSAGE);
+                p = putByte(p, QwpConstants.VERSION);
+                p = putByte(p, (byte) 0);                     // flags
+                p = putByte(p, (byte) 0);                     // msg_kind in header (unused)
+                p = putByte(p, (byte) 1);                     // table_count
+                p = putInt(p, 0);                             // payload_length (unused)
+                p = putByte(p, (byte) 0x11);                  // RESULT_BATCH
+                p = putLong(p, 1L);                           // request_id
+                p = putVarint(p, 0L);                         // batch_seq = 0 (schema-bearing)
+                p = putVarint(p, 0L);                         // table_name_len
+                p = putVarint(p, 0L);                         // row_count
+                p = putVarint(p, 1_000_000_000L);            // column_count: far above the cap
+                buffer.copyFromPayload(staging, (int) (p - staging));
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject an out-of-range column_count");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error must reference column_count: " + expected.getMessage(),
+                            expected.getMessage().contains("column_count out of range"));
+                }
+            } finally {
+                Unsafe.free(staging, 64, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
     @Test
     public void testUnsupportedVersionThrowsProtocolVersionException() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -117,12 +161,45 @@ public class QwpResultBatchDecoderHardeningTest {
             QwpBatchBuffer buffer = new QwpBatchBuffer(128);
             long staging = Unsafe.malloc(128, MemoryTag.NATIVE_DEFAULT);
             try {
-                int len = writeMinimalResultBatch(staging, 0L);
+                int len = writeMinimalResultBatch(staging);
                 Unsafe.getUnsafe().putByte(staging + 4, (byte) 99);
                 buffer.copyFromPayload(staging, len);
                 try {
                     decoder.decode(buffer);
                     Assert.fail("decoder must throw on unsupported version");
+                } catch (QwpProtocolVersionException expected) {
+                    Assert.assertTrue("error must reference unsupported version: " + expected.getMessage(),
+                            expected.getMessage().contains("unsupported version"));
+                    Assert.assertTrue("must extend QwpDecodeException",
+                            expected instanceof QwpDecodeException);
+                }
+            } finally {
+                Unsafe.free(staging, 128, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
+     * The protocol collapsed to a single version. Version 2 -- accepted by the
+     * pre-collapse range check ({@code >= VERSION_1 && <= MAX_SUPPORTED_VERSION})
+     * -- must now be rejected by the flattened {@code != VERSION} check, the same
+     * as any other non-1 version byte. Pins the boundary that actually changed.
+     */
+    @Test
+    public void testVersionTwoIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(128);
+            long staging = Unsafe.malloc(128, MemoryTag.NATIVE_DEFAULT);
+            try {
+                int len = writeMinimalResultBatch(staging);
+                Unsafe.getUnsafe().putByte(staging + 4, (byte) 2);
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject protocol version 2");
                 } catch (QwpProtocolVersionException expected) {
                     Assert.assertTrue("error must reference unsupported version: " + expected.getMessage(),
                             expected.getMessage().contains("unsupported version"));
@@ -305,73 +382,6 @@ public class QwpResultBatchDecoderHardeningTest {
                 } catch (QwpDecodeException expected) {
                     Assert.assertTrue("error must mention GEOHASH precision: " + expected.getMessage(),
                             expected.getMessage().contains("GEOHASH precision"));
-                }
-            } finally {
-                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
-                buffer.close();
-                decoder.close();
-            }
-        });
-    }
-
-    /**
-     * Regression for C5: a server-supplied {@code schema_id} above the per-connection
-     * cap must be rejected. Without the fix, {@code ensureSchemaSlot} would happily
-     * append nulls until OOM (or AIOOBE for negative ids cast from a high varint).
-     */
-    @Test
-    public void testHugeSchemaIdIsRejected() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
-            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
-            try {
-                // schema_id = 1_000_000_000, well above the 65_535 cap.
-                int len = writeMinimalResultBatch(staging, /*schemaId=*/ 1_000_000_000L);
-                buffer.copyFromPayload(staging, len);
-                try {
-                    decoder.decode(buffer);
-                    Assert.fail("decoder must reject huge schema_id");
-                } catch (QwpDecodeException expected) {
-                    Assert.assertTrue("error message should mention schema_id: " + expected.getMessage(),
-                            expected.getMessage().contains("schema_id"));
-                }
-            } finally {
-                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
-                buffer.close();
-                decoder.close();
-            }
-        });
-    }
-
-    /**
-     * Regression for C5: a varint that long-to-int casts to a negative value
-     * (a hostile high varint with the sign bit set after the cast) must be
-     * rejected, not silently passed to {@code getQuick(negativeIndex)}.
-     */
-    @Test
-    public void testNegativeSchemaIdIsRejected() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
-            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
-            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
-            try {
-                // 5-byte varint encoding 0x80000000 (which casts to Integer.MIN_VALUE).
-                // varint bytes for 0x80000000:
-                //   value bits 7..0:  0x00 -> byte: 0x80 (continuation)
-                //   value bits 14..8: 0x00 -> byte: 0x80
-                //   value bits 21..15:0x00 -> byte: 0x80
-                //   value bits 28..22:0x00 -> byte: 0x80
-                //   value bits 35..29:0x08 -> byte: 0x08 (no continuation)
-                int len = writeMinimalResultBatchWithRawSchemaIdVarint(
-                        staging, new byte[]{(byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x08});
-                buffer.copyFromPayload(staging, len);
-                try {
-                    decoder.decode(buffer);
-                    Assert.fail("decoder must reject huge/negative schema_id");
-                } catch (QwpDecodeException expected) {
-                    Assert.assertTrue("error message should mention schema_id: " + expected.getMessage(),
-                            expected.getMessage().contains("schema_id"));
                 }
             } finally {
                 Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
@@ -822,9 +832,8 @@ public class QwpResultBatchDecoderHardeningTest {
      *   table-block:
      *     name_len (varint), name bytes (none)
      *     row_count (varint)
-     *     column_count (varint)
-     *     schema_mode (1 byte) + schema_id (varint)
-     *     [if FULL] per column: name_len varint, name bytes, wire_type byte
+     *     column_count (varint, batch_seq == 0 only)
+     *     per column (batch_seq == 0 only): name_len varint, name bytes, wire_type byte
      *     per column: null_flag byte (+optional bitmap), then column body
      * </pre>
      */
@@ -863,7 +872,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeArrayResultBatchWithDims(long buf, int[] dims) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);
@@ -874,8 +883,6 @@ public class QwpResultBatchDecoderHardeningTest {
         p = putVarint(p, 0L);                         // table_name_len
         p = putVarint(p, 1L);                         // row_count = 1
         p = putVarint(p, 1L);                         // column_count
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        p = putVarint(p, 0L);                         // schema_id
         p = putVarint(p, 1L);                         // column name length
         p = putByte(p, (byte) 'a');
         p = putByte(p, QwpConstants.TYPE_DOUBLE_ARRAY);
@@ -901,7 +908,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeDeltaSymbolDictFrame(long buf, byte[] entryLenVarint) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         // Flags byte lives at HEADER_OFFSET_FLAGS (=5). Existing helpers with
         // flags=0 don't care about the exact slot; a delta-mode frame does.
         p = putByte(p, QwpConstants.FLAG_DELTA_SYMBOL_DICT);
@@ -929,7 +936,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeDeltaSymbolDictFrameWithRange(long buf, long deltaStart, long deltaCount) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, QwpConstants.FLAG_DELTA_SYMBOL_DICT);  // flags at HEADER_OFFSET_FLAGS
         p = putByte(p, (byte) 0);                              // reserved
         p = putByte(p, (byte) 1);                              // table_count
@@ -951,7 +958,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeExecDoneTruncatedRowsAffected(long buf) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);
@@ -973,7 +980,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeGeohashResultBatch(long buf, long precisionBits) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);       // header msg_kind (unused)
         p = putByte(p, (byte) 0);       // flags (no delta dict)
         p = putByte(p, (byte) 1);       // table_count
@@ -984,8 +991,6 @@ public class QwpResultBatchDecoderHardeningTest {
         p = putVarint(p, 0L);           // table_name_len
         p = putVarint(p, 0L);           // row_count (no data rows)
         p = putVarint(p, 1L);           // column_count
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        p = putVarint(p, 0L);           // schema_id
         // Schema: one column "g" of TYPE_GEOHASH.
         p = putVarint(p, 1L);
         p = putByte(p, (byte) 'g');
@@ -997,10 +1002,10 @@ public class QwpResultBatchDecoderHardeningTest {
         return (int) (p - buf);
     }
 
-    private static int writeMinimalResultBatch(long buf, long schemaId) {
+    private static int writeMinimalResultBatch(long buf) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);
@@ -1011,8 +1016,6 @@ public class QwpResultBatchDecoderHardeningTest {
         p = putVarint(p, 0L);                         // table_name_len
         p = putVarint(p, 0L);                         // row_count = 0 (no body needed)
         p = putVarint(p, 0L);                         // column_count = 0
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        p = putVarint(p, schemaId);
         return (int) (p - buf);
     }
 
@@ -1024,7 +1027,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeMinimalResultBatchWithRawNameLenVarint(long buf, byte[] nameLenVarint) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);
@@ -1037,30 +1040,6 @@ public class QwpResultBatchDecoderHardeningTest {
     }
 
     /**
-     * Variant that writes a custom raw varint sequence for schema_id. Lets us
-     * inject a multi-byte varint that decodes to a value with the int sign bit
-     * set after long-to-int truncation.
-     */
-    private static int writeMinimalResultBatchWithRawSchemaIdVarint(long buf, byte[] schemaIdVarint) {
-        long p = buf;
-        p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
-        p = putByte(p, (byte) 0);
-        p = putByte(p, (byte) 0);
-        p = putByte(p, (byte) 1);
-        p = putInt(p, 0);
-        p = putByte(p, (byte) 0x11);
-        p = putLong(p, 1L);
-        p = putVarint(p, 0L);
-        p = putVarint(p, 0L);
-        p = putVarint(p, 0L);
-        p = putVarint(p, 0L);
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        for (byte b : schemaIdVarint) p = putByte(p, b);
-        return (int) (p - buf);
-    }
-
-    /**
      * Crafts a RESULT_BATCH frame whose flags byte advertises FLAG_ZSTD but
      * whose body is junk (not a valid zstd frame). Used by
      * {@link #testZstdCorruptBodyIsRejectedBeforeScratchGrowth}.
@@ -1068,7 +1047,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeResultBatchWithCorruptZstdBody(long buf) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, QwpConstants.FLAG_ZSTD);       // flags byte (offset 5) -- FLAG_ZSTD set
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);
@@ -1091,7 +1070,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeResultEndTruncatedFinalSeq(long buf) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);
@@ -1110,7 +1089,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeResultEndTruncatedTotalRows(long buf) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);
@@ -1126,7 +1105,7 @@ public class QwpResultBatchDecoderHardeningTest {
         long p = buf;
         // Header: magic + version + msg_kind + flags + table_count + payload_length
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);   // 4
-        p = putByte(p, QwpConstants.VERSION_1);       // 1
+        p = putByte(p, QwpConstants.VERSION);       // 1
         p = putByte(p, (byte) 0);                     // msg_kind in header (unused by client)
         p = putByte(p, (byte) 0);                     // flags
         p = putByte(p, (byte) 1);                     // table_count
@@ -1139,9 +1118,7 @@ public class QwpResultBatchDecoderHardeningTest {
         p = putVarint(p, 0L);                         // table_name_len = 0
         p = putVarint(p, nonNull);                    // row_count
         p = putVarint(p, 1L);                         // column_count
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        p = putVarint(p, 0L);                         // schema_id
-        // Schema entries (full): one column "s" of TYPE_VARCHAR
+        // Schema entries: one column "s" of TYPE_VARCHAR
         p = putVarint(p, 1L);                         // column name length
         p = putByte(p, (byte) 's');
         p = putByte(p, QwpConstants.TYPE_VARCHAR);
@@ -1173,7 +1150,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeStringResultBatchWithOffsets(long buf, int[] intOffsets, int totalBytes, int bytesLen) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 1);
@@ -1184,8 +1161,6 @@ public class QwpResultBatchDecoderHardeningTest {
         p = putVarint(p, 0L);                         // table_name_len
         p = putVarint(p, intOffsets.length);          // row_count = nonNull
         p = putVarint(p, 1L);                         // column_count
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        p = putVarint(p, 0L);                         // schema_id
         p = putVarint(p, 1L);                         // column name length
         p = putByte(p, (byte) 's');
         p = putByte(p, QwpConstants.TYPE_VARCHAR);
@@ -1209,7 +1184,7 @@ public class QwpResultBatchDecoderHardeningTest {
     private static int writeSymbolResultBatch(long buf, long rowCount, long dictSize) {
         long p = buf;
         p = putInt(p, QwpConstants.MAGIC_MESSAGE);
-        p = putByte(p, QwpConstants.VERSION_1);
+        p = putByte(p, QwpConstants.VERSION);
         p = putByte(p, (byte) 0);
         p = putByte(p, (byte) 0);       // flags: no delta dict, so non-delta SYMBOL path
         p = putByte(p, (byte) 1);
@@ -1220,8 +1195,6 @@ public class QwpResultBatchDecoderHardeningTest {
         p = putVarint(p, 0L);           // table_name_len
         p = putVarint(p, rowCount);
         p = putVarint(p, 1L);           // column_count
-        p = putByte(p, QwpConstants.SCHEMA_MODE_FULL);
-        p = putVarint(p, 0L);           // schema_id
         // Schema: one column "s" of TYPE_SYMBOL.
         p = putVarint(p, 1L);
         p = putByte(p, (byte) 's');

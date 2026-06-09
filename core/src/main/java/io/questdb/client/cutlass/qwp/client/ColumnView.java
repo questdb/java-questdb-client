@@ -59,8 +59,8 @@ import io.questdb.client.std.str.DirectUtf8Sequence;
  * {@code arrayRowAddr} accessors expose raw native pointers into the WebSocket
  * payload buffer for SIMD or JNI consumers. The layout of the bytes behind
  * these addresses follows the QWP wire format (see
- * {@code docs/qwp/wire-egress.md}); these methods are an expert API and
- * may shift as the wire format evolves.
+ * {@code https://questdb.com/docs/connect/wire-protocols/qwp-egress-websocket/});
+ * these methods are an expert API and may shift as the wire format evolves.
  * <p>
  * <strong>Type contract / NULL handling.</strong> Each typed accessor delegates
  * to the same read path as the corresponding {@code QwpColumnBatch}

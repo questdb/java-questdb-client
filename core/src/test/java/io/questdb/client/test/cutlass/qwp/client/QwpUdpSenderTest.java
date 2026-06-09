@@ -2325,7 +2325,7 @@ public class QwpUdpSenderTest {
 
         private List<DecodedRow> decode() {
             Assert.assertEquals(MAGIC_MESSAGE, reader.readIntLE());
-            Assert.assertEquals(VERSION_1, reader.readByte());
+            Assert.assertEquals(VERSION, reader.readByte());
             reader.readByte();
             int tableCount = reader.readUnsignedShortLE();
             int payloadLength = reader.readIntLE();
@@ -2548,8 +2548,6 @@ public class QwpUdpSenderTest {
             String tableName = reader.readString();
             int rowCount = (int) reader.readVarint();
             int columnCount = (int) reader.readVarint();
-            Assert.assertEquals(SCHEMA_MODE_FULL, reader.readByte());
-            reader.readVarint(); // schemaId
 
             QwpColumnDef[] defs = new QwpColumnDef[columnCount];
             for (int i = 0; i < columnCount; i++) {

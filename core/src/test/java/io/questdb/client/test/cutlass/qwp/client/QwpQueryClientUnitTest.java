@@ -245,7 +245,7 @@ public class QwpQueryClientUnitTest {
     @Test
     public void testGetServerInfoNullableBeforeConnect() {
         // The accessor is documented as returning null before connect(); a
-        // QwpServerInfo instance materialises only after the v2 SERVER_INFO
+        // QwpServerInfo instance materialises only after the SERVER_INFO
         // frame is decoded during connect().
         try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)) {
             QwpServerInfo info = c.getServerInfo();
@@ -255,10 +255,10 @@ public class QwpQueryClientUnitTest {
 
     @Test
     public void testQwpMaxVersionConstant() {
-        // The negotiated-version cap is the v2 protocol; pin it so a future
-        // version bump that adds a new control frame must explicitly update
-        // both the constant and any callers asserting the cap.
-        Assert.assertEquals(2, QwpQueryClient.QWP_MAX_VERSION);
+        // QWP has collapsed to a single protocol version; pin it so a future
+        // version bump must explicitly update both the constant and any callers
+        // asserting the cap.
+        Assert.assertEquals(1, QwpQueryClient.QWP_MAX_VERSION);
     }
 
     @Test
