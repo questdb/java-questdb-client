@@ -170,14 +170,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // directly to the same dispatcher from QwpWebSocketSender.
     private volatile SenderConnectionDispatcher connectionDispatcher;
     private volatile SenderErrorDispatcher errorDispatcher;
-    // Set by checkError() the first time it actually rethrows lastError to a
-    // synchronous user-thread caller (flush/append/close). close() consults
-    // this to decide whether to rethrow the latched terminal -- if a producer
-    // thread already saw the error from a flush() call, throwing again from
-    // close() would mask any in-flight test assertion or user exception. The
-    // async dispatcher path does NOT set this flag: a user who only watches
-    // the async error inbox still gets a loud failure on shutdown.
-    private volatile boolean errorSurfacedSynchronously;
+    // Exact lastError instance that checkError() has thrown to a synchronous
+    // user-thread caller (flush/append/close). close() uses the instance so it
+    // only suppresses errors the user already owned before close() began.
+    private volatile Throwable synchronouslySurfacedError;
     // The send cursor has two coordinate systems:
     //
     //   FSN: durable frame sequence number in the local cursor engine. This is
@@ -472,7 +468,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public void checkError() {
         Throwable e = lastError;
         if (e != null) {
-            errorSurfacedSynchronously = true;
+            synchronouslySurfacedError = e;
             if (e instanceof LineSenderException) throw (LineSenderException) e;
             throw new LineSenderException("I/O thread failed: " + e.getMessage(), e);
         }
@@ -526,6 +522,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     public Throwable getLastError() {
         return lastError;
+    }
+
+    /**
+     * Returns the exact latched throwable instance already thrown by
+     * {@link #checkError()}, or {@code null} when no synchronous caller has
+     * owned the terminal error yet.
+     */
+    public Throwable getSynchronouslySurfacedError() {
+        return synchronouslySurfacedError;
     }
 
     /**
@@ -607,14 +612,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * True when {@link #lastError} is set AND no synchronous user-thread
-     * caller has yet seen it via {@link #checkError()}. close() uses this
-     * to decide whether to rethrow as a safety net: a user who only ever
-     * called close() (e.g. async-initial-connect that never reached the
-     * server) needs to see the error from somewhere; a user who already
-     * caught it from flush() does not.
+     * caller has yet seen that same instance via {@link #checkError()}.
+     * close() uses this to decide whether to rethrow as a safety net: a user
+     * who only ever called close() (e.g. async-initial-connect that never
+     * reached the server) needs to see the error from somewhere; a user who
+     * already caught it from flush() does not.
      */
     public boolean hasUnsurfacedError() {
-        return lastError != null && !errorSurfacedSynchronously;
+        Throwable e = lastError;
+        return e != null && synchronouslySurfacedError != e;
     }
 
     public boolean isRunning() {

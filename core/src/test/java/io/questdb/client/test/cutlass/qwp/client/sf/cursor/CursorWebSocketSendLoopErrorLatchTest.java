@@ -54,6 +54,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
         SenderError err = newSenderError();
         LineSenderServerException original = new LineSenderServerException(err);
         setField(loop, "lastError", original);
+        Assert.assertNull(loop.getSynchronouslySurfacedError());
 
         try {
             loop.checkError();
@@ -64,6 +65,10 @@ public class CursorWebSocketSendLoopErrorLatchTest {
             Assert.assertSame(err,
                     ((LineSenderServerException) thrown).getServerError());
         }
+        Assert.assertSame("checkError must mark the exact latched throwable as user-owned",
+                original, loop.getSynchronouslySurfacedError());
+        Assert.assertFalse("a synchronously surfaced latch is no longer unsurfaced",
+                loop.hasUnsurfacedError());
     }
 
     @Test
@@ -74,6 +79,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
         CursorWebSocketSendLoop loop = newBareLoop();
         Throwable raw = new RuntimeException("oh no");
         setField(loop, "lastError", raw);
+        Assert.assertNull(loop.getSynchronouslySurfacedError());
 
         try {
             loop.checkError();
@@ -83,6 +89,9 @@ public class CursorWebSocketSendLoopErrorLatchTest {
             Assert.assertEquals(raw, thrown.getCause());
             Assert.assertTrue(thrown.getMessage().contains("oh no"));
         }
+        Assert.assertSame("wrapped throwables are owned by their latched source instance",
+                raw, loop.getSynchronouslySurfacedError());
+        Assert.assertFalse(loop.hasUnsurfacedError());
     }
 
     @Test

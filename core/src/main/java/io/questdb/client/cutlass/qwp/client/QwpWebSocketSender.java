@@ -962,14 +962,14 @@ public class QwpWebSocketSender implements Sender {
             // SCHEMA_MISMATCH HALT) from users who only call close() and
             // never call flush() afterwards.
             Throwable terminalError = null;
-            // Snapshot the latched terminal error that the user thread has
-            // ALREADY caught (via flush()/at()) before close() ran. If
-            // flushPendingRows/drainOnClose below also rethrow the same
+            // Snapshot the exact terminal error instance that a user-thread
+            // API call ALREADY caught (via flush()/at()) before close() ran.
+            // If flushPendingRows/drainOnClose below also rethrow the same
             // instance, dropping it at the final rethrow avoids
             // try-with-resources self-suppression: Throwable.addSuppressed
             // raises IllegalArgumentException when primary == suppressed.
-            Throwable alreadyOwnedByUser = (cursorSendLoop != null && !cursorSendLoop.hasUnsurfacedError())
-                    ? cursorSendLoop.getLastError() : null;
+            Throwable alreadyOwnedByUser = cursorSendLoop != null
+                    ? cursorSendLoop.getSynchronouslySurfacedError() : null;
 
             try {
                 // Only drain when both the engine and the I/O loop are wired
@@ -991,7 +991,7 @@ public class QwpWebSocketSender implements Sender {
                     //    only when no other channel has already delivered it
                     //    to the user. "Already delivered" means either the
                     //    producer thread saw it synchronously via
-                    //    flush()/append() (errorSurfacedSynchronously) or the
+                    //    flush()/append() (synchronouslySurfacedError) or the
                     //    async dispatcher delivered it to a user-installed
                     //    custom handler at any point in this sender's life
                     //    (deliveredToCustomHandler). The latter survives a
