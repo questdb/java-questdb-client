@@ -655,7 +655,6 @@ public class QwpQueryClientFromConfigTest {
                 "max_buf_size=100m",
                 "max_datagram_size=1400",
                 "max_name_len=127",
-                "max_schemas_per_connection=65535",
                 "multicast_ttl=1",
                 "pass=secret",
                 "protocol_version=2",
@@ -679,7 +678,7 @@ public class QwpQueryClientFromConfigTest {
             assertParses("ws::addr=db:9000;" + kv + ";");
             all.append(kv).append(';');
         }
-        // All 35 keys at once -- a typical shared-config connect string.
+        // All ingress-only keys at once -- a typical shared-config connect string.
         assertParses(all.toString());
 
         // Out-of-range / malformed values are silently consumed too -- the
@@ -687,7 +686,6 @@ public class QwpQueryClientFromConfigTest {
         assertParses("ws::addr=db:9000;auto_flush_rows=-1;");
         assertParses("ws::addr=db:9000;init_buf_size=garbage;");
         assertParses("ws::addr=db:9000;reconnect_max_duration_millis=banana;");
-        assertParses("ws::addr=db:9000;max_schemas_per_connection=0;");
 
         // Empty values are well-formed and silently consumed.
         assertParses("ws::addr=db:9000;auto_flush=;");
@@ -771,6 +769,16 @@ public class QwpQueryClientFromConfigTest {
                 "ws::addr=db:9000;max_batch_rows=0;",
                 "max_batch_rows must be in [1, 1048576]"
         );
+    }
+
+    @Test
+    public void testMaxSchemasPerConnectionRejected() {
+        // max_schemas_per_connection was removed with the QWP schema-reference
+        // mechanism. It used to be silently accepted on egress (an ingress-only
+        // key); now the parser must surface it as an unknown-key error rather
+        // than swallowing it, matching the ingress Sender's rejection.
+        assertReject("ws::addr=db:9000;max_schemas_per_connection=1024;",
+                "unknown configuration key: max_schemas_per_connection");
     }
 
     @Test

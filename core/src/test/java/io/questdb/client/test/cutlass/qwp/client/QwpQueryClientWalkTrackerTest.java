@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -57,7 +58,7 @@ import java.util.concurrent.TimeUnit;
  *       from "all unreachable" ({@link HttpClientException}).</li>
  * </ul>
  * <p>
- * SERVER_INFO-driven role checks (target=primary against a v2 server
+ * SERVER_INFO-driven role checks (target=primary against a server
  * advertising REPLICA via the SERVER_INFO frame) belong to the parent
  * QuestDB egress integration suite -- TestWebSocketServer here only
  * covers the upgrade-time {@code X-QuestDB-Role} header path which is
@@ -80,6 +81,7 @@ public class QwpQueryClientWalkTrackerTest {
         TestWebSocketServer notFound = new TestWebSocketServer(port404, NOOP_HANDLER);
         notFound.setRejectWithStatus(404, "Not Found");
         TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        ok.setSendServerInfo(true);
         try {
             notFound.start();
             ok.start();
@@ -106,6 +108,7 @@ public class QwpQueryClientWalkTrackerTest {
         TestWebSocketServer rejecting = new TestWebSocketServer(port426, NOOP_HANDLER);
         rejecting.setRejectWithStatus(426, "Upgrade Required");
         TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        ok.setSendServerInfo(true);
         try {
             rejecting.start();
             ok.start();
@@ -258,14 +261,16 @@ public class QwpQueryClientWalkTrackerTest {
         // see every host TopologyReject (priority 5) and walk past the
         // now-healthy A only to fail.
         //
-        // target=any keeps this v1-friendly: the spec defines
-        // target=primary as requiring v2 SERVER_INFO, which the test
-        // server doesn't emit. A separate integration test in the
-        // parent QuestDB repo covers the SERVER_INFO path.
+        // target=any so the rehabilitated host A binds regardless of the
+        // role it advertises in its SERVER_INFO frame -- this test
+        // exercises the fall-through reset, not the role filter. The
+        // SERVER_INFO-driven role filter (target=primary/replica) is
+        // covered by a separate integration test in the parent QuestDB repo.
         int portA = TestPorts.findUnusedPort();
         int portB = TestPorts.findUnusedPort();
         TestWebSocketServer a = new TestWebSocketServer(portA, NOOP_HANDLER);
         a.setRejectWithRole("REPLICA");
+        a.setSendServerInfo(true);
         TestWebSocketServer b = new TestWebSocketServer(portB, NOOP_HANDLER);
         b.setRejectWithRole("REPLICA");
         try {
@@ -305,6 +310,7 @@ public class QwpQueryClientWalkTrackerTest {
         TestWebSocketServer rep = new TestWebSocketServer(portReplica, NOOP_HANDLER);
         rep.setRejectWithRole("REPLICA");
         TestWebSocketServer prim = new TestWebSocketServer(portPrimary, NOOP_HANDLER, false, "PRIMARY");
+        prim.setSendServerInfo(true);
         try {
             rep.start();
             prim.start();
@@ -323,6 +329,110 @@ public class QwpQueryClientWalkTrackerTest {
     }
 
     @Test
+    public void testWalk_ServerInfoReplicaRejectedForTargetPrimary() throws Exception {
+        // A node that completes a clean 101 upgrade and then advertises REPLICA
+        // only in its SERVER_INFO frame (not via the 421 X-QuestDB-Role header
+        // path the other role tests use) must be rejected by the role filter
+        // when target=primary. Pins matchesTarget(info.getRole(), target) where
+        // info is the decoded SERVER_INFO -- the branch that outlived the
+        // v1-mismatch removal. A clean 101 ignores the upgrade-time role header,
+        // so the rejection here is driven purely by the SERVER_INFO role.
+        int port = TestPorts.findUnusedPort();
+        TestWebSocketServer replica = new TestWebSocketServer(port, NOOP_HANDLER);
+        replica.setAdvertisedRole("REPLICA");
+        replica.setSendServerInfo(true);
+        try {
+            replica.start();
+            Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                    "ws::addr=localhost:" + port + ";target=primary;auth_timeout_ms=2000;")) {
+                try {
+                    client.connect();
+                    Assert.fail("expected QwpRoleMismatchException for a REPLICA SERVER_INFO under target=primary");
+                } catch (QwpRoleMismatchException expected) {
+                    Assert.assertFalse("a role mismatch must not leave the client connected", client.isConnected());
+                    Assert.assertEquals("primary", expected.getTargetRole());
+                    // The rejected role is taken from the decoded SERVER_INFO frame.
+                    Assert.assertNotNull("observed SERVER_INFO must be attached", expected.getLastObserved());
+                    Assert.assertEquals(QwpEgressMsgKind.ROLE_REPLICA, expected.getLastObserved().getRole());
+                    Assert.assertTrue("message must mention target=primary: " + expected.getMessage(),
+                            expected.getMessage().contains("target=primary"));
+                }
+            }
+        } finally {
+            replica.close();
+        }
+    }
+
+    @Test
+    public void testWalk_ServerInfoRoleFilterSkipsReplicaBindsPrimary() throws Exception {
+        // Both endpoints complete a clean 101 and advertise their role only via
+        // the SERVER_INFO frame. With target=primary the walk must skip the
+        // REPLICA endpoint -- a SERVER_INFO role mismatch is a skip, not a
+        // terminal failure -- and bind the PRIMARY one. Exercises the
+        // walk-continues side of matchesTarget(info.getRole(), target).
+        int portReplica = TestPorts.findUnusedPort();
+        int portPrimary = TestPorts.findUnusedPort();
+        TestWebSocketServer replica = new TestWebSocketServer(portReplica, NOOP_HANDLER);
+        replica.setAdvertisedRole("REPLICA");
+        replica.setSendServerInfo(true);
+        TestWebSocketServer primary = new TestWebSocketServer(portPrimary, NOOP_HANDLER);
+        primary.setAdvertisedRole("PRIMARY");
+        primary.setSendServerInfo(true);
+        try {
+            replica.start();
+            primary.start();
+            Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(primary.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                    "ws::addr=localhost:" + portReplica + ",localhost:" + portPrimary
+                            + ";target=primary;auth_timeout_ms=2000;")) {
+                client.connect();
+                Assert.assertTrue("client must skip the REPLICA and bind the PRIMARY", client.isConnected());
+                Assert.assertNotNull("bound connection must carry SERVER_INFO", client.getServerInfo());
+                Assert.assertEquals(QwpEgressMsgKind.ROLE_PRIMARY, client.getServerInfo().getRole());
+            }
+        } finally {
+            replica.close();
+            primary.close();
+        }
+    }
+
+    @Test(timeout = 15_000)
+    public void testWalk_ServerInfoTimeoutIsTransportNotTerminal() throws Exception {
+        // A node that completes the 101 upgrade but never sends the mandatory
+        // SERVER_INFO frame must be treated as a transport error so the walk
+        // continues, not a terminal failure. receiveServerInfoSync() now runs on
+        // every connect, so a silent post-upgrade peer would otherwise stall the
+        // client until the server-info timeout; bound it short here and verify
+        // the walk falls through to a healthy node.
+        int portSilent = TestPorts.findUnusedPort();
+        int portOk = TestPorts.findUnusedPort();
+        TestWebSocketServer silent = new TestWebSocketServer(portSilent, NOOP_HANDLER);
+        // sendServerInfo left off: the 101 upgrade succeeds, then the node stays silent.
+        TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        ok.setSendServerInfo(true);
+        try {
+            silent.start();
+            ok.start();
+            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                    "ws::addr=localhost:" + portSilent + ",localhost:" + portOk + ";auth_timeout_ms=2000;")) {
+                client.withServerInfoTimeout(300);
+                client.connect();
+                Assert.assertTrue("client must walk past the SERVER_INFO-silent node", client.isConnected());
+            }
+        } finally {
+            silent.close();
+            ok.close();
+        }
+    }
+
+    @Test
     public void testWalk_TransportFailureContinuesWalk() throws Exception {
         // First port has no server (TCP refused); second is reachable.
         // WalkTracker must classify the first as TransportError and bind
@@ -330,6 +440,7 @@ public class QwpQueryClientWalkTrackerTest {
         int portDead = TestPorts.findUnusedPort();
         int portOk = TestPorts.findUnusedPort();
         try (TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER)) {
+            ok.setSendServerInfo(true);
             ok.start();
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 

@@ -72,7 +72,6 @@ public class QwpTableBuffer implements QuietCloseable {
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int inProgressColumnCount;
     private int rowCount;
-    private int schemaId;
 
     public QwpTableBuffer(String tableName) {
         this(tableName, null);
@@ -90,7 +89,6 @@ public class QwpTableBuffer implements QuietCloseable {
         this.columns = new ObjList<>();
         this.columnNameToIndex = new LowerCaseCharSequenceIntHashMap();
         this.rowCount = 0;
-        this.schemaId = -1;
         this.columnDefsCacheValid = false;
     }
 
@@ -132,7 +130,6 @@ public class QwpTableBuffer implements QuietCloseable {
         committedColumnCount = 0;
         inProgressColumnCount = 0;
         rowCount = 0;
-        schemaId = -1;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
     }
@@ -250,13 +247,6 @@ public class QwpTableBuffer implements QuietCloseable {
     }
 
     /**
-     * Returns the schema ID assigned by the sender, or -1 if not yet assigned.
-     */
-    public int getSchemaId() {
-        return schemaId;
-    }
-
-    /**
      * Returns the table name.
      */
     public String getTableName() {
@@ -363,14 +353,6 @@ public class QwpTableBuffer implements QuietCloseable {
         rebuildColumnAccessStructures();
     }
 
-    /**
-     * Assigns a schema ID. Called by the sender when this table's schema
-     * is first sent to the server.
-     */
-    public void setSchemaId(int schemaId) {
-        this.schemaId = schemaId;
-    }
-
     private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {
         if (column.type != type) {
             throw new LineSenderException(
@@ -408,7 +390,6 @@ public class QwpTableBuffer implements QuietCloseable {
             for (int r = 0; r < rowCount; r++) {
                 col.addNull();
             }
-            schemaId = -1;
             columnDefsCacheValid = false;
         } catch (Throwable t) {
             col.close();
@@ -458,7 +439,6 @@ public class QwpTableBuffer implements QuietCloseable {
             columnNameToIndex.put(col.name, i);
         }
 
-        schemaId = -1;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
     }

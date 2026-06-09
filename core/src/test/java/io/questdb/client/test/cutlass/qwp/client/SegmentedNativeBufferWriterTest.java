@@ -121,7 +121,7 @@ public class SegmentedNativeBufferWriterTest {
             setBuffer.setAccessible(true);
 
             Method encodeTable = cwClass.getDeclaredMethod("encodeTable",
-                    QwpTableBuffer.class, boolean.class, boolean.class, boolean.class);
+                    QwpTableBuffer.class, boolean.class, boolean.class);
             encodeTable.setAccessible(true);
 
             try (QwpTableBuffer tableBuffer = new QwpTableBuffer("test")) {
@@ -148,7 +148,7 @@ public class SegmentedNativeBufferWriterTest {
                 // Encode table with Gorilla enabled into the segmented buffer.
                 // Before the fix, this would compute a wrong write address and corrupt memory.
                 setBuffer.invoke(columnWriter, writer);
-                encodeTable.invoke(columnWriter, tableBuffer, false, false, true);
+                encodeTable.invoke(columnWriter, tableBuffer, false, true);
 
                 // Verify encoding produced data beyond the initial 32 bytes
                 Assert.assertTrue("Encoding should produce data", writer.getPosition() > 32);

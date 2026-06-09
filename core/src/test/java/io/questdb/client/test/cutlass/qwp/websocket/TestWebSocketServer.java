@@ -66,6 +66,12 @@ public class TestWebSocketServer implements Closeable {
     // The server emits the header on both the 101 success path and (when
     // rejectingRole != null) the 421 misdirected-request path.
     private volatile String advertisedRole;
+    // When true, the server sends a SERVER_INFO frame right after a successful
+    // 101 upgrade, mirroring the egress server contract (which always emits it).
+    // The advertised role follows advertisedRole (STANDALONE when unset). Egress
+    // QwpQueryClient tests enable this; ingress sender tests leave it off so their
+    // connections carry only ACK frames.
+    private volatile boolean sendServerInfo;
     // When non-null the next handshake responds with HTTP 421 Misdirected
     // Request + X-QuestDB-Role: <rejectingRole>, mimicking a server whose
     // QwpServerInfoProvider reports REPLICA / PRIMARY_CATCHUP. Set after
@@ -171,6 +177,54 @@ public class TestWebSocketServer implements Closeable {
     public void setRejectWithStatus(int statusCode, String reasonPhrase) {
         this.rejectingStatusCode = statusCode;
         this.rejectingStatusReason = reasonPhrase;
+    }
+
+    /**
+     * When enabled, the server sends a {@code SERVER_INFO} frame immediately
+     * after a successful 101 upgrade, the way a real egress endpoint does. The
+     * advertised role follows {@link #setAdvertisedRole}, defaulting to
+     * {@code STANDALONE}. Leave disabled for ingress (Sender) tests.
+     */
+    public void setSendServerInfo(boolean sendServerInfo) {
+        this.sendServerInfo = sendServerInfo;
+    }
+
+    private static byte[] buildServerInfoFrame(byte role) {
+        byte[] clusterId = "questdb".getBytes(StandardCharsets.UTF_8);
+        byte[] nodeId = "test-node".getBytes(StandardCharsets.UTF_8);
+        int bodyLen = 1 + 1 + 8 + 4 + 8 + 2 + clusterId.length + 2 + nodeId.length;
+        ByteBuffer bb = ByteBuffer.allocate(12 + bodyLen).order(ByteOrder.LITTLE_ENDIAN);
+        bb.put((byte) 'Q').put((byte) 'W').put((byte) 'P').put((byte) '1');
+        bb.put((byte) 1);       // version
+        bb.put((byte) 0);       // flags
+        bb.putShort((short) 0); // table_count (unused for control frames)
+        bb.putInt(bodyLen);     // payload_length
+        bb.put((byte) 0x18);    // SERVER_INFO msg_kind
+        bb.put(role);
+        bb.putLong(0L);         // epoch
+        bb.putInt(0);           // capabilities (no CAP_ZONE -> no zone_id trailer)
+        bb.putLong(1L);         // server_wall_ns (positive)
+        bb.putShort((short) clusterId.length);
+        bb.put(clusterId);
+        bb.putShort((short) nodeId.length);
+        bb.put(nodeId);
+        return bb.array();
+    }
+
+    private static byte roleByte(String role) {
+        if (role == null) {
+            return 0; // ROLE_STANDALONE
+        }
+        switch (role) {
+            case "PRIMARY":
+                return 1;
+            case "REPLICA":
+                return 2;
+            case "PRIMARY_CATCHUP":
+                return 3;
+            default:
+                return 0; // STANDALONE
+        }
     }
 
     public void start() throws IOException {
@@ -474,6 +528,10 @@ public class TestWebSocketServer implements Closeable {
                     if (!performHandshake()) {
                         LOG.error("Handshake failed");
                         return;
+                    }
+
+                    if (sendServerInfo) {
+                        sendBinary(buildServerInfoFrame(roleByte(advertisedRole)));
                     }
 
                     byte[] readBuf = new byte[8192];

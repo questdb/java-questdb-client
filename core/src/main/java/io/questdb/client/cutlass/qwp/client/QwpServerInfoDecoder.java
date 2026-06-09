@@ -83,10 +83,10 @@ public final class QwpServerInfoDecoder {
             throw new QwpDecodeException("SERVER_INFO truncated before node_id length");
         }
         String nodeId = readUtf8U16(p, payloadEnd, "node_id");
-        // Trailing zone_id is gated by the CAP_ZONE bit so a v2.0 client
-        // reading a v2.0 server (capabilities=0) never reaches this branch and
-        // sees the unchanged byte layout. When the bit is set the trailer is
-        // mandatory; a missing or truncated zone_id is a wire error.
+        // Trailing zone_id is gated by the CAP_ZONE bit so a client reading a
+        // server with no zone configured (capabilities=0) never reaches this
+        // branch and sees the zone-less byte layout. When the bit is set the
+        // trailer is mandatory; a missing or truncated zone_id is a wire error.
         String zoneId = null;
         if ((capabilities & QwpEgressMsgKind.CAP_ZONE) != 0) {
             int nodeLen = Unsafe.getUnsafe().getShort(p) & 0xFFFF;
