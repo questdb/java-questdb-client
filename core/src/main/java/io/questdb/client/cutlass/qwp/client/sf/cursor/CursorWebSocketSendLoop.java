@@ -178,10 +178,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // async dispatcher path does NOT set this flag: a user who only watches
     // the async error inbox still gets a loud failure on shutdown.
     private volatile boolean errorSurfacedSynchronously;
-    // fsnAtZero: FSN that wireSeq=0 maps to on the current connection. For
-    // a fresh connection, this is 0. After a reconnect, it's set to
-    // engine.ackedFsn() + 1 — the first frame we replay maps to wireSeq=0
-    // on the new connection so server-side ACK math stays aligned.
+    // The send cursor has two coordinate systems:
+    //
+    //   FSN: durable frame sequence number in the local cursor engine. This is
+    //        stable across reconnects and is what ACKs trim from disk.
+    //   wireSeq: per-WebSocket-connection sequence number. The server resets
+    //        this to 0 for every new connection, so the client must translate
+    //        every ACK/NACK back to an FSN before touching the engine watermark.
+    //
+    // fsnAtZero is that translation anchor: FSN that wireSeq=0 maps to on the
+    // current connection. For a fresh connection, this is 0. After a reconnect,
+    // it is engine.ackedFsn() + 1, so the first replayed frame on the new
+    // connection is wireSeq=0 and server-side cumulative ACKs still line up.
     private long fsnAtZero;
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
@@ -1078,18 +1086,47 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Walk the engine's segments to find the one containing {@code targetFsn},
      * and set {@code sendOffset} to the byte offset of that frame within it.
-     * If {@code targetFsn} is past everything published, park at the live
-     * active segment's published offset (caller will wait for new bytes).
+     * This is called at startup and after every reconnect, after fsnAtZero has
+     * already been reset to {@code targetFsn} and nextWireSeq to 0.
+     * <p>
+     * If {@code targetFsn} is already published, the method positions the byte
+     * cursor exactly at that frame. If {@code targetFsn} is not published yet,
+     * the method positions at the active segment's current tip; the normal send
+     * loop will then wait until the producer publishes more bytes.
      */
     private void positionCursorAt(long targetFsn) {
         MmapSegment seg = engine.findSegmentContaining(targetFsn);
         if (seg == null) {
-            // targetFsn is at or past publishedFsn — nothing to replay.
-            // Resume from the active segment's tip; producer may add more.
+            // No segment currently advertises targetFsn. That normally means
+            // targetFsn is just past publishedFsn and there is nothing to
+            // replay yet, so the cursor should resume from the active tip.
+            //
+            // The producer is concurrent with this I/O thread, though. It can
+            // publish targetFsn after the first findSegmentContaining() returns
+            // null but before or during the active-tip snapshot below.
             sendingSegment = engine.activeSegment();
             sendOffset = sendingSegment.publishedOffset();
+            // The publishedOffset read is the producer's volatile publish
+            // barrier. If it saw the new frame bytes, the frameCount write that
+            // makes targetFsn discoverable is also visible, so a second lookup
+            // must now find it. If the producer publishes later, sendOffset is
+            // still at the old tip and trySendOne() will send the frame normally.
+            seg = engine.findSegmentContaining(targetFsn);
+            if (seg != null) {
+                positionCursorInSegment(seg, targetFsn);
+            }
             return;
         }
+        positionCursorInSegment(seg, targetFsn);
+    }
+
+    /**
+     * Position the byte cursor inside a known segment by scanning frame lengths
+     * from that segment's first frame. MmapSegment frame boundaries are not
+     * indexed, so landing on FSN N means walking payload lengths from baseSeq
+     * until the desired FSN is reached.
+     */
+    private void positionCursorInSegment(MmapSegment seg, long targetFsn) {
         sendingSegment = seg;
         // Walk frame-by-frame from HEADER_SIZE until we land on targetFsn.
         long offset = MmapSegment.HEADER_SIZE;
