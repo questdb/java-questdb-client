@@ -165,18 +165,26 @@ public final class SegmentManager implements QuietCloseable {
     @Override
     public synchronized void close() {
         running = false;
-        if (workerThread != null) {
-            LockSupport.unpark(workerThread);
+        Thread t = workerThread;
+        if (t != null) {
+            LockSupport.unpark(t);
             try {
-                workerThread.join(5_000);
+                t.join(5_000);
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
+            if (t.isAlive()) {
+                LOG.warn("SegmentManager worker did not stop before close wait completed; "
+                        + "leaving worker-owned resources allocated");
+                return;
+            }
             workerThread = null;
         }
-        // Free the rotation-path native scratch buffer. Safe to do here
-        // (after the worker has joined) since the buffer is only touched
-        // on the worker thread.
+        // Free the rotation-path native scratch buffer only after worker
+        // termination has been observed. The worker is the only thread that
+        // touches the buffer, but close() uses a bounded join; if the worker is
+        // still alive, leaking this one scratch allocation is safer than freeing
+        // native memory it may still read or write.
         pathScratch.close();
     }
 
