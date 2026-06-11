@@ -346,7 +346,7 @@ public class QwpWebSocketSenderTest {
                 CursorSendEngine engine = new CursorSendEngine(null, 33, 33, 1L);
                 try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
                         "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
-                        QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION, false, engine, 0L)) {
+                        false, engine, 0L)) {
                     sender.table("t").longColumn("v", 1L).atNow();
 
                     try {

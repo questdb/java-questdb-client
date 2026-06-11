@@ -274,7 +274,7 @@ public final class QwpHostHealthTracker {
     /**
      * Records a server-advertised zone for the given host index per
      * failover.md §2.1. Called once with {@code SERVER_INFO.zone_id} after a
-     * successful upgrade on a v2 connection (gated by {@code CAP_ZONE}), and
+     * successful upgrade (gated by {@code CAP_ZONE}), and
      * once with the {@code X-QuestDB-Zone} HTTP header on a {@code 421}
      * upgrade reject.
      * <p>

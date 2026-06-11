@@ -36,17 +36,19 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Pins down the "every frame on disk is self-sufficient" rule.
+ * Pins down the "every frame on disk is self-sufficient" rule for the symbol
+ * dictionary.
  * <p>
- * The cursor SF path used to elide schema definitions and previously-sent
- * symbols on subsequent batches over the same connection — emitting refs
- * + delta-dicts. That's wrong for SF: the bytes survive process restarts
- * and are replayed against fresh server connections (post-reconnect, or
- * via a background drainer adopting an orphan slot). A frame with a
- * schema-ref to an ID the new server has never seen is unrecoverable.
+ * The cursor SF path used to elide previously-sent symbols on subsequent
+ * batches over the same connection, emitting a delta-dict that carried only
+ * the new entries. That's wrong for SF: the bytes survive process restarts and
+ * replay against fresh server connections (post-reconnect, or via a background
+ * drainer adopting an orphan slot). A delta that references symbol ids the new
+ * server has never seen is unrecoverable.
  * <p>
- * Today every frame must carry its full schema and a complete symbol-dict
- * delta starting at id 0. This test asserts both invariants on the wire.
+ * Today every frame must carry a complete symbol-dict delta starting at id 0
+ * (column schemas travel inline on the first batch too). This test asserts the
+ * symbol-dict invariant on the wire.
  */
 public class SelfSufficientFramesTest {
 

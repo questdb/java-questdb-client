@@ -558,31 +558,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testMaxSchemasPerConnection() {
-        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
-                .address(LOCALHOST)
-                .maxSchemasPerConnection(123);
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testMaxSchemasPerConnectionDoubleSet_fails() {
-        assertThrows("already configured",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .maxSchemasPerConnection(123)
-                        .maxSchemasPerConnection(456));
-    }
-
-    @Test
-    public void testMaxSchemasPerConnectionZero_fails() {
-        assertThrows("must be positive",
-                () -> Sender.builder(Sender.Transport.WEBSOCKET)
-                        .address(LOCALHOST)
-                        .maxSchemasPerConnection(0));
-    }
-
-    @Test
     public void testMinRequestThroughput_notSupportedForWebSocket() {
         assertThrowsAny(
                 Sender.builder(Sender.Transport.WEBSOCKET)
@@ -847,9 +822,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWsConfigString_withMaxSchemasPerConnection() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;max_schemas_per_connection=1024;");
-        Assert.assertNotNull(builder);
+    public void testWsConfigString_withMaxSchemasPerConnection_fails() {
+        // max_schemas_per_connection was removed with the QWP schema-reference
+        // mechanism. The connection string used to accept it; it must now be
+        // rejected as an unknown key rather than silently swallowed.
+        assertBadConfig("ws::addr=localhost:9000;max_schemas_per_connection=1024;",
+                "unknown configuration key [key=max_schemas_per_connection]");
     }
 
     @Test

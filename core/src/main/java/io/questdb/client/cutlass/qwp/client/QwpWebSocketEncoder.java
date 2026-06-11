@@ -41,7 +41,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     private NativeBufferWriter buffer;
     private byte flags;
     private int payloadStart;
-    private byte version = VERSION_1;
+    private byte version = VERSION;
 
     public QwpWebSocketEncoder() {
         this.buffer = new NativeBufferWriter();
@@ -53,8 +53,8 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         this.flags = 0;
     }
 
-    public void addTable(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
-        columnWriter.encodeTable(tableBuffer, useSchemaRef, true, isGorillaEnabled());
+    public void addTable(QwpTableBuffer tableBuffer) {
+        columnWriter.encodeTable(tableBuffer, true, isGorillaEnabled());
     }
 
     public void beginMessage(
@@ -89,12 +89,12 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         }
     }
 
-    public int encode(QwpTableBuffer tableBuffer, boolean useSchemaRef) {
+    public int encode(QwpTableBuffer tableBuffer) {
         buffer.reset();
         writeHeader(1, 0);
         int payloadStart = buffer.getPosition();
         columnWriter.setBuffer(buffer);
-        columnWriter.encodeTable(tableBuffer, useSchemaRef, false, isGorillaEnabled());
+        columnWriter.encodeTable(tableBuffer, false, isGorillaEnabled());
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
         return buffer.getPosition();
@@ -104,11 +104,10 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             QwpTableBuffer tableBuffer,
             GlobalSymbolDictionary globalDict,
             int confirmedMaxId,
-            int batchMaxId,
-            boolean useSchemaRef
+            int batchMaxId
     ) {
         beginMessage(1, globalDict, confirmedMaxId, batchMaxId);
-        addTable(tableBuffer, useSchemaRef);
+        addTable(tableBuffer);
         return finishMessage();
     }
 

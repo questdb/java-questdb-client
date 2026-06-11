@@ -28,7 +28,7 @@ import io.questdb.client.std.Misc;
 import io.questdb.client.std.str.StringSink;
 
 /**
- * Server negotiated a QWP version outside {@code [VERSION_1, MAX_SUPPORTED_VERSION]}.
+ * Server negotiated a QWP version other than {@code QwpConstants.VERSION}.
  * Terminal: version negotiation is cluster-wide, so failover masks the disagreement.
  */
 public class QwpProtocolVersionException extends QwpDecodeException {

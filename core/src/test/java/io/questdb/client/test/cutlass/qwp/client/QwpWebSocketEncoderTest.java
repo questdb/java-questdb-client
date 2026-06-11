@@ -54,7 +54,7 @@ public class QwpWebSocketEncoderTest {
                     col.addLong(i);
                     buffer.nextRow();
                 }
-                int size1 = encoder.encode(buffer, false);
+                int size1 = encoder.encode(buffer);
 
                 // Reset and second batch
                 buffer.reset();
@@ -63,7 +63,7 @@ public class QwpWebSocketEncoderTest {
                     col.addLong(i * 2);
                     buffer.nextRow();
                 }
-                int size2 = encoder.encode(buffer, false);
+                int size2 = encoder.encode(buffer);
 
                 Assert.assertTrue(size1 > size2); // More rows = larger
                 Assert.assertEquals(50, buffer.getRowCount());
@@ -81,7 +81,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDoubleArray(new double[][]{{1.0, 2.0}, {3.0, 4.0}});
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -97,7 +97,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLongArray(new long[][]{{1L, 2L}, {3L, 4L}});
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -116,7 +116,7 @@ public class QwpWebSocketEncoderTest {
                 });
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -141,7 +141,7 @@ public class QwpWebSocketEncoderTest {
 
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(1, buffer.getRowCount());
             }
@@ -160,7 +160,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(100, buffer.getRowCount());
             }
@@ -177,7 +177,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDecimal128(io.questdb.client.std.Decimal128.fromLong(123456789012345L, 4));
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -193,7 +193,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDecimal256(io.questdb.client.std.Decimal256.fromLong(Long.MAX_VALUE, 6));
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -209,7 +209,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDecimal64(io.questdb.client.std.Decimal64.fromLong(12345L, 2)); // 123.45
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -225,7 +225,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDoubleArray(new double[]{1.0, 2.0, 3.0});
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -241,7 +241,7 @@ public class QwpWebSocketEncoderTest {
                 col.addString("");
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -257,7 +257,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(1L);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 0);
             }
         });
@@ -279,7 +279,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDoubleArray(largeArray);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 8000); // At least 8 bytes per double
             }
         });
@@ -297,7 +297,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(10_000, buffer.getRowCount());
             }
@@ -314,7 +314,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLongArray(new long[]{1L, 2L, 3L});
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -332,7 +332,7 @@ public class QwpWebSocketEncoderTest {
                 col.addString(sb);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 10_000);
             }
         });
@@ -351,7 +351,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(Long.MIN_VALUE);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(2, buffer.getRowCount());
             }
@@ -385,7 +385,7 @@ public class QwpWebSocketEncoderTest {
 
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -413,7 +413,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(50, buffer.getRowCount());
             }
@@ -438,7 +438,7 @@ public class QwpWebSocketEncoderTest {
 
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
 
                 // Verify header
@@ -468,7 +468,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDecimal64(io.questdb.client.std.Decimal64.fromLong(11111L, 2)); // 111.11
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(3, buffer.getRowCount());
             }
@@ -491,7 +491,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(100, buffer.getRowCount());
             }
@@ -517,7 +517,7 @@ public class QwpWebSocketEncoderTest {
                 col.addSymbol("server1"); // Back to first
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(4, buffer.getRowCount());
             }
@@ -536,7 +536,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(10, buffer.getRowCount());
             }
@@ -553,7 +553,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDouble(Double.NaN);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -569,7 +569,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(-123456789L);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -586,7 +586,7 @@ public class QwpWebSocketEncoderTest {
                 col.addString(null);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -603,7 +603,7 @@ public class QwpWebSocketEncoderTest {
                 col.addString("hello");
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -625,7 +625,7 @@ public class QwpWebSocketEncoderTest {
                 col.addSymbol("server2");
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(3, buffer.getRowCount());
             }
@@ -642,7 +642,7 @@ public class QwpWebSocketEncoderTest {
                 col.addBoolean(true);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -658,7 +658,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDouble(23.5);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -675,7 +675,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(12345L);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12); // At least header size
 
                 QwpBufferWriter buf = encoder.getBuffer();
@@ -688,7 +688,7 @@ public class QwpWebSocketEncoderTest {
                 Assert.assertEquals((byte) '1', Unsafe.getUnsafe().getByte(ptr + 3));
 
                 // Version
-                Assert.assertEquals(VERSION_1, Unsafe.getUnsafe().getByte(ptr + 4));
+                Assert.assertEquals(VERSION, Unsafe.getUnsafe().getByte(ptr + 4));
 
                 // Table count (little-endian short)
                 Assert.assertEquals((short) 1, Unsafe.getUnsafe().getShort(ptr + 6));
@@ -706,7 +706,7 @@ public class QwpWebSocketEncoderTest {
                 col.addString("hello");
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -723,7 +723,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(1000000L); // Micros
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -739,7 +739,7 @@ public class QwpWebSocketEncoderTest {
                 col.addSymbol("server1");
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -764,7 +764,7 @@ public class QwpWebSocketEncoderTest {
                 col.addDouble(Double.NEGATIVE_INFINITY);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(4, buffer.getRowCount());
             }
@@ -783,7 +783,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
                 Assert.assertEquals(100, buffer.getRowCount());
             }
@@ -800,7 +800,7 @@ public class QwpWebSocketEncoderTest {
                 col.addString("Hello 世界 🌍");
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -816,7 +816,7 @@ public class QwpWebSocketEncoderTest {
                 col.addUuid(0x123456789ABCDEF0L, 0xFEDCBA9876543210L);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -844,7 +844,7 @@ public class QwpWebSocketEncoderTest {
                 int confirmedMaxId = -1;
                 int batchMaxId = 1;
 
-                int size = encoder.encodeWithDeltaDict(buffer, globalDict, confirmedMaxId, batchMaxId, false);
+                int size = encoder.encodeWithDeltaDict(buffer, globalDict, confirmedMaxId, batchMaxId);
                 Assert.assertTrue(size > 12);
 
                 QwpBufferWriter buf = encoder.getBuffer();
@@ -879,7 +879,7 @@ public class QwpWebSocketEncoderTest {
                 int confirmedMaxId = 1;
                 int batchMaxId = 1;
 
-                int size = encoder.encodeWithDeltaDict(buffer, globalDict, confirmedMaxId, batchMaxId, false);
+                int size = encoder.encodeWithDeltaDict(buffer, globalDict, confirmedMaxId, batchMaxId);
                 Assert.assertTrue(size > 12);
 
                 QwpBufferWriter buf = encoder.getBuffer();
@@ -919,11 +919,10 @@ public class QwpWebSocketEncoderTest {
                 buffer.nextRow();
                 col.addSymbolWithGlobalId("SYM_7", 7);
                 buffer.nextRow();
-                buffer.setSchemaId(0);
 
                 Assert.assertEquals(0, col.getAuxDataAddress());
 
-                int size = encoder.encodeWithDeltaDict(buffer, globalDict, 7, 7, false);
+                int size = encoder.encodeWithDeltaDict(buffer, globalDict, 7, 7);
                 Assert.assertTrue(size > 12);
 
                 Cursor cursor = new Cursor(encoder.getBuffer().getBufferPtr() + HEADER_SIZE);
@@ -933,8 +932,6 @@ public class QwpWebSocketEncoderTest {
                 Assert.assertEquals("test_table", cursor.readString());
                 Assert.assertEquals(2, cursor.readVarint());
                 Assert.assertEquals(1, cursor.readVarint());
-                Assert.assertEquals(SCHEMA_MODE_FULL, cursor.readByte());
-                Assert.assertEquals(0, cursor.readVarint()); // schemaId
                 Assert.assertEquals("ticker", cursor.readString());
                 Assert.assertEquals(TYPE_SYMBOL, cursor.readByte());
                 Assert.assertEquals(0, cursor.readByte()); // no nulls
@@ -969,7 +966,7 @@ public class QwpWebSocketEncoderTest {
                 int confirmedMaxId = 1;
                 int batchMaxId = 3;
 
-                int size = encoder.encodeWithDeltaDict(buffer, globalDict, confirmedMaxId, batchMaxId, false);
+                int size = encoder.encodeWithDeltaDict(buffer, globalDict, confirmedMaxId, batchMaxId);
                 Assert.assertTrue(size > 12);
 
                 QwpBufferWriter buf = encoder.getBuffer();
@@ -990,23 +987,6 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
-    public void testEncodeWithSchemaRef() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
-                 QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
-
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
-                col.addLong(42L);
-                buffer.nextRow();
-                buffer.setSchemaId(0);
-
-                int size = encoder.encode(buffer, true); // Use schema reference
-                Assert.assertTrue(size > 12);
-            }
-        });
-    }
-
-    @Test
     public void testEncodeZeroLong() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -1016,7 +996,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(0L);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -1032,13 +1012,13 @@ public class QwpWebSocketEncoderTest {
                 QwpTableBuffer.ColumnBuffer col1 = buffer1.getOrCreateColumn("x", TYPE_LONG, false);
                 col1.addLong(1L);
                 buffer1.nextRow();
-                int size1 = encoder.encode(buffer1, false);
+                int size1 = encoder.encode(buffer1);
 
                 // Encode second message (encoder should reset internally)
                 QwpTableBuffer.ColumnBuffer col2 = buffer2.getOrCreateColumn("y", TYPE_DOUBLE, false);
                 col2.addDouble(2.0);
                 buffer2.nextRow();
-                int size2 = encoder.encode(buffer2, false);
+                int size2 = encoder.encode(buffer2);
 
                 // Both should succeed
                 Assert.assertTrue(size1 > 12);
@@ -1085,7 +1065,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int sizeWithGorilla = encoder.encode(buffer, false);
+                int sizeWithGorilla = encoder.encode(buffer);
 
                 // Calculate theoretical minimum size for Gorilla:
                 // - Header: 12 bytes
@@ -1103,7 +1083,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int sizeWithoutGorilla = encoder.encode(buffer, false);
+                int sizeWithoutGorilla = encoder.encode(buffer);
 
                 // For constant delta, Gorilla should achieve significant compression
                 double compressionRatio = (double) sizeWithGorilla / sizeWithoutGorilla;
@@ -1131,7 +1111,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int sizeWithGorilla = encoder.encode(buffer, false);
+                int sizeWithGorilla = encoder.encode(buffer);
 
                 // Compare with uncompressed
                 encoder.setGorillaEnabled(false);
@@ -1146,7 +1126,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int sizeWithoutGorilla = encoder.encode(buffer, false);
+                int sizeWithoutGorilla = encoder.encode(buffer);
 
                 Assert.assertTrue("Gorilla should compress multiple timestamp columns",
                         sizeWithGorilla < sizeWithoutGorilla);
@@ -1168,7 +1148,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int sizeWithGorilla = encoder.encode(buffer, false);
+                int sizeWithGorilla = encoder.encode(buffer);
 
                 // Now encode without Gorilla
                 encoder.setGorillaEnabled(false);
@@ -1179,7 +1159,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int sizeWithoutGorilla = encoder.encode(buffer, false);
+                int sizeWithoutGorilla = encoder.encode(buffer);
 
                 // Gorilla should produce smaller output for constant-delta timestamps
                 Assert.assertTrue("Gorilla encoding should be smaller",
@@ -1202,7 +1182,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
 
                 // Verify header has Gorilla flag
@@ -1225,7 +1205,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(1000000L);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
             }
         });
@@ -1245,7 +1225,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(2000000L);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
 
                 // Verify header has Gorilla flag set
@@ -1279,7 +1259,7 @@ public class QwpWebSocketEncoderTest {
                     buffer.nextRow();
                 }
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 12);
 
                 // Verify header has Gorilla flag
@@ -1302,7 +1282,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(1000000L);
                 buffer.nextRow();
 
-                encoder.encode(buffer, false);
+                encoder.encode(buffer);
 
                 // Check flags byte doesn't have Gorilla bit set
                 QwpBufferWriter buf = encoder.getBuffer();
@@ -1324,7 +1304,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(1000000L);
                 buffer.nextRow();
 
-                encoder.encode(buffer, false);
+                encoder.encode(buffer);
 
                 // Check flags byte has Gorilla bit set
                 QwpBufferWriter buf = encoder.getBuffer();
@@ -1343,7 +1323,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(42L);
                 buffer.nextRow();
 
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
 
                 // Payload length is at offset 8 (4 magic + 1 version + 1 flags + 2 tablecount)
                 QwpBufferWriter buf = encoder.getBuffer();
@@ -1365,7 +1345,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(1L);
                 buffer.nextRow();
 
-                int size1 = encoder.encode(buffer, false);
+                int size1 = encoder.encode(buffer);
 
                 // Reset and encode again
                 buffer.reset();
@@ -1373,7 +1353,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(2L);
                 buffer.nextRow();
 
-                int size2 = encoder.encode(buffer, false);
+                int size2 = encoder.encode(buffer);
 
                 // Sizes should be similar (same schema)
                 Assert.assertEquals(size1, size2);
@@ -1392,7 +1372,7 @@ public class QwpWebSocketEncoderTest {
                 buffer.nextRow();
 
                 // Default version
-                int size = encoder.encode(buffer, false);
+                int size = encoder.encode(buffer);
                 Assert.assertTrue(size > 0);
                 long ptr = encoder.getBuffer().getBufferPtr();
                 Assert.assertEquals(1, Unsafe.getUnsafe().getByte(ptr + 4));
@@ -1403,7 +1383,7 @@ public class QwpWebSocketEncoderTest {
                 col.addLong(42);
                 buffer.nextRow();
                 encoder.setVersion((byte) 3);
-                encoder.encode(buffer, false);
+                encoder.encode(buffer);
                 Assert.assertEquals(3, Unsafe.getUnsafe().getByte(ptr + 4));
             }
         });
