@@ -507,12 +507,30 @@ jobs:
             fi
           done
 
+      - name: Validate release GitHub App private key
+        env:
+          RAW_PRIVATE_KEY: ${{ secrets.MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          private_key="${RAW_PRIVATE_KEY//$'\r'/}"
+          private_key="${private_key//\\n/$'\n'}"
+
+          if [[ "${private_key}" != *"-----BEGIN PRIVATE KEY-----"* && "${private_key}" != *"-----BEGIN RSA PRIVATE KEY-----"* ]]; then
+            echo "::error::MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY must be the GitHub App private key PEM, including BEGIN/END lines. Do not use the app client secret or webhook secret."
+            exit 1
+          fi
+          if ! printf '%s\n' "${private_key}" | openssl pkey -noout >/dev/null 2>&1; then
+            echo "::error::MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY is present but is not a parseable PEM private key."
+            exit 1
+          fi
+
       - name: Create release GitHub App token
         id: release-app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.MAVEN_RELEASE_GITHUB_APP_CLIENT_ID }}
           private-key: ${{ secrets.MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
           permission-contents: write
 
       - name: Check out release source

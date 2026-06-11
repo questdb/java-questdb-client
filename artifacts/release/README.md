@@ -22,10 +22,16 @@ actor** on the ruleset (Organization settings -> Rules -> `restrict-tag-pushing`
 Store the app credentials for the workflow:
 
 - repository variable `MAVEN_RELEASE_GITHUB_APP_CLIENT_ID`: the app's client ID
-- `maven-release` environment secret `MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY`: a private key for the app
+- `maven-release` environment secret `MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY`: a GitHub App private key for the app,
+  generated from the app's settings page
 
 The branch ruleset on `main` is intentionally **not** bypassed. The next-development snapshot bump lands as an ordinary
 pull request, so `main` keeps its "PR-only, squash, one approval" protection.
+
+`MAVEN_RELEASE_GITHUB_APP_PRIVATE_KEY` must be the PEM private key downloaded from the GitHub App's **Private keys**
+section, including the `BEGIN`/`END` lines. Do not use the app client secret or webhook secret. The workflow accepts the
+key pasted as a raw multi-line PEM or as a PEM with literal `\n` line separators; it validates the key before calling
+`actions/create-github-app-token` so setup failures point at the secret instead of surfacing as `Invalid keyData`.
 
 The AWS secret referenced by `MAVEN_RELEASE_AWS_SECRET_ARN` must expose these JSON keys (they become environment
 variables of the same name): `MAVEN_GPG_PRIVATE_KEY`, `MAVEN_CENTRAL_USERNAME`, `MAVEN_CENTRAL_PASSWORD`, and
