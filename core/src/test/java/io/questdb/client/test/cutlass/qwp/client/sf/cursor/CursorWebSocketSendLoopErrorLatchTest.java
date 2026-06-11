@@ -37,7 +37,7 @@ import java.lang.reflect.Method;
 
 /**
  * Pinpointed tests for the latched-error contract on {@link CursorWebSocketSendLoop}:
- * {@code recordFatal} → {@link CursorWebSocketSendLoop#getLastError} +
+ * {@code recordFatal} → {@link CursorWebSocketSendLoop#getTerminalError} +
  * {@link CursorWebSocketSendLoop#getLastTerminalServerError} +
  * {@link CursorWebSocketSendLoop#checkError}. Bypasses the constructor entirely
  * via {@code Unsafe.allocateInstance} to avoid the live wire/engine dependencies
@@ -53,7 +53,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
         CursorWebSocketSendLoop loop = newBareLoop();
         SenderError err = newSenderError();
         LineSenderServerException original = new LineSenderServerException(err);
-        setField(loop, "lastError", original);
+        setField(loop, "terminalError", original);
         Assert.assertNull(loop.getSynchronouslySurfacedError());
 
         try {
@@ -94,7 +94,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
             first = thrown;
         }
         Assert.assertSame("the latch must hold the wrapper, not the raw cause",
-                first, loop.getLastError());
+                first, loop.getTerminalError());
         Assert.assertSame("ownership tracks the latched wrapper",
                 first, loop.getSynchronouslySurfacedError());
         loop.checkUnsurfacedError(); // owned -> silent
@@ -111,7 +111,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
     @Test
     public void testCheckErrorIsNoopWhenNoLatch() throws Exception {
         CursorWebSocketSendLoop loop = newBareLoop();
-        Assert.assertNull(loop.getLastError());
+        Assert.assertNull(loop.getTerminalError());
         loop.checkError(); // must not throw
     }
 
@@ -124,7 +124,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
         loop.checkUnsurfacedError(); // no latch -> silent
 
         LineSenderException e = new LineSenderException("wire fail");
-        setField(loop, "lastError", e);
+        setField(loop, "terminalError", e);
         try {
             loop.checkUnsurfacedError();
             Assert.fail("an unowned latch must rethrow from the safety net");
@@ -143,18 +143,18 @@ public class CursorWebSocketSendLoopErrorLatchTest {
     }
 
     @Test
-    public void testGetLastErrorReturnsLatchedThrowable() throws Exception {
+    public void testGetTerminalErrorReturnsLatchedThrowable() throws Exception {
         CursorWebSocketSendLoop loop = newBareLoop();
         Throwable e = new LineSenderException("boom");
-        setField(loop, "lastError", e);
-        Assert.assertSame(e, loop.getLastError());
+        setField(loop, "terminalError", e);
+        Assert.assertSame(e, loop.getTerminalError());
     }
 
     @Test
-    public void testGetLastErrorIsNullBeforeAnyFailure() throws Exception {
+    public void testGetTerminalErrorIsNullBeforeAnyFailure() throws Exception {
         CursorWebSocketSendLoop loop = newBareLoop();
         Assert.assertNull("loops with no latched error must report null",
-                loop.getLastError());
+                loop.getTerminalError());
     }
 
     @Test
@@ -166,7 +166,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
 
         invokeRecordFatal(loop, e);
 
-        Assert.assertSame(e, loop.getLastError());
+        Assert.assertSame(e, loop.getTerminalError());
         Assert.assertNull("typed payload must be null for a wire-level fatal",
                 loop.getLastTerminalServerError());
         Assert.assertFalse("recordFatal must stop the loop",
@@ -182,7 +182,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
 
         invokeRecordFatal(loop, ex);
 
-        Assert.assertSame(ex, loop.getLastError());
+        Assert.assertSame(ex, loop.getTerminalError());
         Assert.assertSame("typed payload is derived from the latched LineSenderServerException",
                 err, loop.getLastTerminalServerError());
         Assert.assertFalse((Boolean) getField(loop, "running"));
@@ -204,7 +204,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
         // overwrite, otherwise a follow-on cascade would mask the original
         // root cause.
         Assert.assertSame("first throwable must remain latched",
-                first, loop.getLastError());
+                first, loop.getTerminalError());
         Assert.assertSame("first SenderError must remain latched",
                 firstErr, loop.getLastTerminalServerError());
     }

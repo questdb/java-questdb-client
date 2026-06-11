@@ -71,7 +71,7 @@ import java.util.concurrent.locks.LockSupport;
  * into the engine; this thread reads. {@code engine.publishedFsn()} is
  * the volatile publish barrier.
  * <p>
- * Errors are reported via {@link #getLastError()}; the I/O thread sets it
+ * Errors are reported via {@link #getTerminalError()}; the I/O thread sets it
  * and exits. Producers polling {@link #checkError()} surface the failure.
  */
 public final class CursorWebSocketSendLoop implements QuietCloseable {
@@ -200,10 +200,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private volatile boolean hasEverConnected;
     private volatile Thread ioThread;
     // The latched terminal failure — THE exception every checkError() call
-    // rethrows. Non-LineSenderException causes are wrapped once at latch time
-    // (recordFatal), so rethrows always deliver the same instance and close()
-    // can suppress double-signals by identity.
-    private volatile LineSenderException lastError;
+    // rethrows. Write-once for the loop's lifetime: the only writer is
+    // recordFatal on the I/O thread (first-writer-wins). The whole
+    // close()-ownership protocol rests on that — the identity comparisons
+    // in hasUnsurfacedError() and in close()'s suppression are only
+    // meaningful because the latched instance never changes.
+    // Non-LineSenderException causes are wrapped once at latch time, so
+    // rethrows always deliver the same instance.
+    private volatile LineSenderException terminalError;
     // Wall clock of the last outbound activity on the wire -- a sent frame
     // (trySendOne) or a keepalive PING (sendDurableAckKeepaliveIfDue).
     // Throttles the durable-ack keepalive PING so it fires only when the
@@ -228,7 +232,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // at engine.activeSegment(); advances to newer sealed segments / the new
     // active as the producer rotates.
     private MmapSegment sendingSegment;
-    // Exact lastError instance that checkError() has thrown to a synchronous
+    // Exact terminalError instance that checkError() has thrown to a synchronous
     // user-thread caller (flush/append/close). close() uses the instance so it
     // only suppresses errors the user already owned before close() began.
     private volatile LineSenderException synchronouslySurfacedError;
@@ -476,7 +480,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * an error is set the loop has already exited.
      */
     public void checkError() {
-        LineSenderException e = lastError;
+        LineSenderException e = terminalError;
         if (e != null) {
             synchronouslySurfacedError = e;
             throw e;
@@ -544,10 +548,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
     }
 
-    public Throwable getLastError() {
-        return lastError;
-    }
-
     /**
      * Typed server-rejection payload of the latched terminal error, or
      * {@code null} when the loop latched a wire-level failure (or nothing).
@@ -555,7 +555,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * as a {@link LineSenderServerException} carrying its {@link SenderError}.
      */
     public SenderError getLastTerminalServerError() {
-        LineSenderException e = lastError;
+        LineSenderException e = terminalError;
         return e instanceof LineSenderServerException
                 ? ((LineSenderServerException) e).getServerError() : null;
     }
@@ -568,13 +568,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * This is the single read {@code QwpWebSocketSender.close()} uses to learn
      * which terminal error the user already owns. The ownership decision must
      * be taken from this one field only: deriving it from two separate latch
-     * reads (e.g. an unsurfaced-check followed by {@link #getLastError()})
+     * reads (e.g. an unsurfaced-check followed by {@link #getTerminalError()})
      * races the I/O thread — a terminal latched between the reads gets
      * mis-captured as already-owned and is then silently dropped on close().
      * Guarded by {@code CloseOwnershipRaceTest}.
      */
     public Throwable getSynchronouslySurfacedError() {
         return synchronouslySurfacedError;
+    }
+
+    /**
+     * The latched terminal failure, or {@code null} while the loop is
+     * healthy. Read-only — does not mark the error as surfaced.
+     */
+    public Throwable getTerminalError() {
+        return terminalError;
     }
 
     public long getTotalAcks() {
@@ -1072,14 +1080,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * True when {@link #lastError} is set AND no synchronous user-thread
+     * True when {@link #terminalError} is set AND no synchronous user-thread
      * caller has yet seen that same instance via {@link #checkError()}.
      * The {@link #checkUnsurfacedError()} safety net composes this with
-     * checkError(); reads {@code lastError} once so the comparison cannot
+     * checkError(); reads {@code terminalError} once so the comparison cannot
      * tear against a concurrent latch.
      */
     private boolean hasUnsurfacedError() {
-        Throwable e = lastError;
+        Throwable e = terminalError;
         return e != null && synchronouslySurfacedError != e;
     }
 
@@ -1186,13 +1194,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Mark the loop as fatally failed. Caller has decided no reconnect
      * is possible (or it ran out of budget) — latch the error so
      * {@link #checkError} can surface it to the producer thread, then
-     * stop the loop. Idempotent — only the first failure latches.
+     * stop the loop. First-writer-wins: only the first failure latches.
+     * The check-then-latch is unsynchronized and is safe ONLY because
+     * every caller runs on the I/O thread (connectLoop and the
+     * receive-path rejection handlers are all pumped by ioLoop); calling
+     * this from any other thread would be a lost-update race.
      * Non-{@link LineSenderException} causes are wrapped once here, so
      * every rethrow delivers the same instance.
      */
     private void recordFatal(Throwable t) {
-        if (lastError == null) {
-            lastError = t instanceof LineSenderException
+        if (terminalError == null) {
+            terminalError = t instanceof LineSenderException
                     ? (LineSenderException) t
                     : new LineSenderException("I/O thread failed: " + t.getMessage(), t);
         }

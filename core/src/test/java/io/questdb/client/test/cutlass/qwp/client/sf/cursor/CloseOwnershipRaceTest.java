@@ -78,7 +78,7 @@ public class CloseOwnershipRaceTest {
                 // code it reads a field nobody here writes — it cannot flake;
                 // a reintroduced two-read snapshot tears when the latch lands
                 // between its reads, with near-certainty across all rounds.
-                while (leaked == null && loop.getLastError() == null) {
+                while (leaked == null && loop.getTerminalError() == null) {
                     leaked = loop.getSynchronouslySurfacedError();
                 }
                 loop.close();

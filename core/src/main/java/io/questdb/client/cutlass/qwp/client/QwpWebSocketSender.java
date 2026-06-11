@@ -2563,7 +2563,7 @@ public class QwpWebSocketSender implements Sender {
             error.fillInStackTrace();
             throw error;
         }
-        // Poll the cursor I/O loop's lastError too. Without this, a fatal
+        // Poll the cursor I/O loop's terminalError too. Without this, a fatal
         // wire / server-rejection error recorded by the I/O thread would
         // only surface on the next flush() / close() — every row-level
         // method (table, longColumn, atNow, etc.) routes through
