@@ -1274,13 +1274,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // Nothing more in the current segment. If it's a sealed segment
             // (no longer the live active), advance to the next one.
             if (sendingSegment != engine.activeSegment()) {
-                MmapSegment next = advanceSegment();
-                if (next != sendingSegment) {
-                    sendingSegment = next;
-                    return true; // let the next iteration try sending
+                // The producer can publish the current segment's last frame
+                // between our first publishedOffset() read and the active
+                // segment check above. Re-read before leaving the segment, or
+                // that frame is skipped permanently.
+                pub = sendingSegment.publishedOffset();
+                if (sendOffset >= pub) {
+                    MmapSegment next = advanceSegment();
+                    if (next != sendingSegment) {
+                        sendingSegment = next;
+                        return true; // let the next iteration try sending
+                    }
                 }
+            } else {
+                return false;
             }
-            return false;
         }
         // At least the frame header is published; check we have the full frame.
         if (sendOffset + MmapSegment.FRAME_HEADER_SIZE > pub) {

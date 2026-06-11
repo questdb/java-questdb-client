@@ -126,7 +126,6 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_AUTO_FLUSH_BYTES = 8 * 1024 * 1024;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
-    public static final int DEFAULT_MAX_SCHEMAS_PER_CONNECTION = 65_535;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
@@ -149,7 +148,6 @@ public class QwpWebSocketSender implements Sender {
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
     private final QwpHostHealthTracker hostTracker;
-    private final int maxSchemasPerConnection;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
@@ -234,10 +232,6 @@ public class QwpWebSocketSender implements Sender {
     //         to the SenderError dispatcher rather than thrown from the
     //         constructor.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
-    private int maxSentSchemaId = -1;
-    // Track the highest symbol ID sent to server (for delta encoding)
-    // Once sent over TCP, server is guaranteed to receive it (or connection dies)
-    private int nextSchemaId;
     private boolean ownsCursorEngine;
     private long pendingBytes;
     private int pendingRowCount;
@@ -280,8 +274,7 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            String authorizationHeader,
-            int maxSchemasPerConnection
+            String authorizationHeader
     ) {
         if (endpoints == null || endpoints.isEmpty()) {
             throw new IllegalArgumentException("endpoints must be non-empty");
@@ -304,7 +297,6 @@ public class QwpWebSocketSender implements Sender {
         // X-QWP-Max-Batch-Size is known.
         this.effectiveAutoFlushBytes = autoFlushBytes;
         this.autoFlushIntervalNanos = autoFlushIntervalNanos;
-        this.maxSchemasPerConnection = maxSchemasPerConnection;
         this.globalSymbolDictionary = new GlobalSymbolDictionary();
 
         int microbatchBufferSize = Math.max(DEFAULT_MICROBATCH_BUFFER_SIZE, autoFlushBytes * 2);
@@ -355,7 +347,7 @@ public class QwpWebSocketSender implements Sender {
             return connect(
                     host, port, tlsConfig,
                     DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                    null, DEFAULT_MAX_SCHEMAS_PER_CONNECTION,
+                    null,
                     false, engine
             );
         } catch (Throwable t) {
@@ -381,12 +373,11 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos,
             String authorizationHeader,
-            int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                authorizationHeader, maxSchemasPerConnection,
+                authorizationHeader,
                 requestDurableAck, cursorEngine, 5_000L);
     }
 
@@ -404,14 +395,13 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos,
             String authorizationHeader,
-            int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, authorizationHeader,
-                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis,
                 CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
                 CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS,
@@ -432,7 +422,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos,
             String authorizationHeader,
-            int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis,
@@ -442,7 +431,7 @@ public class QwpWebSocketSender implements Sender {
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, authorizationHeader,
-                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 Sender.InitialConnectMode.OFF);
@@ -463,7 +452,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos,
             String authorizationHeader,
-            int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis,
@@ -474,7 +462,7 @@ public class QwpWebSocketSender implements Sender {
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, authorizationHeader,
-                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, null, SenderErrorDispatcher.DEFAULT_CAPACITY);
@@ -493,7 +481,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos,
             String authorizationHeader,
-            int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis,
@@ -506,7 +493,7 @@ public class QwpWebSocketSender implements Sender {
     ) {
         return connect(host, port, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, authorizationHeader,
-                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
@@ -527,7 +514,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos,
             String authorizationHeader,
-            int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis,
@@ -542,7 +528,7 @@ public class QwpWebSocketSender implements Sender {
         return connect(
                 singleEndpoint(host, port), tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                authorizationHeader, maxSchemasPerConnection,
+                authorizationHeader,
                 requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
@@ -566,7 +552,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos,
             String authorizationHeader,
-            int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis,
@@ -582,7 +567,7 @@ public class QwpWebSocketSender implements Sender {
     ) {
         return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, authorizationHeader,
-                maxSchemasPerConnection, requestDurableAck, cursorEngine,
+                requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
@@ -601,7 +586,6 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos,
             String authorizationHeader,
-            int maxSchemasPerConnection,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis,
@@ -620,7 +604,7 @@ public class QwpWebSocketSender implements Sender {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                authorizationHeader, maxSchemasPerConnection
+                authorizationHeader
         );
         try {
             sender.requestDurableAck = requestDurableAck;
@@ -672,7 +656,7 @@ public class QwpWebSocketSender implements Sender {
         return new QwpWebSocketSender(
                 singleEndpoint(host, port), null,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                authorizationHeader, DEFAULT_MAX_SCHEMAS_PER_CONNECTION
+                authorizationHeader
         );
     }
 
@@ -693,28 +677,10 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushBytes,
             long autoFlushIntervalNanos
     ) {
-        return createForTesting(
-                host,
-                port,
-                autoFlushRows,
-                autoFlushBytes,
-                autoFlushIntervalNanos,
-                DEFAULT_MAX_SCHEMAS_PER_CONNECTION
-        );
-    }
-
-    public static QwpWebSocketSender createForTesting(
-            String host,
-            int port,
-            int autoFlushRows,
-            int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            int maxSchemasPerConnection
-    ) {
         return new QwpWebSocketSender(
                 singleEndpoint(host, port), null,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                null, maxSchemasPerConnection
+                null
         );
     }
 
@@ -2421,7 +2387,7 @@ public class QwpWebSocketSender implements Sender {
                     ? WebSocketClientFactory.newTlsInstance(tlsConfig)
                     : WebSocketClientFactory.newPlainTextInstance();
             try {
-                newClient.setQwpMaxVersion(QwpConstants.MAX_SUPPORTED_INGEST_VERSION);
+                newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpRequestDurableAck(requestDurableAck);
                 newClient.connect(ep.host, ep.port);
@@ -2762,12 +2728,12 @@ public class QwpWebSocketSender implements Sender {
             case ASYNC:
                 // Defer the actual connect to the I/O thread. The user thread
                 // returns immediately; rows accumulate in the cursor SF engine.
-                // Encoder stays at its default (V1 — the only supported wire
-                // version today). When v2+ ships, frames written before the
-                // first successful connect will commit to V1 because cursor
-                // segments are immutable. Auth/upgrade rejects and budget
-                // exhaustion are surfaced via the error inbox by the I/O
-                // thread, not thrown here.
+                // Encoder stays at its default (V1 -- the only supported wire
+                // version today). Frames written before the first successful
+                // connect commit to V1 because cursor segments are immutable;
+                // a future version bump must account for that. Auth/upgrade
+                // rejects and budget exhaustion are surfaced via the error
+                // inbox by the I/O thread, not thrown here.
                 client = null;
                 break;
             case OFF:
@@ -2843,19 +2809,19 @@ public class QwpWebSocketSender implements Sender {
                     host, port, client.getServerQwpVersion(), serverMaxBatchSize, effectiveAutoFlushBytes);
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
-            // its default version (V1). Schema state still gets reset for
-            // consistency with the sync path; the post-connect replay path
-            // does not need a producer-side reset signal because every
+            // its default version (V1). The symbol-dict watermark still gets
+            // reset for consistency with the sync path; the post-connect replay
+            // path does not need a producer-side reset signal because every
             // cursor frame is self-sufficient.
             Endpoint ep = endpoints.get(0);
             LOG.info("Async initial connect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}]",
                     ep.host, ep.port, endpoints.size());
         }
-        // Server starts fresh on each connection — discard any schema IDs
-        // retained from prior state. Cursor frames are self-sufficient (every
-        // frame carries full schema + full symbol-dict delta from id 0), so
-        // post-reconnect replay needs no producer-side schema-reset signal.
-        resetSchemaStateForNewConnection();
+        // Server starts fresh on each connection, so reset the symbol-dict
+        // watermark. Cursor frames are self-sufficient (every frame carries its
+        // full inline schema + a symbol-dict delta from id 0), so post-reconnect
+        // replay needs no producer-side reset signal.
+        resetSymbolDictStateForNewConnection();
         connectionError.set(null);
 
         connected = true;
@@ -2907,16 +2873,11 @@ public class QwpWebSocketSender implements Sender {
         }
 
         ensureActiveBufferReady();
-        // Cursor SF requires every on-disk frame to be self-sufficient
-        // — its schema definition must travel with the row data, not
-        // as a back-reference to an ID the server may not have seen
-        // (orphan-slot drainers and post-reconnect replay both deliver
-        // recorded frames to fresh server connections). So always emit
-        // the full symbol-dict delta from id=0, and always send the
-        // full schema definition for each table — never a ref. With
-        // self-sufficient frames there's no encode-vs-reconnect race
-        // to defend against: the bytes are valid against any server.
-        int batchMaxSchemaId = maxSentSchemaId;
+        // Cursor SF requires every on-disk frame to be self-sufficient:
+        // recorded frames replay to fresh server connections (orphan-slot
+        // drainers and post-reconnect replay), so always emit the full
+        // symbol-dict delta from id=0 and the full column schema inline,
+        // never a back-reference the target server may not have seen.
         encoder.setDeferCommit(deferCommit);
         encoder.beginMessage(tableCount, globalSymbolDictionary,
                 /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
@@ -2930,27 +2891,18 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             }
 
-            if (tableBuffer.getSchemaId() < 0) {
-                if (nextSchemaId >= maxSchemasPerConnection) {
-                    throw new LineSenderException("maximum schemas per connection exceeded")
-                            .put("[maxSchemasPerConnection=").put(maxSchemasPerConnection).put(']');
-                }
-                tableBuffer.setSchemaId(nextSchemaId++);
-            }
-            batchMaxSchemaId = Math.max(batchMaxSchemaId, tableBuffer.getSchemaId());
-
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Encoding table [name={}, rows={}, batchMaxId={}, useSchemaRef=false (cursor SF)]",
+                LOG.debug("Encoding table [name={}, rows={}, batchMaxId={}]",
                         tableName, tableBuffer.getRowCount(), currentBatchMaxSymbolId);
             }
 
-            encoder.addTable(tableBuffer, /*useSchemaRef=*/ false);
+            encoder.addTable(tableBuffer);
         }
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
 
         if (serverMaxBatchSize > 0 && messageSize > serverMaxBatchSize) {
-            flushPendingRowsSplit(keys, batchMaxSchemaId, deferCommit);
+            flushPendingRowsSplit(keys, deferCommit);
             return;
         }
 
@@ -2961,11 +2913,6 @@ public class QwpWebSocketSender implements Sender {
 
         hasDeferredMessages = deferCommit;
 
-        // Update sent state only after successful enqueue.
-        // If sealAndSwapBuffer() threw, these remain unchanged so the
-        // next batch's delta dictionary will correctly re-include the
-        // symbols and schema that the server never received.
-        maxSentSchemaId = batchMaxSchemaId;
         resetTableBuffersAfterFlush(keys);
     }
 
@@ -2980,7 +2927,7 @@ public class QwpWebSocketSender implements Sender {
      *                    carry FLAG_DEFER_COMMIT. When false, only the
      *                    last message omits the flag.
      */
-    private void flushPendingRowsSplit(ObjList<CharSequence> keys, int batchMaxSchemaId, boolean deferCommit) {
+    private void flushPendingRowsSplit(ObjList<CharSequence> keys, boolean deferCommit) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Splitting flush across multiple messages [serverMaxBatchSize={}, defer={}]", serverMaxBatchSize, deferCommit);
         }
@@ -3016,7 +2963,7 @@ public class QwpWebSocketSender implements Sender {
             encoder.setDeferCommit(deferThis);
             encoder.beginMessage(1, globalSymbolDictionary,
                     /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
-            encoder.addTable(tableBuffer, /*useSchemaRef=*/ false);
+            encoder.addTable(tableBuffer);
             int messageSize = encoder.finishMessage();
             QwpBufferWriter buffer = encoder.getBuffer();
 
@@ -3037,7 +2984,6 @@ public class QwpWebSocketSender implements Sender {
 
         encoder.setDeferCommit(false);
         hasDeferredMessages = deferCommit;
-        maxSentSchemaId = batchMaxSchemaId;
         resetTableBuffersAfterFlush(keys);
     }
 
@@ -3081,31 +3027,13 @@ public class QwpWebSocketSender implements Sender {
         hasDeferredMessages = false;
     }
 
-    private void resetSchemaStateForNewConnection() {
-        maxSentSchemaId = -1;
-        nextSchemaId = 0;
-        // The new server has an empty symbol dictionary. The encoder's
-        // delta-dictionary range is computed as
-        //   deltaStart = maxSentSymbolId + 1
-        //   deltaCount = max(0, currentBatchMaxSymbolId - maxSentSymbolId)
-        // so a non-reset watermark would skip every symbol id <= the old
-        // server's confirmed max, leaving column refs into a dictionary the
-        // new server has never seen. Reset both so the next batch ships a
-        // delta starting at id 0 covering every referenced symbol.
+    private void resetSymbolDictStateForNewConnection() {
+        // The new server has an empty symbol dictionary, so the next batch
+        // must ship a delta starting at id 0. beginMessage() always passes
+        // confirmedMaxId = -1; resetting the batch watermark here keeps a
+        // stale value from suppressing re-emission of symbol ids the new
+        // server has never seen.
         currentBatchMaxSymbolId = -1;
-
-        ObjList<CharSequence> keys = tableBuffers.keys();
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer != null) {
-                tableBuffer.setSchemaId(-1);
-            }
-        }
     }
 
     private void rollbackRow() {
@@ -3167,9 +3095,9 @@ public class QwpWebSocketSender implements Sender {
             // payload never reached the engine, so no I/O thread will
             // recycle toSend. Recycle it here so a later flush can swap
             // back to it; flushPendingRows aborts its post-enqueue state
-            // updates after this throw, so the source rows and the
-            // sent-schema watermark stay intact and the next batch re-emits
-            // the same rows along with the full schema + symbol-dict delta.
+            // updates after this throw, so the source rows stay intact and the
+            // next batch re-emits the same rows along with the full inline
+            // schema and symbol-dict delta from id 0.
             if (toSend.isSending()) {
                 toSend.markRecycled();
             } else if (toSend.isSealed()) {

@@ -1036,7 +1036,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int maxBackoffMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxDatagramSize = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxNameLength = PARAMETER_NOT_SET_EXPLICITLY;
-        private int maxSchemasPerConnection = PARAMETER_NOT_SET_EXPLICITLY;
         private int maximumBufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         private final HttpClientConfiguration httpClientConfiguration = new DefaultHttpClientConfiguration() {
             @Override
@@ -1369,8 +1368,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 long actualAutoFlushIntervalNanos = autoFlushIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
                         ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
                         : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
-                int actualMaxSchemasPerConnection = maxSchemasPerConnection == PARAMETER_NOT_SET_EXPLICITLY
-                        ? QwpWebSocketSender.DEFAULT_MAX_SCHEMAS_PER_CONNECTION : maxSchemasPerConnection;
 
                 String wsAuthHeader = buildWebSocketAuthHeader();
 
@@ -1499,7 +1496,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualAutoFlushBytes,
                             actualAutoFlushIntervalNanos,
                             wsAuthHeader,
-                            actualMaxSchemasPerConnection,
                             requestDurableAck,
                             cursorEngine,
                             actualCloseFlushTimeoutMillis,
@@ -2214,25 +2210,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         .put("[max_name_len=").put(maxNameLength).put("]");
             }
             this.maxNameLength = maxNameLength;
-            return this;
-        }
-
-        /**
-         * Sets the maximum number of distinct schemas the WebSocket sender may assign on one connection.
-         */
-        public LineSenderBuilder maxSchemasPerConnection(int maxSchemasPerConnection) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("max schemas per connection is only supported for WebSocket transport");
-            }
-            if (this.maxSchemasPerConnection != PARAMETER_NOT_SET_EXPLICITLY) {
-                throw new LineSenderException("max schemas per connection was already configured")
-                        .put("[maxSchemasPerConnection=").put(this.maxSchemasPerConnection).put("]");
-            }
-            if (maxSchemasPerConnection < 1) {
-                throw new LineSenderException("max schemas per connection must be positive")
-                        .put("[maxSchemasPerConnection=").put(maxSchemasPerConnection).put("]");
-            }
-            this.maxSchemasPerConnection = maxSchemasPerConnection;
             return this;
         }
 
@@ -3154,13 +3131,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     } else {
                         throw new LineSenderException("invalid transaction [value=").put(sink).put(", allowed-values=[on, off]]");
                     }
-                } else if (Chars.equals("max_schemas_per_connection", sink)) {
-                    if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("max_schemas_per_connection is only supported for WebSocket transport");
-                    }
-                    pos = getValue(configurationString, pos, sink, "max_schemas_per_connection");
-                    int maxSchemas = parseIntValue(sink, "max_schemas_per_connection");
-                    maxSchemasPerConnection(maxSchemas);
                 } else if (Chars.equals("sf_dir", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sf_dir is only supported for WebSocket transport");

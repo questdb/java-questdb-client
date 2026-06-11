@@ -32,9 +32,9 @@ package io.questdb.client.cutlass.qwp.client;
 public final class QwpEgressMsgKind {
     /**
      * Server -> client. Connection-scoped cache reset. Body: {@code reset_mask:u8}
-     * with bit 0 = SYMBOL dict, bit 1 = schema-fingerprint cache. Sent between
-     * queries when a cache hits its server-side soft cap. Recipient clears the
-     * indicated caches; subsequent RESULT_BATCH delta sections start fresh.
+     * with bit 0 = SYMBOL dict (the only bit defined). Sent between queries when
+     * the dict hits its server-side soft cap. Recipient clears the dict;
+     * subsequent RESULT_BATCH delta sections start fresh.
      */
     public static final byte CACHE_RESET = 0x17;
     public static final byte CANCEL = 0x14;
@@ -59,10 +59,6 @@ public final class QwpEgressMsgKind {
      * Reset mask bit: clear the connection-scoped SYMBOL dict.
      */
     public static final byte RESET_MASK_DICT = 0x01;
-    /**
-     * Reset mask bit: clear the connection-scoped schema-fingerprint cache.
-     */
-    public static final byte RESET_MASK_SCHEMAS = 0x02;
     public static final byte RESULT_BATCH = 0x11;
     public static final byte RESULT_END = 0x12;
     /**
@@ -88,7 +84,7 @@ public final class QwpEgressMsgKind {
     public static final byte ROLE_STANDALONE = 0;
     /**
      * Server -> client. Unsolicited frame delivered as the first QWP message
-     * on every v2 WebSocket connection. Body (little-endian): {@code
+     * on every WebSocket connection. Body (little-endian): {@code
      * msg_kind:u8, role:u8, epoch:u64, capabilities:u32, server_wall_ns:i64,
      * cluster_id:u16_len+utf8, node_id:u16_len+utf8} followed by an optional
      * {@code zone_id:u16_len+utf8} when the {@link #CAP_ZONE} bit is set in

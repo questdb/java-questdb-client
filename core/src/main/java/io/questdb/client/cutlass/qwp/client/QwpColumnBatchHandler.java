@@ -106,8 +106,7 @@ public interface QwpColumnBatchHandler {
      * the query (with {@code failover=on}, the default).
      * <p>
      * {@code newNode} is the {@link QwpServerInfo} of the endpoint the client
-     * just bound to, or {@code null} if the new server negotiated the v1
-     * protocol (no SERVER_INFO frame).
+     * just bound to.
      * <p>
      * After this callback fires, {@link #onBatch} will be invoked again with
      * {@code batch_seq} restarting at 0 on the new connection. Handlers that
@@ -127,7 +126,7 @@ public interface QwpColumnBatchHandler {
      * {@link #onFailoverReset(QwpServerInfo)} for backwards compatibility.
      *
      * @param requestId client-assigned request id of the query being replayed
-     * @param newNode   the endpoint just bound to, or {@code null} if the new server negotiated v1
+     * @param newNode   the {@link QwpServerInfo} of the endpoint just bound to
      */
     default void onFailoverReset(long requestId, QwpServerInfo newNode) {
         onFailoverReset(newNode);

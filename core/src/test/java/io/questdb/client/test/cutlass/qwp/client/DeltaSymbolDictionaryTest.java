@@ -64,7 +64,7 @@ public class DeltaSymbolDictionaryTest {
                     int batchMaxId = -1;
 
                     // Can still encode with delta dict (empty delta)
-                    int size = encoder.encodeWithDeltaDict(batch, globalDict, -1, batchMaxId, false);
+                    int size = encoder.encodeWithDeltaDict(batch, globalDict, -1, batchMaxId);
                     Assert.assertTrue(size > 0);
 
                     // Verify flag is set
@@ -261,7 +261,7 @@ public class DeltaSymbolDictionaryTest {
                     batch1.nextRow();
 
                     int batch1MaxId = 1;
-                    int size1 = encoder.encodeWithDeltaDict(batch1, clientDict, maxSentSymbolId, batch1MaxId, false);
+                    int size1 = encoder.encodeWithDeltaDict(batch1, clientDict, maxSentSymbolId, batch1MaxId);
                     Assert.assertTrue(size1 > 0);
                     maxSentSymbolId = batch1MaxId;
 
@@ -285,7 +285,7 @@ public class DeltaSymbolDictionaryTest {
                     batch2.nextRow();
 
                     int batch2MaxId = 2;
-                    int size2 = encoder.encodeWithDeltaDict(batch2, clientDict, maxSentSymbolId, batch2MaxId, false);
+                    int size2 = encoder.encodeWithDeltaDict(batch2, clientDict, maxSentSymbolId, batch2MaxId);
                     Assert.assertTrue(size2 > 0);
 
                     // Decode batch 2
@@ -370,7 +370,7 @@ public class DeltaSymbolDictionaryTest {
                     int confirmedMaxId = -1;
                     int batchMaxId = 2;  // AAPL(0), GOOG(1), MSFT(2)
 
-                    int size = encoder.encodeWithDeltaDict(table1, globalDict, confirmedMaxId, batchMaxId, false);
+                    int size = encoder.encodeWithDeltaDict(table1, globalDict, confirmedMaxId, batchMaxId);
                     Assert.assertTrue(size > 0);
 
                     // Verify delta section contains all 3 symbols
@@ -475,7 +475,7 @@ public class DeltaSymbolDictionaryTest {
                     batch.nextRow();
 
                     // Encode - should send full delta (all symbols from 0)
-                    int size = encoder.encodeWithDeltaDict(batch, clientDict, -1, 1, false);
+                    int size = encoder.encodeWithDeltaDict(batch, clientDict, -1, 1);
                     Assert.assertTrue(size > 0);
 
                     // Verify deltaStart is 0
