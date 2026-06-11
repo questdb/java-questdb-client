@@ -88,14 +88,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
-    /** Default initial reconnect backoff (100 ms). */
+    /**
+     * Default initial reconnect backoff (100 ms).
+     */
     public static final long DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS = 100L;
-    /** Default reconnect max backoff (5 s). */
+    /**
+     * Default reconnect max backoff (5 s).
+     */
     public static final long DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS = 5_000L;
-    /** Default per-outage reconnect time cap (5 min). */
+    /**
+     * Default per-outage reconnect time cap (5 min).
+     */
     public static final long DEFAULT_RECONNECT_MAX_DURATION_MILLIS = 300_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
-    /** Throttle "reconnect attempt N failed" WARN logs to one per 5 s. */
+    /**
+     * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
+     */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
     // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
     // Zero or negative disables the keepalive entirely.
@@ -170,10 +178,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // directly to the same dispatcher from QwpWebSocketSender.
     private volatile SenderConnectionDispatcher connectionDispatcher;
     private volatile SenderErrorDispatcher errorDispatcher;
-    // Exact lastError instance that checkError() has thrown to a synchronous
-    // user-thread caller (flush/append/close). close() uses the instance so it
-    // only suppresses errors the user already owned before close() began.
-    private volatile LineSenderException synchronouslySurfacedError;
     // The send cursor has two coordinate systems:
     //
     //   FSN: durable frame sequence number in the local cursor engine. This is
@@ -224,6 +228,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // at engine.activeSegment(); advances to newer sealed segments / the new
     // active as the producer rotates.
     private MmapSegment sendingSegment;
+    // Exact lastError instance that checkError() has thrown to a synchronous
+    // user-thread caller (flush/append/close). close() uses the instance so it
+    // only suppresses errors the user already owned before close() began.
+    private volatile LineSenderException synchronouslySurfacedError;
 
     /**
      * Full constructor with explicit reconnect-policy knobs. When
@@ -315,7 +323,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.hasEverConnected = client != null;
     }
 
-    /** Maps a server status byte to a {@link SenderError.Category}. Exposed for unit tests. */
+    /**
+     * Maps a server status byte to a {@link SenderError.Category}. Exposed for unit tests.
+     */
     @TestOnly
     public static SenderError.Category classify(byte status) {
         switch (status) {
@@ -373,7 +383,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     return c;
                 }
             } catch (QwpAuthFailedException | QwpDurableAckMismatchException
-                    | WebSocketUpgradeException e) {
+                     | WebSocketUpgradeException e) {
                 // Terminal across all configured endpoints per sf-client.md sections
                 // 8.1 (durable-ack mismatch) and 13.3 (auth). Version mismatch is
                 // NOT terminal here -- it falls through to the Throwable branch and
@@ -605,7 +615,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return totalFramesSent.get();
     }
 
-    /** Total reconnect attempts (succeeded + failed). */
+    /**
+     * Total reconnect attempts (succeeded + failed).
+     */
     public long getTotalReconnectAttempts() {
         return totalReconnectAttempts.get();
     }
@@ -771,7 +783,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private void attemptInitialConnect() {
         connectLoop(new LineSenderException(
-                "async initial connect deferred to I/O thread"),
+                        "async initial connect deferred to I/O thread"),
                 "initial connect");
     }
 
@@ -1406,7 +1418,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
     }
 
-    /** Inner ACK handler — parses the binary frame, calls engine.acknowledge. */
+    /**
+     * Inner ACK handler — parses the binary frame, calls engine.acknowledge.
+     */
     private final class ResponseHandler implements WebSocketFrameHandler {
         @Override
         public void onBinaryMessage(long payloadPtr, int payloadLen) {
