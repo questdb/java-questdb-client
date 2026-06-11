@@ -934,6 +934,12 @@ public class QwpWebSocketSender implements Sender {
             // instance, dropping it at the final rethrow avoids
             // try-with-resources self-suppression: Throwable.addSuppressed
             // raises IllegalArgumentException when primary == suppressed.
+            // Must stay this single read: the snapshot needs the identity of
+            // the error the user already owns, and only
+            // getSynchronouslySurfacedError() holds it. Deriving it from two
+            // separate latch reads races the I/O thread -- a terminal latched
+            // between the reads would be adopted as user-owned and silently
+            // dropped (see CloseOwnershipRaceTest).
             Throwable alreadyOwnedByUser = cursorSendLoop != null
                     ? cursorSendLoop.getSynchronouslySurfacedError() : null;
 
@@ -957,21 +963,20 @@ public class QwpWebSocketSender implements Sender {
                     //    only when no other channel has already delivered it
                     //    to the user. "Already delivered" means either the
                     //    producer thread saw it synchronously via
-                    //    flush()/append() (synchronouslySurfacedError) or the
-                    //    async dispatcher delivered it to a user-installed
-                    //    custom handler at any point in this sender's life
-                    //    (deliveredToCustomHandler). The latter survives a
-                    //    setErrorHandler(null) cleanup in test helpers --
-                    //    once the user has owned an error, close() should
-                    //    not double-signal it. The default no-op logging
-                    //    handler does not count as "delivered to user", so a
-                    //    config-string-only caller still gets the loud
-                    //    rethrow on shutdown.
+                    //    flush()/append() (checkUnsurfacedError is silent in
+                    //    that case) or the async dispatcher delivered it to a
+                    //    user-installed custom handler at any point in this
+                    //    sender's life (deliveredToCustomHandler, checked
+                    //    here). The latter survives a setErrorHandler(null)
+                    //    cleanup in test helpers -- once the user has owned
+                    //    an error, close() should not double-signal it. The
+                    //    default no-op logging handler does not count as
+                    //    "delivered to user", so a config-string-only caller
+                    //    still gets the loud rethrow on shutdown.
                     boolean alreadyDeliveredToCustomHandler = errorDispatcher != null
                             && errorDispatcher.hasDeliveredToCustomHandler();
-                    if (!alreadyDeliveredToCustomHandler
-                            && cursorSendLoop.hasUnsurfacedError()) {
-                        cursorSendLoop.checkError();
+                    if (!alreadyDeliveredToCustomHandler) {
+                        cursorSendLoop.checkUnsurfacedError();
                     }
                     // 3) Bounded drain: block until the server has ACK'd
                     //    everything we just published, or until the

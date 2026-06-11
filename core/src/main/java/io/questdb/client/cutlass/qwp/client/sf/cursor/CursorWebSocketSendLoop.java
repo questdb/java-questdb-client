@@ -173,7 +173,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Exact lastError instance that checkError() has thrown to a synchronous
     // user-thread caller (flush/append/close). close() uses the instance so it
     // only suppresses errors the user already owned before close() began.
-    private volatile Throwable synchronouslySurfacedError;
+    private volatile LineSenderException synchronouslySurfacedError;
     // The send cursor has two coordinate systems:
     //
     //   FSN: durable frame sequence number in the local cursor engine. This is
@@ -195,18 +195,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // up" (looks transient).
     private volatile boolean hasEverConnected;
     private volatile Thread ioThread;
-    private volatile Throwable lastError;
+    // The latched terminal failure — THE exception every checkError() call
+    // rethrows. Non-LineSenderException causes are wrapped once at latch time
+    // (recordFatal), so rethrows always deliver the same instance and close()
+    // can suppress double-signals by identity.
+    private volatile LineSenderException lastError;
     // Wall clock of the last outbound activity on the wire -- a sent frame
     // (trySendOne) or a keepalive PING (sendDurableAckKeepaliveIfDue).
     // Throttles the durable-ack keepalive PING so it fires only when the
     // configured interval has elapsed since the most recent outbound event.
     // Zero until the first send; reset to zero on reconnect.
     private long lastFrameOrPingNanos;
-    // Typed payload sibling to lastError. Set when recordFatal is called with
-    // a SenderError (HALT-policy server rejection or terminal protocol violation);
-    // remains null for wire-level fatals (reconnect-budget exhaustion, etc).
-    // Read by QwpWebSocketSender.getLastTerminalError() for ops visibility.
-    private volatile SenderError lastTerminalServerError;
     private long nextWireSeq;
     private volatile SenderProgressDispatcher progressDispatcher;
     // Frames sent during the post-reconnect catch-up window — i.e. frames
@@ -462,15 +461,30 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Surfaces any error the I/O thread recorded. Called by the producer
      * thread (typically from inside its append wrapper) so failures don't
-     * stay silent. Idempotent; once an error is set the loop has already
-     * exited.
+     * stay silent. Every call rethrows the exact latched instance — close()
+     * relies on that identity to suppress double-signals. Idempotent; once
+     * an error is set the loop has already exited.
      */
     public void checkError() {
-        Throwable e = lastError;
+        LineSenderException e = lastError;
         if (e != null) {
             synchronouslySurfacedError = e;
-            if (e instanceof LineSenderException) throw (LineSenderException) e;
-            throw new LineSenderException("I/O thread failed: " + e.getMessage(), e);
+            throw e;
+        }
+    }
+
+    /**
+     * Safety-net variant of {@link #checkError()} for
+     * {@code QwpWebSocketSender.close()}: rethrows the latched terminal error
+     * only when no synchronous caller has owned it yet. A user who already
+     * caught the error from flush()/append() stays undisturbed — throwing
+     * again from close() would double-signal an error they already handled.
+     * A user who only ever called close() (e.g. async-initial-connect that
+     * never reached the server) still gets the loud failure.
+     */
+    public void checkUnsurfacedError() {
+        if (hasUnsurfacedError()) {
+            checkError();
         }
     }
 
@@ -525,21 +539,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Returns the exact latched throwable instance already thrown by
-     * {@link #checkError()}, or {@code null} when no synchronous caller has
-     * owned the terminal error yet.
+     * Typed server-rejection payload of the latched terminal error, or
+     * {@code null} when the loop latched a wire-level failure (or nothing).
+     * Derived from the latch — a server-rejection terminal is always latched
+     * as a {@link LineSenderServerException} carrying its {@link SenderError}.
      */
-    public Throwable getSynchronouslySurfacedError() {
-        return synchronouslySurfacedError;
+    public SenderError getLastTerminalServerError() {
+        LineSenderException e = lastError;
+        return e instanceof LineSenderServerException
+                ? ((LineSenderServerException) e).getServerError() : null;
     }
 
     /**
-     * Snapshot of the typed server-rejection payload for the latched terminal error,
-     * or {@code null} if the loop has not latched a server-rejection terminal (or has
-     * latched only a wire-level failure with no SenderError associated).
+     * Returns the exact latched throwable instance already thrown by
+     * {@link #checkError()}, or {@code null} when no synchronous caller has
+     * owned the terminal error yet.
+     * <p>
+     * This is the single read {@code QwpWebSocketSender.close()} uses to learn
+     * which terminal error the user already owns. The ownership decision must
+     * be taken from this one field only: deriving it from two separate latch
+     * reads (e.g. an unsurfaced-check followed by {@link #getLastError()})
+     * races the I/O thread — a terminal latched between the reads gets
+     * mis-captured as already-owned and is then silently dropped on close().
+     * Guarded by {@code CloseOwnershipRaceTest}.
      */
-    public SenderError getLastTerminalServerError() {
-        return lastTerminalServerError;
+    public Throwable getSynchronouslySurfacedError() {
+        return synchronouslySurfacedError;
     }
 
     public long getTotalAcks() {
@@ -608,19 +633,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public boolean hasEverConnected() {
         return hasEverConnected;
-    }
-
-    /**
-     * True when {@link #lastError} is set AND no synchronous user-thread
-     * caller has yet seen that same instance via {@link #checkError()}.
-     * close() uses this to decide whether to rethrow as a safety net: a user
-     * who only ever called close() (e.g. async-initial-connect that never
-     * reached the server) needs to see the error from somewhere; a user who
-     * already caught it from flush() does not.
-     */
-    public boolean hasUnsurfacedError() {
-        Throwable e = lastError;
-        return e != null && synchronouslySurfacedError != e;
     }
 
     public boolean isRunning() {
@@ -836,7 +848,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         System.nanoTime()
                 );
                 totalServerErrors.incrementAndGet();
-                recordFatal(new LineSenderServerException(err), err);
+                recordFatal(new LineSenderServerException(err));
                 dispatchError(err);
                 return;
             } catch (QwpDurableAckMismatchException e) {
@@ -861,7 +873,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         System.nanoTime()
                 );
                 totalServerErrors.incrementAndGet();
-                recordFatal(new LineSenderServerException(err), err);
+                recordFatal(new LineSenderServerException(err));
                 dispatchError(err);
                 return;
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
@@ -941,7 +953,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         totalServerErrors.incrementAndGet();
         // recordFatal MUST run before dispatchError so the producer-observable
         // terminal error is latched before the handler is invoked.
-        recordFatal(new LineSenderServerException(err), err);
+        recordFatal(new LineSenderServerException(err));
         dispatchError(err);
         // Surface the terminal classification through the connection-event
         // dispatcher too. Listeners learn about budget exhaustion without
@@ -1047,6 +1059,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         connectLoop(initial, "reconnect");
     }
 
+    /**
+     * True when {@link #lastError} is set AND no synchronous user-thread
+     * caller has yet seen that same instance via {@link #checkError()}.
+     * The {@link #checkUnsurfacedError()} safety net composes this with
+     * checkError(); reads {@code lastError} once so the comparison cannot
+     * tear against a concurrent latch.
+     */
+    private boolean hasUnsurfacedError() {
+        Throwable e = lastError;
+        return e != null && synchronouslySurfacedError != e;
+    }
+
     private void ioLoop() {
         try {
             // Async-initial-connect path: ctor accepted a null client because
@@ -1148,27 +1172,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Mark the loop as fatally failed. Caller has decided no reconnect
-     * is possible (or it ran out of budget) — record the error so
+     * is possible (or it ran out of budget) — latch the error so
      * {@link #checkError} can surface it to the producer thread, then
-     * stop the loop.
+     * stop the loop. Idempotent — only the first failure latches.
+     * Non-{@link LineSenderException} causes are wrapped once here, so
+     * every rethrow delivers the same instance.
      */
     private void recordFatal(Throwable t) {
-        recordFatal(t, null);
-    }
-
-    /**
-     * Server-rejection-aware variant. Stashes a typed {@link SenderError} alongside
-     * the throwable so {@code QwpWebSocketSender.getLastTerminalError()} can surface
-     * the structured payload for ops/observability. Idempotent — only the first
-     * failure latches.
-     */
-    private void recordFatal(Throwable t, SenderError serverError) {
         if (lastError == null) {
-            lastError = t;
-            lastTerminalServerError = serverError;
+            lastError = t instanceof LineSenderException
+                    ? (LineSenderException) t
+                    : new LineSenderException("I/O thread failed: " + t.getMessage(), t);
         }
         running = false;
-        if (serverError != null) {
+        if (t instanceof LineSenderServerException) {
+            // server rejections carry a structured message; the stack adds noise
             LOG.error("Cursor I/O loop failure: {}", t.getMessage());
         } else {
             LOG.error("Cursor I/O loop failure: {}", t.getMessage(), t);
@@ -1480,7 +1498,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // recordFatal MUST run before dispatchError so the producer-
                 // observable terminal error is latched before the handler is
                 // invoked.
-                recordFatal(new LineSenderServerException(err), err);
+                recordFatal(new LineSenderServerException(err));
                 dispatchError(err);
                 return;
             }
@@ -1519,7 +1537,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // so a synchronous probe of getLastTerminalError() / flush()
                 // from inside the handler observes the typed error. Mirrors
                 // the ordering in the post-send HALT path below.
-                recordFatal(new LineSenderServerException(err), err);
+                recordFatal(new LineSenderServerException(err));
             }
             // DROP_AND_CONTINUE: no watermark advance -- there is nothing
             // sent on this connection to drop. The dispatch is the user's
@@ -1584,7 +1602,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // probes getLastTerminalError() (or calls flush()) sees the
                 // typed error rather than null. Bytes on disk are the bytes
                 // the server rejected; reconnect/replay cannot fix them.
-                recordFatal(new LineSenderServerException(err), err);
+                recordFatal(new LineSenderServerException(err));
                 dispatchError(err);
             } else {
                 // DROP_AND_CONTINUE: advance ackedFsn past the rejected span

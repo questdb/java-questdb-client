@@ -37,8 +37,14 @@ import org.junit.rules.TemporaryFolder;
  * reads ({@code !hasUnsurfacedError() ? getLastError() : null}), so a terminal error
  * latched by the I/O thread between the reads was mis-captured as already-owned and
  * silently dropped on close(). The fix is the single read
- * {@link CursorWebSocketSendLoop#getSynchronouslySurfacedError()}; this test races that
- * read against real latch transitions and fails on any torn snapshot.
+ * {@link CursorWebSocketSendLoop#getSynchronouslySurfacedError()}.
+ * <p>
+ * Scope: this test races that accessor and fails if its implementation ever recomputes
+ * the snapshot from two reads. It does not execute {@code QwpWebSocketSender.close()}
+ * itself — old and new snapshots agree in every non-racy state, so no black-box test
+ * at the sender level can detect a callsite that bypasses the accessor; that half of
+ * the contract is pinned by the "must stay this single read" comments at the callsite
+ * and on the accessor.
  */
 public class CloseOwnershipRaceTest {
 
