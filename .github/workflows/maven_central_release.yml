@@ -791,7 +791,7 @@ jobs:
             exit 0
           fi
 
-          git commit -am "Bump version to ${NEXT_DEVELOPMENT_VERSION}"
+          git commit -am "build: ${NEXT_DEVELOPMENT_VERSION}"
           # Plain --force: this branch is a throwaway owned solely by this workflow,
           # and the job never fetches it, so --force-with-lease has no lease ref and
           # would be rejected ("stale info") when the branch already exists.
@@ -802,7 +802,7 @@ jobs:
             gh pr create \
               --base "${SOURCE_REF}" \
               --head "${branch}" \
-              --title "Bump version to ${NEXT_DEVELOPMENT_VERSION}" \
+              --title "build: ${NEXT_DEVELOPMENT_VERSION}" \
               --body "Post-release housekeeping after publishing questdb-client ${RELEASE_VERSION}. Merge before the next release."
           else
             echo "A bump PR for ${branch} already exists."
