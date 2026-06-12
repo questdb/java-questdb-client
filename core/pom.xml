@@ -41,6 +41,7 @@
         <questdb.client.native.build.type>Release</questdb.client.native.build.type>
         <questdb.client.native.build.dir>${project.build.directory}/cmake-build-${platform.dir.name}</questdb.client.native.build.dir>
         <questdb.client.native.output.dir>${project.build.outputDirectory}/io/questdb/client/bin/${platform.dir.name}</questdb.client.native.output.dir>
+        <questdb.client.native.configure.extra.args></questdb.client.native.configure.extra.args>
     </properties>
 
     <version>1.3.4-SNAPSHOT</version>
@@ -210,15 +211,7 @@
                             <skip>${questdb.client.native.skip}</skip>
                             <workingDirectory>${project.basedir}</workingDirectory>
                             <executable>cmake</executable>
-                            <arguments>
-                                <argument>-S</argument>
-                                <argument>${project.basedir}</argument>
-                                <argument>-B</argument>
-                                <argument>${questdb.client.native.build.dir}</argument>
-                                <argument>-DCMAKE_BUILD_TYPE=${questdb.client.native.build.type}</argument>
-                                <argument>-DQUESTDB_CLIENT_NATIVE_OUTPUT_DIR=${questdb.client.native.output.dir}</argument>
-                                <argument>-DQUESTDB_CLIENT_NATIVE_COPY_BIN_LOCAL=OFF</argument>
-                            </arguments>
+                            <commandlineArgs>-S "${project.basedir}" -B "${questdb.client.native.build.dir}" -DCMAKE_BUILD_TYPE=${questdb.client.native.build.type} -DQUESTDB_CLIENT_NATIVE_OUTPUT_DIR="${questdb.client.native.output.dir}" -DQUESTDB_CLIENT_NATIVE_COPY_BIN_LOCAL=OFF ${questdb.client.native.configure.extra.args}</commandlineArgs>
                         </configuration>
                     </execution>
                     <execution>
@@ -303,6 +296,7 @@
             <properties>
                 <platform.dir.name>windows-x86-64</platform.dir.name>
                 <questdb.client.native.skip>false</questdb.client.native.skip>
+                <questdb.client.native.configure.extra.args>-G Ninja -DCMAKE_TOOLCHAIN_FILE="${project.basedir}/src/main/c/toolchains/windows-x86_64.cmake"</questdb.client.native.configure.extra.args>
             </properties>
         </profile>
         <profile>
@@ -403,6 +397,63 @@
             </properties>
             <build>
                 <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>validate-release-native-artifacts</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target name="validate-release-native-artifacts">
+                                        <condition property="native.darwin.aarch64.present">
+                                            <and>
+                                                <available file="${project.build.directory}/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib" type="file"/>
+                                                <length file="${project.build.directory}/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib" when="greater" length="0"/>
+                                            </and>
+                                        </condition>
+                                        <fail unless="native.darwin.aarch64.present" message="Missing or empty release native artifact: ${project.build.directory}/native-libs/io/questdb/client/bin/darwin-aarch64/libquestdb.dylib"/>
+
+                                        <condition property="native.darwin.x8664.present">
+                                            <and>
+                                                <available file="${project.build.directory}/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib" type="file"/>
+                                                <length file="${project.build.directory}/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib" when="greater" length="0"/>
+                                            </and>
+                                        </condition>
+                                        <fail unless="native.darwin.x8664.present" message="Missing or empty release native artifact: ${project.build.directory}/native-libs/io/questdb/client/bin/darwin-x86-64/libquestdb.dylib"/>
+
+                                        <condition property="native.linux.aarch64.present">
+                                            <and>
+                                                <available file="${project.build.directory}/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so" type="file"/>
+                                                <length file="${project.build.directory}/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so" when="greater" length="0"/>
+                                            </and>
+                                        </condition>
+                                        <fail unless="native.linux.aarch64.present" message="Missing or empty release native artifact: ${project.build.directory}/native-libs/io/questdb/client/bin/linux-aarch64/libquestdb.so"/>
+
+                                        <condition property="native.linux.x8664.present">
+                                            <and>
+                                                <available file="${project.build.directory}/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so" type="file"/>
+                                                <length file="${project.build.directory}/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so" when="greater" length="0"/>
+                                            </and>
+                                        </condition>
+                                        <fail unless="native.linux.x8664.present" message="Missing or empty release native artifact: ${project.build.directory}/native-libs/io/questdb/client/bin/linux-x86-64/libquestdb.so"/>
+
+                                        <condition property="native.windows.x8664.present">
+                                            <and>
+                                                <available file="${project.build.directory}/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll" type="file"/>
+                                                <length file="${project.build.directory}/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll" when="greater" length="0"/>
+                                            </and>
+                                        </condition>
+                                        <fail unless="native.windows.x8664.present" message="Missing or empty release native artifact: ${project.build.directory}/native-libs/io/questdb/client/bin/windows-x86-64/libquestdb.dll"/>
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-resources-plugin</artifactId>

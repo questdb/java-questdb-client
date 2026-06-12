@@ -1,4 +1,12 @@
 steps:
+  - bash: git submodule update --init --recursive
+    displayName: "Initialize native submodules"
+    condition: ne(variables['Agent.OS'], 'Windows_NT')
+
+  - powershell: git submodule update --init --recursive
+    displayName: "Initialize native submodules"
+    condition: eq(variables['Agent.OS'], 'Windows_NT')
+
   - bash: |
       set -eux
       case "$(jdkArch)" in
@@ -42,6 +50,43 @@ steps:
       Write-Host "##vso[task.setvariable variable=JAVA_HOME]$javaHome"
       Write-Host "##vso[task.prependpath]$javaHome\bin"
     displayName: "Install GraalVM JDK 25 (Windows)"
+    condition: eq(variables['Agent.OS'], 'Windows_NT')
+
+  - bash: |
+      set -eux
+      sudo apt-get update
+      sudo apt-get install -y cmake nasm build-essential
+    displayName: "Install native build tools (Linux)"
+    condition: eq(variables['Agent.OS'], 'Linux')
+
+  - bash: |
+      set -eux
+      for pkg in cmake nasm; do
+        brew list "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+      done
+    displayName: "Install native build tools (macOS)"
+    condition: eq(variables['Agent.OS'], 'Darwin')
+
+  - powershell: |
+      $ErrorActionPreference = "Stop"
+
+      choco install msys2 --no-progress -y
+
+      $msysRoot = @("C:\tools\msys64", "C:\msys64") |
+        Where-Object { Test-Path (Join-Path $_ "usr\bin\bash.exe") } |
+        Select-Object -First 1
+      if (-not $msysRoot) {
+        throw "MSYS2 installation was not found"
+      }
+
+      $bash = Join-Path $msysRoot "usr\bin\bash.exe"
+      & $bash -lc "pacman --noconfirm -Sy --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-ninja"
+      if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+      }
+
+      Write-Host "##vso[task.prependpath]$msysRoot\mingw64\bin"
+    displayName: "Install native build tools (Windows)"
     condition: eq(variables['Agent.OS'], 'Windows_NT')
 
   - bash: sudo sysctl -w fs.file-max=500000
