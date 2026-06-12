@@ -19,6 +19,9 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 # use this is for debug purposes
 #set(CMAKE_VERBOSE_MAKEFILE ON)
 
+set(QUESTDB_CLIENT_NATIVE_OUTPUT_DIR "" CACHE PATH "Native library output directory")
+option(QUESTDB_CLIENT_NATIVE_COPY_BIN_LOCAL "Copy native build outputs into legacy bin-local development directories" ON)
+
 # deal with windows slashes in JAVA_HOME
 if ($ENV{JAVA_HOME})
     FILE(TO_CMAKE_PATH $ENV{JAVA_HOME} JAVA_HOME)
@@ -146,11 +149,15 @@ else ()
     )
 endif ()
 
-set(OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/client/bin-local/)
+if (QUESTDB_CLIENT_NATIVE_OUTPUT_DIR)
+    FILE(TO_CMAKE_PATH "${QUESTDB_CLIENT_NATIVE_OUTPUT_DIR}" OUTPUT)
+else ()
+    set(OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/client/bin-local/)
+endif ()
 
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT})
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${OUTPUT})
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${OUTPUT})
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/archives")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${OUTPUT}")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT}")
 
 add_library(questdb SHARED ${SOURCE_FILES})
 
@@ -268,19 +275,20 @@ else ()
     target_link_libraries(questdb rt -Wl,--gc-sections -Wl,--exclude-libs=ALL -static-libgcc)
 endif ()
 
-# Define the secondary output directory
+if (QUESTDB_CLIENT_NATIVE_COPY_BIN_LOCAL)
+    # Define the secondary output directory
+    set(SECONDARY_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/questdb/client/bin-local/)
+    set(SECONDARY_OUTPUT2 ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/client/bin-local/)
 
-set(SECONDARY_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/questdb/client/bin-local/)
-set(SECONDARY_OUTPUT2 ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/client/bin-local/)
+    add_custom_command(TARGET questdb POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${SECONDARY_OUTPUT}
+            COMMAND ${CMAKE_COMMAND} -E copy_directory ${OUTPUT} ${SECONDARY_OUTPUT}
+            COMMENT "Copying all build outputs from ${OUTPUT} to ${SECONDARY_OUTPUT}"
+    )
 
-add_custom_command(TARGET questdb POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${SECONDARY_OUTPUT}
-        COMMAND ${CMAKE_COMMAND} -E copy_directory ${OUTPUT} ${SECONDARY_OUTPUT}
-        COMMENT "Copying all build outputs from ${OUTPUT} to ${SECONDARY_OUTPUT}"
-)
-
-add_custom_command(TARGET questdb POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${SECONDARY_OUTPUT2}
-        COMMAND ${CMAKE_COMMAND} -E copy_directory ${OUTPUT} ${SECONDARY_OUTPUT2}
-        COMMENT "Copying all build outputs from ${OUTPUT} to ${SECONDARY_OUTPUT2}"
-)
+    add_custom_command(TARGET questdb POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${SECONDARY_OUTPUT2}
+            COMMAND ${CMAKE_COMMAND} -E copy_directory ${OUTPUT} ${SECONDARY_OUTPUT2}
+            COMMENT "Copying all build outputs from ${OUTPUT} to ${SECONDARY_OUTPUT2}"
+    )
+endif ()

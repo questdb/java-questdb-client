@@ -258,7 +258,25 @@ Full release procedure, one-time setup, and failure handling: [artifacts/release
 
 ### Building Native Libraries
 
-The client includes native libraries (C/C++ and assembly) for performance-critical operations. Pre-built binaries are included in the repository, but you can rebuild them locally if needed.
+The client includes native libraries (C/C++ and assembly) for performance-critical operations. Native binaries are
+built on demand by Maven and packaged into the client jar under `io/questdb/client/bin/<platform>/`.
+
+For normal local development, initialize submodules once and run Maven:
+
+```bash
+git submodule update --init --recursive
+mvn -pl core package
+```
+
+Maven builds the current platform's native library during `generate-resources`. To skip the native build explicitly,
+use `-Dquestdb.client.native.skip=true`.
+
+Release builds still use `-P include-native-artifacts`: CI builds each supported platform, stages the results under
+`core/target/native-libs`, and Maven copies those staged binaries into the released jar.
+
+For IntelliJ, add `core/native/intellij_triggers.xml` as an Ant build file and configure the
+`questdb-client-native-build` target to run before compilation. This mirrors the command-line Maven native build for
+IDE test runs.
 
 #### Prerequisites
 
@@ -279,7 +297,7 @@ brew install cmake nasm
 # Set deployment target
 export MACOSX_DEPLOYMENT_TARGET=13.0
 
-# Build native library
+# Build native library directly with CMake
 cd core
 cmake -B cmake-build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build cmake-build-release --config Release
@@ -291,7 +309,7 @@ cmake --build cmake-build-release --config Release
 # Install build tools (Debian/Ubuntu)
 sudo apt-get install cmake nasm build-essential
 
-# Build native library
+# Build native library directly with CMake
 cd core
 cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S.
 cmake --build cmake-build-release --config Release
@@ -326,7 +344,7 @@ cmake --build cmake-build-release-win64 --config Release
 
 #### Native Library Output Locations
 
-Built libraries are placed in the resources directory for each platform:
+Direct CMake builds place libraries in the development resources directory:
 
 ```
 core/target/classes/io/questdb/client/bin-local/
