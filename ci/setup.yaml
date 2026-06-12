@@ -80,7 +80,7 @@ steps:
       }
 
       $bash = Join-Path $msysRoot "usr\bin\bash.exe"
-      & $bash -lc "pacman --noconfirm -Sy --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-ninja"
+      & $bash -lc "pacman --noconfirm -Sy --needed mingw-w64-x86_64-binutils mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-ninja"
       if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
       }
