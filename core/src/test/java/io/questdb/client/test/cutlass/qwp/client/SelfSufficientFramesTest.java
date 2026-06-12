@@ -62,9 +62,9 @@ public class SelfSufficientFramesTest {
         // batch 2 would emit deltaStart=1, deltaCount=1 — only the new
         // symbol. With self-sufficient frames, batch 2 must emit
         // deltaStart=0 covering BOTH symbols.
-        int port = TestPorts.findUnusedPort();
         CapturingHandler handler = new CapturingHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            int port = server.getPort();
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
