@@ -1341,6 +1341,8 @@ public class QwpWebSocketSender implements Sender {
         ensureNoInProgressRow();
         ensureConnected();
 
+        long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+
         // Cursor SF: SF.append happens on the user thread inside
         // sealAndSwapBuffer, so by the time we reach here every encoded
         // batch is durable on its mmap'd segment. No processingCount to
@@ -1354,7 +1356,40 @@ public class QwpWebSocketSender implements Sender {
         }
         cursorSendLoop.checkError();
         checkConnectionError();
-        return cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+
+        long afterFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+        return afterFsn > beforeFsn ? afterFsn : -1L;
+    }
+
+    /**
+     * Flushes pending rows and blocks until the server has acknowledged
+     * every frame published so far (the current published-FSN watermark),
+     * or until {@code timeoutMillis} elapses.
+     * <p>
+     * This override uses <b>watermark semantics</b> rather than per-call
+     * semantics: it waits for the global {@code publishedFsn()}, not just
+     * the FSN returned by the flush in this call. This is necessary because
+     * {@link #flushAndGetSequence()} now returns {@code -1} when no data
+     * was published by the call, and the default {@link Sender#drain}
+     * implementation ({@code awaitAckedFsn(flushAndGetSequence(), timeout)})
+     * would short-circuit immediately on an empty flush even when prior
+     * publishes remain unacknowledged.
+     * <p>
+     * Close-time drain ({@link #drainOnClose()}) already uses the same
+     * watermark approach directly.
+     *
+     * @param timeoutMillis upper bound on the wait; {@code <= 0} returns
+     *                      the current state without blocking (the flush
+     *                      still happens before the check)
+     * @return {@code true} if the server has acknowledged every published
+     *         frame on return, {@code false} on timeout
+     * @throws LineSenderException if the transport has latched a terminal error
+     */
+    @Override
+    public boolean drain(long timeoutMillis) {
+        flush();
+        long targetFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+        return awaitAckedFsn(targetFsn, timeoutMillis);
     }
 
     /**
