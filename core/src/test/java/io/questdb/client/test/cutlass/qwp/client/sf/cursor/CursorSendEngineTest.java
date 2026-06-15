@@ -28,7 +28,6 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
@@ -38,7 +37,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
@@ -189,33 +187,6 @@ public class CursorSendEngineTest {
             CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096);
             engine.close();
             engine.close();
-        });
-    }
-
-    @Test
-    public void testConstructorRollbackRemovesSharedManagerEntryWhenRegisterThrows() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long segSize = MmapSegment.HEADER_SIZE
-                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
-            try (SegmentManager manager = new SegmentManager(segSize)) {
-                manager.start();
-                manager.setAfterRegisterPublishSyncHook(() -> {
-                    throw new RuntimeException("forced register failure");
-                });
-                try {
-                    new CursorSendEngine(tmpDir, segSize, manager);
-                    fail("expected constructor to propagate register failure");
-                } catch (RuntimeException expected) {
-                    assertEquals("forced register failure", expected.getMessage());
-                } finally {
-                    manager.setAfterRegisterPublishSyncHook(null);
-                }
-
-                assertEquals("failed constructor leaked a registered ring",
-                        0, readRingCount(manager));
-                assertEquals("failed constructor leaked totalBytes accounting",
-                        0L, readTotalBytes(manager));
-            }
         });
     }
 
@@ -530,21 +501,4 @@ public class CursorSendEngineTest {
         });
     }
 
-    private static int readRingCount(SegmentManager manager) throws Exception {
-        Field f = SegmentManager.class.getDeclaredField("rings");
-        f.setAccessible(true);
-        ObjList<?> rings = (ObjList<?>) f.get(manager);
-        return rings.size();
-    }
-
-    private static long readTotalBytes(SegmentManager manager) throws Exception {
-        Field f = SegmentManager.class.getDeclaredField("totalBytes");
-        f.setAccessible(true);
-        Field lockF = SegmentManager.class.getDeclaredField("lock");
-        lockF.setAccessible(true);
-        Object lock = lockF.get(manager);
-        synchronized (lock) {
-            return f.getLong(manager);
-        }
-    }
 }

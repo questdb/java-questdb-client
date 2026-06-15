@@ -100,11 +100,6 @@ public final class SegmentManager implements QuietCloseable {
     // registered flag check inside the trim block closes for watermark writes
     // and totalBytes accounting.
     volatile Runnable beforeTrimSyncHook;
-    // Test seam: runs under lock after register() has published the RingEntry
-    // and accounted its bytes, but before register() returns. Null in
-    // production; used to verify register() rolls back a partially-published
-    // entry if post-publication work throws.
-    volatile Runnable afterRegisterPublishSyncHook;
     private long lastDiskFullLogNs;
     private volatile boolean running;
     // Total bytes currently allocated across every segment owned by every
@@ -240,11 +235,6 @@ public final class SegmentManager implements QuietCloseable {
      * {@code lowestSurvivingBaseSeq - 1}.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark) {
-        // Do throwable setup before publishing the entry. Once a RingEntry is
-        // visible in rings, the worker can snapshot it after this method drops
-        // lock, so register() must either fully commit the entry or roll it
-        // back before returning with an exception.
-        //
         // Account for bytes the ring already owns when it joins. A recovered
         // ring (post-restart, orphan adoption) can come up at-or-above the cap;
         // without this seed, totalBytes stays at 0 and the per-tick cap check
@@ -259,36 +249,14 @@ public final class SegmentManager implements QuietCloseable {
         long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
         Runnable managerWakeup = this::wakeWorker;
         RingEntry e = new RingEntry(ring, dir, watermark);
-        boolean published = false;
-        boolean accounted = false;
+        // After rings.add makes the entry visible, only non-throwing state
+        // commits may remain. ObjList growth, if needed, happens before that.
         synchronized (lock) {
-            try {
-                if (dir != null) {
-                    advanceFileGeneration(minNextGeneration);
-                }
-                rings.add(e);
-                published = true;
-                totalBytes += ringBytes;
-                accounted = true;
-                Runnable hook = afterRegisterPublishSyncHook;
-                if (hook != null) {
-                    hook.run();
-                }
-            } catch (Throwable t) {
-                if (published) {
-                    e.registered = false;
-                    for (int i = 0, n = rings.size(); i < n; i++) {
-                        if (rings.get(i) == e) {
-                            rings.remove(i);
-                            break;
-                        }
-                    }
-                    if (accounted) {
-                        totalBytes -= ringBytes;
-                    }
-                }
-                throw t;
+            if (dir != null) {
+                advanceFileGeneration(minNextGeneration);
             }
+            rings.add(e);
+            totalBytes += ringBytes;
         }
         ring.setManagerWakeup(managerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
@@ -312,11 +280,6 @@ public final class SegmentManager implements QuietCloseable {
     @TestOnly
     public void setBeforeTrimSyncHook(Runnable hook) {
         this.beforeTrimSyncHook = hook;
-    }
-
-    @TestOnly
-    public void setAfterRegisterPublishSyncHook(Runnable hook) {
-        this.afterRegisterPublishSyncHook = hook;
     }
 
     private void advanceFileGeneration(long minNext) {
