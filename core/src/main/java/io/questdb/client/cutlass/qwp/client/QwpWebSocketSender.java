@@ -982,11 +982,14 @@ public class QwpWebSocketSender implements Sender {
                     //    everything we just published, or until the
                     //    configured timeout elapses. closeFlushTimeoutMillis
                     //    <= 0 opts out (fast close, may lose memory-mode
-                    //    data on JVM exit). Errors still surface via the
-                    //    safety-net checkError() above and via the async
-                    //    error handler.
+                    //    data on JVM exit). Pass the same ownership flag the
+                    //    step-2 safety net used: when the custom handler
+                    //    already owns the terminal, the drain must stop on it
+                    //    without re-throwing (re-throwing would double-signal
+                    //    an error the user already handled). Otherwise the
+                    //    drain keeps the loud safety net and surfaces it.
                     if (closeFlushTimeoutMillis > 0L) {
-                        drainOnClose();
+                        drainOnClose(alreadyDeliveredToCustomHandler);
                     }
                 }
             } catch (Throwable t) {
@@ -2643,8 +2646,30 @@ public class QwpWebSocketSender implements Sender {
      * SF-mode users can recover the unacked tail by reopening a sender on
      * the same SF directory; memory-mode users have no recovery path and
      * must treat this as fatal.
+     * <p>
+     * A latched terminal error means the server will never ACK up to
+     * {@code target}, so the drain must stop on it regardless. Whether it is
+     * also re-thrown from close() is a separate surfacing policy that mirrors
+     * the step-2 safety net in {@link #close()}:
+     * <ul>
+     *   <li>{@code errorOwnedByCustomHandler == true}: a custom error handler
+     *   has already delivered this terminal to the user, so stop silently —
+     *   re-throwing here would double-signal it (the M3 drainOnClose
+     *   double-signal).</li>
+     *   <li>{@code errorOwnedByCustomHandler == false}: re-throw via
+     *   {@code checkError()} to preserve the loud safety net (a
+     *   config-string-only caller's only channel). The throw also breaks the
+     *   loop; an error a synchronous {@code flush()}/{@code at()} caller
+     *   already owns is then suppressed by close()'s
+     *   {@code terminalError == alreadyOwnedByUser} check, so it is not
+     *   double-signalled either.</li>
+     * </ul>
+     *
+     * @param errorOwnedByCustomHandler whether the async dispatcher has
+     *                                  already delivered a terminal to a
+     *                                  user-installed handler
      */
-    private void drainOnClose() {
+    private void drainOnClose(boolean errorOwnedByCustomHandler) {
         if (closeFlushTimeoutMillis <= 0L) {
             return;
         }
@@ -2654,7 +2679,15 @@ public class QwpWebSocketSender implements Sender {
         }
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
         while (cursorEngine.ackedFsn() < target) {
-            cursorSendLoop.checkError();
+            // Stop on a latched terminal (acks will never reach target);
+            // surface it only when no other channel already delivered it.
+            if (errorOwnedByCustomHandler) {
+                if (cursorSendLoop.getTerminalError() != null) {
+                    return;
+                }
+            } else {
+                cursorSendLoop.checkError();
+            }
             if (System.nanoTime() >= deadlineNanos) {
                 long acked = cursorEngine.ackedFsn();
                 LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost",

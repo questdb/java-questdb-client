@@ -45,8 +45,10 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * RED regression test for finding <b>M3</b> (close-error-race review): a
- * pre-existing {@code drainOnClose()} double-signal.
+ * Regression test for finding <b>M3</b> (close-error-race review): a
+ * pre-existing {@code drainOnClose()} double-signal. Written RED, now green
+ * after the drain stopped re-surfacing a terminal a custom handler already
+ * owns; guards against the double-signal regressing.
  * <p>
  * When ALL of the following hold:
  * <ul>
@@ -83,6 +85,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * makes {@code drainOnClose()} return at its first guard so the buggy
  * {@code checkError()} is never reached. This test flips that one knob on and
  * adds the unacked tail.
+ * <p>
+ * Fix: {@code drainOnClose(boolean)} still stops on a latched terminal (acks
+ * will never reach target) but re-throws only when no custom handler owns the
+ * error, mirroring the step-2 safety-net gate.
  * <p>
  * Determinism: the server fixture holds the HALT rejection behind a gate that
  * the test releases only AFTER {@code flush()} has returned. Without the gate,
