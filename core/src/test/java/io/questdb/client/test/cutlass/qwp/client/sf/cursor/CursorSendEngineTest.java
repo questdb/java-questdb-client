@@ -28,6 +28,8 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
@@ -37,6 +39,9 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
@@ -187,6 +192,50 @@ public class CursorSendEngineTest {
             CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096);
             engine.close();
             engine.close();
+        });
+    }
+
+    @Test
+    public void testConstructorFailureAfterOwnedManagerStartCleansResources() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            SegmentManager manager = new SegmentManager(4096);
+            poisonRegisterGeneration(manager);
+
+            Throwable thrown = invokeOwnedPrivateConstructorExpectingFailure(tmpDir, 4096, manager);
+            assertTrue("register sabotage should surface from constructor catch: " + thrown,
+                    thrown instanceof NullPointerException);
+
+            assertNull("owned manager worker must be stopped by constructor catch",
+                    workerThread(manager));
+            assertSlotCanBeReacquired(tmpDir);
+        });
+    }
+
+    @Test
+    public void testConstructorFailureWithSharedManagerReleasesSlotButKeepsManagerRunning() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            SegmentManager manager = new SegmentManager(4096);
+            try {
+                manager.start();
+                Thread originalWorker = workerThread(manager);
+                assertNotNull("shared manager must be running before constructor", originalWorker);
+                assertTrue("shared manager worker must be alive before constructor",
+                        originalWorker.isAlive());
+
+                poisonRegisterGeneration(manager);
+                Throwable thrown = invokeSharedConstructorExpectingFailure(tmpDir, 4096, manager);
+                assertTrue("register sabotage should surface from constructor catch: " + thrown,
+                        thrown instanceof NullPointerException);
+
+                Thread stillOwnedByCaller = workerThread(manager);
+                assertNotNull("constructor catch must not close caller-owned manager",
+                        stillOwnedByCaller);
+                assertTrue("caller-owned manager worker must remain alive",
+                        stillOwnedByCaller.isAlive());
+                assertSlotCanBeReacquired(tmpDir);
+            } finally {
+                manager.close();
+            }
         });
     }
 
@@ -499,6 +548,53 @@ public class CursorSendEngineTest {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    private static void assertSlotCanBeReacquired(String sfDir) {
+        try (SlotLock ignored = SlotLock.acquire(sfDir)) {
+            // good
+        }
+    }
+
+    private static Throwable invokeOwnedPrivateConstructorExpectingFailure(
+            String sfDir, long segmentSizeBytes, SegmentManager manager) throws Exception {
+        Constructor<CursorSendEngine> ctor = CursorSendEngine.class.getDeclaredConstructor(
+                String.class, long.class, SegmentManager.class, boolean.class, long.class);
+        ctor.setAccessible(true);
+        try {
+            ctor.newInstance(sfDir, segmentSizeBytes, manager, true,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+            fail("expected constructor failure");
+            return null;
+        } catch (InvocationTargetException e) {
+            return e.getCause();
+        }
+    }
+
+    private static Throwable invokeSharedConstructorExpectingFailure(
+            String sfDir, long segmentSizeBytes, SegmentManager manager) {
+        try {
+            new CursorSendEngine(sfDir, segmentSizeBytes, manager);
+            fail("expected constructor failure");
+            return null;
+        } catch (Throwable t) {
+            return t;
+        }
+    }
+
+    private static void poisonRegisterGeneration(SegmentManager manager) throws Exception {
+        // register() advances fileGeneration before publishing the ring. Nulling
+        // it forces a deterministic constructor failure after the ring and
+        // watermark exist, without adding a production test hook.
+        Field f = SegmentManager.class.getDeclaredField("fileGeneration");
+        f.setAccessible(true);
+        f.set(manager, null);
+    }
+
+    private static Thread workerThread(SegmentManager manager) throws Exception {
+        Field f = SegmentManager.class.getDeclaredField("workerThread");
+        f.setAccessible(true);
+        return (Thread) f.get(manager);
     }
 
 }
