@@ -124,23 +124,23 @@ public final class SegmentManager implements QuietCloseable {
      * Full constructor.
      *
      * @param segmentSizeBytes per-segment file size in bytes
-     * @param pollNanos how often the worker polls each registered ring;
-     *                  default {@link #DEFAULT_POLL_NANOS}
-     * @param maxTotalBytes upper bound on total bytes the manager tracks
-     *                      across all registered rings — counts every segment
-     *                      the ring owns (initial active + sealed + hot
-     *                      spare), including bytes already on disk at
-     *                      register-time (e.g. after recovery or orphan
-     *                      adoption). When provisioning a hot spare would
-     *                      exceed this, the manager skips the install — the
-     *                      requesting ring stays in the
-     *                      {@link SegmentRing#BACKPRESSURE_NO_SPARE} state
-     *                      until ACK-driven trim frees space. Pass
-     *                      {@link #UNLIMITED_TOTAL_BYTES} to disable. Must be
-     *                      at least one {@code segmentSizeBytes}; a sensible
-     *                      lower bound for a single ring is
-     *                      {@code 2 × segmentSizeBytes} so the manager can
-     *                      hold an initial active plus one hot spare.
+     * @param pollNanos        how often the worker polls each registered ring;
+     *                         default {@link #DEFAULT_POLL_NANOS}
+     * @param maxTotalBytes    upper bound on total bytes the manager tracks
+     *                         across all registered rings — counts every segment
+     *                         the ring owns (initial active + sealed + hot
+     *                         spare), including bytes already on disk at
+     *                         register-time (e.g. after recovery or orphan
+     *                         adoption). When provisioning a hot spare would
+     *                         exceed this, the manager skips the install — the
+     *                         requesting ring stays in the
+     *                         {@link SegmentRing#BACKPRESSURE_NO_SPARE} state
+     *                         until ACK-driven trim frees space. Pass
+     *                         {@link #UNLIMITED_TOTAL_BYTES} to disable. Must be
+     *                         at least one {@code segmentSizeBytes}; a sensible
+     *                         lower bound for a single ring is
+     *                         {@code 2 × segmentSizeBytes} so the manager can
+     *                         hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
         if (segmentSizeBytes < MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1) {
@@ -281,14 +281,6 @@ public final class SegmentManager implements QuietCloseable {
         this.beforeTrimSyncHook = hook;
     }
 
-    private void advanceFileGeneration(long minNext) {
-        while (true) {
-            long cur = fileGeneration.get();
-            if (cur >= minNext) break;
-            if (fileGeneration.compareAndSet(cur, minNext)) break;
-        }
-    }
-
     public synchronized void start() {
         if (workerThread != null) {
             throw new IllegalStateException("already started");
@@ -349,6 +341,14 @@ public final class SegmentManager implements QuietCloseable {
             Files.findClose(find);
         }
         return max;
+    }
+
+    private void advanceFileGeneration(long minNext) {
+        while (true) {
+            long cur = fileGeneration.get();
+            if (cur >= minNext) break;
+            if (fileGeneration.compareAndSet(cur, minNext)) break;
+        }
     }
 
     /**
