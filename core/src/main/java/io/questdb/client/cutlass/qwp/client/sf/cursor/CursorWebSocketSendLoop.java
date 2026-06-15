@@ -1207,6 +1207,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             terminalError = t instanceof LineSenderException
                     ? (LineSenderException) t
                     : new LineSenderException("I/O thread failed: " + t.getMessage(), t);
+            // Tell the async dispatcher which SenderError IS the terminal, so
+            // close() can distinguish "the custom handler owns THIS terminal"
+            // from "the custom handler saw some earlier DROP_AND_CONTINUE".
+            // Same instance dispatchError() delivers (the err wrapped here),
+            // so the dispatcher's identity compare matches. Marked under the
+            // write-once latch guard so a stray later HALT cannot re-point it.
+            if (terminalError instanceof LineSenderServerException) {
+                SenderErrorDispatcher d = errorDispatcher;
+                if (d != null) {
+                    d.markTerminal(((LineSenderServerException) terminalError).getServerError());
+                }
+            }
         }
         running = false;
         if (t instanceof LineSenderServerException) {

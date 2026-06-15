@@ -959,23 +959,28 @@ public class QwpWebSocketSender implements Sender {
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
-                    // 2) Safety-net rethrow: surface a latched terminal error
-                    //    only when no other channel has already delivered it
-                    //    to the user. "Already delivered" means either the
-                    //    producer thread saw it synchronously via
-                    //    flush()/append() (checkUnsurfacedError is silent in
-                    //    that case) or the async dispatcher delivered it to a
-                    //    user-installed custom handler at any point in this
-                    //    sender's life (deliveredToCustomHandler, checked
-                    //    here). The latter survives a setErrorHandler(null)
-                    //    cleanup in test helpers -- once the user has owned
-                    //    an error, close() should not double-signal it. The
-                    //    default no-op logging handler does not count as
-                    //    "delivered to user", so a config-string-only caller
-                    //    still gets the loud rethrow on shutdown.
-                    boolean alreadyDeliveredToCustomHandler = errorDispatcher != null
-                            && errorDispatcher.hasDeliveredToCustomHandler();
-                    if (!alreadyDeliveredToCustomHandler) {
+                    // 2) Safety-net rethrow: surface the latched terminal
+                    //    error only when no other channel has already
+                    //    delivered THIS terminal to the user. "Already
+                    //    delivered" means either the producer thread saw it
+                    //    synchronously via flush()/append() (checkUnsurfacedError
+                    //    is silent in that case) or the async dispatcher
+                    //    actually delivered the latched terminal to a
+                    //    user-installed custom handler
+                    //    (hasDeliveredTerminalToCustomHandler, checked here).
+                    //    The test is terminal-specific on purpose: an earlier
+                    //    routine DROP_AND_CONTINUE rejection delivered to the
+                    //    handler must NOT suppress a later genuine HALT
+                    //    terminal (the "any error ever" flag did, silently
+                    //    losing it). It also stays false when the terminal
+                    //    reached only the default handler after a
+                    //    setErrorHandler(null) revert, or is still
+                    //    queued/abandoned behind a slow handler -- so a
+                    //    config-string-only caller, and a reverting caller,
+                    //    both still get the loud rethrow on shutdown.
+                    boolean terminalOwnedByCustomHandler = errorDispatcher != null
+                            && errorDispatcher.hasDeliveredTerminalToCustomHandler();
+                    if (!terminalOwnedByCustomHandler) {
                         cursorSendLoop.checkUnsurfacedError();
                     }
                     // 3) Bounded drain: block until the server has ACK'd
@@ -984,12 +989,12 @@ public class QwpWebSocketSender implements Sender {
                     //    <= 0 opts out (fast close, may lose memory-mode
                     //    data on JVM exit). Pass the same ownership flag the
                     //    step-2 safety net used: when the custom handler
-                    //    already owns the terminal, the drain must stop on it
+                    //    already owns THIS terminal, the drain must stop on it
                     //    without re-throwing (re-throwing would double-signal
                     //    an error the user already handled). Otherwise the
                     //    drain keeps the loud safety net and surfaces it.
                     if (closeFlushTimeoutMillis > 0L) {
-                        drainOnClose(alreadyDeliveredToCustomHandler);
+                        drainOnClose(terminalOwnedByCustomHandler);
                     }
                 }
             } catch (Throwable t) {
