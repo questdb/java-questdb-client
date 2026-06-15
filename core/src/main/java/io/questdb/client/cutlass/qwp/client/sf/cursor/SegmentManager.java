@@ -248,8 +248,8 @@ public final class SegmentManager implements QuietCloseable {
         long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
         Runnable managerWakeup = this::wakeWorker;
         RingEntry e = new RingEntry(ring, dir, watermark);
-        // After rings.add makes the entry visible, only non-throwing state
-        // commits may remain. ObjList growth, if needed, happens before that.
+        // ObjList.add either throws before storing e or makes the entry visible.
+        // Once visible, only non-throwing state commits may remain.
         synchronized (lock) {
             if (dir != null) {
                 advanceFileGeneration(minNextGeneration);
