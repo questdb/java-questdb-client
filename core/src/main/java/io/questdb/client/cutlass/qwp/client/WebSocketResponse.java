@@ -75,7 +75,7 @@ public class WebSocketResponse {
      */
     public static final byte STATUS_DURABLE_ACK = 0x02;
     public static final byte STATUS_INTERNAL_ERROR = 0x06;
-    // Status codes (must match docs/qwp/wire-ingress.md)
+    // Status codes (must match https://questdb.com/docs/connect/wire-protocols/qwp-ingress-websocket/)
     public static final byte STATUS_OK = 0x00;
     public static final byte STATUS_PARSE_ERROR = 0x05;
     public static final byte STATUS_SCHEMA_MISMATCH = 0x03;

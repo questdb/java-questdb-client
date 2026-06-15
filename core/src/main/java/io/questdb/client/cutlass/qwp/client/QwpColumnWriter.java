@@ -279,24 +279,14 @@ class QwpColumnWriter {
         }
     }
 
-    private void writeTableHeaderWithSchema(String tableName, int rowCount, int schemaId, QwpColumnDef[] columns) {
+    private void writeTableHeader(String tableName, int rowCount, QwpColumnDef[] columns) {
         buffer.putString(tableName);
         buffer.putVarint(rowCount);
         buffer.putVarint(columns.length);
-        buffer.putByte(SCHEMA_MODE_FULL);
-        buffer.putVarint(schemaId);
         for (QwpColumnDef col : columns) {
             buffer.putString(col.getName());
             buffer.putByte(col.getWireTypeCode());
         }
-    }
-
-    private void writeTableHeaderWithSchemaRef(String tableName, int rowCount, int schemaId, int columnCount) {
-        buffer.putString(tableName);
-        buffer.putVarint(rowCount);
-        buffer.putVarint(columnCount);
-        buffer.putByte(SCHEMA_MODE_REFERENCE);
-        buffer.putVarint(schemaId);
     }
 
     private void writeTimestampColumn(long addr, int count, boolean useGorilla) {
@@ -325,12 +315,8 @@ class QwpColumnWriter {
         }
     }
 
-    void encodeTable(QwpTableBuffer tableBuffer, boolean useSchemaRef, boolean useGlobalSymbols, boolean useGorilla) {
-        int schemaId = tableBuffer.getSchemaId();
-        if (schemaId < 0) {
-            schemaId = 0;
-        }
-        encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useSchemaRef, useGlobalSymbols, useGorilla, schemaId);
+    void encodeTable(QwpTableBuffer tableBuffer, boolean useGlobalSymbols, boolean useGorilla) {
+        encodeTable(tableBuffer, tableBuffer.getRowCount(), null, null, null, useGlobalSymbols, useGorilla);
     }
 
     void encodeTable(
@@ -339,23 +325,12 @@ class QwpColumnWriter {
             int[] limitedValueCounts,
             long[] limitedStringDataSizes,
             int[] limitedSymbolDictionarySizes,
-            boolean useSchemaRef,
             boolean useGlobalSymbols,
-            boolean useGorilla,
-            int schemaId
+            boolean useGorilla
     ) {
         QwpColumnDef[] columnDefs = tableBuffer.getColumnDefs();
 
-        if (useSchemaRef) {
-            writeTableHeaderWithSchemaRef(
-                    tableBuffer.getTableName(),
-                    rowCount,
-                    schemaId,
-                    columnDefs.length
-            );
-        } else {
-            writeTableHeaderWithSchema(tableBuffer.getTableName(), rowCount, schemaId, columnDefs);
-        }
+        writeTableHeader(tableBuffer.getTableName(), rowCount, columnDefs);
 
         for (int i = 0; i < tableBuffer.getColumnCount(); i++) {
             QwpTableBuffer.ColumnBuffer col = tableBuffer.getColumn(i);

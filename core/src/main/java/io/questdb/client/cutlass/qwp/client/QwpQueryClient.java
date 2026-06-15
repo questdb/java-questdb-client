@@ -63,7 +63,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Multi-endpoint routing: the connection string accepts a comma-separated list
  * of {@code addr=host:port[,host:port...]} endpoints plus a {@code target=}
  * filter ({@code any} | {@code primary} | {@code replica}). {@link #connect()}
- * walks the list in order, reads the server's role from the v2
+ * walks the list in order, reads the server's role from the
  * {@code SERVER_INFO} frame, and picks the first endpoint matching the target.
  * When every endpoint reports a role the filter rejects, {@link #connect()}
  * throws {@link QwpRoleMismatchException} with the last observed info attached
@@ -76,7 +76,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@link QwpColumnBatchHandler#onFailoverReset} callback just before replayed
  * batches start arriving (batch_seq restarts at 0 on the new node), so
  * accumulating handlers can discard rows the old connection already delivered.
- * {@code failover=off} restores the pre-v2 behaviour -- terminal failures
+ * {@code failover=off} disables this -- terminal failures
  * surface immediately through {@link QwpColumnBatchHandler#onError}.
  * <p>
  * Terminal-failure latching: transport- or protocol-level faults detected by
@@ -109,7 +109,7 @@ public class QwpQueryClient implements QuietCloseable {
      * sanity bound.
      */
     public static final int MAX_BATCH_ROWS_UPPER_BOUND = 1_048_576;
-    public static final int QWP_MAX_VERSION = QwpConstants.MAX_SUPPORTED_VERSION;
+    public static final int QWP_MAX_VERSION = QwpConstants.VERSION;
     public static final String TARGET_ANY = "any";
     public static final String TARGET_PRIMARY = "primary";
     public static final String TARGET_REPLICA = "replica";
@@ -141,7 +141,7 @@ public class QwpQueryClient implements QuietCloseable {
     private static final long DEFAULT_FAILOVER_MAX_DURATION_MS = 30_000L;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
     /**
-     * How long {@link #connect()} waits to read the v2 {@code SERVER_INFO} frame
+     * How long {@link #connect()} waits to read the {@code SERVER_INFO} frame
      * from each endpoint before giving up and moving to the next. 5 seconds is
      * comfortable on a WAN; the server writes SERVER_INFO into the same send
      * buffer as the 101 upgrade response so under normal conditions the frame
@@ -262,9 +262,9 @@ public class QwpQueryClient implements QuietCloseable {
     // worker thread's post-requestId read.
     private volatile boolean pendingCancel;
     // Decoded SERVER_INFO from the current connection's handshake. Null before
-    // connect() has succeeded, and on connections that negotiated v1 (which
-    // doesn't emit the frame). Volatile so the I/O thread's read on the
-    // {@code onFailoverReset} path sees the latest reconnect.
+    // connect() has succeeded; non-null on every established connection (the
+    // server always emits the frame). Volatile so getServerInfo(), callable
+    // from any thread, observes the latest reconnect's value.
     private volatile QwpServerInfo serverInfo;
     private int serverInfoTimeoutMs = DEFAULT_SERVER_INFO_TIMEOUT_MS;
     // Maximum time close() will wait for the I/O thread to exit before giving up
@@ -312,7 +312,7 @@ public class QwpQueryClient implements QuietCloseable {
      *       Per {@code failover.md} section 1, the comma form and repeated {@code addr=} keys
      *       both accumulate into a single ordered list; empty entries are rejected.</li>
      *   <li>{@code target=any|primary|replica} -- endpoint filter applied against the role
-     *       byte from the v2 {@code SERVER_INFO} frame. Default {@code any}. {@code primary}
+     *       byte from the {@code SERVER_INFO} frame. Default {@code any}. {@code primary}
      *       accepts {@code PRIMARY}, {@code PRIMARY_CATCHUP} and {@code STANDALONE}.</li>
      *   <li>{@code failover=on|off} -- default {@code on}. On transport failure during
      *       {@link #execute}, reconnect to another endpoint and re-submit the query.
@@ -602,7 +602,6 @@ public class QwpQueryClient implements QuietCloseable {
                 case "max_buf_size":
                 case "max_datagram_size":
                 case "max_name_len":
-                case "max_schemas_per_connection":
                 case "multicast_ttl":
                 case "pass":
                 case "protocol_version":
@@ -826,7 +825,7 @@ public class QwpQueryClient implements QuietCloseable {
      * performs the WebSocket upgrade. Must be called before any query is submitted.
      * <p>
      * Walks the endpoint list in order: for each entry it opens the TCP socket,
-     * runs the HTTP upgrade, reads the v2 {@code SERVER_INFO} frame, and accepts
+     * runs the HTTP upgrade, reads the {@code SERVER_INFO} frame, and accepts
      * the endpoint if the server's role matches the configured target. An
      * endpoint that matches becomes the bound connection and the I/O thread is
      * spawned. An endpoint whose role doesn't match is closed and the walk
@@ -855,7 +854,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
         QwpServerInfo lastObservedMismatch = null;
         QwpIngressRoleRejectedException lastUpgradeRoleReject = null;
-        boolean sawV1Mismatch = false;
         Throwable lastTransportError = null;
         while (true) {
             int i = hostTracker.pickNext();
@@ -884,19 +882,13 @@ public class QwpQueryClient implements QuietCloseable {
                 cleanupFailedConnect();
                 continue;
             }
+            // info is non-null: connectToEndpoint() returns only after
+            // receiveServerInfoSync() set serverInfo (it returns non-null or throws).
             QwpServerInfo info = serverInfo;
-            if (info != null && (info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
+            if ((info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
                 hostTracker.recordZone(i, info.getZoneId());
             }
-            if (!TARGET_ANY.equals(target) && info == null) {
-                sawV1Mismatch = true;
-                hostTracker.recordRoleReject(i, false);
-                LOG.info("QwpQueryClient {}:{} negotiated v1 (no SERVER_INFO) and target={} requires v2; trying next",
-                        ep.host, ep.port, target);
-                cleanupFailedConnect();
-                continue;
-            }
-            if (info != null && !matchesTarget(info.getRole(), target)) {
+            if (!matchesTarget(info.getRole(), target)) {
                 lastObservedMismatch = info;
                 boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
                 hostTracker.recordRoleReject(i, isTransient);
@@ -918,14 +910,6 @@ public class QwpQueryClient implements QuietCloseable {
                     "no endpoint matches target=" + target + "; last observed role="
                             + QwpServerInfo.roleName(lastObservedMismatch.getRole())
                             + " cluster=" + lastObservedMismatch.getClusterId()
-            );
-        }
-        if (sawV1Mismatch) {
-            throw new QwpRoleMismatchException(
-                    target,
-                    null,
-                    "no endpoint matches target=" + target
-                            + "; at least one endpoint negotiated v1 and cannot supply a role"
             );
         }
         if (lastUpgradeRoleReject != null) {
@@ -1061,8 +1045,7 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * Returns the {@link QwpServerInfo} decoded from the currently-bound
-     * server's {@code SERVER_INFO} frame, or {@code null} if the server
-     * negotiated the v1 protocol (no frame sent) or the client is not
+     * server's {@code SERVER_INFO} frame, or {@code null} if the client is not
      * connected. The value is refreshed on every successful failover reconnect.
      */
     public QwpServerInfo getServerInfo() {
@@ -1309,7 +1292,7 @@ public class QwpQueryClient implements QuietCloseable {
      * Useful for latency-sensitive streaming consumers that want to start
      * processing the first row as soon as possible -- a smaller cap flushes
      * the first batch sooner, at the cost of more per-batch overhead (WS
-     * header, send syscall, schema-reference decode). The server clamps down
+     * header, send syscall). The server clamps down
      * to its own hard limit; a value of {@code 0} (default) omits the header
      * and the server uses its own cap.
      * <p>
@@ -1326,7 +1309,7 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Overrides the {@link #DEFAULT_SERVER_INFO_TIMEOUT_MS} wait for the v2
+     * Overrides the {@link #DEFAULT_SERVER_INFO_TIMEOUT_MS} wait for the
      * {@code SERVER_INFO} frame. Must be called before {@link #connect}.
      */
     public void withServerInfoTimeout(int ms) {
@@ -1610,16 +1593,12 @@ public class QwpQueryClient implements QuietCloseable {
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
         negotiatedZstdLevel = webSocketClient.getServerNegotiatedZstdLevel();
 
-        // v2 servers send SERVER_INFO as the first WebSocket frame after the
+        // The server sends SERVER_INFO as the first WebSocket frame after the
         // upgrade response. Consume it synchronously on the user thread before
         // spawning the I/O thread, so the role filter can run without any
         // cross-thread synchronisation and so a mismatched role doesn't waste
         // the I/O thread setup + teardown.
-        if (negotiatedQwpVersion >= QwpConstants.VERSION_2) {
-            serverInfo = receiveServerInfoSync();
-        } else {
-            serverInfo = null;
-        }
+        serverInfo = receiveServerInfoSync();
 
         // Early probe: if we told the server we can accept zstd, make sure the
         // bundled native library actually provides the decompression symbols
@@ -1926,7 +1905,6 @@ public class QwpQueryClient implements QuietCloseable {
         lastCloseTimedOut = false;
         hostTracker.beginRound(false);
         QwpServerInfo lastMismatch = null;
-        boolean sawV1Mismatch = false;
         Throwable lastError = null;
         boolean retriedAfterReset = false;
         while (true) {
@@ -1957,17 +1935,13 @@ public class QwpQueryClient implements QuietCloseable {
                 cleanupFailedConnect();
                 continue;
             }
+            // info is non-null: connectToEndpoint() returns only after
+            // receiveServerInfoSync() set serverInfo (it returns non-null or throws).
             QwpServerInfo info = serverInfo;
-            if (info != null && (info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
+            if ((info.getCapabilities() & QwpEgressMsgKind.CAP_ZONE) != 0) {
                 hostTracker.recordZone(i, info.getZoneId());
             }
-            if (!TARGET_ANY.equals(target) && info == null) {
-                sawV1Mismatch = true;
-                hostTracker.recordRoleReject(i, false);
-                cleanupFailedConnect();
-                continue;
-            }
-            if (info != null && !matchesTarget(info.getRole(), target)) {
+            if (!matchesTarget(info.getRole(), target)) {
                 lastMismatch = info;
                 boolean isTransient = info.getRole() == QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
                 hostTracker.recordRoleReject(i, isTransient);
@@ -1984,11 +1958,6 @@ public class QwpQueryClient implements QuietCloseable {
             throw new QwpRoleMismatchException(target, lastMismatch,
                     "no endpoint matches target=" + target + " on failover; last observed role="
                             + QwpServerInfo.roleName(lastMismatch.getRole()));
-        }
-        if (sawV1Mismatch) {
-            throw new QwpRoleMismatchException(target, null,
-                    "no endpoint matches target=" + target
-                            + " on failover; at least one endpoint negotiated v1 and cannot supply a role");
         }
         throw new HttpClientException(
                 "all QWP endpoints unreachable on failover [count=" + total

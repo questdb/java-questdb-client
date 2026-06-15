@@ -86,14 +86,6 @@ public final class QwpConstants {
      */
     public static final int MAX_TABLE_NAME_LENGTH = 127;
     /**
-     * Schema mode: Full schema included.
-     */
-    public static final byte SCHEMA_MODE_FULL = 0x00;
-    /**
-     * Schema mode: Schema reference (ID lookup).
-     */
-    public static final byte SCHEMA_MODE_REFERENCE = 0x01;
-    /**
      * Status byte on a {@code QUERY_ERROR} frame: the query was cancelled,
      * either by a client {@code CANCEL} frame or by explicit server-side
      * cancel. Egress extension of the ingress {@code STATUS_*} namespace
@@ -208,29 +200,12 @@ public final class QwpConstants {
      */
     public static final byte TYPE_VARCHAR = 0x0F;
     /**
-     * Current protocol version.
+     * The QWP protocol version. The wire carries it in the per-frame header at
+     * offset 4; both directions write {@code 1} and validate {@code == 1}. The
+     * {@code X-QWP-Max-Version} handshake header still negotiates the version,
+     * leaving room for a future bump.
      */
-    public static final byte VERSION_1 = 1;
-    /**
-     * Protocol v2 adds an unsolicited {@code SERVER_INFO} control frame
-     * delivered as the first WebSocket frame after the 101 upgrade. Servers that
-     * advertise v2 send the frame automatically; v2 clients must consume it
-     * before submitting the first query and may use the role value it carries
-     * to route reads to primary vs replica.
-     */
-    public static final byte VERSION_2 = 2;
-    /**
-     * Maximum protocol version the ingest path advertises / accepts. Pinned to
-     * v1 because the v2 bump only adds an egress control frame; bumping the
-     * ingest wire to v2 would silently round-trip a version byte that no v1
-     * server can accept.
-     */
-    public static final byte MAX_SUPPORTED_INGEST_VERSION = VERSION_1;
-    /**
-     * Maximum protocol version supported by this client on the egress path.
-     * Ingest pins to {@link #MAX_SUPPORTED_INGEST_VERSION}.
-     */
-    public static final byte MAX_SUPPORTED_VERSION = VERSION_2;
+    public static final byte VERSION = 1;
 
     private QwpConstants() {
         // utility class

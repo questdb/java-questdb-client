@@ -214,11 +214,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             decodeAndEmitError(payloadPtr, payloadLen);
             currentQueryDone = true;
         } else if (msgKind == QwpEgressMsgKind.CACHE_RESET) {
-            // Server reached a configured soft cap on the connection-scoped
-            // SYMBOL dict or schema-fingerprint cache. Drop the indicated
-            // caches on this side so the next RESULT_BATCH's deltaStart and
-            // schema-reference ids line up with the server's fresh counter.
-            // No user-visible event -- CACHE_RESET never arrives between the
+            // Server reached its configured soft cap on the connection-scoped
+            // SYMBOL dict. Drop the dict on this side so the next RESULT_BATCH's
+            // deltaStart lines up with the server's fresh counter. No
+            // user-visible event -- CACHE_RESET never arrives between the
             // RESULT_BATCH / RESULT_END / EXEC_DONE / QUERY_ERROR of a query
             // and the user callback, only after it.
             handleCacheReset(payloadPtr, payloadLen);
@@ -318,6 +317,10 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
                 currentQueryDone = false;
                 currentRequestId = req.requestId;
                 creditEnabled = req.initialCredit > 0L;
+                // The schema rides the first RESULT_BATCH (batch_seq == 0) of each
+                // query; invalidate any schema left from the prior query so a
+                // continuation batch can't bind rows to a stale schema.
+                decoder.resetQuerySchema();
                 sendQueryRequest(req);
 
                 while (!currentQueryDone && !shutdown) {
@@ -573,8 +576,8 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
 
     /**
      * Decodes a {@code CACHE_RESET} frame body and clears the indicated
-     * connection-scoped caches on the client side. Body is a single byte mask:
-     * bit 0 = SYMBOL dict, bit 1 = schema-fingerprint cache.
+     * connection-scoped caches on the client side. Body is a single byte mask;
+     * bit 0 = SYMBOL dict is the only bit defined.
      */
     private void handleCacheReset(long payloadPtr, int payloadLen) {
         int bodyStart = QwpConstants.HEADER_SIZE + 1; // msg_kind byte consumed by caller

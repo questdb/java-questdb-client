@@ -25,7 +25,7 @@
 package io.questdb.client.cutlass.qwp.client;
 
 /**
- * Decoded {@code SERVER_INFO} frame delivered by a v2 QWP egress server as the
+ * Decoded {@code SERVER_INFO} frame delivered by a QWP egress server as the
  * first WebSocket frame after the upgrade handshake. Immutable; safe to publish
  * across threads without synchronisation once assigned.
  */
