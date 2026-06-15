@@ -87,10 +87,10 @@ public final class SegmentManager implements QuietCloseable {
     private final long segmentSizeBytes;
     // Test seam: runs on the worker thread just before the install path's
     // synchronized(lock) entry (the one that performs installHotSpare + the
-    // totalBytes += segmentSize commit). Null in production; install-race
-    // tests use it to deterministically inject a deregister(ring) call into
-    // the race window closed by the registered flag check inside the install
-    // block.
+    // totalBytes += segmentSize commit). Null in production; tests use it to
+    // pause after the worker has snapshotted a RingEntry and created a spare,
+    // but before ownership/accounting commit. Callers may inject a deregister
+    // or hold this stale worker snapshot while caller-side cleanup runs.
     private volatile Runnable beforeInstallSyncHook;
     // Test seam: runs on the worker thread just before the trim block's
     // synchronized(lock) entry. Null in production; only
