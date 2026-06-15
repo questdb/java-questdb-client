@@ -92,14 +92,14 @@ public final class SegmentManager implements QuietCloseable {
     // SegmentManagerWatermarkDeregisterRaceTest install it, to
     // deterministically inject a deregister(ring) call into the race window
     // closed by the registered flag check inside the install block.
-    volatile Runnable beforeInstallSyncHook;
+    private volatile Runnable beforeInstallSyncHook;
     // Test seam: runs on the worker thread just before the trim block's
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
     // inject a deregister(ring) call into the exact race window that the
     // registered flag check inside the trim block closes for watermark writes
     // and totalBytes accounting.
-    volatile Runnable beforeTrimSyncHook;
+    private volatile Runnable beforeTrimSyncHook;
     private long lastDiskFullLogNs;
     private volatile boolean running;
     // Total bytes currently allocated across every segment owned by every
