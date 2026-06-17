@@ -49,8 +49,24 @@ import java.util.concurrent.locks.ReentrantLock;
  * Connection creation happens outside the lock so a slow connect (TLS
  * handshake, DNS) does not block other borrowers or the housekeeper. The
  * pool tracks in-flight creations via {@code inFlightCreations} so the cap
- * check ({@code allSize + inFlightCreations < maxSize}) stays correct under
- * concurrent borrows.
+ * check ({@code allSize + inFlightCreations + closingSlots < maxSize}) stays
+ * correct under concurrent borrows.
+ * <p>
+ * <b>Store-and-forward slots.</b> When the configuration enables SF
+ * ({@code sf_dir} set), every sender owns an exclusive on-disk slot
+ * {@code <sf_dir>/<sender_id>} guarded by a {@code flock}. A pool reuses one
+ * immutable config string for every sender, so without intervention all
+ * senders would inherit the same {@code sender_id}, point at the same slot,
+ * and every sender after the first would die with "sf slot already in use".
+ * The pool therefore hands each slot a distinct id {@code <base>-<index>},
+ * where {@code <base>} is the configured {@code sender_id} (default
+ * {@code "default"}) and {@code <index>} is a stable pool slot index in
+ * {@code [0, maxSize)}. Indices are reused deterministically (lowest free
+ * first), so across a restart the same slot dirs are re-adopted and any
+ * unacked data they hold is recovered on creation. A slot is only returned
+ * to the free set once its delegate has released the {@code flock}, tracked
+ * via {@code closingSlots} so a concurrent borrow can never reclaim a slot
+ * dir whose lock is still held.
  */
 public final class SenderPool implements AutoCloseable {
 
@@ -63,8 +79,23 @@ public final class SenderPool implements AutoCloseable {
     private final long maxLifetimeMillis;
     private final int maxSize;
     private final int minSize;
+    // SF slot base id (configured sender_id, default "default") when SF is
+    // enabled; null otherwise. Each pooled sender's slot id is
+    // {@code slotBaseId + "-" + slotIndex}.
+    private final String slotBaseId;
+    // Reservation bitmap for SF slot indices [0, maxSize). Guarded by lock.
+    // null when SF is disabled (no per-slot identity needed).
+    private final boolean[] slotInUse;
     private final Condition slotReleased;
+    // True iff the configuration enables store-and-forward (sf_dir set).
+    private final boolean storeAndForward;
     private final ThreadLocal<PooledSender> threadAffine = new ThreadLocal<>();
+    // Slots removed from `all` whose delegate is still releasing its flock.
+    // They keep reserving capacity (and their slotInUse mark) until the
+    // flock drops, so the cap check and the slot allocator stay consistent
+    // and no concurrent borrow can reclaim a slot dir that is still locked.
+    // Guarded by lock. Only ever ticks for SF slots.
+    private int closingSlots;
     private volatile boolean closed;
     private int inFlightCreations;
 
@@ -88,11 +119,23 @@ public final class SenderPool implements AutoCloseable {
         this.all = new ArrayList<>(maxSize);
         this.available = new ArrayDeque<>(maxSize);
         this.slotReleased = lock.newCondition();
-        // Pre-warm minSize connections.
+        // Probe the config once, up front: this validates it eagerly (so a
+        // bad config fails at construction even when minSize == 0) and tells
+        // us whether SF is on and, if so, the base slot id to derive
+        // per-sender ids from.
+        Sender.LineSenderBuilder probe = Sender.builder(configurationString);
+        this.storeAndForward = probe.isStoreAndForwardEnabled();
+        this.slotBaseId = this.storeAndForward ? probe.getConfiguredSenderId() : null;
+        this.slotInUse = this.storeAndForward ? new boolean[maxSize] : null;
+        // Pre-warm minSize connections. Pre-warm runs single-threaded in the
+        // constructor, so slots 0..minSize-1 are reserved directly.
         int built = 0;
         try {
             for (int i = 0; i < minSize; i++) {
-                PooledSender ps = createUnlocked();
+                if (storeAndForward) {
+                    slotInUse[i] = true;
+                }
+                PooledSender ps = createUnlocked(storeAndForward ? i : -1);
                 all.add(ps);
                 available.add(ps);
                 built++;
@@ -124,15 +167,20 @@ public final class SenderPool implements AutoCloseable {
                     s.markInUse();
                     return s;
                 }
-                if (all.size() + inFlightCreations < maxSize) {
+                if (all.size() + inFlightCreations + closingSlots < maxSize) {
                     inFlightCreations++;
+                    // Reserve a slot index under the lock so concurrent
+                    // creations never target the same SF slot dir. -1 when
+                    // SF is off (no per-slot identity needed).
+                    int slotIndex = storeAndForward ? allocateSlotIndex() : -1;
                     lock.unlock();
                     PooledSender created;
                     try {
-                        created = createUnlocked();
+                        created = createUnlocked(slotIndex);
                     } catch (RuntimeException e) {
                         lock.lock();
                         inFlightCreations--;
+                        freeSlotIndex(slotIndex);
                         slotReleased.signal();
                         lock.unlock();
                         throw e;
@@ -143,6 +191,7 @@ public final class SenderPool implements AutoCloseable {
                         // Pool was closed mid-creation -- destroy the new connection
                         // rather than leaking it. Other waiters have been signaled
                         // by close() already.
+                        freeSlotIndex(slotIndex);
                         try {
                             created.delegate().close();
                         } catch (RuntimeException ignored) {
@@ -241,21 +290,44 @@ public final class SenderPool implements AutoCloseable {
      */
     void discardBroken(PooledSender s) {
         s.markInvalidated();
+        boolean reserved = false;
         lock.lock();
         try {
             if (closed) {
                 return;
             }
-            all.remove(s);
-            // Wake one waiter -- the cap check in borrow() uses all.size(),
-            // so a freed slot may now allow a creation attempt.
+            boolean removed = all.remove(s);
+            // For an SF slot, keep its index reserved (move the reservation
+            // from `all` to `closingSlots`) until the delegate below releases
+            // the flock. Capacity stays accounted for, so a concurrent borrow
+            // cannot reclaim this slot dir while its lock is still held.
+            if (removed && s.slotIndex() >= 0) {
+                closingSlots++;
+                reserved = true;
+            }
+            // Wake one waiter -- the cap check in borrow() may now admit a
+            // creation attempt (on a *different* slot).
             slotReleased.signal();
         } finally {
             lock.unlock();
         }
+        // Close the delegate outside the lock (releases the SF flock). Always
+        // attempt it so native resources are freed even on the defensive path
+        // where the wrapper had already left `all`.
         try {
             s.delegate().close();
         } catch (RuntimeException ignored) {
+        }
+        // Flock is released now: return the reserved slot index to the free set.
+        if (reserved) {
+            lock.lock();
+            try {
+                freeSlotIndex(s.slotIndex());
+                closingSlots--;
+                slotReleased.signal();
+            } finally {
+                lock.unlock();
+            }
         }
     }
 
@@ -314,6 +386,11 @@ public final class SenderPool implements AutoCloseable {
                 if (idleExpired || overAge) {
                     it.remove();
                     all.remove(s);
+                    // Keep the SF slot reserved until its flock is released
+                    // below (see discardBroken for the rationale).
+                    if (s.slotIndex() >= 0) {
+                        closingSlots++;
+                    }
                     if (toClose == null) {
                         toClose = new ArrayList<>();
                     }
@@ -328,6 +405,22 @@ public final class SenderPool implements AutoCloseable {
                 try {
                     toClose.get(i).delegate().close();
                 } catch (RuntimeException ignored) {
+                }
+            }
+            // Flocks released: return reserved SF slot indices to the free set.
+            if (storeAndForward) {
+                lock.lock();
+                try {
+                    for (int i = 0, n = toClose.size(); i < n; i++) {
+                        PooledSender s = toClose.get(i);
+                        if (s.slotIndex() >= 0) {
+                            freeSlotIndex(s.slotIndex());
+                            closingSlots--;
+                        }
+                    }
+                    slotReleased.signalAll();
+                } finally {
+                    lock.unlock();
                 }
             }
         }
@@ -366,8 +459,48 @@ public final class SenderPool implements AutoCloseable {
         pinned.close();
     }
 
-    private PooledSender createUnlocked() {
-        Sender raw = Sender.fromConfig(configurationString);
-        return new PooledSender(raw, this);
+    private PooledSender createUnlocked(int slotIndex) {
+        final Sender raw;
+        if (storeAndForward) {
+            // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
+            // so concurrent SF senders sharing one sf_dir never collide on
+            // the slot flock. senderId() is only legal on WebSocket transport,
+            // which is exactly when storeAndForward is true.
+            raw = Sender.builder(configurationString)
+                    .senderId(slotBaseId + "-" + slotIndex)
+                    .build();
+        } else {
+            raw = Sender.fromConfig(configurationString);
+        }
+        return new PooledSender(raw, this, slotIndex);
+    }
+
+    /**
+     * Reserves and returns the lowest free SF slot index. The borrow() cap
+     * check ({@code all.size() + inFlightCreations + closingSlots < maxSize})
+     * guarantees a free index exists whenever a creation is admitted, so this
+     * never fails in practice; the guard throws defensively rather than
+     * silently colliding two senders on one slot dir. Caller must hold
+     * {@code lock}.
+     */
+    private int allocateSlotIndex() {
+        for (int i = 0; i < slotInUse.length; i++) {
+            if (!slotInUse[i]) {
+                slotInUse[i] = true;
+                return i;
+            }
+        }
+        throw new IllegalStateException(
+                "no free SF slot index -- pool capacity invariant violated");
+    }
+
+    /**
+     * Returns an SF slot index to the free set. No-op for non-SF pools and
+     * for the {@code -1} sentinel. Caller must hold {@code lock}.
+     */
+    private void freeSlotIndex(int idx) {
+        if (idx >= 0 && slotInUse != null) {
+            slotInUse[idx] = false;
+        }
     }
 }

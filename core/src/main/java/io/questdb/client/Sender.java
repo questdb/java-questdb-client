@@ -2472,6 +2472,29 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * The slot id ({@code sender_id}) currently configured on this
+         * builder, either parsed from the config string or left at its
+         * {@code "default"} default. Introspection hook for the connection
+         * pool, which derives a distinct per-slot id from this base so that
+         * multiple pooled senders sharing one {@code sf_dir} don't collide
+         * on the slot {@code flock}.
+         */
+        public String getConfiguredSenderId() {
+            return senderId;
+        }
+
+        /**
+         * True iff store-and-forward is enabled (an {@code sf_dir} was set).
+         * Introspection hook for the connection pool: SF senders own an
+         * exclusive on-disk slot, so each pooled sender needs its own slot
+         * id, whereas non-SF (memory-mode / HTTP / TCP) senders share no
+         * such resource and need no per-slot identity.
+         */
+        public boolean isStoreAndForwardEnabled() {
+            return sfDir != null;
+        }
+
+        /**
          * Per-call deadline for {@code Sender.flush()} spinning on a full
          * cursor segment ring waiting for ACKs to drain space. Default
          * 30 s. Lower for fail-fast services that prefer surfacing

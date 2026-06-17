@@ -50,13 +50,21 @@ public final class PooledSender implements Sender {
     private final long createdAtMillis;
     private final Sender delegate;
     private final SenderPool pool;
+    // Index of the store-and-forward slot this wrapper owns within the pool,
+    // or -1 when SF is disabled. Stable for the wrapper's whole life; the
+    // pool returns it to the free set only when the wrapper is evicted from
+    // {@code all} (discardBroken / reapIdle). Used to derive a distinct
+    // {@code sender_id} per pooled sender so concurrent SF senders sharing
+    // one {@code sf_dir} never collide on the slot {@code flock}.
+    private final int slotIndex;
     private volatile long idleSinceMillis;
     private volatile boolean inUse;
     private volatile boolean invalidated;
 
-    PooledSender(Sender delegate, SenderPool pool) {
+    PooledSender(Sender delegate, SenderPool pool, int slotIndex) {
         this.delegate = delegate;
         this.pool = pool;
+        this.slotIndex = slotIndex;
         this.createdAtMillis = System.currentTimeMillis();
         this.idleSinceMillis = this.createdAtMillis;
     }
@@ -370,6 +378,10 @@ public final class PooledSender implements Sender {
 
     long createdAtMillis() {
         return createdAtMillis;
+    }
+
+    int slotIndex() {
+        return slotIndex;
     }
 
     Sender delegate() {
