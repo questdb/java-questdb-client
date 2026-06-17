@@ -52,6 +52,46 @@ import java.util.concurrent.atomic.AtomicReference;
 public class QwpResultBatchDecoderHardeningTest {
 
     /**
+     * The per-dimension bound matches the server's {@code DIM_MAX_LEN}
+     * ({@code (1 << 28) - 1}): an empty array carrying a dimension exactly at
+     * that ceiling decodes, while one element past it is rejected. Pins the
+     * boundary so the client accepts every shape the server can emit and no
+     * more. The 0-length sibling keeps the element-count product at 0, so this
+     * exercises the per-dimension cap rather than the product cap.
+     */
+    @Test
+    public void testArrayDimAtServerLimitBoundary() throws Exception {
+        final int dimMaxLen = (1 << 28) - 1;
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // {0, DIM_MAX_LEN}: empty array (product 0) with a sibling at the
+                // server's per-dimension ceiling -- decodes without error.
+                int len = writeArrayResultBatchWithDims(staging, new int[]{0, dimMaxLen});
+                buffer.copyFromPayload(staging, len);
+                decoder.decode(buffer);
+
+                // {0, DIM_MAX_LEN + 1}: one past the ceiling -- rejected.
+                len = writeArrayResultBatchWithDims(staging, new int[]{0, dimMaxLen + 1});
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject an ARRAY dim above DIM_MAX_LEN");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error must blame the ARRAY dim: " + expected.getMessage(),
+                            expected.getMessage().contains("ARRAY dim"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
      * A 0-length dimension is a valid empty array (cardinality 0), distinct
      * from a NULL array (carried in the null bitmap), so {@code {0, 5}} must
      * decode without error. The original concern -- that a 0 collapses the
