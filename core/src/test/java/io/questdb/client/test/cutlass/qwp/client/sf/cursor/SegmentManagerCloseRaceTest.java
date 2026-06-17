@@ -27,7 +27,9 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.std.bytes.DirectByteSink;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.str.DirectUtf8Sink;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
@@ -36,6 +38,10 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.nio.file.Paths;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Concurrent regression for the {@code SegmentManager} worker race vs
@@ -130,6 +136,76 @@ public class SegmentManagerCloseRaceTest {
         });
     }
 
+    @Test(timeout = 15_000L)
+    public void testCloseDoesNotFreePathScratchWhenWorkerStillAlive() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            String slot = tmpDir + "/timeout-slot";
+            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
+            SegmentRing ring = new SegmentRing(initial, segSize);
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            boolean managerClosed = false;
+            try {
+                manager.register(ring, slot);
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                manager.start();
+                Assert.assertTrue("worker did not reach install hook",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+                Assert.assertTrue("precondition: path scratch should be allocated",
+                        readPathScratchImpl(manager) != 0L);
+
+                // Exercise the same branch as a timed-out join without making
+                // the test sleep for 5 seconds: join() returns while the worker
+                // is still alive. close() must leave worker-owned native memory
+                // alone so the worker can resume safely.
+                Thread.currentThread().interrupt();
+                manager.close();
+                Assert.assertTrue("close should preserve interrupted status",
+                        Thread.interrupted());
+                Thread worker = readWorkerThread(manager);
+                Assert.assertTrue("worker should still be tracked after incomplete close",
+                        worker != null && worker.isAlive());
+                Assert.assertTrue("path scratch was freed while worker was still alive",
+                        readPathScratchImpl(manager) != 0L);
+
+                releaseWorker.countDown();
+                manager.close();
+                managerClosed = true;
+                Assert.assertNull("successful close should clear workerThread",
+                        readWorkerThread(manager));
+                Assert.assertEquals("successful close should free path scratch",
+                        0L, readPathScratchImpl(manager));
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                manager.setBeforeInstallSyncHook(null);
+                releaseWorker.countDown();
+                if (!managerClosed) {
+                    Thread.interrupted();
+                    manager.close();
+                }
+                ring.close();
+            }
+        });
+    }
+
     private static void cleanupRecursively(String dir) {
         if (!Files.exists(dir)) return;
         long find = Files.findFirst(dir);
@@ -151,5 +227,23 @@ public class SegmentManagerCloseRaceTest {
         } finally {
             Files.findClose(find);
         }
+    }
+
+    private static long readPathScratchImpl(SegmentManager manager) throws Exception {
+        Field pathScratchF = SegmentManager.class.getDeclaredField("pathScratch");
+        pathScratchF.setAccessible(true);
+        DirectUtf8Sink pathScratch = (DirectUtf8Sink) pathScratchF.get(manager);
+        Field sinkF = DirectUtf8Sink.class.getDeclaredField("sink");
+        sinkF.setAccessible(true);
+        DirectByteSink sink = (DirectByteSink) sinkF.get(pathScratch);
+        Field implF = DirectByteSink.class.getDeclaredField("impl");
+        implF.setAccessible(true);
+        return implF.getLong(sink);
+    }
+
+    private static Thread readWorkerThread(SegmentManager manager) throws Exception {
+        Field workerThreadF = SegmentManager.class.getDeclaredField("workerThread");
+        workerThreadF.setAccessible(true);
+        return (Thread) workerThreadF.get(manager);
     }
 }
