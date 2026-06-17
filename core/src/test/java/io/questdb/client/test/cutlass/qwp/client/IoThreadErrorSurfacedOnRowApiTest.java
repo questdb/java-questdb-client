@@ -80,7 +80,7 @@ public class IoThreadErrorSurfacedOnRowApiTest {
                 sender.flush();
 
                 // Wait for the I/O thread to record the error. After this,
-                // cursorSendLoop.lastError is populated and the loop has
+                // cursorSendLoop.terminalError is populated and the loop has
                 // exited.
                 QwpWebSocketSender wss = (QwpWebSocketSender) sender;
                 long deadline = System.currentTimeMillis() + 3_000L;

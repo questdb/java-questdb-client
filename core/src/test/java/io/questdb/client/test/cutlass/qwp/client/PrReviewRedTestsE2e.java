@@ -66,7 +66,7 @@ public class PrReviewRedTestsE2e {
      * <p>
      * Concrete consequence the spec calls out: a user-supplied error handler
      * that synchronously calls {@code sender.flush()} from inside
-     * {@code onError} can observe {@code lastError == null} and pass —
+     * {@code onError} can observe {@code terminalError == null} and pass —
      * landing post-HALT bytes in the engine.
      * <p>
      * This test asserts the spec invariant directly: by the time the
