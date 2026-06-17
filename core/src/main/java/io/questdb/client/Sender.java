@@ -469,10 +469,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Convenience: flush every buffered row and block until the server has
      * acknowledged the resulting frame, or until {@code timeoutMillis} elapses.
-     * Equivalent to {@code awaitAckedFsn(flushAndGetSequence(), timeoutMillis)},
+     * <br>
+     * The default implementation is equivalent to
+     * {@code awaitAckedFsn(flushAndGetSequence(), timeoutMillis)},
      * which is the same shape as the implicit drain {@link #close()} runs --
      * with the caller controlling the timeout per call-site rather than
      * relying on the builder-time {@code close_flush_timeout_millis}.
+     * <br>
+     * <b>Note:</b> Implementations that support frame-level acknowledgements
+     * (e.g. WebSocket QWP) may override this method with <i>watermark
+     * semantics</i>: flushing first, then waiting for the current global
+     * published FSN rather than the per-call value from
+     * {@code flushAndGetSequence()}. This ensures that {@code drain()} after
+     * a previous publish with unacknowledged frames still blocks until those
+     * frames are acknowledged, even when the current flush publishes nothing.
      * <br>
      * Returns immediately on transports that do not track frame sequence
      * numbers ({@code HTTP}, {@code TCP}, {@code UDP}): the flush still
