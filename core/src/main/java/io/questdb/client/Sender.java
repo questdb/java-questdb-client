@@ -207,6 +207,36 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
+     * Create a Sender instance from a configuration string, giving it a distinct
+     * store-and-forward (SF) slot derived from {@code poolSlotIndex}.
+     * <p>
+     * Used by {@link io.questdb.client.impl.SenderPool} so that the N senders it
+     * builds from a single SF connect string each own their own slot under the
+     * shared {@code sf_dir}, rather than colliding on the same
+     * {@code <sf_dir>/<sender_id>} directory. The slot id becomes
+     * {@code <sender_id>-<poolSlotIndex>} (e.g. {@code default-0}, {@code default-1}).
+     * <p>
+     * The index is only applied in SF mode (when {@code sf_dir} is set). For
+     * non-SF configs there is no slot, so the index is ignored and this behaves
+     * exactly like {@link #fromConfig(CharSequence)}.
+     *
+     * @param configurationString configuration string
+     * @param poolSlotIndex       stable, non-negative slot index within the pool
+     * @return Sender instance
+     * @see #fromConfig(CharSequence)
+     */
+    static Sender fromConfig(CharSequence configurationString, int poolSlotIndex) {
+        LineSenderBuilder builder = builder(configurationString);
+        // sfDir != null is the SF on-switch; only then does a slot (and thus a
+        // sender_id) exist. builder and senderId are nestmates of Sender, so the
+        // private fields are reachable here without widening their visibility.
+        if (builder.sfDir != null) {
+            builder.senderId(builder.senderId + "-" + poolSlotIndex);
+        }
+        return builder.build();
+    }
+
+    /**
      * Create a new Sender instance described by a configuration string available as an environment variable.
      * <br>
      * It obtains a string from an environment variable <code>QDB_CLIENT_CONF</code> and then calls

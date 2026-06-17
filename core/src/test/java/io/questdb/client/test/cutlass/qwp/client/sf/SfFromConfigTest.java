@@ -26,6 +26,8 @@ package io.questdb.client.test.cutlass.qwp.client.sf;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.impl.PooledSender;
+import io.questdb.client.impl.SenderPool;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.client.TestPorts;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -78,41 +80,15 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSfDirOnTcpRejected() throws Exception {
+    public void testInvalidSfDurabilityValueRejected() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // sf_dir is the SF on-switch; on a TCP connect string it has no
-            // legal meaning and must be rejected at parse time.
-            String config = "tcp::addr=localhost:9009;sf_dir=" + sfDir + ";";
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
+                    + ";sf_durability=maybe;";
             try (Sender ignored = Sender.fromConfig(config)) {
-                Assert.fail("expected build() to reject sf_dir on TCP");
+                Assert.fail("expected rejection");
             } catch (LineSenderException expected) {
                 Assert.assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("WebSocket"));
-            }
-        });
-    }
-
-    @Test
-    public void testSfMaxBytesParsing() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
-            AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-
-                String config = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir + ";sf_max_bytes=131072;";
-                try (Sender sender = Sender.fromConfig(config)) {
-                    // Write enough data that segments rotate at ~128 KiB boundary.
-                    for (int i = 0; i < 50; i++) {
-                        sender.table("foo").longColumn("v", i).atNow();
-                    }
-                    sender.flush();
-                }
-                // Just confirm SF dir was populated; rotation under load is
-                // exercised in the cursor SegmentRing/SegmentManager tests.
-                Assert.assertTrue("sfDir was used", Files.exists(sfDir));
+                        expected.getMessage().contains("invalid sf_durability"));
             }
         });
     }
@@ -139,29 +115,96 @@ public class SfFromConfigTest {
         });
     }
 
-    /**
-     * Regression test for the connect-string {@code sf_max_bytes} /
-     * {@code sf_max_total_bytes} parser accepting values larger than
-     * {@code Integer.MAX_VALUE}. The pre-cursor parser used parseInt which
-     * artificially capped the SF size from the connect string at ~2 GiB.
-     */
     @Test
-    public void testSfMaxTotalBytesAcceptsLargeValue() throws Exception {
+    public void testSenderIdCreatesNamedSlotUnderSfDir() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
+            // sender_id="primary" => slot dir <sfDir>/primary; the engine writes
+            // its segments and lock there, leaving sibling slot dirs untouched.
             int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                // 4 GiB > Integer.MAX_VALUE; pre-fix this would throw "invalid sf_max_total_bytes".
                 String config = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir
-                        + ";sf_max_total_bytes=" + (4L * 1024 * 1024 * 1024) + ";";
+                        + ";sf_dir=" + sfDir + ";sender_id=primary;";
                 try (Sender sender = Sender.fromConfig(config)) {
                     sender.table("foo").longColumn("v", 1L).atNow();
                     sender.flush();
                 }
+                Assert.assertTrue("named slot dir created",
+                        Files.exists(sfDir + "/primary"));
+                Assert.assertTrue("lock file dropped in slot",
+                        Files.exists(sfDir + "/primary/.lock"));
+            }
+        });
+    }
+
+    @Test
+    public void testSenderIdInvalidCharRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The id is used verbatim as a directory name — only safe charset
+            // is accepted. A path separator would let the user escape the group
+            // root, which is exactly what the slot model exists to prevent.
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
+                    + ";sender_id=bad/id;";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected invalid sender_id rejection");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("sender_id"));
+            }
+        });
+    }
+
+    @Test
+    public void testSenderPoolWithSfDirMultipleBorrows() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Regression: a pool over an sf_dir config must be able to hand out
+            // more than one live sender. Each pooled sender gets its own slot
+            // <sfDir>/default-N, so concurrent borrows no longer collide on a
+            // single shared "default" slot.
+            int port = TestPorts.findUnusedPort();
+            AckHandler handler = new AckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 1, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender senderA = pool.borrow();
+                    // Pre-fix the 2nd borrow() threw IllegalStateException:
+                    // "sf slot already in use by another process".
+                    PooledSender senderB = pool.borrow();
+
+                    senderA.table("foo").longColumn("v", 1L).atNow();
+                    senderB.table("foo").longColumn("v", 2L).atNow();
+                    senderA.flush();
+                    senderB.flush();
+
+                    // Two distinct, independently-locked slot dirs under the group root.
+                    Assert.assertTrue("slot 0 lock", Files.exists(sfDir + "/default-0/.lock"));
+                    Assert.assertTrue("slot 1 lock", Files.exists(sfDir + "/default-1/.lock"));
+
+                    // Return both to the pool so close()/assertMemoryLeak stay clean.
+                    senderA.close();
+                    senderB.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSfDirOnTcpRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // sf_dir is the SF on-switch; on a TCP connect string it has no
+            // legal meaning and must be rejected at parse time.
+            String config = "tcp::addr=localhost:9009;sf_dir=" + sfDir + ";";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected build() to reject sf_dir on TCP");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("WebSocket"));
             }
         });
     }
@@ -191,20 +234,6 @@ public class SfFromConfigTest {
             } catch (LineSenderException expected) {
                 Assert.assertTrue(expected.getMessage(),
                         expected.getMessage().contains("not yet supported"));
-            }
-        });
-    }
-
-    @Test
-    public void testInvalidSfDurabilityValueRejected() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
-                    + ";sf_durability=maybe;";
-            try (Sender ignored = Sender.fromConfig(config)) {
-                Assert.fail("expected rejection");
-            } catch (LineSenderException expected) {
-                Assert.assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("invalid sf_durability"));
             }
         });
     }
@@ -246,10 +275,21 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSenderIdCreatesNamedSlotUnderSfDir() throws Exception {
+    public void testSfMaxBytesInvalidSizeSuffixRejected() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // sender_id="primary" => slot dir <sfDir>/primary; the engine writes
-            // its segments and lock there, leaving sibling slot dirs untouched.
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";sf_max_bytes=64x;";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected rejection of unknown unit suffix");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("invalid sf_max_bytes"));
+            }
+        });
+    }
+
+    @Test
+    public void testSfMaxBytesParsing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
             int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
@@ -257,15 +297,72 @@ public class SfFromConfigTest {
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 String config = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir + ";sender_id=primary;";
+                        + ";sf_dir=" + sfDir + ";sf_max_bytes=131072;";
+                try (Sender sender = Sender.fromConfig(config)) {
+                    // Write enough data that segments rotate at ~128 KiB boundary.
+                    for (int i = 0; i < 50; i++) {
+                        sender.table("foo").longColumn("v", i).atNow();
+                    }
+                    sender.flush();
+                }
+                // Just confirm SF dir was populated; rotation under load is
+                // exercised in the cursor SegmentRing/SegmentManager tests.
+                Assert.assertTrue("sfDir was used", Files.exists(sfDir));
+            }
+        });
+    }
+
+    /**
+     * Regression test for the connect-string {@code sf_max_bytes} /
+     * {@code sf_max_total_bytes} parser accepting values larger than
+     * {@code Integer.MAX_VALUE}. The pre-cursor parser used parseInt which
+     * artificially capped the SF size from the connect string at ~2 GiB.
+     */
+    @Test
+    public void testSfMaxTotalBytesAcceptsLargeValue() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            AckHandler handler = new AckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // 4 GiB > Integer.MAX_VALUE; pre-fix this would throw "invalid sf_max_total_bytes".
+                String config = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir
+                        + ";sf_max_total_bytes=" + (4L * 1024 * 1024 * 1024) + ";";
                 try (Sender sender = Sender.fromConfig(config)) {
                     sender.table("foo").longColumn("v", 1L).atNow();
                     sender.flush();
                 }
-                Assert.assertTrue("named slot dir created",
-                        Files.exists(sfDir + "/primary"));
-                Assert.assertTrue("lock file dropped in slot",
-                        Files.exists(sfDir + "/primary/.lock"));
+            }
+        });
+    }
+
+    @Test
+    public void testTwoSendersDistinctSlotIdsCoexist() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Two senders against the same group root with distinct sender_id
+            // values are independent slots — both must start cleanly.
+            int port = TestPorts.findUnusedPort();
+            AckHandler handler = new AckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfgA = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir + ";sender_id=a;";
+                String cfgB = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir + ";sender_id=b;";
+                try (Sender a = Sender.fromConfig(cfgA);
+                     Sender b = Sender.fromConfig(cfgB)) {
+                    a.table("foo").longColumn("v", 1L).atNow();
+                    b.table("foo").longColumn("v", 2L).atNow();
+                    a.flush();
+                    b.flush();
+                }
+                Assert.assertTrue(Files.exists(sfDir + "/a/.lock"));
+                Assert.assertTrue(Files.exists(sfDir + "/b/.lock"));
             }
         });
     }
@@ -301,64 +398,6 @@ public class SfFromConfigTest {
         });
     }
 
-    @Test
-    public void testTwoSendersDistinctSlotIdsCoexist() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // Two senders against the same group root with distinct sender_id
-            // values are independent slots — both must start cleanly.
-            int port = TestPorts.findUnusedPort();
-            AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
-                server.start();
-                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-
-                String cfgA = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir + ";sender_id=a;";
-                String cfgB = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir + ";sender_id=b;";
-                try (Sender a = Sender.fromConfig(cfgA);
-                     Sender b = Sender.fromConfig(cfgB)) {
-                    a.table("foo").longColumn("v", 1L).atNow();
-                    b.table("foo").longColumn("v", 2L).atNow();
-                    a.flush();
-                    b.flush();
-                }
-                Assert.assertTrue(Files.exists(sfDir + "/a/.lock"));
-                Assert.assertTrue(Files.exists(sfDir + "/b/.lock"));
-            }
-        });
-    }
-
-    @Test
-    public void testSenderIdInvalidCharRejected() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // The id is used verbatim as a directory name — only safe charset
-            // is accepted. A path separator would let the user escape the group
-            // root, which is exactly what the slot model exists to prevent.
-            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
-                    + ";sender_id=bad/id;";
-            try (Sender ignored = Sender.fromConfig(config)) {
-                Assert.fail("expected invalid sender_id rejection");
-            } catch (LineSenderException expected) {
-                Assert.assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("sender_id"));
-            }
-        });
-    }
-
-    @Test
-    public void testSfMaxBytesInvalidSizeSuffixRejected() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";sf_max_bytes=64x;";
-            try (Sender ignored = Sender.fromConfig(config)) {
-                Assert.fail("expected rejection of unknown unit suffix");
-            } catch (LineSenderException expected) {
-                Assert.assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("invalid sf_max_bytes"));
-            }
-        });
-    }
-
     private static void rmDir(String dir) {
         if (dir == null || !Files.exists(dir)) return;
         long find = Files.findFirst(dir);
@@ -385,7 +424,9 @@ public class SfFromConfigTest {
         Files.remove(dir);
     }
 
-    /** Acks every binary frame so the sender doesn't hang. */
+    /**
+     * Acks every binary frame so the sender doesn't hang.
+     */
     private static class AckHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final AtomicLong nextSeq = new AtomicLong(0);
 

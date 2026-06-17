@@ -50,13 +50,23 @@ public final class PooledSender implements Sender {
     private final long createdAtMillis;
     private final Sender delegate;
     private final SenderPool pool;
+    // Stable index of this slot within the pool's [0, maxSize) id space. In SF
+    // mode it names the on-disk slot dir suffix (<sf_dir>/<base>-<slotIndex>);
+    // the pool reuses it for capacity accounting in non-SF mode too.
+    private final int slotIndex;
     private volatile long idleSinceMillis;
     private volatile boolean inUse;
     private volatile boolean invalidated;
+    // Highest FSN published by the last return-to-pool flush, or -1 if nothing
+    // was published (or non-WebSocket transport). Compared against the delegate's
+    // acked watermark to tell whether this idle slot still has un-acked SF data
+    // on disk -- the reaper must not close it until that data is durable.
+    private volatile long lastPublishedFsn = -1L;
 
-    PooledSender(Sender delegate, SenderPool pool) {
+    PooledSender(Sender delegate, SenderPool pool, int slotIndex) {
         this.delegate = delegate;
         this.pool = pool;
+        this.slotIndex = slotIndex;
         this.createdAtMillis = System.currentTimeMillis();
         this.idleSinceMillis = this.createdAtMillis;
     }
@@ -150,7 +160,11 @@ public final class PooledSender implements Sender {
         }
         boolean broken = false;
         try {
-            delegate.flush();
+            // flushAndGetSequence() performs the same flush as flush() but hands
+            // back the highest published FSN, which the reaper later compares
+            // against the acked watermark (see isDurablyAcked()). -1 on a
+            // non-WebSocket transport, which makes isDurablyAcked() a no-op.
+            lastPublishedFsn = delegate.flushAndGetSequence();
         } catch (RuntimeException e) {
             // Sender does not clear its buffer on flush failure (see
             // Sender Javadoc), and WebSocket transport latches the failure
@@ -380,8 +394,23 @@ public final class PooledSender implements Sender {
         return idleSinceMillis;
     }
 
+    /**
+     * True iff everything this slot has published is durably acked by the server,
+     * i.e. there is no un-acked SF data left in its slot dir. Non-blocking: just a
+     * volatile read of the acked watermark. {@code lastPublishedFsn < 0} means
+     * nothing was published (or non-WebSocket transport), so the slot is trivially
+     * drained. The reaper uses this to avoid closing a slot mid-flight.
+     */
+    boolean isDurablyAcked() {
+        return lastPublishedFsn < 0 || delegate.getAckedFsn() >= lastPublishedFsn;
+    }
+
     boolean isInUse() {
         return inUse;
+    }
+
+    int slotIndex() {
+        return slotIndex;
     }
 
     boolean isInvalidated() {

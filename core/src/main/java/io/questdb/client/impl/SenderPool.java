@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Iterator;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -47,16 +48,31 @@ import java.util.concurrent.locks.ReentrantLock;
  * is pre-sized to {@code maxSize}.
  * <p>
  * Connection creation happens outside the lock so a slow connect (TLS
- * handshake, DNS) does not block other borrowers or the housekeeper. The
- * pool tracks in-flight creations via {@code inFlightCreations} so the cap
- * check ({@code allSize + inFlightCreations < maxSize}) stays correct under
- * concurrent borrows.
+ * handshake, DNS) does not block other borrowers or the housekeeper. Capacity
+ * and slot identity are tracked by a single {@link BitSet} of claimed slot
+ * indices in {@code [0, maxSize)}: a free bit is both "there is room to create"
+ * and "this index is available". An index is claimed under the lock before the
+ * out-of-lock creation (reserving capacity), kept for the slot's whole lifetime,
+ * and returned only after the slot's delegate has been closed.
+ * <p>
+ * In store-and-forward (SF) mode the claimed index also names the slot directory
+ * suffix ({@code <sf_dir>/<sender_id>-<index>}), so each pooled sender owns a
+ * distinct, exclusively-locked slot. Reusing the lowest free index across
+ * grow/reap/restart keeps slot dirs bounded to {@code maxSize} and lets a
+ * restarted pool recover its un-acked data by name.
  */
 public final class SenderPool implements AutoCloseable {
 
     private final long acquireTimeoutMillis;
     private final ArrayList<PooledSender> all;
     private final ArrayDeque<PooledSender> available;
+    // Bit i set == slot index i is claimed (either a live slot in `all` or an
+    // in-flight creation). This is the pool's single capacity token: a free bit
+    // means there is room to create. In SF mode the index also names the slot
+    // dir suffix (<sf_dir>/<base>-i), so an index is returned to the free set
+    // only after its delegate is fully closed and its flock released -- never on
+    // giveBack(). Guarded by `lock`.
+    private final BitSet claimedSlots;
     private final String configurationString;
     private final long idleTimeoutMillis;
     private final ReentrantLock lock = new ReentrantLock();
@@ -66,7 +82,6 @@ public final class SenderPool implements AutoCloseable {
     private final Condition slotReleased;
     private final ThreadLocal<PooledSender> threadAffine = new ThreadLocal<>();
     private volatile boolean closed;
-    private int inFlightCreations;
 
     public SenderPool(
             String configurationString,
@@ -87,14 +102,18 @@ public final class SenderPool implements AutoCloseable {
         this.maxLifetimeMillis = maxLifetimeMillis;
         this.all = new ArrayList<>(maxSize);
         this.available = new ArrayDeque<>(maxSize);
+        this.claimedSlots = new BitSet(maxSize);
         this.slotReleased = lock.newCondition();
-        // Pre-warm minSize connections.
+        // Pre-warm minSize connections on the lowest indices 0..minSize-1, so a
+        // restarted pool re-warms the same slots first and recovers their
+        // un-acked SF data by name.
         int built = 0;
         try {
             for (int i = 0; i < minSize; i++) {
-                PooledSender ps = createUnlocked();
+                PooledSender ps = createUnlocked(i);
                 all.add(ps);
                 available.add(ps);
+                claimedSlots.set(i);
                 built++;
             }
         } catch (RuntimeException e) {
@@ -124,29 +143,33 @@ public final class SenderPool implements AutoCloseable {
                     s.markInUse();
                     return s;
                 }
-                if (all.size() + inFlightCreations < maxSize) {
-                    inFlightCreations++;
+                if (claimedSlots.cardinality() < maxSize) {
+                    // Claiming the index under the lock reserves capacity for the
+                    // whole lifetime of the slot (it replaces the old
+                    // inFlightCreations counter). It is released only when the
+                    // slot is destroyed, after its delegate is closed.
+                    int slotIndex = claimSlotIndex();
                     lock.unlock();
                     PooledSender created;
                     try {
-                        created = createUnlocked();
+                        created = createUnlocked(slotIndex);
                     } catch (RuntimeException e) {
                         lock.lock();
-                        inFlightCreations--;
+                        releaseSlotIndex(slotIndex);
                         slotReleased.signal();
                         lock.unlock();
                         throw e;
                     }
                     lock.lock();
-                    inFlightCreations--;
                     if (closed) {
                         // Pool was closed mid-creation -- destroy the new connection
-                        // rather than leaking it. Other waiters have been signaled
-                        // by close() already.
+                        // rather than leaking it, and free its slot index. Other
+                        // waiters have been signaled by close() already.
                         try {
                             created.delegate().close();
                         } catch (RuntimeException ignored) {
                         }
+                        releaseSlotIndex(slotIndex);
                         throw new LineSenderException("QuestDB handle is closed");
                     }
                     all.add(created);
@@ -247,15 +270,22 @@ public final class SenderPool implements AutoCloseable {
                 return;
             }
             all.remove(s);
-            // Wake one waiter -- the cap check in borrow() uses all.size(),
-            // so a freed slot may now allow a creation attempt.
-            slotReleased.signal();
         } finally {
             lock.unlock();
         }
         try {
             s.delegate().close();
         } catch (RuntimeException ignored) {
+        }
+        // Return the slot index only AFTER the delegate is closed (its SF flock
+        // released), so a concurrent borrow cannot re-lock this slot dir before
+        // the old fd is gone. Only then signal a waiter that capacity opened up.
+        lock.lock();
+        try {
+            releaseSlotIndex(s.slotIndex());
+            slotReleased.signal();
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -311,7 +341,13 @@ public final class SenderPool implements AutoCloseable {
                         && (now - s.idleSinceMillis()) >= idleTimeoutMillis;
                 boolean overAge = maxLifetimeMillis < Long.MAX_VALUE
                         && (now - s.createdAtMillis()) >= maxLifetimeMillis;
-                if (idleExpired || overAge) {
+                // Drain guard: never reap a slot that still has un-acked SF data
+                // on disk. isDurablyAcked() is a non-blocking watermark read; an
+                // idle slot that is not drained yet is left in place and
+                // reconsidered on the next housekeeper tick, once the server has
+                // acked it. This also keeps the close loop below fast -- a
+                // drained close() does not block on the close-flush drain.
+                if ((idleExpired || overAge) && s.isDurablyAcked()) {
                     it.remove();
                     all.remove(s);
                     if (toClose == null) {
@@ -329,6 +365,18 @@ public final class SenderPool implements AutoCloseable {
                     toClose.get(i).delegate().close();
                 } catch (RuntimeException ignored) {
                 }
+            }
+            // Return the freed slot indices only after the delegates are closed
+            // (SF flocks released), so a concurrent borrow cannot re-lock a slot
+            // dir before its old fd is gone. Signal that capacity opened up.
+            lock.lock();
+            try {
+                for (int i = 0, n = toClose.size(); i < n; i++) {
+                    releaseSlotIndex(toClose.get(i).slotIndex());
+                }
+                slotReleased.signalAll();
+            } finally {
+                lock.unlock();
             }
         }
     }
@@ -366,8 +414,26 @@ public final class SenderPool implements AutoCloseable {
         pinned.close();
     }
 
-    private PooledSender createUnlocked() {
-        Sender raw = Sender.fromConfig(configurationString);
-        return new PooledSender(raw, this);
+    private PooledSender createUnlocked(int slotIndex) {
+        Sender raw = Sender.fromConfig(configurationString, slotIndex);
+        return new PooledSender(raw, this, slotIndex);
+    }
+
+    /**
+     * Claims the lowest free slot index in {@code [0, maxSize)}. Caller must hold
+     * {@code lock} and must already have verified a free index exists
+     * ({@code claimedSlots.cardinality() < maxSize}), which guarantees the lowest
+     * clear bit is below {@code maxSize}. Lowest-free-first keeps the low indices
+     * stable across grow/reap cycles.
+     */
+    private int claimSlotIndex() {
+        int idx = claimedSlots.nextClearBit(0);
+        claimedSlots.set(idx);
+        return idx;
+    }
+
+    /** Returns a slot index to the free set. Caller must hold {@code lock}. */
+    private void releaseSlotIndex(int idx) {
+        claimedSlots.clear(idx);
     }
 }
