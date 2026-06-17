@@ -225,13 +225,13 @@ public class CloseDrainTest {
      */
     @Test
     public void testDrainAfterFlushWaitsForPriorUnackedFrames() throws Exception {
-        int port = TestPorts.findUnusedPort();
         long ackDelayMs = 600;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port + ";";
             try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
