@@ -313,7 +313,18 @@ public final class BackgroundDrainer implements Runnable {
             outcome = DrainOutcome.STOPPED;
         } catch (Throwable t) {
             String msg = t.getMessage();
-            LOG.error("drainer setup failed for slot {}: {}", slotPath, msg, t);
+            if (slotPath != null) {
+                // Real orphan slot: a setup failure means unacked data on disk
+                // could not be drained to the server -- a durability concern
+                // that stays at ERROR so operators see it.
+                LOG.error("drainer setup failed for slot {}: {}", slotPath, msg, t);
+            } else if (LOG.isDebugEnabled()) {
+                // Only @TestOnly drainers carry a null slot (zero segment size);
+                // they fast-fail by design and would otherwise flood CI logs.
+                // The isDebugEnabled() guard avoids the varargs array and the
+                // message formatting when DEBUG is off, so it makes no garbage.
+                LOG.debug("drainer setup failed for slot {}: {}", slotPath, msg, t);
+            }
             lastErrorMessage = msg;
             try {
                 OrphanScanner.markFailed(slotPath, "setup: " + msg);
