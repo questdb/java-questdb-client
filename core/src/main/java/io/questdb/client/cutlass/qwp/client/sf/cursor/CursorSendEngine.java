@@ -284,20 +284,18 @@ public final class CursorSendEngine implements QuietCloseable {
             this.ring = ringInProgress;
             this.watermark = watermarkInProgress;
         } catch (Throwable t) {
-            // Order: ring first (releases mmap/fd), then manager (joins
-            // worker thread, but only if we started it AND we own it),
-            // then watermark (releases its own mmap/fd), then slot lock.
-            // Each in its own try/catch so a single failure doesn't
-            // strand later cleanups.
-            if (ringInProgress != null) {
-                try {
-                    ringInProgress.close();
-                } catch (Throwable ignored) {
-                }
-            }
+            // Stop an owned manager before freeing the ring and watermark it may
+            // touch, then release the slot lock. Each cleanup is in its own
+            // try/catch so a single failure doesn't strand later cleanups.
             if (ownsManager && managerStarted) {
                 try {
                     manager.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (ringInProgress != null) {
+                try {
+                    ringInProgress.close();
                 } catch (Throwable ignored) {
                 }
             }

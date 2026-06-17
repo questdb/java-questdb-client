@@ -28,6 +28,8 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
@@ -37,7 +39,12 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Paths;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -191,6 +198,50 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testConstructorFailureAfterOwnedManagerStartCleansResources() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            SegmentManager manager = new SegmentManager(4096);
+            poisonRegisterGeneration(manager);
+
+            Throwable thrown = invokeOwnedPrivateConstructorExpectingFailure(tmpDir, 4096, manager);
+            assertTrue("register sabotage should surface from constructor catch: " + thrown,
+                    thrown instanceof NullPointerException);
+
+            assertNull("owned manager worker must be stopped by constructor catch",
+                    workerThread(manager));
+            assertSlotCanBeReacquired(tmpDir);
+        });
+    }
+
+    @Test
+    public void testConstructorFailureWithSharedManagerReleasesSlotButKeepsManagerRunning() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            SegmentManager manager = new SegmentManager(4096);
+            try {
+                manager.start();
+                Thread originalWorker = workerThread(manager);
+                assertNotNull("shared manager must be running before constructor", originalWorker);
+                assertTrue("shared manager worker must be alive before constructor",
+                        originalWorker.isAlive());
+
+                poisonRegisterGeneration(manager);
+                Throwable thrown = invokeSharedConstructorExpectingFailure(tmpDir, 4096, manager);
+                assertTrue("register sabotage should surface from constructor catch: " + thrown,
+                        thrown instanceof NullPointerException);
+
+                Thread stillOwnedByCaller = workerThread(manager);
+                assertNotNull("constructor catch must not close caller-owned manager",
+                        stillOwnedByCaller);
+                assertTrue("caller-owned manager worker must remain alive",
+                        stillOwnedByCaller.isAlive());
+                assertSlotCanBeReacquired(tmpDir);
+            } finally {
+                manager.close();
+            }
+        });
+    }
+
+    @Test
     public void testMemoryModeSkipsDirAndStillWorks() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // sfDir == null → memory-only ring. No files, no mkdir, no path.
@@ -275,6 +326,53 @@ public class CursorSendEngineTest {
                     // is past publishedFsn=3.
                     assertEquals("corrupt-high watermark must fall back to lowestBase - 1",
                             -1L, engine.ackedFsn());
+                    assertEquals(3L, engine.publishedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000L)
+    public void testManagerPersistedWatermarkSurvivesRestart() throws Exception {
+        // Positive twin of testRecoveryAdvancesAckedFsnPastWatermark. That test
+        // FORGES the .ack-watermark by hand; this one drives a real, started
+        // SegmentManager to PERSIST it from real acks, then proves a second
+        // session recovers the manager-written value. Without this, a regression
+        // that silently stopped the manager's trim-path watermark.write() (e.g.
+        // an inverted `registered` gate) would pass the whole suite: the durable-
+        // ack tests assert on the in-memory engine.ackedFsn(), and the recovery
+        // tests forge the watermark, so nothing observes the manager doing the
+        // write.
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 64);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Session 1: four frames (publishedFsn = 3), partially acked at 2.
+                // The ack is below publishedFsn so close() does not treat the slot
+                // as fully drained — segments and watermark survive for recovery.
+                // All four frames stay in the active segment, so nothing is
+                // trimmed and the segment-derived recovery seed is
+                // lowestBase - 1 == -1; the manager-written watermark (2) is the
+                // only thing that can lift the recovered ackedFsn above it.
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    for (int i = 0; i < 4; i++) {
+                        engine.appendBlocking(buf, 64);
+                    }
+                    assertTrue("ack must advance", engine.acknowledge(2L));
+                    // Block until the background worker has actually written the
+                    // watermark to disk. If the trim-path write were gated off this
+                    // never reaches 2 and the helper fails with a clear message,
+                    // rather than the test flaking on a close()-before-tick race.
+                    awaitManagerPersistedWatermark(tmpDir, 2L);
+                }
+                // Session 2: recovery must seed ackedFsn from the manager-written
+                // watermark (2), not the bare segment-derived seed (-1).
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
+                    assertEquals("recovery must consume the manager-persisted watermark",
+                            2L, engine.ackedFsn());
                     assertEquals(3L, engine.publishedFsn());
                 }
             } finally {
@@ -500,4 +598,73 @@ public class CursorSendEngineTest {
             }
         });
     }
+
+    private static void assertSlotCanBeReacquired(String sfDir) {
+        try (SlotLock ignored = SlotLock.acquire(sfDir)) {
+            // good
+        }
+    }
+
+    private static Throwable invokeOwnedPrivateConstructorExpectingFailure(
+            String sfDir, long segmentSizeBytes, SegmentManager manager) throws Exception {
+        Constructor<CursorSendEngine> ctor = CursorSendEngine.class.getDeclaredConstructor(
+                String.class, long.class, SegmentManager.class, boolean.class, long.class);
+        ctor.setAccessible(true);
+        try {
+            ctor.newInstance(sfDir, segmentSizeBytes, manager, true,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+            fail("expected constructor failure");
+            return null;
+        } catch (InvocationTargetException e) {
+            return e.getCause();
+        }
+    }
+
+    private static Throwable invokeSharedConstructorExpectingFailure(
+            String sfDir, long segmentSizeBytes, SegmentManager manager) {
+        try {
+            new CursorSendEngine(sfDir, segmentSizeBytes, manager);
+            fail("expected constructor failure");
+            return null;
+        } catch (Throwable t) {
+            return t;
+        }
+    }
+
+    private static void poisonRegisterGeneration(SegmentManager manager) throws Exception {
+        // register() advances fileGeneration before publishing the ring. Nulling
+        // it forces a deterministic constructor failure after the ring and
+        // watermark exist, without adding a production test hook.
+        Field f = SegmentManager.class.getDeclaredField("fileGeneration");
+        f.setAccessible(true);
+        f.set(manager, null);
+    }
+
+    private static Thread workerThread(SegmentManager manager) throws Exception {
+        Field f = SegmentManager.class.getDeclaredField("workerThread");
+        f.setAccessible(true);
+        return (Thread) f.get(manager);
+    }
+
+    // Polls the on-disk watermark until it reads {@code expected}, or fails after
+    // a bounded wait. The probe is a second mapping of the same file the manager
+    // worker writes through; its MAP_SHARED reads observe the worker's writes, and
+    // it is closed before the next session opens the slot.
+    private static void awaitManagerPersistedWatermark(String slotDir, long expected) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        long last = AckWatermark.INVALID;
+        try (AckWatermark probe = AckWatermark.open(slotDir)) {
+            assertNotNull("watermark file must exist after register", probe);
+            while (System.nanoTime() < deadline) {
+                last = probe.read();
+                if (last == expected) {
+                    return;
+                }
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(2));
+            }
+        }
+        fail("manager did not persist watermark=" + expected
+                + " within 10s (last on-disk read=" + last + ")");
+    }
+
 }

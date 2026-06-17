@@ -122,7 +122,7 @@ public class SegmentManagerTotalBytesRaceTest {
                     CountDownLatch hookDone = new CountDownLatch(1);
                     AtomicBoolean fired = new AtomicBoolean();
                     AtomicReference<Throwable> hookErr = new AtomicReference<>();
-                    setBeforeInstallSyncHook(mgr, () -> {
+                    mgr.setBeforeInstallSyncHook(() -> {
                         if (!fired.compareAndSet(false, true)) return;
                         try {
                             mgr.deregister(ring);
@@ -170,7 +170,7 @@ public class SegmentManagerTotalBytesRaceTest {
                                     + "under the same lock that covers deregister.",
                             0L, observed);
                 } finally {
-                    setBeforeInstallSyncHook(mgr, null);
+                    mgr.setBeforeInstallSyncHook(null);
                     try {
                         ring.close();
                     } catch (Throwable ignored) {
@@ -224,12 +224,6 @@ public class SegmentManagerTotalBytesRaceTest {
             }
         }
         Files.remove(dir);
-    }
-
-    private static void setBeforeInstallSyncHook(SegmentManager mgr, Runnable hook) throws Exception {
-        Field f = SegmentManager.class.getDeclaredField("beforeInstallSyncHook");
-        f.setAccessible(true);
-        f.set(mgr, hook);
     }
 
     private static Thread workerThread(SegmentManager mgr) throws Exception {
