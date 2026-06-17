@@ -1034,6 +1034,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpToken;
+        private HttpTokenProvider httpTokenProvider;
         // Drives the initial-connect strategy. null means "not set
         // explicitly", which build() resolves to SYNC when any reconnect_*
         // knob was tuned by the user, otherwise OFF. SYNC retries on the
@@ -1365,7 +1366,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     tlsConfig = new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode == TlsValidationMode.DEFAULT ? ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL : ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE);
                 }
                 return AbstractLineHttpSender.createLineSender(hosts, ports, httpPath, httpClientConfiguration, tlsConfig, actualAutoFlushRows, httpToken,
-                        username, password, maxNameLength, actualMaxRetriesNanos, maxBackoffMillis, actualMinRequestThroughput, actualAutoFlushIntervalMillis, protocolVersion);
+                        username, password, maxNameLength, actualMaxRetriesNanos, maxBackoffMillis, actualMinRequestThroughput, actualAutoFlushIntervalMillis, protocolVersion, httpTokenProvider);
             }
 
             if (protocol == PROTOCOL_WEBSOCKET) {
@@ -1998,10 +1999,44 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (this.httpToken != null) {
                 throw new LineSenderException("token was already configured");
             }
+            if (this.httpTokenProvider != null) {
+                throw new LineSenderException("token provider was already configured");
+            }
             if (Chars.isBlank(token)) {
                 throw new LineSenderException("token cannot be empty nor null");
             }
             this.httpToken = token;
+            return this;
+        }
+
+        /**
+         * Supplies the HTTP authentication token from a provider that the sender queries as it builds
+         * each request, instead of a fixed {@link #httpToken(String) token} captured once. This keeps a
+         * long-lived sender following token refreshes - for example a token obtained through the OIDC
+         * device flow: {@code .httpTokenProvider(auth::getTokenSilently)}.
+         * <br>
+         * The provider runs on the flush path, so it must return promptly and must not block on
+         * interactive input (see {@link HttpTokenProvider}). Only valid for HTTP transport, and mutually
+         * exclusive with {@link #httpToken(String)} and {@link #httpUsernamePassword(String, String)}.
+         *
+         * @param httpTokenProvider supplies the current HTTP authentication token
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder httpTokenProvider(HttpTokenProvider httpTokenProvider) {
+            if (this.username != null) {
+                throw new LineSenderException("authentication username was already configured ")
+                        .put("[username=").put(this.username).put("]");
+            }
+            if (this.httpToken != null) {
+                throw new LineSenderException("token was already configured");
+            }
+            if (this.httpTokenProvider != null) {
+                throw new LineSenderException("token provider was already configured");
+            }
+            if (httpTokenProvider == null) {
+                throw new LineSenderException("token provider cannot be null");
+            }
+            this.httpTokenProvider = httpTokenProvider;
             return this;
         }
 
@@ -2029,6 +2064,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (httpToken != null) {
                 throw new LineSenderException("token authentication is already configured");
+            }
+            if (httpTokenProvider != null) {
+                throw new LineSenderException("token provider authentication is already configured");
             }
             this.username = username;
             this.password = password;
@@ -3435,6 +3473,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (httpToken != null) {
                     throw new LineSenderException("HTTP token authentication is not supported for TCP protocol");
                 }
+                if (httpTokenProvider != null) {
+                    throw new LineSenderException("HTTP token provider authentication is not supported for TCP protocol");
+                }
                 if (retryTimeoutMillis != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("retrying is not supported for TCP protocol");
                 }
@@ -3459,6 +3500,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (httpToken != null) {
                     throw new LineSenderException("HTTP token authentication is not supported for UDP transport");
+                }
+                if (httpTokenProvider != null) {
+                    throw new LineSenderException("HTTP token provider authentication is not supported for UDP transport");
                 }
                 if (username != null || password != null) {
                     throw new LineSenderException("username/password authentication is not supported for UDP transport");
@@ -3502,6 +3546,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (httpToken != null && (username != null || password != null)) {
                     throw new LineSenderException("cannot use both token and username/password authentication");
+                }
+                if (httpTokenProvider != null) {
+                    throw new LineSenderException("HTTP token provider authentication is not supported for WebSocket protocol");
                 }
                 if (httpPath != null) {
                     throw new LineSenderException("HTTP path is not supported for WebSocket protocol");

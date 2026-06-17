@@ -22,25 +22,27 @@
  *
  ******************************************************************************/
 
-package io.questdb.client.cutlass.http.client;
+package io.questdb.client;
 
 /**
- * Interface for receiving HTTP response data.
+ * Supplies an HTTP authentication token to a {@link Sender} on demand. The sender calls
+ * {@link #getToken()} as it builds each request, so a provider that returns a freshly refreshed
+ * token - for example {@code OidcDeviceAuth::getTokenSilently} - keeps a long-lived sender
+ * authenticated as the token rotates, without rebuilding the sender.
+ * <p>
+ * {@link #getToken()} runs on the sender's flush path, so it must return promptly and must not
+ * block on interactive input. It may perform a quick silent token refresh, but must not start an
+ * interactive sign-in. An exception thrown from {@link #getToken()} fails the current flush.
+ *
+ * @see Sender.LineSenderBuilder#httpTokenProvider(HttpTokenProvider)
  */
-public interface Response {
+@FunctionalInterface
+public interface HttpTokenProvider {
     /**
-     * Receives the next fragment of response data using the default timeout.
+     * Returns the current HTTP authentication token, without the {@code "Bearer "} prefix (the
+     * sender adds it). Must not return null or an empty value.
      *
-     * @return the received fragment
+     * @return the current HTTP authentication token
      */
-    Fragment recv();
-
-    /**
-     * Receives the next fragment of response data, blocking at most {@code timeout} milliseconds for
-     * a socket read.
-     *
-     * @param timeout the receive timeout in milliseconds
-     * @return the received fragment, or null once the body has been fully read
-     */
-    Fragment recv(int timeout);
+    CharSequence getToken();
 }

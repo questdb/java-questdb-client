@@ -32,6 +32,7 @@ import io.questdb.client.std.IntStack;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Mutable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.StringSink;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -243,7 +244,9 @@ public class JsonLexerTest {
 
     @Test
     public void testQuoteEscape() throws Exception {
-        assertThat("{\"x\":\"a\\\"bc\"}", "{\"x\": \"a\\\"bc\"}");
+        // the lexer decodes the escaped quote: the value a\"bc becomes a"bc (the assembling parser does
+        // not re-escape, so the decoded quote shows bare in the re-serialized form)
+        assertThat("{\"x\":\"a\"bc\"}", "{\"x\": \"a\\\"bc\"}");
     }
 
     @Test
@@ -661,6 +664,38 @@ public class JsonLexerTest {
     @Test
     public void testWrongQuote() {
         assertError("Unexpected symbol", 10, "{\"x\": \"a\"bc\",}");
+    }
+
+    @Test
+    public void testStringEscapesAreDecoded() throws Exception {
+        assertMemoryLeak(() -> {
+            // JSON string escapes must be resolved, not handed back to the listener literally
+            assertDecodedValue("{\"v\":\"https:\\/\\/h\\/p\"}", "https://h/p"); // escaped slash -> slash
+            assertDecodedValue("{\"v\":\"a\\\"b\"}", "a\"b");                   // escaped quote -> quote
+            assertDecodedValue("{\"v\":\"a\\\\b\"}", "a\\b");                   // escaped backslash -> backslash
+            assertDecodedValue("{\"v\":\"X\\u0041Y\"}", "XAY");                // 4-hex unicode escape decoded
+            assertDecodedValue("{\"v\":\"tab\\tend\"}", "tab\tend");            // escaped tab -> tab
+            assertDecodedValue("{\"v\":\"plain\"}", "plain");                  // no escapes (fast path)
+        });
+    }
+
+    private static void assertDecodedValue(String json, String expected) throws JsonException {
+        int len = json.length();
+        long address = TestUtils.toMemory(json);
+        StringSink captured = new StringSink();
+        JsonParser parser = (code, tag, position) -> {
+            if (code == JsonLexer.EVT_VALUE) {
+                captured.clear();
+                captured.put(tag);
+            }
+        };
+        try (JsonLexer lexer = new JsonLexer(4, 1024)) {
+            lexer.parse(address, address + len, parser);
+            lexer.parseLast();
+            TestUtils.assertEquals(expected, captured);
+        } finally {
+            Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     private void assertError(String expected, int expectedPosition, String input) {

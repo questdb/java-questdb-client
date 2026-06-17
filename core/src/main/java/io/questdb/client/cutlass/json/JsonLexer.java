@@ -55,6 +55,7 @@ public class JsonLexer implements Mutable, Closeable {
     private final int cacheSizeLimit;
     private final IntStack objDepthStack = new IntStack(64);
     private final StringSink sink = new StringSink();
+    private final StringSink unescapeSink = new StringSink();
     private int arrayDepth = 0;
     private long cache;
     private int cacheCapacity;
@@ -286,6 +287,18 @@ public class JsonLexer implements Mutable, Closeable {
         return unquotedTerminators.excludes(c);
     }
 
+    private static int parseHex4(CharSequence value, int offset) {
+        int result = 0;
+        for (int j = 0; j < 4; j++) {
+            int digit = Character.digit(value.charAt(offset + j), 16);
+            if (digit < 0) {
+                return -1;
+            }
+            result = (result << 4) | digit;
+        }
+        return result;
+    }
+
     private static JsonException unsupportedEncoding(int position) {
         return JsonException.$(position, "Unsupported encoding");
     }
@@ -328,7 +341,82 @@ public class JsonLexer implements Mutable, Closeable {
         } else {
             utf8DecodeCacheAndBuffer(lo, hi - 1, position);
         }
-        return sink;
+        // the decode above assembles the raw bytes between the quotes verbatim; JSON string escape
+        // sequences are only resolved here, so callers see fully decoded string values
+        return unescape(sink);
+    }
+
+    private CharSequence unescape(CharSequence raw) {
+        final int n = raw.length();
+        int i = 0;
+        while (i < n && raw.charAt(i) != '\\') {
+            i++;
+        }
+        if (i == n) {
+            return raw; // no escapes - the common case, return the assembled value unchanged
+        }
+        unescapeSink.clear();
+        unescapeSink.put(raw, 0, i);
+        while (i < n) {
+            char c = raw.charAt(i);
+            if (c != '\\' || i + 1 >= n) {
+                unescapeSink.put(c);
+                i++;
+                continue;
+            }
+            char esc = raw.charAt(i + 1);
+            switch (esc) {
+                case '"':
+                    unescapeSink.put('"');
+                    i += 2;
+                    break;
+                case '\\':
+                    unescapeSink.put('\\');
+                    i += 2;
+                    break;
+                case '/':
+                    unescapeSink.put('/');
+                    i += 2;
+                    break;
+                case 'b':
+                    unescapeSink.put('\b');
+                    i += 2;
+                    break;
+                case 'f':
+                    unescapeSink.put('\f');
+                    i += 2;
+                    break;
+                case 'n':
+                    unescapeSink.put('\n');
+                    i += 2;
+                    break;
+                case 'r':
+                    unescapeSink.put('\r');
+                    i += 2;
+                    break;
+                case 't':
+                    unescapeSink.put('\t');
+                    i += 2;
+                    break;
+                case 'u':
+                    int cp = i + 6 <= n ? parseHex4(raw, i + 2) : -1;
+                    if (cp >= 0) {
+                        unescapeSink.put((char) cp);
+                        i += 6;
+                    } else {
+                        // malformed unicode escape: drop the backslash, keep the following character
+                        unescapeSink.put(esc);
+                        i += 2;
+                    }
+                    break;
+                default:
+                    // unknown escape: drop the backslash, keep the escaped character (lenient)
+                    unescapeSink.put(esc);
+                    i += 2;
+                    break;
+            }
+        }
+        return unescapeSink;
     }
 
     private void utf8DecodeCacheAndBuffer(long lo, long hi, int position) throws JsonException {

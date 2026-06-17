@@ -237,4 +237,42 @@ public class SenderBuilderErrorApiTest {
         Assert.assertNotNull(c);
         Assert.assertNotNull(p);
     }
+
+    @Test
+    public void testHttpTokenProviderIsMutuallyExclusiveWithOtherAuth() {
+        // a provider cannot be combined with a static token or username/password, in either order
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000")
+                    .httpToken("static").httpTokenProvider(() -> "dynamic");
+            Assert.fail("expected token-already-configured");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token was already configured"));
+        }
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000")
+                    .httpTokenProvider(() -> "dynamic").httpToken("static");
+            Assert.fail("expected token-provider-already-configured");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token provider was already configured"));
+        }
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000")
+                    .httpUsernamePassword("u", "p").httpTokenProvider(() -> "dynamic");
+            Assert.fail("expected username-already-configured");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("username was already configured"));
+        }
+    }
+
+    @Test
+    public void testHttpTokenProviderRejectedForNonHttpTransport() {
+        // the provider is an HTTP-only feature
+        try {
+            Sender.builder(Sender.Transport.TCP).address("localhost:9009")
+                    .httpTokenProvider(() -> "dynamic").build().close();
+            Assert.fail("expected provider to be rejected for TCP");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token provider authentication is not supported for TCP"));
+        }
+    }
 }

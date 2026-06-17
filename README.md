@@ -156,6 +156,61 @@ try (Sender sender = Sender.fromConfig("https::addr=localhost:9000;tls_verify=un
 }
 ```
 
+### OIDC Sign-In (Device Flow)
+
+For QuestDB Enterprise instances secured with OIDC, `OidcDeviceAuth` signs a user in interactively using the [OAuth 2.0 Device Authorization Grant](https://www.rfc-editor.org/rfc/rfc8628). It works from environments that have no local browser — a remote notebook kernel, a container, a headless job — because the user authorizes on any device (laptop or phone) while the process only makes outbound calls to the identity provider.
+
+On first use it prints a verification URL and a short code; open the URL, enter the code, and the token is cached in memory and refreshed silently on later calls.
+
+```java
+import io.questdb.client.Sender;
+import io.questdb.client.cutlass.auth.OidcDeviceAuth;
+
+// Discover the client id, scope and endpoints from the QuestDB server's /settings:
+try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
+    auth.getToken(); // sign in once: prompts on first use, then caches and refreshes
+
+    // Pass a token provider, not a fixed string: the sender pulls a freshly refreshed token on each
+    // request, so a long-lived sender keeps working as the token rotates. getTokenSilently() refreshes
+    // silently and never prompts on the flush path.
+    try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+            .address("questdb.example.com:9000")
+            .enableTls()
+            .httpTokenProvider(auth::getTokenSilently)
+            .build()) {
+        sender.table("trades")
+                .symbol("symbol", "ETH-USD")
+                .doubleColumn("price", 2615.54)
+                .atNow();
+    }
+}
+```
+
+Prefer `httpTokenProvider(auth::getTokenSilently)` for a long-lived sender: it pulls a freshly refreshed token on every request, so the sender keeps working as the token rotates. A fixed `httpToken(token)` captures the token once, so a sender that outlives the token's lifetime starts failing with 401s. Either way, hand the token to the client through the builder (or the header/password fields below), not by embedding it in a `Sender.fromConfig(...)` string or the `QDB_CLIENT_CONF` environment variable, which are easily logged, persisted, or left in shell history.
+
+The same token can be presented to QuestDB over any auth path the server already validates:
+
+- **REST API:** send it as an `Authorization: Bearer <token>` header (`auth.getAuthorizationHeaderValue()` returns the full value).
+- **PG-wire:** connect as user `_sso` with the token as the password (requires `acl.oidc.pg.token.as.password.enabled=true` on the server).
+
+To configure the identity provider explicitly instead of discovering it from the server:
+
+```java
+OidcDeviceAuth auth = OidcDeviceAuth.builder()
+        .clientId("questdb")
+        .deviceAuthorizationEndpoint("https://idp.example.com/as/device_authz.oauth2")
+        .tokenEndpoint("https://idp.example.com/as/token.oauth2")
+        .scope("openid groups")
+        .groupsInToken(true) // matches acl.oidc.groups.encoded.in.token on the server
+        .build();
+```
+
+Discovery via `fromQuestDB(...)` needs a server that advertises its device authorization endpoint through `/settings`, and the identity provider's client must have the device authorization grant enabled.
+
+By default the device authorization and token endpoints must use `https`, so tokens are never sent in cleartext; an `http` endpoint is rejected. For local development against an `http` endpoint, opt in explicitly with `.allowInsecureTransport(true)` on the builder, or `OidcDeviceAuth.fromQuestDB(url, true)`.
+
+`fromQuestDB(...)` takes the identity provider endpoints from the server's unauthenticated `/settings`, so it trusts that server to designate where you sign in: a spoofed, compromised, or man-in-the-middled server could redirect the sign-in to an attacker-controlled identity provider. Only use it against a server you trust, reached over `https`. When the server is not trusted, configure the identity provider explicitly with `OidcDeviceAuth.builder()` instead of discovering it.
+
 ### Explicit Timestamps
 
 ```java

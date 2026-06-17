@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.line.http;
 import io.questdb.client.BuildInformationHolder;
 import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.http.HttpConstants;
@@ -88,6 +89,7 @@ public abstract class AbstractLineHttpSender implements Sender {
     private boolean closed;
     private int currentAddressIndex;
     private long flushAfterNanos = Long.MAX_VALUE;
+    private HttpTokenProvider httpTokenProvider;
     private JsonErrorParser jsonErrorParser;
     private boolean lastFlushFailed;
     private long pendingRows;
@@ -225,7 +227,8 @@ public abstract class AbstractLineHttpSender implements Sender {
     ) {
         return createLineSender(new ObjList<>(host), IntList.createWithValues(port), path, clientConfiguration, tlsConfig, autoFlushRows, authToken, username, password, maxNameLength, maxRetriesNanos, maxBackoffMillis, minRequestThroughput,
                 flushIntervalNanos,
-                protocolVersion
+                protocolVersion,
+                null
         );
     }
 
@@ -244,7 +247,8 @@ public abstract class AbstractLineHttpSender implements Sender {
             int maxBackoffMillis,
             long minRequestThroughput,
             long flushIntervalNanos,
-            int protocolVersion
+            int protocolVersion,
+            HttpTokenProvider httpTokenProvider
     ) {
         HttpClient cli = null;
         Rnd rnd = new Rnd(NanosecondClockImpl.INSTANCE.getTicks(), MicrosecondClockImpl.INSTANCE.getTicks());
@@ -334,9 +338,10 @@ public abstract class AbstractLineHttpSender implements Sender {
             throw new LineSenderException("Failed to detect server line protocol version");
         }
 
+        final AbstractLineHttpSender sender;
         switch (protocolVersion) {
             case PROTOCOL_VERSION_V1:
-                return new LineHttpSenderV1(
+                sender = new LineHttpSenderV1(
                         hosts,
                         ports,
                         path,
@@ -355,8 +360,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                         currentAddressIndex,
                         rnd
                 );
+                break;
             case PROTOCOL_VERSION_V2:
-                return new LineHttpSenderV2(
+                sender = new LineHttpSenderV2(
                         hosts,
                         ports,
                         path,
@@ -375,8 +381,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                         currentAddressIndex,
                         rnd
                 );
+                break;
             case PROTOCOL_VERSION_V3:
-                return new LineHttpSenderV3(
+                sender = new LineHttpSenderV3(
                         hosts,
                         ports,
                         path,
@@ -395,9 +402,22 @@ public abstract class AbstractLineHttpSender implements Sender {
                         currentAddressIndex,
                         rnd
                 );
+                break;
             default:
                 throw new LineSenderException("Unsupported protocol version: " + protocolVersion);
         }
+        if (httpTokenProvider != null) {
+            // wire the per-request token provider and rebuild the pending request so its first send
+            // already carries a provider-sourced token (the constructor built it before this was set)
+            sender.httpTokenProvider = httpTokenProvider;
+            try {
+                sender.request = sender.newRequest();
+            } catch (Throwable t) {
+                Misc.free(sender);
+                throw t;
+            }
+        }
+        return sender;
     }
 
     public static boolean isNotFound(DirectUtf8Sequence statusCode) {
@@ -733,6 +753,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                 .header("User-Agent", "QuestDB/java/" + questDBVersion);
         if (username != null) {
             r.authBasic(username, password);
+        } else if (httpTokenProvider != null) {
+            // pull a fresh token per request so a long-lived sender follows token refreshes
+            r.authToken(httpTokenProvider.getToken());
         } else if (authToken != null) {
             r.authToken(authToken);
         }
