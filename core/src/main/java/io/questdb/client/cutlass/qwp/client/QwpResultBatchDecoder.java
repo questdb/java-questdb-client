@@ -605,16 +605,16 @@ public class QwpResultBatchDecoder implements QuietCloseable {
             long elements = 1;
             for (int d = 0; d < nDims; d++) {
                 int dl = Unsafe.getUnsafe().getInt(p + 1 + 4L * d);
-                // Require dl >= 1 in every dimension. A dl of 0 in any
-                // position would zero out {@code elements} and short-circuit
-                // the {@code MAX_ARRAY_ELEMENTS} cap for the rest of the
-                // loop, letting subsequent dimensions hold arbitrary values
-                // unchecked. The encoder side never emits dl == 0 (see
-                // {@code ColumnType} which asserts nDims >= 1 and treats
-                // every dimension symmetrically), so reject the
-                // wire-format inconsistency outright.
-                if (dl < 1) {
-                    throw new QwpDecodeException("ARRAY dim " + d + " must be >= 1: " + dl);
+                // A 0-length dimension is a valid empty array (cardinality 0),
+                // distinct from a NULL array (which the null bitmap carries).
+                // Reject only a negative length, and bound each dimension
+                // independently: a single 0 collapses {@code elements} to 0,
+                // so without a per-dimension cap a 0 in one dimension would let
+                // another hold an arbitrary value the product check below could
+                // no longer catch. Matches the server's QwpArrayColumnCursor.
+                if (dl < 0 || dl > MAX_ARRAY_ELEMENTS) {
+                    throw new QwpDecodeException("ARRAY dim " + d + " out of range [0, "
+                            + MAX_ARRAY_ELEMENTS + "]: " + dl);
                 }
                 elements *= dl;
                 if (elements > MAX_ARRAY_ELEMENTS) {
