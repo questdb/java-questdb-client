@@ -210,6 +210,47 @@ public class CloseDrainTest {
         }
     }
 
+    /**
+     * Regression test for #7142: drain() after a prior flush() with unacked
+     * frames must block for those frames, even though the inner
+     * flushAndGetSequence() publishes nothing and returns -1.
+     * <p>
+     * On buggy code (no drain() override): drain() calls the default
+     * Sender.drain() → flushAndGetSequence() returns -1 → awaitAckedFsn(-1, ...)
+     * returns true immediately (ackedFsn >= -1 is always true) at elapsed≈0ms.
+     * The elapsed >= 300 assertion fails deterministically.
+     * <p>
+     * On fixed code: drain() uses the watermark override → waits for the
+     * delayed ACK (~600ms) → passes.
+     */
+    @Test
+    public void testDrainAfterFlushWaitsForPriorUnackedFrames() throws Exception {
+        int port = TestPorts.findUnusedPort();
+        long ackDelayMs = 600;
+        DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
+        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + port + ";";
+            try (Sender sender = Sender.fromConfig(cfg)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();                         // publish FSN 0; ACK delayed ~600ms
+
+                long t0 = System.nanoTime();
+                boolean drained = sender.drain(5_000);  // empty flush → -1 on buggy code
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+
+                Assert.assertTrue("drain() must return true when ACK arrives within budget",
+                        drained);
+                Assert.assertTrue(
+                        "drain() must wait for prior unacked frame, but returned in only "
+                                + elapsedMs + "ms (expected >= " + (ackDelayMs / 2) + "ms)",
+                        elapsedMs >= ackDelayMs / 2);
+            }
+        }
+    }
+
     @Test
     public void testDrainReturnsFalseOnTimeoutAndSenderStillUsable() throws Exception {
         // Server never ACKs. drain() with a small timeout must return false
