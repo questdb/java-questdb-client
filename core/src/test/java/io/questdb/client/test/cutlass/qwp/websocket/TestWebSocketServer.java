@@ -136,12 +136,10 @@ public class TestWebSocketServer implements Closeable {
         // close their sockets below — if the listener is still up, those
         // reconnects succeed and the new connections are never tracked here,
         // leaving them alive past close().
-        if (serverSocket != null) {
-            try {
-                serverSocket.close();
-            } catch (IOException e) {
-                // ignore
-            }
+        try {
+            serverSocket.close();
+        } catch (IOException e) {
+            // ignore
         }
 
         for (ClientHandler client : clients) {
