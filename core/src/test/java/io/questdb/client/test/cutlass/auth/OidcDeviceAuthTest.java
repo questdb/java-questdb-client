@@ -612,6 +612,11 @@ public class OidcDeviceAuthTest {
         assertBuildFails("https://idp/d", "https://idp:notaport/t", "could not parse the port");
         assertBuildFails("https:///d", "https://idp/t", "the host is empty");
         assertBuildFails("https://[::1]:9000/d", "https://idp/t", "IPv6 literal hosts are not supported");
+        // an out-of-range port (0, negative, or above 65535) is rejected rather than passed to the transport
+        assertBuildFails("https://idp:99999/d", "https://idp/t", "between 1 and 65535");
+        assertBuildFails("https://idp:0/d", "https://idp/t", "between 1 and 65535");
+        assertBuildFails("https://idp:-1/d", "https://idp/t", "between 1 and 65535");
+        assertBuildFails("https://idp/d", "https://idp:70000/t", "between 1 and 65535");
     }
 
     @Test(timeout = 30_000)
@@ -1055,6 +1060,55 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testNullAccessTokenNotServedAsLiteralNull() throws Exception {
+        assertMemoryLeak(() -> {
+            // a JSON null arrives from the lexer as the literal "null"; "access_token": null must be treated
+            // as absent, not stored and served as the 4-char token "null"
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, "{\"token_type\":\"Bearer\",\"expires_in\":3600,\"access_token\":null}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    String token = auth.getToken();
+                    Assert.fail("a JSON null access_token must not be served as the literal token \"null\" [got=" + token + "]");
+                } catch (OidcAuthException e) {
+                    // null is absent, so a 2xx with no token is a definitive but malformed answer
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("unexpected response"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testNullJsonErrorIsTreatedAsAbsent() throws Exception {
+        assertMemoryLeak(() -> {
+            // "error": null in a device-auth response must be treated as absent, not as an OAuth error whose
+            // code is the literal string "null"; the flow must proceed to prompt and poll
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEV\","
+                            + "\"user_code\":\"WDJB\","
+                            + "\"verification_uri\":\"https://verify.example/device\","
+                            + "\"error\":null,"
+                            + "\"expires_in\":300,"
+                            + "\"interval\":1"
+                            + "}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-OK", null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-OK", auth.getToken());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testNullPromptDefaultsToSystemOut() throws Exception {
         assertMemoryLeak(() -> {
             // builder.prompt(null) must fall back to the default prompt rather than NPE during the flow
@@ -1460,6 +1514,43 @@ public class OidcDeviceAuthTest {
                             e.getMessage().contains(secret));
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("httpStatus="));
                 }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testTokenResponseExpiresInIsClamped() throws Exception {
+        assertMemoryLeak(() -> {
+            // an absurd token-response expires_in (here Integer.MAX_VALUE, ~68 years) must be clamped like
+            // the device-side value, so the client does not trust a stale cached token for decades. With the
+            // clock-skew margin set above the clamp, a clamped token reads as already-expired on the next
+            // call and getToken() re-runs the flow; an unclamped ~68-year cache would be served instead, so
+            // the device endpoint would be hit only once.
+            AtomicInteger deviceCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    deviceCalls.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                // no refresh_token, so an expired cache forces a fresh device flow rather than a silent refresh
+                return MockOidcServer.json(200, tokenJson("ACCESS-OK", null, null, Integer.MAX_VALUE));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                         .clientId("questdb")
+                         .deviceAuthorizationEndpoint(server.httpUrl(DEVICE_PATH))
+                         .tokenEndpoint(server.httpUrl(TOKEN_PATH))
+                         .scope("openid")
+                         .prompt(noopPrompt())
+                         .allowInsecureTransport(true)
+                         .clockSkewSeconds(7200) // 2h, above the 1h (MAX_EXPIRES_IN_SECONDS) clamp
+                         .build()) {
+                Assert.assertEquals("ACCESS-OK", auth.getToken());
+                Assert.assertEquals("first sign-in runs the device flow once", 1, deviceCalls.get());
+                // the clamped 1h TTL minus the 2h skew is already in the past, so the next call re-runs the
+                // flow; without the clamp the ~68-year cache would be served and the flow would not run again
+                Assert.assertEquals("ACCESS-OK", auth.getToken());
+                Assert.assertEquals("clamped token expiry forces a fresh sign-in", 2, deviceCalls.get());
             }
         });
     }

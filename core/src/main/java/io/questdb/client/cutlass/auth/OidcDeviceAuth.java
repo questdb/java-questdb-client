@@ -447,11 +447,14 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
-    private static void putValue(StringSink sink, CharSequence tag) {
+    private static void putNonNull(StringSink sink, CharSequence tag) {
         // clear before storing so a repeated key in the response replaces, rather than concatenates onto,
-        // the previous value (the same clear-before-put guard SettingsDiscoveryParser.putNonNull applies)
+        // the previous value; a JSON null arrives from the lexer as the literal "null", so treat it as
+        // absent rather than store the 4-char string "null" as a token, error code, endpoint or user code
         sink.clear();
-        sink.put(tag);
+        if (!Chars.equals("null", tag)) {
+            sink.put(tag);
+        }
     }
 
     private static void requireSecureTransport(boolean isTls, String label, String url) {
@@ -710,7 +713,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (parser.refreshToken.length() > 0) {
             refreshToken = parser.refreshToken.toString();
         }
-        int ttlSeconds = parser.expiresIn > 0 ? parser.expiresIn : DEFAULT_TOKEN_TTL_SECONDS;
+        // clamp like the device-side expires_in: fall back to the default for a non-positive value and cap
+        // an absurd one, so a hostile or buggy token TTL cannot cache the token for decades (the server
+        // still enforces the real expiry; this only bounds how long the client trusts its cached copy)
+        int ttlSeconds = boundedSeconds(parser.expiresIn, DEFAULT_TOKEN_TTL_SECONDS, MAX_EXPIRES_IN_SECONDS);
         expiresAtMillis = System.currentTimeMillis() + ttlSeconds * 1000L;
     }
 
@@ -950,16 +956,16 @@ public class OidcDeviceAuth implements QuietCloseable {
                     if (depth == 1) {
                         switch (field) {
                             case FIELD_DEVICE_CODE:
-                                putValue(deviceCode, tag);
+                                putNonNull(deviceCode, tag);
                                 break;
                             case FIELD_USER_CODE:
-                                putValue(userCode, tag);
+                                putNonNull(userCode, tag);
                                 break;
                             case FIELD_VERIFICATION_URI:
-                                putValue(verificationUri, tag);
+                                putNonNull(verificationUri, tag);
                                 break;
                             case FIELD_VERIFICATION_URI_COMPLETE:
-                                putValue(verificationUriComplete, tag);
+                                putNonNull(verificationUriComplete, tag);
                                 break;
                             case FIELD_EXPIRES_IN:
                                 expiresIn = parseIntOrZero(tag);
@@ -968,10 +974,10 @@ public class OidcDeviceAuth implements QuietCloseable {
                                 interval = parseIntOrZero(tag);
                                 break;
                             case FIELD_ERROR:
-                                putValue(error, tag);
+                                putNonNull(error, tag);
                                 break;
                             case FIELD_ERROR_DESCRIPTION:
-                                putValue(errorDescription, tag);
+                                putNonNull(errorDescription, tag);
                                 break;
                             default:
                                 break;
@@ -1032,6 +1038,9 @@ public class OidcDeviceAuth implements QuietCloseable {
                     port = Integer.parseInt(hostPort.substring(colon + 1));
                 } catch (NumberFormatException e) {
                     throw new OidcAuthException().put("invalid url, could not parse the port [url=").put(url).put(']');
+                }
+                if (port < 1 || port > 65535) {
+                    throw new OidcAuthException().put("invalid url, the port must be between 1 and 65535 [url=").put(url).put(']');
                 }
             } else {
                 host = hostPort;
@@ -1136,15 +1145,6 @@ public class OidcDeviceAuth implements QuietCloseable {
                     break;
             }
         }
-
-        private static void putNonNull(StringSink sink, CharSequence tag) {
-            // a JSON null is delivered as the literal "null", treat it as absent; clear first so a
-            // duplicate key cannot concatenate onto an earlier value
-            sink.clear();
-            if (!Chars.equals("null", tag)) {
-                sink.put(tag);
-            }
-        }
     }
 
     private static final class TokenResponseParser implements JsonParser, Mutable {
@@ -1208,22 +1208,22 @@ public class OidcDeviceAuth implements QuietCloseable {
                     if (depth == 1) {
                         switch (field) {
                             case FIELD_ACCESS_TOKEN:
-                                putValue(accessToken, tag);
+                                putNonNull(accessToken, tag);
                                 break;
                             case FIELD_ID_TOKEN:
-                                putValue(idToken, tag);
+                                putNonNull(idToken, tag);
                                 break;
                             case FIELD_REFRESH_TOKEN:
-                                putValue(refreshToken, tag);
+                                putNonNull(refreshToken, tag);
                                 break;
                             case FIELD_EXPIRES_IN:
                                 expiresIn = parseIntOrZero(tag);
                                 break;
                             case FIELD_ERROR:
-                                putValue(error, tag);
+                                putNonNull(error, tag);
                                 break;
                             case FIELD_ERROR_DESCRIPTION:
-                                putValue(errorDescription, tag);
+                                putNonNull(errorDescription, tag);
                                 break;
                             default:
                                 break;
