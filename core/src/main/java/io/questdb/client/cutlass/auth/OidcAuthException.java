@@ -67,6 +67,22 @@ public class OidcAuthException extends RuntimeException {
         return e;
     }
 
+    // Reports characters that must never reach a terminal or a log line. Beyond the C0/C1 controls and
+    // DEL that isISOControl covers, this strips the Unicode "format" category (Cf) - zero-width joiners,
+    // the byte-order mark, and the bidirectional embedding/override/isolate controls - plus an explicit
+    // bidi/BOM set, so an attacker-influenced value (a verification_uri, a user_code, an error string)
+    // carrying a right-to-left override cannot reorder the text a human reads, even on a JDK whose
+    // Unicode tables categorize these differently. Hex literals (not char escapes) keep this source
+    // strictly ASCII, so the file itself carries none of the characters it guards against.
+    static boolean isUnsafeForDisplay(char c) {
+        return Character.isISOControl(c)
+                || Character.getType(c) == Character.FORMAT
+                || (c >= 0x202A && c <= 0x202E) // LRE, RLE, PDF, LRO, RLO
+                || (c >= 0x2066 && c <= 0x2069) // LRI, RLI, FSI, PDI
+                || c == 0x200E || c == 0x200F   // LRM, RLM
+                || c == 0xFEFF;                 // BOM / zero-width no-break space
+    }
+
     @Override
     public String getMessage() {
         return message.toString();
@@ -91,13 +107,14 @@ public class OidcAuthException extends RuntimeException {
         return this;
     }
 
-    // appends untrusted text with control characters stripped, so an attacker-influenced IdP error
-    // string cannot inject ANSI escapes or forge log lines when the exception message is rendered
+    // appends untrusted text with display-unsafe characters stripped, so an attacker-influenced IdP
+    // error string cannot inject ANSI escapes, forge log lines, or smuggle bidi/zero-width formatting
+    // when the exception message is rendered
     private void putSanitized(CharSequence cs) {
         if (cs != null) {
             for (int i = 0, n = cs.length(); i < n; i++) {
                 char c = cs.charAt(i);
-                if (!Character.isISOControl(c)) {
+                if (!isUnsafeForDisplay(c)) {
                     message.put(c);
                 }
             }

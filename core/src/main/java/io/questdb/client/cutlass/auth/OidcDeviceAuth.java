@@ -466,25 +466,27 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (value == null) {
             return null;
         }
-        int firstControl = -1;
+        int firstUnsafe = -1;
         int n = value.length();
         for (int i = 0; i < n; i++) {
-            if (Character.isISOControl(value.charAt(i))) {
-                firstControl = i;
+            if (OidcAuthException.isUnsafeForDisplay(value.charAt(i))) {
+                firstUnsafe = i;
                 break;
             }
         }
-        if (firstControl < 0) {
+        if (firstUnsafe < 0) {
             // common case: nothing to strip
             return value;
         }
-        // an attacker-influenced device-auth field smuggled in control characters (ANSI escapes,
-        // CR/LF); strip them so a prompt cannot be tricked into rewriting or spoofing the terminal
+        // an attacker-influenced device-auth field smuggled in characters that can rewrite or spoof the
+        // terminal - ANSI escapes, CR/LF, or bidi/zero-width formatting that reorders or hides text - so
+        // strip them; otherwise a right-to-left override could make the verification URL a human reads
+        // differ from the one their browser opens
         StringSink sink = new StringSink();
-        sink.put(value, 0, firstControl);
-        for (int i = firstControl + 1; i < n; i++) {
+        sink.put(value, 0, firstUnsafe);
+        for (int i = firstUnsafe + 1; i < n; i++) {
             char c = value.charAt(i);
-            if (!Character.isISOControl(c)) {
+            if (!OidcAuthException.isUnsafeForDisplay(c)) {
                 sink.put(c);
             }
         }

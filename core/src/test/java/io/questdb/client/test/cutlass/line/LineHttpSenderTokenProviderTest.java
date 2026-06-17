@@ -1,0 +1,104 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.line;
+
+import io.questdb.client.HttpTokenProvider;
+import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Verifies that a {@link Sender} built with {@link Sender.LineSenderBuilder#httpTokenProvider}
+ * does not query the provider on the build path: the first token pull is deferred to the first
+ * row. That lets a provider which signs in lazily - the documented
+ * {@code .httpTokenProvider(auth::getTokenSilently)} - be wired before the interactive sign-in
+ * has completed.
+ * <p>
+ * An explicit {@code protocol_version} keeps {@link Sender.LineSenderBuilder#build()} from probing
+ * the server, and auto-flush is disabled, so rows can be buffered against a port nobody listens on
+ * without ever opening a connection.
+ */
+public class LineHttpSenderTokenProviderTest {
+
+    @Test
+    public void testBuildSucceedsWhenProviderHasNotSignedInYet() {
+        // a provider that throws until the caller has signed in, mirroring OidcDeviceAuth::getTokenSilently
+        AtomicBoolean signedIn = new AtomicBoolean(false);
+        HttpTokenProvider provider = () -> {
+            if (!signedIn.get()) {
+                throw new LineSenderException("no token has been obtained yet");
+            }
+            return "TOKEN";
+        };
+        try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                .address("127.0.0.1:1")
+                .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                .disableAutoFlush()
+                .httpTokenProvider(provider)
+                .build()) {
+            // build() must succeed even though the provider cannot supply a token yet, so the natural
+            // "construct the sender, sign in, then send" ordering is possible
+            try {
+                sender.table("t").longColumn("v", 1L).atNow();
+                Assert.fail("expected the not-yet-signed-in provider to fail the first row");
+            } catch (LineSenderException e) {
+                // the deferred pull surfaces the provider's error at first use, not at build time
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("no token has been obtained yet"));
+            }
+            // after signing in, the still-pending stamp is retried and the row is accepted
+            signedIn.set(true);
+            sender.table("t").longColumn("v", 1L).atNow();
+            Assert.assertTrue("row must be buffered after signing in", sender.bufferView().size() > 0);
+        }
+    }
+
+    @Test
+    public void testProviderTokenNotPulledAtBuildAndPulledOnFirstRow() {
+        AtomicInteger calls = new AtomicInteger();
+        HttpTokenProvider provider = () -> {
+            calls.incrementAndGet();
+            return "TOKEN";
+        };
+        try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                .address("127.0.0.1:1")
+                .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                .disableAutoFlush()
+                .httpTokenProvider(provider)
+                .build()) {
+            // build() must not query the provider: a lazily-signing-in provider would not have a token yet
+            Assert.assertEquals("provider must not be queried at build time", 0, calls.get());
+            // the first row pulls the deferred token so the first send will carry it
+            sender.table("t").longColumn("v", 1L).atNow();
+            Assert.assertEquals("provider must be queried when the first row starts", 1, calls.get());
+            // a second row in the same un-flushed batch reuses the same request, so it does not re-pull
+            sender.table("t").longColumn("v", 2L).atNow();
+            Assert.assertEquals("provider must not be re-queried within the same batch", 1, calls.get());
+        }
+    }
+}

@@ -130,6 +130,47 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testChallengeStripsBidiAndZeroWidthFromDisplayFields() throws Exception {
+        assertMemoryLeak(() -> {
+            // a hostile or MITM'd IdP smuggles bidi/zero-width formatting into the display fields. Here a
+            // right-to-left override (U+202E) arrives as a JSON unicode escape, which this client's lexer
+            // decodes into the real character before it reaches the prompt; a BOM, a zero-width space and a
+            // bidi isolate arrive the same way. The challenge shown to the user must strip them all, so the
+            // verification URL a human reads matches the one their browser opens
+            String evilUri = "https://verify.example/" + jsonUnicodeEscape(0x202E) + "evil";           // RTL override
+            String evilComplete = "https://verify.example/" + jsonUnicodeEscape(0xFEFF) + "device?x=1"; // BOM
+            String evilUserCode = "W" + jsonUnicodeEscape(0x200B) + "D" + jsonUnicodeEscape(0x2066) + "JB"; // ZWSP + LRI
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEV\","
+                            + "\"user_code\":\"" + evilUserCode + "\","
+                            + "\"verification_uri\":\"" + evilUri + "\","
+                            + "\"verification_uri_complete\":\"" + evilComplete + "\","
+                            + "\"expires_in\":300,"
+                            + "\"interval\":1"
+                            + "}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-OK", null, null, 3600));
+            };
+            AtomicReference<DeviceAuthorizationChallenge> shown = new AtomicReference<>();
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, shown::set)) {
+                Assert.assertEquals("ACCESS-OK", auth.getToken());
+                DeviceAuthorizationChallenge challenge = shown.get();
+                Assert.assertNotNull(challenge);
+                // the bidi/zero-width/BOM characters are removed, the readable text is preserved
+                Assert.assertEquals("https://verify.example/evil", challenge.getVerificationUri());
+                Assert.assertEquals("https://verify.example/device?x=1", challenge.getVerificationUriComplete());
+                Assert.assertEquals("WDJB", challenge.getUserCode());
+                assertNoUnsafeDisplayChars(challenge.getUserCode());
+                assertNoUnsafeDisplayChars(challenge.getVerificationUri());
+                assertNoUnsafeDisplayChars(challenge.getVerificationUriComplete());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testChallengeStripsControlCharactersFromDisplayFields() throws Exception {
         assertMemoryLeak(() -> {
             // an attacker-influenced device-auth response embeds ANSI/control characters; the challenge
@@ -1038,6 +1079,31 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testOauthErrorMessageStripsBidiControls() throws Exception {
+        assertMemoryLeak(() -> {
+            // an IdP error_description carrying a right-to-left override and a zero-width space (as JSON
+            // unicode escapes the lexer decodes) must not reach the exception message verbatim; they would
+            // let a malicious IdP reorder or hide text when the message is rendered to a terminal or a log
+            String desc = "denied" + jsonUnicodeEscape(0x202E) + "reversed" + jsonUnicodeEscape(0x200B) + "end";
+            MockOidcServer.Handler handler = (method, path, body) ->
+                    MockOidcServer.json(400, "{\"error\":\"access_denied\",\"error_description\":\"" + desc + "\"}");
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected an OidcAuthException");
+                } catch (OidcAuthException e) {
+                    Assert.assertEquals("access_denied", e.getOauthError());
+                    String msg = e.getMessage();
+                    assertNoUnsafeDisplayChars(msg);
+                    Assert.assertTrue(msg, msg.contains("access_denied"));
+                    Assert.assertTrue(msg, msg.contains("deniedreversedend")); // readable text survives, controls gone
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testOauthErrorMessageStripsControlChars() throws Exception {
         assertMemoryLeak(() -> {
             // an IdP error_description carrying ANSI/CRLF control chars must not reach the exception
@@ -1623,6 +1689,20 @@ public class OidcDeviceAuthTest {
         }
     }
 
+    private static void assertNoUnsafeDisplayChars(String value) {
+        // mirrors OidcAuthException.isUnsafeForDisplay: no controls, no Cf format chars, no bidi/BOM
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            boolean unsafe = Character.isISOControl(c)
+                    || Character.getType(c) == Character.FORMAT
+                    || (c >= 0x202A && c <= 0x202E)
+                    || (c >= 0x2066 && c <= 0x2069)
+                    || c == 0x200E || c == 0x200F
+                    || c == 0xFEFF;
+            Assert.assertFalse("display-unsafe char U+" + Integer.toHexString(c) + " at index " + i + " in '" + value + "'", unsafe);
+        }
+    }
+
     private static String deviceAuthorizationJson(int interval, int expiresIn) {
         return "{"
                 + "\"device_code\":\"DEV-CODE\","
@@ -1632,6 +1712,14 @@ public class OidcDeviceAuthTest {
                 + "\"expires_in\":" + expiresIn + ","
                 + "\"interval\":" + interval
                 + "}";
+    }
+
+    // builds a JSON unicode escape (backslash-u-XXXX) for a BMP code point without writing one literally
+    // in this source (char 92 is REVERSE SOLIDUS), so the file stays ASCII; the client's JSON lexer decodes
+    // the escape back into the real character, exercising the same decode-then-display path a hostile IdP hits
+    private static String jsonUnicodeEscape(int codePoint) {
+        String hex = Integer.toHexString(codePoint);
+        return ((char) 92) + "u" + "0000".substring(hex.length()) + hex;
     }
 
     private static OidcDeviceAuth newAuth(MockOidcServer server, boolean groupsInToken, DeviceCodePrompt prompt) {

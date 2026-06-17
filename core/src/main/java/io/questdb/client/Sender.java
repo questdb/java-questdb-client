@@ -2015,9 +2015,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * long-lived sender following token refreshes - for example a token obtained through the OIDC
          * device flow: {@code .httpTokenProvider(auth::getTokenSilently)}.
          * <br>
-         * The provider runs on the flush path, so it must return promptly and must not block on
-         * interactive input (see {@link HttpTokenProvider}). Only valid for HTTP transport, and mutually
-         * exclusive with {@link #httpToken(String)} and {@link #httpUsernamePassword(String, String)}.
+         * The sender does not call the provider at build time: the first call happens when the first row
+         * is started, then once per flush. A provider that signs in lazily can therefore be wired before
+         * the interactive sign-in completes, as long as a token is obtainable before the first row is
+         * added - otherwise that first row fails. The provider runs on the flush path, so it must return
+         * promptly and must not block on interactive input (see {@link HttpTokenProvider}). Only valid for
+         * HTTP transport, and mutually exclusive with {@link #httpToken(String)} and
+         * {@link #httpUsernamePassword(String, String)}.
          *
          * @param httpTokenProvider supplies the current HTTP authentication token
          * @return this instance for method chaining
