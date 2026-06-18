@@ -34,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
 /**
  * Elastic pool of {@link QueryWorker}s. Each worker pairs one
@@ -52,6 +53,12 @@ public final class QueryClientPool {
     private final ArrayList<QueryWorker> all;
     private final ArrayDeque<QueryWorker> available;
     private final String configurationString;
+    // Test seam. Production connects via QwpQueryClient.connect(); white-box
+    // tests in io.questdb.client.test.impl reach the package-private constructor
+    // by reflection to inject a hook that throws a non-RuntimeException
+    // Throwable (e.g. an -ea AssertionError) from the native connect path,
+    // exercising the Error-safe cleanup on the prewarm and acquire paths.
+    private final Consumer<QwpQueryClient> connectHook;
     private final long idleTimeoutMillis;
     private final ReentrantLock lock = new ReentrantLock();
     private final long maxLifetimeMillis;
@@ -70,9 +77,27 @@ public final class QueryClientPool {
             long idleTimeoutMillis,
             long maxLifetimeMillis
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, null);
+    }
+
+    // Package-private constructor exposing the connectHook test seam: production
+    // passes null (-> the real QwpQueryClient.connect()). White-box tests in
+    // io.questdb.client.test.impl reach this by reflection to inject a hook that
+    // throws a non-RuntimeException Throwable from the native connect path.
+    QueryClientPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            Consumer<QwpQueryClient> connectHook
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
+        this.connectHook = connectHook != null ? connectHook : QwpQueryClient::connect;
         this.configurationString = configurationString;
         this.minSize = minSize;
         this.maxSize = maxSize;
@@ -91,7 +116,13 @@ public final class QueryClientPool {
                 available.add(w);
                 built++;
             }
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
+            // Catch Throwable, not just RuntimeException: createUnlocked()/start()
+            // run a heavy native build path that can throw an Error -- e.g. an
+            // -ea AssertionError or OutOfMemoryError -- mid-prewarm. If we only
+            // caught RuntimeException the Error would propagate without running
+            // the cleanup below, stranding every already-built worker's I/O
+            // thread and native allocations.
             for (int i = 0; i < built; i++) {
                 try {
                     all.get(i).shutdown();
@@ -126,7 +157,15 @@ public final class QueryClientPool {
                     try {
                         created = createUnlocked();
                         created.start();
-                    } catch (RuntimeException e) {
+                    } catch (Throwable e) {
+                        // Catch Throwable, not just RuntimeException:
+                        // createUnlocked()/start() run a heavy native build path
+                        // that can throw an Error -- e.g. an -ea AssertionError
+                        // or OutOfMemoryError. If we only caught RuntimeException
+                        // the Error would propagate with inFlightCreations still
+                        // incremented, permanently shrinking pool capacity until
+                        // every acquire() times out. Restoring the reservation
+                        // for any throwable is safe.
                         lock.lock();
                         inFlightCreations--;
                         workerReleased.signal();
@@ -253,16 +292,31 @@ public final class QueryClientPool {
         }
     }
 
+    // Package-private white-box accessor for tests: reports the current
+    // in-flight creation count under the pool lock. A non-zero value after a
+    // failed acquire() means the slot reservation was never released -- the
+    // capacity-shrink bug this guards against.
+    int inFlightCreations() {
+        lock.lock();
+        try {
+            return inFlightCreations;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private QueryWorker createUnlocked() {
         QwpQueryClient client = QwpQueryClient.fromConfig(configurationString);
         try {
-            client.connect();
-        } catch (RuntimeException e) {
-            // connect() may throw after QwpQueryClient.fromConfig() has already
+            connectHook.accept(client);
+        } catch (Throwable e) {
+            // Catch Throwable, not just RuntimeException: connect() runs a heavy
+            // native path that can throw an Error (e.g. an -ea AssertionError or
+            // OutOfMemoryError) after QwpQueryClient.fromConfig() has already
             // allocated native scratch (the QwpBindValues NativeBufferWriter is
             // field-initialised). Close the half-built client so its allocations
-            // are released, otherwise every connect failure during pool growth
-            // leaks NATIVE_DEFAULT bytes.
+            // are released, otherwise an Error during pool growth leaks the
+            // NATIVE_DEFAULT bytes that only this cleanup would reclaim.
             try {
                 client.close();
             } catch (Throwable ignored) {

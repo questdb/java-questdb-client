@@ -36,6 +36,7 @@ import java.util.Iterator;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.IntFunction;
 
 /**
  * Elastic pool of {@link Sender} instances, each wrapped in a
@@ -79,6 +80,12 @@ public final class SenderPool implements AutoCloseable {
     private final ArrayDeque<PooledSender> available;
     private final String configurationString;
     private final long idleTimeoutMillis;
+    // Test seam. Production builds delegates via defaultSender(); white-box
+    // tests in io.questdb.client.test.impl reach the package-private
+    // constructor by reflection to inject a factory that throws a non-
+    // RuntimeException Throwable (e.g. an -ea AssertionError) mid-prewarm,
+    // exercising the Error-safe delegate cleanup loop.
+    private final IntFunction<Sender> senderFactory;
     private final ReentrantLock lock = new ReentrantLock();
     private final long maxLifetimeMillis;
     private final int maxSize;
@@ -117,9 +124,27 @@ public final class SenderPool implements AutoCloseable {
             long idleTimeoutMillis,
             long maxLifetimeMillis
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, null);
+    }
+
+    // Package-private constructor exposing the senderFactory test seam:
+    // production passes null (-> the real defaultSender()). White-box tests in
+    // io.questdb.client.test.impl reach this by reflection to inject a factory
+    // that throws a non-RuntimeException Throwable mid-prewarm.
+    SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
+        this.senderFactory = senderFactory != null ? senderFactory : this::defaultSender;
         this.configurationString = configurationString;
         this.minSize = minSize;
         this.maxSize = maxSize;
@@ -150,7 +175,14 @@ public final class SenderPool implements AutoCloseable {
                 available.add(ps);
                 built++;
             }
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
+            // Catch Throwable, not just RuntimeException: createUnlocked() runs a
+            // heavy native build path (mmap, flock, WebSocket connect) that can
+            // throw an Error -- e.g. an -ea AssertionError or OutOfMemoryError --
+            // mid-prewarm. If we only caught RuntimeException the Error would
+            // propagate without running the cleanup below, leaking every
+            // already-built delegate's flock + mmap'd ring + I/O thread and
+            // resurrecting "sf slot already in use" on the next attempt.
             for (int i = 0; i < built; i++) {
                 try {
                     all.get(i).delegate().close();
@@ -546,6 +578,10 @@ public final class SenderPool implements AutoCloseable {
     }
 
     private PooledSender createUnlocked(int slotIndex) {
+        return new PooledSender(senderFactory.apply(slotIndex), this, slotIndex);
+    }
+
+    private Sender defaultSender(int slotIndex) {
         final Sender raw;
         if (storeAndForward) {
             // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
@@ -567,7 +603,7 @@ public final class SenderPool implements AutoCloseable {
         } else {
             raw = Sender.fromConfig(configurationString);
         }
-        return new PooledSender(raw, this, slotIndex);
+        return raw;
     }
 
     /**
