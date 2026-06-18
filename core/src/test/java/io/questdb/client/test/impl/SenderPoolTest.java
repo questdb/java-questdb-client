@@ -26,12 +26,16 @@ package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Proxy;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -486,5 +490,97 @@ public class SenderPoolTest {
 
             pool.releaseCurrentThread();
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // Teardown robustness: a delegate close() can throw an Error (e.g. an
+    // -ea AssertionError), not just a RuntimeException. The pool's best-effort
+    // teardown paths used to catch only RuntimeException, so such an Error
+    // escaped: reapIdle() aborted mid-loop (stranding siblings) and the cap
+    // accounting was skipped, permanently understating capacity. These tests
+    // pin the fix: an Error during delegate close() must not abort the loop,
+    // must not propagate, and must leave the pool fully usable.
+    // ----------------------------------------------------------------------
+
+    @Test
+    public void testReapIdleSurvivesDelegateCloseError() throws Exception {
+        // idleTimeout=1ms so every idle slot is reap-eligible after a short sleep.
+        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 0, 3, 1_000, 1, Long.MAX_VALUE)) {
+            AtomicInteger closeAttempts = new AtomicInteger();
+            PooledSender a = pool.borrow();
+            PooledSender b = pool.borrow();
+            PooledSender c = pool.borrow();
+            installFailingCloseDelegate(a, closeAttempts);
+            installFailingCloseDelegate(b, closeAttempts);
+            installFailingCloseDelegate(c, closeAttempts);
+            pool.giveBack(a);
+            pool.giveBack(b);
+            pool.giveBack(c);
+            Assert.assertEquals(3, pool.totalSize());
+
+            Thread.sleep(10);
+            // Must NOT throw even though every delegate.close() raises an Error.
+            pool.reapIdle();
+
+            // The loop attempted to close ALL three delegates -- it did not abort
+            // after the first Error.
+            Assert.assertEquals("reap loop must not abort on a delegate close() Error",
+                    3, closeAttempts.get());
+            // Every reaped slot left `all`; capacity was not stranded.
+            Assert.assertEquals(0, pool.totalSize());
+            Assert.assertEquals(0, pool.availableSize());
+
+            // Pool still grows back to full capacity -- no permanent leak.
+            PooledSender d = pool.borrow();
+            PooledSender e = pool.borrow();
+            PooledSender f = pool.borrow();
+            Assert.assertEquals(3, pool.totalSize());
+            pool.giveBack(d);
+            pool.giveBack(e);
+            pool.giveBack(f);
+        }
+    }
+
+    @Test
+    public void testCloseSurvivesDelegateCloseError() throws Exception {
+        SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
+        AtomicInteger closeAttempts = new AtomicInteger();
+        PooledSender a = pool.borrow();
+        PooledSender b = pool.borrow();
+        installFailingCloseDelegate(a, closeAttempts);
+        installFailingCloseDelegate(b, closeAttempts);
+        pool.giveBack(a);
+        pool.giveBack(b);
+
+        // close() must not propagate an Error and must attempt every delegate.
+        pool.close();
+        Assert.assertEquals("close() must attempt to close every delegate despite an Error",
+                2, closeAttempts.get());
+        // Idempotent second close stays clean.
+        pool.close();
+    }
+
+    /**
+     * Reflectively replaces the wrapper's delegate with a {@link Proxy} that
+     * throws an {@link AssertionError} (an {@link Error}, not a
+     * {@link RuntimeException}) on {@code close()} and forwards every other
+     * call to the real delegate. Models an -ea assertion firing during native
+     * teardown.
+     */
+    private static void installFailingCloseDelegate(PooledSender ps, AtomicInteger closeAttempts) throws Exception {
+        Field f = PooledSender.class.getDeclaredField("delegate");
+        f.setAccessible(true);
+        Sender real = (Sender) f.get(ps);
+        Sender failing = (Sender) Proxy.newProxyInstance(
+                Sender.class.getClassLoader(),
+                new Class[]{Sender.class},
+                (proxy, method, args) -> {
+                    if ("close".equals(method.getName()) && (args == null || args.length == 0)) {
+                        closeAttempts.incrementAndGet();
+                        throw new AssertionError("injected delegate close() Error");
+                    }
+                    return method.invoke(real, args);
+                });
+        f.set(ps, failing);
     }
 }

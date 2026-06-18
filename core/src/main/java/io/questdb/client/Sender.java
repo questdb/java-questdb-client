@@ -1022,6 +1022,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // runtime lands in a follow-up commit. For now we surface the
         // count via logging so users can confirm orphans are being seen.
         private boolean drainOrphans = false;
+        // When non-null, orphan scanning skips any sibling slot whose dir
+        // name starts with this prefix. Set by the connection pool to its
+        // own "<base>-" slot namespace so pooled senders never treat each
+        // other's slots as drainable orphans (the pool recovers those on
+        // (re)creation). Foreign leftovers under other names are still drained.
+        private String orphanDrainExcludePrefix;
         private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
         // Optional user-supplied async error handler. When null, the sender
         // uses DefaultSenderErrorHandler.INSTANCE (loud-not-silent log).
@@ -1548,7 +1554,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     if (drainOrphans && sfDir != null) {
                         io.questdb.client.std.ObjList<String> orphans =
                                 io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner
-                                        .scan(sfDir, senderId);
+                                        .scan(sfDir, senderId, orphanDrainExcludePrefix);
                         if (orphans.size() > 0) {
                             org.slf4j.LoggerFactory.getLogger(LineSenderBuilder.class)
                                     .info("dispatching drainers for {} orphan slot(s) under {} "
@@ -2481,6 +2487,29 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          */
         public String getConfiguredSenderId() {
             return senderId;
+        }
+
+        /**
+         * Excludes a whole slot-name namespace from {@link #drainOrphans(boolean)}
+         * scanning: any sibling slot under {@code sf_dir} whose directory name
+         * starts with {@code prefix} is never treated as a drainable orphan.
+         * <p>
+         * Internal introspection hook for the connection pool. The pool gives
+         * each pooled SF sender a distinct slot id {@code <base>-<index>} and
+         * co-manages the entire {@code <base>-} namespace; it recovers each
+         * slot's unacked data itself when it (re)creates that slot. Without
+         * this exclusion, one pooled sender's startup drainer could adopt a
+         * sibling pool slot's lock and dir, reintroducing the very
+         * "sf slot already in use" collision the per-slot ids were added to
+         * prevent. Foreign leftovers (a different base, or a bare un-suffixed
+         * id) do not match the prefix and are still drained.
+         * <p>
+         * Pass {@code null} or an empty string to disable the exclusion
+         * (the default).
+         */
+        public LineSenderBuilder orphanDrainExcludePrefix(String prefix) {
+            this.orphanDrainExcludePrefix = prefix;
+            return this;
         }
 
         /**

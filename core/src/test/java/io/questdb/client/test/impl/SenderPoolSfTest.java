@@ -26,6 +26,7 @@ package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.std.Files;
@@ -533,6 +534,140 @@ public class SenderPoolSfTest {
     }
 
     // ----------------------------------------------------------------------
+    // drain_orphans=on + pool: the pool must NOT treat its own sibling slots
+    // as drainable orphans, but MUST still drain genuine foreign leftovers.
+    // ----------------------------------------------------------------------
+
+    @Test
+    public void testDrainOrphansPoolDoesNotCannibalizeSiblingSlots() throws Exception {
+        // Regression guard. The pool gives each SF sender a sibling slot
+        // <base>-<index>. With drain_orphans=on, every pooled build runs an
+        // orphan scan -- and before the namespace-exclusion fix that scan
+        // listed the pool's OWN siblings (default-1 holds unacked .sfa) as
+        // orphans and dispatched a background drainer at them. That drainer
+        // could win a sibling's flock and re-surface the exact
+        // "sf slot already in use" collision the per-slot ids were added to
+        // prevent. After the fix the pool fences off its whole "<base>-"
+        // namespace, so building a drain_orphans pool over pre-existing
+        // sibling data is clean and the data is recovered by the pool itself.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: seed unacked data into default-0 AND default-1 via a
+            // plain (no drain_orphans) pool against a silent server.
+            int silentPort = TestPorts.findUnusedPort();
+            try (TestWebSocketServer silent = new TestWebSocketServer(silentPort, new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=500;";
+                try (SenderPool seed = new SenderPool(seedCfg, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = seed.borrow();
+                    PooledSender b = seed.borrow();
+                    a.table("recover").longColumn("v", 1L).atNow();
+                    a.flush();
+                    b.table("recover").longColumn("v", 2L).atNow();
+                    b.flush();
+                    b.close();
+                    a.close();
+                }
+            }
+            Assert.assertTrue("default-0 must hold unacked data", hasSegmentFile(slot("default-0")));
+            Assert.assertTrue("default-1 must hold unacked data", hasSegmentFile(slot("default-1")));
+
+            // Phase 2: a drain_orphans=on pool over the same sf_dir. Pre-fix
+            // this construction could throw "sf slot already in use"; post-fix
+            // it is deterministically clean -- no drainer targets a sibling.
+            int ackPort = TestPorts.findUnusedPort();
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(ackPort, handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir
+                        + ";drain_orphans=on;";
+                try (SenderPool pool = new SenderPool(cfg, 2, 2, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    Assert.assertEquals(2, pool.totalSize());
+                    Assert.assertEquals("no extra slot dirs spawned by a rogue drainer",
+                            2, countSlotDirs());
+                    // A drainer must NOT have given up on a sibling slot.
+                    Assert.assertFalse("sibling must not be flagged .failed",
+                            Files.exists(slot("default-0") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                    Assert.assertFalse("sibling must not be flagged .failed",
+                            Files.exists(slot("default-1") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+
+                    // The pool owns and recovers both slots: borrowing + draining
+                    // replays the recovered frames through the legitimate senders.
+                    PooledSender a = pool.borrow();
+                    PooledSender b = pool.borrow();
+                    try {
+                        a.drain(5_000);
+                        b.drain(5_000);
+                        Assert.assertTrue("both slots' recovered data must replay",
+                                awaitAtLeast(handler.frames, 2, 5_000));
+                    } finally {
+                        b.close();
+                        a.close();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDrainOrphansPoolStillDrainsForeignOrphan() throws Exception {
+        // The fix excludes only the pool's OWN "<base>-" namespace -- a
+        // genuine foreign leftover (a different sender_id base) must still be
+        // adopted and drained, otherwise we would have silently disabled the
+        // drain_orphans feature for pooled deployments.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: a standalone sender with a DIFFERENT base leaves unacked
+            // data under <sf_dir>/legacy.
+            int silentPort = TestPorts.findUnusedPort();
+            try (TestWebSocketServer silent = new TestWebSocketServer(silentPort, new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                // close_flush_timeout_millis=0 => close() does not drain, so
+                // the flushed-but-unacked frames stay on disk (silent server
+                // never acks) and close() never throws a drain timeout.
+                String ghostCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";sender_id=legacy;close_flush_timeout_millis=0;";
+                try (Sender ghost = Sender.fromConfig(ghostCfg)) {
+                    for (int i = 0; i < 3; i++) {
+                        ghost.table("foreign").longColumn("v", i).atNow();
+                        ghost.flush();
+                    }
+                } catch (Exception ignored) {
+                    // best-effort: we only need the unacked .sfa on disk
+                }
+            }
+            Assert.assertTrue("foreign leftover must hold unacked data",
+                    hasSegmentFile(slot("legacy")));
+
+            // Phase 2: a drain_orphans=on pool with the default base. Its
+            // pooled senders are default-*, so "legacy" is NOT in the excluded
+            // namespace -- the background drainer must adopt it, replay its
+            // frames to the ack server, and clear the slot.
+            int ackPort = TestPorts.findUnusedPort();
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(ackPort, handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir
+                        + ";drain_orphans=on;";
+                try (SenderPool pool = new SenderPool(cfg, 1, 2, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender s = pool.borrow();
+                    try {
+                        Assert.assertTrue("foreign orphan frames must be replayed by a drainer",
+                                awaitAtLeast(handler.frames, 1, 10_000));
+                        Assert.assertTrue("foreign orphan slot must be drained (no unacked .sfa left)",
+                                awaitNoSegmentFile(slot("legacy"), 10_000));
+                    } finally {
+                        s.close();
+                    }
+                }
+            }
+        });
+    }
+
+    // ----------------------------------------------------------------------
     // Helpers.
     // ----------------------------------------------------------------------
 
@@ -601,6 +736,18 @@ public class SenderPoolSfTest {
             Thread.sleep(10);
         }
         return counter.get() >= target;
+    }
+
+    private static boolean awaitNoSegmentFile(String slotPath, long timeoutMillis)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            if (!hasSegmentFile(slotPath)) {
+                return true;
+            }
+            Thread.sleep(10);
+        }
+        return !hasSegmentFile(slotPath);
     }
 
     private static void rmDir(String dir) {

@@ -80,12 +80,15 @@ final class PoolHousekeeper {
             }
             try {
                 senderPool.reapIdle();
-            } catch (RuntimeException ignored) {
+            } catch (Throwable ignored) {
                 // Reaping must not propagate -- it's best-effort housekeeping.
+                // Catch Throwable (not just RuntimeException) so an Error from a
+                // delegate teardown can never kill this daemon thread and stop
+                // all future reaping for the life of the handle.
             }
             try {
                 queryPool.reapIdle();
-            } catch (RuntimeException ignored) {
+            } catch (Throwable ignored) {
             }
         }
     }

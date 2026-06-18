@@ -149,6 +149,64 @@ public class OrphanScannerTest {
     }
 
     @Test
+    public void testExcludeNamePrefixSkipsWholePoolNamespace() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // A connection pool co-manages the whole "<base>-" namespace
+            // (default-0, default-1, ...). With drain_orphans=on, one pooled
+            // sender's startup scan must NOT list its siblings as orphans --
+            // the prefix filter fences them off. A foreign leftover under a
+            // different name is still reported.
+            for (String name : new String[]{"default-0", "default-1", "default-2"}) {
+                String slot = sfDir + "/" + name;
+                assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+                touchFile(slot + "/sf-0001.sfa");
+            }
+            String foreign = sfDir + "/legacy";
+            assertEquals(0, Files.mkdir(foreign, Files.DIR_MODE_DEFAULT));
+            touchFile(foreign + "/sf-0001.sfa");
+
+            // Caller is default-0; exclude the whole default- namespace.
+            ObjList<String> orphans = OrphanScanner.scan(sfDir, "default-0", "default-");
+            assertEquals("only the foreign slot remains a candidate", 1, orphans.size());
+            assertEquals(foreign, orphans.get(0));
+        });
+    }
+
+    @Test
+    public void testExcludeNamePrefixDoesNotMatchBareBase() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // A bare un-suffixed id equal to the base (e.g. a standalone
+            // sender's "default" slot) is NOT part of the pool's "default-"
+            // namespace, so it is still a drainable foreign orphan.
+            String bare = sfDir + "/default";
+            String sibling = sfDir + "/default-1";
+            assertEquals(0, Files.mkdir(bare, Files.DIR_MODE_DEFAULT));
+            assertEquals(0, Files.mkdir(sibling, Files.DIR_MODE_DEFAULT));
+            touchFile(bare + "/sf-0001.sfa");
+            touchFile(sibling + "/sf-0001.sfa");
+
+            ObjList<String> orphans = OrphanScanner.scan(sfDir, "default-0", "default-");
+            assertEquals(1, orphans.size());
+            assertEquals(bare, orphans.get(0));
+        });
+    }
+
+    @Test
+    public void testNullOrEmptyPrefixBehavesLikeTwoArgScan() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Without a prefix the sibling IS listed -- this is exactly the
+            // pre-fix behavior the pool now suppresses by passing "default-".
+            String sibling = sfDir + "/default-1";
+            assertEquals(0, Files.mkdir(sibling, Files.DIR_MODE_DEFAULT));
+            touchFile(sibling + "/sf-0001.sfa");
+
+            assertEquals(1, OrphanScanner.scan(sfDir, "default-0", null).size());
+            assertEquals(1, OrphanScanner.scan(sfDir, "default-0", "").size());
+            assertEquals(1, OrphanScanner.scan(sfDir, "default-0").size());
+        });
+    }
+
+    @Test
     public void testIsCandidateOrphanDirect() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slot = sfDir + "/probe";

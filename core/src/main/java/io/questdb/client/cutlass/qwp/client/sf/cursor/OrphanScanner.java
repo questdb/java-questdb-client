@@ -75,10 +75,28 @@ public final class OrphanScanner {
      * "no orphans" answer in that case.
      */
     public static ObjList<String> scan(String sfDir, String excludeSlotName) {
+        return scan(sfDir, excludeSlotName, null);
+    }
+
+    /**
+     * As {@link #scan(String, String)}, but additionally skips any child
+     * whose name starts with {@code excludeNamePrefix} (when non-null and
+     * non-empty).
+     * <p>
+     * This is how a connection pool keeps the scanner from treating its own
+     * sibling slots as orphans: every pooled SF sender lives at
+     * {@code <sf_dir>/<base>-<index>}, and the pool itself recovers each
+     * slot's unacked data when it (re)creates that slot — so the pool's
+     * whole {@code <base>-} namespace must be excluded from auto-drain.
+     * Genuine foreign leftovers (a different base, or a bare un-suffixed
+     * id) do not match the prefix and are still reported.
+     */
+    public static ObjList<String> scan(String sfDir, String excludeSlotName, String excludeNamePrefix) {
         ObjList<String> orphans = new ObjList<>();
         if (sfDir == null || !Files.exists(sfDir)) {
             return orphans;
         }
+        boolean hasPrefix = excludeNamePrefix != null && !excludeNamePrefix.isEmpty();
         long find = Files.findFirst(sfDir);
         if (find < 0) {
             LOG.warn("orphan scan could not enumerate {} — treating as no orphans, "
@@ -97,6 +115,9 @@ public final class OrphanScanner {
                     continue;
                 }
                 if (excludeSlotName != null && excludeSlotName.equals(name)) {
+                    continue;
+                }
+                if (hasPrefix && name.startsWith(excludeNamePrefix)) {
                     continue;
                 }
                 String slotPath = sfDir + "/" + name;

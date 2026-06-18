@@ -144,7 +144,12 @@ public final class SenderPool implements AutoCloseable {
             for (int i = 0; i < built; i++) {
                 try {
                     all.get(i).delegate().close();
-                } catch (RuntimeException ignored) {
+                } catch (Throwable ignored) {
+                    // Best-effort cleanup: a delegate close() can throw an
+                    // Error (e.g. an -ea AssertionError) as well as a
+                    // RuntimeException. Swallow either so we still close the
+                    // remaining pre-warmed slots and rethrow the original
+                    // construction failure below.
                 }
             }
             throw e;
@@ -194,7 +199,9 @@ public final class SenderPool implements AutoCloseable {
                         freeSlotIndex(slotIndex);
                         try {
                             created.delegate().close();
-                        } catch (RuntimeException ignored) {
+                        } catch (Throwable ignored) {
+                            // Best-effort: an Error (e.g. -ea AssertionError)
+                            // from teardown must not mask the closed-pool signal.
                         }
                         throw new LineSenderException("QuestDB handle is closed");
                     }
@@ -254,7 +261,9 @@ public final class SenderPool implements AutoCloseable {
         for (int i = 0; i < snapshot.length; i++) {
             try {
                 snapshot[i].delegate().close();
-            } catch (RuntimeException ignored) {
+            } catch (Throwable ignored) {
+                // Best-effort: an Error from one delegate's teardown must not
+                // abort the loop and strand the remaining delegates unclosed.
             }
         }
     }
@@ -316,17 +325,24 @@ public final class SenderPool implements AutoCloseable {
         // where the wrapper had already left `all`.
         try {
             s.delegate().close();
-        } catch (RuntimeException ignored) {
-        }
-        // Flock is released now: return the reserved slot index to the free set.
-        if (reserved) {
-            lock.lock();
-            try {
-                freeSlotIndex(s.slotIndex());
-                closingSlots--;
-                slotReleased.signal();
-            } finally {
-                lock.unlock();
+        } catch (Throwable ignored) {
+            // Best-effort teardown: a delegate close() can throw an Error
+            // (e.g. an -ea AssertionError) as well as a RuntimeException.
+            // Either way the slot accounting in the finally below MUST run,
+            // otherwise an SF slot stays reserved forever (slotInUse stuck
+            // true, closingSlots over-counted) and the pool leaks capacity
+            // until borrow() can only ever time out.
+        } finally {
+            // Flock is released now: return the reserved slot index to the free set.
+            if (reserved) {
+                lock.lock();
+                try {
+                    freeSlotIndex(s.slotIndex());
+                    closingSlots--;
+                    slotReleased.signal();
+                } finally {
+                    lock.unlock();
+                }
             }
         }
     }
@@ -404,7 +420,13 @@ public final class SenderPool implements AutoCloseable {
             for (int i = 0, n = toClose.size(); i < n; i++) {
                 try {
                     toClose.get(i).delegate().close();
-                } catch (RuntimeException ignored) {
+                } catch (Throwable ignored) {
+                    // Best-effort: a single delegate close() failure (including
+                    // an Error such as an -ea AssertionError) must not abort the
+                    // loop -- that would leave sibling flocks unreleased -- nor
+                    // skip the slot-accounting release block below, which would
+                    // strand every reaped index (slotInUse stuck true,
+                    // closingSlots over-counted) and leak pool capacity.
                 }
             }
             // Flocks released: return reserved SF slot indices to the free set.
@@ -466,8 +488,17 @@ public final class SenderPool implements AutoCloseable {
             // so concurrent SF senders sharing one sf_dir never collide on
             // the slot flock. senderId() is only legal on WebSocket transport,
             // which is exactly when storeAndForward is true.
+            //
+            // Also fence off the pool's own "<base>-" namespace from orphan
+            // draining: the pool co-manages every <base>-<index> slot and
+            // recovers each slot's unacked data when it (re)creates it, so a
+            // sibling's startup drainer must never adopt another pool slot's
+            // dir/lock (that would resurrect "sf slot already in use"). This
+            // is a no-op unless the config also set drain_orphans=on; foreign
+            // leftovers under other names are still drained.
             raw = Sender.builder(configurationString)
                     .senderId(slotBaseId + "-" + slotIndex)
+                    .orphanDrainExcludePrefix(slotBaseId + "-")
                     .build();
         } else {
             raw = Sender.fromConfig(configurationString);

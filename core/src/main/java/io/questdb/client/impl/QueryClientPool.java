@@ -95,7 +95,10 @@ public final class QueryClientPool {
             for (int i = 0; i < built; i++) {
                 try {
                     all.get(i).shutdown();
-                } catch (RuntimeException ignored) {
+                } catch (Throwable ignored) {
+                    // Best-effort cleanup: an Error (e.g. -ea AssertionError)
+                    // from one worker's shutdown must not strand the remaining
+                    // pre-warmed workers nor mask the original failure below.
                 }
             }
             throw e;
@@ -136,7 +139,9 @@ public final class QueryClientPool {
                     if (closed) {
                         try {
                             created.shutdown();
-                        } catch (RuntimeException ignored) {
+                        } catch (Throwable ignored) {
+                            // Best-effort: an Error from teardown must not mask
+                            // the closed-pool signal.
                         }
                         throw new QueryException((byte) 0, "QuestDB handle is closed");
                     }
@@ -180,7 +185,13 @@ public final class QueryClientPool {
         // join the worker threads and close their clients. Done outside the lock
         // so a slow join doesn't keep the pool latched.
         for (int i = 0; i < snapshot.size(); i++) {
-            snapshot.get(i).shutdown();
+            try {
+                snapshot.get(i).shutdown();
+            } catch (Throwable ignored) {
+                // Best-effort: a single worker's shutdown failure (including an
+                // Error such as an -ea AssertionError) must not abort the loop
+                // and strand the remaining workers unclosed.
+            }
         }
     }
 
@@ -218,7 +229,10 @@ public final class QueryClientPool {
             for (int i = 0, n = toShutdown.size(); i < n; i++) {
                 try {
                     toShutdown.get(i).shutdown();
-                } catch (RuntimeException ignored) {
+                } catch (Throwable ignored) {
+                    // Best-effort: a single worker's shutdown failure (including
+                    // an Error such as an -ea AssertionError) must not abort the
+                    // reap loop and strand the remaining reaped workers.
                 }
             }
         }
@@ -251,7 +265,9 @@ public final class QueryClientPool {
             // leaks NATIVE_DEFAULT bytes.
             try {
                 client.close();
-            } catch (RuntimeException ignored) {
+            } catch (Throwable ignored) {
+                // Best-effort: an Error from closing the half-built client must
+                // not mask the original connect failure being rethrown below.
             }
             throw e;
         }
