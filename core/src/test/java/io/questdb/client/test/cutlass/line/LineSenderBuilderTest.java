@@ -275,11 +275,11 @@ public class LineSenderBuilderTest {
             // itself be malformed -- the key is the reportable defect.
             assertConfStrError("http::addr=localhost;not_a_real_key=", "unknown configuration key [key=not_a_real_key]");
 
-            // in_flight_window is silently accepted as a no-op for backward
-            // compatibility. The store-and-forward mechanism replaces it.
-            assertConfStrOk("http::addr=localhost;in_flight_window=10000;protocol_version=2;");
-            assertConfStrOk("udp::addr=localhost;in_flight_window=10000;");
-            assertConfStrOk("http::addr=localhost;in_flight_window=;protocol_version=2;");
+            // in_flight_window has been removed; it is now rejected like any
+            // other unknown configuration key.
+            assertConfStrError("http::addr=localhost;in_flight_window=10000;protocol_version=2;", "unknown configuration key [key=in_flight_window]");
+            assertConfStrError("udp::addr=localhost;in_flight_window=10000;", "unknown configuration key [key=in_flight_window]");
+            assertConfStrError("http::addr=localhost;in_flight_window=;protocol_version=2;", "unknown configuration key [key=in_flight_window]");
         });
     }
 

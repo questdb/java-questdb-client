@@ -610,6 +610,13 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testInFlightWindowKeyRejected() {
+        // in_flight_window has been removed; the egress client rejects it like
+        // any other unknown key.
+        assertReject("ws::addr=db:9000;in_flight_window=10000;", "unknown configuration key: in_flight_window");
+    }
+
+    @Test
     public void testIngressOnlyKeysSilentlyAcceptedOnEgress() {
         // connect-string.md: these keys configure the Sender (ingress) only.
         // QwpQueryClient.fromConfig silently consumes them so a single connect
@@ -632,7 +639,6 @@ public class QwpQueryClientFromConfigTest {
                 "drain_orphans=on",
                 "durable_ack_keepalive_interval_millis=200",
                 "error_inbox_capacity=256",
-                "in_flight_window=10000",
                 "init_buf_size=65536",
                 "initial_connect_retry=on",
                 "max_background_drainers=4",

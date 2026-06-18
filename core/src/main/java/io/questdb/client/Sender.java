@@ -3307,10 +3307,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // genuine value-parse error names the offending key.
                     String egressKey = Chars.toString(sink);
                     pos = getValue(configurationString, pos, sink, egressKey);
-                } else if (Chars.equals("in_flight_window", sink)) {
-                    // Accepted as a no-op for backward compatibility. The
-                    // store-and-forward mechanism replaces the in-flight window.
-                    pos = getValue(configurationString, pos, sink, "in_flight_window");
                 } else {
                     // sf-client.md §4.6: parser must reject unknown keys.
                     // Forward-compat is via the spec, not silent ignore — silent

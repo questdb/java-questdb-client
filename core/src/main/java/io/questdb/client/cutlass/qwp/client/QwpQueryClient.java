@@ -590,7 +590,6 @@ public class QwpQueryClient implements QuietCloseable {
                 case "drain_orphans":
                 case "durable_ack_keepalive_interval_millis":
                 case "error_inbox_capacity":
-                case "in_flight_window":
                 case "init_buf_size":
                 case "initial_connect_retry":
                 case "max_background_drainers":
