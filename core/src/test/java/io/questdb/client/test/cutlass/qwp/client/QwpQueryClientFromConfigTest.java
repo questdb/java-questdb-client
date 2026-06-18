@@ -647,14 +647,10 @@ public class QwpQueryClientFromConfigTest {
                 "max_name_len=127",
                 "multicast_ttl=1",
                 "pass=secret",
-                "protocol_version=2",
                 "reconnect_initial_backoff_millis=100",
                 "reconnect_max_backoff_millis=5000",
                 "reconnect_max_duration_millis=300000",
                 "request_durable_ack=on",
-                "request_min_throughput=102400",
-                "request_timeout=10000",
-                "retry_timeout=10000",
                 "sender_id=ingest-1",
                 "sf_append_deadline_millis=30000",
                 "sf_dir=/var/lib/qdb-sf",
@@ -805,6 +801,28 @@ public class QwpQueryClientFromConfigTest {
                             || msg.startsWith("unsupported schema")
             );
         }
+    }
+
+    @Test
+    public void testNonQwpKeysRejectedOnEgress() {
+        // request_timeout, retry_timeout, request_min_throughput, and
+        // protocol_version are legacy ILP HTTP/TCP keys, absent from the QWP
+        // connect-string vocabulary (connect-string.md Key index). The
+        // QwpQueryClient is QWP-only, so a ws:: string carrying them is
+        // malformed -- the parser rejects them as unknown rather than
+        // silently consuming them.
+        assertReject("ws::addr=db:9000;request_timeout=10000;",
+                "unknown configuration key: request_timeout");
+        assertReject("ws::addr=db:9000;retry_timeout=10000;",
+                "unknown configuration key: retry_timeout");
+        assertReject("ws::addr=db:9000;request_min_throughput=102400;",
+                "unknown configuration key: request_min_throughput");
+        assertReject("ws::addr=db:9000;protocol_version=2;",
+                "unknown configuration key: protocol_version");
+        // protocol_version is rejected regardless of value: the egress side
+        // has no "auto" pass-through.
+        assertReject("ws::addr=db:9000;protocol_version=auto;",
+                "unknown configuration key: protocol_version");
     }
 
     @Test

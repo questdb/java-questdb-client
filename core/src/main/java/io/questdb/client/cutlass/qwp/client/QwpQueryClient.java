@@ -598,14 +598,10 @@ public class QwpQueryClient implements QuietCloseable {
                 case "max_name_len":
                 case "multicast_ttl":
                 case "pass":
-                case "protocol_version":
                 case "reconnect_initial_backoff_millis":
                 case "reconnect_max_backoff_millis":
                 case "reconnect_max_duration_millis":
                 case "request_durable_ack":
-                case "request_min_throughput":
-                case "request_timeout":
-                case "retry_timeout":
                 case "sender_id":
                 case "sf_append_deadline_millis":
                 case "sf_dir":

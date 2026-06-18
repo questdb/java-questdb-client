@@ -787,6 +787,47 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_withProtocolVersionAuto_fails() {
+        // protocol_version is not part of the QWP connect-string vocabulary at
+        // all; even the no-op "auto" value is rejected on ws::, matching the
+        // egress QwpQueryClient and the other language clients.
+        assertBadConfig("ws::addr=localhost:9000;protocol_version=auto;",
+                "protocol_version is not supported for WebSocket transport");
+    }
+
+    @Test
+    public void testWsConfigString_withProtocolVersion_fails() {
+        // protocol_version is a legacy ILP key, not part of the QWP
+        // connect-string vocabulary; QWP negotiates its version at handshake.
+        assertBadConfig("ws::addr=localhost:9000;protocol_version=2;",
+                "protocol_version is not supported for WebSocket transport");
+    }
+
+    @Test
+    public void testWsConfigString_withRequestMinThroughput_fails() {
+        // request_min_throughput is an HTTP-only key, absent from the QWP
+        // connect-string vocabulary.
+        assertBadConfig("ws::addr=localhost:9000;request_min_throughput=102400;",
+                "request_min_throughput is not supported for WebSocket transport");
+    }
+
+    @Test
+    public void testWsConfigString_withRequestTimeout_fails() {
+        // request_timeout is an HTTP-only key, absent from the QWP
+        // connect-string vocabulary.
+        assertBadConfig("ws::addr=localhost:9000;request_timeout=10000;",
+                "request_timeout is not supported for WebSocket transport");
+    }
+
+    @Test
+    public void testWsConfigString_withRetryTimeout_fails() {
+        // retry_timeout is an HTTP-only key; the QWP analogue is the per-outage
+        // reconnect budget (reconnect_max_duration_millis).
+        assertBadConfig("ws::addr=localhost:9000;retry_timeout=10000;",
+                "retry_timeout is not supported for WebSocket transport");
+    }
+
+    @Test
     public void testWsConfigString_withToken() throws Exception {
         assertMemoryLeak(() -> {
             Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;token=mytoken;");

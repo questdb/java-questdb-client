@@ -3013,6 +3013,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         httpToken(sink.toString());
                     }
                 } else if (Chars.equals("retry_timeout", sink)) {
+                    if (protocol == PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("retry_timeout is not supported for WebSocket transport; use reconnect_max_duration_millis for the per-outage reconnect budget");
+                    }
                     pos = getValue(configurationString, pos, sink, "retry_timeout");
                     int timeout = parseIntValue(sink, "retry_timeout");
                     retryTimeoutMillis(timeout);
@@ -3094,15 +3097,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         throw new LineSenderException("invalid auto_flush [value=").put(sink).put(", allowed-values=[on, off]]");
                     }
                 } else if (Chars.equals("request_timeout", sink)) {
+                    if (protocol == PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("request_timeout is not supported for WebSocket transport");
+                    }
                     pos = getValue(configurationString, pos, sink, "request_timeout");
                     int requestTimeout = parseIntValue(sink, "request_timeout");
                     httpTimeoutMillis(requestTimeout);
                 } else if (Chars.equals("request_min_throughput", sink)) {
+                    if (protocol == PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("request_min_throughput is not supported for WebSocket transport");
+                    }
                     pos = getValue(configurationString, pos, sink, "request_min_throughput");
                     int requestMinThroughput = parseIntValue(sink, "request_min_throughput");
                     minRequestThroughput(requestMinThroughput);
                 } else if (Chars.equals("protocol_version", sink)) {
                     pos = getValue(configurationString, pos, sink, "protocol_version");
+                    if (protocol == PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("protocol_version is not supported for WebSocket transport; QWP negotiates the protocol version during the WebSocket upgrade");
+                    }
                     if (!Chars.equalsIgnoreCase("auto", sink)) {
                         int protocolVersion = parseIntValue(sink, "protocol_version");
                         protocolVersion(protocolVersion);
