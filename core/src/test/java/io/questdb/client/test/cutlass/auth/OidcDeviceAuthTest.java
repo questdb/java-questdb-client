@@ -597,14 +597,17 @@ public class OidcDeviceAuthTest {
 
     @Test(timeout = 30_000)
     public void testDiscoveryTransportFailureDoesNotLeakNativeMemory() throws Exception {
-        // discoverSettings allocates a JSON lexer and an HTTP client and frees both in a finally; a transport
-        // failure during discovery must not leak the lexer's native buffer. The module's assertMemoryLeak does
-        // not flag single-tag growth, so measure the parser tag directly (as testMalformedEndpoint... does).
+        // discoverSettings allocates a JSON lexer (NATIVE_TEXT_PARSER_RSS) and an HTTP client (NATIVE_DEFAULT
+        // buffers) and frees both in a finally; a transport failure during discovery must not leak either.
+        // The module's assertMemoryLeak does not reliably flag single-tag growth, so measure both tags
+        // directly. Measuring only the parser tag (as an earlier version did) was blind to a leak of the
+        // HTTP client's native buffers - the resource most likely to be left dangling on the failure path.
         int deadPort;
         try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             deadPort = probe.getLocalPort();
         } // closed now - nothing listens on deadPort
         long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
+        long clientMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
         try {
             OidcDeviceAuth.fromQuestDB("http://127.0.0.1:" + deadPort, true);
             Assert.fail("expected discovery to fail against a dead port");
@@ -613,6 +616,8 @@ public class OidcDeviceAuthTest {
         }
         Assert.assertEquals("the discovery JSON lexer native buffer leaked",
                 parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
+        Assert.assertEquals("the discovery HTTP client native buffers leaked",
+                clientMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT));
     }
 
     @Test(timeout = 30_000)

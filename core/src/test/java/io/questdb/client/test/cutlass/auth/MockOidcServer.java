@@ -47,6 +47,9 @@ import java.util.List;
  * a keep-alive connection.
  */
 public class MockOidcServer implements Closeable {
+    private final Thread acceptThread;
+    private final List<Socket> connSockets = Collections.synchronizedList(new ArrayList<>());
+    private final List<Thread> connThreads = Collections.synchronizedList(new ArrayList<>());
     private final Handler handler;
     private final List<String> requestAuthHeaders = Collections.synchronizedList(new ArrayList<>());
     private final ServerSocket serverSocket;
@@ -54,9 +57,9 @@ public class MockOidcServer implements Closeable {
     public MockOidcServer(Handler handler) throws IOException {
         this.handler = handler;
         this.serverSocket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
-        Thread acceptThread = new Thread(this::acceptLoop, "mock-oidc-accept");
-        acceptThread.setDaemon(true);
-        acceptThread.start();
+        this.acceptThread = new Thread(this::acceptLoop, "mock-oidc-accept");
+        this.acceptThread.setDaemon(true);
+        this.acceptThread.start();
     }
 
     public static MockResponse chunkedJson(int status, String body) {
@@ -75,7 +78,27 @@ public class MockOidcServer implements Closeable {
 
     @Override
     public void close() throws IOException {
+        // tear the server down deterministically so a test's threads are gone before its assertions (and
+        // assertMemoryLeak's native-memory check) run, instead of lingering as daemon threads that can
+        // perturb a later test: stop accepting, drop every connection (which unblocks a handler reading a
+        // socket), then interrupt and join the accept and connection threads (interrupt wakes a stalled
+        // handler that is sleeping on the response body)
         serverSocket.close();
+        synchronized (connSockets) {
+            for (Socket s : connSockets) {
+                try {
+                    s.close();
+                } catch (IOException ignore) {
+                    // already closed
+                }
+            }
+        }
+        interruptAndJoin(acceptThread);
+        synchronized (connThreads) {
+            for (Thread t : connThreads) {
+                interruptAndJoin(t);
+            }
+        }
     }
 
     public String httpUrl(String path) {
@@ -88,6 +111,15 @@ public class MockOidcServer implements Closeable {
 
     public List<String> requestAuthHeaders() {
         return requestAuthHeaders;
+    }
+
+    private static void interruptAndJoin(Thread t) {
+        t.interrupt();
+        try {
+            t.join(5_000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static String readLine(InputStream in) throws IOException {
@@ -208,8 +240,10 @@ public class MockOidcServer implements Closeable {
         while (!serverSocket.isClosed()) {
             try {
                 Socket socket = serverSocket.accept();
+                connSockets.add(socket);
                 Thread connThread = new Thread(() -> handleConnection(socket), "mock-oidc-conn");
                 connThread.setDaemon(true);
+                connThreads.add(connThread);
                 connThread.start();
             } catch (IOException e) {
                 // server socket closed, stop accepting
