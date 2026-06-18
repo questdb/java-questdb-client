@@ -334,9 +334,9 @@ public class QwpWebSocketSenderTest {
     @Test
     public void testFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse() throws Exception {
         assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, new TestWebSocketServer.WebSocketServerHandler() {
+            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
             })) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 

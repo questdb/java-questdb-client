@@ -74,8 +74,8 @@ public class RecoveryReplayTest {
         // Phase 1: silent server, sender 1 writes enough to rotate at
         // least once, closes fast (no drain). Slot ends up with sealed +
         // active segments holding unacked data.
-        int port1 = TestPorts.findUnusedPort();
-        try (TestWebSocketServer silent = new TestWebSocketServer(port1, new SilentHandler())) {
+        try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+            int port1 = silent.getPort();
             silent.start();
             Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
 
@@ -111,9 +111,9 @@ public class RecoveryReplayTest {
         // sender 1 wrote (50 of them) reaches the new server. Without
         // the fix, the sender would only ship the active segment's data
         // (≪ 50) and orphan the sealed segments forever.
-        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
-        try (TestWebSocketServer good = new TestWebSocketServer(port2, ack)) {
+        try (TestWebSocketServer good = new TestWebSocketServer(ack)) {
+            int port2 = good.getPort();
             good.start();
             Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
 

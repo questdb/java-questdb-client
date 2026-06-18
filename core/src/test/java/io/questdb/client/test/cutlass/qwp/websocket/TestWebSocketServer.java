@@ -59,6 +59,7 @@ public class TestWebSocketServer implements Closeable {
     private final WebSocketServerHandler handler;
     private final int port;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final ServerSocket serverSocket;
     private final CountDownLatch startLatch = new CountDownLatch(1);
     private Thread acceptThread;
     // X-QuestDB-Role value to emit on handshake responses. null = omit the
@@ -83,10 +84,9 @@ public class TestWebSocketServer implements Closeable {
     // 401, 403, 404, 426, 503, etc. that the failover loop should
     // classify per failover.md §6.
     private volatile String rejectingStatusReason;
-    private ServerSocket serverSocket;
 
-    public TestWebSocketServer(int port, WebSocketServerHandler handler) {
-        this(port, handler, false);
+    public TestWebSocketServer(WebSocketServerHandler handler) throws IOException {
+        this(handler, false);
     }
 
     /**
@@ -97,8 +97,8 @@ public class TestWebSocketServer implements Closeable {
      *                             that silently ignores the request and force
      *                             the client's early-fail check.
      */
-    public TestWebSocketServer(int port, WebSocketServerHandler handler, boolean emitDurableAckHeader) {
-        this(port, handler, emitDurableAckHeader, null);
+    public TestWebSocketServer(WebSocketServerHandler handler, boolean emitDurableAckHeader) throws IOException {
+        this(handler, emitDurableAckHeader, null);
     }
 
     /**
@@ -108,12 +108,20 @@ public class TestWebSocketServer implements Closeable {
      *                       handshakes. Pass {@code null} for legacy handshakes
      *                       without the header.
      */
-    public TestWebSocketServer(int port, WebSocketServerHandler handler,
-                               boolean emitDurableAckHeader, String advertisedRole) {
-        this.port = port;
+    public TestWebSocketServer(WebSocketServerHandler handler,
+                               boolean emitDurableAckHeader, String advertisedRole) throws IOException {
         this.handler = handler;
         this.emitDurableAckHeader = emitDurableAckHeader;
         this.advertisedRole = advertisedRole;
+        // Bind the listener up front and hold it open for the server's whole
+        // lifetime, then read the OS-assigned ephemeral port back via getPort().
+        // Owning the socket from allocation to teardown closes the window in
+        // which another process could grab a pre-selected port before start()
+        // binds it. Pinning to loopback keeps client "localhost" connections
+        // routed here rather than to a wildcard listener on the same port.
+        serverSocket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+        serverSocket.setSoTimeout(100);
+        this.port = serverSocket.getLocalPort();
     }
 
     public boolean awaitStart(long timeout, TimeUnit unit) throws InterruptedException {
@@ -128,12 +136,10 @@ public class TestWebSocketServer implements Closeable {
         // close their sockets below — if the listener is still up, those
         // reconnects succeed and the new connections are never tracked here,
         // leaving them alive past close().
-        if (serverSocket != null) {
-            try {
-                serverSocket.close();
-            } catch (IOException e) {
-                // ignore
-            }
+        try {
+            serverSocket.close();
+        } catch (IOException e) {
+            // ignore
         }
 
         for (ClientHandler client : clients) {
@@ -148,6 +154,14 @@ public class TestWebSocketServer implements Closeable {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    /**
+     * Returns the loopback port the listener is bound to. Stable for the
+     * server's whole lifetime; safe to read immediately after construction.
+     */
+    public int getPort() {
+        return port;
     }
 
     /**
@@ -232,15 +246,8 @@ public class TestWebSocketServer implements Closeable {
             return;
         }
 
-        // Bind explicitly to the loopback address. The wildcard 0.0.0.0
-        // default lets a leftover process holding 127.0.0.1:port coexist
-        // on the same port under BSD/macOS SO_REUSEADDR semantics, and
-        // client connections to "localhost" then route to the more-specific
-        // listener instead of this mock. Pinning to loopback forces the
-        // kernel to detect the conflict and pick a different ephemeral port.
-        serverSocket = new ServerSocket(port, 50, java.net.InetAddress.getLoopbackAddress());
-        serverSocket.setSoTimeout(100);
-
+        // The listener is already bound (see the constructor); just spin up the
+        // accept loop on it.
         acceptThread = new Thread(() -> {
             startLatch.countDown();
             while (running.get()) {

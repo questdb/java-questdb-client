@@ -76,12 +76,12 @@ public class QwpQueryClientWalkTrackerTest {
         // 404 (per failover.md §4.1: a single mid-deploy node serving the
         // wrong path while peers are healthy is a routing glitch, not an
         // auth failure). Walk must continue.
-        int port404 = TestPorts.findUnusedPort();
-        int portOk = TestPorts.findUnusedPort();
-        TestWebSocketServer notFound = new TestWebSocketServer(port404, NOOP_HANDLER);
+        TestWebSocketServer notFound = new TestWebSocketServer(NOOP_HANDLER);
         notFound.setRejectWithStatus(404, "Not Found");
-        TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        int port404 = notFound.getPort();
+        TestWebSocketServer ok = new TestWebSocketServer(NOOP_HANDLER);
         ok.setSendServerInfo(true);
+        int portOk = ok.getPort();
         try {
             notFound.start();
             ok.start();
@@ -103,12 +103,12 @@ public class QwpQueryClientWalkTrackerTest {
     public void testWalk_426UpgradeRequiredIsTransportNotTerminal() throws Exception {
         // 426 Upgrade Required is per failover.md §6 a transient/transport
         // failure (NOT terminal). The walk must continue to the next host.
-        int port426 = TestPorts.findUnusedPort();
-        int portOk = TestPorts.findUnusedPort();
-        TestWebSocketServer rejecting = new TestWebSocketServer(port426, NOOP_HANDLER);
+        TestWebSocketServer rejecting = new TestWebSocketServer(NOOP_HANDLER);
         rejecting.setRejectWithStatus(426, "Upgrade Required");
-        TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        int port426 = rejecting.getPort();
+        TestWebSocketServer ok = new TestWebSocketServer(NOOP_HANDLER);
         ok.setSendServerInfo(true);
+        int portOk = ok.getPort();
         try {
             rejecting.start();
             ok.start();
@@ -133,12 +133,12 @@ public class QwpQueryClientWalkTrackerTest {
         // TopologyRejects from prior outages -- here there are none),
         // exhausts again, and surfaces QwpRoleMismatchException with the
         // last observed role attached.
-        int port1 = TestPorts.findUnusedPort();
-        int port2 = TestPorts.findUnusedPort();
-        TestWebSocketServer rep1 = new TestWebSocketServer(port1, NOOP_HANDLER);
+        TestWebSocketServer rep1 = new TestWebSocketServer(NOOP_HANDLER);
         rep1.setRejectWithRole("REPLICA");
-        TestWebSocketServer rep2 = new TestWebSocketServer(port2, NOOP_HANDLER);
+        int port1 = rep1.getPort();
+        TestWebSocketServer rep2 = new TestWebSocketServer(NOOP_HANDLER);
         rep2.setRejectWithRole("REPLICA");
+        int port2 = rep2.getPort();
         try {
             rep1.start();
             rep2.start();
@@ -187,11 +187,11 @@ public class QwpQueryClientWalkTrackerTest {
     @Test
     public void testWalk_AuthFailure403IsTerminal() throws Exception {
         // 403 is symmetric to 401: same terminal classification.
-        int port403 = TestPorts.findUnusedPort();
-        int portOk = TestPorts.findUnusedPort();
-        TestWebSocketServer forbidden = new TestWebSocketServer(port403, NOOP_HANDLER);
+        TestWebSocketServer forbidden = new TestWebSocketServer(NOOP_HANDLER);
         forbidden.setRejectWithStatus(403, "Forbidden");
-        TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        int port403 = forbidden.getPort();
+        TestWebSocketServer ok = new TestWebSocketServer(NOOP_HANDLER);
+        int portOk = ok.getPort();
         try {
             forbidden.start();
             ok.start();
@@ -220,11 +220,11 @@ public class QwpQueryClientWalkTrackerTest {
         // loop would continue to the second host, producing a
         // QwpRoleMismatchException or accepting the second host -- both
         // mask the credential failure (failover.md §6 AuthError).
-        int port401 = TestPorts.findUnusedPort();
-        int portOk = TestPorts.findUnusedPort();
-        TestWebSocketServer auth = new TestWebSocketServer(port401, NOOP_HANDLER);
+        TestWebSocketServer auth = new TestWebSocketServer(NOOP_HANDLER);
         auth.setRejectWithStatus(401, "Unauthorized");
-        TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        int port401 = auth.getPort();
+        TestWebSocketServer ok = new TestWebSocketServer(NOOP_HANDLER);
+        int portOk = ok.getPort();
         try {
             auth.start();
             ok.start();
@@ -266,13 +266,13 @@ public class QwpQueryClientWalkTrackerTest {
         // exercises the fall-through reset, not the role filter. The
         // SERVER_INFO-driven role filter (target=primary/replica) is
         // covered by a separate integration test in the parent QuestDB repo.
-        int portA = TestPorts.findUnusedPort();
-        int portB = TestPorts.findUnusedPort();
-        TestWebSocketServer a = new TestWebSocketServer(portA, NOOP_HANDLER);
+        TestWebSocketServer a = new TestWebSocketServer(NOOP_HANDLER);
         a.setRejectWithRole("REPLICA");
         a.setSendServerInfo(true);
-        TestWebSocketServer b = new TestWebSocketServer(portB, NOOP_HANDLER);
+        int portA = a.getPort();
+        TestWebSocketServer b = new TestWebSocketServer(NOOP_HANDLER);
         b.setRejectWithRole("REPLICA");
+        int portB = b.getPort();
         try {
             a.start();
             b.start();
@@ -305,12 +305,12 @@ public class QwpQueryClientWalkTrackerTest {
     public void testWalk_FirstReachablePrimaryWins() throws Exception {
         // First host is REPLICA-rejecting; second is a PRIMARY-advertising
         // server. WalkTracker must skip the first and bind to the second.
-        int portReplica = TestPorts.findUnusedPort();
-        int portPrimary = TestPorts.findUnusedPort();
-        TestWebSocketServer rep = new TestWebSocketServer(portReplica, NOOP_HANDLER);
+        TestWebSocketServer rep = new TestWebSocketServer(NOOP_HANDLER);
         rep.setRejectWithRole("REPLICA");
-        TestWebSocketServer prim = new TestWebSocketServer(portPrimary, NOOP_HANDLER, false, "PRIMARY");
+        int portReplica = rep.getPort();
+        TestWebSocketServer prim = new TestWebSocketServer(NOOP_HANDLER, false, "PRIMARY");
         prim.setSendServerInfo(true);
+        int portPrimary = prim.getPort();
         try {
             rep.start();
             prim.start();
@@ -337,10 +337,10 @@ public class QwpQueryClientWalkTrackerTest {
         // info is the decoded SERVER_INFO -- the branch that outlived the
         // v1-mismatch removal. A clean 101 ignores the upgrade-time role header,
         // so the rejection here is driven purely by the SERVER_INFO role.
-        int port = TestPorts.findUnusedPort();
-        TestWebSocketServer replica = new TestWebSocketServer(port, NOOP_HANDLER);
+        TestWebSocketServer replica = new TestWebSocketServer(NOOP_HANDLER);
         replica.setAdvertisedRole("REPLICA");
         replica.setSendServerInfo(true);
+        int port = replica.getPort();
         try {
             replica.start();
             Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));
@@ -372,14 +372,14 @@ public class QwpQueryClientWalkTrackerTest {
         // REPLICA endpoint -- a SERVER_INFO role mismatch is a skip, not a
         // terminal failure -- and bind the PRIMARY one. Exercises the
         // walk-continues side of matchesTarget(info.getRole(), target).
-        int portReplica = TestPorts.findUnusedPort();
-        int portPrimary = TestPorts.findUnusedPort();
-        TestWebSocketServer replica = new TestWebSocketServer(portReplica, NOOP_HANDLER);
+        TestWebSocketServer replica = new TestWebSocketServer(NOOP_HANDLER);
         replica.setAdvertisedRole("REPLICA");
         replica.setSendServerInfo(true);
-        TestWebSocketServer primary = new TestWebSocketServer(portPrimary, NOOP_HANDLER);
+        int portReplica = replica.getPort();
+        TestWebSocketServer primary = new TestWebSocketServer(NOOP_HANDLER);
         primary.setAdvertisedRole("PRIMARY");
         primary.setSendServerInfo(true);
+        int portPrimary = primary.getPort();
         try {
             replica.start();
             primary.start();
@@ -408,12 +408,12 @@ public class QwpQueryClientWalkTrackerTest {
         // every connect, so a silent post-upgrade peer would otherwise stall the
         // client until the server-info timeout; bound it short here and verify
         // the walk falls through to a healthy node.
-        int portSilent = TestPorts.findUnusedPort();
-        int portOk = TestPorts.findUnusedPort();
-        TestWebSocketServer silent = new TestWebSocketServer(portSilent, NOOP_HANDLER);
+        TestWebSocketServer silent = new TestWebSocketServer(NOOP_HANDLER);
+        int portSilent = silent.getPort();
         // sendServerInfo left off: the 101 upgrade succeeds, then the node stays silent.
-        TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER);
+        TestWebSocketServer ok = new TestWebSocketServer(NOOP_HANDLER);
         ok.setSendServerInfo(true);
+        int portOk = ok.getPort();
         try {
             silent.start();
             ok.start();
@@ -438,9 +438,9 @@ public class QwpQueryClientWalkTrackerTest {
         // WalkTracker must classify the first as TransportError and bind
         // the second on the same walk (no fall-through reset needed yet).
         int portDead = TestPorts.findUnusedPort();
-        int portOk = TestPorts.findUnusedPort();
-        try (TestWebSocketServer ok = new TestWebSocketServer(portOk, NOOP_HANDLER)) {
+        try (TestWebSocketServer ok = new TestWebSocketServer(NOOP_HANDLER)) {
             ok.setSendServerInfo(true);
+            int portOk = ok.getPort();
             ok.start();
             Assert.assertTrue(ok.awaitStart(5, TimeUnit.SECONDS));
 

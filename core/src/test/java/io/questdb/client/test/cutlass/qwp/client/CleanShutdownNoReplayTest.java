@@ -73,12 +73,12 @@ public class CleanShutdownNoReplayTest {
         // Phase 1: server ACKs every frame. Sender writes a few rows,
         // flushes, then close() blocks for the default 5s drain — by the
         // time close returns, every frame has been ACK'd.
-        int port1 = TestPorts.findUnusedPort();
         AckHandler ack1 = new AckHandler();
-        try (TestWebSocketServer s1 = new TestWebSocketServer(port1, ack1)) {
+        try (TestWebSocketServer s1 = new TestWebSocketServer(ack1)) {
             s1.start();
             Assert.assertTrue(s1.awaitStart(5, TimeUnit.SECONDS));
 
+            int port1 = s1.getPort();
             String cfg1 = "ws::addr=localhost:" + port1
                     + ";sf_dir=" + sfDir + ";";
             try (Sender sender = Sender.fromConfig(cfg1)) {
@@ -105,12 +105,12 @@ public class CleanShutdownNoReplayTest {
         // SAME slot dir. There is no unacked work — both rings should agree
         // there's nothing to send. The expected count of binary frames at
         // server 2 is zero.
-        int port2 = port1 + 50;
         AckHandler ack2 = new AckHandler();
-        try (TestWebSocketServer s2 = new TestWebSocketServer(port2, ack2)) {
+        try (TestWebSocketServer s2 = new TestWebSocketServer(ack2)) {
             s2.start();
             Assert.assertTrue(s2.awaitStart(5, TimeUnit.SECONDS));
 
+            int port2 = s2.getPort();
             String cfg2 = "ws::addr=localhost:" + port2
                     + ";sf_dir=" + sfDir + ";";
             try (Sender ignored = Sender.fromConfig(cfg2)) {
