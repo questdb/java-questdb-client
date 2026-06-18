@@ -156,17 +156,15 @@ public final class PooledSender implements Sender {
         if (!inUse) {
             return;
         }
-        boolean broken = false;
+        // Track normal completion rather than catching a specific throwable
+        // type. flush() can exit abnormally with an Error (AssertionError
+        // under -ea, OutOfMemoryError, ...) as well as a RuntimeException;
+        // keying the recycle decision off normal completion treats every
+        // abnormal exit as unrecyclable, which is the fail-safe default.
+        boolean flushed = false;
         try {
             delegate.flush();
-        } catch (RuntimeException e) {
-            // Sender does not clear its buffer on flush failure (see
-            // Sender Javadoc), and WebSocket transport latches the failure
-            // for good. Either way, the wrapper is unsafe to recycle: the
-            // next borrower would inherit the failed rows or a dead
-            // connection.
-            broken = true;
-            throw e;
+            flushed = true;
         } finally {
             inUse = false;
             // Clear the pin BEFORE returning the slot. If we cleared
@@ -175,10 +173,17 @@ public final class PooledSender implements Sender {
             // re-pin on this thread would return the (now in-use)
             // wrapper -- the same race this clear is meant to close.
             pool.clearPinIfCurrent(this);
-            if (broken) {
-                pool.discardBroken(this);
-            } else {
+            if (flushed) {
                 pool.giveBack(this);
+            } else {
+                // flush() did not complete normally. Sender does not clear
+                // its buffer on flush failure (see Sender Javadoc), and
+                // WebSocket transport latches the failure for good. Either
+                // way the wrapper is unsafe to recycle: the next borrower
+                // would inherit the failed rows or a dead connection. The
+                // original throwable propagates naturally once this finally
+                // returns -- no explicit rethrow needed.
+                pool.discardBroken(this);
             }
         }
     }
