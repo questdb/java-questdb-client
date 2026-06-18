@@ -1029,7 +1029,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Bounded inbox capacity for the async error dispatcher.
         // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
         private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean gorillaEnabled = true;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1517,7 +1516,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
                             authTimeoutMillis,
-                            gorillaEnabled,
                             connectionListener,
                             actualConnectionListenerInboxCapacity
                     );
@@ -1873,14 +1871,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
             }
             this.errorInboxCapacity = capacity;
-            return this;
-        }
-
-        public LineSenderBuilder gorilla(boolean enabled) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("gorilla is only supported for WebSocket transport");
-            }
-            this.gorillaEnabled = enabled;
             return this;
         }
 
@@ -3183,18 +3173,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "auth_timeout_ms");
                     authTimeoutMillis(parseLongValue(sink, "auth_timeout_ms"));
-                } else if (Chars.equals("gorilla", sink)) {
-                    if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("gorilla is only supported for WebSocket transport");
-                    }
-                    pos = getValue(configurationString, pos, sink, "gorilla");
-                    if (Chars.equals("on", sink) || Chars.equals("true", sink)) {
-                        gorilla(true);
-                    } else if (Chars.equals("off", sink) || Chars.equals("false", sink)) {
-                        gorilla(false);
-                    } else {
-                        throw new LineSenderException("invalid gorilla [value=").put(sink).put(", allowed=[on, off]]");
-                    }
                 } else if (Chars.equals("durable_ack_keepalive_interval_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException(

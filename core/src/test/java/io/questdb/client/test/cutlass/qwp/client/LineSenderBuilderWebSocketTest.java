@@ -369,50 +369,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testGorillaConfig_acceptsOn() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=on;");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testGorillaConfig_acceptsOff() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=off;");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testGorillaConfig_acceptsTrue() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=true;");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testGorillaConfig_acceptsFalse() {
-        Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;gorilla=false;");
-        Assert.assertNotNull(builder);
-    }
-
-    @Test
-    public void testGorillaConfig_unknownValueRejected() {
-        assertBadConfig("ws::addr=localhost:9000;gorilla=maybe;",
-                "invalid gorilla [value=maybe");
-    }
-
-    @Test
-    public void testGorillaConfig_notSupportedForHttp() {
-        assertBadConfig("http::addr=localhost:9000;gorilla=on;",
-                "gorilla is only supported for WebSocket transport");
-    }
-
-    @Test
-    public void testGorillaBuilder_notSupportedForTcp() {
-        assertThrows("gorilla is only supported for WebSocket transport",
-                () -> Sender.builder(Sender.Transport.TCP)
-                        .address(LOCALHOST)
-                        .gorilla(false));
-    }
-
-    @Test
     public void testWsConfigString_emptyHost_fails() {
         assertBadConfig("ws::addr=:9000;", "empty host in addr entry");
     }
