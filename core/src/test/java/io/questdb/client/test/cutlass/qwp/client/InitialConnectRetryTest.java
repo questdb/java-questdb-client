@@ -100,14 +100,14 @@ public class InitialConnectRetryTest {
     }
 
     @Test
-    public void testWithRetrySucceedsWhenServerComesUpInTime() {
+    public void testWithRetrySucceedsWhenServerComesUpInTime() throws Exception {
         // initial_connect_retry=true; we open the sender BEFORE starting
         // the server, then start the server in a background thread after
         // a short delay. The retry loop should see the server come up and
         // proceed cleanly.
-        int port = TestPorts.findUnusedPort();
         AckHandler handler = new AckHandler();
-        TestWebSocketServer server = new TestWebSocketServer(port, handler);
+        TestWebSocketServer server = new TestWebSocketServer(handler);
+        int port = server.getPort();
         Thread starter = new Thread(() -> {
             try {
                 Thread.sleep(300);

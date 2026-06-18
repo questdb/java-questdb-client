@@ -64,9 +64,9 @@ public class IoThreadErrorSurfacedOnRowApiTest {
 
     @Test
     public void testRowApiMethodSurfacesIoThreadTerminalError() throws Exception {
-        int port = TestPorts.findUnusedPort();
         ErrorAckHandler handler = new ErrorAckHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            int port = server.getPort();
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 

@@ -28,7 +28,6 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
-import io.questdb.client.test.cutlass.qwp.client.TestPorts;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -61,9 +60,9 @@ public class CursorWebSocketSendLoopReconnectLeakTest {
     @Test
     public void testCloseClosesLivePostReconnectClient() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             DisconnectAfterFirstAckHandler handler = new DisconnectAfterFirstAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
