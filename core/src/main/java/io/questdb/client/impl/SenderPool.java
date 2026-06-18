@@ -589,16 +589,21 @@ public final class SenderPool implements AutoCloseable {
             // the slot flock. senderId() is only legal on WebSocket transport,
             // which is exactly when storeAndForward is true.
             //
-            // Also fence off the pool's own "<base>-" namespace from orphan
-            // draining: the pool co-manages every <base>-<index> slot and
-            // recovers each slot's unacked data when it (re)creates it, so a
-            // sibling's startup drainer must never adopt another pool slot's
-            // dir/lock (that would resurrect "sf slot already in use"). This
-            // is a no-op unless the config also set drain_orphans=on; foreign
-            // leftovers under other names are still drained.
+            // Also fence off the pool's own live slot set [0, maxSize) from
+            // orphan draining: the pool co-manages every <base>-<index> slot it
+            // can re-create and recovers each slot's unacked data when it
+            // (re)creates it, so a sibling's startup drainer must never adopt
+            // another live pool slot's dir/lock (that would resurrect "sf slot
+            // already in use"). The bound is maxSize, NOT the whole "<base>-"
+            // prefix: a same-base slot at an index >= maxSize (left behind when
+            // a previous run used a larger maxSize) is out of the pool's index
+            // range forever, so it is left drainable and its unacked data is
+            // recovered rather than silently stranded. This is a no-op unless
+            // the config also set drain_orphans=on; foreign leftovers under
+            // other names are still drained.
             raw = Sender.builder(configurationString)
                     .senderId(slotBaseId + "-" + slotIndex)
-                    .orphanDrainExcludePrefix(slotBaseId + "-")
+                    .orphanDrainExcludeManagedSlots(slotBaseId, maxSize)
                     .build();
         } else {
             raw = Sender.fromConfig(configurationString);

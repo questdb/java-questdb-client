@@ -866,6 +866,79 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testShrinkingMaxSizeDrainsStrandedOutOfRangeSlots() throws Exception {
+        // The bug: a deployment that previously ran at maxSize=4 leaves unacked
+        // data in default-0..3. Restarting at maxSize=2 means default-2 and
+        // default-3 are out of the new [0,2) index range forever -- the pool
+        // never re-creates them. Before the fix the pool also fenced off the
+        // WHOLE "default-" prefix from draining, so default-2/3 were neither
+        // re-created nor drained: their store-and-forward data was silently
+        // stranded even with drain_orphans=on. After the fix the exclusion is
+        // bounded to [0,maxSize), so the out-of-range slots are adopted by a
+        // background drainer and recovered.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: seed unacked data into default-0..3 via a maxSize=4 pool
+            // against a silent (never-acks) server. close_flush_timeout_millis=0
+            // so close() leaves the flushed-but-unacked .sfa on disk.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (SenderPool seed = new SenderPool(seedCfg, 4, 4, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] s = new PooledSender[4];
+                    for (int i = 0; i < 4; i++) {
+                        s[i] = seed.borrow();
+                    }
+                    for (int i = 0; i < 4; i++) {
+                        s[i].table("recover").longColumn("v", i).atNow();
+                        s[i].flush();
+                    }
+                    for (int i = 3; i >= 0; i--) {
+                        s[i].close();
+                    }
+                }
+            }
+            for (int i = 0; i < 4; i++) {
+                Assert.assertTrue("default-" + i + " must hold unacked data",
+                        hasSegmentFile(slot("default-" + i)));
+            }
+
+            // Phase 2: restart at maxSize=2 with drain_orphans=on against an ack
+            // server. The pool re-creates + self-recovers default-0/1; the
+            // out-of-range default-2/3 must be drained, not stranded.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir
+                        + ";drain_orphans=on;";
+                try (SenderPool pool = new SenderPool(cfg, 1, 2, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = pool.borrow();
+                    PooledSender b = pool.borrow();
+                    try {
+                        // The regression: the out-of-range slots must be adopted
+                        // by a background drainer and emptied.
+                        Assert.assertTrue("default-2 unacked data must be recovered, not stranded",
+                                awaitNoSegmentFile(slot("default-2"), 15_000));
+                        Assert.assertTrue("default-3 unacked data must be recovered, not stranded",
+                                awaitNoSegmentFile(slot("default-3"), 15_000));
+                        Assert.assertFalse("out-of-range slot must not be abandoned as .failed",
+                                Files.exists(slot("default-2") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                        Assert.assertFalse("out-of-range slot must not be abandoned as .failed",
+                                Files.exists(slot("default-3") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                    } finally {
+                        b.close();
+                        a.close();
+                    }
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Helpers.
     // ----------------------------------------------------------------------

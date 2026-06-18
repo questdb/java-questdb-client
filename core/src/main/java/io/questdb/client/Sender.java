@@ -1022,12 +1022,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // runtime lands in a follow-up commit. For now we surface the
         // count via logging so users can confirm orphans are being seen.
         private boolean drainOrphans = false;
-        // When non-null, orphan scanning skips any sibling slot whose dir
-        // name starts with this prefix. Set by the connection pool to its
-        // own "<base>-" slot namespace so pooled senders never treat each
-        // other's slots as drainable orphans (the pool recovers those on
-        // (re)creation). Foreign leftovers under other names are still drained.
-        private String orphanDrainExcludePrefix;
+        // Orphan-scan exclusion for the connection pool. The pool co-manages
+        // exactly <orphanDrainBase>-<i> for i in [0, orphanDrainSlotCount) and
+        // recovers each of those on (re)creation, so pooled senders must never
+        // treat one another's live slots as drainable orphans. Anything else --
+        // a different base, a bare un-suffixed id, OR a same-base index at or
+        // above the count (a slot left behind by a larger pool before maxSize
+        // shrank) -- is still drained, so unacked data is never stranded.
+        private String orphanDrainBase;
+        private int orphanDrainSlotCount;
         private long durableAckKeepaliveIntervalMillis = DURABLE_ACK_KEEPALIVE_NOT_SET;
         // Optional user-supplied async error handler. When null, the sender
         // uses DefaultSenderErrorHandler.INSTANCE (loud-not-silent log).
@@ -1562,7 +1565,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     if (drainOrphans && sfDir != null) {
                         io.questdb.client.std.ObjList<String> orphans =
                                 io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner
-                                        .scan(sfDir, senderId, orphanDrainExcludePrefix);
+                                        .scan(sfDir, senderId, orphanDrainBase, orphanDrainSlotCount);
                         if (orphans.size() > 0) {
                             org.slf4j.LoggerFactory.getLogger(LineSenderBuilder.class)
                                     .info("dispatching drainers for {} orphan slot(s) under {} "
@@ -2498,25 +2501,33 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Excludes a whole slot-name namespace from {@link #drainOrphans(boolean)}
-         * scanning: any sibling slot under {@code sf_dir} whose directory name
-         * starts with {@code prefix} is never treated as a drainable orphan.
+         * Excludes the connection pool's <em>live</em> slot set from
+         * {@link #drainOrphans(boolean)} scanning: a sibling slot under
+         * {@code sf_dir} named {@code <base>-<index>} with
+         * {@code 0 <= index < slotCount} is never treated as a drainable orphan.
          * <p>
          * Internal introspection hook for the connection pool. The pool gives
          * each pooled SF sender a distinct slot id {@code <base>-<index>} and
-         * co-manages the entire {@code <base>-} namespace; it recovers each
-         * slot's unacked data itself when it (re)creates that slot. Without
-         * this exclusion, one pooled sender's startup drainer could adopt a
-         * sibling pool slot's lock and dir, reintroducing the very
-         * "sf slot already in use" collision the per-slot ids were added to
-         * prevent. Foreign leftovers (a different base, or a bare un-suffixed
-         * id) do not match the prefix and are still drained.
+         * recovers each slot's unacked data itself when it (re)creates that
+         * slot. Without this exclusion, one pooled sender's startup drainer
+         * could adopt a sibling pool slot's lock and dir, reintroducing the
+         * very "sf slot already in use" collision the per-slot ids were added
+         * to prevent.
          * <p>
-         * Pass {@code null} or an empty string to disable the exclusion
-         * (the default).
+         * Unlike a blanket {@code <base>-} prefix exclusion, the bound is the
+         * pool's {@code maxSize}: a same-base slot whose index is at or above
+         * {@code slotCount} (e.g. {@code <base>-3} left behind by a larger pool
+         * before {@code maxSize} shrank from 4 to 2) is NOT excluded and is
+         * drained like any foreign leftover, so its unacked data is recovered
+         * instead of being silently stranded. Foreign leftovers (a different
+         * base, or a bare un-suffixed id) are also still drained.
+         * <p>
+         * Pass a {@code null}/empty base or {@code slotCount <= 0} to disable
+         * the exclusion (the default).
          */
-        public LineSenderBuilder orphanDrainExcludePrefix(String prefix) {
-            this.orphanDrainExcludePrefix = prefix;
+        public LineSenderBuilder orphanDrainExcludeManagedSlots(String base, int slotCount) {
+            this.orphanDrainBase = base;
+            this.orphanDrainSlotCount = slotCount;
             return this;
         }
 

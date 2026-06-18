@@ -133,6 +133,117 @@ public final class OrphanScanner {
     }
 
     /**
+     * As {@link #scan(String, String)}, but excludes only the <em>exact</em>
+     * set of slot dirs a connection pool can re-create and self-recover:
+     * {@code <managedBase>-<i>} for {@code 0 <= i < managedSlotCount}.
+     * <p>
+     * This is the precise replacement for the coarser prefix exclusion
+     * ({@link #scan(String, String, String)}). The prefix form fences off the
+     * <em>whole</em> {@code <base>-} namespace, which silently strands unacked
+     * data after a {@code maxSize} shrink across restarts: a slot like
+     * {@code <base>-3} left over from a larger pool is neither re-created (out
+     * of the new {@code [0,maxSize)} index range) nor drained (it matched the
+     * excluded prefix). By bounding the exclusion to {@code [0,managedSlotCount)},
+     * any same-base slot with an index at or above {@code managedSlotCount} is
+     * treated like a foreign leftover and becomes a drainable orphan, so its
+     * data is recovered through the normal drain path.
+     * <p>
+     * Only canonical, pool-minted names are excluded: the suffix after
+     * {@code <managedBase>-} must be a canonical non-negative decimal
+     * ({@code 0,1,2,...} with no leading zeros, sign, or non-digits). Anything
+     * else under the same base ({@code <base>-foo}, {@code <base>-007}) is not a
+     * name the pool creates and is reported as a candidate.
+     * <p>
+     * When {@code managedBase} is null/empty or {@code managedSlotCount <= 0}
+     * no exclusion is applied (every sibling with data is a candidate).
+     */
+    public static ObjList<String> scan(String sfDir, String excludeSlotName, String managedBase, int managedSlotCount) {
+        ObjList<String> orphans = new ObjList<>();
+        if (sfDir == null || !Files.exists(sfDir)) {
+            return orphans;
+        }
+        boolean hasManaged = managedBase != null && !managedBase.isEmpty() && managedSlotCount > 0;
+        String managedPrefix = hasManaged ? managedBase + "-" : null;
+        long find = Files.findFirst(sfDir);
+        if (find < 0) {
+            LOG.warn("orphan scan could not enumerate {} \u2014 treating as no orphans, "
+                    + "but this may indicate a permission or transient error", sfDir);
+            return orphans;
+        }
+        if (find == 0) {
+            return orphans;
+        }
+        try {
+            int rc = 1;
+            while (rc > 0) {
+                String name = Files.utf8ToString(Files.findName(find));
+                rc = Files.findNext(find);
+                if (name == null || ".".equals(name) || "..".equals(name)) {
+                    continue;
+                }
+                if (excludeSlotName != null && excludeSlotName.equals(name)) {
+                    continue;
+                }
+                if (hasManaged && isManagedSlot(name, managedPrefix, managedSlotCount)) {
+                    continue;
+                }
+                String slotPath = sfDir + "/" + name;
+                if (!isCandidateOrphan(slotPath)) {
+                    continue;
+                }
+                orphans.add(slotPath);
+            }
+        } finally {
+            Files.findClose(find);
+        }
+        return orphans;
+    }
+
+    /**
+     * True iff {@code name} is a slot the pool actively co-manages, i.e.
+     * {@code <managedPrefix><i>} where {@code i} is a canonical non-negative
+     * decimal in {@code [0, managedSlotCount)}. Visible for testing.
+     */
+    public static boolean isManagedSlot(String name, String managedPrefix, int managedSlotCount) {
+        if (name == null || managedPrefix == null || !name.startsWith(managedPrefix)) {
+            return false;
+        }
+        int idx = parseCanonicalIndex(name, managedPrefix.length());
+        return idx >= 0 && idx < managedSlotCount;
+    }
+
+    /**
+     * Parses the canonical non-negative decimal that makes up the rest of
+     * {@code name} from {@code from}. Returns {@code -1} for an empty suffix,
+     * a non-digit, a leading zero (e.g. {@code "007"}), or anything that would
+     * overflow {@code int}. Only the exact form the pool emits
+     * ({@code Integer.toString(index)}) is accepted, so foreign or malformed
+     * same-base names never get mistaken for a managed slot.
+     */
+    private static int parseCanonicalIndex(String name, int from) {
+        int len = name.length();
+        if (from >= len) {
+            return -1;
+        }
+        // Reject leading zeros unless the whole suffix is exactly "0".
+        if (name.charAt(from) == '0' && len - from > 1) {
+            return -1;
+        }
+        long acc = 0;
+        for (int i = from; i < len; i++) {
+            char c = name.charAt(i);
+            if (c < '0' || c > '9') {
+                return -1;
+            }
+            acc = acc * 10 + (c - '0');
+            if (acc > Integer.MAX_VALUE) {
+                return -1;
+            }
+        }
+        return (int) acc;
+    }
+
+    /**
      * True iff {@code slotPath} looks like a slot dir with unacked data
      * and no failure sentinel. Visible for testing.
      */
