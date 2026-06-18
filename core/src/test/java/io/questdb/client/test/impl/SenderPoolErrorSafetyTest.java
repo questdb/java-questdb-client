@@ -31,6 +31,7 @@ import org.junit.Test;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Proxy;
+import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntFunction;
@@ -152,6 +153,62 @@ public class SenderPoolErrorSafetyTest {
                             return null;
                     }
                 });
+    }
+
+    // Companion to the SF slot-index reservation in borrow(): when
+    // createUnlocked() throws on a borrow-triggered grow, the reserved slot
+    // index MUST be returned via freeSlotIndex(). Otherwise slotInUse[idx] is
+    // stuck true, pool capacity is permanently lowered, and the next borrow()
+    // either trips the "no free SF slot index" invariant in allocateSlotIndex()
+    // or eventually only times out -- the exact failure mode this PR fixes.
+    //
+    // The other SenderPool error-injection test fails in the constructor
+    // pre-warm loop with a non-SF config (slotIndex == -1), so neither the
+    // borrow-path freeSlotIndex nor the SF (slotIndex >= 0) case is otherwise
+    // covered.
+    //
+    // RED  (freeSlotIndex(slotIndex) removed from the borrow catch): the 2nd
+    //      borrow() throws IllegalStateException out of allocateSlotIndex().
+    // GREEN (slot index returned): the 2nd borrow() reuses the slot and
+    //      succeeds, proving capacity survived the failed grow.
+    @Test(timeout = 30_000)
+    public void borrowReleasesSfSlotIndexWhenCreationFails() throws Exception {
+        // Unique, non-existent sf_dir: minSize=0 means no pre-warm, so the dir
+        // is never created and the constructor's startup SF recovery is a no-op.
+        // The factory replaces createUnlocked(), so localhost:1 is never dialed.
+        String sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
+                "qdb-sf-borrowfail-" + System.nanoTime()).toString();
+        String sfCfg = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+
+        AtomicInteger calls = new AtomicInteger();
+        IntFunction<Sender> factory = slotIndex -> {
+            // First borrow-triggered build fails (the slot index reserved for
+            // it must be released); later builds succeed.
+            if (calls.getAndIncrement() == 0) {
+                throw new AssertionError("injected native build failure on first grow");
+            }
+            return fakeSender(new AtomicBoolean());
+        };
+
+        try (SenderPool pool = newPool(sfCfg, 0, 1, 2_000, factory)) {
+            try {
+                pool.borrow();
+                Assert.fail("borrow() must propagate the Error from the failed build");
+            } catch (AssertionError expected) {
+                // expected: the original throwable propagates out of borrow()
+            }
+
+            // The single SF slot index must have been returned to the free set.
+            // If it leaked, this borrow() trips the capacity invariant (or, in
+            // the timeout-only variant, exhausts the acquire budget).
+            Sender second = pool.borrow();
+            try {
+                Assert.assertNotNull(
+                        "after a failed grow the SF slot index must be reusable", second);
+            } finally {
+                second.close();
+            }
+        }
     }
 
     private static Sender fakeSender(AtomicBoolean closedFlag) {
