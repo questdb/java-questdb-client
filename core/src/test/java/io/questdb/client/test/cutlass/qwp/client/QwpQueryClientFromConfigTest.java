@@ -661,6 +661,7 @@ public class QwpQueryClientFromConfigTest {
                 "sf_durability=memory",
                 "sf_max_bytes=4m",
                 "sf_max_total_bytes=10g",
+                "transaction=on",
                 "user=alice",
         };
         StringBuilder all = new StringBuilder("ws::addr=db:9000;");

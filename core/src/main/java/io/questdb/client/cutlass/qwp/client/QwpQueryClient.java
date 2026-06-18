@@ -612,6 +612,7 @@ public class QwpQueryClient implements QuietCloseable {
                 case "sf_durability":
                 case "sf_max_bytes":
                 case "sf_max_total_bytes":
+                case "transaction":
                 case "user":
                     break;
                 default:
