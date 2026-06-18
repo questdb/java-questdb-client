@@ -78,13 +78,13 @@ public class PrReviewRedTestsE2e {
     @Test
     public void testC4_handlerMustObserveTerminalErrorWhenInvoked() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             int iterations = 30;
             AtomicInteger nullObservations = new AtomicInteger();
             AtomicInteger totalObservations = new AtomicInteger();
 
             ParseErrorAckHandler serverHandler = new ParseErrorAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, serverHandler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(serverHandler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -161,9 +161,9 @@ public class PrReviewRedTestsE2e {
     @Test
     public void testC11_postHaltFlushThrowsTypedLineSenderServerException() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             ParseErrorAckHandler serverHandler = new ParseErrorAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, serverHandler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(serverHandler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 

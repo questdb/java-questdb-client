@@ -67,9 +67,9 @@ public class ReconnectTest {
         // Without reconnect, the next batch's flush() would throw. With
         // reconnect, the I/O loop opens a fresh connection (same port,
         // same server) and the second batch goes through.
-        int port = TestPorts.findUnusedPort();
         DisconnectAfterFirstAckHandler handler = new DisconnectAfterFirstAckHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            int port = server.getPort();
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -101,14 +101,14 @@ public class ReconnectTest {
     }
 
     @Test
-    public void testReconnectGivesUpAfterCap() {
+    public void testReconnectGivesUpAfterCap() throws Exception {
         // Server is up at first (initial connect succeeds + ACKs batch 1),
         // then we tear it down — subsequent reconnect attempts get TCP
         // connection-refused and accumulate against the budget. With a
         // 500ms cap, the loop should give up well inside the test's 5s
         // poll window and the next user-thread flush() must throw.
-        int port = TestPorts.findUnusedPort();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, new AckHandler())) {
+        try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
+            int port = server.getPort();
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -167,10 +167,10 @@ public class ReconnectTest {
         // a 401 happening on the very first reconnect, the cursor I/O
         // loop should surface the terminal error within hundreds of ms,
         // not after 10s.
-        int port = TestPorts.findUnusedPort();
         try (Auth401AfterFirstConnectionFixture fixture =
-                     new Auth401AfterFirstConnectionFixture(port)) {
+                     new Auth401AfterFirstConnectionFixture()) {
             fixture.start();
+            int port = fixture.getPort();
             String cfg = "ws::addr=localhost:" + port
                     + ";reconnect_max_duration_millis=10000"
                     + ";close_flush_timeout_millis=0;";
@@ -220,9 +220,9 @@ public class ReconnectTest {
         // ackedFsn is still -1. On reconnect, the cursor must reposition at
         // FSN 0 and replay it — the new connection should observe the
         // *same* batch a second time before any new batch arrives.
-        int port = TestPorts.findUnusedPort();
         ReceiveThenDisconnectHandler handler = new ReceiveThenDisconnectHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            int port = server.getPort();
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -373,8 +373,16 @@ public class ReconnectTest {
         private volatile boolean running;
         private final java.util.List<Socket> openSockets = new java.util.concurrent.CopyOnWriteArrayList<>();
 
-        Auth401AfterFirstConnectionFixture(int port) throws IOException {
-            this.serverSocket = new ServerSocket(port);
+        Auth401AfterFirstConnectionFixture() throws IOException {
+            // Bind the listener up front on an OS-assigned loopback port and
+            // hold it for the fixture's lifetime; read it back via getPort().
+            // Owning the port from allocation to teardown avoids the bind race
+            // a pre-selected port would carry.
+            this.serverSocket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+        }
+
+        int getPort() {
+            return serverSocket.getLocalPort();
         }
 
         void start() {

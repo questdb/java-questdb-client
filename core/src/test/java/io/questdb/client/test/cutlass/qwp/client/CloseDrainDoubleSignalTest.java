@@ -103,12 +103,12 @@ public class CloseDrainDoubleSignalTest {
 
     @Test(timeout = 30_000)
     public void testCloseDoesNotDoubleSignalWhenAsyncHandlerOwnsErrorAndDrainRuns() throws Exception {
-        int port = TestPorts.findUnusedPort();
         GatedHaltHandler server = new GatedHaltHandler();
-        try (TestWebSocketServer ws = new TestWebSocketServer(port, server)) {
+        try (TestWebSocketServer ws = new TestWebSocketServer(server)) {
             ws.start();
             Assert.assertTrue(ws.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = ws.getPort();
             // Memory mode + a positive drain timeout: drainOnClose() WILL run.
             String cfg = "ws::addr=localhost:" + port
                     + ";close_flush_timeout_millis=2000;";
