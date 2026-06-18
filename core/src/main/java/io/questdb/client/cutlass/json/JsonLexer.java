@@ -64,6 +64,7 @@ public class JsonLexer implements Mutable, Closeable {
     private int objDepth = 0;
     private int position = 0;
     private boolean quoted = false;
+    private boolean sawEscape = false;
     private int state = S_START;
     private boolean useCache = false;
 
@@ -86,6 +87,7 @@ public class JsonLexer implements Mutable, Closeable {
         arrayDepth = 0;
         ignoreNext = false;
         quoted = false;
+        sawEscape = false;
         cacheSize = 0;
         useCache = false;
         position = 0;
@@ -110,6 +112,7 @@ public class JsonLexer implements Mutable, Closeable {
         int state = this.state;
         boolean quoted = this.quoted;
         boolean ignoreNext = this.ignoreNext;
+        boolean sawEscape = this.sawEscape;
         boolean useCache = this.useCache;
         int objDepth = this.objDepth;
         int arrayDepth = this.arrayDepth;
@@ -126,6 +129,7 @@ public class JsonLexer implements Mutable, Closeable {
                 if (quoted) {
                     if (c == '\\') {
                         ignoreNext = true;
+                        sawEscape = true;
                         continue;
                     }
 
@@ -138,10 +142,10 @@ public class JsonLexer implements Mutable, Closeable {
 
                 int vp = (int) (posAtStart + valueStart - lo + 1 - cacheSize);
                 if (state == S_EXPECT_NAME || state == S_EXPECT_FIRST_NAME) {
-                    listener.onEvent(EVT_NAME, getCharSequence(valueStart, p, vp), vp);
+                    listener.onEvent(EVT_NAME, getCharSequence(valueStart, p, vp, sawEscape), vp);
                     state = S_EXPECT_COLON;
                 } else {
-                    listener.onEvent(arrayDepth > 0 ? EVT_ARRAY_VALUE : EVT_VALUE, getCharSequence(valueStart, p, vp), vp);
+                    listener.onEvent(arrayDepth > 0 ? EVT_ARRAY_VALUE : EVT_VALUE, getCharSequence(valueStart, p, vp, sawEscape), vp);
                     state = S_EXPECT_COMMA;
                 }
 
@@ -241,6 +245,7 @@ public class JsonLexer implements Mutable, Closeable {
                     }
                     valueStart = p;
                     quoted = true;
+                    sawEscape = false;
                     break;
                 default:
                     if (state != S_EXPECT_VALUE) {
@@ -249,6 +254,7 @@ public class JsonLexer implements Mutable, Closeable {
                     // this isn't a quote, include this character
                     valueStart = p - 1;
                     quoted = false;
+                    sawEscape = false;
                     break;
             }
         }
@@ -258,6 +264,7 @@ public class JsonLexer implements Mutable, Closeable {
         this.state = state;
         this.quoted = quoted;
         this.ignoreNext = ignoreNext;
+        this.sawEscape = sawEscape;
         this.objDepth = objDepth;
         this.arrayDepth = arrayDepth;
 
@@ -332,7 +339,7 @@ public class JsonLexer implements Mutable, Closeable {
         cache = ptr;
     }
 
-    private CharSequence getCharSequence(long lo, long hi, int position) throws JsonException {
+    private CharSequence getCharSequence(long lo, long hi, int position, boolean hasEscape) throws JsonException {
         sink.clear();
         if (cacheSize == 0) {
             if (!Utf8s.utf8ToUtf16(lo, hi - 1, sink)) {
@@ -341,9 +348,11 @@ public class JsonLexer implements Mutable, Closeable {
         } else {
             utf8DecodeCacheAndBuffer(lo, hi - 1, position);
         }
-        // the decode above assembles the raw bytes between the quotes verbatim; JSON string escape
-        // sequences are only resolved here, so callers see fully decoded string values
-        return unescape(sink);
+        // the decode above assembled the raw bytes between the quotes verbatim; resolve JSON string escape
+        // sequences only when the scan actually saw a backslash. The common no-escape value (and every
+        // escape-free name) returns the assembled sink directly, instead of unescape() rescanning it from
+        // the start just to rediscover that there was nothing to unescape
+        return hasEscape ? unescape(sink) : sink;
     }
 
     private CharSequence unescape(CharSequence raw) {

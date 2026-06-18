@@ -662,6 +662,12 @@ public class OidcDeviceAuthTest {
         assertBuildFails("https://idp:0/d", "https://idp/t", "between 1 and 65535");
         assertBuildFails("https://idp:-1/d", "https://idp/t", "between 1 and 65535");
         assertBuildFails("https://idp/d", "https://idp:70000/t", "between 1 and 65535");
+        // a host carrying control characters or whitespace (e.g. a smuggled CR/LF that would inject into the
+        // outbound Host header) is rejected rather than passed verbatim to the transport
+        assertBuildFails("https://ho\r\nst/d", "https://idp/t", "illegal character");
+        assertBuildFails("https://h\tst/d", "https://idp/t", "illegal character");
+        assertBuildFails("https://h st/d", "https://idp/t", "illegal character");
+        assertBuildFails("https://idp/d", "https://e\nvil/t", "illegal character");
     }
 
     @Test(timeout = 30_000)

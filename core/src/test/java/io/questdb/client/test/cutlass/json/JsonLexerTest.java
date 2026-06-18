@@ -24,9 +24,11 @@
 
 package io.questdb.client.test.cutlass.json;
 
+import io.questdb.client.Sender;
 import io.questdb.client.cutlass.json.JsonException;
 import io.questdb.client.cutlass.json.JsonLexer;
 import io.questdb.client.cutlass.json.JsonParser;
+import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntStack;
 import io.questdb.client.std.MemoryTag;
@@ -676,6 +678,83 @@ public class JsonLexerTest {
             assertDecodedValue("{\"v\":\"X\\u0041Y\"}", "XAY");                // 4-hex unicode escape decoded
             assertDecodedValue("{\"v\":\"tab\\tend\"}", "tab\tend");            // escaped tab -> tab
             assertDecodedValue("{\"v\":\"plain\"}", "plain");                  // no escapes (fast path)
+        });
+    }
+
+    @Test
+    public void testStringEscapesDecodedAcrossSplitParseCalls() throws Exception {
+        assertMemoryLeak(() -> {
+            // a value whose backslash escape straddles two parse() calls (a real HTTP-fragment boundary)
+            // must still be decoded: the "saw a backslash" flag that gates the unescape pass has to persist
+            // across the calls, not reset to false at the start of the second one
+            String json = "{\"v\":\"ab\\ncd\"}"; // value ab\ncd -> ab<newline>cd
+            int len = json.length();
+            long address = TestUtils.toMemory(json);
+            StringSink captured = new StringSink();
+            JsonParser parser = (code, tag, position) -> {
+                if (code == JsonLexer.EVT_VALUE) {
+                    captured.clear();
+                    captured.put(tag);
+                }
+            };
+            try (JsonLexer lexer = new JsonLexer(4, 1024)) {
+                // split immediately after the backslash, so the escape's '\' is in the first chunk and the
+                // 'n' it escapes is in the second
+                int split = json.indexOf('\\') + 1;
+                lexer.parse(address, address + split, parser);
+                lexer.parse(address + split, address + len, parser);
+                lexer.parseLast();
+                TestUtils.assertEquals("ab\ncd", captured);
+            } finally {
+                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testStringEscapesExoticAndLenient() throws Exception {
+        assertMemoryLeak(() -> {
+            String bs = String.valueOf((char) 92); // a single backslash, built without a literal escape
+            // a surrogate pair (two backslash-u escapes) reassembles into the supplementary point U+1F600
+            assertDecodedValue("{\"v\":\"x" + bs + "uD83D" + bs + "uDE00y\"}",
+                    "x" + new String(Character.toChars(0x1F600)) + "y");
+            // the backspace and form-feed arms
+            assertDecodedValue("{\"v\":\"a" + bs + "bb" + bs + "fc\"}",
+                    "a" + ((char) 8) + "b" + ((char) 12) + "c");
+            // the lexer is deliberately lenient (not RFC 8259-strict) about malformed or unknown escapes:
+            // it drops the backslash and keeps the following text rather than failing the parse. These pin
+            // that behavior and cover the lenient arms that otherwise carry most of the file's coverage:
+            assertDecodedValue("{\"v\":\"a" + bs + "xb\"}", "axb");          // unknown escape -> drop backslash
+            assertDecodedValue("{\"v\":\"a" + bs + "uZZZZb\"}", "auZZZZb");  // non-hex unicode escape -> literal
+            assertDecodedValue("{\"v\":\"ab" + bs + "u12\"}", "abu12");      // too few hex digits -> literal
+            // a lone (unpaired) high surrogate is emitted as-is, not dropped or replaced
+            assertDecodedValue("{\"v\":\"x" + bs + "uD83Dy\"}", "x" + ((char) 0xD83D) + "y");
+        });
+    }
+
+    @Test
+    public void testSettingsParserKeysDecodedThroughUnescape() throws Exception {
+        assertMemoryLeak(() -> {
+            // the line-protocol version probe parses /settings with JsonSettingsParser, whose keys now flow
+            // through the lexer's unescape pass. An escaped key (here a JSON unicode escape standing in for
+            // the letter 'o') must decode to the real key, otherwise the probe would miss the advertised
+            // versions and silently fall back to V1. The backslash is built from char 92, so this source
+            // carries no literal backslash-u sequence.
+            String esc = ((char) 92) + "u006f"; // a JSON unicode escape for 'o'
+            String json = "{\"line.proto.support.versi" + esc + "ns\":[1,2,3],\"cairo.max.file.name.length\":127}";
+            long address = TestUtils.toMemory(json);
+            int len = json.length();
+            try (AbstractLineHttpSender.JsonSettingsParser parser = new AbstractLineHttpSender.JsonSettingsParser();
+                 JsonLexer lexer = new JsonLexer(1024, 1024)) {
+                lexer.parse(address, address + len, parser);
+                lexer.parseLast();
+                // the escaped "versions" key decoded and matched, so the highest advertised version was
+                // picked; a non-decoded key would leave the versions empty and fall back to V1
+                Assert.assertEquals(Sender.PROTOCOL_VERSION_V3, parser.getDefaultProtocolVersion());
+                Assert.assertEquals(127, parser.getMaxNameLen());
+            } finally {
+                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+            }
         });
     }
 

@@ -266,13 +266,18 @@ public class SenderBuilderErrorApiTest {
 
     @Test
     public void testHttpTokenProviderRejectedForNonHttpTransport() {
-        // the provider is an HTTP-only feature
-        try {
-            Sender.builder(Sender.Transport.TCP).address("localhost:9009")
-                    .httpTokenProvider(() -> "dynamic").build().close();
-            Assert.fail("expected provider to be rejected for TCP");
+        // the provider is an HTTP-only feature; every non-HTTP transport must reject it at build time
+        assertProviderRejected(Sender.Transport.TCP, "token provider authentication is not supported for TCP protocol");
+        assertProviderRejected(Sender.Transport.UDP, "token provider authentication is not supported for UDP transport");
+        assertProviderRejected(Sender.Transport.WEBSOCKET, "token provider authentication is not supported for WebSocket protocol");
+    }
+
+    private static void assertProviderRejected(Sender.Transport transport, String expectedMessage) {
+        try (Sender ignored = Sender.builder(transport).address("localhost:9009")
+                .httpTokenProvider(() -> "dynamic").build()) {
+            Assert.fail("expected the token provider to be rejected for " + transport);
         } catch (LineSenderException e) {
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token provider authentication is not supported for TCP"));
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
         }
     }
 }

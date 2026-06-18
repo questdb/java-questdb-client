@@ -1101,6 +1101,14 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (host.isEmpty()) {
                 throw new OidcAuthException().put("invalid url, the host is empty [url=").put(url).put(']');
             }
+            for (int i = 0, n = host.length(); i < n; i++) {
+                char c = host.charAt(i);
+                if (c <= ' ' || c == 0x7f) {
+                    // a host carrying control characters or whitespace (e.g. a smuggled CR/LF) would corrupt
+                    // the outbound Host header, so reject it rather than pass it through to the transport
+                    throw new OidcAuthException().put("invalid url, the host contains an illegal character [url=").put(url).put(']');
+                }
+            }
             return new Endpoint(host, port, path, isTls);
         }
     }
