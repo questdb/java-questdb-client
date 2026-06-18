@@ -1441,6 +1441,39 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testRefreshTokenAlongsideErrorFallsBackToInteractiveFlow() throws Exception {
+        assertMemoryLeak(() -> {
+            // a refresh response that carries an OAuth error (under a non-2xx status) must not be trusted
+            // even if it also returns a token; the client ignores the smuggled token and falls back to a
+            // fresh interactive sign-in rather than caching it
+            AtomicInteger deviceCalls = new AtomicInteger();
+            AtomicInteger deviceCodeGrants = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    deviceCalls.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    // malformed: a 400 error together with a token
+                    return MockOidcServer.json(400, "{\"error\":\"invalid_grant\",\"access_token\":\"SHOULD-NOT-BE-USED\"}");
+                }
+                if (deviceCodeGrants.getAndIncrement() == 0) {
+                    return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 1));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-2", null, "REFRESH-2", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-1", auth.getToken());
+                // the cached token is expired vs the skew; the refresh carries an error+token, so the
+                // client must ignore the smuggled token and re-run the interactive flow
+                Assert.assertEquals("ACCESS-2", auth.getToken());
+                Assert.assertEquals("the interactive flow must run twice (initial + fallback)", 2, deviceCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testRefreshWithoutIdTokenFallsBackToInteractiveFlow() throws Exception {
         assertMemoryLeak(() -> {
             // groups are encoded in the token (the default enterprise config), so getToken() serves the
@@ -1608,6 +1641,31 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testTokenAlongsideOauthErrorIsRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // RFC 6749 5.2: an error response must not be treated as a grant even if the body also carries
+            // a token. A hostile or buggy IdP returns access_denied together with an access_token; the
+            // client must surface the error, not cache the smuggled token
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(400, "{\"error\":\"access_denied\",\"access_token\":\"SHOULD-NOT-BE-USED\"}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected the error response to be rejected, not the smuggled token accepted");
+                } catch (OidcAuthException e) {
+                    Assert.assertEquals("access_denied", e.getOauthError());
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("SHOULD-NOT-BE-USED"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTokenCachedAcrossCalls() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger deviceCalls = new AtomicInteger();
@@ -1690,6 +1748,31 @@ public class OidcDeviceAuthTest {
                 // flow; without the clamp the ~68-year cache would be served and the flow would not run again
                 Assert.assertEquals("ACCESS-OK", auth.getToken());
                 Assert.assertEquals("clamped token expiry forces a fresh sign-in", 2, deviceCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testTokenUnderNonSuccessStatusIsNotAccepted() throws Exception {
+        assertMemoryLeak(() -> {
+            // RFC 6749 5.1: a token must come from a 2xx response. A token under a non-2xx status with no
+            // OAuth error is a malformed or hostile answer; the client must not cache it - it charges the
+            // response to the transport-error budget and aborts rather than trusting the token
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(400, "{\"access_token\":\"SHOULD-NOT-BE-USED\"}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected a token under a 400 to be rejected, not accepted");
+                } catch (OidcAuthException e) {
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("SHOULD-NOT-BE-USED"));
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("repeated unexpected responses"));
+                }
             }
         });
     }

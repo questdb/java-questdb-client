@@ -576,26 +576,32 @@ public class OidcDeviceAuth implements QuietCloseable {
         // on a persistent failure rather than swallowing it as a pending authorization
         postForm(tokenEndpoint, tokenParser);
 
-        if (tokenParser.accessToken.length() > 0 || tokenParser.idToken.length() > 0) {
-            storeTokens(tokenParser);
-            return POLL_SUCCESS;
+        // RFC 6749 5.2: an error response is an error even if the body also carries a token, so handle the
+        // OAuth error first - a token smuggled alongside an error must never count as a grant
+        if (tokenParser.error.length() > 0) {
+            if (Chars.equals(ERROR_AUTHORIZATION_PENDING, tokenParser.error)) {
+                return POLL_PENDING;
+            }
+            if (Chars.equals(ERROR_SLOW_DOWN, tokenParser.error)) {
+                return POLL_SLOW_DOWN;
+            }
+            throw OidcAuthException.oauthError(tokenParser.error, tokenParser.errorDescription);
         }
-        if (tokenParser.error.length() == 0) {
-            // a 2xx with neither tokens nor an OAuth error is a definitive but malformed answer and
-            // aborts; a non-2xx with no parseable error (a gateway 5xx, an empty body) is a transport-
-            // class blip - retry it rather than abort the whole sign-in on a momentary upstream failure
+        // RFC 6749 5.1: a grant is a 2xx response carrying a token; a token under a non-2xx status is a
+        // malformed or hostile answer - charge it to the transport-error budget rather than trusting it
+        if (tokenParser.accessToken.length() > 0 || tokenParser.idToken.length() > 0) {
             if (isHttpStatusSuccess()) {
-                throw new OidcAuthException().put("unexpected response from the token endpoint [httpStatus=").put(responseStatus).put(']');
+                storeTokens(tokenParser);
+                return POLL_SUCCESS;
             }
             return POLL_TRANSIENT_ERROR;
         }
-        if (Chars.equals(ERROR_AUTHORIZATION_PENDING, tokenParser.error)) {
-            return POLL_PENDING;
+        // no tokens and no OAuth error: a 2xx is a definitive but malformed answer and aborts; a non-2xx
+        // (a gateway 5xx, an empty body) is a transport-class blip - retry rather than abort the sign-in
+        if (isHttpStatusSuccess()) {
+            throw new OidcAuthException().put("unexpected response from the token endpoint [httpStatus=").put(responseStatus).put(']');
         }
-        if (Chars.equals(ERROR_SLOW_DOWN, tokenParser.error)) {
-            return POLL_SLOW_DOWN;
-        }
-        throw OidcAuthException.oauthError(tokenParser.error, tokenParser.errorDescription);
+        return POLL_TRANSIENT_ERROR;
     }
 
     private void pollForToken(String deviceCode, int expiresInSeconds, int intervalSeconds) {
@@ -793,13 +799,16 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             return false;
         }
-        // only treat the refresh as a success if it returned the token getToken() actually serves
-        // (the id token when groups are encoded in it, the access token otherwise); a refresh that
-        // omits the id token - which RFC 6749 permits and many providers do - must fall back to the
-        // interactive flow rather than fail later in selectToken()
-        boolean hasRequiredToken = groupsInToken
+        // only treat the refresh as a success if a clean 2xx response (no OAuth error) returned the token
+        // getToken() actually serves (the id token when groups are encoded in it, the access token
+        // otherwise). A refresh that omits the id token - which RFC 6749 permits and many providers do -
+        // or one that carries an error or arrives under a non-2xx status must fall back to the interactive
+        // flow rather than be cached (and later fail in selectToken())
+        boolean hasRequiredToken = (groupsInToken
                 ? tokenParser.idToken.length() > 0
-                : tokenParser.accessToken.length() > 0;
+                : tokenParser.accessToken.length() > 0)
+                && isHttpStatusSuccess()
+                && tokenParser.error.length() == 0;
         if (hasRequiredToken) {
             storeTokens(tokenParser);
             return true;
