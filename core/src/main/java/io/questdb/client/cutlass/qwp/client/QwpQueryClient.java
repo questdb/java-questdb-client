@@ -594,9 +594,19 @@ public class QwpQueryClient implements QuietCloseable {
                 case "initial_connect_retry":
                 case "max_background_drainers":
                 case "max_buf_size":
-                case "max_datagram_size":
                 case "max_name_len":
-                case "multicast_ttl":
+                // connect-string.md "Error handling": the on_*_error keys select
+                // the per-category error policy. The spec reserves them and
+                // directs new client implementations to accept them in the
+                // connect string. The Java client does not wire them to a policy
+                // yet, so the egress parser consumes them as an accepted no-op
+                // rather than rejecting them.
+                case "on_internal_error":
+                case "on_parse_error":
+                case "on_schema_error":
+                case "on_security_error":
+                case "on_server_error":
+                case "on_write_error":
                 case "pass":
                 case "reconnect_initial_backoff_millis":
                 case "reconnect_max_backoff_millis":

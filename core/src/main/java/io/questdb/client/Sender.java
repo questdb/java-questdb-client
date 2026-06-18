@@ -3262,10 +3262,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "reconnect_max_backoff_millis");
                     reconnectMaxBackoffMillis(parseLongValue(sink, "reconnect_max_backoff_millis"));
                 } else if (Chars.equals("max_datagram_size", sink)) {
+                    if (protocol == PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("max_datagram_size is not supported for WebSocket transport; it applies to the UDP transport only");
+                    }
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");
                     int mds = parseIntValue(sink, "max_datagram_size");
                     maxDatagramSize(mds);
                 } else if (Chars.equals("multicast_ttl", sink)) {
+                    if (protocol == PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("multicast_ttl is not supported for WebSocket transport; it applies to the UDP transport only");
+                    }
                     pos = getValue(configurationString, pos, sink, "multicast_ttl");
                     int ttl = parseIntValue(sink, "multicast_ttl");
                     multicastTtl(ttl);
@@ -3297,6 +3303,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // genuine value-parse error names the offending key.
                     String egressKey = Chars.toString(sink);
                     pos = getValue(configurationString, pos, sink, egressKey);
+                } else if (Chars.equals("on_internal_error", sink)
+                        || Chars.equals("on_parse_error", sink)
+                        || Chars.equals("on_schema_error", sink)
+                        || Chars.equals("on_security_error", sink)
+                        || Chars.equals("on_server_error", sink)
+                        || Chars.equals("on_write_error", sink)) {
+                    // connect-string.md "Error handling": the on_*_error keys select
+                    // the per-category error policy. The spec reserves them and
+                    // directs new client implementations to accept them in the
+                    // connect string. The Sender does not wire them to a policy yet,
+                    // so it consumes them as an accepted no-op rather than rejecting
+                    // them. Capture the key name before getValue clears the sink so a
+                    // genuine value-parse error names the offending key.
+                    String reservedKey = Chars.toString(sink);
+                    pos = getValue(configurationString, pos, sink, reservedKey);
                 } else {
                     // sf-client.md §4.6: parser must reject unknown keys.
                     // Forward-compat is via the spec, not silent ignore — silent

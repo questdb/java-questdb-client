@@ -643,9 +643,7 @@ public class QwpQueryClientFromConfigTest {
                 "initial_connect_retry=on",
                 "max_background_drainers=4",
                 "max_buf_size=100m",
-                "max_datagram_size=1400",
                 "max_name_len=127",
-                "multicast_ttl=1",
                 "pass=secret",
                 "reconnect_initial_backoff_millis=100",
                 "reconnect_max_backoff_millis=5000",
@@ -823,6 +821,13 @@ public class QwpQueryClientFromConfigTest {
         // has no "auto" pass-through.
         assertReject("ws::addr=db:9000;protocol_version=auto;",
                 "unknown configuration key: protocol_version");
+        // max_datagram_size and multicast_ttl apply to the UDP transport only;
+        // the QWP ws:: vocabulary does not include them, so the egress parser
+        // rejects them as unknown.
+        assertReject("ws::addr=db:9000;max_datagram_size=1400;",
+                "unknown configuration key: max_datagram_size");
+        assertReject("ws::addr=db:9000;multicast_ttl=4;",
+                "unknown configuration key: multicast_ttl");
     }
 
     @Test
@@ -833,6 +838,30 @@ public class QwpQueryClientFromConfigTest {
     @Test
     public void testPathOverrideAccepted() {
         assertParses("ws::addr=db:9000;path=/custom/read;");
+    }
+
+    @Test
+    public void testReservedErrorPolicyKeysSilentlyAccepted() {
+        // connect-string.md "Error handling": the on_*_error keys are reserved
+        // by the spec, which directs new clients to accept them in the connect
+        // string. The Java client does not wire them to a policy yet, so the
+        // egress parser consumes them as an accepted no-op -- it must not reject
+        // them as unknown keys. Mirror of the Sender (ingress) behavior so one
+        // connect string carrying these keys configures both clients.
+        String[] keys = {
+                "on_internal_error=halt",
+                "on_parse_error=halt",
+                "on_schema_error=drop",
+                "on_security_error=halt",
+                "on_server_error=auto",
+                "on_write_error=drop",
+        };
+        StringBuilder all = new StringBuilder("ws::addr=db:9000;");
+        for (String kv : keys) {
+            assertParses("ws::addr=db:9000;" + kv + ";");
+            all.append(kv).append(';');
+        }
+        assertParses(all.toString());
     }
 
     @Test
