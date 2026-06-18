@@ -66,12 +66,12 @@ public class ServerErrorAckTerminalTest {
 
     @Test
     public void testServerErrorAckIsTerminalAndDoesNotBurnReconnectBudget() throws Exception {
-        int port = TestPorts.findUnusedPort();
         ErrorAckHandler handler = new ErrorAckHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             // Tight reconnect cadence so the pre-fix loop accumulates
             // attempts quickly inside our observation window.
             String cfg = "ws::addr=localhost:" + port
@@ -155,12 +155,12 @@ public class ServerErrorAckTerminalTest {
      */
     @Test
     public void testDropPolicyNackDoesNotHaltAndAdvancesAck() throws Exception {
-        int port = TestPorts.findUnusedPort();
         SchemaMismatchAckHandler handler = new SchemaMismatchAckHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port
                     + ";reconnect_max_duration_millis=10000"
                     + ";reconnect_initial_backoff_millis=10"

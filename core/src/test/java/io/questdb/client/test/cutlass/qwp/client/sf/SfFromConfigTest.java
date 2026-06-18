@@ -27,7 +27,6 @@ package io.questdb.client.test.cutlass.qwp.client.sf;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.Files;
-import io.questdb.client.test.cutlass.qwp.client.TestPorts;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -60,12 +59,12 @@ public class SfFromConfigTest {
     @Test
     public void testFromConfigEnablesSfAndOwnsLog() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
                 try (Sender sender = Sender.fromConfig(config)) {
                     sender.table("foo").longColumn("v", 42L).atNow();
@@ -95,12 +94,12 @@ public class SfFromConfigTest {
     @Test
     public void testSfMaxBytesParsing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String config = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir + ";sf_max_bytes=131072;";
                 try (Sender sender = Sender.fromConfig(config)) {
@@ -123,12 +122,12 @@ public class SfFromConfigTest {
             // Absence of sf_dir is the only way to disable SF — no separate
             // off switch. Verify a basic SF-less sender still works end-to-end
             // and creates no directory.
-            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String config = "ws::addr=localhost:" + port + ";";
                 try (Sender sender = Sender.fromConfig(config)) {
                     sender.table("foo").longColumn("v", 1L).atNow();
@@ -148,12 +147,12 @@ public class SfFromConfigTest {
     @Test
     public void testSfMaxTotalBytesAcceptsLargeValue() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 // 4 GiB > Integer.MAX_VALUE; pre-fix this would throw "invalid sf_max_total_bytes".
                 String config = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir
@@ -225,12 +224,12 @@ public class SfFromConfigTest {
     @Test
     public void testSfMaxBytesAcceptsSizeSuffixes() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 // 64m / 4g should parse identically to their byte-count equivalents.
                 String config = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir
@@ -250,12 +249,12 @@ public class SfFromConfigTest {
         TestUtils.assertMemoryLeak(() -> {
             // sender_id="primary" => slot dir <sfDir>/primary; the engine writes
             // its segments and lock there, leaving sibling slot dirs untouched.
-            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String config = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir + ";sender_id=primary;";
                 try (Sender sender = Sender.fromConfig(config)) {
@@ -277,12 +276,12 @@ public class SfFromConfigTest {
             // share a group root. The second open with a colliding id must
             // refuse to start — silently allowing it would interleave FSN
             // sequences on disk and corrupt recovery.
-            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String config = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir + ";";
                 try (Sender first = Sender.fromConfig(config)) {
@@ -306,12 +305,12 @@ public class SfFromConfigTest {
         TestUtils.assertMemoryLeak(() -> {
             // Two senders against the same group root with distinct sender_id
             // values are independent slots — both must start cleanly.
-            int port = TestPorts.findUnusedPort();
             AckHandler handler = new AckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String cfgA = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir + ";sender_id=a;";
                 String cfgB = "ws::addr=localhost:" + port

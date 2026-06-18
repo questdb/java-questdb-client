@@ -28,7 +28,6 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
-import io.questdb.client.test.cutlass.qwp.client.TestPorts;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -74,14 +73,14 @@ public class OrphanScanIntegrationTest {
             // unacked .sfa files when the sender shuts down. Then the same
             // slot should be reported as an orphan when a second sender opens
             // with sender_id=primary and drain_orphans=true.
-            int port = TestPorts.findUnusedPort();
 
             // Phase 1: ghost writes + closes; never acked.
-            try (TestWebSocketServer ghostServer = new TestWebSocketServer(port, new SilentHandler())) {
+            try (TestWebSocketServer ghostServer = new TestWebSocketServer(new SilentHandler())) {
                 ghostServer.start();
                 Assert.assertTrue(ghostServer.awaitStart(5, TimeUnit.SECONDS));
 
-                String ghostCfg = "ws::addr=localhost:" + port
+                int ghostPort = ghostServer.getPort();
+                String ghostCfg = "ws::addr=localhost:" + ghostPort
                         + ";sf_dir=" + sfDir + ";sender_id=ghost;close_flush_timeout_millis=0;";
                 try (Sender ghost = Sender.fromConfig(ghostCfg)) {
                     ghost.table("foo").longColumn("v", 7L).atNow();
@@ -101,11 +100,12 @@ public class OrphanScanIntegrationTest {
             // can't directly assert the log output in this test, but the
             // call must not throw, and the primary's own slot must NOT
             // appear in a fresh scan (sender_id-filtered).
-            try (TestWebSocketServer primaryServer = new TestWebSocketServer(port + 1000, new AckHandler())) {
+            try (TestWebSocketServer primaryServer = new TestWebSocketServer(new AckHandler())) {
                 primaryServer.start();
                 Assert.assertTrue(primaryServer.awaitStart(5, TimeUnit.SECONDS));
 
-                String primaryCfg = "ws::addr=localhost:" + (port + 1000)
+                int primaryPort = primaryServer.getPort();
+                String primaryCfg = "ws::addr=localhost:" + primaryPort
                         + ";sf_dir=" + sfDir
                         + ";sender_id=primary"
                         + ";drain_orphans=true;";
