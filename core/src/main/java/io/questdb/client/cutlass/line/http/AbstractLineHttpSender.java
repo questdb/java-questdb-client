@@ -764,8 +764,14 @@ public abstract class AbstractLineHttpSender implements Sender {
             r.authBasic(username, password);
         } else if (httpTokenProvider != null) {
             if (pullProviderToken) {
-                // pull a fresh token per request so a long-lived sender follows token refreshes
-                r.authToken(httpTokenProvider.getToken());
+                // pull a fresh token per request so a long-lived sender follows token refreshes; reject a
+                // null/empty/blank return (the HttpTokenProvider contract forbids it) with a clear error
+                // rather than emit a malformed "Authorization: Bearer " header the server only 401s on
+                CharSequence token = httpTokenProvider.getToken();
+                if (Chars.isBlank(token)) {
+                    throw new LineSenderException("token provider returned a null or empty token");
+                }
+                r.authToken(token);
             } else {
                 // do NOT pull the provider token on the construct/flush path: getToken() can throw (a
                 // provider that has not signed in yet, or a failed silent refresh), and pulling it here -

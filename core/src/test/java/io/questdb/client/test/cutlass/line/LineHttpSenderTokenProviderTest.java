@@ -79,6 +79,16 @@ public class LineHttpSenderTokenProviderTest {
     }
 
     @Test
+    public void testNullOrEmptyProviderTokenIsRejected() {
+        // the HttpTokenProvider contract forbids a null or empty token; the sender must reject it with a
+        // clear LineSenderException at first use, rather than silently send a malformed "Authorization:
+        // Bearer " header that the server only answers with a 401 far from the cause
+        assertProviderTokenRejected(() -> null);
+        assertProviderTokenRejected(() -> "");
+        assertProviderTokenRejected(() -> "   ");
+    }
+
+    @Test
     public void testProviderTokenNotPulledAtBuildAndPulledOnFirstRow() {
         AtomicInteger calls = new AtomicInteger();
         HttpTokenProvider provider = () -> {
@@ -99,6 +109,22 @@ public class LineHttpSenderTokenProviderTest {
             // a second row in the same un-flushed batch reuses the same request, so it does not re-pull
             sender.table("t").longColumn("v", 2L).atNow();
             Assert.assertEquals("provider must not be re-queried within the same batch", 1, calls.get());
+        }
+    }
+
+    private static void assertProviderTokenRejected(HttpTokenProvider provider) {
+        try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                .address("127.0.0.1:1")
+                .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                .disableAutoFlush()
+                .httpTokenProvider(provider)
+                .build()) {
+            try {
+                sender.table("t").longColumn("v", 1L).atNow();
+                Assert.fail("expected a null or empty provider token to be rejected");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("null or empty token"));
+            }
         }
     }
 }
