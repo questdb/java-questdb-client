@@ -78,6 +78,82 @@ public class SenderPoolErrorSafetyTest {
                 firstClosed.get());
     }
 
+    // Companion to the catch (RuntimeException) -> track-normal-completion fix in
+    // PooledSender.close(). flush() can exit with an Error (AssertionError under
+    // -ea, OutOfMemoryError, ...) as well as a RuntimeException; the wrapper is
+    // unsafe to recycle either way because Sender does not clear its buffer on a
+    // failed flush and WebSocket transport latches the failure.
+    //
+    // RED  (catch (RuntimeException)): the AssertionError from flush() is not
+    //      caught, broken stays false, the finally runs giveBack() -> the broken
+    //      wrapper is recycled -> the next borrow() hands back the SAME instance.
+    // GREEN (track normal completion): flush() throwing leaves flushed=false ->
+    //      discardBroken() -> the next borrow() builds a fresh wrapper.
+    @Test(timeout = 30_000)
+    public void flushErrorDiscardsBrokenSenderInsteadOfRecycling() throws Exception {
+        IntFunction<Sender> factory = slotIndex -> flushThrowingSender();
+
+        try (SenderPool pool = newPool(CFG, 1, 1, 1_000, factory)) {
+            Sender first = pool.borrow();
+            try {
+                first.close();
+                Assert.fail("close() must propagate the Error thrown by flush()");
+            } catch (AssertionError expected) {
+                // expected: the original throwable propagates naturally
+            }
+
+            Sender second = pool.borrow();
+            try {
+                Assert.assertNotSame(
+                        "a sender whose flush() exited with an Error must be discarded, not recycled",
+                        first, second);
+            } finally {
+                // second's flush() also throws on close(); swallow on teardown.
+                try {
+                    second.close();
+                } catch (AssertionError ignored) {
+                    // expected
+                }
+            }
+        }
+    }
+
+    // Like fakeSender(), but flush() throws an Error to drive the
+    // PooledSender.close() abnormal-exit branch.
+    private static Sender flushThrowingSender() {
+        return (Sender) Proxy.newProxyInstance(
+                Sender.class.getClassLoader(),
+                new Class[]{Sender.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "flush":
+                            throw new AssertionError("injected flush failure");
+                        case "close":
+                            return null;
+                        case "toString":
+                            return "FlushThrowingSender";
+                        case "hashCode":
+                            return System.identityHashCode(proxy);
+                        case "equals":
+                            return proxy == args[0];
+                        default:
+                            Class<?> rt = method.getReturnType();
+                            if (rt == boolean.class) return false;
+                            if (rt == byte.class) return (byte) 0;
+                            if (rt == short.class) return (short) 0;
+                            if (rt == int.class) return 0;
+                            if (rt == long.class) return 0L;
+                            if (rt == float.class) return 0f;
+                            if (rt == double.class) return 0d;
+                            if (rt == char.class) return (char) 0;
+                            if (rt == void.class) return null;
+                            // fluent ArraySender methods return Sender
+                            if (rt.isInstance(proxy)) return proxy;
+                            return null;
+                    }
+                });
+    }
+
     private static Sender fakeSender(AtomicBoolean closedFlag) {
         return (Sender) Proxy.newProxyInstance(
                 Sender.class.getClassLoader(),
