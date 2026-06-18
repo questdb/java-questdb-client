@@ -47,6 +47,7 @@ import io.questdb.client.std.str.StringSink;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Obtains an OIDC access or id token using the OAuth 2.0 Device Authorization Grant
@@ -80,13 +81,15 @@ import java.nio.charset.StandardCharsets;
  *         .build();
  * }</pre>
  * {@link #getToken()} returns a cached token while it is still valid, silently refreshes it
- * when a refresh token is available, and otherwise re-runs the interactive flow. The method
- * is synchronized, so concurrent callers never start two sign-ins at once; the trade-off is
- * that a sign-in waiting for the user holds the instance lock for the lifetime of the device
- * code (up to an hour), and any other {@link #getToken()} or {@link #clearCache()} call on the
- * same instance blocks behind it. To abort a sign-in that is waiting, call {@link #close()}
- * from another thread: it cancels the in-flight flow, which then fails promptly with an
- * {@link OidcAuthException} rather than running to the device-code timeout.
+ * when a refresh token is available, and otherwise re-runs the interactive flow. Calls are
+ * serialized on an instance lock, so concurrent callers never start two sign-ins at once. A
+ * sign-in waiting for the user holds that lock for the lifetime of the device code (up to an
+ * hour), so a concurrent {@link #getToken()} or {@link #clearCache()} call on the same instance
+ * blocks behind it - but {@link #getTokenSilently()} does not: it never waits for an in-flight
+ * sign-in, it fails fast with an {@link OidcAuthException}, so a request/flush path is never
+ * stalled. To abort a sign-in that is waiting, call {@link #close()} from another thread: it
+ * cancels the in-flight flow, which then fails promptly with an {@link OidcAuthException} rather
+ * than running to the device-code timeout.
  * <p>
  * Instances are interactive by design and hold a network connection; close them when done.
  * Token state lives in memory only and does not survive a restart of the process.
@@ -137,6 +140,10 @@ public class OidcDeviceAuth implements QuietCloseable {
     private final StringSink formSink = new StringSink();
     private final boolean groupsInToken;
     private final int httpTimeoutMillis;
+    // serializes getToken()/getTokenSilently()/clearCache()/close(); getToken() holds it for the whole
+    // interactive flow, getTokenSilently() acquires it without blocking (tryLock) so the flush path is
+    // never stalled behind an in-flight sign-in
+    private final ReentrantLock lock = new ReentrantLock();
     private final DeviceCodePrompt prompt;
     private final StringSink responseStatus = new StringSink();
     private final String scope;
@@ -253,12 +260,17 @@ public class OidcDeviceAuth implements QuietCloseable {
     /**
      * Drops any cached token so the next {@link #getToken()} starts a fresh interactive sign-in.
      */
-    public synchronized void clearCache() {
-        throwIfClosed();
-        accessToken = null;
-        idToken = null;
-        refreshToken = null;
-        expiresAtMillis = 0;
+    public void clearCache() {
+        lock.lock();
+        try {
+            throwIfClosed();
+            accessToken = null;
+            idToken = null;
+            refreshToken = null;
+            expiresAtMillis = 0;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**
@@ -269,15 +281,18 @@ public class OidcDeviceAuth implements QuietCloseable {
      */
     @Override
     public void close() {
-        // flag cancellation before taking the lock: getToken() holds the monitor for the whole
-        // interactive flow, so close() signals the in-flight sign-in to stop with a lock-free volatile
-        // write, then acquires the lock - which the now-cancelled flow releases promptly - and frees the
-        // native resources. close() never frees while a flow holds the lock, so there is no use-after-free
+        // flag cancellation before taking the lock: getToken() holds the lock for the whole interactive
+        // flow, so close() signals the in-flight sign-in to stop with a lock-free volatile write, then
+        // acquires the lock - which the now-cancelled flow releases promptly - and frees the native
+        // resources. close() never frees while a flow holds the lock, so there is no use-after-free
         closed = true;
-        synchronized (this) {
+        lock.lock();
+        try {
             plainClient = Misc.free(plainClient);
             tlsClient = Misc.free(tlsClient);
             jsonLexer = Misc.free(jsonLexer);
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -299,50 +314,73 @@ public class OidcDeviceAuth implements QuietCloseable {
      * @throws OidcAuthException if the interactive flow fails, times out, or the identity provider
      *                           does not return the expected token
      */
-    public synchronized String getToken() {
-        throwIfClosed();
-        // only a cached copy of the token getToken() actually serves counts as a cache hit; a grant
-        // that returned the other kind (an access token when the server wants the id token, or vice
-        // versa) leaves the served token null, so the flow must re-run rather than report the unusable
-        // grant as valid and have selectToken() throw on this and every later call
-        final String cachedToken = groupsInToken ? idToken : accessToken;
-        if (cachedToken != null) {
-            if (System.currentTimeMillis() < expiresAtMillis - clockSkewMillis) {
-                return cachedToken;
+    public String getToken() {
+        lock.lock();
+        try {
+            throwIfClosed();
+            // only a cached copy of the token getToken() actually serves counts as a cache hit; a grant
+            // that returned the other kind (an access token when the server wants the id token, or vice
+            // versa) leaves the served token null, so the flow must re-run rather than report the unusable
+            // grant as valid and have selectToken() throw on this and every later call
+            final String cachedToken = groupsInToken ? idToken : accessToken;
+            if (cachedToken != null) {
+                if (System.currentTimeMillis() < expiresAtMillis - clockSkewMillis) {
+                    return cachedToken;
+                }
+                if (refreshToken != null && tryRefresh()) {
+                    return selectToken();
+                }
             }
-            if (refreshToken != null && tryRefresh()) {
-                return selectToken();
-            }
+            runDeviceFlow();
+            return selectToken();
+        } finally {
+            lock.unlock();
         }
-        runDeviceFlow();
-        return selectToken();
     }
 
     /**
-     * Returns a valid token like {@link #getToken()} but never starts the interactive device flow:
-     * it returns the cached token while it is valid and silently refreshes it when a refresh token is
-     * available, otherwise it throws. Intended as a per-request token source for a long-lived client,
-     * for example {@code Sender.builder(...).httpTokenProvider(auth::getTokenSilently)}, where an
-     * interactive prompt on the request path would be inappropriate. Call {@link #getToken()} once to
-     * sign in before handing this method to a client.
+     * Returns a valid token like {@link #getToken()} but never starts the interactive device flow and
+     * never blocks: it returns the cached token while it is valid and silently refreshes it when a
+     * refresh token is available, otherwise it throws. Designed for the request/flush path of a
+     * long-lived client, for example {@code Sender.builder(...).httpTokenProvider(auth::getTokenSilently)},
+     * where an interactive prompt would be inappropriate and a stalled flush unacceptable. Call
+     * {@link #getToken()} once to sign in before handing this method to a client.
+     * <p>
+     * To keep the flush path responsive it returns promptly or throws promptly - it never waits for an
+     * interactive {@link #getToken()} in progress on another thread (which would otherwise stall the
+     * flush for the whole device-code lifetime). While such a sign-in runs there is no token to return
+     * anyway, so this method throws and the caller should retry once the sign-in completes.
      *
      * @return a non-null, non-empty token
-     * @throws OidcAuthException if no token has been obtained yet, or the cached token expired and
-     *                           could not be refreshed without an interactive sign-in
+     * @throws OidcAuthException if no token has been obtained yet, if the cached token expired and could
+     *                           not be refreshed without an interactive sign-in, or if a sign-in or
+     *                           refresh is already in progress on another thread
      */
-    public synchronized String getTokenSilently() {
+    public String getTokenSilently() {
         throwIfClosed();
-        final String cachedToken = groupsInToken ? idToken : accessToken;
-        if (cachedToken != null) {
-            if (System.currentTimeMillis() < expiresAtMillis - clockSkewMillis) {
-                return cachedToken;
-            }
-            if (refreshToken != null && tryRefresh()) {
-                return selectToken();
-            }
-            throw new OidcAuthException("the cached token expired and could not be refreshed without an interactive sign-in; call getToken() to sign in again");
+        // never wait on the flush path: getToken()'s interactive sign-in holds the lock for the whole
+        // device-code lifetime (up to an hour), so acquire it without blocking and fail fast if it is
+        // held. A sign-in in progress means there is no token to serve yet, so the caller gets a prompt
+        // exception to retry rather than a stalled flush
+        if (!lock.tryLock()) {
+            throw new OidcAuthException("a sign-in or token refresh is already in progress on another thread; no token is available without blocking - retry shortly");
         }
-        throw new OidcAuthException("no token has been obtained yet; call getToken() to sign in before using getTokenSilently()");
+        try {
+            throwIfClosed();
+            final String cachedToken = groupsInToken ? idToken : accessToken;
+            if (cachedToken != null) {
+                if (System.currentTimeMillis() < expiresAtMillis - clockSkewMillis) {
+                    return cachedToken;
+                }
+                if (refreshToken != null && tryRefresh()) {
+                    return selectToken();
+                }
+                throw new OidcAuthException("the cached token expired and could not be refreshed without an interactive sign-in; call getToken() to sign in again");
+            }
+            throw new OidcAuthException("no token has been obtained yet; call getToken() to sign in before using getTokenSilently()");
+        } finally {
+            lock.unlock();
+        }
     }
 
     private static String appendSettingsPath(String basePath) {

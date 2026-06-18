@@ -815,6 +815,54 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testGetTokenSilentlyDoesNotBlockBehindInteractiveSignIn() throws Exception {
+        assertMemoryLeak(() -> {
+            // an interactive getToken() is parked polling (authorization_pending), holding the instance
+            // lock for the whole device-code lifetime. A flush-path getTokenSilently() on another thread
+            // must NOT block behind it - it must fail fast, so a Sender flush is never stalled by a
+            // concurrent sign-in. (With the old synchronized model it blocked until the code expired.)
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 10));
+                }
+                return MockOidcServer.json(400, "{\"error\":\"authorization_pending\"}");
+            };
+            CountDownLatch polling = new CountDownLatch(1);
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, challenge -> polling.countDown())) {
+                Thread signIn = new Thread(() -> {
+                    try {
+                        auth.getToken();
+                    } catch (Throwable ignore) {
+                        // expected: cancelled by close() at the end of the test
+                    }
+                }, "oidc-sign-in");
+                signIn.setDaemon(true);
+                signIn.start();
+                try {
+                    // wait until the interactive flow has prompted and is polling (it holds the lock now)
+                    Assert.assertTrue("the sign-in did not reach the polling stage", polling.await(10, TimeUnit.SECONDS));
+                    // getTokenSilently() must return control promptly (here: throw), NOT block ~10s until
+                    // the device code expires and getToken() releases the lock
+                    long startNanos = System.nanoTime();
+                    try {
+                        auth.getTokenSilently();
+                        Assert.fail("expected getTokenSilently() to fail fast while a sign-in is in progress");
+                    } catch (OidcAuthException e) {
+                        long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                        Assert.assertTrue("getTokenSilently() blocked " + elapsedMillis + "ms behind the in-flight sign-in",
+                                elapsedMillis < 2_000);
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("in progress"));
+                    }
+                } finally {
+                    auth.close();        // cancel the in-flight sign-in
+                    signIn.join(10_000); // let the daemon thread unwind before the leak check
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testGetTokenSilentlyRefreshesWithoutPrompting() throws Exception {
         assertMemoryLeak(() -> {
             // getTokenSilently() returns the cached token, silently refreshes it when it expires, and never
