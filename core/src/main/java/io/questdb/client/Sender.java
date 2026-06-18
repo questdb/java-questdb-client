@@ -1478,7 +1478,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 } else {
                     if (!Files.exists(sfDir)) {
                         int rc = Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT);
-                        if (rc != 0) {
+                        // mkdir is non-zero on failure, but "already exists"
+                        // is one such failure. Multiple SF senders sharing one
+                        // sf_dir can be built concurrently (the pool calls
+                        // build() outside its lock), so two threads can both
+                        // pass the exists() check and race into mkdir; the
+                        // loser gets EEXIST. Treat a benign creation race --
+                        // the dir now exists -- as success and only fail when
+                        // the directory is genuinely absent afterwards.
+                        if (rc != 0 && !Files.exists(sfDir)) {
                             throw new LineSenderException(
                                     "could not create sf_dir: " + sfDir + " rc=" + rc);
                         }

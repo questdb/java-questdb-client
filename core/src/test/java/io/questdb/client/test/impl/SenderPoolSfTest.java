@@ -24,6 +24,10 @@
 
 package io.questdb.client.test.impl;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
@@ -36,6 +40,7 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -46,6 +51,7 @@ import java.nio.file.Paths;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -487,6 +493,71 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testLeakedSlotIsObservable() throws Exception {
+        // M1 (observability): when a delegate's close() returns with the SF
+        // flock still held, the pool retires the slot forever and silently
+        // shrinks capacity. SenderPool has no logger today, so a pool that
+        // bleeds capacity this way degrades to "every borrow() times out"
+        // with nothing in the logs to explain why. Pin the contract: the
+        // leakedSlots++ path MUST emit a WARN (or louder) that names the
+        // retired slot. This test is RED until that log line is added.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Capture everything SenderPool logs (logback is the SLF4J
+                // binding on the test classpath).
+                Logger poolLogger = (Logger) LoggerFactory.getLogger(SenderPool.class);
+                ListAppender<ILoggingEvent> appender = new ListAppender<>();
+                appender.start();
+                Level savedLevel = poolLogger.getLevel();
+                poolLogger.setLevel(Level.ALL);
+                poolLogger.addAppender(appender);
+                try {
+                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                    try (SenderPool pool = new SenderPool(config, 1, 2, 500, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                        PooledSender a = pool.borrow();
+
+                        // Forge the exact leak symptom: close() returned with
+                        // the flock still held (I/O thread refused to stop).
+                        // Tear the delegate down for real first so the test
+                        // leaks no native resources; close() is idempotent so
+                        // discardBroken's re-close leaves the forged flag set.
+                        Sender delegate = getDelegate(a);
+                        delegate.close();
+                        setBooleanField(delegate, "slotLockReleased", false);
+                        invokeDiscardBroken(pool, a);
+
+                        // Sanity: the slot really was retired as leaked.
+                        Assert.assertEquals("precondition: one slot must leak",
+                                1, getIntField(pool, "leakedSlots"));
+                        // The leak must be observable via public API (metric).
+                        Assert.assertEquals("leaked slot must be observable via leakedSlotCount()",
+                                1, pool.leakedSlotCount());
+
+                        // Contract under test: the leak must be observable.
+                        boolean warned = appender.list.stream().anyMatch(e ->
+                                e.getLevel().isGreaterOrEqual(Level.WARN)
+                                        && e.getFormattedMessage().toLowerCase().contains("slot"));
+                        Assert.assertTrue(
+                                "leakedSlots++ must emit a WARN naming the retired slot, "
+                                        + "otherwise capacity loss is invisible; captured events="
+                                        + appender.list,
+                                warned);
+                    }
+                } finally {
+                    poolLogger.detachAppender(appender);
+                    poolLogger.setLevel(savedLevel);
+                    appender.stop();
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Recovery: stable slot ids let a re-created pool re-adopt unacked data.
     // ----------------------------------------------------------------------
@@ -593,6 +664,69 @@ public class SenderPoolSfTest {
                     Assert.assertTrue("available <= total",
                             pool.availableSize() <= pool.totalSize());
                     Assert.assertTrue("no slot dir beyond max created", countSlotDirs() <= 4);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testConcurrentFirstBorrowsWithMinZeroRaceOnSfDir() throws Exception {
+        // C2 regression: senderPoolMin(0) means no single-threaded pre-warm,
+        // so the shared parent sf_dir is NOT created at construction (the
+        // constructor probe only parses the config). The first concurrent
+        // borrows then race into build() -> Files.mkdir(sfDir) outside the
+        // pool lock. Pre-fix, the mkdir loser got a non-zero rc (EEXIST) and
+        // its borrow() threw "could not create sf_dir" on a perfectly healthy
+        // pool. Post-fix, a benign creation race is treated as success.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // minSize=0 -> no pre-warm -> sf_dir absent until first borrow.
+                try (SenderPool pool = new SenderPool(config, 0, 4, 10_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    Assert.assertFalse("sf_dir must not exist before the first borrow",
+                            Files.exists(sfDir));
+
+                    final int threads = 4;
+                    final CyclicBarrier barrier = new CyclicBarrier(threads);
+                    final CountDownLatch done = new CountDownLatch(threads);
+                    final AtomicReference<Throwable> failure = new AtomicReference<>();
+                    final PooledSender[] borrowed = new PooledSender[threads];
+                    for (int t = 0; t < threads; t++) {
+                        final int id = t;
+                        Thread worker = new Thread(() -> {
+                            try {
+                                // Align all first borrows so they race into the
+                                // shared parent mkdir simultaneously.
+                                barrier.await();
+                                borrowed[id] = pool.borrow();
+                            } catch (Throwable e) {
+                                failure.compareAndSet(null, e);
+                            } finally {
+                                done.countDown();
+                            }
+                        });
+                        worker.start();
+                    }
+                    Assert.assertTrue("workers must finish", done.await(30, TimeUnit.SECONDS));
+                    try {
+                        if (failure.get() != null) {
+                            throw new AssertionError(
+                                    "concurrent first borrows must not race on sf_dir", failure.get());
+                        }
+                        Assert.assertEquals(threads, pool.totalSize());
+                        Assert.assertEquals("one slot dir per borrow", threads, countSlotDirs());
+                    } finally {
+                        for (PooledSender s : borrowed) {
+                            if (s != null) {
+                                s.close();
+                            }
+                        }
+                    }
                 }
             }
         });

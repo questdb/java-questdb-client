@@ -27,6 +27,8 @@ package io.questdb.client.impl;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -71,6 +73,7 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class SenderPool implements AutoCloseable {
 
+    private static final Logger LOG = LoggerFactory.getLogger(SenderPool.class);
     private final long acquireTimeoutMillis;
     private final ArrayList<PooledSender> all;
     private final ArrayDeque<PooledSender> available;
@@ -189,7 +192,18 @@ public final class SenderPool implements AutoCloseable {
                     PooledSender created;
                     try {
                         created = createUnlocked(slotIndex);
-                    } catch (RuntimeException e) {
+                    } catch (Throwable e) {
+                        // Catch Throwable, not just RuntimeException:
+                        // createUnlocked() runs a heavy native build path
+                        // (mmap, flock, WebSocket connect) that can throw an
+                        // Error -- e.g. an -ea AssertionError or
+                        // OutOfMemoryError. If we only caught RuntimeException
+                        // the Error would propagate with inFlightCreations
+                        // still incremented and the SF slot index still
+                        // reserved (slotInUse[idx] stuck true), permanently
+                        // lowering pool capacity. The cleanup below is
+                        // idempotent, so undoing the reservation for any
+                        // throwable is safe.
                         lock.lock();
                         inFlightCreations--;
                         freeSlotIndex(slotIndex);
@@ -358,6 +372,9 @@ public final class SenderPool implements AutoCloseable {
                         // reuses the still-locked dir.
                         closingSlots--;
                         leakedSlots++;
+                        LOG.warn("SF slot {} retired permanently: delegate close() returned with the flock still held " +
+                                        "(I/O thread refused to stop); pool capacity reduced by 1, now {} of {} usable [leakedSlots={}]",
+                                s.slotIndex(), maxSize - leakedSlots, maxSize, leakedSlots);
                     }
                 } finally {
                     lock.unlock();
@@ -463,6 +480,10 @@ public final class SenderPool implements AutoCloseable {
                             } else {
                                 closingSlots--;
                                 leakedSlots++;
+                                LOG.warn("SF slot {} retired permanently during idle reaping: delegate close() returned " +
+                                                "with the flock still held (I/O thread refused to stop); pool capacity reduced by 1, " +
+                                                "now {} of {} usable [leakedSlots={}]",
+                                        s.slotIndex(), maxSize - leakedSlots, maxSize, leakedSlots);
                             }
                         }
                     }
@@ -489,6 +510,23 @@ public final class SenderPool implements AutoCloseable {
         lock.lock();
         try {
             return all.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Snapshot of the number of SF slots permanently retired because a
+     * delegate {@code close()} returned with the slot flock still held (the
+     * I/O thread refused to stop). Each leaked slot permanently lowers the
+     * pool's effective capacity ({@code maxSize - leakedSlotCount()}). A
+     * non-zero, growing value explains a pool that has started timing out
+     * every {@code borrow()}. For metrics and tests.
+     */
+    public int leakedSlotCount() {
+        lock.lock();
+        try {
+            return leakedSlots;
         } finally {
             lock.unlock();
         }
