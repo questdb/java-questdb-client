@@ -132,6 +132,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final int POLL_TRANSIENT_ERROR = 3;
     private static final int SLOW_DOWN_INCREMENT_SECONDS = 5;
     private static final String USER_AGENT = "questdb/java-client-oidc";
+    private static final String WELL_KNOWN_OPENID_CONFIGURATION_PATH = "/.well-known/openid-configuration";
     private final String audience;
     private final String clientId;
     private final long clockSkewMillis;
@@ -191,16 +192,16 @@ public class OidcDeviceAuth implements QuietCloseable {
      * identity provider and harvest the user's authorization. Only call {@code fromQuestDB} against a
      * server you trust, reached over {@code https} (required by default; relaxing it with
      * {@link Builder#allowInsecureTransport(boolean)} removes the transport protection). When the
-     * server is not trusted, configure the identity provider explicitly with {@link #builder()}
-     * rather than discovering it.
+     * server is not trusted, configure the identity provider explicitly with {@link #builder()},
+     * or pin it with {@link #fromQuestDB(String, String)}.
      *
      * @param questdbUrl the QuestDB HTTP base URL, for example {@code https://questdb.example.com:9000}
      * @return a configured, ready-to-use instance
      * @throws OidcAuthException if the server has OIDC disabled, or does not advertise a device
-     *                           authorization endpoint (an older server, or one not configured for it)
+     *                           authorization endpoint and no issuer was pinned to discover it
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl) {
-        return fromQuestDB(questdbUrl, defaultTlsConfig(), false);
+        return fromQuestDB(questdbUrl, null, null, defaultTlsConfig(), false);
     }
 
     /**
@@ -209,15 +210,42 @@ public class OidcDeviceAuth implements QuietCloseable {
      * {@link Builder#allowInsecureTransport(boolean)}). Intended for local development only.
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl, boolean allowInsecureTransport) {
-        return fromQuestDB(questdbUrl, defaultTlsConfig(), allowInsecureTransport);
+        return fromQuestDB(questdbUrl, null, null, defaultTlsConfig(), allowInsecureTransport);
     }
 
     /**
-     * Same as {@link #fromQuestDB(String)} but with an explicit TLS configuration, used both for
-     * the discovery request and for the later identity provider requests.
+     * Same as {@link #fromQuestDB(String)} but pins the identity provider by its {@code issuer} origin
+     * (for example {@code https://idp.example.com}). The issuer serves two roles:
+     * <ul>
+     *     <li>when the server does not advertise the device authorization endpoint (today's servers,
+     *     and older ones), it is discovered from the issuer's {@code .well-known/openid-configuration}
+     *     document; the discovery origin is taken only from this out-of-band issuer, never from a value
+     *     the server's {@code /settings} supplied, so a tampered {@code /settings} cannot choose where
+     *     the credentials are sent;</li>
+     *     <li>it pins the token and device authorization endpoints: either endpoint that does not belong
+     *     to the issuer origin is rejected, so a compromised-but-TLS-valid server cannot redirect the
+     *     sign-in to an attacker.</li>
+     * </ul>
+     */
+    public static OidcDeviceAuth fromQuestDB(String questdbUrl, String issuer) {
+        return fromQuestDB(questdbUrl, issuer, null, defaultTlsConfig(), false);
+    }
+
+    /**
+     * Same as {@link #fromQuestDB(String, String)} but lets the caller permit insecure {@code http}
+     * transport for the QuestDB server and the discovered identity provider endpoints (see
+     * {@link Builder#allowInsecureTransport(boolean)}). Intended for local development only.
+     */
+    public static OidcDeviceAuth fromQuestDB(String questdbUrl, String issuer, boolean allowInsecureTransport) {
+        return fromQuestDB(questdbUrl, issuer, null, defaultTlsConfig(), allowInsecureTransport);
+    }
+
+    /**
+     * Same as {@link #fromQuestDB(String)} but with an explicit TLS configuration, used for the
+     * discovery request, any identity provider discovery document, and the later sign-in requests.
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl, ClientTlsConfiguration tlsConfig) {
-        return fromQuestDB(questdbUrl, tlsConfig, false);
+        return fromQuestDB(questdbUrl, null, null, tlsConfig, false);
     }
 
     /**
@@ -226,6 +254,23 @@ public class OidcDeviceAuth implements QuietCloseable {
      * (see {@link Builder#allowInsecureTransport(boolean)}). Intended for local development only.
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport) {
+        return fromQuestDB(questdbUrl, null, null, tlsConfig, allowInsecureTransport);
+    }
+
+    /**
+     * Same as {@link #fromQuestDB(String, String)} but lets the caller supply the identity provider
+     * discovery document URL directly (an alternative to {@code issuer}, which otherwise derives it as
+     * {@code {issuer}/.well-known/openid-configuration}) and an explicit TLS configuration. Either an
+     * {@code issuer} or a {@code discoveryUrl} pins the identity provider; pass both {@code null} to
+     * trust the endpoints the server advertises.
+     *
+     * @param questdbUrl             the QuestDB HTTP base URL
+     * @param issuer                 the identity provider origin to pin, or {@code null}
+     * @param discoveryUrl           the identity provider discovery document URL to pin, or {@code null}
+     * @param tlsConfig              the TLS configuration for the discovery and sign-in requests
+     * @param allowInsecureTransport permits insecure {@code http} for the server and identity provider
+     */
+    public static OidcDeviceAuth fromQuestDB(String questdbUrl, String issuer, String discoveryUrl, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport) {
         Endpoint server = Endpoint.parse(questdbUrl);
         if (!allowInsecureTransport) {
             requireSecureTransport(server.isTls, "QuestDB server url", questdbUrl);
@@ -238,20 +283,75 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (parser.clientId.length() == 0) {
             throw new OidcAuthException().put("the QuestDB server does not advertise an OIDC client id [url=").put(questdbUrl).put(']');
         }
-        if (parser.tokenEndpoint.length() == 0) {
-            throw new OidcAuthException().put("the QuestDB server does not advertise an OIDC token endpoint [url=").put(questdbUrl).put(']');
-        }
-        if (parser.deviceAuthorizationEndpoint.length() == 0) {
+        String tokenEndpoint = parser.tokenEndpoint.length() > 0 ? parser.tokenEndpoint.toString() : null;
+        String deviceAuthorizationEndpoint = parser.deviceAuthorizationEndpoint.length() > 0 ? parser.deviceAuthorizationEndpoint.toString() : null;
+        String resolvedIssuer = issuer != null && !issuer.isEmpty() ? issuer : null;
+        String pinnedDiscoveryUrl = discoveryUrl != null && !discoveryUrl.isEmpty() ? discoveryUrl : null;
+
+        // When the QuestDB /settings channel is a plaintext, MITM-able http connection (only reachable
+        // with allowInsecureTransport; the default rejects it), the endpoints it advertises could be
+        // tampered in transit to route the device code and long-lived refresh token to an attacker. The
+        // missing-endpoint discovery path below already demands an out-of-band pin, but a tampered
+        // /settings that advertises BOTH endpoints at one attacker origin skips that path - the
+        // co-location check passes trivially and there is no issuer to pin against - so require the same
+        // pin before trusting /settings-supplied endpoints over such a channel.
+        boolean settingsSuppliedCredentials = tokenEndpoint != null || deviceAuthorizationEndpoint != null;
+        if (settingsSuppliedCredentials && resolvedIssuer == null && pinnedDiscoveryUrl == null && settingsChannelIsPlaintext(server)) {
             throw new OidcAuthException()
-                    .put("the QuestDB server does not advertise a device authorization endpoint; upgrade the server ")
-                    .put("or configure the endpoint explicitly with OidcDeviceAuth.builder() [url=").put(questdbUrl).put(']');
+                    .put("the QuestDB server was reached over insecure http, so its /settings response - and the OIDC ")
+                    .put("endpoints it advertises - can be tampered in transit and used to redirect the device-code and ")
+                    .put("refresh-token requests to an attacker; pin the identity provider with an issuer (its origin, for ")
+                    .put("example https://your-idp), configure the endpoints explicitly with OidcDeviceAuth.builder(), or ")
+                    .put("connect to QuestDB over https [url=").put(questdbUrl).put(']');
+        }
+
+        // Fall back to identity provider discovery when the server does not advertise the device
+        // authorization endpoint (and/or the token endpoint). This contacts the identity provider, whose
+        // origin must be pinned out of band: the discovery target is never derived from a value the
+        // server supplied, otherwise a tampered or intercepted /settings could steer discovery - and so
+        // the credential POSTs - to an attacker, with the co-location and issuer checks passing trivially.
+        if (deviceAuthorizationEndpoint == null || tokenEndpoint == null) {
+            if (resolvedIssuer == null && pinnedDiscoveryUrl == null) {
+                throw new OidcAuthException()
+                        .put("the QuestDB server did not advertise the OIDC device authorization endpoint (and/or the token ")
+                        .put("endpoint), so it must be discovered from the identity provider, but the identity provider is not ")
+                        .put("pinned; pass an issuer (its origin, for example https://your-idp) to OidcDeviceAuth.fromQuestDB so ")
+                        .put("a tampered or intercepted /settings response cannot redirect the device-code and refresh-token ")
+                        .put("requests to an attacker, or configure the endpoints explicitly with OidcDeviceAuth.builder() [url=")
+                        .put(questdbUrl).put(']');
+            }
+            WellKnownDiscoveryParser doc = new WellKnownDiscoveryParser();
+            discoverFromIdp(resolvedIssuer, pinnedDiscoveryUrl, tlsConfig, allowInsecureTransport, doc);
+            if (deviceAuthorizationEndpoint == null && doc.deviceAuthorizationEndpoint.length() > 0) {
+                deviceAuthorizationEndpoint = doc.deviceAuthorizationEndpoint.toString();
+            }
+            if (tokenEndpoint == null && doc.tokenEndpoint.length() > 0) {
+                tokenEndpoint = doc.tokenEndpoint.toString();
+            }
+            // adopt the issuer the discovery document declares, so the endpoint pin below binds to it
+            if (resolvedIssuer == null && doc.issuer.length() > 0) {
+                resolvedIssuer = doc.issuer.toString();
+            }
+        }
+
+        if (tokenEndpoint == null) {
+            throw new OidcAuthException()
+                    .put("could not resolve the OIDC token endpoint from the QuestDB /settings response or the identity ")
+                    .put("provider discovery document; configure it explicitly with OidcDeviceAuth.builder() [url=").put(questdbUrl).put(']');
+        }
+        if (deviceAuthorizationEndpoint == null) {
+            throw new OidcAuthException()
+                    .put("could not resolve the device authorization endpoint; the identity provider discovery document did ")
+                    .put("not advertise \"device_authorization_endpoint\". Ensure the identity provider supports the device ")
+                    .put("grant, or configure the endpoint explicitly with OidcDeviceAuth.builder() [url=").put(questdbUrl).put(']');
         }
         return builder()
                 .clientId(parser.clientId.toString())
-                .deviceAuthorizationEndpoint(parser.deviceAuthorizationEndpoint.toString())
-                .tokenEndpoint(parser.tokenEndpoint.toString())
+                .deviceAuthorizationEndpoint(deviceAuthorizationEndpoint)
+                .tokenEndpoint(tokenEndpoint)
                 .scope(parser.scope.length() > 0 ? parser.scope.toString() : DEFAULT_SCOPE)
                 .groupsInToken(parser.groupsInToken)
+                .issuer(resolvedIssuer)
                 .allowInsecureTransport(allowInsecureTransport)
                 .tlsConfig(tlsConfig)
                 .build();
@@ -427,31 +527,88 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private static void discoverFromIdp(String issuer, String discoveryUrl, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport, WellKnownDiscoveryParser parser) {
+        // the discovery document URL is pinned out of band (a caller-supplied discoveryUrl, else built
+        // from the issuer) - the caller guarantees one of the two is non-null - so the server cannot
+        // choose where discovery, and the credential POSTs it resolves, are aimed
+        String url = discoveryUrl != null ? discoveryUrl : wellKnownUrl(issuer);
+        Endpoint endpoint = Endpoint.parse(url);
+        if (!allowInsecureTransport) {
+            requireSecureTransport(endpoint.isTls, "OIDC issuer / discovery url", url);
+        }
+        fetchJson(endpoint, endpoint.path, tlsConfig, parser,
+                "could not reach the identity provider to discover OIDC settings",
+                "could not parse the identity provider discovery document");
+    }
+
     private static void discoverSettings(Endpoint server, ClientTlsConfiguration tlsConfig, SettingsDiscoveryParser parser) {
-        HttpClient client = server.isTls
+        fetchJson(server, appendSettingsPath(server.path), tlsConfig, parser,
+                "could not reach the QuestDB server to discover OIDC settings",
+                "could not parse the QuestDB /settings response");
+    }
+
+    private static void fetchJson(Endpoint endpoint, String path, ClientTlsConfiguration tlsConfig, JsonParser parser, String reachError, String parseError) {
+        HttpClient client = endpoint.isTls
                 ? HttpClientFactory.newTlsInstance(HTTP_CONFIG, tlsConfig)
                 : HttpClientFactory.newPlainTextInstance(HTTP_CONFIG);
         JsonLexer lexer = new JsonLexer(JSON_LEXER_CACHE_SIZE, JSON_LEXER_MAX_VALUE_BYTES);
         try {
-            HttpClient.Request request = client.newRequest(server.host, server.port)
+            HttpClient.Request request = client.newRequest(endpoint.host, endpoint.port)
                     .GET()
-                    .url(appendSettingsPath(server.path))
+                    .url(path)
                     .header("Accept", "application/json")
                     .header("User-Agent", USER_AGENT);
             HttpClient.ResponseHeaders response = request.send(DEFAULT_HTTP_TIMEOUT_MILLIS);
             response.await(DEFAULT_HTTP_TIMEOUT_MILLIS);
             Response body = response.getResponse();
             // bounded read: parseBody enforces a wall-clock deadline and a byte cap so an untrusted
-            // server cannot wedge discovery, and its parseLast rejects a truncated /settings document
+            // server cannot wedge discovery, and its parseLast rejects a truncated document
             parseBody(body, lexer, parser, DEFAULT_HTTP_TIMEOUT_MILLIS);
         } catch (HttpClientException e) {
-            throw new OidcAuthException(e).put("could not reach the QuestDB server to discover OIDC settings");
+            throw new OidcAuthException(e).put(reachError);
         } catch (JsonException e) {
-            throw new OidcAuthException(e).put("could not parse the QuestDB /settings response");
+            throw new OidcAuthException(e).put(parseError);
         } finally {
             Misc.free(lexer);
             Misc.free(client);
         }
+    }
+
+    private static boolean isDottedIpv4(String host) {
+        // validate a dotted IPv4 literal (four 0-255 octets) without a DNS lookup, so a hostname that
+        // merely starts with "127." is not mistaken for the loopback block
+        int octets = 1;
+        int value = 0;
+        int digits = 0;
+        for (int i = 0, n = host.length(); i < n; i++) {
+            char c = host.charAt(i);
+            if (c == '.') {
+                if (digits == 0 || value > 255) {
+                    return false;
+                }
+                octets++;
+                value = 0;
+                digits = 0;
+            } else if (c >= '0' && c <= '9') {
+                value = value * 10 + (c - '0');
+                if (++digits > 3) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        return octets == 4 && digits > 0 && value <= 255;
+    }
+
+    private static boolean isLoopbackHost(String host) {
+        // traffic to a loopback target never leaves the host, so a plaintext /settings fetch to it carries
+        // no network interception risk; match localhost and the whole IPv4 127.0.0.0/8 block
+        return host != null && (host.equalsIgnoreCase("localhost") || (host.startsWith("127.") && isDottedIpv4(host)));
+    }
+
+    private static String originOf(Endpoint endpoint) {
+        return (endpoint.isTls ? "https://" : "http://") + endpoint.host + ':' + endpoint.port;
     }
 
     private static void parseBody(Response body, JsonLexer lexer, JsonParser parser, int timeoutMillis) throws JsonException {
@@ -503,6 +660,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private static boolean sameOrigin(Endpoint a, Endpoint b) {
+        // scheme (captured by isTls), host and port - the security origin; the path is deliberately not
+        // compared, the token and device endpoints legitimately differ in path on one authorization server
+        return a.isTls == b.isTls && a.port == b.port && a.host.equalsIgnoreCase(b.host);
+    }
+
     private static String sanitizeForDisplay(String value) {
         if (value == null) {
             return null;
@@ -539,8 +702,52 @@ public class OidcDeviceAuth implements QuietCloseable {
         return sink.toString();
     }
 
+    private static boolean settingsChannelIsPlaintext(Endpoint server) {
+        // /settings reached over plaintext http to a non-loopback host is MITM-able (only possible when
+        // allowInsecureTransport is set; the default rejects it), so the endpoints it advertises must not
+        // be trusted to route credentials without an out-of-band pin
+        return !server.isTls && !isLoopbackHost(server.host);
+    }
+
     private static String urlEncode(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    private static void validateEndpointOrigins(Endpoint tokenEndpoint, Endpoint deviceAuthorizationEndpoint, Endpoint issuer) {
+        // the device code and the long-lived refresh token are POSTed to the device authorization and
+        // token endpoints. RFC 8628 co-locates them on one authorization server, so reject a configuration
+        // that splits them across origins (a tampered /settings or discovery document trying to siphon one
+        // off), and - when the issuer is pinned - reject either endpoint that does not belong to it. The
+        // pin compares origins, so an identity provider that hosts its endpoints on a different origin than
+        // its issuer must be configured without an issuer (or with explicit endpoints).
+        if (!sameOrigin(tokenEndpoint, deviceAuthorizationEndpoint)) {
+            throw new OidcAuthException()
+                    .put("the OIDC token and device authorization endpoints are on different origins (")
+                    .put(originOf(tokenEndpoint)).put(" vs ").put(originOf(deviceAuthorizationEndpoint))
+                    .put("); refusing to send credentials. This indicates a misconfigured or tampered OIDC configuration");
+        }
+        if (issuer != null) {
+            if (!sameOrigin(tokenEndpoint, issuer)) {
+                throw new OidcAuthException()
+                        .put("the OIDC token endpoint origin (").put(originOf(tokenEndpoint))
+                        .put(") does not match the issuer origin (").put(originOf(issuer))
+                        .put("); refusing to send credentials to an endpoint outside the trusted issuer");
+            }
+            if (!sameOrigin(deviceAuthorizationEndpoint, issuer)) {
+                throw new OidcAuthException()
+                        .put("the OIDC device authorization endpoint origin (").put(originOf(deviceAuthorizationEndpoint))
+                        .put(") does not match the issuer origin (").put(originOf(issuer))
+                        .put("); refusing to send credentials to an endpoint outside the trusted issuer");
+            }
+        }
+    }
+
+    private static String wellKnownUrl(String issuer) {
+        String trimmed = issuer;
+        while (trimmed.length() > 1 && trimmed.charAt(trimmed.length() - 1) == '/') {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        }
+        return trimmed + WELL_KNOWN_OPENID_CONFIGURATION_PATH;
     }
 
     private void appendParam(StringSink sink, String name, String value) {
@@ -830,6 +1037,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         private String deviceAuthorizationEndpoint;
         private boolean groupsInToken;
         private int httpTimeoutMillis = DEFAULT_HTTP_TIMEOUT_MILLIS;
+        private String issuer;
         private DeviceCodePrompt prompt = DeviceCodePrompt.SYSTEM_OUT;
         private String scope = DEFAULT_SCOPE;
         private ClientTlsConfiguration tlsConfig;
@@ -870,10 +1078,16 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (scope == null || scope.isEmpty()) {
                 scope = DEFAULT_SCOPE;
             }
+            Endpoint deviceEndpoint = Endpoint.parse(deviceAuthorizationEndpoint);
+            Endpoint parsedTokenEndpoint = Endpoint.parse(tokenEndpoint);
+            Endpoint issuerEndpoint = issuer != null && !issuer.isEmpty() ? Endpoint.parse(issuer) : null;
             if (!allowInsecureTransport) {
-                requireSecureTransport(Endpoint.parse(deviceAuthorizationEndpoint).isTls, "device authorization endpoint", deviceAuthorizationEndpoint);
-                requireSecureTransport(Endpoint.parse(tokenEndpoint).isTls, "token endpoint", tokenEndpoint);
+                requireSecureTransport(deviceEndpoint.isTls, "device authorization endpoint", deviceAuthorizationEndpoint);
+                requireSecureTransport(parsedTokenEndpoint.isTls, "token endpoint", tokenEndpoint);
             }
+            // enforce the credential-endpoint co-location / issuer pin on every construction path (not just
+            // discovery), so the documented guarantee holds for the explicit builder too
+            validateEndpointOrigins(parsedTokenEndpoint, deviceEndpoint, issuerEndpoint);
             ClientTlsConfiguration tls = tlsConfig != null ? tlsConfig : defaultTlsConfig();
             return new OidcDeviceAuth(this, tls);
         }
@@ -909,6 +1123,20 @@ public class OidcDeviceAuth implements QuietCloseable {
 
         public Builder httpTimeoutMillis(int httpTimeoutMillis) {
             this.httpTimeoutMillis = httpTimeoutMillis;
+            return this;
+        }
+
+        /**
+         * Pins the identity provider by its {@code issuer} origin (for example
+         * {@code https://idp.example.com}). When set, {@link #build()} rejects a token or device
+         * authorization endpoint that does not belong to this origin, so a compromised or tampered
+         * configuration cannot redirect the device code and refresh token to an attacker.
+         * {@link #fromQuestDB(String, String)} sets it for you when discovering from a server. The
+         * endpoints of an identity provider that hosts them on a different origin than its issuer are
+         * rejected when pinned; configure such a provider without an issuer. Optional.
+         */
+        public Builder issuer(String issuer) {
+            this.issuer = issuer;
             return this;
         }
 
@@ -1284,6 +1512,64 @@ public class OidcDeviceAuth implements QuietCloseable {
                                 break;
                             case FIELD_ERROR_DESCRIPTION:
                                 putNonNull(errorDescription, tag);
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    private static final class WellKnownDiscoveryParser implements JsonParser {
+        private static final int FIELD_DEVICE_AUTHORIZATION_ENDPOINT = 1;
+        private static final int FIELD_ISSUER = 3;
+        private static final int FIELD_NONE = 0;
+        private static final int FIELD_TOKEN_ENDPOINT = 2;
+        final StringSink deviceAuthorizationEndpoint = new StringSink();
+        final StringSink issuer = new StringSink();
+        final StringSink tokenEndpoint = new StringSink();
+        private int depth;
+        private int field = FIELD_NONE;
+
+        @Override
+        public void onEvent(int code, CharSequence tag, int position) {
+            switch (code) {
+                case JsonLexer.EVT_OBJ_START:
+                    depth++;
+                    break;
+                case JsonLexer.EVT_OBJ_END:
+                    depth--;
+                    break;
+                case JsonLexer.EVT_NAME:
+                    // the standard OIDC discovery document is a flat top-level object; only read its
+                    // top-level keys so a nested value cannot be mistaken for an endpoint
+                    if (depth == 1) {
+                        if (Chars.equals("device_authorization_endpoint", tag)) {
+                            field = FIELD_DEVICE_AUTHORIZATION_ENDPOINT;
+                        } else if (Chars.equals("token_endpoint", tag)) {
+                            field = FIELD_TOKEN_ENDPOINT;
+                        } else if (Chars.equals("issuer", tag)) {
+                            field = FIELD_ISSUER;
+                        } else {
+                            field = FIELD_NONE;
+                        }
+                    }
+                    break;
+                case JsonLexer.EVT_VALUE:
+                    if (depth == 1) {
+                        switch (field) {
+                            case FIELD_DEVICE_AUTHORIZATION_ENDPOINT:
+                                putNonNull(deviceAuthorizationEndpoint, tag);
+                                break;
+                            case FIELD_TOKEN_ENDPOINT:
+                                putNonNull(tokenEndpoint, tag);
+                                break;
+                            case FIELD_ISSUER:
+                                putNonNull(issuer, tag);
                                 break;
                             default:
                                 break;

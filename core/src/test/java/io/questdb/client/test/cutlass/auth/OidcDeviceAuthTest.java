@@ -57,6 +57,7 @@ public class OidcDeviceAuthTest {
     };
     private static final String SETTINGS_PATH = "/settings";
     private static final String TOKEN_PATH = "/token";
+    private static final String WELL_KNOWN_PATH = "/.well-known/openid-configuration";
 
     @Test(timeout = 30_000)
     public void testAccessDeniedSurfacesOauthError() throws Exception {
@@ -108,6 +109,38 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testBuilderIssuerPinAcceptsMatchingOrigin() throws Exception {
+        assertMemoryLeak(() -> {
+            // endpoints that belong to the pinned issuer origin are accepted; only the origin is pinned, so
+            // the differing paths of the device and token endpoints are fine
+            OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("https://idp.example/as/device")
+                    .tokenEndpoint("https://idp.example/as/token")
+                    .issuer("https://idp.example")
+                    .build()
+                    .close();
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testBuilderIssuerPinRejectsOffOriginEndpoints() {
+        // the token/device endpoints do not belong to the pinned issuer origin; build() must reject them
+        // rather than send the device code and refresh token outside the trusted issuer
+        try {
+            OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("https://idp.example/device")
+                    .tokenEndpoint("https://idp.example/token")
+                    .issuer("https://other-idp.example")
+                    .build();
+            Assert.fail("expected the issuer pin to reject off-origin endpoints");
+        } catch (OidcAuthException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testBuilderRejectsMissingRequiredOptions() {
         try {
             OidcDeviceAuth.builder().deviceAuthorizationEndpoint("https://h/d").tokenEndpoint("https://h/t").build();
@@ -126,6 +159,22 @@ public class OidcDeviceAuthTest {
             Assert.fail("expected tokenEndpoint validation to fail");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("tokenEndpoint"));
+        }
+    }
+
+    @Test(timeout = 30_000)
+    public void testBuilderRejectsSplitOriginEndpoints() {
+        // the token and device authorization endpoints are on different origins; RFC 8628 co-locates them
+        // on one authorization server, so build() must refuse to spread the credential POSTs across hosts
+        try {
+            OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("https://device.example/device")
+                    .tokenEndpoint("https://token.example/token")
+                    .build();
+            Assert.fail("expected split-origin endpoints to be rejected");
+        } catch (OidcAuthException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("different origins"));
         }
     }
 
@@ -756,6 +805,94 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoversDeviceEndpointFromIssuer() throws Exception {
+        assertMemoryLeak(() -> {
+            // the server advertises a token endpoint but not the device authorization endpoint (today's
+            // servers); pinning the issuer lets the client discover the device endpoint from the issuer's
+            // .well-known/openid-configuration document and complete the flow
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, settingsJson(true, false, server.httpUrl(TOKEN_PATH), null));
+                }
+                if (WELL_KNOWN_PATH.equals(path)) {
+                    return MockOidcServer.json(200, wellKnownJson(server.httpUrl(DEVICE_PATH), server.httpUrl(TOKEN_PATH), server.httpUrl("")));
+                }
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-WK", "ID-WK", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                // the issuer is the mock itself, which also serves the .well-known document and the IdP endpoints
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), server.httpUrl(""), true)) {
+                    // settings advertise groups.encoded.in.token=true, so getToken() returns the id token
+                    Assert.assertEquals("ID-WK", auth.getToken());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoversFromDiscoveryUrl() throws Exception {
+        assertMemoryLeak(() -> {
+            // a discovery url pins the identity provider directly (an alternative to an issuer); the device
+            // endpoint and the issuer to pin against both come from the discovery document
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, settingsJson(true, false, server.httpUrl(TOKEN_PATH), null));
+                }
+                if (WELL_KNOWN_PATH.equals(path)) {
+                    return MockOidcServer.json(200, wellKnownJson(server.httpUrl(DEVICE_PATH), server.httpUrl(TOKEN_PATH), server.httpUrl("")));
+                }
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-DU", "ID-DU", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, server.httpUrl(WELL_KNOWN_PATH), null, true)) {
+                    Assert.assertEquals("ID-DU", auth.getToken());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoveryDocMissingDeviceEndpointRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // discovery runs against the pinned issuer, but the discovery document does not advertise a
+            // device authorization endpoint (the identity provider lacks the device grant); fail clearly
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, settingsJson(true, false, server.httpUrl(TOKEN_PATH), null));
+                }
+                // a discovery document with a token endpoint and issuer but no device_authorization_endpoint
+                return MockOidcServer.json(200, "{"
+                        + "\"issuer\":\"" + server.httpUrl("") + "\","
+                        + "\"token_endpoint\":\"" + server.httpUrl(TOKEN_PATH) + "\""
+                        + "}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), server.httpUrl(""), true);
+                    Assert.fail("expected discovery to fail");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("device_authorization_endpoint"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testFromQuestDbDiscoveryRunsFlow() throws Exception {
         assertMemoryLeak(() -> {
             AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
@@ -774,6 +911,29 @@ public class OidcDeviceAuthTest {
                 try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
                     // discovery advertises groups.encoded.in.token=true, so getToken() must return the id token
                     Assert.assertEquals("ID-D", auth.getToken());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFromQuestDbIssuerPinRejectsOffOriginAdvertisedEndpoint() throws Exception {
+        assertMemoryLeak(() -> {
+            // the server advertises both endpoints directly, but they do not belong to the pinned issuer
+            // origin; the issuer pin must reject them rather than route credentials off the trusted issuer
+            // (this is the protection against a compromised-but-reachable server redirecting the sign-in)
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                return MockOidcServer.json(200, settingsJson(true, true, server.httpUrl(TOKEN_PATH), server.httpUrl(DEVICE_PATH)));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), "https://idp.attacker.example", true);
+                    Assert.fail("expected the issuer pin to reject the off-origin endpoints");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
                 }
             }
         });
@@ -1167,10 +1327,10 @@ public class OidcDeviceAuthTest {
 
     @Test(timeout = 30_000)
     public void testMalformedEndpointDoesNotLeakNativeMemory() {
-        // allowInsecureTransport skips build()'s own Endpoint.parse, so the constructor is the first to
-        // parse and throw on this malformed url; the native JSON lexer must not have been allocated yet
-        // (otherwise the never-returned instance leaks it). Measure the parser tag directly - the
-        // module's assertMemoryLeak does not flag a single-tag growth.
+        // build() parses the endpoints up front (for the co-location / issuer-pin checks) and throws on
+        // this malformed url before the constructor allocates the native JSON lexer, so the never-returned
+        // instance cannot leak it. Measure the parser tag directly - the module's assertMemoryLeak does not
+        // flag a single-tag growth.
         long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
         try {
             OidcDeviceAuth.builder()
@@ -1359,19 +1519,21 @@ public class OidcDeviceAuthTest {
     @Test(timeout = 30_000)
     public void testPersistentTransportFailureDuringPollingAborts() throws Exception {
         assertMemoryLeak(() -> {
-            // the device endpoint works, but the token endpoint is unreachable; polling must abort with
-            // the underlying transport error after a few attempts, not retry silently until the code expires
-            int deadPort;
-            try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-                deadPort = probe.getLocalPort();
-            } // closed now - nothing listens on deadPort
-            MockOidcServer.Handler handler = (method, path, body) ->
-                    MockOidcServer.json(200, deviceAuthorizationJson(1, 10));
+            // the device endpoint works, but the (co-located) token endpoint drops the connection on every
+            // poll; polling must abort with the underlying transport error after a few attempts, not retry
+            // silently until the code expires. The endpoints share one origin so the build-time co-location
+            // check passes - the mock simulates the unreachable token endpoint by dropping the connection
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 10));
+                }
+                return MockOidcServer.dropConnection();
+            };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 try (OidcDeviceAuth auth = OidcDeviceAuth.builder()
                         .clientId("questdb")
                         .deviceAuthorizationEndpoint(server.httpUrl(DEVICE_PATH))
-                        .tokenEndpoint("http://127.0.0.1:" + deadPort + "/token")
+                        .tokenEndpoint(server.httpUrl(TOKEN_PATH))
                         .allowInsecureTransport(true)
                         .prompt(noopPrompt())
                         .build()) {
@@ -2102,5 +2264,14 @@ public class OidcDeviceAuthTest {
         }
         sb.put('}');
         return sb.toString();
+    }
+
+    private static String wellKnownJson(String deviceEndpoint, String tokenEndpoint, String issuer) {
+        return "{"
+                + "\"issuer\":\"" + issuer + "\","
+                + "\"authorization_endpoint\":\"" + issuer + "/authorize\","
+                + "\"token_endpoint\":\"" + tokenEndpoint + "\","
+                + "\"device_authorization_endpoint\":\"" + deviceEndpoint + "\""
+                + "}";
     }
 }

@@ -66,6 +66,15 @@ public class MockOidcServer implements Closeable {
         return new MockResponse(status, body, true);
     }
 
+    public static MockResponse dropConnection() {
+        // close the connection without responding, so the client sees a transport failure (connection
+        // reset / EOF) on this request - used to simulate an unreachable endpoint that is co-located with
+        // a working one on the same mock origin
+        MockResponse response = new MockResponse(0, "", false);
+        response.dropConnection = true;
+        return response;
+    }
+
     public static MockResponse json(int status, String body) {
         return new MockResponse(status, body, false);
     }
@@ -257,7 +266,13 @@ public class MockOidcServer implements Closeable {
             Request request;
             while ((request = readRequest(in)) != null) {
                 requestAuthHeaders.add(request.authorization);
-                writeResponse(out, handler.handle(request.method, request.path, request.body));
+                MockResponse response = handler.handle(request.method, request.path, request.body);
+                if (response.dropConnection) {
+                    // returning closes the socket (try-with-resources on its streams), so the client's
+                    // in-flight read fails with a transport error
+                    return;
+                }
+                writeResponse(out, response);
             }
         } catch (SocketException e) {
             // client closed the connection, expected
@@ -275,6 +290,7 @@ public class MockOidcServer implements Closeable {
         final String body;
         final boolean chunked;
         final int status;
+        boolean dropConnection;
         boolean stall;
 
         MockResponse(int status, String body, boolean chunked) {

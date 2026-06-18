@@ -205,11 +205,18 @@ OidcDeviceAuth auth = OidcDeviceAuth.builder()
         .build();
 ```
 
-Discovery via `fromQuestDB(...)` needs a server that advertises its device authorization endpoint through `/settings`, and the identity provider's client must have the device authorization grant enabled.
+Discovery via `fromQuestDB(...)` reads the OIDC client id, scope and endpoints from the server's `/settings`, and the identity provider's client must have the device authorization grant enabled. When the server does not advertise its device authorization endpoint (today's servers), pin the identity provider by its issuer so the client can discover the endpoint from the issuer's `.well-known/openid-configuration` document:
+
+```java
+try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
+        "https://questdb.example.com:9000", "https://idp.example.com")) {
+    auth.getToken();
+}
+```
 
 By default the device authorization and token endpoints must use `https`, so tokens are never sent in cleartext; an `http` endpoint is rejected. For local development against an `http` endpoint, opt in explicitly with `.allowInsecureTransport(true)` on the builder, or `OidcDeviceAuth.fromQuestDB(url, true)`.
 
-`fromQuestDB(...)` takes the identity provider endpoints from the server's unauthenticated `/settings`, so it trusts that server to designate where you sign in: a spoofed, compromised, or man-in-the-middled server could redirect the sign-in to an attacker-controlled identity provider. Only use it against a server you trust, reached over `https`. When the server is not trusted, configure the identity provider explicitly with `OidcDeviceAuth.builder()` instead of discovering it.
+`fromQuestDB(...)` takes the identity provider endpoints from the server's unauthenticated `/settings`, so it trusts that server to designate where you sign in: a spoofed, compromised, or man-in-the-middled server could redirect the sign-in to an attacker-controlled identity provider. Only use it against a server you trust, reached over `https`. Passing an issuer hardens this: the token and device authorization endpoints are then pinned to the issuer's origin, and an endpoint outside it is rejected; the issuer itself comes from you out of band, so a tampered `/settings` cannot move it. When the server is not trusted, configure the identity provider explicitly with `OidcDeviceAuth.builder()` (optionally with `.issuer(...)`) instead of discovering it.
 
 ### Explicit Timestamps
 
