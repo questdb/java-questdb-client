@@ -39,6 +39,8 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Paths;
@@ -422,6 +424,70 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testSlotLeakedWhenDelegateCloseDoesNotReleaseFlock() throws Exception {
+        // Latent-fragility guard (M2): the pool returns a slot index to the
+        // free set ONLY after the delegate's close() has released the SF
+        // flock. If close() returns with the flock still held (it bailed out
+        // early with the I/O thread still running), the index must stay
+        // reserved forever -- otherwise the pool would hand the still-locked
+        // dir to the next borrow and resurrect "sf slot already in use".
+        TestUtils.assertMemoryLeak(() -> {
+            int port = TestPorts.findUnusedPort();
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 1, 2, 500, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = pool.borrow();
+                    Assert.assertTrue(Files.exists(slot("default-0")));
+
+                    // Tear the delegate down for real first (so the test leaks
+                    // no native resources), then forge the exact symptom:
+                    // close() returned WITHOUT clearing slotLockReleased.
+                    // close() is idempotent, so the discardBroken re-close
+                    // below is a no-op and leaves the forged flag in place.
+                    Sender delegate = getDelegate(a);
+                    delegate.close();
+                    setBooleanField(delegate, "slotLockReleased", false);
+
+                    // Route the wrapper through the pool's broken-eviction path.
+                    invokeDiscardBroken(pool, a);
+
+                    // The leaked index must NOT be returned to the free set,
+                    // and capacity must be accounted as permanently consumed.
+                    Assert.assertEquals("one slot must be retired as leaked",
+                            1, getIntField(pool, "leakedSlots"));
+                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
+                    Assert.assertTrue("leaked slot index 0 must stay reserved", slotInUse[0]);
+
+                    // The next borrow must take a fresh index -- never reuse the
+                    // still-locked default-0 dir.
+                    PooledSender b = pool.borrow();
+                    try {
+                        Assert.assertTrue("new borrow must use a fresh slot dir",
+                                Files.exists(slot("default-1")));
+                        Assert.assertEquals(2, countSlotDirs());
+
+                        // Capacity is permanently reduced by the leaked slot:
+                        // max=2, one leaked + one live => the next borrow times
+                        // out rather than colliding on the locked dir.
+                        try {
+                            pool.borrow();
+                            Assert.fail("capacity must be reduced by the leaked slot");
+                        } catch (LineSenderException e) {
+                            Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
+                        }
+                    } finally {
+                        b.close();
+                    }
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Recovery: stable slot ids let a re-created pool re-adopt unacked data.
     // ----------------------------------------------------------------------
@@ -773,6 +839,36 @@ public class SenderPoolSfTest {
             }
         }
         Files.remove(dir);
+    }
+
+    private static Sender getDelegate(PooledSender ps) throws Exception {
+        Field f = PooledSender.class.getDeclaredField("delegate");
+        f.setAccessible(true);
+        return (Sender) f.get(ps);
+    }
+
+    private static void setBooleanField(Object target, String name, boolean value) throws Exception {
+        Field f = target.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        f.setBoolean(target, value);
+    }
+
+    private static int getIntField(Object target, String name) throws Exception {
+        Field f = target.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getInt(target);
+    }
+
+    private static Object getField(Object target, String name) throws Exception {
+        Field f = target.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(target);
+    }
+
+    private static void invokeDiscardBroken(SenderPool pool, PooledSender ps) throws Exception {
+        Method m = SenderPool.class.getDeclaredMethod("discardBroken", PooledSender.class);
+        m.setAccessible(true);
+        m.invoke(pool, ps);
     }
 
     /**

@@ -234,6 +234,12 @@ public class QwpWebSocketSender implements Sender {
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
     private boolean ownsCursorEngine;
     private long pendingBytes;
+    // Set true by close() once the SF slot flock has been released (the normal
+    // teardown path). Stays false if close() bailed early with the I/O thread
+    // still running -- then cursorEngine.close() never ran and the flock is
+    // still held, so the owning pool MUST keep the slot reserved rather than
+    // hand the still-locked dir to the next borrow ("sf slot already in use").
+    private boolean slotLockReleased;
     private int pendingRowCount;
     private SenderProgressDispatcher progressDispatcher;
     // Async-delivery sink for ack-watermark advances. Default no-op; a
@@ -1087,6 +1093,10 @@ public class QwpWebSocketSender implements Sender {
                 cursorEngine = null;
                 ownsCursorEngine = false;
             }
+            // Past the ioThreadStopped guard => cursorEngine.close() ran and
+            // released the SF flock in its finally (or this sender owned no
+            // engine holding one). Signal the pool it may reuse the slot.
+            slotLockReleased = true;
 
             // Shutdown order: dispatcher last, after the I/O loop has stopped
             // producing into it. close() drains pending entries with a short
@@ -1127,6 +1137,16 @@ public class QwpWebSocketSender implements Sender {
             }
             rethrowTerminal(terminalError);
         }
+    }
+
+    /**
+     * True once {@link #close()} has released the store-and-forward slot
+     * flock. False means close() leaked the still-running I/O thread (and its
+     * resources), so the flock is still held; the owning pool must keep the
+     * slot index reserved instead of reusing the still-locked slot dir.
+     */
+    public boolean isSlotLockReleased() {
+        return slotLockReleased;
     }
 
     @Override

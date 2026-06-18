@@ -26,6 +26,7 @@ package io.questdb.client.impl;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -49,8 +50,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * Connection creation happens outside the lock so a slow connect (TLS
  * handshake, DNS) does not block other borrowers or the housekeeper. The
  * pool tracks in-flight creations via {@code inFlightCreations} so the cap
- * check ({@code allSize + inFlightCreations + closingSlots < maxSize}) stays
- * correct under concurrent borrows.
+ * check ({@code allSize + inFlightCreations + closingSlots + leakedSlots <
+ * maxSize}) stays correct under concurrent borrows.
  * <p>
  * <b>Store-and-forward slots.</b> When the configuration enables SF
  * ({@code sf_dir} set), every sender owns an exclusive on-disk slot
@@ -98,6 +99,12 @@ public final class SenderPool implements AutoCloseable {
     private int closingSlots;
     private volatile boolean closed;
     private int inFlightCreations;
+    // Slots whose delegate close() returned with the SF flock still held
+    // (the I/O thread refused to stop). Permanently consumed: the index is
+    // never freed and never reused, so no borrow ever hands out a still-
+    // locked slot dir. Counted in the cap check so the lost capacity is
+    // accounted for. Guarded by lock; only ever ticks for SF slots.
+    private int leakedSlots;
 
     public SenderPool(
             String configurationString,
@@ -172,7 +179,7 @@ public final class SenderPool implements AutoCloseable {
                     s.markInUse();
                     return s;
                 }
-                if (all.size() + inFlightCreations + closingSlots < maxSize) {
+                if (all.size() + inFlightCreations + closingSlots + leakedSlots < maxSize) {
                     inFlightCreations++;
                     // Reserve a slot index under the lock so concurrent
                     // creations never target the same SF slot dir. -1 when
@@ -333,13 +340,25 @@ public final class SenderPool implements AutoCloseable {
             // true, closingSlots over-counted) and the pool leaks capacity
             // until borrow() can only ever time out.
         } finally {
-            // Flock is released now: return the reserved slot index to the free set.
             if (reserved) {
                 lock.lock();
                 try {
-                    freeSlotIndex(s.slotIndex());
-                    closingSlots--;
-                    slotReleased.signal();
+                    if (flockReleased(s)) {
+                        // Flock is released now: return the reserved slot
+                        // index to the free set.
+                        freeSlotIndex(s.slotIndex());
+                        closingSlots--;
+                        slotReleased.signal();
+                    } else {
+                        // close() leaked the still-running I/O thread; the
+                        // flock is still held. Retire the slot permanently:
+                        // keep slotInUse[idx] set and move it from
+                        // closingSlots to leakedSlots so the cap math
+                        // accounts for the lost capacity and no borrow ever
+                        // reuses the still-locked dir.
+                        closingSlots--;
+                        leakedSlots++;
+                    }
                 } finally {
                     lock.unlock();
                 }
@@ -429,15 +448,22 @@ public final class SenderPool implements AutoCloseable {
                     // closingSlots over-counted) and leak pool capacity.
                 }
             }
-            // Flocks released: return reserved SF slot indices to the free set.
+            // Return reserved SF slot indices to the free set -- but only for
+            // slots whose delegate confirmed the flock was released. A slot
+            // left locked (I/O thread refused to stop) is retired permanently.
             if (storeAndForward) {
                 lock.lock();
                 try {
                     for (int i = 0, n = toClose.size(); i < n; i++) {
                         PooledSender s = toClose.get(i);
                         if (s.slotIndex() >= 0) {
-                            freeSlotIndex(s.slotIndex());
-                            closingSlots--;
+                            if (flockReleased(s)) {
+                                freeSlotIndex(s.slotIndex());
+                                closingSlots--;
+                            } else {
+                                closingSlots--;
+                                leakedSlots++;
+                            }
                         }
                     }
                     slotReleased.signalAll();
@@ -508,9 +534,9 @@ public final class SenderPool implements AutoCloseable {
 
     /**
      * Reserves and returns the lowest free SF slot index. The borrow() cap
-     * check ({@code all.size() + inFlightCreations + closingSlots < maxSize})
-     * guarantees a free index exists whenever a creation is admitted, so this
-     * never fails in practice; the guard throws defensively rather than
+     * check ({@code all.size() + inFlightCreations + closingSlots + leakedSlots
+     * < maxSize}) guarantees a free index exists whenever a creation is
+     * admitted, so this never fails in practice; the guard throws defensively rather than
      * silently colliding two senders on one slot dir. Caller must hold
      * {@code lock}.
      */
@@ -533,5 +559,17 @@ public final class SenderPool implements AutoCloseable {
         if (idx >= 0 && slotInUse != null) {
             slotInUse[idx] = false;
         }
+    }
+
+    /**
+     * Whether the delegate's {@code close()} released the SF slot flock. A
+     * non-QWP delegate never holds an SF flock, so it is always treated as
+     * released. A {@link QwpWebSocketSender} reports it via
+     * {@link QwpWebSocketSender#isSlotLockReleased()} -- false means close()
+     * bailed early with the I/O thread still running and the flock still held.
+     */
+    private static boolean flockReleased(PooledSender s) {
+        Sender d = s.delegate();
+        return !(d instanceof QwpWebSocketSender) || ((QwpWebSocketSender) d).isSlotLockReleased();
     }
 }
