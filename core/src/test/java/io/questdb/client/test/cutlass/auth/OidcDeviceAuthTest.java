@@ -902,6 +902,57 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testHttpSenderProviderFailureAfterFlushDoesNotCorruptSender() throws Exception {
+        assertMemoryLeak(() -> {
+            // regression: the per-request token must be pulled lazily when a row starts, never eagerly when
+            // the post-flush request is rebuilt. A provider that throws on a later pull (e.g.
+            // OidcDeviceAuth::getTokenSilently when a refresh fails) must NOT turn an already-successful
+            // flush into a thrown exception, and must NOT leave a half-built request that corrupts the
+            // sender so later rows go out malformed
+            MockOidcServer.Handler handler = (method, path, body) -> MockOidcServer.json(204, "");
+            AtomicInteger pulls = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 Sender sender = Sender.builder(Sender.Transport.HTTP)
+                         .address("127.0.0.1:" + server.port())
+                         .protocolVersion(Sender.PROTOCOL_VERSION_V2)
+                         .httpTokenProvider(() -> {
+                             int n = pulls.incrementAndGet();
+                             if (n == 2) {
+                                 // the second pull - for the request after the first, successful flush - fails
+                                 throw new OidcAuthException("the cached token expired and could not be refreshed");
+                             }
+                             return "TOKEN-" + n;
+                         })
+                         .build()) {
+                // first batch: the token is pulled when the row starts (TOKEN-1); the flush sends it and must
+                // succeed. The failing *next* pull must not strike here - the eager post-flush pull was the bug
+                sender.table("t").doubleColumn("x", 1.0).atNow();
+                sender.flush();
+
+                // next batch: the deferred pull runs when the row starts and the provider throws there; the
+                // failure must surface cleanly, leaving the previous successful flush and its data untouched
+                try {
+                    sender.table("t").doubleColumn("x", 2.0).atNow();
+                    Assert.fail("expected the failing provider pull to surface on the next row");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not be refreshed"));
+                }
+
+                // the provider recovers (pull #3 -> TOKEN-3); the failed pull must not have corrupted the
+                // sender, so this row produces a well-formed request the server accepts
+                sender.table("t").doubleColumn("x", 3.0).atNow();
+                sender.flush();
+
+                java.util.List<String> seen = server.requestAuthHeaders();
+                Assert.assertTrue(seen.toString(), seen.contains("Bearer TOKEN-1"));
+                Assert.assertTrue(seen.toString(), seen.contains("Bearer TOKEN-3"));
+                // the failed pull never reached the wire as a partial request
+                Assert.assertFalse(seen.toString(), seen.contains("Bearer TOKEN-2"));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testHttpSenderPullsTokenProviderPerRequest() throws Exception {
         assertMemoryLeak(() -> {
             // a long-lived HTTP Sender must pull the token from the provider on each request, so a rotating
