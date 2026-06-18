@@ -319,14 +319,13 @@ public class QwpQueryClient implements QuietCloseable {
      *       The user handler sees {@link QwpColumnBatchHandler#onFailoverReset} before
      *       replayed batches begin arriving (batch_seq restarts at 0 on the new node).</li>
      *   <li>{@code path=/read/v1} -- egress endpoint. Default {@value #DEFAULT_ENDPOINT_PATH}.</li>
-     *   <li>{@code auth=<value>} -- sent verbatim as the HTTP {@code Authorization} header during the upgrade handshake.
-     *       Mutually exclusive with {@code username}/{@code password} and {@code token}.</li>
-     *   <li>{@code username=<name>;password=<secret>} -- HTTP Basic authentication. Server verifies the credentials
+     *   <li>{@code username=<name>;password=<secret>} -- HTTP Basic authentication. The client builds the
+     *       {@code Authorization: Basic <base64>} header from these. Server verifies the credentials
      *       against the same user store the Postgres wire protocol uses, so a user created via
      *       {@code CREATE USER ... WITH PASSWORD ...} can log in unchanged.
-     *       Both keys must be present together; mutually exclusive with {@code auth} and {@code token}.</li>
+     *       Both keys must be present together; mutually exclusive with {@code token}.</li>
      *   <li>{@code token=<access_token>} -- HTTP Bearer authentication with an OIDC access token (sent as
-     *       {@code Authorization: Bearer <token>}). Mutually exclusive with {@code auth} and
+     *       {@code Authorization: Bearer <token>}). Mutually exclusive with
      *       {@code username}/{@code password}.</li>
      *   <li>{@code client_id=<id>} -- sent as the {@code X-QWP-Client-Id} header.</li>
      *   <li>{@code buffer_pool_size=N} -- depth of the I/O thread's batch buffer pool. Default 4.</li>
@@ -355,7 +354,7 @@ public class QwpQueryClient implements QuietCloseable {
      * Examples:
      * <pre>
      *   ws::addr=localhost:9000;
-     *   ws::addr=db.internal:9000;path=/read/v1;auth=Bearer abc123;client_id=dashboard/2.0;
+     *   ws::addr=db.internal:9000;path=/read/v1;token=abc123;client_id=dashboard/2.0;
      *   ws::addr=db-a:9000,db-b:9000,db-c:9000;target=primary;failover=on;
      * </pre>
      */
@@ -388,7 +387,6 @@ public class QwpQueryClient implements QuietCloseable {
         Long failoverMaxDurationMs = null;
         Long authTimeoutMs = null;
         Long initialCredit = null;
-        String auth = null;
         String username = null;
         String password = null;
         String token = null;
@@ -496,9 +494,6 @@ public class QwpQueryClient implements QuietCloseable {
                 }
                 case "path":
                     path = value;
-                    break;
-                case "auth":
-                    auth = value;
                     break;
                 case "username":
                     username = value;
@@ -631,10 +626,9 @@ public class QwpQueryClient implements QuietCloseable {
         if (hasBasic && (username == null || password == null)) {
             throw new IllegalArgumentException("both username and password must be provided together");
         }
-        int authModesSet = (auth != null ? 1 : 0) + (hasBasic ? 1 : 0) + (token != null ? 1 : 0);
-        if (authModesSet > 1) {
+        if (hasBasic && token != null) {
             throw new IllegalArgumentException(
-                    "auth, username/password, and token are mutually exclusive");
+                    "username/password and token are mutually exclusive");
         }
         if (!tls && (tlsValidation != null || tlsRoots != null || tlsRootsPassword != null)) {
             throw new IllegalArgumentException(
@@ -692,7 +686,6 @@ public class QwpQueryClient implements QuietCloseable {
                 client.withTls();
             }
         }
-        if (auth != null) client.withAuthorization(auth);
         if (hasBasic) client.withBasicAuth(username, password);
         if (token != null) client.withBearerToken(token);
         if (cid != null) client.withClientId(cid);
@@ -1112,11 +1105,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
         this.authTimeoutMs = authTimeoutMs;
         return this;
-    }
-
-    public void withAuthorization(String authorizationHeader) {
-        checkPreConnect("withAuthorization");
-        this.authorizationHeader = authorizationHeader;
     }
 
     /**

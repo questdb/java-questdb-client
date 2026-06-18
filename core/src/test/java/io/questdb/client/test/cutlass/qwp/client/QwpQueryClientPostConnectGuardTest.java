@@ -47,8 +47,6 @@ public class QwpQueryClientPostConnectGuardTest {
 
     @Test
     public void testAllSettersRejectAfterConnect() throws Exception {
-        // withAuthorization
-        assertRejects(c -> c.withAuthorization("Bearer x"), "withAuthorization");
         // withBasicAuth
         assertRejects(c -> c.withBasicAuth("u", "p"), "withBasicAuth");
         // withBearerToken

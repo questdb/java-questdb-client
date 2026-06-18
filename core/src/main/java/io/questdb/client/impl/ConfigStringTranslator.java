@@ -45,8 +45,9 @@ import io.questdb.client.std.str.StringSink;
  * </ul>
  * <p>
  * <strong>Schema translation:</strong> http&lt;-&gt;ws, https&lt;-&gt;wss.
- * A curated subset of keys carries over to the derived side (addr, token /
- * auth, TLS); everything else stays on the input side only.
+ * A curated subset of keys carries over to the derived side (addr,
+ * credentials -- token or username/password -- and TLS settings); everything
+ * else stays on the input side only.
  * <p>
  * The parser runs once at {@code QuestDB.connect(...)} time. Allocation here
  * is one-shot startup cost; the hot borrow / submit paths never see it.
@@ -94,7 +95,6 @@ public final class ConfigStringTranslator {
         StringSink token = new StringSink();
         StringSink username = new StringSink();
         StringSink password = new StringSink();
-        StringSink auth = new StringSink();
         StringSink tlsRoots = new StringSink();
         StringSink tlsRootsPassword = new StringSink();
         StringSink tlsVerify = new StringSink();
@@ -102,7 +102,6 @@ public final class ConfigStringTranslator {
         boolean hasToken = false;
         boolean hasUsername = false;
         boolean hasPassword = false;
-        boolean hasAuth = false;
         boolean hasTlsRoots = false;
         boolean hasTlsRootsPassword = false;
         boolean hasTlsVerify = false;
@@ -155,11 +154,6 @@ public final class ConfigStringTranslator {
                     password.put(sink);
                     hasPassword = true;
                     break;
-                case "auth":
-                    auth.clear();
-                    auth.put(sink);
-                    hasAuth = true;
-                    break;
                 case "tls_roots":
                     tlsRoots.clear();
                     tlsRoots.put(sink);
@@ -188,14 +182,14 @@ public final class ConfigStringTranslator {
         String query;
         if (isHttp) {
             ingest = inputPassthrough.toString();
-            query = buildQueryConfig(isTls, addr, hasToken, token, hasUsername,
-                    hasPassword, hasAuth, auth,
+            query = buildQueryConfig(isTls, addr, hasToken, token,
+                    hasUsername, username, hasPassword, password,
                     hasTlsRoots, tlsRoots, hasTlsRootsPassword, tlsRootsPassword,
                     hasTlsVerify, tlsVerify);
         } else {
             query = inputPassthrough.toString();
             ingest = buildIngestConfig(isTls, addr, hasToken, token, hasUsername, username,
-                    hasPassword, password, hasAuth, auth,
+                    hasPassword, password,
                     hasTlsRoots, tlsRoots, hasTlsRootsPassword, tlsRootsPassword,
                     hasTlsVerify, tlsVerify);
         }
@@ -221,7 +215,6 @@ public final class ConfigStringTranslator {
             boolean hasToken, CharSequence token,
             boolean hasUsername, CharSequence username,
             boolean hasPassword, CharSequence password,
-            boolean hasAuth, CharSequence auth,
             boolean hasTlsRoots, CharSequence tlsRoots,
             boolean hasTlsRootsPassword, CharSequence tlsRootsPassword,
             boolean hasTlsVerify, CharSequence tlsVerify
@@ -237,9 +230,6 @@ public final class ConfigStringTranslator {
         }
         if (hasPassword) {
             appendKv(out, "password", password);
-        }
-        if (hasAuth && !hasToken && !hasUsername) {
-            appendKv(out, "auth", auth);
         }
         if (hasTlsRoots) {
             appendKv(out, "tls_roots", tlsRoots);
@@ -257,9 +247,8 @@ public final class ConfigStringTranslator {
             boolean isTls,
             CharSequence addr,
             boolean hasToken, CharSequence token,
-            boolean hasUsername,
-            boolean hasPassword,
-            boolean hasAuth, CharSequence auth,
+            boolean hasUsername, CharSequence username,
+            boolean hasPassword, CharSequence password,
             boolean hasTlsRoots, CharSequence tlsRoots,
             boolean hasTlsRootsPassword, CharSequence tlsRootsPassword,
             boolean hasTlsVerify, CharSequence tlsVerify
@@ -267,16 +256,17 @@ public final class ConfigStringTranslator {
         StringSink out = new StringSink();
         out.put(isTls ? "wss::" : "ws::");
         appendKv(out, "addr", addr);
-        if (hasAuth) {
-            appendKv(out, "auth", auth);
-        } else if (hasToken) {
-            StringSink bearer = new StringSink();
-            bearer.put("Bearer ").put(token);
-            appendKv(out, "auth", bearer);
-        } else if (hasUsername && hasPassword) {
-            throw new IllegalArgumentException(
-                    "username/password auth is not supported in unified config for ws/wss derivation; "
-                            + "pass auth=Basic <base64> directly, or use the builder with explicit queryConfig()");
+        // Mirror the structured credentials; QwpQueryClient synthesizes the
+        // Authorization header from them downstream (Bearer from token, Basic
+        // from username/password).
+        if (hasToken) {
+            appendKv(out, "token", token);
+        }
+        if (hasUsername) {
+            appendKv(out, "username", username);
+        }
+        if (hasPassword) {
+            appendKv(out, "password", password);
         }
         if (isTls) {
             if (hasTlsRoots) {

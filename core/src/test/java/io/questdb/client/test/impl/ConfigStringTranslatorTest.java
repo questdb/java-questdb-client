@@ -45,7 +45,7 @@ public class ConfigStringTranslatorTest {
         ConfigStringTranslator.Bundle bundle = ConfigStringTranslator.deriveBothSides(
                 "http::addr=db.host:9000;token=secret;");
         Assert.assertEquals("http::addr=db.host:9000;token=secret;", bundle.ingestConfig);
-        Assert.assertEquals("ws::addr=db.host:9000;auth=Bearer secret;", bundle.queryConfig);
+        Assert.assertEquals("ws::addr=db.host:9000;token=secret;", bundle.queryConfig);
         // No pool keys -> all defaults preserved.
         Assert.assertEquals(ConfigStringTranslator.PoolConfig.UNSET, bundle.poolConfig.senderPoolMin);
         Assert.assertEquals(ConfigStringTranslator.PoolConfig.UNSET, bundle.poolConfig.acquireTimeoutMillis);
@@ -136,24 +136,24 @@ public class ConfigStringTranslatorTest {
     }
 
     @Test
-    public void testUsernamePasswordRejectedForWsDerivation() {
-        try {
-            ConfigStringTranslator.deriveBothSides(
-                    "http::addr=h:9000;username=u;password=p;");
-            Assert.fail();
-        } catch (IllegalArgumentException e) {
-            Assert.assertTrue(e.getMessage().contains("username/password"));
-        }
+    public void testUsernamePasswordMirroredToWsDerivation() {
+        // Structured Basic-auth credentials carry over to the derived ws side;
+        // QwpQueryClient synthesizes the Authorization header from them.
+        ConfigStringTranslator.Bundle bundle = ConfigStringTranslator.deriveBothSides(
+                "http::addr=h:9000;username=u;password=p;");
+        Assert.assertEquals("http::addr=h:9000;username=u;password=p;", bundle.ingestConfig);
+        Assert.assertEquals("ws::addr=h:9000;username=u;password=p;", bundle.queryConfig);
     }
 
     @Test
     public void testWsInputPassesThroughAndDerivesHttp() {
         ConfigStringTranslator.Bundle bundle = ConfigStringTranslator.deriveBothSides(
-                "ws::addr=db.host:9000;auth=Bearer foo;");
-        Assert.assertEquals("ws::addr=db.host:9000;auth=Bearer foo;", bundle.queryConfig);
+                "ws::addr=db.host:9000;token=foo;");
+        Assert.assertEquals("ws::addr=db.host:9000;token=foo;", bundle.queryConfig);
         Assert.assertTrue(
                 "expected ingest config to start with http::; got: " + bundle.ingestConfig,
                 bundle.ingestConfig.startsWith("http::"));
         Assert.assertTrue(bundle.ingestConfig.contains("addr=db.host:9000"));
+        Assert.assertTrue(bundle.ingestConfig.contains("token=foo"));
     }
 }

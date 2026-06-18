@@ -211,27 +211,11 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testAuthAndBasicMutuallyExclusive() {
-        assertReject(
-                "ws::addr=db:9000;auth=Bearer xyz;username=admin;password=quest;",
-                "auth, username/password, and token are mutually exclusive"
-        );
-    }
-
-    @Test
-    public void testAuthAndTokenMutuallyExclusive() {
-        assertReject(
-                "ws::addr=db:9000;auth=Bearer xyz;token=ey.xyz;",
-                "auth, username/password, and token are mutually exclusive"
-        );
-    }
-
-    @Test
-    public void testAuthHeaderAcceptedAlone() {
-        // Each of the three auth modes has a dedicated mutual-exclusion test;
-        // the positive happy path is asserted here so the parser's per-key
-        // dispatch and the post-loop "no auth set" path both have coverage.
-        assertParses("ws::addr=db:9000;auth=Bearer xyz;");
+    public void testAuthKeyRejected() {
+        // The raw auth= header key is removed. Credentials are supplied as
+        // token= or username=/password=, from which the client synthesizes the
+        // Authorization header downstream.
+        assertReject("ws::addr=db:9000;auth=Bearer xyz;", "unknown configuration key: auth");
     }
 
     @Test
@@ -289,7 +273,7 @@ public class QwpQueryClientFromConfigTest {
     public void testBasicAuthAndTokenMutuallyExclusive() {
         assertReject(
                 "ws::addr=db:9000;username=admin;password=quest;token=ey.xyz;",
-                "auth, username/password, and token are mutually exclusive"
+                "username/password and token are mutually exclusive"
         );
     }
 

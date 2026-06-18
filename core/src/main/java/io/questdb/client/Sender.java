@@ -3284,8 +3284,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // zone-blind (pinned to v1) and silently accepts the key so
                     // the same connect string works on both sides.
                     pos = getValue(configurationString, pos, sink, "zone");
-                } else if (Chars.equals("auth", sink)
-                        || Chars.equals("buffer_pool_size", sink)
+                } else if (Chars.equals("buffer_pool_size", sink)
                         || Chars.equals("client_id", sink)
                         || Chars.equals("compression", sink)
                         || Chars.equals("compression_level", sink)

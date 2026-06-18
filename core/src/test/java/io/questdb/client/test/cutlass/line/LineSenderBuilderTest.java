@@ -193,6 +193,7 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost;username=foo;", "password cannot be empty nor null");
             assertConfStrError("http::addr=localhost;pass=foo;", "password is configured, but username is missing");
             assertConfStrError("http::addr=localhost;password=foo;", "password is configured, but username is missing");
+            assertConfStrError("http::addr=localhost;auth=Bearer xyz;", "unknown configuration key [key=auth]");
             assertConfStrError("tcp::addr=localhost;pass=foo;", "password is not supported for TCP protocol");
             assertConfStrError("tcp::addr=localhost;password=foo;", "password is not supported for TCP protocol");
             assertConfStrError("tcp::addr=localhost;retry_timeout=;", "retry_timeout cannot be empty");
@@ -360,7 +361,6 @@ public class LineSenderBuilderTest {
             // Each egress-only key on its own with a representative happy-path
             // value. Covers query-client knobs and per-Execute failover knobs.
             String[] keys = {
-                    "auth=Bearer xyz",
                     "client_id=batch-job/42",
                     "compression=zstd",
                     "compression_level=5",
@@ -379,7 +379,7 @@ public class LineSenderBuilderTest {
                 assertConfStrOk("http::addr=" + LOCALHOST + ";" + kv + ";protocol_version=2;");
                 all.append(kv).append(';');
             }
-            // All 13 keys at once -- a typical shared-config connect string.
+            // All 12 keys at once -- a typical shared-config connect string.
             assertConfStrOk(all.toString());
 
             // Out-of-range / malformed values are silently consumed too -- the
