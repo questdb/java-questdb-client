@@ -30,7 +30,6 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.std.Files;
-import io.questdb.client.test.cutlass.qwp.client.TestPorts;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -91,9 +90,9 @@ public class SenderPoolSfTest {
         // hand out two live senders. Pre-fix, the second borrow() blew up on
         // the slot flock.
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -118,9 +117,9 @@ public class SenderPoolSfTest {
     @Test
     public void testGrowToMaxAllSfSendersCoexist() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -161,9 +160,9 @@ public class SenderPoolSfTest {
         // appends -<index> per slot. This is the knob that lets two pools (or
         // two processes) share one sf_dir without colliding.
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -188,9 +187,9 @@ public class SenderPoolSfTest {
         // Borrow, return, borrow again: the wrapper (and thus its slot) is
         // recycled, NOT grown into a new slot dir.
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -218,9 +217,9 @@ public class SenderPoolSfTest {
         // re-used -- no new index beyond the original high-water mark, and no
         // "no free SF slot index" / "sf slot already in use" failure.
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -270,9 +269,9 @@ public class SenderPoolSfTest {
         // the closingSlots accounting ever drifted, allocateSlotIndex() would
         // throw "no free SF slot index" or a borrow would collide on a flock.
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -303,9 +302,9 @@ public class SenderPoolSfTest {
     @Test
     public void testEndToEndIngestThroughPooledSenders() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -340,9 +339,9 @@ public class SenderPoolSfTest {
         // second must fail fast rather than interleave FSNs on disk. The pool
         // fix must NOT weaken this contract.
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -367,9 +366,9 @@ public class SenderPoolSfTest {
         // Distinct sender_id base per pool -> distinct slot dirs -> both pools
         // coexist on one sf_dir and both can ingest.
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -401,9 +400,9 @@ public class SenderPoolSfTest {
         // After the pool closes, every slot flock must be released so the
         // dirs can be re-acquired -- by a fresh pool or a standalone sender.
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -433,9 +432,9 @@ public class SenderPoolSfTest {
         // reserved forever -- otherwise the pool would hand the still-locked
         // dir to the next borrow and resurrect "sf slot already in use".
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -501,8 +500,8 @@ public class SenderPoolSfTest {
         // slot ids are exactly what make this recovery possible.
         TestUtils.assertMemoryLeak(() -> {
             // Phase 1 -- silent server.
-            int silentPort = TestPorts.findUnusedPort();
-            try (TestWebSocketServer silent = new TestWebSocketServer(silentPort, new SilentHandler())) {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
                 String cfg1 = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
@@ -520,9 +519,9 @@ public class SenderPoolSfTest {
             Assert.assertTrue("unacked data must persist on disk", hasSegmentFile(slot("default-0")));
 
             // Phase 2 -- ack-ing server, brand-new pool, same sf_dir.
-            int ackPort = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer ack = new TestWebSocketServer(ackPort, handler)) {
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
                 ack.start();
                 Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
                 String cfg2 = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
@@ -548,9 +547,9 @@ public class SenderPoolSfTest {
     @Test
     public void testConcurrentBorrowReturnStress() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -619,8 +618,8 @@ public class SenderPoolSfTest {
         TestUtils.assertMemoryLeak(() -> {
             // Phase 1: seed unacked data into default-0 AND default-1 via a
             // plain (no drain_orphans) pool against a silent server.
-            int silentPort = TestPorts.findUnusedPort();
-            try (TestWebSocketServer silent = new TestWebSocketServer(silentPort, new SilentHandler())) {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
                 String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
@@ -642,9 +641,9 @@ public class SenderPoolSfTest {
             // Phase 2: a drain_orphans=on pool over the same sf_dir. Pre-fix
             // this construction could throw "sf slot already in use"; post-fix
             // it is deterministically clean -- no drainer targets a sibling.
-            int ackPort = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer ack = new TestWebSocketServer(ackPort, handler)) {
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
                 ack.start();
                 Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
                 String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir
@@ -686,8 +685,8 @@ public class SenderPoolSfTest {
         TestUtils.assertMemoryLeak(() -> {
             // Phase 1: a standalone sender with a DIFFERENT base leaves unacked
             // data under <sf_dir>/legacy.
-            int silentPort = TestPorts.findUnusedPort();
-            try (TestWebSocketServer silent = new TestWebSocketServer(silentPort, new SilentHandler())) {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
                 // close_flush_timeout_millis=0 => close() does not drain, so
@@ -711,9 +710,9 @@ public class SenderPoolSfTest {
             // pooled senders are default-*, so "legacy" is NOT in the excluded
             // namespace -- the background drainer must adopt it, replay its
             // frames to the ack server, and clear the slot.
-            int ackPort = TestPorts.findUnusedPort();
             CountingAckHandler handler = new CountingAckHandler();
-            try (TestWebSocketServer ack = new TestWebSocketServer(ackPort, handler)) {
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
                 ack.start();
                 Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
                 String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir
