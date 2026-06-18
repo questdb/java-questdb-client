@@ -2501,6 +2501,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * The store-and-forward group root ({@code sf_dir}) currently
+         * configured on this builder, or {@code null} when SF is disabled.
+         * Introspection hook for the connection pool, which needs the group
+         * root to locate its own managed slot dirs {@code <sf_dir>/<base>-<i>}
+         * when recovering unacked data a previous run left behind.
+         */
+        public String getConfiguredSfDir() {
+            return sfDir;
+        }
+
+        /**
          * Excludes the connection pool's <em>live</em> slot set from
          * {@link #drainOrphans(boolean)} scanning: a sibling slot under
          * {@code sf_dir} named {@code <base>-<index>} with

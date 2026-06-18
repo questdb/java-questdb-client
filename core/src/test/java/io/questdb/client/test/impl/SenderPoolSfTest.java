@@ -939,6 +939,87 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testInRangeIdleSlotIsRecoveredAtStartupUnderSteadyLowLoad() throws Exception {
+        // The drain exclusion is bounded to [0, maxSize) so a sibling's drainer
+        // never adopts a slot dir the pool intends to (re)create -- that is what
+        // prevents "sf slot already in use" (see
+        // testDrainOrphansPoolDoesNotCannibalizeSiblingSlots). The trade-off was
+        // that an in-range slot left holding unacked data by a previous run was
+        // recovered ONLY when the pool happened to (re)create that index: the
+        // pool pre-warms [0, minSize) and builds [minSize, maxSize) lazily on
+        // demand, so under steady low load a high in-range index was never
+        // rebuilt -- neither drained (excluded) nor recovered -- and its data
+        // was stranded on disk until a restart or load spike.
+        //
+        // The fix has the pool recover its own stranded managed slots once, at
+        // construction, under its own slot reservation (so the cannibalization
+        // race the exclusion guards against still cannot happen). This test
+        // seeds a busy run, then restarts under steady low load and asserts the
+        // idle in-range slots are recovered anyway.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: a busy run at maxSize=4 seeds unacked data into
+            // default-0..3 (silent server never acks; close_flush_timeout=0 so
+            // close() leaves the flushed-but-unacked .sfa on disk).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (SenderPool seed = new SenderPool(seedCfg, 4, 4, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] s = new PooledSender[4];
+                    for (int i = 0; i < 4; i++) {
+                        s[i] = seed.borrow();
+                    }
+                    for (int i = 0; i < 4; i++) {
+                        s[i].table("recover").longColumn("v", i).atNow();
+                        s[i].flush();
+                    }
+                    for (int i = 3; i >= 0; i--) {
+                        s[i].close();
+                    }
+                }
+            }
+            for (int i = 0; i < 4; i++) {
+                Assert.assertTrue("default-" + i + " must hold unacked data",
+                        hasSegmentFile(slot("default-" + i)));
+            }
+
+            // Phase 2: restart at the SAME maxSize=4 (so default-0..3 stay in
+            // range) with steady low load. minSize=0 means prewarm builds
+            // nothing and the lowest-free allocator would never reach the high
+            // indices under a single in-flight borrow -- yet startup recovery
+            // must still empty every in-range slot.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(cfg, 0, 4, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    // All four in-range slots must be recovered by the startup
+                    // pass, even though steady low load never grows the pool to
+                    // their indices.
+                    for (int i = 0; i < 4; i++) {
+                        Assert.assertTrue("in-range idle default-" + i
+                                        + " must be recovered at startup, not stranded",
+                                awaitNoSegmentFile(slot("default-" + i), 15_000));
+                        Assert.assertFalse("recovered slot must not be flagged .failed",
+                                Files.exists(slot("default-" + i) + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                    }
+                    // The recovered frames must have actually reached the server.
+                    Assert.assertTrue("recovered frames must be replayed to the server",
+                            awaitAtLeast(handler.frames, 4, 15_000));
+
+                    // Sanity: the pool is still usable for normal borrows.
+                    PooledSender a = pool.borrow();
+                    a.close();
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Helpers.
     // ----------------------------------------------------------------------

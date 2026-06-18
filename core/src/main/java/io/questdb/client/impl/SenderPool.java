@@ -27,6 +27,8 @@ package io.questdb.client.impl;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.std.Files;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -94,6 +96,10 @@ public final class SenderPool implements AutoCloseable {
     // enabled; null otherwise. Each pooled sender's slot id is
     // {@code slotBaseId + "-" + slotIndex}.
     private final String slotBaseId;
+    // SF group root (sf_dir) when SF is enabled; null otherwise. Used to
+    // locate this pool's own managed slot dirs <sfDir>/<slotBaseId>-<index>
+    // for startup recovery of unacked data left by a previous run.
+    private final String sfDir;
     // Reservation bitmap for SF slot indices [0, maxSize). Guarded by lock.
     // null when SF is disabled (no per-slot identity needed).
     private final boolean[] slotInUse;
@@ -161,6 +167,7 @@ public final class SenderPool implements AutoCloseable {
         Sender.LineSenderBuilder probe = Sender.builder(configurationString);
         this.storeAndForward = probe.isStoreAndForwardEnabled();
         this.slotBaseId = this.storeAndForward ? probe.getConfiguredSenderId() : null;
+        this.sfDir = this.storeAndForward ? probe.getConfiguredSfDir() : null;
         this.slotInUse = this.storeAndForward ? new boolean[maxSize] : null;
         // Pre-warm minSize connections. Pre-warm runs single-threaded in the
         // constructor, so slots 0..minSize-1 are reserved directly.
@@ -195,6 +202,105 @@ public final class SenderPool implements AutoCloseable {
                 }
             }
             throw e;
+        }
+        // Prewarm succeeded; the pool is still single-threaded and unpublished.
+        // Recover any unacked data a previous run left in this pool's own
+        // managed slots that prewarm did not already re-adopt.
+        recoverStrandedManagedSlots();
+    }
+
+    /**
+     * Best-effort, one-shot recovery of unacked data left in this pool's own
+     * managed SF slots {@code [0, maxSize)} by a previous run.
+     * <p>
+     * Every pooled SF sender's orphan drainer deliberately excludes the whole
+     * {@code [0, maxSize)} managed range (via
+     * {@code orphanDrainExcludeManagedSlots}) so a sibling never adopts a slot
+     * dir/lock the pool intends to (re)create -- that exclusion is what keeps
+     * the per-slot ids from resurfacing "sf slot already in use". The
+     * trade-off is that an in-range slot left holding unacked data is otherwise
+     * recovered ONLY when the pool happens to (re)create that index; under
+     * steady low load the pool may never grow to a high index, stranding that
+     * slot's data (durable on disk, but undelivered) until a later restart or
+     * a load spike. This method closes that gap by recovering such slots once,
+     * here at construction.
+     * <p>
+     * It runs while the pool is single-threaded and unpublished, and reserves
+     * each slot index for the duration of its recovery, so no concurrent
+     * borrow can target the dir -- the cannibalization race the drainer
+     * exclusion prevents cannot occur here either. Prewarmed slots (already
+     * live, holding their flock) are skipped; they deliver their recovered
+     * data through normal use.
+     * <p>
+     * Every step is best-effort: a slot with no unacked data is a cheap
+     * directory probe; an unreachable server, a slow drain, or a build/close
+     * Error is logged and never fails construction, since the data stays
+     * durable on disk for a later attempt.
+     */
+    private void recoverStrandedManagedSlots() {
+        if (!storeAndForward || sfDir == null || !Files.exists(sfDir)) {
+            return;
+        }
+        for (int i = 0; i < maxSize; i++) {
+            // Reserve this index unless prewarm already holds it live.
+            boolean reserved;
+            lock.lock();
+            try {
+                reserved = slotInUse[i];
+                if (!reserved) {
+                    slotInUse[i] = true;
+                }
+            } finally {
+                lock.unlock();
+            }
+            if (reserved) {
+                continue;
+            }
+            String slotPath = sfDir + "/" + slotBaseId + "-" + i;
+            boolean stopScan = false;
+            try {
+                if (OrphanScanner.isCandidateOrphan(slotPath)) {
+                    PooledSender recoverer = null;
+                    try {
+                        recoverer = createUnlocked(i);
+                    } catch (Throwable buildErr) {
+                        // A build/connect failure (e.g. server unreachable)
+                        // will very likely repeat for every remaining slot, so
+                        // stop here rather than pay a connect timeout per slot.
+                        LOG.warn("startup SF recovery: could not open slot {} ({}); "
+                                + "skipping remaining slots", slotPath, buildErr.toString());
+                        stopScan = true;
+                    }
+                    if (recoverer != null) {
+                        try {
+                            recoverer.drain(acquireTimeoutMillis);
+                        } catch (Throwable drainErr) {
+                            LOG.warn("startup SF recovery: drain failed for slot {} ({})",
+                                    slotPath, drainErr.toString());
+                        } finally {
+                            try {
+                                recoverer.delegate().close();
+                            } catch (Throwable ignored) {
+                                // Best-effort close: a teardown Error must not
+                                // abort recovery of the remaining slots.
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable scanErr) {
+                LOG.warn("startup SF recovery: scan failed for slot {} ({})",
+                        slotPath, scanErr.toString());
+            } finally {
+                lock.lock();
+                try {
+                    slotInUse[i] = false;
+                } finally {
+                    lock.unlock();
+                }
+            }
+            if (stopScan) {
+                break;
+            }
         }
     }
 
