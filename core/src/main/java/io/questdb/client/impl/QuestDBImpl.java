@@ -29,6 +29,10 @@ import io.questdb.client.QuestDB;
 import io.questdb.client.Query;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+
+import java.util.function.Consumer;
+import java.util.function.IntFunction;
 
 /**
  * Implementation of {@link QuestDB}. Owns the elastic {@link SenderPool}
@@ -56,19 +60,55 @@ public final class QuestDBImpl implements QuestDB {
             long maxLifetimeMillis,
             long housekeeperIntervalMillis
     ) {
+        this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
+                acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
+                housekeeperIntervalMillis, null, null);
+    }
+
+    // Package-private constructor exposing the senderFactory and connectHook test
+    // seams: production passes null for both (-> the real native build/connect
+    // paths). White-box tests in io.questdb.client.test.impl reach this by
+    // reflection (the main module is declared `open`) to make SenderPool prewarm
+    // an observable delegate while QueryClientPool construction throws an Error,
+    // exercising the cleanup catch below.
+    QuestDBImpl(
+            String ingestConfig,
+            String queryConfig,
+            int senderMin,
+            int senderMax,
+            int queryMin,
+            int queryMax,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            long housekeeperIntervalMillis,
+            IntFunction<Sender> senderFactory,
+            Consumer<QwpQueryClient> connectHook
+    ) {
         SenderPool builtSenderPool = null;
         QueryClientPool builtQueryPool = null;
         PoolHousekeeper builtHousekeeper = null;
         try {
             builtSenderPool = new SenderPool(
                     ingestConfig, senderMin, senderMax, acquireTimeoutMillis,
-                    idleTimeoutMillis, maxLifetimeMillis);
+                    idleTimeoutMillis, maxLifetimeMillis, senderFactory);
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
-                    idleTimeoutMillis, maxLifetimeMillis);
+                    idleTimeoutMillis, maxLifetimeMillis, connectHook);
             builtHousekeeper = new PoolHousekeeper(builtSenderPool, builtQueryPool, housekeeperIntervalMillis);
             builtHousekeeper.start();
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
+            // Catch Throwable, not just RuntimeException: this orchestrator is the
+            // direct caller of the SenderPool and QueryClientPool constructors,
+            // both of which run heavy native build/connect paths that can throw an
+            // Error under -ea (AssertionError, OutOfMemoryError). The pools widened
+            // their own prewarm catches to Throwable for exactly this reason; if we
+            // only caught RuntimeException here, an Error from QueryClientPool
+            // construction (or the housekeeper start) would propagate without
+            // closing the already-built SenderPool, stranding its prewarmed
+            // delegates' flocks, mmap'd rings, and I/O threads -- the precise leak
+            // class this teardown-hardening work exists to kill. The cleanup below
+            // is best-effort and rethrows the original failure.
             if (builtHousekeeper != null) {
                 builtHousekeeper.stop();
             }
