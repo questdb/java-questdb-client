@@ -67,14 +67,17 @@ public class OidcAuthException extends RuntimeException {
         return e;
     }
 
-    // Reports characters that must never reach a terminal or a log line. Beyond the C0/C1 controls and
-    // DEL that isISOControl covers, this strips the Unicode "format" category (Cf) - zero-width joiners,
-    // the byte-order mark, and the bidirectional embedding/override/isolate controls - plus an explicit
-    // bidi/BOM set, so an attacker-influenced value (a verification_uri, a user_code, an error string)
-    // carrying a right-to-left override cannot reorder the text a human reads, even on a JDK whose
-    // Unicode tables categorize these differently. Hex literals (not char escapes) keep this source
-    // strictly ASCII, so the file itself carries none of the characters it guards against.
-    static boolean isUnsafeForDisplay(char c) {
+    // Reports characters that must never reach a terminal or a log line. The parameter is a Unicode code
+    // point, not a UTF-16 unit, so a supplementary-plane (>= U+10000) format or control character - a
+    // surrogate pair the JSON lexer reassembled - is judged as one character rather than as two surrogate
+    // halves that each look harmless (the gap that let an invisible U+E00xx "tag" char slip through).
+    // Beyond the C0/C1 controls and DEL that isISOControl covers, this strips the Unicode "format"
+    // category (Cf) - zero-width joiners, the byte-order mark, the bidirectional embedding/override/isolate
+    // controls, and the U+E00xx tag characters - plus an explicit bidi/BOM set, so an attacker-influenced
+    // value (a verification_uri, a user_code, an error string) cannot reorder, hide, or spoof the text a
+    // human reads, even on a JDK whose Unicode tables categorize these differently. Hex literals (not char
+    // escapes) keep this source strictly ASCII, so the file itself carries none of the chars it guards against.
+    static boolean isUnsafeForDisplay(int c) {
         return Character.isISOControl(c)
                 || Character.getType(c) == Character.FORMAT
                 || (c >= 0x202A && c <= 0x202E) // LRE, RLE, PDF, LRO, RLO
@@ -112,11 +115,13 @@ public class OidcAuthException extends RuntimeException {
     // when the exception message is rendered
     private void putSanitized(CharSequence cs) {
         if (cs != null) {
-            for (int i = 0, n = cs.length(); i < n; i++) {
-                char c = cs.charAt(i);
-                if (!isUnsafeForDisplay(c)) {
-                    message.put(c);
+            for (int i = 0, n = cs.length(); i < n; ) {
+                final int cp = Character.codePointAt(cs, i);
+                final int count = Character.charCount(cp);
+                if (!isUnsafeForDisplay(cp)) {
+                    message.put(cs, i, i + count);
                 }
+                i += count;
             }
         }
     }

@@ -507,29 +507,34 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (value == null) {
             return null;
         }
+        final int n = value.length();
         int firstUnsafe = -1;
-        int n = value.length();
-        for (int i = 0; i < n; i++) {
-            if (OidcAuthException.isUnsafeForDisplay(value.charAt(i))) {
+        for (int i = 0; i < n; ) {
+            final int cp = value.codePointAt(i);
+            if (OidcAuthException.isUnsafeForDisplay(cp)) {
                 firstUnsafe = i;
                 break;
             }
+            i += Character.charCount(cp);
         }
         if (firstUnsafe < 0) {
             // common case: nothing to strip
             return value;
         }
         // an attacker-influenced device-auth field smuggled in characters that can rewrite or spoof the
-        // terminal - ANSI escapes, CR/LF, or bidi/zero-width formatting that reorders or hides text - so
-        // strip them; otherwise a right-to-left override could make the verification URL a human reads
+        // terminal - ANSI escapes, CR/LF, or bidi/zero-width formatting (including supplementary-plane
+        // "tag" characters that arrive as surrogate pairs) that reorders or hides text - so strip them
+        // per code point; otherwise a right-to-left override could make the verification URL a human reads
         // differ from the one their browser opens
         StringSink sink = new StringSink();
         sink.put(value, 0, firstUnsafe);
-        for (int i = firstUnsafe + 1; i < n; i++) {
-            char c = value.charAt(i);
-            if (!OidcAuthException.isUnsafeForDisplay(c)) {
-                sink.put(c);
+        for (int i = firstUnsafe; i < n; ) {
+            final int cp = value.codePointAt(i);
+            final int count = Character.charCount(cp);
+            if (!OidcAuthException.isUnsafeForDisplay(cp)) {
+                sink.put(value, i, i + count);
             }
+            i += count;
         }
         return sink.toString();
     }

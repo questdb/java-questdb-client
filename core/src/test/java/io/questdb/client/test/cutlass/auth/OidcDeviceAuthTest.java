@@ -205,6 +205,46 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testChallengeStripsSupplementaryPlaneFormatChars() throws Exception {
+        assertMemoryLeak(() -> {
+            // a hostile IdP smuggles a supplementary-plane (>= U+10000) format char - U+E0001 LANGUAGE TAG,
+            // an invisible Unicode "tag" character (category Cf) used to hide or spoof text - via a
+            // surrogate-pair JSON unicode escape the lexer reassembles. A per-UTF-16-unit filter misses it
+            // (each surrogate half is neither a control nor Cf); the sanitizer must judge it per code point
+            // and strip it, while leaving a legitimate astral character (an emoji) intact.
+            String evilTag = jsonUnicodeEscape(0xDB40) + jsonUnicodeEscape(0xDC01); // U+E0001 as a surrogate pair
+            String emoji = jsonUnicodeEscape(0xD83D) + jsonUnicodeEscape(0xDE00);   // U+1F600 grinning face
+            String evilUserCode = "WD" + evilTag + "JB";
+            String evilUri = "https://verify.example/" + evilTag + "evil" + emoji;
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEV\","
+                            + "\"user_code\":\"" + evilUserCode + "\","
+                            + "\"verification_uri\":\"" + evilUri + "\","
+                            + "\"expires_in\":300,"
+                            + "\"interval\":1"
+                            + "}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-OK", null, null, 3600));
+            };
+            AtomicReference<DeviceAuthorizationChallenge> shown = new AtomicReference<>();
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, shown::set)) {
+                Assert.assertEquals("ACCESS-OK", auth.getToken());
+                DeviceAuthorizationChallenge challenge = shown.get();
+                Assert.assertNotNull(challenge);
+                // the invisible tag char is removed; the readable text and the legitimate emoji survive
+                Assert.assertEquals("WDJB", challenge.getUserCode());
+                Assert.assertEquals("https://verify.example/evil" + new String(Character.toChars(0x1F600)),
+                        challenge.getVerificationUri());
+                assertNoUnsafeDisplayChars(challenge.getUserCode());
+                assertNoUnsafeDisplayChars(challenge.getVerificationUri());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testChunkedTokenResponseParses() throws Exception {
         assertMemoryLeak(() -> {
             // real IdPs use Transfer-Encoding: chunked; a multi-KB id token split across chunks must parse
@@ -1880,16 +1920,18 @@ public class OidcDeviceAuthTest {
     }
 
     private static void assertNoUnsafeDisplayChars(String value) {
-        // mirrors OidcAuthException.isUnsafeForDisplay: no controls, no Cf format chars, no bidi/BOM
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            boolean unsafe = Character.isISOControl(c)
-                    || Character.getType(c) == Character.FORMAT
-                    || (c >= 0x202A && c <= 0x202E)
-                    || (c >= 0x2066 && c <= 0x2069)
-                    || c == 0x200E || c == 0x200F
-                    || c == 0xFEFF;
-            Assert.assertFalse("display-unsafe char U+" + Integer.toHexString(c) + " at index " + i + " in '" + value + "'", unsafe);
+        // mirrors OidcAuthException.isUnsafeForDisplay: no controls, no Cf format chars, no bidi/BOM -
+        // checked per code point so a supplementary-plane (>= U+10000) format/control char is not missed
+        for (int i = 0; i < value.length(); ) {
+            int cp = value.codePointAt(i);
+            boolean unsafe = Character.isISOControl(cp)
+                    || Character.getType(cp) == Character.FORMAT
+                    || (cp >= 0x202A && cp <= 0x202E)
+                    || (cp >= 0x2066 && cp <= 0x2069)
+                    || cp == 0x200E || cp == 0x200F
+                    || cp == 0xFEFF;
+            Assert.assertFalse("display-unsafe char U+" + Integer.toHexString(cp) + " at index " + i + " in '" + value + "'", unsafe);
+            i += Character.charCount(cp);
         }
     }
 
