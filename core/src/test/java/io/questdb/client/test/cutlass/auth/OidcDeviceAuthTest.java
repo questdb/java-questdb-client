@@ -1565,6 +1565,28 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testNonSuccessDeviceAuthorizationResponseRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // RFC 8628 3.2: a device authorization grant is a 2xx response. A non-2xx body that nonetheless
+            // carries device_code/user_code/verification_uri and no OAuth error must be rejected - the client
+            // must not prompt the user and poll on a response the server never signalled success for
+            MockOidcServer.Handler handler = (method, path, body) ->
+                    MockOidcServer.json(403, deviceAuthorizationJson(1, 300));
+            AtomicBoolean prompted = new AtomicBoolean(false);
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, challenge -> prompted.set(true))) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected the non-2xx device authorization response to be rejected");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("unexpected response from the device authorization endpoint"));
+                }
+                Assert.assertFalse("the user must not be prompted on a rejected device authorization response", prompted.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testNullAccessTokenNotServedAsLiteralNull() throws Exception {
         assertMemoryLeak(() -> {
             // a JSON null arrives from the lexer as the literal "null"; "access_token": null must be treated

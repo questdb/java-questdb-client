@@ -797,6 +797,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         int consecutiveTransportErrors = 0;
         while (true) {
             throwIfClosed();
+            // check the deadline before polling so an expiry that elapsed during the previous sleep aborts
+            // here, rather than after one more wasted poll round-trip
+            if (System.nanoTime() >= deadlineNanos) {
+                throw new OidcAuthException("timed out waiting for authorization, the device code expired; please retry");
+            }
             try {
                 int result = pollOnce(deviceCode);
                 if (result == POLL_SUCCESS) {
@@ -834,10 +839,9 @@ public class OidcDeviceAuth implements QuietCloseable {
                     throw e;
                 }
             }
-            if (System.nanoTime() >= deadlineNanos) {
-                throw new OidcAuthException("timed out waiting for authorization, the device code expired; please retry");
-            }
-            sleepBetweenPolls(intervalMillis);
+            // wait for the next poll, but never past the device-code deadline, so the timeout check at the
+            // top of the loop fires promptly at expiry instead of up to one poll interval late
+            sleepBetweenPolls(Math.min(intervalMillis, (deadlineNanos - System.nanoTime()) / 1_000_000L));
         }
     }
 
@@ -934,6 +938,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (deviceAuthParser.error.length() > 0) {
             throw OidcAuthException.oauthError(deviceAuthParser.error, deviceAuthParser.errorDescription);
         }
+        // RFC 8628 3.2: a device authorization grant is a 2xx response. A non-2xx body that carries no OAuth
+        // error (handled above) is a malformed or hostile answer; reject it rather than prompt the user and
+        // poll on it - the same 2xx gate pollOnce and tryRefresh apply before trusting a token
+        if (!isHttpStatusSuccess()) {
+            throw new OidcAuthException().put("unexpected response from the device authorization endpoint [httpStatus=").put(responseStatus).put(']');
+        }
         if (deviceAuthParser.deviceCode.length() == 0 || deviceAuthParser.userCode.length() == 0
                 || deviceAuthParser.verificationUri.length() == 0) {
             throw new OidcAuthException().put("incomplete device authorization response from the identity provider [httpStatus=").put(responseStatus).put(']');
@@ -1019,12 +1029,10 @@ public class OidcDeviceAuth implements QuietCloseable {
             // could not reach the token endpoint, fall back to the interactive flow
             return false;
         } catch (OidcAuthException e) {
-            // a garbled / unparseable refresh response is a transient blip, not a definitive answer;
-            // fall back to the interactive flow rather than fail the whole getToken() call. A genuine
-            // OAuth error arrives in tokenParser.error (handled below), not as a thrown oauthError here
-            if (e.getOauthError() != null) {
-                throw e;
-            }
+            // postForm only throws an OidcAuthException on a parse failure (a garbled / unparseable refresh
+            // response), never an OAuth error: a genuine OAuth error arrives in tokenParser.error and is
+            // handled by the hasRequiredToken check below. So treat this as a transient blip and fall back to
+            // the interactive flow rather than fail the whole getToken() call
             return false;
         }
         // only treat the refresh as a success if a clean 2xx response (no OAuth error) returned the token
