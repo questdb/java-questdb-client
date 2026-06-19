@@ -600,7 +600,7 @@ public class QwpQueryClientFromConfigTest {
         // Verifies the parser's cross-key validation doesn't reject an otherwise
         // legal combination, and that the happy-path client construction works.
         String conf = "wss::addr=a.internal:9443,b.internal:9443,c.internal:9443;"
-                + "path=/read/v1;target=primary;failover=on;"
+                + "target=primary;failover=on;"
                 + "username=admin;password=quest;"
                 + "client_id=batch-job/42;buffer_pool_size=8;"
                 + "compression=zstd;compression_level=5;"
@@ -836,8 +836,10 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testPathOverrideAccepted() {
-        assertParses("ws::addr=db:9000;path=/custom/read;");
+    public void testPathKeyRejected() {
+        // path has been removed; the egress client rejects it like any other
+        // unknown key.
+        assertReject("ws::addr=db:9000;path=/custom/read;", "unknown configuration key: path");
     }
 
     @Test

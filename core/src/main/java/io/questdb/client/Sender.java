@@ -3291,7 +3291,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         || Chars.equals("failover_max_duration_ms", sink)
                         || Chars.equals("initial_credit", sink)
                         || Chars.equals("max_batch_rows", sink)
-                        || Chars.equals("path", sink)
                         || Chars.equals("target", sink)) {
                     // connect-string.md "Query client keys" and "Multi-host failover":
                     // these keys configure the QwpQueryClient (egress) only. The

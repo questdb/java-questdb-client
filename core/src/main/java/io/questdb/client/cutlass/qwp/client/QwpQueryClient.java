@@ -205,7 +205,6 @@ public class QwpQueryClient implements QuietCloseable {
     // user thread's write is visible to a concurrent cancel caller; 64-bit writes
     // are atomic under {@code volatile long}.
     private volatile long currentRequestId = -1L;
-    private String endpointPath = DEFAULT_ENDPOINT_PATH;
     // True by default: on transport failure during execute(), reconnect to
     // another endpoint and replay the query. Callers that prefer to see the
     // error themselves opt out via {@code failover=off} in the connection
@@ -318,7 +317,6 @@ public class QwpQueryClient implements QuietCloseable {
      *       {@link #execute}, reconnect to another endpoint and re-submit the query.
      *       The user handler sees {@link QwpColumnBatchHandler#onFailoverReset} before
      *       replayed batches begin arriving (batch_seq restarts at 0 on the new node).</li>
-     *   <li>{@code path=/read/v1} -- egress endpoint. Default {@value #DEFAULT_ENDPOINT_PATH}.</li>
      *   <li>{@code username=<name>;password=<secret>} -- HTTP Basic authentication. The client builds the
      *       {@code Authorization: Basic <base64>} header from these. Server verifies the credentials
      *       against the same user store the Postgres wire protocol uses, so a user created via
@@ -354,7 +352,7 @@ public class QwpQueryClient implements QuietCloseable {
      * Examples:
      * <pre>
      *   ws::addr=localhost:9000;
-     *   ws::addr=db.internal:9000;path=/read/v1;token=abc123;client_id=dashboard/2.0;
+     *   ws::addr=db.internal:9000;token=abc123;client_id=dashboard/2.0;
      *   ws::addr=db-a:9000,db-b:9000,db-c:9000;target=primary;failover=on;
      * </pre>
      */
@@ -378,7 +376,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
 
         List<Endpoint> parsedEndpoints = new ArrayList<>();
-        String path = DEFAULT_ENDPOINT_PATH;
         String target = TARGET_ANY;
         Boolean failover = null;
         Integer failoverMaxAttempts = null;
@@ -492,9 +489,6 @@ public class QwpQueryClient implements QuietCloseable {
                     authTimeoutMs = parsed;
                     break;
                 }
-                case "path":
-                    path = value;
-                    break;
                 case "username":
                     username = value;
                     break;
@@ -680,7 +674,6 @@ public class QwpQueryClient implements QuietCloseable {
         if (initialCredit != null) {
             client.withInitialCredit(initialCredit);
         }
-        client.withEndpointPath(path);
         client.withBufferPoolSize(poolSize);
         client.withCompression(compression, compressionLevel);
         if (tls) {
@@ -1185,11 +1178,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
         this.compressionPreference = preference;
         this.compressionLevel = level;
-    }
-
-    public void withEndpointPath(String endpointPath) {
-        checkPreConnect("withEndpointPath");
-        this.endpointPath = endpointPath;
     }
 
     /**
@@ -1962,7 +1950,7 @@ public class QwpQueryClient implements QuietCloseable {
         int timeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
         try {
             webSocketClient.connect(ep.host, ep.port);
-            webSocketClient.upgrade(endpointPath, timeoutMs, authorizationHeader);
+            webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authorizationHeader);
         } catch (HttpClientException ex) {
             if (ex.isTimeout()) {
                 HttpClientException timeout = new HttpClientException("WebSocket upgrade to ")

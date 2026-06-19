@@ -787,6 +787,15 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_withPath_fails() {
+        // path is an egress endpoint that the QWP read client no longer accepts.
+        // The Sender rejects it on a ws:: string as an unknown key, matching the
+        // QwpQueryClient (egress).
+        assertBadConfig("ws::addr=localhost:9000;path=/read/v1;",
+                "unknown configuration key [key=path]");
+    }
+
+    @Test
     public void testWsConfigString_withEgressOnlyKeysSilentlyAccepted() {
         // connect-string.md "Query client keys" and "Multi-host failover": these
         // keys configure the QwpQueryClient (egress) only. A ws:: / wss:: connect
@@ -806,7 +815,6 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 "failover_max_duration_ms=30000",
                 "initial_credit=1048576",
                 "max_batch_rows=512",
-                "path=/read/v1",
                 "target=primary",
         };
         StringBuilder all = new StringBuilder("ws::addr=localhost:9000;");

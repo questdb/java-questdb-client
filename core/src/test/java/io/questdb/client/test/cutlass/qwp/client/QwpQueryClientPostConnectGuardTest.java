@@ -57,8 +57,6 @@ public class QwpQueryClientPostConnectGuardTest {
         assertRejects(c -> c.withClientId("id"), "withClientId");
         // withCompression
         assertRejects(c -> c.withCompression("zstd", 3), "withCompression");
-        // withEndpointPath
-        assertRejects(c -> c.withEndpointPath("/x"), "withEndpointPath");
         // withFailover
         assertRejects(c -> c.withFailover(false), "withFailover");
         // withFailoverBackoff

@@ -371,7 +371,6 @@ public class LineSenderBuilderTest {
                     "failover_max_duration_ms=30000",
                     "initial_credit=1048576",
                     "max_batch_rows=10000",
-                    "path=/api/v2/query",
                     "target=primary",
             };
             StringBuilder all = new StringBuilder("http::addr=").append(LOCALHOST).append(";protocol_version=2;");
@@ -379,7 +378,7 @@ public class LineSenderBuilderTest {
                 assertConfStrOk("http::addr=" + LOCALHOST + ";" + kv + ";protocol_version=2;");
                 all.append(kv).append(';');
             }
-            // All 12 keys at once -- a typical shared-config connect string.
+            // All 11 keys at once -- a typical shared-config connect string.
             assertConfStrOk(all.toString());
 
             // Out-of-range / malformed values are silently consumed too -- the
@@ -394,7 +393,6 @@ public class LineSenderBuilderTest {
             // Empty values are well-formed and silently consumed.
             assertConfStrOk("http::addr=" + LOCALHOST + ";compression=;protocol_version=2;");
             assertConfStrOk("http::addr=" + LOCALHOST + ";target=;protocol_version=2;");
-            assertConfStrOk("http::addr=" + LOCALHOST + ";path=;protocol_version=2;");
         });
     }
 
