@@ -68,9 +68,13 @@ public class OidcAuthException extends RuntimeException {
     }
 
     // Reports characters that must never reach a terminal or a log line. The parameter is a Unicode code
-    // point, not a UTF-16 unit, so a supplementary-plane (>= U+10000) format or control character - a
-    // surrogate pair the JSON lexer reassembled - is judged as one character rather than as two surrogate
-    // halves that each look harmless (the gap that let an invisible U+E00xx "tag" char slip through).
+    // point, not a UTF-16 unit: the callers (sanitizeForDisplay / putSanitized) scan with codePointAt, which
+    // reassembles a valid high+low surrogate pair - the form a supplementary-plane char arrives in after the
+    // JSON lexer emits each backslash-u-XXXX escape verbatim - into one code point, so a supplementary-plane format
+    // or control char is judged as one character rather than as two surrogate halves that each look harmless
+    // (the gap that let an invisible U+E00xx "tag" char slip through). An unpaired surrogate (a lone half the
+    // lexer never reassembled) surfaces from codePointAt as a SURROGATE code point and is stripped too, as it
+    // carries no displayable meaning.
     // Beyond the C0/C1 controls and DEL that isISOControl covers, this strips the Unicode "format"
     // category (Cf) - zero-width joiners, the byte-order mark, the bidirectional embedding/override/isolate
     // controls, and the U+E00xx tag characters - plus an explicit bidi/BOM set, so an attacker-influenced
@@ -80,6 +84,7 @@ public class OidcAuthException extends RuntimeException {
     static boolean isUnsafeForDisplay(int c) {
         return Character.isISOControl(c)
                 || Character.getType(c) == Character.FORMAT
+                || Character.getType(c) == Character.SURROGATE // unpaired surrogate (lone half), no displayable meaning
                 || (c >= 0x202A && c <= 0x202E) // LRE, RLE, PDF, LRO, RLO
                 || (c >= 0x2066 && c <= 0x2069) // LRI, RLI, FSI, PDI
                 || c == 0x200E || c == 0x200F   // LRM, RLM

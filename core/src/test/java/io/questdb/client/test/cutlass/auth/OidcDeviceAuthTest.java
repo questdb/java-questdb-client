@@ -39,6 +39,7 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.util.concurrent.CountDownLatch;
@@ -249,6 +250,46 @@ public class OidcDeviceAuthTest {
                 Assert.assertEquals("https://verify.example/FAKE: enter 000", challenge.getVerificationUri());
                 assertNoControlChars(challenge.getUserCode());
                 assertNoControlChars(challenge.getVerificationUri());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testChallengeStripsLoneSurrogates() throws Exception {
+        assertMemoryLeak(() -> {
+            // a hostile IdP smuggles unpaired UTF-16 surrogates into display fields via single backslash-u-XXXX escapes
+            // the lexer emits verbatim (it does not pair them). codePointAt surfaces a lone surrogate as a
+            // SURROGATE code point, which the sanitizer must strip - while a legitimate adjacent high+low pair
+            // (an emoji) that codePointAt reassembles survives.
+            String loneHigh = jsonUnicodeEscape(0xD83D);                          // high surrogate, no low half
+            String loneLow = jsonUnicodeEscape(0xDE00);                           // low surrogate, no high half
+            String emoji = jsonUnicodeEscape(0xD83D) + jsonUnicodeEscape(0xDE00); // U+1F600, a valid pair
+            String evilUserCode = "WD" + loneHigh + "JB";
+            String evilUri = "https://verify.example/" + loneLow + "evil" + emoji;
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEV\","
+                            + "\"user_code\":\"" + evilUserCode + "\","
+                            + "\"verification_uri\":\"" + evilUri + "\","
+                            + "\"expires_in\":300,"
+                            + "\"interval\":1"
+                            + "}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-OK", null, null, 3600));
+            };
+            AtomicReference<DeviceAuthorizationChallenge> shown = new AtomicReference<>();
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, shown::set)) {
+                Assert.assertEquals("ACCESS-OK", auth.getToken());
+                DeviceAuthorizationChallenge challenge = shown.get();
+                Assert.assertNotNull(challenge);
+                // the unpaired surrogates are removed; the readable text and the legitimate emoji survive
+                Assert.assertEquals("WDJB", challenge.getUserCode());
+                Assert.assertEquals("https://verify.example/evil" + new String(Character.toChars(0x1F600)),
+                        challenge.getVerificationUri());
+                assertNoUnsafeDisplayChars(challenge.getUserCode());
+                assertNoUnsafeDisplayChars(challenge.getVerificationUri());
             }
         });
     }
@@ -1440,6 +1481,46 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testLoopbackHostClassifierAcceptsLoopbackForms() throws Exception {
+        // localhost (any case) and the whole 127.0.0.0/8 block are loopback: a plaintext /settings fetch to
+        // them never leaves the host, so settingsChannelIsPlaintext correctly skips the plaintext-channel
+        // pin. This is the pin's only exercised exemption, since MockOidcServer binds to loopback.
+        String[] loopback = {
+                "localhost", "LOCALHOST", "LocalHost",
+                "127.0.0.1", "127.0.0.0", "127.1.2.3", "127.255.255.255", "127.0.0.255"
+        };
+        for (int i = 0; i < loopback.length; i++) {
+            Assert.assertTrue("expected loopback: [" + loopback[i] + "]", invokeIsLoopbackHost(loopback[i]));
+        }
+    }
+
+    @Test(timeout = 30_000)
+    public void testLoopbackHostClassifierRejectsNonLoopbackAndSpoofing() throws Exception {
+        // every other host must classify as non-loopback so the plaintext-channel MITM pin FIRES over http -
+        // the firing path the loopback-bound test mock cannot reach end to end. A classifier that accepted
+        // any of these as loopback would silently disable the pin for a tampered /settings endpoint.
+        String[] notLoopback = {
+                null, "",
+                "example.com", "questdb.example",
+                "127.evil.com",        // starts with "127." but is not a dotted-IPv4 literal
+                "localhost.evil.com",  // not an exact localhost match
+                "evil.localhost",
+                "0x7f.0.0.1",          // hex form is not the dotted 127.0.0.0/8 literal
+                "127.1", "127.0.1", "127", // short forms the OS would expand are deliberately not accepted
+                "127.0.0.256",         // octet out of range
+                "127.0.0.1.evil.com",  // extra label after a valid prefix
+                "127.0.0.1.",          // trailing dot
+                "127..0.1",            // empty octet
+                "1270.0.0.1",          // does not start with "127."
+                "227.0.0.1",           // not the 127 block
+                "0.0.0.0", "10.0.0.1", "192.168.0.1", "::1"
+        };
+        for (int i = 0; i < notLoopback.length; i++) {
+            Assert.assertFalse("expected non-loopback: [" + notLoopback[i] + "]", invokeIsLoopbackHost(notLoopback[i]));
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testMalformedEndpointDoesNotLeakNativeMemory() {
         // build() parses the endpoints up front (for the co-location / issuer-pin checks) and throws on
         // this malformed url before the constructor allocates the native JSON lexer, so the never-returned
@@ -2296,6 +2377,7 @@ public class OidcDeviceAuthTest {
             int cp = value.codePointAt(i);
             boolean unsafe = Character.isISOControl(cp)
                     || Character.getType(cp) == Character.FORMAT
+                    || Character.getType(cp) == Character.SURROGATE
                     || (cp >= 0x202A && cp <= 0x202E)
                     || (cp >= 0x2066 && cp <= 0x2069)
                     || cp == 0x200E || cp == 0x200F
@@ -2314,6 +2396,14 @@ public class OidcDeviceAuthTest {
                 + "\"expires_in\":" + expiresIn + ","
                 + "\"interval\":" + interval
                 + "}";
+    }
+
+    // isLoopbackHost is a private static security classifier (it gates the plaintext-channel MITM pin); the
+    // client is an open module, so reflection reaches it without widening production visibility for the test
+    private static boolean invokeIsLoopbackHost(String host) throws Exception {
+        Method m = OidcDeviceAuth.class.getDeclaredMethod("isLoopbackHost", String.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(null, host);
     }
 
     // builds a JSON unicode escape (backslash-u-XXXX) for a BMP code point without writing one literally

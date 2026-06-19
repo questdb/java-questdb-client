@@ -88,8 +88,12 @@ import java.util.concurrent.locks.ReentrantLock;
  * blocks behind it - but {@link #getTokenSilently()} does not: it never waits for an in-flight
  * sign-in, it fails fast with an {@link OidcAuthException}, so a request/flush path is never
  * stalled. To abort a sign-in that is waiting, call {@link #close()} from another thread: it
- * cancels the in-flight flow, which then fails promptly with an {@link OidcAuthException} rather
- * than running to the device-code timeout.
+ * signals the in-flight flow to stop, which then fails with an {@link OidcAuthException} rather
+ * than polling on until the device code expires. Cancellation is observed between polls (within
+ * about 100ms while a poll interval is being waited out); a poll request already in flight is not
+ * interrupted mid-request, so the abort - and {@link #close()} itself - can take up to one HTTP
+ * request timeout (see {@link Builder#httpTimeoutMillis(int)}), still far short of the device-code
+ * lifetime.
  * <p>
  * Instances are interactive by design and hold a network connection; close them when done.
  * Token state lives in memory only and does not survive a restart of the process.
@@ -385,16 +389,21 @@ public class OidcDeviceAuth implements QuietCloseable {
 
     /**
      * Frees the network connections and native buffers this instance holds. If a {@link #getToken()}
-     * sign-in is in flight on another thread, {@code close()} cancels it, so the blocked sign-in fails
-     * promptly with an {@link OidcAuthException} instead of polling to the device-code timeout. Safe to
-     * call more than once. After close, {@link #getToken()} and {@link #clearCache()} throw.
+     * sign-in is in flight on another thread, {@code close()} signals it to stop, so the sign-in fails
+     * with an {@link OidcAuthException} instead of polling on until the device code expires. The signal
+     * is observed between polls (within about 100ms while a poll interval is being waited out); a poll
+     * request already in flight is not interrupted, so {@code close()} acquires the instance lock - and
+     * returns - only once that request finishes or times out, i.e. after at most one HTTP request timeout
+     * (see {@link Builder#httpTimeoutMillis(int)}), not the full device-code lifetime. Safe to call more
+     * than once. After close, {@link #getToken()} and {@link #clearCache()} throw.
      */
     @Override
     public void close() {
         // flag cancellation before taking the lock: getToken() holds the lock for the whole interactive
         // flow, so close() signals the in-flight sign-in to stop with a lock-free volatile write, then
-        // acquires the lock - which the now-cancelled flow releases promptly - and frees the native
-        // resources. close() never frees while a flow holds the lock, so there is no use-after-free
+        // acquires the lock - which the now-cancelled flow releases once it observes the flag (between
+        // polls, or after an in-flight poll request returns) - and frees the native resources. close()
+        // never frees while a flow holds the lock, so there is no use-after-free
         closed = true;
         lock.lock();
         try {
