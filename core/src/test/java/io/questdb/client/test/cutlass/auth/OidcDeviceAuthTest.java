@@ -699,6 +699,35 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testEndpointParseRejectsDisplayUnsafeUrl() {
+        // a url carrying a display-unsafe character is rejected, and the rejection message itself must carry
+        // none: otherwise a tampered /settings or discovery endpoint url could reorder, hide or forge the
+        // log line / exception text it lands in. The control-char scan alone does not catch these higher
+        // code points (bidi, zero-width, BOM, supplementary-plane tag chars), the last scanned per code point
+        String[] unsafe = {
+                String.valueOf((char) 0x202E),          // right-to-left override
+                String.valueOf((char) 0x200B),          // zero-width space
+                String.valueOf((char) 0xFEFF),          // BOM / zero-width no-break space
+                new String(Character.toChars(0xE0001))  // U+E0001 LANGUAGE TAG (supplementary-plane format char)
+        };
+        for (int i = 0; i < unsafe.length; i++) {
+            String marker = unsafe[i];
+            try {
+                OidcDeviceAuth.builder()
+                        .clientId("c")
+                        .deviceAuthorizationEndpoint("https://idp.example/dev" + marker + "ice")
+                        .tokenEndpoint("https://idp.example/t")
+                        .build();
+                Assert.fail("expected the display-unsafe url to be rejected [index=" + i + "]");
+            } catch (OidcAuthException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("illegal character"));
+                // the raw unsafe character must not survive into the message
+                assertNoUnsafeDisplayChars(e.getMessage());
+            }
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testEndpointParseRejectsMalformedUrls() {
         // Endpoint.parse rejects malformed endpoint URLs at build time
         assertBuildFails("ftp://idp/d", "https://idp/t", "expected http or https");

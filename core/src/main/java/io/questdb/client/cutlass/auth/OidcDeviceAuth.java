@@ -1297,17 +1297,21 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (url == null) {
                 throw new OidcAuthException("url is required");
             }
-            // Reject control characters and whitespace anywhere in the url, before it is split or used. A
-            // smuggled CR/LF (or other control char) in the host would corrupt the outbound Host header;
-            // in the path or query it would inject into the HTTP request line - postForm sends the path
-            // verbatim via .url(endpoint.path) - a request-smuggling / header-injection vector when the url
-            // comes from a tampered /settings or discovery document. Validating up front also keeps the raw
-            // url safe to echo in the parse error messages below.
-            for (int i = 0, n = url.length(); i < n; i++) {
-                char c = url.charAt(i);
-                if (c <= ' ' || c == 0x7f) {
+            // Reject control characters, whitespace and display-unsafe code points anywhere in the url,
+            // before it is split or used. A smuggled CR/LF (or other control char) in the host would corrupt
+            // the outbound Host header; in the path or query it would inject into the HTTP request line -
+            // postForm sends the path verbatim via .url(endpoint.path) - a request-smuggling / header-
+            // injection vector when the url comes from a tampered /settings or discovery document. A bidi,
+            // zero-width or other format character (isUnsafeForDisplay, scanned per code point so a
+            // supplementary-plane one is not missed) would reorder, hide or forge the text when the url is
+            // echoed into a log line or the parse error messages below. Rejecting up front keeps the raw url
+            // safe both on the wire and on screen.
+            for (int i = 0, n = url.length(); i < n; ) {
+                final int cp = url.codePointAt(i);
+                if (cp <= ' ' || OidcAuthException.isUnsafeForDisplay(cp)) {
                     throw new OidcAuthException().put("invalid url, it contains an illegal character [url=").put(sanitizeForDisplay(url)).put(']');
                 }
+                i += Character.charCount(cp);
             }
             int schemeEnd = url.indexOf("://");
             if (schemeEnd < 0) {
