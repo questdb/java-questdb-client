@@ -850,7 +850,9 @@ public class OidcDeviceAuth implements QuietCloseable {
                 } else {
                     consecutiveTransportErrors = 0;
                     if (result == POLL_SLOW_DOWN) {
-                        intervalMillis += SLOW_DOWN_INCREMENT_SECONDS * 1000L;
+                        // grow the interval per RFC 8628, but keep it within the same cap as the initial
+                        // value so repeated slow_down responses cannot inflate the wait without bound
+                        intervalMillis = Math.min(intervalMillis + SLOW_DOWN_INCREMENT_SECONDS * 1000L, MAX_POLL_INTERVAL_SECONDS * 1000L);
                     }
                 }
             } catch (HttpClientException e) {
@@ -1282,6 +1284,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                                 break;
                         }
                     }
+                    field = FIELD_NONE;
                     break;
                 default:
                     break;
@@ -1544,6 +1547,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                                 break;
                         }
                     }
+                    field = FIELD_NONE;
                     break;
                 default:
                     break;
@@ -1602,6 +1606,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                                 break;
                         }
                     }
+                    field = FIELD_NONE;
                     break;
                 default:
                     break;
