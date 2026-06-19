@@ -334,6 +334,16 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
         }
 
+        // A caller-supplied discoveryUrl pins the identity provider just as an issuer does. When /settings
+        // advertised both endpoints the discovery branch above was skipped, so it adopted no issuer from a
+        // discovery document (and a document without an "issuer" field would not have either); derive the
+        // pin origin from the discoveryUrl itself so validateEndpointOrigins still rejects an endpoint that
+        // does not belong to it. Without this, a tampered /settings advertising both endpoints at one
+        // attacker origin would slip past a discoveryUrl pin - the co-location check alone passes trivially.
+        if (resolvedIssuer == null && pinnedDiscoveryUrl != null) {
+            resolvedIssuer = originOf(Endpoint.parse(pinnedDiscoveryUrl));
+        }
+
         if (tokenEndpoint == null) {
             throw new OidcAuthException()
                     .put("could not resolve the OIDC token endpoint from the QuestDB /settings response or the identity ")
@@ -1287,6 +1297,18 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (url == null) {
                 throw new OidcAuthException("url is required");
             }
+            // Reject control characters and whitespace anywhere in the url, before it is split or used. A
+            // smuggled CR/LF (or other control char) in the host would corrupt the outbound Host header;
+            // in the path or query it would inject into the HTTP request line - postForm sends the path
+            // verbatim via .url(endpoint.path) - a request-smuggling / header-injection vector when the url
+            // comes from a tampered /settings or discovery document. Validating up front also keeps the raw
+            // url safe to echo in the parse error messages below.
+            for (int i = 0, n = url.length(); i < n; i++) {
+                char c = url.charAt(i);
+                if (c <= ' ' || c == 0x7f) {
+                    throw new OidcAuthException().put("invalid url, it contains an illegal character [url=").put(sanitizeForDisplay(url)).put(']');
+                }
+            }
             int schemeEnd = url.indexOf("://");
             if (schemeEnd < 0) {
                 throw new OidcAuthException().put("invalid url, expected a scheme [url=").put(url).put(']');
@@ -1328,14 +1350,6 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             if (host.isEmpty()) {
                 throw new OidcAuthException().put("invalid url, the host is empty [url=").put(url).put(']');
-            }
-            for (int i = 0, n = host.length(); i < n; i++) {
-                char c = host.charAt(i);
-                if (c <= ' ' || c == 0x7f) {
-                    // a host carrying control characters or whitespace (e.g. a smuggled CR/LF) would corrupt
-                    // the outbound Host header, so reject it rather than pass it through to the transport
-                    throw new OidcAuthException().put("invalid url, the host contains an illegal character [url=").put(url).put(']');
-                }
             }
             return new Endpoint(host, port, path, isTls);
         }

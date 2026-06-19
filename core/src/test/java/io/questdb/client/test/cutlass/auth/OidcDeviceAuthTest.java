@@ -717,6 +717,11 @@ public class OidcDeviceAuthTest {
         assertBuildFails("https://h\tst/d", "https://idp/t", "illegal character");
         assertBuildFails("https://h st/d", "https://idp/t", "illegal character");
         assertBuildFails("https://idp/d", "https://e\nvil/t", "illegal character");
+        // a control character or whitespace in the path or query is rejected too: postForm sends the path
+        // verbatim on the request line, so a smuggled CR/LF there would inject a header / smuggle a request
+        assertBuildFails("https://idp/devic\r\ne", "https://idp/t", "illegal character");
+        assertBuildFails("https://idp/d", "https://idp/toke\r\nX-Injected:1", "illegal character");
+        assertBuildFails("https://idp/d", "https://idp/t?a=b\nc", "illegal character");
     }
 
     @Test(timeout = 30_000)
@@ -917,6 +922,61 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoveryUrlPinAcceptsOnOriginAdvertisedEndpoints() throws Exception {
+        assertMemoryLeak(() -> {
+            // /settings advertises both endpoints on the same origin as the pinned discoveryUrl, so the pin
+            // is satisfied and the flow completes - and without a discovery round-trip, since the discovery
+            // branch is skipped when both endpoints are already advertised
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            AtomicBoolean wellKnownHit = new AtomicBoolean(false);
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, settingsJson(true, true, server.httpUrl(TOKEN_PATH), server.httpUrl(DEVICE_PATH)));
+                }
+                if (WELL_KNOWN_PATH.equals(path)) {
+                    wellKnownHit.set(true);
+                    return MockOidcServer.json(200, wellKnownJson(server.httpUrl(DEVICE_PATH), server.httpUrl(TOKEN_PATH), server.httpUrl("")));
+                }
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-DUP", "ID-DUP", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, server.httpUrl(WELL_KNOWN_PATH), null, true)) {
+                    Assert.assertEquals("ID-DUP", auth.getToken());
+                }
+                Assert.assertFalse("discovery must be skipped when /settings advertises both endpoints", wellKnownHit.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoveryUrlPinRejectsOffOriginAdvertisedEndpoints() throws Exception {
+        assertMemoryLeak(() -> {
+            // /settings advertises both endpoints directly (so the discovery branch is skipped), but they do
+            // not belong to the pinned discoveryUrl origin; the discoveryUrl pin must reject them just as an
+            // issuer pin does, rather than let a compromised server redirect the sign-in to its chosen origin
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                return MockOidcServer.json(200, settingsJson(true, true, server.httpUrl(TOKEN_PATH), server.httpUrl(DEVICE_PATH)));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, "https://trusted-idp.example/.well-known/openid-configuration", null, true);
+                    Assert.fail("expected the discoveryUrl pin to reject the off-origin endpoints");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testFromQuestDbIssuerPinRejectsOffOriginAdvertisedEndpoint() throws Exception {
         assertMemoryLeak(() -> {
             // the server advertises both endpoints directly, but they do not belong to the pinned issuer
@@ -934,6 +994,31 @@ public class OidcDeviceAuthTest {
                     Assert.fail("expected the issuer pin to reject the off-origin endpoints");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFromQuestDbRejectsCrlfInjectedAdvertisedEndpoint() throws Exception {
+        assertMemoryLeak(() -> {
+            // a tampered /settings advertises a token endpoint whose path carries a JSON-escaped CR/LF; the
+            // lexer decodes it to real control characters, and Endpoint.parse must reject it rather than let
+            // it inject into the outbound request line (header smuggling against the identity provider)
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                String crlf = jsonUnicodeEscape(0x0d) + jsonUnicodeEscape(0x0a);
+                String injectedToken = server.httpUrl(TOKEN_PATH) + crlf + "X-Injected:1";
+                return MockOidcServer.json(200, settingsJson(true, true, injectedToken, server.httpUrl(DEVICE_PATH)));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                    Assert.fail("expected the CR/LF-injected token endpoint to be rejected");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("illegal character"));
                 }
             }
         });
