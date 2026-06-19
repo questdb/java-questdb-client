@@ -1712,6 +1712,29 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testOversizedSettingsBodyAbortsAtSizeCap() throws Exception {
+        assertMemoryLeak(() -> {
+            // a hostile or MITM'd server streams a /settings body larger than the client's response-size cap
+            // (MAX_RESPONSE_BODY_BYTES, 4 MiB); the bounded read must abort on the cap rather than consume the
+            // body without limit. Stream well past the cap - the client stops reading and closes the
+            // connection once it crosses 4 MiB
+            MockOidcServer.Handler handler = (method, path, body) -> MockOidcServer.oversizedJson(8L * 1024 * 1024);
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                    Assert.fail("expected discovery to abort on the response-size cap");
+                } catch (OidcAuthException e) {
+                    // the size-cap failure surfaces as the cause; the body (which carries access/id/refresh
+                    // tokens on a real response) is never embedded in the message
+                    Throwable cause = e.getCause();
+                    Assert.assertNotNull("expected the size-cap failure as the cause", cause);
+                    Assert.assertTrue(cause.getMessage(), cause.getMessage().contains("exceeded the size limit"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testPersistentTransportFailureDuringPollingAborts() throws Exception {
         assertMemoryLeak(() -> {
             // the device endpoint works, but the (co-located) token endpoint drops the connection on every

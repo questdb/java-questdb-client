@@ -36,6 +36,7 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
@@ -77,6 +78,16 @@ public class MockOidcServer implements Closeable {
 
     public static MockResponse json(int status, String body) {
         return new MockResponse(status, body, false);
+    }
+
+    public static MockResponse oversizedJson(long bodyBytes) {
+        // stream a chunked body larger than the client's response-size cap (MAX_RESPONSE_BODY_BYTES), so the
+        // bounded read aborts on the cap instead of letting a hostile or MITM'd server stream an endless body
+        // and wedge the thread. The payload is all whitespace, which the JSON lexer skips, so the byte cap is
+        // what trips - not a parse error, and not the lexer's per-value length limit
+        MockResponse response = new MockResponse(200, "", true);
+        response.oversizedBodyBytes = bodyBytes;
+        return response;
     }
 
     public static MockResponse stall() {
@@ -215,7 +226,38 @@ public class MockOidcServer implements Closeable {
         out.write("0\r\n\r\n".getBytes(StandardCharsets.US_ASCII)); // terminal chunk
     }
 
+    private static void writeOversized(OutputStream out, long bodyBytes) throws IOException {
+        // chunked body of the requested size, all whitespace after the opening brace so the JSON lexer keeps
+        // consuming (no per-value limit) until the client trips its response-size cap. The client aborts and
+        // closes the connection mid-stream once the cap is crossed, so tolerate the write failing under us
+        out.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+        final int chunkLen = 64 * 1024;
+        final byte[] chunk = new byte[chunkLen];
+        Arrays.fill(chunk, (byte) ' ');
+        chunk[0] = '{'; // open an object once; the rest is whitespace, an unterminated body the cap cuts short
+        final byte[] crlf = "\r\n".getBytes(StandardCharsets.US_ASCII);
+        try {
+            long remaining = bodyBytes;
+            while (remaining > 0) {
+                final int len = (int) Math.min(chunkLen, remaining);
+                out.write((Integer.toHexString(len) + "\r\n").getBytes(StandardCharsets.US_ASCII));
+                out.write(chunk, 0, len);
+                out.write(crlf);
+                chunk[0] = ' '; // only the first chunk opens the object; the rest is pure whitespace
+                remaining -= len;
+            }
+            out.write("0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+        } catch (IOException ignore) {
+            // expected: the client aborts on its response-size cap mid-stream and closes the connection
+        }
+    }
+
     private static void writeResponse(OutputStream out, MockResponse response) throws IOException {
+        if (response.oversizedBodyBytes > 0) {
+            writeOversized(out, response.oversizedBodyBytes);
+            return;
+        }
         if (response.stall) {
             // send chunked headers then block without sending the body, so the client must abort on its
             // own configured deadline rather than wedging on the HttpClient default timeout
@@ -291,6 +333,7 @@ public class MockOidcServer implements Closeable {
         final boolean chunked;
         final int status;
         boolean dropConnection;
+        long oversizedBodyBytes;
         boolean stall;
 
         MockResponse(int status, String body, boolean chunked) {
