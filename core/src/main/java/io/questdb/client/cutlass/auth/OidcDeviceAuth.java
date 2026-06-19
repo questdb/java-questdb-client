@@ -791,45 +791,6 @@ public class OidcDeviceAuth implements QuietCloseable {
         return responseStatus.length() > 0 && responseStatus.charAt(0) == '2';
     }
 
-    private int pollOnce(String deviceCode) {
-        formSink.clear();
-        formSink.putAscii("grant_type=").putAscii(urlEncode(GRANT_TYPE_DEVICE_CODE));
-        appendParam(formSink, "device_code", deviceCode);
-        appendParam(formSink, "client_id", clientId);
-
-        tokenParser.clear();
-        // a transport failure here propagates to pollForToken, which retries a brief blip but aborts
-        // on a persistent failure rather than swallowing it as a pending authorization
-        postForm(tokenEndpoint, tokenParser);
-
-        // RFC 6749 5.2: an error response is an error even if the body also carries a token, so handle the
-        // OAuth error first - a token smuggled alongside an error must never count as a grant
-        if (tokenParser.error.length() > 0) {
-            if (Chars.equals(ERROR_AUTHORIZATION_PENDING, tokenParser.error)) {
-                return POLL_PENDING;
-            }
-            if (Chars.equals(ERROR_SLOW_DOWN, tokenParser.error)) {
-                return POLL_SLOW_DOWN;
-            }
-            throw OidcAuthException.oauthError(tokenParser.error, tokenParser.errorDescription);
-        }
-        // RFC 6749 5.1: a grant is a 2xx response carrying a token; a token under a non-2xx status is a
-        // malformed or hostile answer - charge it to the transport-error budget rather than trusting it
-        if (tokenParser.accessToken.length() > 0 || tokenParser.idToken.length() > 0) {
-            if (isHttpStatusSuccess()) {
-                storeTokens(tokenParser);
-                return POLL_SUCCESS;
-            }
-            return POLL_TRANSIENT_ERROR;
-        }
-        // no tokens and no OAuth error: a 2xx is a definitive but malformed answer and aborts; a non-2xx
-        // (a gateway 5xx, an empty body) is a transport-class blip - retry rather than abort the sign-in
-        if (isHttpStatusSuccess()) {
-            throw new OidcAuthException().put("unexpected response from the token endpoint [httpStatus=").put(responseStatus).put(']');
-        }
-        return POLL_TRANSIENT_ERROR;
-    }
-
     private void pollForToken(String deviceCode, int expiresInSeconds, int intervalSeconds) {
         final long deadlineNanos = System.nanoTime() + expiresInSeconds * 1_000_000_000L;
         long intervalMillis = (long) intervalSeconds * 1000L;
@@ -878,6 +839,45 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             sleepBetweenPolls(intervalMillis);
         }
+    }
+
+    private int pollOnce(String deviceCode) {
+        formSink.clear();
+        formSink.putAscii("grant_type=").putAscii(urlEncode(GRANT_TYPE_DEVICE_CODE));
+        appendParam(formSink, "device_code", deviceCode);
+        appendParam(formSink, "client_id", clientId);
+
+        tokenParser.clear();
+        // a transport failure here propagates to pollForToken, which retries a brief blip but aborts
+        // on a persistent failure rather than swallowing it as a pending authorization
+        postForm(tokenEndpoint, tokenParser);
+
+        // RFC 6749 5.2: an error response is an error even if the body also carries a token, so handle the
+        // OAuth error first - a token smuggled alongside an error must never count as a grant
+        if (tokenParser.error.length() > 0) {
+            if (Chars.equals(ERROR_AUTHORIZATION_PENDING, tokenParser.error)) {
+                return POLL_PENDING;
+            }
+            if (Chars.equals(ERROR_SLOW_DOWN, tokenParser.error)) {
+                return POLL_SLOW_DOWN;
+            }
+            throw OidcAuthException.oauthError(tokenParser.error, tokenParser.errorDescription);
+        }
+        // RFC 6749 5.1: a grant is a 2xx response carrying a token; a token under a non-2xx status is a
+        // malformed or hostile answer - charge it to the transport-error budget rather than trusting it
+        if (tokenParser.accessToken.length() > 0 || tokenParser.idToken.length() > 0) {
+            if (isHttpStatusSuccess()) {
+                storeTokens(tokenParser);
+                return POLL_SUCCESS;
+            }
+            return POLL_TRANSIENT_ERROR;
+        }
+        // no tokens and no OAuth error: a 2xx is a definitive but malformed answer and aborts; a non-2xx
+        // (a gateway 5xx, an empty body) is a transport-class blip - retry rather than abort the sign-in
+        if (isHttpStatusSuccess()) {
+            throw new OidcAuthException().put("unexpected response from the token endpoint [httpStatus=").put(responseStatus).put(']');
+        }
+        return POLL_TRANSIENT_ERROR;
     }
 
     private void postForm(Endpoint endpoint, JsonParser parser) {

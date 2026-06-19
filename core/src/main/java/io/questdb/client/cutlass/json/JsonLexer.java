@@ -297,7 +297,10 @@ public class JsonLexer implements Mutable, Closeable {
     private static int parseHex4(CharSequence value, int offset) {
         int result = 0;
         for (int j = 0; j < 4; j++) {
-            int digit = Character.digit(value.charAt(offset + j), 16);
+            final char c = value.charAt(offset + j);
+            // direct lookup in the shared hex table (returns -1 for a non-hex char), cheaper than
+            // Character.digit; the table is ASCII-sized, so a code point above 127 is never a hex digit
+            final int digit = c < 128 ? Numbers.hexNumbers[c] : -1;
             if (digit < 0) {
                 return -1;
             }
@@ -350,22 +353,17 @@ public class JsonLexer implements Mutable, Closeable {
         }
         // the decode above assembled the raw bytes between the quotes verbatim; resolve JSON string escape
         // sequences only when the scan actually saw a backslash. The common no-escape value (and every
-        // escape-free name) returns the assembled sink directly, instead of unescape() rescanning it from
-        // the start just to rediscover that there was nothing to unescape
+        // escape-free name) skips unescape() entirely and returns the assembled sink directly.
         return hasEscape ? unescape(sink) : sink;
     }
 
     private CharSequence unescape(CharSequence raw) {
+        // called only when the scan saw a backslash (hasEscape), so at least one escape is present; walk the
+        // value once, copying plain characters and resolving each escape in place. No separate leading scan
+        // to re-find the first backslash - the lexer already proved one exists.
         final int n = raw.length();
-        int i = 0;
-        while (i < n && raw.charAt(i) != '\\') {
-            i++;
-        }
-        if (i == n) {
-            return raw; // no escapes - the common case, return the assembled value unchanged
-        }
         unescapeSink.clear();
-        unescapeSink.put(raw, 0, i);
+        int i = 0;
         while (i < n) {
             char c = raw.charAt(i);
             if (c != '\\' || i + 1 >= n) {
