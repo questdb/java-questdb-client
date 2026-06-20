@@ -1020,6 +1020,95 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testStartupRecoveryIsBoundedByASharedBudget() throws Exception {
+        // Regression for the startup-recovery budget (M1).
+        // recoverStrandedManagedSlots() runs synchronously in the SenderPool
+        // constructor. A previous run can strand unacked data in EVERY in-range
+        // slot, and if the server is reachable but does not ack, each slot's
+        // drain blocks for the full acquireTimeoutMillis. Without a shared,
+        // whole-scan budget (and a short-circuit on the first drain that fails
+        // to ack) construction blocks for (maxSize - minSize) *
+        // acquireTimeoutMillis -- here 4 * 1s = 4s -- so QuestDB.build() stalls
+        // proportionally to the recovery backlog. The fix caps the TOTAL
+        // recovery at ~one acquireTimeoutMillis and stops scanning the moment a
+        // drain fails to ack, so construction must return well inside that
+        // ceiling no matter how many slots are stranded.
+        final long acquireTimeoutMillis = 1_000L;
+        final int maxSize = 4;
+
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: seed unacked data into default-0..3 against a silent
+            // server (never acks; close_flush_timeout=0 leaves the
+            // flushed-but-unacked .sfa on disk).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (SenderPool seed = new SenderPool(seedCfg, maxSize, maxSize, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] s = new PooledSender[maxSize];
+                    for (int i = 0; i < maxSize; i++) {
+                        s[i] = seed.borrow();
+                    }
+                    for (int i = 0; i < maxSize; i++) {
+                        s[i].table("recover").longColumn("v", i).atNow();
+                        s[i].flush();
+                    }
+                    for (int i = maxSize - 1; i >= 0; i--) {
+                        s[i].close();
+                    }
+                }
+            }
+            for (int i = 0; i < maxSize; i++) {
+                Assert.assertTrue("default-" + i + " must hold unacked data",
+                        hasSegmentFile(slot("default-" + i)));
+            }
+
+            // Phase 2: restart against a STILL-silent (reachable but
+            // never-acking) server. Construction triggers startup recovery over
+            // all four stranded slots. close_flush_timeout=0 makes each
+            // recoverer's close() a fast close, so the measured window isolates
+            // the drain budget: pre-fix it is maxSize * acquireTimeoutMillis;
+            // post-fix it is bounded by ~one acquireTimeoutMillis.
+            try (TestWebSocketServer silent2 = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent2.getPort();
+                silent2.start();
+                Assert.assertTrue(silent2.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+
+                long startNanos = System.nanoTime();
+                SenderPool pool = new SenderPool(cfg, 0, maxSize, acquireTimeoutMillis, Long.MAX_VALUE, Long.MAX_VALUE);
+                long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+                try {
+                    // Headline guarantee: total recovery is bounded by the
+                    // shared budget, NOT maxSize * acquireTimeoutMillis. The 3x
+                    // ceiling leaves generous CI margin over the ~1x post-fix
+                    // cost while still decisively failing the pre-fix 4x stall.
+                    Assert.assertTrue(
+                            "startup recovery must be bounded by a shared budget, not per-slot: took "
+                                    + elapsedMillis + "ms with acquireTimeout=" + acquireTimeoutMillis
+                                    + "ms over " + maxSize + " stranded slots (pre-fix ~"
+                                    + (maxSize * acquireTimeoutMillis) + "ms)",
+                            elapsedMillis < 3 * acquireTimeoutMillis);
+
+                    // Durability, not loss: the silent server never acked, so
+                    // the stranded data is deferred (still on disk for a later
+                    // attempt), never dropped.
+                    for (int i = 0; i < maxSize; i++) {
+                        Assert.assertTrue(
+                                "stranded data must be preserved on disk, not lost: default-" + i,
+                                hasSegmentFile(slot("default-" + i)));
+                    }
+                } finally {
+                    pool.close();
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Helpers.
     // ----------------------------------------------------------------------

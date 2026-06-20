@@ -241,7 +241,24 @@ public final class SenderPool implements AutoCloseable {
         if (!storeAndForward || sfDir == null || !Files.exists(sfDir)) {
             return;
         }
+        // Shared wall-clock budget for the WHOLE scan, not per slot. Without
+        // it a reachable-but-not-acking server pays a full drain timeout on
+        // every stranded slot, so construction could block for up to
+        // (maxSize - minSize) * acquireTimeoutMillis. One acquire timeout is
+        // the ceiling already accepted for a single borrow, so we reuse it as
+        // the total recovery budget: once it is spent the scan stops and the
+        // remaining slots wait for a later attempt (their data stays durable
+        // on disk).
+        final long recoveryDeadlineNanos =
+                System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(acquireTimeoutMillis);
         for (int i = 0; i < maxSize; i++) {
+            long remainingMillis = TimeUnit.NANOSECONDS.toMillis(
+                    recoveryDeadlineNanos - System.nanoTime());
+            if (remainingMillis <= 0) {
+                LOG.warn("startup SF recovery: {}ms budget exhausted; "
+                        + "skipping remaining slots", acquireTimeoutMillis);
+                break;
+            }
             // Reserve this index unless prewarm already holds it live.
             boolean reserved;
             lock.lock();
@@ -273,7 +290,18 @@ public final class SenderPool implements AutoCloseable {
                     }
                     if (recoverer != null) {
                         try {
-                            recoverer.drain(acquireTimeoutMillis);
+                            // Cap the drain at the remaining shared budget and
+                            // short-circuit on a timeout: a server that fails to
+                            // ack within the budget will very likely do the same
+                            // for every remaining slot -- exactly the build-
+                            // failure reasoning above -- so stop rather than pay
+                            // a drain timeout per slot.
+                            if (!recoverer.drain(remainingMillis)) {
+                                LOG.warn("startup SF recovery: drain did not ack slot {} "
+                                        + "within {}ms; skipping remaining slots",
+                                        slotPath, remainingMillis);
+                                stopScan = true;
+                            }
                         } catch (Throwable drainErr) {
                             LOG.warn("startup SF recovery: drain failed for slot {} ({})",
                                     slotPath, drainErr.toString());
