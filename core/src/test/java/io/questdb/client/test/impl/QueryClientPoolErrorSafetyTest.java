@@ -27,6 +27,7 @@ package io.questdb.client.test.impl;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.QueryClientPool;
+import io.questdb.client.impl.QueryWorker;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
@@ -144,9 +145,90 @@ public class QueryClientPoolErrorSafetyTest {
                 baseline, after);
     }
 
+    // Site: acquire() outer catch around createUnlocked()/start(). When start()
+    // throws *after* createUnlocked() returned a fully connected client, that
+    // client (NATIVE_DEFAULT scratch + socket + I/O thread) must be torn down,
+    // otherwise it is stranded -- nothing else references it. This is the
+    // start()-throws path connectHook cannot reach: connect() runs (no-op here,
+    // committing the scratch) and the failure is injected at thread start.
+    // RED: catch does inFlightCreations-- but never created.shutdown() -> leak.
+    // GREEN: catch calls created.shutdown() -> client.close() -> no leak.
+    @Test(timeout = 30_000)
+    public void acquireDoesNotLeakNativeScratchOnErrorFromStart() throws Exception {
+        QueryClientPool pool = newPool(CFG, 0, 1, 250, noConnect(), alwaysThrowStart());
+        try {
+            long baseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+            try {
+                pool.acquire();
+                Assert.fail("expected acquire() to propagate the injected start Error");
+            } catch (Throwable expected) {
+                // wrapped or raw -- the leak check is the discriminator
+            }
+            long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+            Assert.assertEquals(
+                    "acquire() leaked NATIVE_DEFAULT scratch on an Error from start()",
+                    baseline, after);
+            // The reservation must also be restored so the pool is not wedged.
+            Assert.assertEquals(
+                    "acquire() leaked an in-flight creation slot on an Error from start()",
+                    0, inFlightCreations(pool));
+        } finally {
+            pool.close();
+        }
+    }
+
+    // Site: constructor prewarm. When start() throws after createUnlocked()
+    // returned a fully connected client, the just-built worker is not yet in
+    // `all`, so the cleanup loop (which only walks `all`) would skip it. Its
+    // client (NATIVE_DEFAULT) must still be torn down.
+    // RED: cleanup loop walks `all` only -> the worker that failed at start()
+    //      is never closed -> leak.
+    // GREEN: the pending-worker teardown closes it -> no leak.
+    @Test(timeout = 30_000)
+    public void preWarmDoesNotLeakNativeScratchOnErrorFromStart() throws Exception {
+        long baseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+        // First worker is admitted to `all` (start is a no-op here -- the test
+        // never runs queries, and an unstarted thread keeps the later
+        // shutdown()'s join() instant); the second throws at start() after its
+        // client is fully built. That second worker is the stranded one: it
+        // never made it into `all`, so only the new pending-worker teardown
+        // closes it. The assertion catches a leak of EITHER worker's scratch.
+        AtomicInteger calls = new AtomicInteger();
+        Consumer<QueryWorker> startHook = w -> {
+            if (calls.incrementAndGet() >= 2) {
+                throw new AssertionError("injected thread-start failure");
+            }
+            // first worker: leave the dispatch thread unstarted (see above)
+        };
+        try {
+            newPool(CFG, 2, 2, 250, noConnect(), startHook);
+            Assert.fail("expected prewarm to propagate the injected start Error");
+        } catch (Throwable expected) {
+            // expected -- construction aborts
+        }
+        long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+        Assert.assertEquals(
+                "prewarm leaked NATIVE_DEFAULT scratch of a start()-failed worker",
+                baseline, after);
+    }
+
     private static Consumer<QwpQueryClient> alwaysThrow() {
         return client -> {
             throw new AssertionError("injected native connect failure");
+        };
+    }
+
+    // connectHook that connects nothing: fromConfig() has already committed the
+    // NATIVE_DEFAULT scratch, so the client is half-built (scratch, no socket)
+    // -- exactly the state createUnlocked() returns before start() runs.
+    private static Consumer<QwpQueryClient> noConnect() {
+        return client -> {
+        };
+    }
+
+    private static Consumer<QueryWorker> alwaysThrowStart() {
+        return worker -> {
+            throw new AssertionError("injected thread-start failure");
         };
     }
 
@@ -163,5 +245,17 @@ public class QueryClientPoolErrorSafetyTest {
                 String.class, int.class, int.class, long.class, long.class, long.class, Consumer.class);
         c.setAccessible(true);
         return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, connectHook);
+    }
+
+    private static QueryClientPool newPool(
+            String cfg, int min, int max, long acquireMs,
+            Consumer<QwpQueryClient> connectHook, Consumer<QueryWorker> startHook
+    ) throws Exception {
+        Constructor<QueryClientPool> c = QueryClientPool.class.getDeclaredConstructor(
+                String.class, int.class, int.class, long.class, long.class, long.class,
+                Consumer.class, Consumer.class);
+        c.setAccessible(true);
+        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE,
+                connectHook, startHook);
     }
 }

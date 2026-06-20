@@ -81,14 +81,20 @@ final class PoolHousekeeper {
             try {
                 senderPool.reapIdle();
             } catch (Throwable ignored) {
-                // Reaping must not propagate -- it's best-effort housekeeping.
-                // Catch Throwable (not just RuntimeException) so an Error from a
-                // delegate teardown can never kill this daemon thread and stop
-                // all future reaping for the life of the handle.
+                // Defensive, intentionally unreachable in normal operation:
+                // SenderPool.reapIdle() already swallows per-delegate close()
+                // failures internally. The outer catch is a belt-and-braces
+                // guard. Reaping must not propagate -- it's best-effort
+                // housekeeping. Catch Throwable (not just RuntimeException) so
+                // an Error from a delegate teardown can never kill this daemon
+                // thread and stop all future reaping for the life of the handle.
             }
             try {
                 queryPool.reapIdle();
             } catch (Throwable ignored) {
+                // Same rationale as the senderPool guard above: best-effort,
+                // must never propagate, and Throwable (not RuntimeException) so
+                // an Error from query-client teardown cannot kill the daemon.
             }
         }
     }

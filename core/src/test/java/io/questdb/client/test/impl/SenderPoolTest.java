@@ -566,6 +566,11 @@ public class SenderPoolTest {
      * {@link RuntimeException}) on {@code close()} and forwards every other
      * call to the real delegate. Models an -ea assertion firing during native
      * teardown.
+     * <p>
+     * The proxy still forwards {@code close()} to the real delegate (freeing
+     * its native {@code HttpClient} buffers) <em>before</em> throwing, so the
+     * pool sees the injected {@link Error} exactly as it would in production
+     * while the test does not leak native memory.
      */
     private static void installFailingCloseDelegate(PooledSender ps, AtomicInteger closeAttempts) throws Exception {
         Field f = PooledSender.class.getDeclaredField("delegate");
@@ -577,6 +582,16 @@ public class SenderPoolTest {
                 (proxy, method, args) -> {
                     if ("close".equals(method.getName()) && (args == null || args.length == 0)) {
                         closeAttempts.incrementAndGet();
+                        // Free the real delegate's native resources first, then
+                        // surface the injected Error -- the pool's teardown loop
+                        // still observes it, but no native memory is leaked.
+                        try {
+                            real.close();
+                        } catch (Throwable ignore) {
+                            // real.close() on an empty HTTP buffer is a no-op;
+                            // swallow anything so the injected Error is what the
+                            // pool sees.
+                        }
                         throw new AssertionError("injected delegate close() Error");
                     }
                     return method.invoke(real, args);

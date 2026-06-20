@@ -560,6 +560,80 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testSlotLeakedWhenDelegateCloseDoesNotReleaseFlockDuringReap() throws Exception {
+        // Coverage twin of testSlotLeakedWhenDelegateCloseDoesNotReleaseFlock,
+        // but the close-and-reclaim is driven through reapIdle()'s leaked
+        // branch -- reclaimSlot(s, " during idle reaping") -- rather than
+        // discardBroken(). reapIdle is the only one of the three
+        // close-and-reclaim paths whose flockReleased()==false branch had no
+        // test: the existing reap tests use live QWP delegates (flock IS
+        // released => free path), and testReapIdleSurvivesDelegateCloseError
+        // is HTTP (storeAndForward off => reclaimSlot never runs). Pin it: an
+        // idle delegate whose close() leaves the flock held must retire the
+        // slot permanently (leakedSlots++, slotInUse stays set), never hand
+        // the still-locked dir to a later borrow.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // minSize=0 so reapIdle is free to evict; idleTimeout=1ms so a
+                // returned slot is immediately reap-eligible.
+                try (SenderPool pool = new SenderPool(config, 0, 2, 500, 1, Long.MAX_VALUE)) {
+                    PooledSender a = pool.borrow();
+                    Assert.assertTrue(Files.exists(slot("default-0")));
+
+                    // Return it to the idle set with a LIVE delegate, then
+                    // forge the exact leak symptom: tear the delegate down for
+                    // real (so no native resources leak) and clear
+                    // slotLockReleased. close() is idempotent, so reapIdle's
+                    // re-close is a no-op that leaves the flock "still held".
+                    pool.giveBack(a);
+                    Sender delegate = getDelegate(a);
+                    delegate.close();
+                    setBooleanField(delegate, "slotLockReleased", false);
+
+                    // Drive the sweep: the idle timeout has elapsed.
+                    Thread.sleep(10);
+                    pool.reapIdle();
+
+                    // The reap leaked branch must have fired.
+                    Assert.assertEquals("reapIdle must retire the still-locked slot as leaked",
+                            1, getIntField(pool, "leakedSlots"));
+                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
+                    Assert.assertTrue("leaked slot index 0 must stay reserved", slotInUse[0]);
+                    Assert.assertEquals("leaked slot must be observable via leakedSlotCount()",
+                            1, pool.leakedSlotCount());
+
+                    // The next borrow must take a fresh index -- never reuse
+                    // the still-locked default-0 dir.
+                    PooledSender b = pool.borrow();
+                    try {
+                        Assert.assertTrue("new borrow must use a fresh slot dir",
+                                Files.exists(slot("default-1")));
+                        Assert.assertEquals(2, countSlotDirs());
+
+                        // Capacity is permanently reduced by the leaked slot:
+                        // max=2, one leaked + one live => the next borrow times
+                        // out rather than colliding on the locked dir.
+                        try {
+                            pool.borrow();
+                            Assert.fail("capacity must be reduced by the leaked slot");
+                        } catch (LineSenderException e) {
+                            Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
+                        }
+                    } finally {
+                        b.close();
+                    }
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Recovery: stable slot ids let a re-created pool re-adopt unacked data.
     // ----------------------------------------------------------------------
@@ -837,6 +911,47 @@ public class SenderPoolSfTest {
                                 s.close();
                             }
                         }
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFirstBorrowToleratesPreExistingSfDir() throws Exception {
+        // Deterministic complement to testConcurrentFirstBorrowsWithMinZeroRaceOnSfDir.
+        // That test only RAISES the probability of two threads racing into
+        // Files.mkdir(sfDir); on a run where one thread wins the mkdir cleanly
+        // before the others reach the exists() check, the benign-race branch
+        // in Sender.build() is never hit and the test would pass even on
+        // pre-fix code. This test removes the timing dependency: it pre-creates
+        // sfDir so EVERY first borrow finds the parent already present and must
+        // build successfully without throwing "could not create sf_dir".
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Pre-create the shared parent: now build()'s mkdir guard is
+                // skipped on every borrow, deterministically asserting that a
+                // pre-existing sf_dir is tolerated rather than fatal.
+                Assert.assertEquals("pre-create sf_dir must succeed",
+                        0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
+                Assert.assertTrue(Files.exists(sfDir));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 0, 4, 10_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = pool.borrow();
+                    PooledSender b = pool.borrow();
+                    try {
+                        Assert.assertEquals(2, pool.totalSize());
+                        Assert.assertTrue(Files.exists(slot("default-0")));
+                        Assert.assertTrue(Files.exists(slot("default-1")));
+                    } finally {
+                        a.close();
+                        b.close();
                     }
                 }
             }

@@ -59,6 +59,14 @@ public final class QueryClientPool {
     // Throwable (e.g. an -ea AssertionError) from the native connect path,
     // exercising the Error-safe cleanup on the prewarm and acquire paths.
     private final Consumer<QwpQueryClient> connectHook;
+    // Test seam. Production starts the worker's dispatch thread via
+    // QueryWorker.start(); white-box tests in io.questdb.client.test.impl reach
+    // the package-private constructor by reflection to inject a hook that throws
+    // a Throwable (modelling OutOfMemoryError "unable to create native thread")
+    // *after* createUnlocked() has returned a fully connected client, exercising
+    // the Error-safe client teardown on the prewarm and acquire paths -- the
+    // start()-throws path connectHook cannot reach.
+    private final Consumer<QueryWorker> startHook;
     private final long idleTimeoutMillis;
     private final ReentrantLock lock = new ReentrantLock();
     private final long maxLifetimeMillis;
@@ -94,10 +102,31 @@ public final class QueryClientPool {
             long maxLifetimeMillis,
             Consumer<QwpQueryClient> connectHook
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, connectHook, null);
+    }
+
+    // Package-private constructor exposing both the connectHook and startHook
+    // test seams: production passes null for each (-> the real
+    // QwpQueryClient.connect() and QueryWorker.start()). White-box tests in
+    // io.questdb.client.test.impl reach this by reflection to inject a hook that
+    // throws a Throwable from either the native connect path (connectHook) or
+    // the worker thread-start path (startHook).
+    QueryClientPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            Consumer<QwpQueryClient> connectHook,
+            Consumer<QueryWorker> startHook
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
         this.connectHook = connectHook != null ? connectHook : QwpQueryClient::connect;
+        this.startHook = startHook != null ? startHook : QueryWorker::start;
         this.configurationString = configurationString;
         this.minSize = minSize;
         this.maxSize = maxSize;
@@ -108,12 +137,21 @@ public final class QueryClientPool {
         this.available = new ArrayDeque<>(maxSize);
         this.workerReleased = lock.newCondition();
         int built = 0;
+        // Tracks a worker built by createUnlocked() but not yet added to `all`:
+        // it is fully connected (socket + native scratch + I/O thread) the
+        // instant createUnlocked() returns, yet the following start() can still
+        // throw (e.g. OutOfMemoryError creating the dispatch thread). Without
+        // this handle the cleanup loop below -- which only walks `all` -- would
+        // never close it, stranding exactly the I/O thread and native
+        // allocations this catch exists to reclaim.
+        QueryWorker pending = null;
         try {
             for (int i = 0; i < minSize; i++) {
-                QueryWorker w = createUnlocked();
-                w.start();
-                all.add(w);
-                available.add(w);
+                pending = createUnlocked();
+                startHook.accept(pending);
+                all.add(pending);
+                available.add(pending);
+                pending = null;
                 built++;
             }
         } catch (Throwable e) {
@@ -130,6 +168,17 @@ public final class QueryClientPool {
                     // Best-effort cleanup: an Error (e.g. -ea AssertionError)
                     // from one worker's shutdown must not strand the remaining
                     // pre-warmed workers nor mask the original failure below.
+                }
+            }
+            // Close the worker that was built but never made it into `all`
+            // (start() threw after createUnlocked() returned a live client).
+            // createUnlocked() already self-cleans when connect() throws, so
+            // pending is only non-null on the start()-throws path.
+            if (pending != null) {
+                try {
+                    pending.shutdown();
+                } catch (Throwable ignored) {
+                    // Best-effort: must not mask the original failure below.
                 }
             }
             throw e;
@@ -153,10 +202,10 @@ public final class QueryClientPool {
                 if (all.size() + inFlightCreations < maxSize) {
                     inFlightCreations++;
                     lock.unlock();
-                    QueryWorker created;
+                    QueryWorker created = null;
                     try {
                         created = createUnlocked();
-                        created.start();
+                        startHook.accept(created);
                     } catch (Throwable e) {
                         // Catch Throwable, not just RuntimeException:
                         // createUnlocked()/start() run a heavy native build path
@@ -170,6 +219,20 @@ public final class QueryClientPool {
                         inFlightCreations--;
                         workerReleased.signal();
                         lock.unlock();
+                        // createUnlocked() returns a fully connected client
+                        // (socket + native scratch + I/O thread), so if start()
+                        // threw afterwards we must close it here -- nothing else
+                        // references it. createUnlocked() already self-cleans
+                        // when connect() throws, leaving created == null, so
+                        // this only fires on the start()-throws path.
+                        if (created != null) {
+                            try {
+                                created.shutdown();
+                            } catch (Throwable ignored) {
+                                // Best-effort: a teardown Error must not mask the
+                                // original creation failure rethrown below.
+                            }
+                        }
                         throw new QueryException((byte) 0,
                                 "failed to create query client: " + e.getMessage(), e);
                     }
