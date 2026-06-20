@@ -275,9 +275,15 @@ public final class SenderPool implements AutoCloseable {
             }
             String slotPath = sfDir + "/" + slotBaseId + "-" + i;
             boolean stopScan = false;
+            // Hoisted out of the inner try so the outer finally can consult its
+            // flock state: createUnlocked(i) takes the slot flock on <base>-i,
+            // and recoverer.delegate().close() can early-return with the I/O
+            // thread still running (flock still held). Freeing the index in
+            // that case would resurrect "sf slot already in use" on the next
+            // borrow, so the finally must retire it permanently instead.
+            PooledSender recoverer = null;
             try {
                 if (OrphanScanner.isCandidateOrphan(slotPath)) {
-                    PooledSender recoverer = null;
                     try {
                         recoverer = createUnlocked(i);
                     } catch (Throwable buildErr) {
@@ -321,7 +327,21 @@ public final class SenderPool implements AutoCloseable {
             } finally {
                 lock.lock();
                 try {
-                    slotInUse[i] = false;
+                    if (recoverer != null && !flockReleased(recoverer)) {
+                        // close() bailed early with the I/O thread still
+                        // running and the flock still held. Retire the slot
+                        // permanently (mirror discardBroken/reapIdle): keep
+                        // slotInUse[i] set and count it in leakedSlots so the
+                        // borrow() cap math accounts for the lost capacity and
+                        // no later borrow ever reuses the still-locked dir.
+                        leakedSlots++;
+                        LOG.warn("startup SF recovery: slot {} retired permanently: delegate close() returned with "
+                                        + "the flock still held (I/O thread refused to stop); pool capacity reduced by 1, "
+                                        + "now {} of {} usable [leakedSlots={}]",
+                                i, maxSize - leakedSlots, maxSize, leakedSlots);
+                    } else {
+                        slotInUse[i] = false;
+                    }
                 } finally {
                     lock.unlock();
                 }
@@ -523,24 +543,11 @@ public final class SenderPool implements AutoCloseable {
             if (reserved) {
                 lock.lock();
                 try {
-                    if (flockReleased(s)) {
-                        // Flock is released now: return the reserved slot
-                        // index to the free set.
-                        freeSlotIndex(s.slotIndex());
-                        closingSlots--;
+                    // Free the index only when the flock was released; a slot
+                    // left locked is retired permanently. Signal a waiter only
+                    // on the free path, where a new creation can now be admitted.
+                    if (reclaimSlot(s, "")) {
                         slotReleased.signal();
-                    } else {
-                        // close() leaked the still-running I/O thread; the
-                        // flock is still held. Retire the slot permanently:
-                        // keep slotInUse[idx] set and move it from
-                        // closingSlots to leakedSlots so the cap math
-                        // accounts for the lost capacity and no borrow ever
-                        // reuses the still-locked dir.
-                        closingSlots--;
-                        leakedSlots++;
-                        LOG.warn("SF slot {} retired permanently: delegate close() returned with the flock still held " +
-                                        "(I/O thread refused to stop); pool capacity reduced by 1, now {} of {} usable [leakedSlots={}]",
-                                s.slotIndex(), maxSize - leakedSlots, maxSize, leakedSlots);
                     }
                 } finally {
                     lock.unlock();
@@ -640,17 +647,7 @@ public final class SenderPool implements AutoCloseable {
                     for (int i = 0, n = toClose.size(); i < n; i++) {
                         PooledSender s = toClose.get(i);
                         if (s.slotIndex() >= 0) {
-                            if (flockReleased(s)) {
-                                freeSlotIndex(s.slotIndex());
-                                closingSlots--;
-                            } else {
-                                closingSlots--;
-                                leakedSlots++;
-                                LOG.warn("SF slot {} retired permanently during idle reaping: delegate close() returned " +
-                                                "with the flock still held (I/O thread refused to stop); pool capacity reduced by 1, " +
-                                                "now {} of {} usable [leakedSlots={}]",
-                                        s.slotIndex(), maxSize - leakedSlots, maxSize, leakedSlots);
-                            }
+                            reclaimSlot(s, " during idle reaping");
                         }
                     }
                     slotReleased.signalAll();
@@ -784,5 +781,36 @@ public final class SenderPool implements AutoCloseable {
     private static boolean flockReleased(PooledSender s) {
         Sender d = s.delegate();
         return !(d instanceof QwpWebSocketSender) || ((QwpWebSocketSender) d).isSlotLockReleased();
+    }
+
+    /**
+     * Reclaims one SF slot after its delegate's {@code close()} has been
+     * attempted. When the flock was released the index returns to the free
+     * set; when {@code close()} returned with the flock still held (the I/O
+     * thread refused to stop) the slot is retired permanently --
+     * {@code leakedSlots++} and {@code slotInUse[idx]} stays set -- so the cap
+     * math accounts for the lost capacity and no later borrow ever reuses the
+     * still-locked dir. Either way {@code closingSlots} is decremented.
+     * <p>
+     * Caller must hold {@code lock} and is responsible for signalling waiters
+     * (only the free path admits a new creation). Shared by
+     * {@link #discardBroken} and {@link #reapIdle}.
+     *
+     * @param s       sender whose slot is being reclaimed ({@code slotIndex() >= 0})
+     * @param context phrase woven into the retire WARN to name the reclaim
+     *                path (e.g. {@code ""} or {@code " during idle reaping"})
+     * @return {@code true} if the index was freed, {@code false} if retired
+     */
+    private boolean reclaimSlot(PooledSender s, String context) {
+        closingSlots--;
+        if (flockReleased(s)) {
+            freeSlotIndex(s.slotIndex());
+            return true;
+        }
+        leakedSlots++;
+        LOG.warn("SF slot {} retired permanently{}: delegate close() returned with the flock still held " +
+                        "(I/O thread refused to stop); pool capacity reduced by 1, now {} of {} usable [leakedSlots={}]",
+                s.slotIndex(), context, maxSize - leakedSlots, maxSize, leakedSlots);
+        return false;
     }
 }

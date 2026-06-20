@@ -43,6 +43,7 @@ import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -56,6 +57,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.IntFunction;
 
 /**
  * Exhaustive tests for {@link SenderPool} interaction with store-and-forward
@@ -605,6 +607,115 @@ public class SenderPoolSfTest {
                                 awaitAtLeast(handler.frames, 1, 5_000));
                     } finally {
                         s.close();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStartupRecoveryRetiresSlotWhenRecovererCloseLeavesFlockHeld() throws Exception {
+        // C1 regression: the startup recovery loop MUST mirror discardBroken /
+        // reapIdle. When a recoverer's delegate close() returns with the SF
+        // flock still held (the I/O thread refused to stop), the recovered slot
+        // index must be retired permanently (leakedSlots++, slotInUse stays
+        // set) -- NOT freed. Freeing it would let a later borrow re-pick the
+        // still-locked dir and resurrect "sf slot already in use", the exact
+        // failure class this PR exists to kill. Pre-fix the recovery finally
+        // set slotInUse[i]=false unconditionally; this test is RED until it
+        // consults flockReleased() like the other two close-and-reclaim paths.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: leave unacked data on disk under default-0 so startup
+            // recovery treats it as a candidate orphan and builds a recoverer.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg1 = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=500;";
+                try (SenderPool pool = new SenderPool(cfg1, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender s = pool.borrow();
+                    for (int i = 0; i < 3; i++) {
+                        s.table("recover").longColumn("v", i).atNow();
+                        s.flush();
+                    }
+                    s.close();
+                }
+            }
+            Assert.assertTrue("unacked data must persist under default-0",
+                    hasSegmentFile(slot("default-0")));
+
+            // Phase 2: ack-ing server + a new pool whose injected factory forges
+            // the exact leak symptom for the recovery build of slot 0. The
+            // factory returns a real, flock-holding QwpWebSocketSender but
+            // pre-sets closed=true, so the recovery close() is a complete no-op
+            // (checkNotClosed short-circuits drain too): the flock stays held
+            // and slotLockReleased never flips -- precisely a refused I/O-thread
+            // stop. flockReleased(recoverer) must therefore report false.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg2 = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+
+                AtomicReference<Sender> forged = new AtomicReference<>();
+                IntFunction<Sender> factory = idx -> {
+                    Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
+                    if (idx == 0) {
+                        try {
+                            setBooleanField(real, "closed", true);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                        forged.set(real);
+                    }
+                    return real;
+                };
+
+                // minSize=0 so prewarm never adopts slot 0 -- recovery is the
+                // only builder of slot 0. maxSize=2 so a later borrow can still
+                // get a fresh slot (default-1), proving capacity dropped by one.
+                SenderPool pool = newPoolWithFactory(cfg2, 0, 2, 500, factory);
+                try {
+                    // The forge must actually have reached recovery's build.
+                    Assert.assertNotNull("recovery must have built slot 0", forged.get());
+                    // The retire branch must have fired during construction.
+                    Assert.assertEquals("recovery must retire the still-locked slot as leaked",
+                            1, getIntField(pool, "leakedSlots"));
+                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
+                    Assert.assertTrue("retired slot 0 must stay reserved", slotInUse[0]);
+                    Assert.assertFalse("slot 1 must remain free", slotInUse[1]);
+
+                    // A later borrow must take the fresh slot 1, never re-pick
+                    // the still-locked default-0 (which would throw "sf slot
+                    // already in use").
+                    PooledSender b = pool.borrow();
+                    try {
+                        Assert.assertTrue("borrow must use a fresh slot dir",
+                                Files.exists(slot("default-1")));
+                        // Capacity is permanently reduced by the leaked slot:
+                        // max=2, one leaked + one live => the next borrow times
+                        // out rather than colliding on the locked dir.
+                        try {
+                            pool.borrow();
+                            Assert.fail("capacity must be reduced by the leaked slot");
+                        } catch (LineSenderException e) {
+                            Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
+                        }
+                    } finally {
+                        b.close();
+                    }
+                } finally {
+                    pool.close();
+                    // Release the forged recoverer's real flock + native
+                    // resources: pool.close() never saw it (recovery never
+                    // added the recoverer to `all`), so un-forge closed and
+                    // close it for real, otherwise assertMemoryLeak trips.
+                    Sender leaked = forged.get();
+                    if (leaked != null) {
+                        setBooleanField(leaked, "closed", false);
+                        leaked.close();
                     }
                 }
             }
@@ -1245,6 +1356,17 @@ public class SenderPoolSfTest {
         Method m = SenderPool.class.getDeclaredMethod("discardBroken", PooledSender.class);
         m.setAccessible(true);
         m.invoke(pool, ps);
+    }
+
+    // Reaches the package-private senderFactory test seam by reflection so a
+    // test can inject a fake/forged delegate (mirrors SenderPoolErrorSafetyTest).
+    private static SenderPool newPoolWithFactory(
+            String cfg, int min, int max, long acquireMs, IntFunction<Sender> senderFactory
+    ) throws Exception {
+        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
+                String.class, int.class, int.class, long.class, long.class, long.class, IntFunction.class);
+        c.setAccessible(true);
+        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
     }
 
     /**

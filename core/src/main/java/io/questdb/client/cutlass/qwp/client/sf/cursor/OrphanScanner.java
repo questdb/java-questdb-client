@@ -75,40 +75,11 @@ public final class OrphanScanner {
      * "no orphans" answer in that case.
      */
     public static ObjList<String> scan(String sfDir, String excludeSlotName) {
-        ObjList<String> orphans = new ObjList<>();
-        if (sfDir == null || !Files.exists(sfDir)) {
-            return orphans;
-        }
-        long find = Files.findFirst(sfDir);
-        if (find < 0) {
-            LOG.warn("orphan scan could not enumerate {} — treating as no orphans, "
-                    + "but this may indicate a permission or transient error", sfDir);
-            return orphans;
-        }
-        if (find == 0) {
-            return orphans;
-        }
-        try {
-            int rc = 1;
-            while (rc > 0) {
-                String name = Files.utf8ToString(Files.findName(find));
-                rc = Files.findNext(find);
-                if (name == null || ".".equals(name) || "..".equals(name)) {
-                    continue;
-                }
-                if (excludeSlotName != null && excludeSlotName.equals(name)) {
-                    continue;
-                }
-                String slotPath = sfDir + "/" + name;
-                if (!isCandidateOrphan(slotPath)) {
-                    continue;
-                }
-                orphans.add(slotPath);
-            }
-        } finally {
-            Files.findClose(find);
-        }
-        return orphans;
+        // Thin delegate to the managed-aware scan: a null managedBase disables
+        // managed-slot exclusion, so this is exactly the unmanaged scan. Kept
+        // as a convenience overload for callers (and tests) with no pool-minted
+        // slot namespace to skip.
+        return scan(sfDir, excludeSlotName, null, 0);
     }
 
     /**
