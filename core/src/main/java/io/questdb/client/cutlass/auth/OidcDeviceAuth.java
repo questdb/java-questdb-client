@@ -919,11 +919,24 @@ public class OidcDeviceAuth implements QuietCloseable {
         // a message, it carries access, id and refresh tokens that must not reach logs or exceptions
         responseStatus.clear();
         DirectUtf8Sequence statusCode = response.getStatusCode();
+        Response body = response.getResponse();
         if (statusCode != null) {
-            responseStatus.put(statusCode.asAsciiCharSequence());
+            // a well-formed HTTP status code is bare digits, but the header parser copies the status-line
+            // token verbatim apart from SP/CR/LF, so a non-digit byte means a malformed or hostile status
+            // line. Reject it rather than echo any of its bytes - which could smuggle ESC or other control
+            // sequences into a log or terminal when responseStatus is surfaced in a message below - or trust
+            // its leading digit as a success gate. Drain the body first so the keep-alive connection stays usable.
+            CharSequence raw = statusCode.asAsciiCharSequence();
+            for (int i = 0, n = raw.length(); i < n; i++) {
+                char c = raw.charAt(i);
+                if (c < '0' || c > '9') {
+                    discardBody(body, httpTimeoutMillis);
+                    throw new OidcAuthException("the identity provider returned a malformed HTTP status code");
+                }
+                responseStatus.put(c);
+            }
         }
         jsonLexer.clear();
-        Response body = response.getResponse();
         try {
             parseBody(body, jsonLexer, parser, httpTimeoutMillis);
         } catch (JsonException e) {

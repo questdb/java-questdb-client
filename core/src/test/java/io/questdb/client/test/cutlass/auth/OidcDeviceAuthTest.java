@@ -561,6 +561,47 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testNonNumericStatusCodeRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // a hostile or MITM'd identity provider returns a status line whose status-code token carries an
+            // ANSI escape (the HTTP header parser copies the token verbatim apart from SP/CR/LF). A status code
+            // is bare digits, so a non-digit byte is a malformed or hostile status line: the client must reject
+            // it - never echoing its bytes (which could rewrite a terminal or forge a log line) and never
+            // trusting its leading digit as a 2xx success gate
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{\"config\":{"
+                            + "\"acl.oidc.enabled\":true,"
+                            + "\"acl.oidc.client.id\":\"questdb\","
+                            + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl(TOKEN_PATH) + "\","
+                            + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl(DEVICE_PATH) + "\""
+                            + "}}");
+                }
+                // status code "2<ESC>[m00": an ANSI reset spliced into the token. The leading '2' would pass a
+                // first-char success check, but the non-digit bytes must make the client reject the response
+                return MockOidcServer.raw("HTTP/1.1 2\u001b[m00 OK\r\n"
+                        + "Content-Type: application/json\r\n"
+                        + "Content-Length: 2\r\n"
+                        + "\r\n"
+                        + "{}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                    auth.getToken();
+                    Assert.fail("expected a malformed status code to be rejected");
+                } catch (OidcAuthException e) {
+                    String msg = e.getMessage();
+                    Assert.assertTrue(msg, msg.contains("malformed HTTP status code"));
+                    Assert.assertFalse("raw ESC must not leak into the message: " + msg, msg.indexOf('\u001b') >= 0);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testDiscoveryDefaultsScopeToOpenid() throws Exception {
         assertMemoryLeak(() -> {
             AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();

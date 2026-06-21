@@ -90,6 +90,15 @@ public class MockOidcServer implements Closeable {
         return response;
     }
 
+    public static MockResponse raw(String rawResponse) {
+        // write the supplied bytes verbatim as the whole HTTP response, so a test can craft a malformed
+        // status line (for example a status code carrying control bytes) that the int-typed status factories
+        // cannot express
+        MockResponse response = new MockResponse(0, "", false);
+        response.rawResponse = rawResponse;
+        return response;
+    }
+
     public static MockResponse stall() {
         MockResponse response = new MockResponse(200, "", true);
         response.stall = true;
@@ -254,6 +263,11 @@ public class MockOidcServer implements Closeable {
     }
 
     private static void writeResponse(OutputStream out, MockResponse response) throws IOException {
+        if (response.rawResponse != null) {
+            out.write(response.rawResponse.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            return;
+        }
         if (response.oversizedBodyBytes > 0) {
             writeOversized(out, response.oversizedBodyBytes);
             return;
@@ -334,6 +348,7 @@ public class MockOidcServer implements Closeable {
         final int status;
         boolean dropConnection;
         long oversizedBodyBytes;
+        String rawResponse;
         boolean stall;
 
         MockResponse(int status, String body, boolean chunked) {
