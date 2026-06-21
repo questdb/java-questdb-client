@@ -332,18 +332,33 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (tokenEndpoint == null && doc.tokenEndpoint.length() > 0) {
                 tokenEndpoint = doc.tokenEndpoint.toString();
             }
-            // adopt the issuer the discovery document declares, so the endpoint pin below binds to it
-            if (resolvedIssuer == null && doc.issuer.length() > 0) {
-                resolvedIssuer = doc.issuer.toString();
+            // The discovery origin is pinned out of band - the caller's issuer, else the discoveryUrl origin
+            // (derived after this block) - and that pin, never an issuer the document declares about itself,
+            // is the trust anchor the endpoint pin binds to. When discovery ran off a pinned discoveryUrl (no
+            // caller issuer), reject a document whose own "issuer" sits on a different origin (RFC 8414
+            // section 3.3): otherwise a tampered or content-injected document at the pinned url could name an
+            // attacker issuer, co-locate both endpoints under it, and route the device code and long-lived
+            // refresh token there while the co-location and issuer checks below passed trivially. An identity
+            // provider that serves its discovery document on a different origin than its endpoints must
+            // instead be configured with explicit endpoints via OidcDeviceAuth.builder().
+            if (resolvedIssuer == null && pinnedDiscoveryUrl != null && doc.issuer.length() > 0) {
+                Endpoint docIssuer = Endpoint.parse(doc.issuer.toString());
+                Endpoint discoveryEndpoint = Endpoint.parse(pinnedDiscoveryUrl);
+                if (!sameOrigin(docIssuer, discoveryEndpoint)) {
+                    throw new OidcAuthException()
+                            .put("the OIDC discovery document declares an issuer (").put(originOf(docIssuer))
+                            .put(") on a different origin than the pinned discovery url (").put(originOf(discoveryEndpoint))
+                            .put("); refusing to send credentials to an issuer outside the pinned discovery origin");
+                }
             }
         }
 
-        // A caller-supplied discoveryUrl pins the identity provider just as an issuer does. When /settings
-        // advertised both endpoints the discovery branch above was skipped, so it adopted no issuer from a
-        // discovery document (and a document without an "issuer" field would not have either); derive the
-        // pin origin from the discoveryUrl itself so validateEndpointOrigins still rejects an endpoint that
-        // does not belong to it. Without this, a tampered /settings advertising both endpoints at one
-        // attacker origin would slip past a discoveryUrl pin - the co-location check alone passes trivially.
+        // A caller-supplied discoveryUrl pins the identity provider just as an issuer does: derive the pin
+        // origin from the discoveryUrl itself so validateEndpointOrigins rejects any endpoint - read from the
+        // discovery document above, or advertised by /settings when it supplied both endpoints and the
+        // discovery branch was skipped - that does not belong to it. Without this, a tampered response
+        // advertising both endpoints at one attacker origin would slip past a discoveryUrl pin, the
+        // co-location check alone passing trivially.
         if (resolvedIssuer == null && pinnedDiscoveryUrl != null) {
             resolvedIssuer = originOf(Endpoint.parse(pinnedDiscoveryUrl));
         }

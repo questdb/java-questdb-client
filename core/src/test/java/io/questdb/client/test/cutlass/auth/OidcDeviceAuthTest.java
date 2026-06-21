@@ -1024,6 +1024,42 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoveryUrlPinRejectsForeignIssuerInDocument() throws Exception {
+        assertMemoryLeak(() -> {
+            // RFC 8414 section 3.3: discovery runs against the pinned discoveryUrl, and the document it
+            // returns declares an issuer - with co-located token and device endpoints - on an attacker
+            // origin. The discoveryUrl pins the identity provider to its own origin, so a document that
+            // vouches for a foreign issuer (and would route the device code and the long-lived refresh token
+            // there) must be rejected, rather than trusted just because its endpoints agree with its own
+            // self-declared issuer and the co-location check passes trivially.
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (SETTINGS_PATH.equals(path)) {
+                    // OIDC enabled, with a client id, but neither endpoint advertised - so both the token and
+                    // the device endpoint must be read from the discovery document below
+                    return MockOidcServer.json(200, "{\"config\":{"
+                            + "\"acl.oidc.enabled\":true,"
+                            + "\"acl.oidc.client.id\":\"questdb\","
+                            + "\"acl.oidc.scope\":\"openid groups\""
+                            + "}}");
+                }
+                // the document served at the pinned (loopback) discoveryUrl points everything at an attacker origin
+                return MockOidcServer.json(200, wellKnownJson(
+                        "https://attacker.example/device",
+                        "https://attacker.example/token",
+                        "https://attacker.example"));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, server.httpUrl(WELL_KNOWN_PATH), null, true);
+                    Assert.fail("expected the discoveryUrl pin to reject a document declaring a foreign issuer");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("different origin than the pinned discovery url"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testFromQuestDbDiscoveryUrlPinRejectsOffOriginAdvertisedEndpoints() throws Exception {
         assertMemoryLeak(() -> {
             // /settings advertises both endpoints directly (so the discovery branch is skipped), but they do
