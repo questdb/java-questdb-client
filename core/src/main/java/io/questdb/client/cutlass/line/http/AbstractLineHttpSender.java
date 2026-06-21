@@ -1030,16 +1030,16 @@ public abstract class AbstractLineHttpSender implements Sender {
         private void drainAndReset(LineSenderException sink, DirectUtf8Sequence httpStatus) {
             assert state == State.INIT;
 
-            sink.put(messageSink).put(" [http-status=").put(httpStatus.asAsciiCharSequence());
+            sink.putAsPrintable(messageSink).put(" [http-status=").put(httpStatus.asAsciiCharSequence());
             if (codeSink.length() != 0 || errorIdSink.length() != 0 || lineSink.length() != 0) {
                 if (errorIdSink.length() != 0) {
-                    sink.put(", id: ").put(errorIdSink);
+                    sink.put(", id: ").putAsPrintable(errorIdSink);
                 }
                 if (codeSink.length() != 0) {
-                    sink.put(", code: ").put(codeSink);
+                    sink.put(", code: ").putAsPrintable(codeSink);
                 }
                 if (lineSink.length() != 0) {
-                    sink.put(", line: ").put(lineSink);
+                    sink.put(", line: ").putAsPrintable(lineSink);
                 }
             }
             sink.put(']');
