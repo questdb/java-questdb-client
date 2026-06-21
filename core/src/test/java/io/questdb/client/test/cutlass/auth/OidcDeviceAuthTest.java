@@ -1598,6 +1598,41 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testPlaintextSettingsWithAdvertisedEndpointsRequiresPin() throws Exception {
+        assertMemoryLeak(() -> {
+            // the end-to-end firing path of the plaintext-channel MITM pin, which a 127.0.0.1-bound mock
+            // cannot otherwise reach: a non-loopback http /settings that advertises BOTH endpoints (so the
+            // missing-endpoint discovery pin does not apply) must be refused unless the identity provider is
+            // pinned out of band - otherwise a tampered response could route the device code and refresh token
+            // to an attacker. Reaching the mock through "127.1" is the trick: the OS resolver expands the short
+            // form to 127.0.0.1 so the loopback mock answers, but the loopback classifier deliberately rejects
+            // the short form, so the server host is non-loopback and the pin fires.
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                return MockOidcServer.json(200, settingsJson(true, true, server.httpUrl(TOKEN_PATH), server.httpUrl(DEVICE_PATH)));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                String questdbUrl = "http://127.1:" + server.port();
+                // without an out-of-band pin the plaintext channel is untrusted: the pin fires
+                try {
+                    OidcDeviceAuth.fromQuestDB(questdbUrl, (String) null, true);
+                    Assert.fail("expected the plaintext-channel pin to reject /settings-supplied endpoints without a pin");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("reached over insecure http"));
+                }
+                // pinning the issuer to the advertised endpoints' origin satisfies the pin over the very same
+                // plaintext channel, so construction succeeds - proving the pin, not some unrelated rejection,
+                // is what gated the unpinned call above
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(questdbUrl, server.httpUrl(""), true)) {
+                    Assert.assertNotNull(auth);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testMalformedEndpointDoesNotLeakNativeMemory() {
         // build() parses the endpoints up front (for the co-location / issuer-pin checks) and throws on
         // this malformed url before the constructor allocates the native JSON lexer, so the never-returned
