@@ -712,6 +712,36 @@ public class JsonLexerTest {
     }
 
     @Test
+    public void testUnicodeEscapeDecodedAcrossSplitParseCalls() throws Exception {
+        assertMemoryLeak(() -> {
+            // a backslash-u-XXXX escape whose four hex digits straddle two parse() calls (a real HTTP-fragment
+            // boundary) must still decode to one character: the lexer stashes the partial value and resolves the
+            // escape only once the whole value is assembled, so parseHex4 never sees a truncated escape
+            String bs = String.valueOf((char) 92); // a single backslash, built without a literal escape
+            String json = "{\"v\":\"x" + bs + "u0041y\"}"; // value x then the escape for A then y -> xAy
+            int len = json.length();
+            long address = TestUtils.toMemory(json);
+            StringSink captured = new StringSink();
+            JsonParser parser = (code, tag, position) -> {
+                if (code == JsonLexer.EVT_VALUE) {
+                    captured.clear();
+                    captured.put(tag);
+                }
+            };
+            try (JsonLexer lexer = new JsonLexer(4, 1024)) {
+                // split inside the four hex digits: backslash-u-0-0 lands in the first chunk, 4-1 in the second
+                int split = json.indexOf(bs) + 4;
+                lexer.parse(address, address + split, parser);
+                lexer.parse(address + split, address + len, parser);
+                lexer.parseLast();
+                TestUtils.assertEquals("xAy", captured);
+            } finally {
+                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testStringEscapesExoticAndLenient() throws Exception {
         assertMemoryLeak(() -> {
             String bs = String.valueOf((char) 92); // a single backslash, built without a literal escape

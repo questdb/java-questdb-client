@@ -43,6 +43,45 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 public class LineHttpSenderErrorResponseTest {
 
     @Test(timeout = 30_000)
+    public void testServerJsonErrorBidiAndZeroWidthAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // beyond C0 controls, a hostile or proxied endpoint can smuggle bidi overrides and zero-width
+            // characters (as JSON \\uXXXX escapes the lexer decodes) that reorder or hide text in a terminal.
+            // The sender must escape these too, matching the OIDC display sanitizer, so the rendered message
+            // cannot be visually spoofed
+            String errorBody = "{"
+                    + "\"code\":\"invalid\","
+                    + "\"message\":\"safe\\u202ehidden\\u200bend\","
+                    + "\"line\":1,"
+                    + "\"errorId\":\"E1\""
+                    + "}";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's JSON error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        // the visible text survives, but the bidi override (U+202E) and the zero-width space
+                        // (U+200B) arrive escaped, never as raw code points that could reorder or hide text
+                        Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("safe"));
+                        Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("hidden"));
+                        Assert.assertTrue("the bidi override must be escaped: " + msg, msg.contains("\\u202e"));
+                        Assert.assertTrue("the zero-width space must be escaped: " + msg, msg.contains("\\u200b"));
+                        Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                        Assert.assertFalse("a raw zero-width space must not leak: " + msg, msg.indexOf(0x200b) >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testServerJsonErrorControlCharsAreEscaped() throws Exception {
         assertMemoryLeak(() -> {
             // the server's error body carries control characters as JSON escapes: an ESC and a newline in

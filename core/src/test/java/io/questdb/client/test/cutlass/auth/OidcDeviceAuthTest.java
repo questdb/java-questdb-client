@@ -599,6 +599,38 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testNonNumericStatusCodeRejectedDuringPolling() throws Exception {
+        assertMemoryLeak(() -> {
+            // the malformed-status guard must also fire on the token-poll path, where readResponse handles the
+            // POSTs that carry the device code on every poll (testNonNumericStatusCodeRejected covers the
+            // device-authorization POST). The device step succeeds, then the token endpoint returns a status
+            // line whose status-code token splices in an ANSI escape; the client must reject it - never echoing
+            // its bytes, never trusting its leading '2' as a 2xx success gate
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.raw("HTTP/1.1 2\u001b[m00 OK\r\n"
+                        + "Content-Type: application/json\r\n"
+                        + "Content-Length: 2\r\n"
+                        + "\r\n"
+                        + "{}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected a malformed status code on the poll path to be rejected");
+                } catch (OidcAuthException e) {
+                    String msg = e.getMessage();
+                    Assert.assertTrue(msg, msg.contains("malformed HTTP status code"));
+                    Assert.assertFalse("raw ESC must not leak into the message: " + msg, msg.indexOf('\u001b') >= 0);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testDiscoveryDefaultsScopeToOpenid() throws Exception {
         assertMemoryLeak(() -> {
             AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
@@ -1286,6 +1318,71 @@ public class OidcDeviceAuthTest {
                 } finally {
                     auth.close();        // cancel the in-flight sign-in
                     signIn.join(10_000); // let the daemon thread unwind before the leak check
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testGetTokenSilentlyDoesNotBlockBehindSilentRefresh() throws Exception {
+        assertMemoryLeak(() -> {
+            // the flush-path contract also holds when the lock is held by another thread's SILENT REFRESH, not
+            // just an interactive sign-in: getTokenSilently() must fail fast rather than queue behind it. A high
+            // clock skew keeps the cached token permanently "expired", so getTokenSilently() always refreshes;
+            // the token endpoint blocks the refresh response until the test releases it, pinning the lock on the
+            // refresher thread while the second caller races for it
+            CountDownLatch refreshInFlight = new CountDownLatch(1);
+            CountDownLatch releaseRefresh = new CountDownLatch(1);
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    refreshInFlight.countDown();
+                    try {
+                        releaseRefresh.await(20, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return MockOidcServer.json(200, tokenJson("ACCESS-2", null, "REFRESH-2", 1));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 1)); // initial device_code grant
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                         .clientId("questdb")
+                         .deviceAuthorizationEndpoint(server.httpUrl(DEVICE_PATH))
+                         .tokenEndpoint(server.httpUrl(TOKEN_PATH))
+                         .allowInsecureTransport(true)
+                         .clockSkewSeconds(3600) // keep the cached token always "expired" so a refresh runs
+                         .prompt(noopPrompt())
+                         .build()) {
+                auth.getToken(); // sign in once: caches ACCESS-1 and a refresh token
+                Thread refresher = new Thread(() -> {
+                    try {
+                        auth.getTokenSilently();
+                    } catch (Throwable ignore) {
+                        // the refresh completes once released; a late error here is irrelevant to this test
+                    }
+                }, "oidc-silent-refresh");
+                refresher.setDaemon(true);
+                refresher.start();
+                try {
+                    Assert.assertTrue("the silent refresh did not start", refreshInFlight.await(10, TimeUnit.SECONDS));
+                    // a refresh holds the lock now; getTokenSilently() on this thread must fail fast, not block
+                    long startNanos = System.nanoTime();
+                    try {
+                        auth.getTokenSilently();
+                        Assert.fail("expected getTokenSilently() to fail fast while a refresh is in progress");
+                    } catch (OidcAuthException e) {
+                        long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                        Assert.assertTrue("getTokenSilently() blocked " + elapsedMillis + "ms behind the in-flight refresh",
+                                elapsedMillis < 2_000);
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("in progress"));
+                    }
+                } finally {
+                    releaseRefresh.countDown();
+                    refresher.join(10_000);
                 }
             }
         });
@@ -2122,8 +2219,11 @@ public class OidcDeviceAuthTest {
                     Assert.fail("expected the stalled body read to abort");
                 } catch (OidcAuthException e) {
                     long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
-                    // aborted on the ~1s OIDC timeout, not the 600s HttpClient default (or an indefinite wedge)
-                    Assert.assertTrue("aborted too slowly: " + elapsedMillis + "ms", elapsedMillis < 10_000);
+                    // aborted on the configured ~1s OIDC timeout: not instantly (which would be a different
+                    // failure path) and not on the 600s HttpClient default (or an indefinite wedge). The window
+                    // proves the 1s timeout fired, with generous headroom for a slow CI host
+                    Assert.assertTrue("aborted too fast to be the 1s timeout: " + elapsedMillis + "ms", elapsedMillis >= 500);
+                    Assert.assertTrue("aborted too slowly for the 1s timeout: " + elapsedMillis + "ms", elapsedMillis < 5_000);
                 }
             }
         });

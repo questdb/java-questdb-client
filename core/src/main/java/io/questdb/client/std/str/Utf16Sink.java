@@ -52,17 +52,23 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
     }
 
     default void putAsPrintable(char c) {
-        if (c > 0x1F && c != 0x7F) {
+        // escape control characters (C0/C1 and DEL) and Unicode "format" characters - the bidi
+        // embeddings/overrides/isolates, the LRM/RLM marks, zero-width joiners and the BOM - to a visible
+        // \\uXXXX. Left raw, attacker-influenced text (an ILP server's JSON error body, a column name) could
+        // reorder, hide or forge what a human reads in a terminal or a log line; escaping rather than
+        // stripping keeps the original visible for diagnosis. Scanning per UTF-16 unit covers every BMP
+        // threat; a legitimate supplementary-plane char (an emoji surrogate pair) is neither a control nor a
+        // format character and passes through unchanged. The full four hex digits are emitted, so a format
+        // char above U+00FF (e.g. U+202E) renders correctly rather than truncated to its low byte.
+        if (!Character.isISOControl(c) && Character.getType(c) != Character.FORMAT) {
             put(c);
         } else {
             put('\\');
             put('u');
-
-            final int s = (int) c & 0xFF;
-            put('0');
-            put('0');
-            put(hexDigits[s / 0x10]);
-            put(hexDigits[s % 0x10]);
+            put(hexDigits[(c >> 12) & 0xF]);
+            put(hexDigits[(c >> 8) & 0xF]);
+            put(hexDigits[(c >> 4) & 0xF]);
+            put(hexDigits[c & 0xF]);
         }
     }
 
