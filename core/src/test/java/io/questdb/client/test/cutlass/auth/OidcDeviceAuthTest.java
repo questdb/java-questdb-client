@@ -33,10 +33,12 @@ import io.questdb.client.cutlass.json.JsonException;
 import io.questdb.client.cutlass.json.JsonLexer;
 import io.questdb.client.cutlass.json.JsonParser;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.StringSink;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.lang.reflect.Method;
@@ -114,13 +116,15 @@ public class OidcDeviceAuthTest {
         assertMemoryLeak(() -> {
             // endpoints that belong to the pinned issuer origin are accepted; only the origin is pinned, so
             // the differing paths of the device and token endpoints are fine
-            OidcDeviceAuth.builder()
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
                     .clientId("c")
                     .deviceAuthorizationEndpoint("https://idp.example/as/device")
                     .tokenEndpoint("https://idp.example/as/token")
                     .issuer("https://idp.example")
                     .build()
-                    .close();
+            ) {
+                // accepted: build() did not reject the matching-origin endpoints
+            }
         });
     }
 
@@ -128,13 +132,13 @@ public class OidcDeviceAuthTest {
     public void testBuilderIssuerPinRejectsOffOriginEndpoints() {
         // the token/device endpoints do not belong to the pinned issuer origin; build() must reject them
         // rather than send the device code and refresh token outside the trusted issuer
-        try {
-            OidcDeviceAuth.builder()
-                    .clientId("c")
-                    .deviceAuthorizationEndpoint("https://idp.example/device")
-                    .tokenEndpoint("https://idp.example/token")
-                    .issuer("https://other-idp.example")
-                    .build();
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                .clientId("c")
+                .deviceAuthorizationEndpoint("https://idp.example/device")
+                .tokenEndpoint("https://idp.example/token")
+                .issuer("https://other-idp.example")
+                .build()
+        ) {
             Assert.fail("expected the issuer pin to reject off-origin endpoints");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
@@ -143,20 +147,17 @@ public class OidcDeviceAuthTest {
 
     @Test(timeout = 30_000)
     public void testBuilderRejectsMissingRequiredOptions() {
-        try {
-            OidcDeviceAuth.builder().deviceAuthorizationEndpoint("https://h/d").tokenEndpoint("https://h/t").build();
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.builder().deviceAuthorizationEndpoint("https://h/d").tokenEndpoint("https://h/t").build()) {
             Assert.fail("expected clientId validation to fail");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("clientId"));
         }
-        try {
-            OidcDeviceAuth.builder().clientId("c").tokenEndpoint("https://h/t").build();
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.builder().clientId("c").tokenEndpoint("https://h/t").build()) {
             Assert.fail("expected deviceAuthorizationEndpoint validation to fail");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("deviceAuthorizationEndpoint"));
         }
-        try {
-            OidcDeviceAuth.builder().clientId("c").deviceAuthorizationEndpoint("https://h/d").build();
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.builder().clientId("c").deviceAuthorizationEndpoint("https://h/d").build()) {
             Assert.fail("expected tokenEndpoint validation to fail");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("tokenEndpoint"));
@@ -167,12 +168,12 @@ public class OidcDeviceAuthTest {
     public void testBuilderRejectsSplitOriginEndpoints() {
         // the token and device authorization endpoints are on different origins; RFC 8628 co-locates them
         // on one authorization server, so build() must refuse to spread the credential POSTs across hosts
-        try {
-            OidcDeviceAuth.builder()
-                    .clientId("c")
-                    .deviceAuthorizationEndpoint("https://device.example/device")
-                    .tokenEndpoint("https://token.example/token")
-                    .build();
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                .clientId("c")
+                .deviceAuthorizationEndpoint("https://device.example/device")
+                .tokenEndpoint("https://token.example/token")
+                .build()
+        ) {
             Assert.fail("expected split-origin endpoints to be rejected");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("different origins"));
@@ -338,11 +339,7 @@ public class OidcDeviceAuthTest {
     public void testChunkedTokenResponseParses() throws Exception {
         assertMemoryLeak(() -> {
             // real IdPs use Transfer-Encoding: chunked; a multi-KB id token split across chunks must parse
-            StringBuilder bigToken = new StringBuilder();
-            for (int i = 0; i < 3000; i++) {
-                bigToken.append('a');
-            }
-            String idToken = bigToken.toString();
+            String idToken = "a".repeat(3000);
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.chunkedJson(200, deviceAuthorizationJson(1, 300));
@@ -691,8 +688,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("client id"));
@@ -716,8 +712,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("token endpoint"));
@@ -739,8 +734,7 @@ public class OidcDeviceAuthTest {
         } // closed now - nothing listens on deadPort
         long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
         long clientMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
-        try {
-            OidcDeviceAuth.fromQuestDB("http://127.0.0.1:" + deadPort, true);
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB("http://127.0.0.1:" + deadPort, true)) {
             Assert.fail("expected discovery to fail against a dead port");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not reach the QuestDB server"));
@@ -794,12 +788,12 @@ public class OidcDeviceAuthTest {
         };
         for (int i = 0; i < unsafe.length; i++) {
             String marker = unsafe[i];
-            try {
-                OidcDeviceAuth.builder()
-                        .clientId("c")
-                        .deviceAuthorizationEndpoint("https://idp.example/dev" + marker + "ice")
-                        .tokenEndpoint("https://idp.example/t")
-                        .build();
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("https://idp.example/dev" + marker + "ice")
+                    .tokenEndpoint("https://idp.example/t")
+                    .build()
+            ) {
                 Assert.fail("expected the display-unsafe url to be rejected [index=" + i + "]");
             } catch (OidcAuthException e) {
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains("illegal character"));
@@ -998,8 +992,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), server.httpUrl(""), true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), server.httpUrl(""), true)) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("device_authorization_endpoint"));
@@ -1090,8 +1083,7 @@ public class OidcDeviceAuthTest {
                         "https://attacker.example"));
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, server.httpUrl(WELL_KNOWN_PATH), null, true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, server.httpUrl(WELL_KNOWN_PATH), null, true)) {
                     Assert.fail("expected the discoveryUrl pin to reject a document declaring a foreign issuer");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("different origin than the pinned discovery url"));
@@ -1113,8 +1105,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, "https://trusted-idp.example/.well-known/openid-configuration", null, true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, "https://trusted-idp.example/.well-known/openid-configuration", null, true)) {
                     Assert.fail("expected the discoveryUrl pin to reject the off-origin endpoints");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
@@ -1136,8 +1127,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), "https://idp.attacker.example", true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), "https://idp.attacker.example", true)) {
                     Assert.fail("expected the issuer pin to reject the off-origin endpoints");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
@@ -1161,8 +1151,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
                     Assert.fail("expected the CR/LF-injected token endpoint to be rejected");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("illegal character"));
@@ -1176,8 +1165,7 @@ public class OidcDeviceAuthTest {
         // the default-secure fromQuestDB overload must reject an http:// QuestDB server url (the discovery
         // response and the sign-in it bootstraps would travel in cleartext) unless insecure transport is
         // explicitly opted in
-        try {
-            OidcDeviceAuth.fromQuestDB("http://questdb.example:9000");
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB("http://questdb.example:9000")) {
             Assert.fail("expected an http server url to be rejected");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("QuestDB server url"));
@@ -1196,8 +1184,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("device authorization endpoint"));
@@ -1214,8 +1201,7 @@ public class OidcDeviceAuthTest {
                     MockOidcServer.json(200, settingsJson(false, false, serverRef.get().httpUrl(TOKEN_PATH), null));
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("OIDC is not enabled"));
@@ -1492,36 +1478,38 @@ public class OidcDeviceAuthTest {
     public void testInsecureEndpointsRejectedUnlessOptedIn() throws Exception {
         assertMemoryLeak(() -> {
             // http endpoints carry tokens in cleartext; the client must refuse them unless the caller opts in
-            try {
-                OidcDeviceAuth.builder()
-                        .clientId("c")
-                        .deviceAuthorizationEndpoint("http://idp.example/device")
-                        .tokenEndpoint("https://idp.example/token")
-                        .build();
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("http://idp.example/device")
+                    .tokenEndpoint("https://idp.example/token")
+                    .build()
+            ) {
                 Assert.fail("expected the http device authorization endpoint to be rejected");
             } catch (OidcAuthException e) {
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains("device authorization endpoint"));
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains("insecure http"));
             }
-            try {
-                OidcDeviceAuth.builder()
-                        .clientId("c")
-                        .deviceAuthorizationEndpoint("https://idp.example/device")
-                        .tokenEndpoint("http://idp.example/token")
-                        .build();
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("https://idp.example/device")
+                    .tokenEndpoint("http://idp.example/token")
+                    .build()
+            ) {
                 Assert.fail("expected the http token endpoint to be rejected");
             } catch (OidcAuthException e) {
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains("token endpoint"));
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains("insecure http"));
             }
             // opting in allows http, for local development
-            OidcDeviceAuth.builder()
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
                     .clientId("c")
                     .deviceAuthorizationEndpoint("http://idp.example/device")
                     .tokenEndpoint("http://idp.example/token")
                     .allowInsecureTransport(true)
                     .build()
-                    .close();
+            ) {
+                // accepted: http endpoints are allowed once insecure transport is opted in
+            }
         });
     }
 
@@ -1533,24 +1521,20 @@ public class OidcDeviceAuthTest {
             // such a split value still parses. This mirrors OidcDeviceAuth's production sizing
             // (JSON_LEXER_CACHE_SIZE / JSON_LEXER_MAX_VALUE_BYTES); the original (1024, 1024) sizing
             // rejected a >1024-byte split value with "String is too long".
-            StringBuilder value = new StringBuilder();
-            for (int i = 0; i < 4000; i++) {
-                value.append('a');
-            }
-            String json = "{\"id_token\":\"" + value + "\"}";
+            String json = "{\"id_token\":\"" + "a".repeat(4000) + "\"}";
             int len = json.length();
             int split = "{\"id_token\":\"".length() + 1300; // boundary inside the value, past the old 1024 limit
             long address = TestUtils.toMemory(json);
             try {
                 try {
-                    parseSplitValue(1024, 1024, address, split, len);
+                    parseSplitValue(1024, address, split, len);
                     Assert.fail("the original 1024-byte cache limit must reject a split multi-KB token value");
                 } catch (JsonException expected) {
                     Assert.assertTrue(expected.getFlyweightMessage().toString(),
                             expected.getFlyweightMessage().toString().contains("String is too long"));
                 }
                 // the sizing OidcDeviceAuth now uses parses the same split value
-                parseSplitValue(1024, 1 << 20, address, split, len);
+                parseSplitValue(1 << 20, address, split, len);
             } finally {
                 Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
             }
@@ -1566,8 +1550,8 @@ public class OidcDeviceAuthTest {
                 "localhost", "LOCALHOST", "LocalHost",
                 "127.0.0.1", "127.0.0.0", "127.1.2.3", "127.255.255.255", "127.0.0.255"
         };
-        for (int i = 0; i < loopback.length; i++) {
-            Assert.assertTrue("expected loopback: [" + loopback[i] + "]", invokeIsLoopbackHost(loopback[i]));
+        for (String s : loopback) {
+            Assert.assertTrue("expected loopback: [" + s + "]", invokeIsLoopbackHost(s));
         }
     }
 
@@ -1592,13 +1576,17 @@ public class OidcDeviceAuthTest {
                 "227.0.0.1",           // not the 127 block
                 "0.0.0.0", "10.0.0.1", "192.168.0.1", "::1"
         };
-        for (int i = 0; i < notLoopback.length; i++) {
-            Assert.assertFalse("expected non-loopback: [" + notLoopback[i] + "]", invokeIsLoopbackHost(notLoopback[i]));
+        for (String s : notLoopback) {
+            Assert.assertFalse("expected non-loopback: [" + s + "]", invokeIsLoopbackHost(s));
         }
     }
 
     @Test(timeout = 30_000)
     public void testPlaintextSettingsWithAdvertisedEndpointsRequiresPin() throws Exception {
+        // The "127.1" reachability trick below depends on the OS resolver expanding the abbreviated IPv4
+        // form to 127.0.0.1 (inet_aton, on Linux/macOS). Windows getaddrinfo - which the native HTTP client
+        // resolves through - does not accept the short form, so the loopback mock is unreachable there.
+        Assume.assumeTrue("requires inet_aton-style short-form IPv4 resolution, unavailable on Windows", Os.type != Os.WINDOWS);
         assertMemoryLeak(() -> {
             // the end-to-end firing path of the plaintext-channel MITM pin, which a 127.0.0.1-bound mock
             // cannot otherwise reach: a non-loopback http /settings that advertises BOTH endpoints (so the
@@ -1616,8 +1604,7 @@ public class OidcDeviceAuthTest {
                 serverRef.set(server);
                 String questdbUrl = "http://127.1:" + server.port();
                 // without an out-of-band pin the plaintext channel is untrusted: the pin fires
-                try {
-                    OidcDeviceAuth.fromQuestDB(questdbUrl, (String) null, true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(questdbUrl, (String) null, true)) {
                     Assert.fail("expected the plaintext-channel pin to reject /settings-supplied endpoints without a pin");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("reached over insecure http"));
@@ -1639,13 +1626,13 @@ public class OidcDeviceAuthTest {
         // instance cannot leak it. Measure the parser tag directly - the module's assertMemoryLeak does not
         // flag a single-tag growth.
         long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
-        try {
-            OidcDeviceAuth.builder()
-                    .clientId("c")
-                    .deviceAuthorizationEndpoint("not-a-url")
-                    .tokenEndpoint("https://idp.example/token")
-                    .allowInsecureTransport(true)
-                    .build();
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                .clientId("c")
+                .deviceAuthorizationEndpoint("not-a-url")
+                .tokenEndpoint("https://idp.example/token")
+                .allowInsecureTransport(true)
+                .build()
+        ) {
             Assert.fail("expected Endpoint.parse to reject the malformed url");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("expected a scheme"));
@@ -1854,8 +1841,7 @@ public class OidcDeviceAuthTest {
             // connection once it crosses 4 MiB
             MockOidcServer.Handler handler = (method, path, body) -> MockOidcServer.oversizedJson(8L * 1024 * 1024);
             try (MockOidcServer server = new MockOidcServer(handler)) {
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
                     Assert.fail("expected discovery to abort on the response-size cap");
                 } catch (OidcAuthException e) {
                     // the size-cap failure surfaces as the cause; the body (which carries access/id/refresh
@@ -2334,8 +2320,7 @@ public class OidcDeviceAuthTest {
             MockOidcServer.Handler handler = (method, path, body) ->
                     MockOidcServer.json(200, "{\"config\":{\"acl.oidc.enabled\":true,\"acl.oidc.client.id\":\"questdb\"");
             try (MockOidcServer server = new MockOidcServer(handler)) {
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
                     Assert.fail("expected discovery to reject the truncated settings body");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not parse"));
@@ -2418,28 +2403,32 @@ public class OidcDeviceAuthTest {
         // calling getToken()/clearCache() after close() must fail with a clear "closed" error rather than
         // NPE on the freed JSON lexer or resurrect (and leak) a fresh native HTTP client
         long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
-        OidcDeviceAuth auth = OidcDeviceAuth.builder()
+        // close() is the subject under test, so it is called explicitly mid-body; the try-with-resources
+        // close at scope exit is a harmless idempotent second close that also covers an early assertion throw
+        try (OidcDeviceAuth auth = OidcDeviceAuth.builder()
                 .clientId("c")
                 .deviceAuthorizationEndpoint("https://idp.example/device")
                 .tokenEndpoint("https://idp.example/token")
-                .build();
-        auth.close();
-        try {
-            auth.getToken();
-            Assert.fail("expected getToken() after close() to be rejected");
-        } catch (OidcAuthException e) {
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("closed"));
+                .build()
+        ) {
+            auth.close();
+            try {
+                auth.getToken();
+                Assert.fail("expected getToken() after close() to be rejected");
+            } catch (OidcAuthException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("closed"));
+            }
+            try {
+                auth.clearCache();
+                Assert.fail("expected clearCache() after close() to be rejected");
+            } catch (OidcAuthException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("closed"));
+            }
+            // getToken() must reject before resurrecting a native HTTP client, and close() must have freed
+            // the JSON lexer, so the parser-tag memory returns to its pre-construction level
+            Assert.assertEquals("a closed instance must not leak or resurrect native memory",
+                    parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
         }
-        try {
-            auth.clearCache();
-            Assert.fail("expected clearCache() after close() to be rejected");
-        } catch (OidcAuthException e) {
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("closed"));
-        }
-        // getToken() must reject before resurrecting a native HTTP client, and close() must have freed
-        // the JSON lexer, so the parser-tag memory returns to its pre-construction level
-        Assert.assertEquals("a closed instance must not leak or resurrect native memory",
-                parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
     }
 
     @Test(timeout = 30_000)
@@ -2509,12 +2498,12 @@ public class OidcDeviceAuthTest {
     }
 
     private static void assertBuildFails(String deviceEndpoint, String tokenEndpoint, String expectedMessage) {
-        try {
-            OidcDeviceAuth.builder()
-                    .clientId("c")
-                    .deviceAuthorizationEndpoint(deviceEndpoint)
-                    .tokenEndpoint(tokenEndpoint)
-                    .build();
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                .clientId("c")
+                .deviceAuthorizationEndpoint(deviceEndpoint)
+                .tokenEndpoint(tokenEndpoint)
+                .build()
+        ) {
             Assert.fail("expected build to fail for device=" + deviceEndpoint + " token=" + tokenEndpoint);
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
@@ -2588,8 +2577,8 @@ public class OidcDeviceAuthTest {
         };
     }
 
-    private static void parseSplitValue(int cacheSize, int cacheSizeLimit, long address, int split, int len) throws JsonException {
-        try (JsonLexer lexer = new JsonLexer(cacheSize, cacheSizeLimit)) {
+    private static void parseSplitValue(int cacheSizeLimit, long address, int split, int len) throws JsonException {
+        try (JsonLexer lexer = new JsonLexer(1024, cacheSizeLimit)) {
             lexer.parse(address, address + split, NOOP_JSON_PARSER);
             lexer.parse(address + split, address + len, NOOP_JSON_PARSER);
             lexer.parseLast();
