@@ -25,9 +25,8 @@
 package io.questdb.client.cutlass.auth;
 
 /**
- * The user-facing part of an RFC 8628 device authorization response: the code the
- * user has to type and the URL where they type it. A {@link DeviceCodePrompt}
- * receives this object and is responsible for showing it to the user.
+ * The user-facing part of an RFC 8628 device authorization response: the code to type and the URL
+ * to type it at. A {@link DeviceCodePrompt} receives this object and shows it to the user.
  * <p>
  * The {@code device_code} secret is deliberately not exposed here; it stays inside
  * {@link OidcDeviceAuth} and is never shown to the user.
@@ -54,36 +53,36 @@ public class DeviceAuthorizationChallenge {
     }
 
     /**
-     * @return how long, in seconds, the {@link #getUserCode() user code} stays valid.
+     * @return seconds the {@link #getUserCode() user code} stays valid.
      */
     public int getExpiresInSeconds() {
         return expiresInSeconds;
     }
 
     /**
-     * @return the minimum number of seconds the client must wait between polls.
+     * @return minimum seconds the client must wait between polls.
      */
     public int getIntervalSeconds() {
         return intervalSeconds;
     }
 
     /**
-     * @return the code the user has to enter at the {@link #getVerificationUri() verification URL}.
+     * @return the code the user enters at the {@link #getVerificationUri() verification URL}.
      */
     public String getUserCode() {
         return userCode;
     }
 
     /**
-     * @return the URL the user has to open to authorize the device.
+     * @return the URL the user opens to authorize the device.
      */
     public String getVerificationUri() {
         return verificationUri;
     }
 
     /**
-     * @return a URL that already embeds the user code, so the user does not have to type it,
-     * or {@code null} when the identity provider does not supply one.
+     * @return a URL with the user code already embedded, so the user need not type it, or
+     * {@code null} when the identity provider does not supply one.
      */
     public String getVerificationUriComplete() {
         return verificationUriComplete;

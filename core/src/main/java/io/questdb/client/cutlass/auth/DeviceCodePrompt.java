@@ -27,20 +27,18 @@ package io.questdb.client.cutlass.auth;
 import io.questdb.client.std.str.StringSink;
 
 /**
- * Shows an RFC 8628 device authorization challenge to the user, who then opens the
- * verification URL in any browser (on the same machine or on a phone) and enters the
- * code. {@link OidcDeviceAuth} calls this once per interactive sign-in, just before it
- * starts polling the token endpoint.
+ * Shows an RFC 8628 device authorization challenge to the user, who then opens the verification URL
+ * in any browser (same machine or phone) and enters the code. {@link OidcDeviceAuth} calls this once
+ * per interactive sign-in, just before polling the token endpoint.
  * <p>
- * The {@link #SYSTEM_OUT default implementation} prints the instructions to
- * {@code System.out}. Supply your own implementation to render the challenge somewhere
- * else, for example as a clickable link or a QR code in a notebook.
+ * The {@link #SYSTEM_OUT default implementation} prints instructions to {@code System.out}. Supply
+ * your own to render the challenge elsewhere, e.g. a clickable link or a QR code in a notebook.
  */
 @FunctionalInterface
 public interface DeviceCodePrompt {
 
     /**
-     * Prints the sign-in instructions to {@code System.out} using plain ASCII text.
+     * Prints the sign-in instructions to {@code System.out} as plain ASCII.
      */
     DeviceCodePrompt SYSTEM_OUT = challenge -> {
         String newLine = System.lineSeparator();
@@ -59,8 +57,8 @@ public interface DeviceCodePrompt {
     };
 
     /**
-     * Shows the challenge to the user. This method must return quickly; the actual waiting
-     * for the user happens afterwards while {@link OidcDeviceAuth} polls the token endpoint.
+     * Shows the challenge to the user. Must return quickly; waiting for the user happens afterwards
+     * while {@link OidcDeviceAuth} polls the token endpoint.
      *
      * @param challenge the user code, verification URL and timing parameters to show
      */

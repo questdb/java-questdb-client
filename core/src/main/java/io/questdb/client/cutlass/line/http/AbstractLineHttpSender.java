@@ -408,11 +408,10 @@ public abstract class AbstractLineHttpSender implements Sender {
                 throw new LineSenderException("Unsupported protocol version: " + protocolVersion);
         }
         if (httpTokenProvider != null) {
-            // wire the per-request token provider. The constructor built the initial request before the
-            // provider was set, so it carries no token yet; defer pulling the first token off the build
-            // path to the first row (table()), instead of calling getToken() here. That lets a provider
-            // that signs in lazily - e.g. OidcDeviceAuth::getTokenSilently - be wired before the sign-in
-            // has completed, and keeps the token pull on the use/flush path the provider documents
+            // The constructor already built the initial request without a token. Defer the first
+            // getToken() off this build path to the first row (table()), so a provider that signs in
+            // lazily - e.g. OidcDeviceAuth::getTokenSilently - can be wired before sign-in completes,
+            // and the token pull stays on the use/flush path the provider documents.
             sender.httpTokenProvider = httpTokenProvider;
             sender.isTokenPending = true;
         }
@@ -502,8 +501,8 @@ public abstract class AbstractLineHttpSender implements Sender {
 
     @TestOnly
     public void putRawMessage(Utf8Sequence msg) {
-        // pull the deferred provider token (if any) so a raw message sent as the first row of a request
-        // carries it, just like table() does; a no-op when no provider is configured
+        // stamp the deferred provider token (like table() does) so a raw message sent as the first row
+        // carries it; a no-op when no provider is configured
         stampTokenIfPending();
         request.put(msg); // message must include trailing \n
         state = RequestState.EMPTY;
@@ -561,8 +560,8 @@ public abstract class AbstractLineHttpSender implements Sender {
         if (table.length() == 0) {
             throw new LineSenderException("table name cannot be empty");
         }
-        // pull the deferred provider token (if any) before writing the first row of this request, so the
-        // send carries it; a no-op once the token has been stamped or when no provider is configured
+        // stamp the deferred provider token before the first row of this request, so the send carries it;
+        // a no-op once the token has been stamped or when no provider is configured
         stampTokenIfPending();
         // set bookmark at start of the line.
         rowBookmark = request.getContentLength();
@@ -765,7 +764,7 @@ public abstract class AbstractLineHttpSender implements Sender {
         } else if (httpTokenProvider != null) {
             if (pullProviderToken) {
                 // pull a fresh token per request so a long-lived sender follows token refreshes; reject a
-                // null/empty/blank return (the HttpTokenProvider contract forbids it) with a clear error
+                // null/empty/blank return (forbidden by the HttpTokenProvider contract) with a clear error
                 // rather than emit a malformed "Authorization: Bearer " header the server only 401s on
                 CharSequence token = httpTokenProvider.getToken();
                 if (Chars.isBlank(token)) {
@@ -773,12 +772,11 @@ public abstract class AbstractLineHttpSender implements Sender {
                 }
                 r.authToken(token);
             } else {
-                // do NOT pull the provider token on the construct/flush path: getToken() can throw (a
-                // provider that has not signed in yet, or a failed silent refresh), and pulling it here -
-                // after client.newRequest() has already reset and re-headered the shared request but
-                // before withContent() - would leave a half-built request behind and corrupt the sender,
-                // turning an already-successful flush into a thrown exception. Defer to the first row
-                // (stampTokenIfPending), where a failed pull is retriable and rebuilds the request cleanly
+                // do NOT pull the token on the construct/flush path: getToken() can throw (not signed in
+                // yet, or a failed silent refresh). Here - after client.newRequest() reset and re-headered
+                // the shared request but before withContent() - a throw would leave a half-built request
+                // and corrupt the sender, turning an already-successful flush into an exception. Defer to
+                // the first row (stampTokenIfPending), where a failed pull is retriable and rebuilds cleanly.
                 isTokenPending = true;
             }
         } else if (authToken != null) {
@@ -816,13 +814,13 @@ public abstract class AbstractLineHttpSender implements Sender {
 
     private void stampTokenIfPending() {
         if (isTokenPending) {
-            // the construct/flush path deferred the provider token so a provider that signs in lazily (e.g.
+            // The construct/flush path deferred the token so a lazily-signing-in provider (e.g.
             // OidcDeviceAuth::getTokenSilently) could be wired before sign-in completed, and so a provider
-            // failure never strikes after a successful send. The caller is now starting the first row of
-            // this request, so pull the token and rebuild the still-empty request to carry it before any
-            // row data goes in. Clear the flag only after newRequest(true) succeeds, so a pull that throws
-            // (not signed in yet, or a failed refresh) leaves the stamp pending: the next row re-runs this
-            // and client.newRequest() fully rebuilds the request, so the sender is never left corrupted
+            // failure never strikes after a successful send. The caller is now starting the first row, so
+            // rebuild the still-empty request to carry the token before any row data goes in. Clear the
+            // flag only after newRequest(true) succeeds: a pull that throws (not signed in yet, or a failed
+            // refresh) leaves the stamp pending, so the next row re-runs this and fully rebuilds the
+            // request - the sender is never left corrupted.
             request = newRequest(true);
             isTokenPending = false;
         }

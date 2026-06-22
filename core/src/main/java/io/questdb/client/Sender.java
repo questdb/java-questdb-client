@@ -2010,18 +2010,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Supplies the HTTP authentication token from a provider that the sender queries as it builds
-         * each request, instead of a fixed {@link #httpToken(String) token} captured once. This keeps a
-         * long-lived sender following token refreshes - for example a token obtained through the OIDC
-         * device flow: {@code .httpTokenProvider(auth::getTokenSilently)}.
+         * Supplies the HTTP authentication token from a provider queried as the sender builds each request,
+         * instead of a fixed {@link #httpToken(String) token} captured once, so a long-lived sender follows
+         * token refreshes - e.g. an OIDC device-flow token: {@code .httpTokenProvider(auth::getTokenSilently)}.
          * <br>
-         * The sender does not call the provider at build time: the first call happens when the first row
-         * is started, then once per flush. A provider that signs in lazily can therefore be wired before
-         * the interactive sign-in completes, as long as a token is obtainable before the first row is
-         * added - otherwise that first row fails. The provider runs on the flush path, so it must return
-         * promptly and must not block on interactive input (see {@link HttpTokenProvider}). Only valid for
-         * HTTP transport, and mutually exclusive with {@link #httpToken(String)} and
-         * {@link #httpUsernamePassword(String, String)}.
+         * The provider is not called at build time: the first call happens when the first row is started,
+         * then once per flush. A lazily-signing-in provider can therefore be wired before the interactive
+         * sign-in completes, as long as a token is obtainable before the first row - otherwise that row
+         * fails. Running on the flush path, the provider must return promptly and must not block on
+         * interactive input (see {@link HttpTokenProvider}). HTTP transport only, and mutually exclusive
+         * with {@link #httpToken(String)} and {@link #httpUsernamePassword(String, String)}.
          *
          * @param httpTokenProvider supplies the current HTTP authentication token
          * @return this instance for method chaining

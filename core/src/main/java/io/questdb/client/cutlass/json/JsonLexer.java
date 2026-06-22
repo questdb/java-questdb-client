@@ -298,8 +298,8 @@ public class JsonLexer implements Mutable, Closeable {
         int result = 0;
         for (int j = 0; j < 4; j++) {
             final char c = value.charAt(offset + j);
-            // direct lookup in the shared hex table (returns -1 for a non-hex char), cheaper than
-            // Character.digit; the table is ASCII-sized, so a code point above 127 is never a hex digit
+            // shared hex table lookup (-1 for non-hex), cheaper than Character.digit; the table is
+            // ASCII-sized, so a code point above 127 is never a hex digit
             final int digit = c < 128 ? Numbers.hexNumbers[c] : -1;
             if (digit < 0) {
                 return -1;
@@ -351,16 +351,14 @@ public class JsonLexer implements Mutable, Closeable {
         } else {
             utf8DecodeCacheAndBuffer(lo, hi - 1, position);
         }
-        // the decode above assembled the raw bytes between the quotes verbatim; resolve JSON string escape
-        // sequences only when the scan actually saw a backslash. The common no-escape value (and every
-        // escape-free name) skips unescape() entirely and returns the assembled sink directly.
+        // the decode above assembled the raw bytes verbatim; resolve JSON escapes only when the scan saw a
+        // backslash, so escape-free values and names skip unescape() and return the assembled sink directly.
         return hasEscape ? unescape(sink) : sink;
     }
 
     private CharSequence unescape(CharSequence raw) {
-        // called only when the scan saw a backslash (hasEscape), so at least one escape is present; walk the
-        // value once, copying plain characters and resolving each escape in place. No separate leading scan
-        // to re-find the first backslash - the lexer already proved one exists.
+        // called only when the scan saw a backslash, so at least one escape is present; walk the value once,
+        // copying plain chars and resolving each escape - no leading scan to re-find the first backslash.
         final int n = raw.length();
         unescapeSink.clear();
         int i = 0;

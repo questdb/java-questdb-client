@@ -26,21 +26,21 @@ package io.questdb.client;
 
 /**
  * Supplies an HTTP authentication token to a {@link Sender} on demand. The sender calls
- * {@link #getToken()} as it builds each request, so a provider that returns a freshly refreshed
- * token - for example {@code OidcDeviceAuth::getTokenSilently} - keeps a long-lived sender
- * authenticated as the token rotates, without rebuilding the sender.
+ * {@link #getToken()} as it builds each request, so a provider returning a freshly refreshed token
+ * - e.g. {@code OidcDeviceAuth::getTokenSilently} - keeps a long-lived sender authenticated as the
+ * token rotates, without rebuilding it.
  * <p>
- * {@link #getToken()} runs on the sender's flush path, so it must return promptly and must not
- * block on interactive input. It may perform a quick silent token refresh, but must not start an
- * interactive sign-in. An exception thrown from {@link #getToken()} fails the current flush.
+ * {@link #getToken()} runs on the sender's flush path: it must return promptly and must not block on
+ * interactive input. A quick silent token refresh is fine, but it must not start an interactive
+ * sign-in. An exception from {@link #getToken()} fails the current flush.
  *
  * @see Sender.LineSenderBuilder#httpTokenProvider(HttpTokenProvider)
  */
 @FunctionalInterface
 public interface HttpTokenProvider {
     /**
-     * Returns the current HTTP authentication token, without the {@code "Bearer "} prefix (the
-     * sender adds it). Must not return null or an empty value.
+     * Returns the current HTTP authentication token, without the {@code "Bearer "} prefix (the sender
+     * adds it). Must not return null or empty.
      *
      * @return the current HTTP authentication token
      */

@@ -52,14 +52,13 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
     }
 
     default void putAsPrintable(char c) {
-        // escape control characters (C0/C1 and DEL) and Unicode "format" characters - the bidi
-        // embeddings/overrides/isolates, the LRM/RLM marks, zero-width joiners and the BOM - to a visible
-        // \\uXXXX. Left raw, attacker-influenced text (an ILP server's JSON error body, a column name) could
-        // reorder, hide or forge what a human reads in a terminal or a log line; escaping rather than
-        // stripping keeps the original visible for diagnosis. Scanning per UTF-16 unit covers every BMP
-        // threat; a legitimate supplementary-plane char (an emoji surrogate pair) is neither a control nor a
-        // format character and passes through unchanged. The full four hex digits are emitted, so a format
-        // char above U+00FF (e.g. U+202E) renders correctly rather than truncated to its low byte.
+        // escape control chars (C0/C1, DEL) and Unicode format chars - bidi embeddings/overrides/isolates,
+        // LRM/RLM marks, zero-width joiners, the BOM - to a visible \\uXXXX. Left raw, attacker-influenced
+        // text (an ILP server's JSON error body, a column name) could reorder, hide or forge what a human
+        // reads in a terminal or log; escaping rather than stripping keeps it visible for diagnosis. Per
+        // UTF-16-unit scanning covers every BMP threat; a supplementary-plane char (emoji surrogate pair) is
+        // neither control nor format and passes through. Emitting all four hex digits keeps a format char
+        // above U+00FF (e.g. U+202E) correct rather than truncated to its low byte.
         if (!Character.isISOControl(c) && Character.getType(c) != Character.FORMAT) {
             put(c);
         } else {

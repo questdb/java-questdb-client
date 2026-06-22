@@ -27,12 +27,11 @@ package io.questdb.client.cutlass.auth;
 import io.questdb.client.std.str.StringSink;
 
 /**
- * Thrown when the OIDC device authorization flow cannot obtain a token. The message is built
- * with the fluent {@link #put(CharSequence)} family, backed by a {@link StringSink}.
+ * Thrown when the OIDC device authorization flow cannot obtain a token. The message is built via
+ * the fluent {@link #put(CharSequence)} family, backed by a {@link StringSink}.
  * <p>
- * When the failure originates from an OAuth error response (RFC 6749 / RFC 8628),
- * {@link #getOauthError()} returns the machine-readable error code (for example
- * {@code access_denied} or {@code expired_token}); otherwise it returns {@code null}.
+ * For an OAuth error response (RFC 6749 / RFC 8628), {@link #getOauthError()} returns the
+ * machine-readable error code (e.g. {@code access_denied}, {@code expired_token}); else {@code null}.
  */
 public class OidcAuthException extends RuntimeException {
     private final StringSink message = new StringSink();
@@ -50,7 +49,7 @@ public class OidcAuthException extends RuntimeException {
     }
 
     /**
-     * Builds an exception out of an OAuth error response.
+     * Builds an exception from an OAuth error response.
      *
      * @param error       the OAuth {@code error} code, never null
      * @param description the optional {@code error_description}, may be null or empty
@@ -67,20 +66,16 @@ public class OidcAuthException extends RuntimeException {
         return e;
     }
 
-    // Reports characters that must never reach a terminal or a log line. The parameter is a Unicode code
-    // point, not a UTF-16 unit: the callers (sanitizeForDisplay / putSanitized) scan with codePointAt, which
-    // reassembles a valid high+low surrogate pair - the form a supplementary-plane char arrives in after the
-    // JSON lexer emits each backslash-u-XXXX escape verbatim - into one code point, so a supplementary-plane format
-    // or control char is judged as one character rather than as two surrogate halves that each look harmless
-    // (the gap that let an invisible U+E00xx "tag" char slip through). An unpaired surrogate (a lone half the
-    // lexer never reassembled) surfaces from codePointAt as a SURROGATE code point and is stripped too, as it
-    // carries no displayable meaning.
-    // Beyond the C0/C1 controls and DEL that isISOControl covers, this strips the Unicode "format"
-    // category (Cf) - zero-width joiners, the byte-order mark, the bidirectional embedding/override/isolate
-    // controls, and the U+E00xx tag characters - plus an explicit bidi/BOM set, so an attacker-influenced
-    // value (a verification_uri, a user_code, an error string) cannot reorder, hide, or spoof the text a
-    // human reads, even on a JDK whose Unicode tables categorize these differently. Hex literals (not char
-    // escapes) keep this source strictly ASCII, so the file itself carries none of the chars it guards against.
+    // Reports characters that must never reach a terminal or log line. The argument is a code point, not
+    // a UTF-16 unit: putSanitized scans with codePointAt, which joins a surrogate pair into one code point,
+    // so a supplementary-plane format/control char is judged whole rather than as two harmless-looking
+    // halves (the gap that once let an invisible U+E00xx "tag" char through). A lone unpaired surrogate
+    // surfaces as a SURROGATE code point and is stripped too, having no displayable meaning.
+    // Beyond the C0/C1 controls and DEL from isISOControl, this strips the Unicode format category (Cf:
+    // zero-width joiners, BOM, bidi embedding/override/isolate controls, U+E00xx tag chars) plus an
+    // explicit bidi/BOM set, so an attacker-influenced value (verification_uri, user_code, error string)
+    // cannot reorder, hide, or spoof displayed text - even on a JDK that categorizes these differently.
+    // Hex literals (not char escapes) keep this source ASCII, so it carries none of the chars it guards.
     static boolean isUnsafeForDisplay(int c) {
         return Character.isISOControl(c)
                 || Character.getType(c) == Character.FORMAT
@@ -115,9 +110,9 @@ public class OidcAuthException extends RuntimeException {
         return this;
     }
 
-    // appends untrusted text with display-unsafe characters stripped, so an attacker-influenced IdP
-    // error string cannot inject ANSI escapes, forge log lines, or smuggle bidi/zero-width formatting
-    // when the exception message is rendered
+    // appends untrusted text with display-unsafe chars stripped, so an attacker-influenced IdP error
+    // string cannot inject ANSI escapes, forge log lines, or smuggle bidi/zero-width formatting when
+    // the exception message is rendered
     private void putSanitized(CharSequence cs) {
         if (cs != null) {
             for (int i = 0, n = cs.length(); i < n; ) {

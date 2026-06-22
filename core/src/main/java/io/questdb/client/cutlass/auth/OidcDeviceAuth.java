@@ -50,13 +50,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Obtains an OIDC access or id token using the OAuth 2.0 Device Authorization Grant
- * (RFC 8628), so a process with no local browser (a remote notebook kernel, a container,
- * a headless job) can still sign a human in. The user authorizes on any device, while the
- * token request travels outbound only.
+ * Obtains an OIDC access or id token via the OAuth 2.0 Device Authorization Grant
+ * (RFC 8628), so a browserless process (remote notebook kernel, container, headless job)
+ * can sign a human in: the user authorizes on any device while the token request travels
+ * outbound only.
  * <p>
- * The resulting token can be presented to QuestDB Enterprise over any of the auth paths
- * the server already validates:
+ * The token works on any auth path the server validates:
  * <ul>
  *     <li>HTTP {@code Authorization: Bearer <token>} (REST {@code /exec}, or the ingestion
  *     {@link io.questdb.client.Sender} via {@code httpToken});</li>
@@ -80,54 +79,50 @@ import java.util.concurrent.locks.ReentrantLock;
  *         .groupsInToken(true)
  *         .build();
  * }</pre>
- * {@link #getToken()} returns a cached token while it is still valid, silently refreshes it
- * when a refresh token is available, and otherwise re-runs the interactive flow. Calls are
- * serialized on an instance lock, so concurrent callers never start two sign-ins at once. A
- * sign-in waiting for the user holds that lock for the lifetime of the device code (up to an
- * hour), so a concurrent {@link #getToken()} or {@link #clearCache()} call on the same instance
- * blocks behind it - but {@link #getTokenSilently()} does not: it never waits for an in-flight
- * sign-in, it fails fast with an {@link OidcAuthException}, so a request/flush path is never
- * stalled. To abort a sign-in that is waiting, call {@link #close()} from another thread: it
- * signals the in-flight flow to stop, which then fails with an {@link OidcAuthException} rather
- * than polling on until the device code expires. Cancellation is observed between polls (within
- * about 100ms while a poll interval is being waited out); a poll request already in flight is not
- * interrupted mid-request, so the abort - and {@link #close()} itself - can take up to one HTTP
- * request timeout (see {@link Builder#httpTimeoutMillis(int)}), still far short of the device-code
- * lifetime.
+ * {@link #getToken()} serves a cached token while valid, silently refreshes when a refresh token
+ * exists, otherwise re-runs the interactive flow. An instance lock serializes calls, so two
+ * sign-ins never start at once. A sign-in waiting for the user holds that lock for the device code
+ * lifetime (up to an hour), so a concurrent {@link #getToken()} or {@link #clearCache()} blocks
+ * behind it - but {@link #getTokenSilently()} never waits: it fails fast with an
+ * {@link OidcAuthException} so a request/flush path never stalls. To abort a waiting sign-in, call
+ * {@link #close()} from another thread; it signals the flow to stop, which then fails with an
+ * {@link OidcAuthException} rather than polling until the device code expires. Cancellation is seen
+ * between polls (within ~100ms while waiting out an interval); a poll already in flight is not
+ * interrupted, so the abort - and {@link #close()} - can take up to one HTTP request timeout (see
+ * {@link Builder#httpTimeoutMillis(int)}), still far short of the device-code lifetime.
  * <p>
- * Instances are interactive by design and hold a network connection; close them when done.
- * Token state lives in memory only and does not survive a restart of the process.
+ * Instances are interactive and hold a network connection; close them when done. Token state is
+ * in-memory only and does not survive a process restart.
  */
 public class OidcDeviceAuth implements QuietCloseable {
     public static final String DEFAULT_SCOPE = "openid";
     static final String GRANT_TYPE_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
     static final String GRANT_TYPE_REFRESH_TOKEN = "refresh_token";
     private static final int DEFAULT_CLOCK_SKEW_SECONDS = 30;
-    // how long the device code stays valid for the interactive sign-in when the identity provider's
-    // device authorization response omits expires_in
+    // device code TTL when the device authorization response omits expires_in
     private static final int DEFAULT_DEVICE_CODE_TTL_SECONDS = 300;
     private static final int DEFAULT_HTTP_TIMEOUT_MILLIS = 30_000;
     private static final int DEFAULT_POLL_INTERVAL_SECONDS = 5;
-    // how long a token is cached before getToken() refreshes it, when the token response omits expires_in
+    // token cache TTL when the token response omits expires_in
     private static final int DEFAULT_TOKEN_TTL_SECONDS = 300;
     private static final String ERROR_AUTHORIZATION_PENDING = "authorization_pending";
     private static final String ERROR_SLOW_DOWN = "slow_down";
     private static final HttpClientConfiguration HTTP_CONFIG = DefaultHttpClientConfiguration.INSTANCE;
-    // Token responses carry JWTs - an id token with group claims can be several KB - and a single
-    // value may arrive split across HTTP response fragments. The JSON lexer stashes a split value
-    // and rejects it once it grows past JSON_LEXER_MAX_VALUE_BYTES, so the limit must comfortably
-    // exceed any real token, otherwise large tokens fail to parse with "String is too long".
+    // Token responses carry JWTs (an id token with group claims can be several KB), and a single
+    // value may arrive split across HTTP fragments. The lexer stashes a split value and rejects it
+    // past JSON_LEXER_MAX_VALUE_BYTES, so the limit must comfortably exceed any real token or large
+    // tokens fail to parse with "String is too long".
     private static final int JSON_LEXER_CACHE_SIZE = 1024;
     private static final int JSON_LEXER_MAX_VALUE_BYTES = 1 << 20;
-    // a persistent transport failure while polling aborts after this many consecutive attempts,
-    // instead of silently retrying until the device code expires
+    // abort polling after this many consecutive transport failures instead of silently retrying
+    // until the device code expires
     private static final int MAX_CONSECUTIVE_POLL_ERRORS = 3;
-    // upper bounds on the expires_in / interval the identity provider reports, so an absurd or
-    // hostile value cannot overflow the poll timing arithmetic or make the client wait absurdly long
+    // upper bounds on the provider-reported expires_in / interval, so an absurd or hostile value
+    // cannot overflow the poll timing arithmetic or make the client wait absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
     private static final int MAX_POLL_INTERVAL_SECONDS = 300;
-    // cap the bytes drained from a single response so a hostile or MITM'd server cannot stream an endless
-    // body and wedge the thread; set far above any real OIDC JSON response
+    // cap bytes drained per response so a hostile/MITM'd server cannot stream an endless body and
+    // wedge the thread; far above any real OIDC JSON response
     private static final int MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024;
     private static final int POLL_PENDING = 1;
     private static final long POLL_SLEEP_SLICE_MILLIS = 100;
@@ -146,8 +141,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     private final boolean groupsInToken;
     private final int httpTimeoutMillis;
     // serializes getToken()/getTokenSilently()/clearCache()/close(); getToken() holds it for the whole
-    // interactive flow, getTokenSilently() acquires it without blocking (tryLock) so the flush path is
-    // never stalled behind an in-flight sign-in
+    // interactive flow, getTokenSilently() uses tryLock so the flush path never stalls behind a sign-in
     private final ReentrantLock lock = new ReentrantLock();
     private final DeviceCodePrompt prompt;
     private final StringSink responseStatus = new StringSink();
@@ -175,8 +169,8 @@ public class OidcDeviceAuth implements QuietCloseable {
         this.clockSkewMillis = builder.clockSkewSeconds * 1000L;
         this.prompt = builder.prompt;
         this.tlsConfig = tlsConfig;
-        // allocate the native JSON lexer last: an Endpoint.parse above can throw on a malformed url,
-        // and the half-built instance is never returned, so close() could not free an earlier alloc
+        // allocate the native lexer last: an Endpoint.parse above can throw on a malformed url, and
+        // the half-built instance is never returned, so close() could not free an earlier alloc
         this.jsonLexer = new JsonLexer(JSON_LEXER_CACHE_SIZE, JSON_LEXER_MAX_VALUE_BYTES);
     }
 
@@ -185,19 +179,17 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Discovers the OIDC configuration from a running QuestDB server and builds an instance
-     * around it. Reads the public {@code /settings} endpoint (no auth required) and picks up
-     * the client id, scope, token endpoint, device authorization endpoint and the
-     * groups-in-token mode the server expects.
+     * Discovers the OIDC configuration from a running QuestDB server and builds an instance.
+     * Reads the public {@code /settings} endpoint (no auth) for the client id, scope, token
+     * endpoint, device authorization endpoint and groups-in-token mode.
      * <p>
-     * <b>Trust model:</b> the token and device authorization endpoints the user signs in against are
-     * taken from the server's unauthenticated {@code /settings} response. A spoofed, compromised, or
-     * man-in-the-middled server can therefore redirect the entire sign-in to an attacker-controlled
-     * identity provider and harvest the user's authorization. Only call {@code fromQuestDB} against a
-     * server you trust, reached over {@code https} (required by default; relaxing it with
-     * {@link Builder#allowInsecureTransport(boolean)} removes the transport protection). When the
-     * server is not trusted, configure the identity provider explicitly with {@link #builder()},
-     * or pin it with {@link #fromQuestDB(String, String)}.
+     * <b>Trust model:</b> the endpoints the user signs in against come from the server's
+     * unauthenticated {@code /settings} response, so a spoofed, compromised, or MITM'd server can
+     * redirect the whole sign-in to an attacker-controlled identity provider and harvest the
+     * authorization. Only call {@code fromQuestDB} against a trusted server reached over {@code https}
+     * (required by default; {@link Builder#allowInsecureTransport(boolean)} removes that protection).
+     * For an untrusted server, configure the identity provider explicitly with {@link #builder()}, or
+     * pin it with {@link #fromQuestDB(String, String)}.
      *
      * @param questdbUrl the QuestDB HTTP base URL, for example {@code https://questdb.example.com:9000}
      * @return a configured, ready-to-use instance
@@ -209,26 +201,24 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Same as {@link #fromQuestDB(String)} but lets the caller permit insecure {@code http} transport
-     * for the QuestDB server and the discovered identity provider endpoints (see
-     * {@link Builder#allowInsecureTransport(boolean)}). Intended for local development only.
+     * Like {@link #fromQuestDB(String)} but permits insecure {@code http} for the server and the
+     * discovered identity provider endpoints (see {@link Builder#allowInsecureTransport(boolean)}).
+     * Local development only.
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl, boolean allowInsecureTransport) {
         return fromQuestDB(questdbUrl, null, null, defaultTlsConfig(), allowInsecureTransport);
     }
 
     /**
-     * Same as {@link #fromQuestDB(String)} but pins the identity provider by its {@code issuer} origin
+     * Like {@link #fromQuestDB(String)} but pins the identity provider by its {@code issuer} origin
      * (for example {@code https://idp.example.com}). The issuer serves two roles:
      * <ul>
      *     <li>when the server does not advertise the device authorization endpoint (today's servers,
-     *     and older ones), it is discovered from the issuer's {@code .well-known/openid-configuration}
-     *     document; the discovery origin is taken only from this out-of-band issuer, never from a value
-     *     the server's {@code /settings} supplied, so a tampered {@code /settings} cannot choose where
-     *     the credentials are sent;</li>
-     *     <li>it pins the token and device authorization endpoints: either endpoint that does not belong
-     *     to the issuer origin is rejected, so a compromised-but-TLS-valid server cannot redirect the
-     *     sign-in to an attacker.</li>
+     *     and older ones), it is discovered from the issuer's {@code .well-known/openid-configuration};
+     *     the discovery origin comes only from this out-of-band issuer, never from {@code /settings}, so
+     *     a tampered {@code /settings} cannot choose where credentials are sent;</li>
+     *     <li>it pins the token and device authorization endpoints: any endpoint not on the issuer
+     *     origin is rejected, so a compromised-but-TLS-valid server cannot redirect the sign-in.</li>
      * </ul>
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl, String issuer) {
@@ -236,35 +226,35 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Same as {@link #fromQuestDB(String, String)} but lets the caller permit insecure {@code http}
-     * transport for the QuestDB server and the discovered identity provider endpoints (see
-     * {@link Builder#allowInsecureTransport(boolean)}). Intended for local development only.
+     * Like {@link #fromQuestDB(String, String)} but permits insecure {@code http} for the server and
+     * the discovered identity provider endpoints (see {@link Builder#allowInsecureTransport(boolean)}).
+     * Local development only.
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl, String issuer, boolean allowInsecureTransport) {
         return fromQuestDB(questdbUrl, issuer, null, defaultTlsConfig(), allowInsecureTransport);
     }
 
     /**
-     * Same as {@link #fromQuestDB(String)} but with an explicit TLS configuration, used for the
-     * discovery request, any identity provider discovery document, and the later sign-in requests.
+     * Like {@link #fromQuestDB(String)} but with an explicit TLS configuration, used for the discovery
+     * request, any identity provider discovery document, and the later sign-in requests.
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl, ClientTlsConfiguration tlsConfig) {
         return fromQuestDB(questdbUrl, null, null, tlsConfig, false);
     }
 
     /**
-     * Same as {@link #fromQuestDB(String, ClientTlsConfiguration)} but lets the caller permit insecure
-     * {@code http} transport for the QuestDB server and the discovered identity provider endpoints
-     * (see {@link Builder#allowInsecureTransport(boolean)}). Intended for local development only.
+     * Like {@link #fromQuestDB(String, ClientTlsConfiguration)} but permits insecure {@code http} for
+     * the server and the discovered identity provider endpoints (see
+     * {@link Builder#allowInsecureTransport(boolean)}). Local development only.
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport) {
         return fromQuestDB(questdbUrl, null, null, tlsConfig, allowInsecureTransport);
     }
 
     /**
-     * Same as {@link #fromQuestDB(String, String)} but lets the caller supply the identity provider
-     * discovery document URL directly (an alternative to {@code issuer}, which otherwise derives it as
-     * {@code {issuer}/.well-known/openid-configuration}) and an explicit TLS configuration. Either an
+     * Like {@link #fromQuestDB(String, String)} but accepts the discovery document URL directly (an
+     * alternative to {@code issuer}, which otherwise derives it as
+     * {@code {issuer}/.well-known/openid-configuration}) plus an explicit TLS configuration. Either an
      * {@code issuer} or a {@code discoveryUrl} pins the identity provider; pass both {@code null} to
      * trust the endpoints the server advertises.
      *
@@ -292,13 +282,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         String resolvedIssuer = issuer != null && !issuer.isEmpty() ? issuer : null;
         String pinnedDiscoveryUrl = discoveryUrl != null && !discoveryUrl.isEmpty() ? discoveryUrl : null;
 
-        // When the QuestDB /settings channel is a plaintext, MITM-able http connection (only reachable
-        // with allowInsecureTransport; the default rejects it), the endpoints it advertises could be
-        // tampered in transit to route the device code and long-lived refresh token to an attacker. The
-        // missing-endpoint discovery path below already demands an out-of-band pin, but a tampered
-        // /settings that advertises BOTH endpoints at one attacker origin skips that path - the
-        // co-location check passes trivially and there is no issuer to pin against - so require the same
-        // pin before trusting /settings-supplied endpoints over such a channel.
+        // Over a plaintext, MITM-able http /settings channel (only reachable with allowInsecureTransport;
+        // the default rejects it), advertised endpoints can be tampered in transit to route the device
+        // code and long-lived refresh token to an attacker. The missing-endpoint discovery path below
+        // already demands an out-of-band pin, but a tampered /settings advertising BOTH endpoints at one
+        // attacker origin skips that path - the co-location check passes trivially and there is no issuer
+        // to pin against - so require the same pin before trusting /settings endpoints over such a channel.
         boolean settingsSuppliedCredentials = tokenEndpoint != null || deviceAuthorizationEndpoint != null;
         if (settingsSuppliedCredentials && resolvedIssuer == null && pinnedDiscoveryUrl == null && settingsChannelIsPlaintext(server)) {
             throw new OidcAuthException()
@@ -309,11 +298,11 @@ public class OidcDeviceAuth implements QuietCloseable {
                     .put("connect to QuestDB over https [url=").put(questdbUrl).put(']');
         }
 
-        // Fall back to identity provider discovery when the server does not advertise the device
-        // authorization endpoint (and/or the token endpoint). This contacts the identity provider, whose
-        // origin must be pinned out of band: the discovery target is never derived from a value the
-        // server supplied, otherwise a tampered or intercepted /settings could steer discovery - and so
-        // the credential POSTs - to an attacker, with the co-location and issuer checks passing trivially.
+        // Fall back to identity provider discovery when the server omits the device authorization endpoint
+        // (and/or the token endpoint). The provider's origin must be pinned out of band: the discovery
+        // target is never derived from a server-supplied value, else a tampered or intercepted /settings
+        // could steer discovery - and the credential POSTs - to an attacker while the co-location and
+        // issuer checks pass trivially.
         if (deviceAuthorizationEndpoint == null || tokenEndpoint == null) {
             if (resolvedIssuer == null && pinnedDiscoveryUrl == null) {
                 throw new OidcAuthException()
@@ -332,15 +321,14 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (tokenEndpoint == null && doc.tokenEndpoint.length() > 0) {
                 tokenEndpoint = doc.tokenEndpoint.toString();
             }
-            // The discovery origin is pinned out of band - the caller's issuer, else the discoveryUrl origin
-            // (derived after this block) - and that pin, never an issuer the document declares about itself,
-            // is the trust anchor the endpoint pin binds to. When discovery ran off a pinned discoveryUrl (no
-            // caller issuer), reject a document whose own "issuer" sits on a different origin (RFC 8414
-            // section 3.3): otherwise a tampered or content-injected document at the pinned url could name an
-            // attacker issuer, co-locate both endpoints under it, and route the device code and long-lived
-            // refresh token there while the co-location and issuer checks below passed trivially. An identity
-            // provider that serves its discovery document on a different origin than its endpoints must
-            // instead be configured with explicit endpoints via OidcDeviceAuth.builder().
+            // The endpoint pin's trust anchor is the out-of-band discovery origin (the caller's issuer, else
+            // the discoveryUrl origin derived after this block), never an issuer the document declares about
+            // itself. When discovery ran off a pinned discoveryUrl (no caller issuer), reject a document
+            // whose own "issuer" is on a different origin (RFC 8414 section 3.3): else a tampered or
+            // content-injected document at the pinned url could name an attacker issuer, co-locate both
+            // endpoints under it, and route the device code and refresh token there while the checks below
+            // pass trivially. A provider serving its discovery document on a different origin than its
+            // endpoints must use explicit endpoints via OidcDeviceAuth.builder().
             if (resolvedIssuer == null && pinnedDiscoveryUrl != null && doc.issuer.length() > 0) {
                 Endpoint docIssuer = Endpoint.parse(doc.issuer.toString());
                 Endpoint discoveryEndpoint = Endpoint.parse(pinnedDiscoveryUrl);
@@ -353,12 +341,11 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
         }
 
-        // A caller-supplied discoveryUrl pins the identity provider just as an issuer does: derive the pin
-        // origin from the discoveryUrl itself so validateEndpointOrigins rejects any endpoint - read from the
-        // discovery document above, or advertised by /settings when it supplied both endpoints and the
-        // discovery branch was skipped - that does not belong to it. Without this, a tampered response
-        // advertising both endpoints at one attacker origin would slip past a discoveryUrl pin, the
-        // co-location check alone passing trivially.
+        // A caller-supplied discoveryUrl pins the provider just as an issuer does: derive the pin origin
+        // from it so validateEndpointOrigins rejects any endpoint not on it - whether read from the
+        // discovery document above or advertised by /settings (when it supplied both endpoints and the
+        // discovery branch was skipped). Without this, a tampered response advertising both endpoints at one
+        // attacker origin would slip past a discoveryUrl pin, the co-location check alone passing trivially.
         if (resolvedIssuer == null && pinnedDiscoveryUrl != null) {
             resolvedIssuer = originOf(Endpoint.parse(pinnedDiscoveryUrl));
         }
@@ -404,21 +391,20 @@ public class OidcDeviceAuth implements QuietCloseable {
 
     /**
      * Frees the network connections and native buffers this instance holds. If a {@link #getToken()}
-     * sign-in is in flight on another thread, {@code close()} signals it to stop, so the sign-in fails
-     * with an {@link OidcAuthException} instead of polling on until the device code expires. The signal
-     * is observed between polls (within about 100ms while a poll interval is being waited out); a poll
-     * request already in flight is not interrupted, so {@code close()} acquires the instance lock - and
-     * returns - only once that request finishes or times out, i.e. after at most one HTTP request timeout
-     * (see {@link Builder#httpTimeoutMillis(int)}), not the full device-code lifetime. Safe to call more
-     * than once. After close, {@link #getToken()} and {@link #clearCache()} throw.
+     * sign-in is in flight on another thread, signals it to stop so it fails with an
+     * {@link OidcAuthException} instead of polling until the device code expires. The signal is observed
+     * between polls (within ~100ms while waiting out a poll interval); a poll request already in flight
+     * is not interrupted, so {@code close()} acquires the lock - and returns - only once that request
+     * finishes or times out, i.e. after at most one HTTP request timeout
+     * (see {@link Builder#httpTimeoutMillis(int)}), not the full device-code lifetime. Idempotent. After
+     * close, {@link #getToken()} and {@link #clearCache()} throw.
      */
     @Override
     public void close() {
-        // flag cancellation before taking the lock: getToken() holds the lock for the whole interactive
-        // flow, so close() signals the in-flight sign-in to stop with a lock-free volatile write, then
-        // acquires the lock - which the now-cancelled flow releases once it observes the flag (between
-        // polls, or after an in-flight poll request returns) - and frees the native resources. close()
-        // never frees while a flow holds the lock, so there is no use-after-free
+        // flag cancellation before taking the lock: getToken() holds it for the whole flow, so signal the
+        // in-flight sign-in to stop via a lock-free volatile write, then acquire the lock - released by the
+        // cancelled flow once it observes the flag (between polls, or after an in-flight poll returns) - and
+        // free the native resources. close() never frees while a flow holds the lock, so no use-after-free
         closed = true;
         lock.lock();
         try {
@@ -439,10 +425,9 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Returns a valid token to present to QuestDB. Returns the cached token while it is still
-     * valid; otherwise refreshes it silently when possible, or runs the interactive device flow.
-     * The returned token is the id token when the server expects groups encoded in the token,
-     * and the access token otherwise.
+     * Returns a valid token to present to QuestDB: the cached token while still valid, otherwise a
+     * silent refresh when possible, otherwise the interactive device flow. The token is the id token
+     * when the server expects groups encoded in the token, the access token otherwise.
      *
      * @return a non-null, non-empty token
      * @throws OidcAuthException if the interactive flow fails, times out, or the identity provider
@@ -452,10 +437,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         lock.lock();
         try {
             throwIfClosed();
-            // only a cached copy of the token getToken() actually serves counts as a cache hit; a grant
-            // that returned the other kind (an access token when the server wants the id token, or vice
-            // versa) leaves the served token null, so the flow must re-run rather than report the unusable
-            // grant as valid and have selectToken() throw on this and every later call
+            // only the kind of token getToken() actually serves counts as a cache hit; a grant that
+            // returned the other kind (access token when the server wants the id token, or vice versa)
+            // leaves the served token null, so re-run the flow rather than report the unusable grant as
+            // valid and have selectToken() throw on this and every later call
             final String cachedToken = groupsInToken ? idToken : accessToken;
             if (cachedToken != null) {
                 if (System.currentTimeMillis() < expiresAtMillis - clockSkewMillis) {
@@ -473,17 +458,16 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Returns a valid token like {@link #getToken()} but never starts the interactive device flow and
-     * never blocks: it returns the cached token while it is valid and silently refreshes it when a
-     * refresh token is available, otherwise it throws. Designed for the request/flush path of a
-     * long-lived client, for example {@code Sender.builder(...).httpTokenProvider(auth::getTokenSilently)},
-     * where an interactive prompt would be inappropriate and a stalled flush unacceptable. Call
-     * {@link #getToken()} once to sign in before handing this method to a client.
+     * Like {@link #getToken()} but never starts the interactive device flow and never blocks: returns
+     * the cached token while valid, silently refreshes when a refresh token is available, otherwise
+     * throws. Designed for the request/flush path of a long-lived client, for example
+     * {@code Sender.builder(...).httpTokenProvider(auth::getTokenSilently)}, where an interactive prompt
+     * is inappropriate and a stalled flush unacceptable. Call {@link #getToken()} once to sign in first.
      * <p>
-     * To keep the flush path responsive it returns promptly or throws promptly - it never waits for an
-     * interactive {@link #getToken()} in progress on another thread (which would otherwise stall the
-     * flush for the whole device-code lifetime). While such a sign-in runs there is no token to return
-     * anyway, so this method throws and the caller should retry once the sign-in completes.
+     * To keep the flush path responsive it returns or throws promptly - it never waits for an interactive
+     * {@link #getToken()} on another thread (which would stall the flush for the whole device-code
+     * lifetime). While such a sign-in runs there is no token to return anyway, so it throws and the caller
+     * should retry once the sign-in completes.
      *
      * @return a non-null, non-empty token
      * @throws OidcAuthException if no token has been obtained yet, if the cached token expired and could
@@ -492,10 +476,10 @@ public class OidcDeviceAuth implements QuietCloseable {
      */
     public String getTokenSilently() {
         throwIfClosed();
-        // never wait on the flush path: getToken()'s interactive sign-in holds the lock for the whole
-        // device-code lifetime (up to an hour), so acquire it without blocking and fail fast if it is
-        // held. A sign-in in progress means there is no token to serve yet, so the caller gets a prompt
-        // exception to retry rather than a stalled flush
+        // never wait on the flush path: getToken()'s sign-in holds the lock for the whole device-code
+        // lifetime (up to an hour), so tryLock and fail fast if held. A sign-in in progress means there
+        // is no token to serve yet, so the caller gets a prompt exception to retry rather than a stalled
+        // flush
         if (!lock.tryLock()) {
             throw new OidcAuthException("a sign-in or token refresh is already in progress on another thread; no token is available without blocking - retry shortly");
         }
@@ -537,8 +521,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static void discardBody(Response body, int timeoutMillis) {
-        // best-effort drain after a parse failure so the keep-alive connection stays usable; bounded the
-        // same way as parseBody so a hostile server cannot wedge the thread here either
+        // best-effort drain after a parse failure to keep the keep-alive connection usable; bounded like
+        // parseBody so a hostile server cannot wedge the thread here either
         final long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
         long totalBytes = 0;
         try {
@@ -562,9 +546,9 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static void discoverFromIdp(String issuer, String discoveryUrl, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport, WellKnownDiscoveryParser parser) {
-        // the discovery document URL is pinned out of band (a caller-supplied discoveryUrl, else built
-        // from the issuer) - the caller guarantees one of the two is non-null - so the server cannot
-        // choose where discovery, and the credential POSTs it resolves, are aimed
+        // the discovery URL is pinned out of band (a caller-supplied discoveryUrl, else built from the
+        // issuer; the caller guarantees one is non-null), so the server cannot choose where discovery -
+        // and the credential POSTs it resolves - are aimed
         String url = discoveryUrl != null ? discoveryUrl : wellKnownUrl(issuer);
         Endpoint endpoint = Endpoint.parse(url);
         if (!allowInsecureTransport) {
@@ -595,8 +579,8 @@ public class OidcDeviceAuth implements QuietCloseable {
             HttpClient.ResponseHeaders response = request.send(DEFAULT_HTTP_TIMEOUT_MILLIS);
             response.await(DEFAULT_HTTP_TIMEOUT_MILLIS);
             Response body = response.getResponse();
-            // bounded read: parseBody enforces a wall-clock deadline and a byte cap so an untrusted
-            // server cannot wedge discovery, and its parseLast rejects a truncated document
+            // parseBody enforces a wall-clock deadline and a byte cap so an untrusted server cannot wedge
+            // discovery, and its parseLast rejects a truncated document
             parseBody(body, lexer, parser, DEFAULT_HTTP_TIMEOUT_MILLIS);
         } catch (HttpClientException e) {
             throw new OidcAuthException(e).put(reachError);
@@ -609,8 +593,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static boolean isDottedIpv4(String host) {
-        // validate a dotted IPv4 literal (four 0-255 octets) without a DNS lookup, so a hostname that
-        // merely starts with "127." is not mistaken for the loopback block
+        // validate a dotted IPv4 literal (four 0-255 octets) without DNS, so a hostname merely starting
+        // with "127." is not mistaken for the loopback block
         int octets = 1;
         int value = 0;
         int digits = 0;
@@ -636,8 +620,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static boolean isLoopbackHost(String host) {
-        // traffic to a loopback target never leaves the host, so a plaintext /settings fetch to it carries
-        // no network interception risk; match localhost and the whole IPv4 127.0.0.0/8 block
+        // loopback traffic never leaves the host, so a plaintext /settings fetch to it has no network
+        // interception risk; match localhost and the whole IPv4 127.0.0.0/8 block
         return host != null && (host.equalsIgnoreCase("localhost") || (host.startsWith("127.") && isDottedIpv4(host)));
     }
 
@@ -646,8 +630,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static void parseBody(Response body, JsonLexer lexer, JsonParser parser, int timeoutMillis) throws JsonException {
-        // read and parse the whole body, bounded by an overall wall-clock deadline and a cumulative byte
-        // cap, so a hostile or stalled server cannot wedge the thread by dribbling or endlessly streaming
+        // read and parse the whole body, bounded by a wall-clock deadline and a cumulative byte cap, so a
+        // hostile or stalled server cannot wedge the thread by dribbling or endlessly streaming
         final long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
         long totalBytes = 0;
         while (true) {
@@ -677,9 +661,9 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static void putNonNull(StringSink sink, CharSequence tag) {
-        // clear before storing so a repeated key in the response replaces, rather than concatenates onto,
-        // the previous value; a JSON null arrives from the lexer as the literal "null", so treat it as
-        // absent rather than store the 4-char string "null" as a token, error code, endpoint or user code
+        // clear before storing so a repeated key replaces, not concatenates onto, the previous value; a
+        // JSON null arrives from the lexer as the literal "null", so treat it as absent rather than store
+        // the 4-char string "null" as a token, error code, endpoint or user code
         sink.clear();
         if (!Chars.equals("null", tag)) {
             sink.put(tag);
@@ -695,8 +679,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static boolean sameOrigin(Endpoint a, Endpoint b) {
-        // scheme (captured by isTls), host and port - the security origin; the path is deliberately not
-        // compared, the token and device endpoints legitimately differ in path on one authorization server
+        // scheme (via isTls), host and port - the security origin; path is deliberately not compared, the
+        // token and device endpoints legitimately differ in path on one authorization server
         return a.isTls == b.isTls && a.port == b.port && a.host.equalsIgnoreCase(b.host);
     }
 
@@ -715,14 +699,13 @@ public class OidcDeviceAuth implements QuietCloseable {
             i += Character.charCount(cp);
         }
         if (firstUnsafe < 0) {
-            // common case: nothing to strip
-            return value;
+            return value; // common case: nothing to strip
         }
-        // an attacker-influenced device-auth field smuggled in characters that can rewrite or spoof the
-        // terminal - ANSI escapes, CR/LF, or bidi/zero-width formatting (including supplementary-plane
-        // "tag" characters that arrive as surrogate pairs) that reorders or hides text - so strip them
-        // per code point; otherwise a right-to-left override could make the verification URL a human reads
-        // differ from the one their browser opens
+        // an attacker-influenced device-auth field can smuggle in terminal-spoofing characters - ANSI
+        // escapes, CR/LF, or bidi/zero-width formatting (including supplementary-plane "tag" chars that
+        // arrive as surrogate pairs) - that reorder or hide text, so strip them per code point; else a
+        // right-to-left override could make the verification URL a human reads differ from the one their
+        // browser opens
         StringSink sink = new StringSink();
         sink.put(value, 0, firstUnsafe);
         for (int i = firstUnsafe; i < n; ) {
@@ -737,9 +720,9 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static boolean settingsChannelIsPlaintext(Endpoint server) {
-        // /settings reached over plaintext http to a non-loopback host is MITM-able (only possible when
-        // allowInsecureTransport is set; the default rejects it), so the endpoints it advertises must not
-        // be trusted to route credentials without an out-of-band pin
+        // /settings over plaintext http to a non-loopback host is MITM-able (only possible with
+        // allowInsecureTransport; the default rejects it), so its advertised endpoints must not be trusted
+        // to route credentials without an out-of-band pin
         return !server.isTls && !isLoopbackHost(server.host);
     }
 
@@ -748,12 +731,12 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static void validateEndpointOrigins(Endpoint tokenEndpoint, Endpoint deviceAuthorizationEndpoint, Endpoint issuer) {
-        // the device code and the long-lived refresh token are POSTed to the device authorization and
-        // token endpoints. RFC 8628 co-locates them on one authorization server, so reject a configuration
-        // that splits them across origins (a tampered /settings or discovery document trying to siphon one
-        // off), and - when the issuer is pinned - reject either endpoint that does not belong to it. The
-        // pin compares origins, so an identity provider that hosts its endpoints on a different origin than
-        // its issuer must be configured without an issuer (or with explicit endpoints).
+        // the device code and long-lived refresh token are POSTed to the device authorization and token
+        // endpoints. RFC 8628 co-locates them on one authorization server, so reject a config that splits
+        // them across origins (a tampered /settings or discovery document siphoning one off), and - when
+        // the issuer is pinned - reject either endpoint not on it. The pin compares origins, so a provider
+        // hosting its endpoints on a different origin than its issuer must be configured without an issuer
+        // (or with explicit endpoints).
         if (!sameOrigin(tokenEndpoint, deviceAuthorizationEndpoint)) {
             throw new OidcAuthException()
                     .put("the OIDC token and device authorization endpoints are on different origins (")
@@ -777,13 +760,13 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static void validateTokenChars(CharSequence token, String tokenName) {
-        // The selected token is written verbatim into the "Authorization: Bearer <token>" header sent to the
-        // trusted QuestDB server, and used as the PG-wire _sso password. A CR/LF or other control character
-        // would break out of the header and inject into the request line - the JSON lexer now decodes a \r or
-        // \n escape in the identity provider's response into a real control byte - and a non-ASCII character
-        // is silently truncated to one byte by the ASCII header writer. A real OAuth token is printable ASCII,
-        // so reject anything outside that range rather than route a tampered or corrupt credential onto the
-        // wire. The token bytes are never embedded in the message: they are the secret this class protects.
+        // The selected token goes verbatim into the "Authorization: Bearer <token>" header sent to the
+        // trusted QuestDB server and into the PG-wire _sso password. A CR/LF or other control char would
+        // break out of the header into the request line (the lexer now decodes a \r or \n escape in the
+        // provider's response into a real control byte), and a non-ASCII char is silently truncated to one
+        // byte by the ASCII header writer. A real OAuth token is printable ASCII, so reject anything else
+        // rather than route a tampered or corrupt credential onto the wire. Token bytes are never embedded
+        // in the message: they are the secret this class protects.
         for (int i = 0, n = token.length(); i < n; i++) {
             char c = token.charAt(i);
             if (c < 0x20 || c > 0x7e) {
@@ -820,7 +803,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private boolean isHttpStatusSuccess() {
-        // responseStatus holds the numeric HTTP status captured by readResponse; a 2xx starts with '2'
+        // responseStatus is the numeric HTTP status captured by readResponse; a 2xx starts with '2'
         return responseStatus.length() > 0 && responseStatus.charAt(0) == '2';
     }
 
@@ -831,7 +814,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         while (true) {
             throwIfClosed();
             // check the deadline before polling so an expiry that elapsed during the previous sleep aborts
-            // here, rather than after one more wasted poll round-trip
+            // here, not after one more wasted poll round-trip
             if (System.nanoTime() >= deadlineNanos) {
                 throw new OidcAuthException("timed out waiting for authorization, the device code expired; please retry");
             }
@@ -841,7 +824,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                     return;
                 }
                 if (result == POLL_TRANSIENT_ERROR) {
-                    // a non-2xx with no parseable answer; charge it to the transport-error budget so a
+                    // a non-2xx with no parseable answer; charge the transport-error budget so a
                     // persistently failing token endpoint aborts instead of polling until the code expires
                     if (++consecutiveTransportErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
                         throw new OidcAuthException().put("the token endpoint returned repeated unexpected responses [httpStatus=").put(responseStatus).put(']');
@@ -849,22 +832,22 @@ public class OidcDeviceAuth implements QuietCloseable {
                 } else {
                     consecutiveTransportErrors = 0;
                     if (result == POLL_SLOW_DOWN) {
-                        // grow the interval per RFC 8628, but keep it within the same cap as the initial
-                        // value so repeated slow_down responses cannot inflate the wait without bound
+                        // grow the interval per RFC 8628, capped at the same bound as the initial value so
+                        // repeated slow_down responses cannot inflate the wait without bound
                         intervalMillis = Math.min(intervalMillis + SLOW_DOWN_INCREMENT_SECONDS * 1000L, MAX_POLL_INTERVAL_SECONDS * 1000L);
                     }
                 }
             } catch (HttpClientException e) {
-                // a brief network blip is fine to retry, but a persistent failure (a rejected TLS
-                // certificate, a refused connection, an unresolvable host) must surface with its cause
-                // rather than masquerade as a device-code timeout
+                // a brief network blip is fine to retry, but a persistent failure (rejected TLS cert,
+                // refused connection, unresolvable host) must surface with its cause rather than
+                // masquerade as a device-code timeout
                 if (++consecutiveTransportErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
                     throw new OidcAuthException(e).put("the token endpoint became unreachable while waiting for authorization");
                 }
             } catch (OidcAuthException e) {
-                // a garbled / non-JSON body (a JsonException cause) is a transport-class blip and is
-                // retried on the same budget; a well-formed OAuth error or unexpected response (no
-                // parse cause) is a real answer from the identity provider and aborts immediately
+                // a garbled / non-JSON body (a JsonException cause) is a transport-class blip, retried on
+                // the same budget; a well-formed OAuth error or unexpected response (no parse cause) is a
+                // real answer from the identity provider and aborts immediately
                 if (!(e.getCause() instanceof JsonException)) {
                     throw e;
                 }
@@ -872,8 +855,8 @@ public class OidcDeviceAuth implements QuietCloseable {
                     throw e;
                 }
             }
-            // wait for the next poll, but never past the device-code deadline, so the timeout check at the
-            // top of the loop fires promptly at expiry instead of up to one poll interval late
+            // wait for the next poll, never past the device-code deadline, so the timeout check at the top
+            // of the loop fires promptly at expiry instead of up to one poll interval late
             sleepBetweenPolls(Math.min(intervalMillis, (deadlineNanos - System.nanoTime()) / 1_000_000L));
         }
     }
@@ -885,8 +868,8 @@ public class OidcDeviceAuth implements QuietCloseable {
         appendParam(formSink, "client_id", clientId);
 
         tokenParser.clear();
-        // a transport failure here propagates to pollForToken, which retries a brief blip but aborts
-        // on a persistent failure rather than swallowing it as a pending authorization
+        // a transport failure here propagates to pollForToken, which retries a brief blip but aborts on a
+        // persistent failure rather than swallowing it as a pending authorization
         postForm(tokenEndpoint, tokenParser);
 
         // RFC 6749 5.2: an error response is an error even if the body also carries a token, so handle the
@@ -900,8 +883,8 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             throw OidcAuthException.oauthError(tokenParser.error, tokenParser.errorDescription);
         }
-        // RFC 6749 5.1: a grant is a 2xx response carrying a token; a token under a non-2xx status is a
-        // malformed or hostile answer - charge it to the transport-error budget rather than trusting it
+        // RFC 6749 5.1: a grant is a 2xx response carrying a token; a token under a non-2xx status is
+        // malformed or hostile - charge the transport-error budget rather than trust it
         if (tokenParser.accessToken.length() > 0 || tokenParser.idToken.length() > 0) {
             if (isHttpStatusSuccess()) {
                 storeTokens(tokenParser);
@@ -910,7 +893,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             return POLL_TRANSIENT_ERROR;
         }
         // no tokens and no OAuth error: a 2xx is a definitive but malformed answer and aborts; a non-2xx
-        // (a gateway 5xx, an empty body) is a transport-class blip - retry rather than abort the sign-in
+        // (gateway 5xx, empty body) is a transport-class blip - retry rather than abort the sign-in
         if (isHttpStatusSuccess()) {
             throw new OidcAuthException().put("unexpected response from the token endpoint [httpStatus=").put(responseStatus).put(']');
         }
@@ -933,17 +916,17 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void readResponse(HttpClient.ResponseHeaders response, JsonParser parser) {
-        // capture only the HTTP status for diagnostics; the body is never retained or surfaced in
-        // a message, it carries access, id and refresh tokens that must not reach logs or exceptions
+        // capture only the HTTP status for diagnostics; the body is never retained or surfaced in a
+        // message - it carries access, id and refresh tokens that must not reach logs or exceptions
         responseStatus.clear();
         DirectUtf8Sequence statusCode = response.getStatusCode();
         Response body = response.getResponse();
         if (statusCode != null) {
             // a well-formed HTTP status code is bare digits, but the header parser copies the status-line
             // token verbatim apart from SP/CR/LF, so a non-digit byte means a malformed or hostile status
-            // line. Reject it rather than echo any of its bytes - which could smuggle ESC or other control
-            // sequences into a log or terminal when responseStatus is surfaced in a message below - or trust
-            // its leading digit as a success gate. Drain the body first so the keep-alive connection stays usable.
+            // line. Reject it rather than echo any byte (which could smuggle ESC or other control sequences
+            // into a log or terminal when responseStatus is surfaced in a message below) or trust its
+            // leading digit as a success gate. Drain the body first to keep the keep-alive connection usable.
             CharSequence raw = statusCode.asAsciiCharSequence();
             for (int i = 0, n = raw.length(); i < n; i++) {
                 char c = raw.charAt(i);
@@ -958,8 +941,8 @@ public class OidcDeviceAuth implements QuietCloseable {
         try {
             parseBody(body, jsonLexer, parser, httpTimeoutMillis);
         } catch (JsonException e) {
-            // drain the rest so the keep-alive connection stays usable; never embed the body, it may
-            // carry tokens
+            // drain the rest to keep the keep-alive connection usable; never embed the body, it may carry
+            // tokens
             discardBody(body, httpTimeoutMillis);
             throw new OidcAuthException(e)
                     .put("could not parse the identity provider response [httpStatus=").put(responseStatus).put(']');
@@ -984,9 +967,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (deviceAuthParser.error.length() > 0) {
             throw OidcAuthException.oauthError(deviceAuthParser.error, deviceAuthParser.errorDescription);
         }
-        // RFC 8628 3.2: a device authorization grant is a 2xx response. A non-2xx body that carries no OAuth
-        // error (handled above) is a malformed or hostile answer; reject it rather than prompt the user and
-        // poll on it - the same 2xx gate pollOnce and tryRefresh apply before trusting a token
+        // RFC 8628 3.2: a device authorization grant is a 2xx response. A non-2xx body with no OAuth error
+        // (handled above) is malformed or hostile; reject it rather than prompt the user and poll on it -
+        // the same 2xx gate pollOnce and tryRefresh apply before trusting a token
         if (!isHttpStatusSuccess()) {
             throw new OidcAuthException().put("unexpected response from the device authorization endpoint [httpStatus=").put(responseStatus).put(']');
         }
@@ -1028,7 +1011,7 @@ public class OidcDeviceAuth implements QuietCloseable {
 
     private void sleepBetweenPolls(long millis) {
         // sleep in short slices so close() can abort an in-flight sign-in within ~POLL_SLEEP_SLICE_MILLIS
-        // instead of after a full (possibly slow_down-inflated) poll interval; Os.sleep ignores thread
+        // instead of after a full (possibly slow_down-inflated) interval; Os.sleep ignores thread
         // interrupts, so polling the closed flag is the only way to stay responsive to cancellation
         long remaining = millis;
         while (remaining > 0) {
@@ -1040,20 +1023,20 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void storeTokens(TokenResponseParser parser) {
-        // reject a token carrying control or non-ASCII characters before caching it: getToken() serves it
-        // verbatim as an HTTP Authorization header value and a PG-wire password, where a decoded CR/LF would
-        // inject into the request line sent to the trusted QuestDB server
+        // reject a token with control or non-ASCII chars before caching: getToken() serves it verbatim as
+        // an HTTP Authorization header value and a PG-wire password, where a decoded CR/LF would inject
+        // into the request line sent to the trusted QuestDB server
         validateTokenChars(parser.accessToken, "access_token");
         validateTokenChars(parser.idToken, "id_token");
         accessToken = parser.accessToken.length() > 0 ? parser.accessToken.toString() : null;
         idToken = parser.idToken.length() > 0 ? parser.idToken.toString() : null;
-        // a refresh response usually omits a new refresh token, in that case we keep the current one
+        // a refresh response usually omits a new refresh token; keep the current one in that case
         if (parser.refreshToken.length() > 0) {
             refreshToken = parser.refreshToken.toString();
         }
-        // clamp like the device-side expires_in: fall back to the default for a non-positive value and cap
-        // an absurd one, so a hostile or buggy token TTL cannot cache the token for decades (the server
-        // still enforces the real expiry; this only bounds how long the client trusts its cached copy)
+        // clamp like the device-side expires_in: default for a non-positive value, cap an absurd one, so a
+        // hostile or buggy token TTL cannot cache the token for decades (the server still enforces the real
+        // expiry; this only bounds how long the client trusts its cached copy)
         int ttlSeconds = boundedSeconds(parser.expiresIn, DEFAULT_TOKEN_TTL_SECONDS, MAX_EXPIRES_IN_SECONDS);
         expiresAtMillis = System.currentTimeMillis() + ttlSeconds * 1000L;
     }
@@ -1077,20 +1060,19 @@ public class OidcDeviceAuth implements QuietCloseable {
         try {
             postForm(tokenEndpoint, tokenParser);
         } catch (HttpClientException e) {
-            // could not reach the token endpoint, fall back to the interactive flow
+            // could not reach the token endpoint; fall back to the interactive flow
             return false;
         } catch (OidcAuthException e) {
-            // postForm only throws an OidcAuthException on a parse failure (a garbled / unparseable refresh
-            // response), never an OAuth error: a genuine OAuth error arrives in tokenParser.error and is
-            // handled by the hasRequiredToken check below. So treat this as a transient blip and fall back to
-            // the interactive flow rather than fail the whole getToken() call
+            // postForm throws OidcAuthException only on a parse failure (a garbled / unparseable refresh
+            // response), never an OAuth error: a genuine OAuth error arrives in tokenParser.error, handled
+            // by hasRequiredToken below. So treat this as a transient blip and fall back to the interactive
+            // flow rather than fail the whole getToken() call
             return false;
         }
-        // only treat the refresh as a success if a clean 2xx response (no OAuth error) returned the token
-        // getToken() actually serves (the id token when groups are encoded in it, the access token
-        // otherwise). A refresh that omits the id token - which RFC 6749 permits and many providers do -
-        // or one that carries an error or arrives under a non-2xx status must fall back to the interactive
-        // flow rather than be cached (and later fail in selectToken())
+        // succeed only on a clean 2xx (no OAuth error) returning the token getToken() actually serves (the
+        // id token when groups are encoded in it, the access token otherwise). A refresh that omits the id
+        // token - which RFC 6749 permits and many providers do - or carries an error or a non-2xx status
+        // must fall back to the interactive flow rather than be cached (and later fail in selectToken())
         boolean hasRequiredToken = (groupsInToken
                 ? tokenParser.idToken.length() > 0
                 : tokenParser.accessToken.length() > 0)
@@ -1100,8 +1082,8 @@ public class OidcDeviceAuth implements QuietCloseable {
             storeTokens(tokenParser);
             return true;
         }
-        // the refresh token expired or was revoked, or it did not return the token we need;
-        // fall back to the interactive flow
+        // the refresh token expired or was revoked, or did not return the token we need; fall back to the
+        // interactive flow
         return false;
     }
 
@@ -1128,8 +1110,8 @@ public class OidcDeviceAuth implements QuietCloseable {
 
         /**
          * Permits insecure {@code http} (rather than {@code https}) for the device authorization and
-         * token endpoints. Tokens then travel in cleartext, so this is rejected by default and should
-         * only be enabled for local development on a trusted network. Defaults to {@code false}.
+         * token endpoints. Tokens then travel in cleartext, so this is rejected by default; enable only
+         * for local development on a trusted network. Defaults to {@code false}.
          */
         public Builder allowInsecureTransport(boolean allowInsecureTransport) {
             this.allowInsecureTransport = allowInsecureTransport;
@@ -1165,8 +1147,8 @@ public class OidcDeviceAuth implements QuietCloseable {
                 requireSecureTransport(deviceEndpoint.isTls, "device authorization endpoint", deviceAuthorizationEndpoint);
                 requireSecureTransport(parsedTokenEndpoint.isTls, "token endpoint", tokenEndpoint);
             }
-            // enforce the credential-endpoint co-location / issuer pin on every construction path (not just
-            // discovery), so the documented guarantee holds for the explicit builder too
+            // enforce the credential-endpoint co-location / issuer pin on every construction path, not just
+            // discovery, so the documented guarantee holds for the explicit builder too
             validateEndpointOrigins(parsedTokenEndpoint, deviceEndpoint, issuerEndpoint);
             ClientTlsConfiguration tls = tlsConfig != null ? tlsConfig : defaultTlsConfig();
             return new OidcDeviceAuth(this, tls);
@@ -1178,8 +1160,8 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
 
         /**
-         * Sets how many seconds before the real expiry a cached token is treated as expired. Defaults
-         * to 30 seconds. The margin absorbs clock drift and request latency.
+         * Seconds before the real expiry at which a cached token is treated as expired, absorbing clock
+         * drift and request latency. Defaults to 30.
          */
         public Builder clockSkewSeconds(int clockSkewSeconds) {
             this.clockSkewSeconds = clockSkewSeconds;
@@ -1209,11 +1191,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         /**
          * Pins the identity provider by its {@code issuer} origin (for example
          * {@code https://idp.example.com}). When set, {@link #build()} rejects a token or device
-         * authorization endpoint that does not belong to this origin, so a compromised or tampered
-         * configuration cannot redirect the device code and refresh token to an attacker.
-         * {@link #fromQuestDB(String, String)} sets it for you when discovering from a server. The
-         * endpoints of an identity provider that hosts them on a different origin than its issuer are
-         * rejected when pinned; configure such a provider without an issuer. Optional.
+         * authorization endpoint not on this origin, so a compromised or tampered configuration cannot
+         * redirect the device code and refresh token to an attacker. {@link #fromQuestDB(String, String)}
+         * sets it for you when discovering from a server. A provider hosting its endpoints on a different
+         * origin than its issuer is rejected when pinned; configure it without an issuer. Optional.
          */
         public Builder issuer(String issuer) {
             this.issuer = issuer;
@@ -1368,15 +1349,14 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (url == null) {
                 throw new OidcAuthException("url is required");
             }
-            // Reject control characters, whitespace and display-unsafe code points anywhere in the url,
-            // before it is split or used. A smuggled CR/LF (or other control char) in the host would corrupt
-            // the outbound Host header; in the path or query it would inject into the HTTP request line -
-            // postForm sends the path verbatim via .url(endpoint.path) - a request-smuggling / header-
-            // injection vector when the url comes from a tampered /settings or discovery document. A bidi,
-            // zero-width or other format character (isUnsafeForDisplay, scanned per code point so a
-            // supplementary-plane one is not missed) would reorder, hide or forge the text when the url is
-            // echoed into a log line or the parse error messages below. Rejecting up front keeps the raw url
-            // safe both on the wire and on screen.
+            // Reject control characters, whitespace and display-unsafe code points anywhere in the url
+            // before it is split or used. A smuggled CR/LF (or other control char) in the host corrupts the
+            // outbound Host header; in the path or query it injects into the HTTP request line (postForm
+            // sends the path verbatim via .url(endpoint.path)) - a request-smuggling / header-injection
+            // vector when the url comes from a tampered /settings or discovery document. A bidi, zero-width
+            // or other format char (isUnsafeForDisplay, scanned per code point so a supplementary-plane one
+            // is not missed) reorders, hides or forges text when the url is echoed into a log line or the
+            // parse errors below. Rejecting up front keeps the raw url safe on the wire and on screen.
             for (int i = 0, n = url.length(); i < n; ) {
                 final int cp = url.codePointAt(i);
                 if (cp <= ' ' || OidcAuthException.isUnsafeForDisplay(cp)) {
@@ -1402,8 +1382,8 @@ public class OidcDeviceAuth implements QuietCloseable {
             String hostPort = pathStart < 0 ? url.substring(hostStart) : url.substring(hostStart, pathStart);
             String path = pathStart < 0 ? "/" : url.substring(pathStart);
             if (hostPort.startsWith("[")) {
-                // bracketed IPv6 literal: the client's HTTP layer does not bracket the Host header,
-                // so reject it clearly rather than mis-parse it on a ':' inside the address
+                // bracketed IPv6 literal: the client's HTTP layer does not bracket the Host header, so
+                // reject it clearly rather than mis-parse it on a ':' inside the address
                 throw new OidcAuthException().put("invalid url, IPv6 literal hosts are not supported [url=").put(url).put(']');
             }
             int colon = hostPort.indexOf(':');
@@ -1467,8 +1447,8 @@ public class OidcDeviceAuth implements QuietCloseable {
                     break;
                 case JsonLexer.EVT_NAME:
                     if (depth == 1) {
-                        // only the top-level "config" object is trusted; the sibling "preferences"
-                        // object holds arbitrary user-written keys and must not feed OIDC discovery
+                        // only the top-level "config" object is trusted; the sibling "preferences" object
+                        // holds arbitrary user-written keys and must not feed OIDC discovery
                         isConfigNext = Chars.equals("config", tag);
                         field = FIELD_NONE;
                     } else if (depth == 2 && isInConfig) {
@@ -1635,8 +1615,8 @@ public class OidcDeviceAuth implements QuietCloseable {
                     depth--;
                     break;
                 case JsonLexer.EVT_NAME:
-                    // the standard OIDC discovery document is a flat top-level object; only read its
-                    // top-level keys so a nested value cannot be mistaken for an endpoint
+                    // the OIDC discovery document is a flat top-level object; only read top-level keys so a
+                    // nested value cannot be mistaken for an endpoint
                     if (depth == 1) {
                         if (Chars.equals("device_authorization_endpoint", tag)) {
                             field = FIELD_DEVICE_AUTHORIZATION_ENDPOINT;
