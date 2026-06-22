@@ -91,10 +91,24 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
     }
 
     public Fragment recv(int timeout) {
+        // When a positive timeout is given, bound the whole call to it, not each socket read. This loop keeps
+        // re-reading while a chunk-size line (or the chunk-data-end CRLF) is still incomplete, so without one
+        // shared deadline a server that dribbles those bytes - one per timeout window - would keep a single
+        // recv() running for (line length) x timeout and defeat a caller's wall-clock bound (e.g.
+        // OidcDeviceAuth.parseBody). A non-positive timeout keeps the legacy "no bound" behaviour.
+        final boolean bounded = timeout > 0;
+        final long startNanos = bounded ? System.nanoTime() : 0L;
         while (true) {
             if (receive || dataLo == dataHi) {
                 compactBuffer();
-                dataHi += recvOrDie(dataHi, bufHi, timeout);
+                int callTimeout = timeout;
+                if (bounded) {
+                    callTimeout = timeout - (int) ((System.nanoTime() - startNanos) / 1_000_000L);
+                    if (callTimeout <= 0) {
+                        throw new HttpClientException("timed out reading the chunked response body");
+                    }
+                }
+                dataHi += recvOrDie(dataHi, bufHi, callTimeout);
             }
             long p; // moving data pointer for scanning buffer
             switch (state) {

@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.http.client;
 
 import io.questdb.client.cutlass.http.client.AbstractChunkedResponse;
 import io.questdb.client.cutlass.http.client.Fragment;
+import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.ObjList;
@@ -184,6 +185,37 @@ public class ChunkedResponseTest {
         assertResponse(
                 input,
                 createChunks(rnd, encoded.toString(), fragCount));
+    }
+
+    @Test(timeout = 30_000)
+    public void testRecvHonoursTotalTimeoutWhileChunkSizeDribbles() {
+        // a server that dribbles the chunk-size line and never sends its terminating CRLF must not keep a
+        // single recv() running past its timeout. recv(timeout) bounds the whole call (not each socket read),
+        // so the loop scanning the never-terminated chunk size aborts once the timeout elapses. Without the
+        // bound this recv() never returns and the @Test timeout fires instead.
+        final long memSize = 64;
+        final long mem = Unsafe.malloc(memSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            final AbstractChunkedResponse rsp = new AbstractChunkedResponse(mem, mem + memSize, -1) {
+                @Override
+                protected int recvOrDie(long bufLo, long bufHi, int timeout) {
+                    if (bufLo >= bufHi) {
+                        return 0; // buffer full of a CRLF-less chunk size: no forward progress
+                    }
+                    Unsafe.getUnsafe().putByte(bufLo, (byte) '0'); // a hex digit, never the terminating CR
+                    return 1;
+                }
+            };
+            rsp.begin(mem, mem);
+            try {
+                rsp.recv(50);
+                Assert.fail("expected recv to time out on a dribbled, never-terminated chunk size");
+            } catch (HttpClientException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
+            }
+        } finally {
+            Unsafe.free(mem, memSize, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     @Test

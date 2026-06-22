@@ -36,8 +36,10 @@ public interface Response {
     Fragment recv();
 
     /**
-     * Receives the next fragment of response data, blocking at most {@code timeout} milliseconds for
-     * a socket read.
+     * Receives the next fragment of response data. When {@code timeout} is positive it bounds the whole
+     * call to at most {@code timeout} milliseconds in total (not per socket read), so a server that
+     * dribbles the body one byte at a time cannot keep a single call running past it; a non-positive
+     * {@code timeout} disables the bound.
      *
      * @param timeout the receive timeout in milliseconds
      * @return the received fragment, or null once the body has been fully read
