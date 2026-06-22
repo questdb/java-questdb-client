@@ -776,6 +776,24 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private static void validateTokenChars(CharSequence token, String tokenName) {
+        // The selected token is written verbatim into the "Authorization: Bearer <token>" header sent to the
+        // trusted QuestDB server, and used as the PG-wire _sso password. A CR/LF or other control character
+        // would break out of the header and inject into the request line - the JSON lexer now decodes a \r or
+        // \n escape in the identity provider's response into a real control byte - and a non-ASCII character
+        // is silently truncated to one byte by the ASCII header writer. A real OAuth token is printable ASCII,
+        // so reject anything outside that range rather than route a tampered or corrupt credential onto the
+        // wire. The token bytes are never embedded in the message: they are the secret this class protects.
+        for (int i = 0, n = token.length(); i < n; i++) {
+            char c = token.charAt(i);
+            if (c < 0x20 || c > 0x7e) {
+                throw new OidcAuthException()
+                        .put("the identity provider returned an ").put(tokenName)
+                        .put(" containing a disallowed control or non-ASCII character; refusing to use it as a credential");
+            }
+        }
+    }
+
     private static String wellKnownUrl(String issuer) {
         String trimmed = issuer;
         while (trimmed.length() > 1 && trimmed.charAt(trimmed.length() - 1) == '/') {
@@ -1022,6 +1040,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void storeTokens(TokenResponseParser parser) {
+        // reject a token carrying control or non-ASCII characters before caching it: getToken() serves it
+        // verbatim as an HTTP Authorization header value and a PG-wire password, where a decoded CR/LF would
+        // inject into the request line sent to the trusted QuestDB server
+        validateTokenChars(parser.accessToken, "access_token");
+        validateTokenChars(parser.idToken, "id_token");
         accessToken = parser.accessToken.length() > 0 ? parser.accessToken.toString() : null;
         idToken = parser.idToken.length() > 0 ? parser.idToken.toString() : null;
         // a refresh response usually omits a new refresh token, in that case we keep the current one

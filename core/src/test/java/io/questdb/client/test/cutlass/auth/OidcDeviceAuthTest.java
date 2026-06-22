@@ -2289,6 +2289,34 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testTokenWithControlCharsRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // a hostile or man-in-the-middled identity provider returns an access token whose JSON value carries
+            // an escaped CR/LF; the lexer decodes it to real control bytes, which - sent verbatim in the
+            // Authorization header to the trusted QuestDB server - would inject into the request line. storeTokens
+            // must reject the token rather than cache and serve it, and must not leak the token into the message
+            String injected = "header.payload" + jsonUnicodeEscape(0x0d) + jsonUnicodeEscape(0x0a) + "X-Injected:1";
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson(injected, null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected a token with control characters to be rejected");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("disallowed control or non-ASCII"));
+                    // the token bytes must never leak into the message
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("X-Injected"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTransientParseFailureDuringPollingRecovers() throws Exception {
         assertMemoryLeak(() -> {
             // the token endpoint returns a garbled (non-JSON) body once, then a valid token; a transient
