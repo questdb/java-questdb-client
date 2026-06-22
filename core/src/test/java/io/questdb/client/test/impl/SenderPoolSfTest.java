@@ -1166,6 +1166,77 @@ public class SenderPoolSfTest {
     }
 
     @Test
+    public void testDefaultConfigRecoversOutOfRangeSlotsAfterShrink() throws Exception {
+        // Regression for review claim M1: with the out-of-the-box config
+        // (drain_orphans defaults to OFF), shrinking maxSize across a restart
+        // must STILL deliver the unacked data left in the now-out-of-range
+        // slots. recoverStrandedManagedSlots() pass 2 adopts <base>-i for
+        // i >= maxSize at construction, independent of drain_orphans.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: seed unacked data into default-0..3 via a maxSize=4 pool
+            // against a silent (never-acks) server.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (SenderPool seed = new SenderPool(seedCfg, 4, 4, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] s = new PooledSender[4];
+                    for (int i = 0; i < 4; i++) {
+                        s[i] = seed.borrow();
+                    }
+                    for (int i = 0; i < 4; i++) {
+                        s[i].table("recover").longColumn("v", i).atNow();
+                        s[i].flush();
+                    }
+                    for (int i = 3; i >= 0; i--) {
+                        s[i].close();
+                    }
+                }
+            }
+            for (int i = 0; i < 4; i++) {
+                Assert.assertTrue("default-" + i + " must hold unacked data",
+                        hasSegmentFile(slot("default-" + i)));
+            }
+
+            // Phase 2: restart at maxSize=2 with the DEFAULT config (NO
+            // drain_orphans) against a healthy ack server. minSize=0 so startup
+            // recovery -- not prewarm "normal use" -- is the recovery path for
+            // the in-range slots, and pass 2 is the only path for default-2/3.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(cfg, 0, 2, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    // In-range [0,2): startup recovery pass 1 drains these.
+                    Assert.assertTrue("in-range default-0 must be recovered at startup",
+                            awaitNoSegmentFile(slot("default-0"), 15_000));
+                    Assert.assertTrue("in-range default-1 must be recovered at startup",
+                            awaitNoSegmentFile(slot("default-1"), 15_000));
+
+                    // Out-of-range [2,4): pass 2 must deliver these too, under
+                    // the default config (no drain_orphans).
+                    Assert.assertTrue("default-2 unacked data must be recovered, not stranded",
+                            awaitNoSegmentFile(slot("default-2"), 15_000));
+                    Assert.assertTrue("default-3 unacked data must be recovered, not stranded",
+                            awaitNoSegmentFile(slot("default-3"), 15_000));
+                    Assert.assertFalse("out-of-range slot must not be abandoned as .failed",
+                            Files.exists(slot("default-2") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                    Assert.assertFalse("out-of-range slot must not be abandoned as .failed",
+                            Files.exists(slot("default-3") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+
+                    // Sanity: the pool is still usable for normal borrows.
+                    PooledSender a = pool.borrow();
+                    a.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testInRangeIdleSlotIsRecoveredAtStartupUnderSteadyLowLoad() throws Exception {
         // The drain exclusion is bounded to [0, maxSize) so a sibling's drainer
         // never adopts a slot dir the pool intends to (re)create -- that is what
@@ -1335,6 +1406,158 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testDeferredStartupRecoveryDoesNotBlockConstruction() throws Exception {
+        // M2 fix: when recovery is deferred (the pooled QuestDB handle's path),
+        // constructing the SenderPool must NOT run startup recovery inline, so
+        // build() never blocks on a reachable-but-not-acking server -- not even
+        // when every in-range slot holds stranded data. Recovery is driven later,
+        // off the build() thread (by the housekeeper in production; explicitly
+        // here).
+        final long acquireTimeoutMillis = 1_000L;
+        final int maxSize = 4;
+
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: seed unacked data into default-0..3 against a silent
+            // server (never acks; close_flush_timeout=0 leaves the .sfa on disk).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (SenderPool seed = new SenderPool(seedCfg, maxSize, maxSize, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] s = new PooledSender[maxSize];
+                    for (int i = 0; i < maxSize; i++) {
+                        s[i] = seed.borrow();
+                    }
+                    for (int i = 0; i < maxSize; i++) {
+                        s[i].table("recover").longColumn("v", i).atNow();
+                        s[i].flush();
+                    }
+                    for (int i = maxSize - 1; i >= 0; i--) {
+                        s[i].close();
+                    }
+                }
+            }
+            for (int i = 0; i < maxSize; i++) {
+                Assert.assertTrue("default-" + i + " must hold unacked data",
+                        hasSegmentFile(slot("default-" + i)));
+            }
+
+            // Phase 2: construct a DEFERRED pool against a STILL-silent (reachable
+            // but never-acking) server. Pre-fix, inline recovery would block the
+            // constructor for ~one acquireTimeoutMillis here; deferred, it returns
+            // effectively immediately because recovery has not run yet.
+            try (TestWebSocketServer silent2 = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent2.getPort();
+                silent2.start();
+                Assert.assertTrue(silent2.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+
+                long startNanos = System.nanoTime();
+                SenderPool pool = newDeferredPool(cfg, 0, maxSize, acquireTimeoutMillis);
+                long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+                try {
+                    // Headline: deferred construction does not pay the recovery
+                    // drain budget. A whole acquireTimeout of margin is plenty --
+                    // pre-fix this would have been ~acquireTimeoutMillis.
+                    Assert.assertTrue(
+                            "deferred construction must not block on recovery: took " + elapsedMillis
+                                    + "ms with acquireTimeout=" + acquireTimeoutMillis + "ms",
+                            elapsedMillis < acquireTimeoutMillis);
+
+                    // Recovery has not been driven yet, so every stranded slot is
+                    // still on disk -- proving construction skipped inline recovery.
+                    for (int i = 0; i < maxSize; i++) {
+                        Assert.assertTrue(
+                                "deferred construction must NOT recover inline: default-" + i,
+                                hasSegmentFile(slot("default-" + i)));
+                    }
+
+                    // Driving recovery against the still-silent server is bounded
+                    // by the shared budget and preserves the data (durable, not
+                    // lost) for a later attempt -- exercising the deferred path's
+                    // concurrency-safe slot reservation too.
+                    long recoverStart = System.nanoTime();
+                    invokeRunStartupRecoveryOnce(pool);
+                    long recoverMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - recoverStart);
+                    Assert.assertTrue(
+                            "driven recovery must be bounded by the shared budget: took " + recoverMillis
+                                    + "ms (acquireTimeout=" + acquireTimeoutMillis + "ms)",
+                            recoverMillis < 3 * acquireTimeoutMillis);
+                    for (int i = 0; i < maxSize; i++) {
+                        Assert.assertTrue(
+                                "stranded data must be preserved on disk, not lost: default-" + i,
+                                hasSegmentFile(slot("default-" + i)));
+                    }
+                } finally {
+                    pool.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDeferredStartupRecoveryDeliversWhenDriven() throws Exception {
+        // Deferring recovery off the constructor must not lose it: once driven
+        // (by the housekeeper in production; explicitly here) against an acking
+        // server, a deferred pool recovers its stranded managed slots exactly as
+        // the inline path would. The drive is also idempotent.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: seed unacked data into default-0 (silent server).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (SenderPool seed = new SenderPool(seedCfg, 1, 1, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender s = seed.borrow();
+                    s.table("recover").longColumn("v", 1).atNow();
+                    s.flush();
+                    s.close();
+                }
+            }
+            Assert.assertTrue("default-0 must hold unacked data", hasSegmentFile(slot("default-0")));
+
+            // Phase 2: deferred pool against an ACKING server.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+                SenderPool pool = newDeferredPool(cfg, 0, 2, 5_000);
+                try {
+                    // Deferred: not recovered until driven.
+                    Assert.assertTrue("deferred construction must NOT recover inline: default-0",
+                            hasSegmentFile(slot("default-0")));
+
+                    // Drive it (what the housekeeper does on its first tick).
+                    invokeRunStartupRecoveryOnce(pool);
+                    Assert.assertTrue("driven recovery must empty default-0",
+                            awaitNoSegmentFile(slot("default-0"), 15_000));
+                    Assert.assertTrue("recovered frames must reach the server",
+                            awaitAtLeast(handler.frames, 1, 15_000));
+                    Assert.assertFalse("recovered slot must not be flagged .failed",
+                            Files.exists(slot("default-0") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+
+                    // Idempotent: a second drive is a no-op and must not throw.
+                    invokeRunStartupRecoveryOnce(pool);
+                    Assert.assertFalse("default-0 stays recovered", hasSegmentFile(slot("default-0")));
+
+                    // Pool still usable for normal borrows.
+                    PooledSender a = pool.borrow();
+                    a.close();
+                } finally {
+                    pool.close();
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Helpers.
     // ----------------------------------------------------------------------
@@ -1482,6 +1705,26 @@ public class SenderPoolSfTest {
                 String.class, int.class, int.class, long.class, long.class, long.class, IntFunction.class);
         c.setAccessible(true);
         return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
+    }
+
+    // Reaches the package-private 8-arg constructor (deferStartupRecovery=true)
+    // by reflection so a test can build a pool whose SF startup recovery is NOT
+    // run inline -- mirroring the pooled QuestDB handle, which defers it to the
+    // housekeeper. senderFactory=null -> the real defaultSender().
+    private static SenderPool newDeferredPool(String cfg, int min, int max, long acquireMs) throws Exception {
+        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
+                String.class, int.class, int.class, long.class, long.class, long.class,
+                IntFunction.class, boolean.class);
+        c.setAccessible(true);
+        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, null, true);
+    }
+
+    // Drives the package-private one-shot startup recovery the housekeeper would
+    // run, so a deferred pool's recovery can be triggered explicitly in tests.
+    private static void invokeRunStartupRecoveryOnce(SenderPool pool) throws Exception {
+        Method m = SenderPool.class.getDeclaredMethod("runStartupRecoveryOnce");
+        m.setAccessible(true);
+        m.invoke(pool);
     }
 
     /**

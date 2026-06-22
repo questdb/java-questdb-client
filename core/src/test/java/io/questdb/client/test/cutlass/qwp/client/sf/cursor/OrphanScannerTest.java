@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.IntList;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -200,6 +201,45 @@ public class OrphanScannerTest {
             }
             assertTrue("default-2 stranded", has2);
             assertTrue("default-3 stranded", has3);
+        });
+    }
+
+    @Test
+    public void testListStrandedOutOfRangeManagedSlots() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // A previous run used maxSize=2; default-0/1 are in range, default-2/3
+            // are out of range and hold unacked data. A non-canonical same-base
+            // name (default-04) and a foreign base (other-9) must NOT be listed:
+            // the pool only ever minted canonical default-<i>, so only those are
+            // its own stranded out-of-range slots.
+            for (String name : new String[]{"default-0", "default-1", "default-2", "default-3",
+                    "default-04", "other-9"}) {
+                String slot = sfDir + "/" + name;
+                assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+                touchFile(slot + "/sf-0001.sfa");
+            }
+            // An out-of-range slot already flagged .failed must be skipped.
+            String failed = sfDir + "/default-5";
+            assertEquals(0, Files.mkdir(failed, Files.DIR_MODE_DEFAULT));
+            touchFile(failed + "/sf-0001.sfa");
+            OrphanScanner.markFailed(failed, "test-induced");
+            // An out-of-range slot with no segment file must be skipped.
+            String empty = sfDir + "/default-6";
+            assertEquals(0, Files.mkdir(empty, Files.DIR_MODE_DEFAULT));
+
+            IntList stranded = OrphanScanner.listStrandedOutOfRangeManagedSlots(sfDir, "default", 2);
+            assertEquals("only canonical same-base i>=2 with unacked data", 2, stranded.size());
+            boolean has2 = false, has3 = false;
+            for (int i = 0; i < stranded.size(); i++) {
+                if (stranded.getQuick(i) == 2) has2 = true;
+                if (stranded.getQuick(i) == 3) has3 = true;
+            }
+            assertTrue("default-2 must be listed", has2);
+            assertTrue("default-3 must be listed", has3);
+
+            // count <= 0 / null / empty base disables the bound.
+            assertEquals(0, OrphanScanner.listStrandedOutOfRangeManagedSlots(sfDir, null, 2).size());
+            assertEquals(0, OrphanScanner.listStrandedOutOfRangeManagedSlots(sfDir, "", 2).size());
         });
     }
 

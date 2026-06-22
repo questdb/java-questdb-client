@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.IntList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -121,6 +122,20 @@ public final class SenderPool implements AutoCloseable {
     // locked slot dir. Counted in the cap check so the lost capacity is
     // accounted for. Guarded by lock; only ever ticks for SF slots.
     private int leakedSlots;
+    // SF slots currently held by the in-range startup-recovery pass
+    // (recoverStrandedManagedSlots): each is reserved under `lock` for the
+    // duration of its drain and counted in the borrow() cap check so a
+    // concurrent borrow can neither over-allocate past maxSize nor target a
+    // dir being recovered. Only ever non-zero on the deferred (housekeeper-
+    // driven) recovery path, where recovery overlaps borrow()/return; on the
+    // inline construction path the pool is still single-threaded. Guarded by
+    // lock; only ever ticks for SF slots.
+    private int recoveringSlots;
+    // True once recoverStrandedManagedSlots() has been started for this pool
+    // (inline at construction, or on the first PoolHousekeeper tick when the
+    // pooled handle defers it). Guarded by lock; makes runStartupRecoveryOnce()
+    // idempotent.
+    private boolean startupRecoveryDone;
 
     public SenderPool(
             String configurationString,
@@ -137,7 +152,9 @@ public final class SenderPool implements AutoCloseable {
     // Package-private constructor exposing the senderFactory test seam:
     // production passes null (-> the real defaultSender()). White-box tests in
     // io.questdb.client.test.impl reach this by reflection to inject a factory
-    // that throws a non-RuntimeException Throwable mid-prewarm.
+    // that throws a non-RuntimeException Throwable mid-prewarm. Recovery runs
+    // inline here (deferStartupRecovery=false); the pooled QuestDB handle uses
+    // the 8-arg overload to defer it to the housekeeper thread.
     SenderPool(
             String configurationString,
             int minSize,
@@ -146,6 +163,27 @@ public final class SenderPool implements AutoCloseable {
             long idleTimeoutMillis,
             long maxLifetimeMillis,
             IntFunction<Sender> senderFactory
+    ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, senderFactory, false);
+    }
+
+    // Full constructor. deferStartupRecovery=true skips the inline,
+    // construction-time SF recovery (recoverStrandedManagedSlots) so
+    // QuestDB.build() never blocks on a slow or reachable-but-not-acking
+    // server; the owner (QuestDBImpl) then drives recovery on the
+    // PoolHousekeeper thread via runStartupRecoveryOnce(). The in-range
+    // recovery pass is concurrency-safe against borrow()/return on that
+    // deferred path -- see recoverStrandedManagedSlots().
+    SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory,
+            boolean deferStartupRecovery
     ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
@@ -203,15 +241,51 @@ public final class SenderPool implements AutoCloseable {
             }
             throw e;
         }
-        // Prewarm succeeded; the pool is still single-threaded and unpublished.
-        // Recover any unacked data a previous run left in this pool's own
-        // managed slots that prewarm did not already re-adopt.
+        // Prewarm succeeded. Recover any unacked data a previous run left in
+        // this pool's own managed slots that prewarm did not already re-adopt.
+        // The pooled QuestDB handle defers this to the housekeeper thread
+        // (deferStartupRecovery=true) so QuestDB.build() never blocks on a slow
+        // or reachable-but-not-acking server; direct constructions run it inline
+        // here, while still single-threaded and unpublished.
+        if (!deferStartupRecovery) {
+            runStartupRecoveryOnce();
+        }
+    }
+
+    /**
+     * Runs {@link #recoverStrandedManagedSlots()} at most once for this pool.
+     * No-op when SF is off, when the pool is already closed, or when recovery
+     * has already been started (inline at construction, or on an earlier
+     * housekeeper tick).
+     * <p>
+     * The pooled {@code QuestDB} handle constructs its {@link SenderPool} with
+     * {@code deferStartupRecovery=true} and drives recovery through this method
+     * from the {@link PoolHousekeeper} thread, so {@code QuestDB.build()}
+     * returns without blocking on a slow or reachable-but-not-acking server.
+     * Safe to call while {@link #borrow()} and return run concurrently -- see
+     * the concurrency note on {@link #recoverStrandedManagedSlots()}.
+     */
+    void runStartupRecoveryOnce() {
+        if (!storeAndForward || closed) {
+            return;
+        }
+        lock.lock();
+        try {
+            if (startupRecoveryDone) {
+                return;
+            }
+            startupRecoveryDone = true;
+        } finally {
+            lock.unlock();
+        }
         recoverStrandedManagedSlots();
     }
 
     /**
      * Best-effort, one-shot recovery of unacked data left in this pool's own
-     * managed SF slots {@code [0, maxSize)} by a previous run.
+     * managed SF slots by a previous run -- both the in-range slots
+     * {@code [0, maxSize)} and the same-base slots a larger previous run left
+     * OUT of range ({@code <base>-i} with {@code i >= maxSize}).
      * <p>
      * Every pooled SF sender's orphan drainer deliberately excludes the whole
      * {@code [0, maxSize)} managed range (via
@@ -222,20 +296,33 @@ public final class SenderPool implements AutoCloseable {
      * recovered ONLY when the pool happens to (re)create that index; under
      * steady low load the pool may never grow to a high index, stranding that
      * slot's data (durable on disk, but undelivered) until a later restart or
-     * a load spike. This method closes that gap by recovering such slots once,
-     * here at construction.
+     * a load spike. An out-of-range slot is worse off still: the pool never
+     * re-creates its index at all, and the per-sender drainer only adopts it
+     * when {@code drain_orphans=on}, so under the default config its data would
+     * sit durable-but-undelivered indefinitely. This method closes both gaps by
+     * recovering such slots once, here at construction, regardless of
+     * {@code drain_orphans}.
      * <p>
-     * It runs while the pool is single-threaded and unpublished, and reserves
-     * each slot index for the duration of its recovery, so no concurrent
-     * borrow can target the dir -- the cannibalization race the drainer
-     * exclusion prevents cannot occur here either. Prewarmed slots (already
-     * live, holding their flock) are skipped; they deliver their recovered
-     * data through normal use.
+     * It runs either inline at construction (single-threaded, unpublished) or,
+     * for the pooled {@code QuestDB} handle, on the {@link PoolHousekeeper}
+     * thread shortly after publication -- concurrently with {@link #borrow()}
+     * and return. Either way the in-range pass reserves each slot index under
+     * {@code lock} for the duration of its recovery AND counts it in the
+     * borrow() capacity check (via {@code recoveringSlots}), so a concurrent
+     * borrow can neither target the dir being recovered nor over-allocate past
+     * {@code maxSize} -- the cannibalization race the drainer exclusion prevents
+     * cannot occur here either. Prewarmed slots (already live, holding their
+     * flock) are skipped; they deliver their recovered data through normal use.
+     * The out-of-range pass needs no reservation: those indices are outside
+     * {@code [0, maxSize)}, have no {@code slotInUse} entry, and are never
+     * allocated by borrow().
      * <p>
      * Every step is best-effort: a slot with no unacked data is a cheap
      * directory probe; an unreachable server, a slow drain, or a build/close
      * Error is logged and never fails construction, since the data stays
-     * durable on disk for a later attempt.
+     * durable on disk for a later attempt. A single shared wall-clock budget
+     * (one {@code acquireTimeoutMillis}) caps the WHOLE recovery -- both passes
+     * -- and the first build/drain failure stops the scan.
      */
     private void recoverStrandedManagedSlots() {
         if (!storeAndForward || sfDir == null || !Files.exists(sfDir)) {
@@ -251,21 +338,31 @@ public final class SenderPool implements AutoCloseable {
         // on disk).
         final long recoveryDeadlineNanos =
                 System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(acquireTimeoutMillis);
+        final boolean[] flockHeld = new boolean[1];
+        boolean stopScan = false;
+
+        // Pass 1: in-range managed slots [0, maxSize). Reserve each index so no
+        // concurrent borrow can target the dir; prewarmed slots are skipped.
         for (int i = 0; i < maxSize; i++) {
             long remainingMillis = TimeUnit.NANOSECONDS.toMillis(
                     recoveryDeadlineNanos - System.nanoTime());
             if (remainingMillis <= 0) {
                 LOG.warn("startup SF recovery: {}ms budget exhausted; "
                         + "skipping remaining slots", acquireTimeoutMillis);
+                stopScan = true;
                 break;
             }
-            // Reserve this index unless prewarm already holds it live.
+            // Reserve this index unless prewarm (or a concurrent borrow, on the
+            // deferred path) already holds it live. Count the reservation in
+            // recoveringSlots so the borrow() cap check cannot over-allocate
+            // while this slot is held for recovery.
             boolean reserved;
             lock.lock();
             try {
                 reserved = slotInUse[i];
                 if (!reserved) {
                     slotInUse[i] = true;
+                    recoveringSlots++;
                 }
             } finally {
                 lock.unlock();
@@ -274,82 +371,152 @@ public final class SenderPool implements AutoCloseable {
                 continue;
             }
             String slotPath = sfDir + "/" + slotBaseId + "-" + i;
-            boolean stopScan = false;
-            // Hoisted out of the inner try so the outer finally can consult its
-            // flock state: createUnlocked(i) takes the slot flock on <base>-i,
-            // and recoverer.delegate().close() can early-return with the I/O
-            // thread still running (flock still held). Freeing the index in
-            // that case would resurrect "sf slot already in use" on the next
-            // borrow, so the finally must retire it permanently instead.
-            PooledSender recoverer = null;
+            stopScan = drainCandidateSlotForRecovery(i, slotPath, remainingMillis, flockHeld);
+            lock.lock();
             try {
-                if (OrphanScanner.isCandidateOrphan(slotPath)) {
-                    try {
-                        recoverer = createUnlocked(i);
-                    } catch (Throwable buildErr) {
-                        // A build/connect failure (e.g. server unreachable)
-                        // will very likely repeat for every remaining slot, so
-                        // stop here rather than pay a connect timeout per slot.
-                        LOG.warn("startup SF recovery: could not open slot {} ({}); "
-                                + "skipping remaining slots", slotPath, buildErr.toString());
-                        stopScan = true;
-                    }
-                    if (recoverer != null) {
-                        try {
-                            // Cap the drain at the remaining shared budget and
-                            // short-circuit on a timeout: a server that fails to
-                            // ack within the budget will very likely do the same
-                            // for every remaining slot -- exactly the build-
-                            // failure reasoning above -- so stop rather than pay
-                            // a drain timeout per slot.
-                            if (!recoverer.drain(remainingMillis)) {
-                                LOG.warn("startup SF recovery: drain did not ack slot {} "
-                                        + "within {}ms; skipping remaining slots",
-                                        slotPath, remainingMillis);
-                                stopScan = true;
-                            }
-                        } catch (Throwable drainErr) {
-                            LOG.warn("startup SF recovery: drain failed for slot {} ({})",
-                                    slotPath, drainErr.toString());
-                        } finally {
-                            try {
-                                recoverer.delegate().close();
-                            } catch (Throwable ignored) {
-                                // Best-effort close: a teardown Error must not
-                                // abort recovery of the remaining slots.
-                            }
-                        }
-                    }
+                // Release the recovery reservation accounting; from here either
+                // leakedSlots (retire) or the freed index carries the cap math.
+                recoveringSlots--;
+                if (flockHeld[0]) {
+                    // close() bailed early with the I/O thread still running and
+                    // the flock still held. Retire the slot permanently (mirror
+                    // discardBroken/reapIdle): keep slotInUse[i] set and count it
+                    // in leakedSlots so the borrow() cap math accounts for the
+                    // lost capacity and no later borrow ever reuses the
+                    // still-locked dir.
+                    leakedSlots++;
+                    LOG.warn("startup SF recovery: slot {} retired permanently: delegate close() returned with "
+                                    + "the flock still held (I/O thread refused to stop); pool capacity reduced by 1, "
+                                    + "now {} of {} usable [leakedSlots={}]",
+                            i, maxSize - leakedSlots, maxSize, leakedSlots);
+                } else {
+                    slotInUse[i] = false;
+                    // On the deferred path a borrow may be waiting on capacity
+                    // this recovery held; the freed index can now admit a
+                    // creation.
+                    slotReleased.signal();
                 }
-            } catch (Throwable scanErr) {
-                LOG.warn("startup SF recovery: scan failed for slot {} ({})",
-                        slotPath, scanErr.toString());
             } finally {
-                lock.lock();
-                try {
-                    if (recoverer != null && !flockReleased(recoverer)) {
-                        // close() bailed early with the I/O thread still
-                        // running and the flock still held. Retire the slot
-                        // permanently (mirror discardBroken/reapIdle): keep
-                        // slotInUse[i] set and count it in leakedSlots so the
-                        // borrow() cap math accounts for the lost capacity and
-                        // no later borrow ever reuses the still-locked dir.
-                        leakedSlots++;
-                        LOG.warn("startup SF recovery: slot {} retired permanently: delegate close() returned with "
-                                        + "the flock still held (I/O thread refused to stop); pool capacity reduced by 1, "
-                                        + "now {} of {} usable [leakedSlots={}]",
-                                i, maxSize - leakedSlots, maxSize, leakedSlots);
-                    } else {
-                        slotInUse[i] = false;
-                    }
-                } finally {
-                    lock.unlock();
-                }
+                lock.unlock();
             }
             if (stopScan) {
                 break;
             }
         }
+
+        if (stopScan) {
+            // Budget exhausted, or a build/drain failure that will very likely
+            // repeat -- do not start the out-of-range pass; that data stays
+            // durable on disk for a later attempt.
+            return;
+        }
+
+        // Pass 2: same-base slots a previous run left OUT of the current index
+        // range (<base>-i with i >= maxSize, from a run with a larger maxSize).
+        // The pool never re-creates these indices, and the per-sender orphan
+        // drainer only adopts them when drain_orphans=on -- so without this pass
+        // their unacked data would sit durable-but-undelivered under the default
+        // config. They are outside [0, maxSize), so they have no slotInUse entry
+        // and never affect the borrow() cap math; the pool is single-threaded
+        // and unpublished here and never allocates these indices, so no
+        // reservation is needed and the cannibalization race cannot occur.
+        IntList outOfRange = OrphanScanner.listStrandedOutOfRangeManagedSlots(
+                sfDir, slotBaseId, maxSize);
+        for (int k = 0, n = outOfRange.size(); k < n; k++) {
+            long remainingMillis = TimeUnit.NANOSECONDS.toMillis(
+                    recoveryDeadlineNanos - System.nanoTime());
+            if (remainingMillis <= 0) {
+                LOG.warn("startup SF recovery: {}ms budget exhausted; "
+                        + "skipping remaining out-of-range slots", acquireTimeoutMillis);
+                break;
+            }
+            int idx = outOfRange.getQuick(k);
+            String slotPath = sfDir + "/" + slotBaseId + "-" + idx;
+            boolean stop = drainCandidateSlotForRecovery(idx, slotPath, remainingMillis, flockHeld);
+            if (flockHeld[0]) {
+                // Out of the pool's [0, maxSize) capacity range: there is no
+                // slotInUse entry to retire and no future borrow targets this
+                // dir, so a still-held flock only leaks this recoverer's I/O
+                // thread (a best-effort teardown loss, logged). Crucially we do
+                // NOT touch leakedSlots -- that would wrongly shrink the
+                // in-range pool capacity.
+                LOG.warn("startup SF recovery: out-of-range slot {} closed with the flock still held "
+                                + "(I/O thread refused to stop); its data is durable on disk for a later attempt",
+                        slotPath);
+            }
+            if (stop) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Drains one candidate orphan slot dir within {@code remainingMillis},
+     * best-effort and never throwing. Builds a recoverer on {@code slotIndex}
+     * (whose {@link #defaultSender} derives the dir {@code <base>-slotIndex}),
+     * drains its unacked data, and closes the delegate. Shared by both recovery
+     * passes -- the in-range pass and the out-of-range pass -- which differ only
+     * in their slot bookkeeping, handled by the caller via {@code flockHeld}.
+     *
+     * @param flockHeld single-element out-param set to {@code true} iff a
+     *                  recoverer was built and its {@code close()} returned with
+     *                  the flock still held (the I/O thread refused to stop)
+     * @return {@code true} if a build/drain failure occurred that will very
+     * likely repeat for every remaining slot, so the caller should stop scanning
+     */
+    private boolean drainCandidateSlotForRecovery(int slotIndex, String slotPath,
+                                                  long remainingMillis, boolean[] flockHeld) {
+        flockHeld[0] = false;
+        // Hoisted so the flock check after the try can consult it:
+        // createUnlocked() takes the slot flock on <base>-slotIndex, and
+        // delegate().close() can early-return with the I/O thread still running
+        // (flock still held).
+        PooledSender recoverer = null;
+        boolean stopScan = false;
+        try {
+            if (!OrphanScanner.isCandidateOrphan(slotPath)) {
+                return false;
+            }
+            try {
+                recoverer = createUnlocked(slotIndex);
+            } catch (Throwable buildErr) {
+                // A build/connect failure (e.g. server unreachable) will very
+                // likely repeat for every remaining slot, so stop here rather
+                // than pay a connect timeout per slot.
+                LOG.warn("startup SF recovery: could not open slot {} ({}); "
+                        + "skipping remaining slots", slotPath, buildErr.toString());
+                return true;
+            }
+            try {
+                // Cap the drain at the remaining shared budget and short-circuit
+                // on a timeout: a server that fails to ack within the budget
+                // will very likely do the same for every remaining slot -- the
+                // same reasoning as the build-failure case above.
+                if (!recoverer.drain(remainingMillis)) {
+                    LOG.warn("startup SF recovery: drain did not ack slot {} "
+                            + "within {}ms; skipping remaining slots",
+                            slotPath, remainingMillis);
+                    stopScan = true;
+                }
+            } catch (Throwable drainErr) {
+                LOG.warn("startup SF recovery: drain failed for slot {} ({})",
+                        slotPath, drainErr.toString());
+            } finally {
+                try {
+                    recoverer.delegate().close();
+                } catch (Throwable ignored) {
+                    // Best-effort close: a teardown Error must not abort
+                    // recovery of the remaining slots.
+                }
+            }
+        } catch (Throwable scanErr) {
+            LOG.warn("startup SF recovery: scan failed for slot {} ({})",
+                    slotPath, scanErr.toString());
+        }
+        if (recoverer != null) {
+            flockHeld[0] = !flockReleased(recoverer);
+        }
+        return stopScan;
     }
 
     public PooledSender borrow() {
@@ -368,7 +535,7 @@ public final class SenderPool implements AutoCloseable {
                     s.markInUse();
                     return s;
                 }
-                if (all.size() + inFlightCreations + closingSlots + leakedSlots < maxSize) {
+                if (all.size() + inFlightCreations + closingSlots + leakedSlots + recoveringSlots < maxSize) {
                     inFlightCreations++;
                     // Reserve a slot index under the lock so concurrent
                     // creations never target the same SF slot dir. -1 when
@@ -728,10 +895,14 @@ public final class SenderPool implements AutoCloseable {
             // already in use"). The bound is maxSize, NOT the whole "<base>-"
             // prefix: a same-base slot at an index >= maxSize (left behind when
             // a previous run used a larger maxSize) is out of the pool's index
-            // range forever, so it is left drainable and its unacked data is
-            // recovered rather than silently stranded. This is a no-op unless
-            // the config also set drain_orphans=on; foreign leftovers under
-            // other names are still drained.
+            // range forever, so it is left drainable here. Its unacked data is
+            // delivered by the pool's own startup recovery
+            // (recoverStrandedManagedSlots, pass 2), which adopts these
+            // out-of-range same-base slots at construction REGARDLESS of
+            // drain_orphans -- so the default config never strands it. The
+            // per-sender drainer is an additional path that only runs when
+            // drain_orphans=on; foreign leftovers under other names are drained
+            // only by that path.
             raw = Sender.builder(configurationString)
                     .senderId(slotBaseId + "-" + slotIndex)
                     .orphanDrainExcludeManagedSlots(slotBaseId, maxSize)

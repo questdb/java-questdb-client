@@ -63,6 +63,19 @@ final class PoolHousekeeper {
     }
 
     private void runLoop() {
+        // One-shot, up front (before the first interval wait): deliver any
+        // unacked data a previous run stranded in the sender pool's managed SF
+        // slots. Done here, on the housekeeper thread, rather than in the
+        // SenderPool constructor so QuestDB.build() never blocks on a slow or
+        // reachable-but-not-acking server during startup recovery. No-op when SF
+        // is off or the pool is already closed. Best-effort: a recovery failure
+        // (including an Error such as an -ea AssertionError) must never kill
+        // this daemon, so swallow Throwable -- exactly as the reap guards below.
+        try {
+            senderPool.runStartupRecoveryOnce();
+        } catch (Throwable ignored) {
+            // see rationale above
+        }
         while (!stop) {
             synchronized (signalLock) {
                 if (stop) {

@@ -91,7 +91,11 @@ public final class QuestDBImpl implements QuestDB {
         try {
             builtSenderPool = new SenderPool(
                     ingestConfig, senderMin, senderMax, acquireTimeoutMillis,
-                    idleTimeoutMillis, maxLifetimeMillis, senderFactory);
+                    idleTimeoutMillis, maxLifetimeMillis, senderFactory,
+                    // Defer SF startup recovery to the PoolHousekeeper thread so
+                    // build() never blocks on a slow / reachable-but-not-acking
+                    // server; the housekeeper drives it via runStartupRecoveryOnce().
+                    true);
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
                     idleTimeoutMillis, maxLifetimeMillis, connectHook);

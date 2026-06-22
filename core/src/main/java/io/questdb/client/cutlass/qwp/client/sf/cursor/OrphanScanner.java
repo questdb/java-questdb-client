@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.IntList;
 import io.questdb.client.std.ObjList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -94,8 +95,12 @@ public final class OrphanScanner {
      * of the new {@code [0,maxSize)} index range) nor silently excluded. By
      * bounding the exclusion to {@code [0,managedSlotCount)},
      * any same-base slot with an index at or above {@code managedSlotCount} is
-     * treated like a foreign leftover and becomes a drainable orphan, so its
-     * data is recovered through the normal drain path.
+     * treated like a foreign leftover and becomes a drainable orphan. Its data
+     * is recovered either by the pool's startup recovery (which adopts these
+     * out-of-range same-base slots regardless of {@code drain_orphans}; see
+     * {@link #listStrandedOutOfRangeManagedSlots}) or, when
+     * {@code drain_orphans=on}, by the per-sender drain path -- never silently
+     * stranded.
      * <p>
      * Only canonical, pool-minted names are excluded: the suffix after
      * {@code <managedBase>-} must be a canonical non-negative decimal
@@ -146,6 +151,72 @@ public final class OrphanScanner {
             Files.findClose(find);
         }
         return orphans;
+    }
+
+    /**
+     * Lists the canonical indices of this pool's OWN same-base slots that a
+     * previous run left behind out of the current index range, i.e.
+     * {@code <managedBase>-<i>} for {@code i >= managedSlotCount} that still
+     * hold unacked data (no failure sentinel).
+     * <p>
+     * These are not foreign orphans: they are the pool's own canonical,
+     * pool-minted slots from a run with a larger {@code maxSize}. Because the
+     * current run's index range is {@code [0, managedSlotCount)} they are never
+     * re-created and so never recovered by the pool's normal (re)creation path,
+     * yet their unacked data is durable on disk. Startup recovery uses this to
+     * adopt and drain them once, at construction -- so their data is delivered
+     * under the default config, without waiting for {@code drain_orphans=on}.
+     * <p>
+     * Only exact, pool-minted names match: the suffix after
+     * {@code <managedBase>-} must be a canonical non-negative decimal
+     * ({@code 0,1,2,...} with no leading zeros, sign, or non-digits). Anything
+     * else under the same base is a foreign leftover, not a slot the pool
+     * created, and is left to the {@code drain_orphans} path.
+     *
+     * @return canonical indices ({@code >= managedSlotCount}) of same-base
+     * slots holding unacked data; empty when none, or when inputs are invalid
+     */
+    public static IntList listStrandedOutOfRangeManagedSlots(String sfDir, String managedBase, int managedSlotCount) {
+        IntList out = new IntList();
+        if (sfDir == null || managedBase == null || managedBase.isEmpty()
+                || managedSlotCount < 0 || !Files.exists(sfDir)) {
+            return out;
+        }
+        String managedPrefix = managedBase + "-";
+        long find = Files.findFirst(sfDir);
+        if (find < 0) {
+            LOG.warn("orphan scan could not enumerate {} \u2014 treating as no stranded slots, "
+                    + "but this may indicate a permission or transient error", sfDir);
+            return out;
+        }
+        if (find == 0) {
+            return out;
+        }
+        try {
+            int rc = 1;
+            while (rc > 0) {
+                String name = Files.utf8ToString(Files.findName(find));
+                rc = Files.findNext(find);
+                if (name == null || ".".equals(name) || "..".equals(name)) {
+                    continue;
+                }
+                if (!name.startsWith(managedPrefix)) {
+                    continue;
+                }
+                int idx = parseCanonicalIndex(name, managedPrefix.length());
+                if (idx < managedSlotCount) {
+                    // Negative (non-canonical) or in-range: not our concern here.
+                    continue;
+                }
+                if (!isCandidateOrphan(sfDir + "/" + name)) {
+                    continue;
+                }
+                out.add(idx);
+            }
+        } finally {
+            Files.findClose(find);
+        }
+        return out;
     }
 
     /**
