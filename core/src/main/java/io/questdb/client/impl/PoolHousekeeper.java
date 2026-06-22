@@ -34,6 +34,12 @@ final class PoolHousekeeper {
     // How long stop() waits for the daemon to exit. Kept ABOVE
     // SenderPool.RECOVERY_DRAIN_BUDGET_MILLIS so a startup-recovery drain still
     // in flight when close() arrives finishes well within this join (C1 fix).
+    // The recovery build that precedes the drain is bounded separately --
+    // recoverers force initial_connect_mode=OFF, so the build makes at most one
+    // connect attempt rather than a SYNC reconnect-budget retry (M1). The lone
+    // case that can still overrun this join is an in-flight connect to a
+    // black-holed host (no application-level connect timeout in the transport);
+    // see the residual-window note on SenderPool.recoverOneSlotStep.
     static final long STOP_TIMEOUT_MILLIS = 2_000;
 
     private final long intervalMillis;
@@ -74,9 +80,13 @@ final class PoolHousekeeper {
             // in the SenderPool constructor keeps QuestDB.build() from blocking
             // on a slow or reachable-but-not-acking server. Each step does at
             // most one drain bounded by SenderPool.RECOVERY_DRAIN_BUDGET_MILLIS
-            // (< STOP_TIMEOUT_MILLIS), and we re-check stop every step, so a
-            // close() landing mid-recovery only ever waits out a single bounded
-            // drain and the join in stop() cannot time out on a fresh slot.
+            // (< STOP_TIMEOUT_MILLIS) on a recoverer whose initial connect is
+            // forced OFF (at most one connect attempt, never a SYNC
+            // reconnect-budget retry -- M1), and we re-check stop every step, so
+            // a close() landing mid-recovery normally only waits out a single
+            // bounded drain and the join in stop() does not time out. The sole
+            // residual overrun is an in-flight connect to a black-holed host;
+            // see SenderPool.recoverOneSlotStep.
             // While recovery still has work we skip the idle wait so the backlog
             // drains promptly; once done we fall back to the normal interval.
             // No-op once recovery completes or the pool is closing. Best-effort:

@@ -83,6 +83,14 @@ public final class SenderPool implements AutoCloseable {
     // recovery drain still in flight when close() arrives cannot outlive the
     // housekeeper join -- the residual-budget bound that, together with the
     // early markClosing() signal, keeps close() prompt (C1 fix).
+    //
+    // This caps only the DRAIN. The recovery build that precedes it is bounded
+    // separately: recovery delegates force initial_connect_mode=OFF (see
+    // defaultRecoverySender) so the build does at most ONE connect attempt
+    // rather than a SYNC reconnect-budget retry loop (M1). One in-flight
+    // connect against a black-holed host still blocks on the OS connect timeout
+    // -- the residual window documented on recoverOneSlotStep -- because the
+    // transport has no application-level connect timeout to clamp it.
     private static final long RECOVERY_DRAIN_BUDGET_MILLIS = 1_000;
     private final long acquireTimeoutMillis;
     private final ArrayList<PooledSender> all;
@@ -95,6 +103,17 @@ public final class SenderPool implements AutoCloseable {
     // RuntimeException Throwable (e.g. an -ea AssertionError) mid-prewarm,
     // exercising the Error-safe delegate cleanup loop.
     private final IntFunction<Sender> senderFactory;
+    // Factory for startup-recovery delegates. Distinct from senderFactory so a
+    // recoverer can force a non-blocking initial connect (initial_connect_mode=
+    // OFF) regardless of user config: a recovery build runs on the
+    // PoolHousekeeper thread and must NOT inherit SYNC (auto-enabled by any
+    // reconnect_* knob), which would retry the connect for the whole reconnect
+    // budget inside build() -- far past PoolHousekeeper.STOP_TIMEOUT_MILLIS, so
+    // a close() landing during that build would make housekeeper.stop()'s join
+    // time out and leave the recoverer holding the slot flock after close()
+    // returned (M1). Mirrors senderFactory's test seam: an injected factory
+    // (non-null) drives BOTH paths so white-box recovery tests keep control.
+    private final IntFunction<Sender> recoverySenderFactory;
     private final ReentrantLock lock = new ReentrantLock();
     private final long maxLifetimeMillis;
     private final int maxSize;
@@ -213,6 +232,10 @@ public final class SenderPool implements AutoCloseable {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
         this.senderFactory = senderFactory != null ? senderFactory : this::defaultSender;
+        // An injected factory (tests) drives recovery too, preserving the
+        // white-box recovery seam; production recovery forces OFF-mode connects
+        // via defaultRecoverySender (see field comment / createRecoverer).
+        this.recoverySenderFactory = senderFactory != null ? senderFactory : this::defaultRecoverySender;
         this.configurationString = configurationString;
         this.minSize = minSize;
         this.maxSize = maxSize;
@@ -315,10 +338,15 @@ public final class SenderPool implements AutoCloseable {
      * Driven by the {@link PoolHousekeeper} one slot per step, back-to-back, on
      * the reap-loop thread: each step performs at most one drain bounded by
      * {@link #RECOVERY_DRAIN_BUDGET_MILLIS} -- kept below the housekeeper
-     * stop/join budget -- and the housekeeper re-checks {@code stop} between
-     * steps while {@link QuestDBImpl#close()} raises the {@code closed} shutdown
-     * signal (via {@link #markClosing()}) BEFORE stopping it, so a {@code close()}
-     * landing mid-recovery only ever has to wait out a single bounded drain.
+     * stop/join budget -- on a delegate whose initial connect is forced OFF
+     * ({@link #defaultRecoverySender}) so the build makes at most one connect
+     * attempt. The housekeeper re-checks {@code stop} between steps while
+     * {@link QuestDBImpl#close()} raises the {@code closed} shutdown signal (via
+     * {@link #markClosing()}) BEFORE stopping it, so a {@code close()} landing
+     * mid-recovery normally only has to wait out a single bounded drain. The one
+     * exception is an in-flight connect to a black-holed host, which blocks on
+     * the OS connect timeout -- see the residual-window note on
+     * {@link #recoverOneSlotStep}.
      * No-op (returns {@code false}) when SF is off, the pool is shutting down, or
      * recovery has already finished.
      *
@@ -367,6 +395,23 @@ public final class SenderPool implements AutoCloseable {
      * never propagates, since the data stays durable on disk for a later attempt;
      * the first build failure or drain timeout latches {@code recoveryComplete}
      * (the failure will very likely repeat for every remaining slot).
+     * <p>
+     * <b>Boundedness / residual window.</b> Recovery is driven on the
+     * PoolHousekeeper thread, and {@code close()} relies on a step finishing
+     * within {@code PoolHousekeeper.STOP_TIMEOUT_MILLIS}. A step is build +
+     * drain + close. The drain is capped by {@link #RECOVERY_DRAIN_BUDGET_MILLIS}
+     * and the build forces {@code initial_connect_mode=OFF} (see
+     * {@link #defaultRecoverySender}), so it makes at most ONE connect attempt
+     * instead of a SYNC reconnect-budget retry loop. That removes the
+     * minutes-long block a {@code reconnect_*}-tuned config used to cause (M1).
+     * One residual window remains and is NOT closed here: a single in-flight
+     * connect to a black-holed/firewalled host blocks on the OS connect timeout
+     * (the transport exposes no application-level connect timeout to clamp it).
+     * If {@code close()} lands during that one connect the housekeeper join can
+     * still time out and the detached build releases the slot flock shortly
+     * after {@code close()} returns. No data is lost (the slot stays durable on
+     * disk); the exposure is a brief "sf slot already in use" window on an
+     * immediate reopen, bounded by a single OS connect timeout.
      *
      * @return {@code true} if a drain was performed and more slots may remain;
      * {@code false} once the scan is complete or the pool is shutting down
@@ -523,7 +568,7 @@ public final class SenderPool implements AutoCloseable {
                                                   long remainingMillis, boolean[] flockHeld) {
         flockHeld[0] = false;
         // Hoisted so the flock check after the try can consult it:
-        // createUnlocked() takes the slot flock on <base>-slotIndex, and
+        // createRecoverer() takes the slot flock on <base>-slotIndex, and
         // delegate().close() can early-return with the I/O thread still running
         // (flock still held).
         PooledSender recoverer = null;
@@ -533,7 +578,12 @@ public final class SenderPool implements AutoCloseable {
                 return false;
             }
             try {
-                recoverer = createUnlocked(slotIndex);
+                // Recovery delegate: forced OFF-mode initial connect (see
+                // createRecoverer / defaultRecoverySender), so this build does
+                // at most ONE connect attempt -- it never inherits the SYNC
+                // reconnect-budget retry loop that would block this
+                // (PoolHousekeeper) thread for minutes (M1).
+                recoverer = createRecoverer(slotIndex);
             } catch (Throwable buildErr) {
                 // A build/connect failure (e.g. server unreachable) will very
                 // likely repeat for every remaining slot, so stop here rather
@@ -950,38 +1000,71 @@ public final class SenderPool implements AutoCloseable {
         return new PooledSender(senderFactory.apply(slotIndex), this, slotIndex);
     }
 
+    /**
+     * Builds a {@link PooledSender} for startup recovery of one stranded slot.
+     * Routes through {@link #recoverySenderFactory}, which in production forces
+     * a non-blocking initial connect ({@link #defaultRecoverySender}) so a
+     * single recovery step stays bounded -- see that method and
+     * {@link #drainCandidateSlotForRecovery}.
+     */
+    private PooledSender createRecoverer(int slotIndex) {
+        return new PooledSender(recoverySenderFactory.apply(slotIndex), this, slotIndex);
+    }
+
     private Sender defaultSender(int slotIndex) {
-        final Sender raw;
-        if (storeAndForward) {
-            // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
-            // so concurrent SF senders sharing one sf_dir never collide on
-            // the slot flock. senderId() is only legal on WebSocket transport,
-            // which is exactly when storeAndForward is true.
-            //
-            // Also fence off the pool's own live slot set [0, maxSize) from
-            // orphan draining: the pool co-manages every <base>-<index> slot it
-            // can re-create and recovers each slot's unacked data when it
-            // (re)creates it, so a sibling's startup drainer must never adopt
-            // another live pool slot's dir/lock (that would resurrect "sf slot
-            // already in use"). The bound is maxSize, NOT the whole "<base>-"
-            // prefix: a same-base slot at an index >= maxSize (left behind when
-            // a previous run used a larger maxSize) is out of the pool's index
-            // range forever, so it is left drainable here. Its unacked data is
-            // delivered by the pool's own startup recovery
-            // (recoverOneSlotStep, pass 2), which adopts these
-            // out-of-range same-base slots at construction REGARDLESS of
-            // drain_orphans -- so the default config never strands it. The
-            // per-sender drainer is an additional path that only runs when
-            // drain_orphans=on; foreign leftovers under other names are drained
-            // only by that path.
-            raw = Sender.builder(configurationString)
-                    .senderId(slotBaseId + "-" + slotIndex)
-                    .orphanDrainExcludeManagedSlots(slotBaseId, maxSize)
-                    .build();
-        } else {
-            raw = Sender.fromConfig(configurationString);
+        return buildManagedSlotSender(slotIndex, false);
+    }
+
+    /**
+     * Same managed-slot delegate as {@link #defaultSender}, but with the
+     * initial connect forced to {@link Sender.InitialConnectMode#OFF}. Used
+     * only for startup recovery, which runs on the PoolHousekeeper thread: OFF
+     * makes the build do at most ONE connect attempt instead of retrying for
+     * the whole reconnect budget (SYNC, auto-enabled by any reconnect_* knob),
+     * keeping a recovery step bounded below
+     * {@code PoolHousekeeper.STOP_TIMEOUT_MILLIS}. See M1 / the residual-window
+     * note on {@link #recoverOneSlotStep}.
+     */
+    private Sender defaultRecoverySender(int slotIndex) {
+        return buildManagedSlotSender(slotIndex, true);
+    }
+
+    private Sender buildManagedSlotSender(int slotIndex, boolean forRecovery) {
+        if (!storeAndForward) {
+            return Sender.fromConfig(configurationString);
         }
-        return raw;
+        // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
+        // so concurrent SF senders sharing one sf_dir never collide on
+        // the slot flock. senderId() is only legal on WebSocket transport,
+        // which is exactly when storeAndForward is true.
+        //
+        // Also fence off the pool's own live slot set [0, maxSize) from
+        // orphan draining: the pool co-manages every <base>-<index> slot it
+        // can re-create and recovers each slot's unacked data when it
+        // (re)creates it, so a sibling's startup drainer must never adopt
+        // another live pool slot's dir/lock (that would resurrect "sf slot
+        // already in use"). The bound is maxSize, NOT the whole "<base>-"
+        // prefix: a same-base slot at an index >= maxSize (left behind when
+        // a previous run used a larger maxSize) is out of the pool's index
+        // range forever, so it is left drainable here. Its unacked data is
+        // delivered by the pool's own startup recovery
+        // (recoverOneSlotStep, pass 2), which adopts these
+        // out-of-range same-base slots at construction REGARDLESS of
+        // drain_orphans -- so the default config never strands it. The
+        // per-sender drainer is an additional path that only runs when
+        // drain_orphans=on; foreign leftovers under other names are drained
+        // only by that path.
+        Sender.LineSenderBuilder builder = Sender.builder(configurationString)
+                .senderId(slotBaseId + "-" + slotIndex)
+                .orphanDrainExcludeManagedSlots(slotBaseId, maxSize);
+        if (forRecovery) {
+            // Force OFF so the recovery build never blocks on the reconnect
+            // budget (see defaultRecoverySender). An explicit mode wins over
+            // the SYNC auto-promotion the user's reconnect_* knobs would
+            // otherwise trigger.
+            builder.initialConnectMode(Sender.InitialConnectMode.OFF);
+        }
+        return builder.build();
     }
 
     /**

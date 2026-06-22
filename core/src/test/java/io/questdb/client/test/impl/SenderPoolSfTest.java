@@ -688,6 +688,52 @@ public class SenderPoolSfTest {
     }
 
     @Test
+    public void testRecoveryDelegateForcesOffInitialConnectMode() throws Exception {
+        // M1 regression: a startup-recovery delegate runs on the PoolHousekeeper
+        // thread, so its build() must NOT inherit the user's SYNC initial-connect
+        // mode (auto-enabled by any reconnect_* knob). SYNC would retry the
+        // connect for the whole reconnect budget inside build() -- far past
+        // PoolHousekeeper.STOP_TIMEOUT_MILLIS -- so a close() landing during that
+        // build would make the housekeeper join time out and leave the recoverer
+        // holding the slot flock after close() returned. The recovery factory
+        // forces initial_connect_mode=OFF (at most one connect attempt); the
+        // normal factory must still honour the user's promoted SYNC mode.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                // reconnect_max_duration_millis set, initial_connect_mode unset
+                // -> the builder promotes to SYNC for ordinary senders.
+                String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir
+                        + ";reconnect_max_duration_millis=30000;";
+                // min=0 (no prewarm connect), no stranded data (recovery no-op).
+                try (SenderPool pool = new SenderPool(cfg, 0, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    // Normal managed-slot delegate: inherits the promoted SYNC.
+                    Sender normal = invokeBuildSlotDelegate(pool, "defaultSender", 0);
+                    try {
+                        Assert.assertEquals(
+                                "ordinary pooled sender must honour the user's promoted SYNC mode",
+                                Sender.InitialConnectMode.SYNC, readInitialConnectMode(normal));
+                    } finally {
+                        normal.close();
+                    }
+                    // Recovery delegate on a different slot: forced OFF.
+                    Sender recoverer = invokeBuildSlotDelegate(pool, "defaultRecoverySender", 1);
+                    try {
+                        Assert.assertEquals(
+                                "recovery delegate must force OFF so build() makes at most one connect attempt",
+                                Sender.InitialConnectMode.OFF, readInitialConnectMode(recoverer));
+                    } finally {
+                        recoverer.close();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testStartupRecoveryRetiresSlotWhenRecovererCloseLeavesFlockHeld() throws Exception {
         // C1 regression: the startup recovery loop MUST mirror discardBroken /
         // reapIdle. When a recoverer's delegate close() returns with the SF
@@ -1747,6 +1793,25 @@ public class SenderPoolSfTest {
         Field f = PooledSender.class.getDeclaredField("delegate");
         f.setAccessible(true);
         return (Sender) f.get(ps);
+    }
+
+    // Invokes one of the pool's private managed-slot delegate factories
+    // (defaultSender / defaultRecoverySender) so a test can inspect the raw
+    // delegate it would build for a given slot index.
+    private static Sender invokeBuildSlotDelegate(SenderPool pool, String methodName, int slotIndex)
+            throws Exception {
+        Method m = SenderPool.class.getDeclaredMethod(methodName, int.class);
+        m.setAccessible(true);
+        return (Sender) m.invoke(pool, slotIndex);
+    }
+
+    // Reads the resolved initial-connect mode a built QwpWebSocketSender delegate
+    // is using (the value after the builder's SYNC auto-promotion / explicit
+    // override has been applied).
+    private static Sender.InitialConnectMode readInitialConnectMode(Sender delegate) throws Exception {
+        Field f = delegate.getClass().getDeclaredField("initialConnectMode");
+        f.setAccessible(true);
+        return (Sender.InitialConnectMode) f.get(delegate);
     }
 
     private static void setBooleanField(Object target, String name, boolean value) throws Exception {
