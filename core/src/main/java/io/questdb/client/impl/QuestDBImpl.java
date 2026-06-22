@@ -94,7 +94,7 @@ public final class QuestDBImpl implements QuestDB {
                     idleTimeoutMillis, maxLifetimeMillis, senderFactory,
                     // Defer SF startup recovery to the PoolHousekeeper thread so
                     // build() never blocks on a slow / reachable-but-not-acking
-                    // server; the housekeeper drives it via runStartupRecoveryOnce().
+                    // server; the housekeeper drives it via runStartupRecoveryStep().
                     true);
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
@@ -142,6 +142,13 @@ public final class QuestDBImpl implements QuestDB {
             return;
         }
         closed = true;
+        // Cancel any in-flight startup SF recovery BEFORE stopping the
+        // housekeeper: markClosing() raises the pool's shutdown signal so a
+        // recovery step driven on the housekeeper thread bails between slots and
+        // the housekeeper join below cannot time out waiting on a fresh slot's
+        // recovery drain (C1 fix #1). This only raises the flag; full pool
+        // teardown still happens in senderPool.close() further down.
+        senderPool.markClosing();
         // Independently guarded so a Throwable from one teardown step cannot skip
         // the rest. senderPool is closed last and owns the flock/mmap/I/O-thread
         // resources, so it must run even if housekeeper.stop()/queryPool.close()

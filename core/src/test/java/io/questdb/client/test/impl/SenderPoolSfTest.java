@@ -1170,7 +1170,7 @@ public class SenderPoolSfTest {
         // Regression for review claim M1: with the out-of-the-box config
         // (drain_orphans defaults to OFF), shrinking maxSize across a restart
         // must STILL deliver the unacked data left in the now-out-of-range
-        // slots. recoverStrandedManagedSlots() pass 2 adopts <base>-i for
+        // slots. recoverOneSlotStep() pass 2 adopts <base>-i for
         // i >= maxSize at construction, independent of drain_orphans.
         TestUtils.assertMemoryLeak(() -> {
             // Phase 1: seed unacked data into default-0..3 via a maxSize=4 pool
@@ -1320,7 +1320,7 @@ public class SenderPoolSfTest {
     @Test
     public void testStartupRecoveryIsBoundedByASharedBudget() throws Exception {
         // Regression for the startup-recovery budget (M1).
-        // recoverStrandedManagedSlots() runs synchronously in the SenderPool
+        // recoverOneSlotStep() runs synchronously in the SenderPool
         // constructor. A previous run can strand unacked data in EVERY in-range
         // slot, and if the server is reachable but does not ack, each slot's
         // drain blocks for the full acquireTimeoutMillis. Without a shared,
@@ -1558,6 +1558,83 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test(timeout = 60_000)
+    public void testCloseDuringDeferredRecoveryStopsBuildingOnClosingPool() throws Exception {
+        // C1 regression. The housekeeper drives startup recovery one slot per
+        // step on its own thread. QuestDBImpl.close() raises the pool's shutdown
+        // signal (markClosing) BEFORE stopping the housekeeper, and every step
+        // re-checks it, so a close() landing while a recoverer is mid-drain must
+        // stop recovery from building the NEXT slot -- no more "keeps building
+        // senders on a logically-closed pool". A fake recoverer parks slot-0's
+        // drain so we can raise the signal deterministically inside the window.
+        TestUtils.assertMemoryLeak(() -> {
+            // Seed REAL unacked data into default-0 and default-1 (two candidates).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedCfg = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (SenderPool seed = new SenderPool(seedCfg, 2, 2, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = seed.borrow();
+                    PooledSender b = seed.borrow();
+                    a.table("recover").longColumn("v", 0).atNow();
+                    a.flush();
+                    b.table("recover").longColumn("v", 1).atNow();
+                    b.flush();
+                    b.close();
+                    a.close();
+                }
+            }
+            Assert.assertTrue(hasSegmentFile(slot("default-0")));
+            Assert.assertTrue(hasSegmentFile(slot("default-1")));
+
+            final CountDownLatch slot0DrainStarted = new CountDownLatch(1);
+            final CountDownLatch releaseSlot0Drain = new CountDownLatch(1);
+            final java.util.List<Integer> builtSlots =
+                    java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+            IntFunction<Sender> factory = idx -> {
+                builtSlots.add(idx);
+                return blockingFakeSender(idx, slot0DrainStarted, releaseSlot0Drain);
+            };
+
+            // minSize=0 -> recovery is the only factory caller. Generous
+            // acquireTimeout so the ONLY reason slot 1 could be skipped is the
+            // shutdown signal being honoured.
+            final SenderPool pool = newDeferredPoolWithFactory(
+                    "ws::addr=localhost:1;sf_dir=" + sfDir + ";", 0, 2, 30_000, factory);
+            // Mimic the housekeeper: drive steps back-to-back until done/closing.
+            Thread recovery = new Thread(() -> {
+                try {
+                    while (invokeRunStartupRecoveryStep(pool)) {
+                        // keep stepping
+                    }
+                } catch (Exception ignored) {
+                }
+            }, "test-recovery");
+            recovery.start();
+
+            Assert.assertTrue("slot-0 recoverer must reach drain()",
+                    slot0DrainStarted.await(10, TimeUnit.SECONDS));
+
+            // Raise the shutdown signal mid-drain, exactly as QuestDBImpl.close()
+            // does before stopping the housekeeper.
+            invokeMarkClosing(pool);
+            releaseSlot0Drain.countDown();
+            recovery.join(TimeUnit.SECONDS.toMillis(10));
+            Assert.assertFalse("recovery thread must finish", recovery.isAlive());
+
+            Assert.assertTrue("sanity: the in-flight slot-0 recoverer was built",
+                    builtSlots.contains(0));
+            Assert.assertFalse(
+                    "recovery built a recoverer for slot 1 after the pool was signalled "
+                            + "closing; builtSlots=" + builtSlots,
+                    builtSlots.contains(1));
+
+            pool.close();
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Helpers.
     // ----------------------------------------------------------------------
@@ -1719,12 +1796,73 @@ public class SenderPoolSfTest {
         return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, null, true);
     }
 
-    // Drives the package-private one-shot startup recovery the housekeeper would
-    // run, so a deferred pool's recovery can be triggered explicitly in tests.
+    // Drives a deferred pool's startup recovery to completion (the housekeeper
+    // drives it one slot per tick; tests drive the whole backlog in one call).
     private static void invokeRunStartupRecoveryOnce(SenderPool pool) throws Exception {
-        Method m = SenderPool.class.getDeclaredMethod("runStartupRecoveryOnce");
+        Method m = SenderPool.class.getDeclaredMethod("runStartupRecoveryToCompletion");
         m.setAccessible(true);
         m.invoke(pool);
+    }
+
+    // Drives a SINGLE recovery step (the housekeeper's per-tick unit); returns
+    // whether more stranded slots remain.
+    private static boolean invokeRunStartupRecoveryStep(SenderPool pool) throws Exception {
+        Method m = SenderPool.class.getDeclaredMethod("runStartupRecoveryStep");
+        m.setAccessible(true);
+        return (Boolean) m.invoke(pool);
+    }
+
+    // Raises the pool's shutdown signal early, exactly as QuestDBImpl.close()
+    // does before stopping the housekeeper.
+    private static void invokeMarkClosing(SenderPool pool) throws Exception {
+        Method m = SenderPool.class.getDeclaredMethod("markClosing");
+        m.setAccessible(true);
+        m.invoke(pool);
+    }
+
+    // Deferred pool (deferStartupRecovery=true) WITH an injected factory, so a
+    // test can drive the housekeeper recovery path against fully controlled
+    // (fake) recoverers.
+    private static SenderPool newDeferredPoolWithFactory(
+            String cfg, int min, int max, long acquireMs, IntFunction<Sender> factory) throws Exception {
+        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
+                String.class, int.class, int.class, long.class, long.class, long.class,
+                IntFunction.class, boolean.class);
+        c.setAccessible(true);
+        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, factory, true);
+    }
+
+    // Fake Sender whose drain() (for slot 0 only) parks until released, opening a
+    // deterministic shutdown-during-recovery window. Holds no native resources.
+    private static Sender blockingFakeSender(int idx, CountDownLatch drainStarted, CountDownLatch release) {
+        return (Sender) java.lang.reflect.Proxy.newProxyInstance(
+                Sender.class.getClassLoader(),
+                new Class[]{Sender.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "drain":
+                            if (idx == 0) {
+                                drainStarted.countDown();
+                                release.await();
+                            }
+                            return true;
+                        case "close":
+                            return null;
+                        case "toString":
+                            return "BlockingFakeSender-" + idx;
+                        case "hashCode":
+                            return System.identityHashCode(proxy);
+                        case "equals":
+                            return proxy == args[0];
+                        default:
+                            Class<?> rt = method.getReturnType();
+                            if (rt == boolean.class) return false;
+                            if (rt == int.class) return 0;
+                            if (rt == long.class) return 0L;
+                            if (rt.isInstance(proxy)) return proxy;
+                            return null;
+                    }
+                });
     }
 
     /**

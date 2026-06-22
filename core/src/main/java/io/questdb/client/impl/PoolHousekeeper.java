@@ -31,6 +31,11 @@ package io.questdb.client.impl;
  */
 final class PoolHousekeeper {
 
+    // How long stop() waits for the daemon to exit. Kept ABOVE
+    // SenderPool.RECOVERY_DRAIN_BUDGET_MILLIS so a startup-recovery drain still
+    // in flight when close() arrives finishes well within this join (C1 fix).
+    static final long STOP_TIMEOUT_MILLIS = 2_000;
+
     private final long intervalMillis;
     private final QueryClientPool queryPool;
     private final SenderPool senderPool;
@@ -56,36 +61,44 @@ final class PoolHousekeeper {
             signalLock.notifyAll();
         }
         try {
-            thread.join(2_000);
+            thread.join(STOP_TIMEOUT_MILLIS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
     }
 
     private void runLoop() {
-        // One-shot, up front (before the first interval wait): deliver any
-        // unacked data a previous run stranded in the sender pool's managed SF
-        // slots. Done here, on the housekeeper thread, rather than in the
-        // SenderPool constructor so QuestDB.build() never blocks on a slow or
-        // reachable-but-not-acking server during startup recovery. No-op when SF
-        // is off or the pool is already closed. Best-effort: a recovery failure
-        // (including an Error such as an -ea AssertionError) must never kill
-        // this daemon, so swallow Throwable -- exactly as the reap guards below.
-        try {
-            senderPool.runStartupRecoveryOnce();
-        } catch (Throwable ignored) {
-            // see rationale above
-        }
         while (!stop) {
+            // Per-slot startup SF recovery, driven on THIS (the reap-loop)
+            // thread, one stranded slot per iteration. Doing it here rather than
+            // in the SenderPool constructor keeps QuestDB.build() from blocking
+            // on a slow or reachable-but-not-acking server. Each step does at
+            // most one drain bounded by SenderPool.RECOVERY_DRAIN_BUDGET_MILLIS
+            // (< STOP_TIMEOUT_MILLIS), and we re-check stop every step, so a
+            // close() landing mid-recovery only ever waits out a single bounded
+            // drain and the join in stop() cannot time out on a fresh slot.
+            // While recovery still has work we skip the idle wait so the backlog
+            // drains promptly; once done we fall back to the normal interval.
+            // No-op once recovery completes or the pool is closing. Best-effort:
+            // a recovery failure (including an Error) must never kill this
+            // daemon, so swallow Throwable -- exactly as the reap guards below.
+            boolean recovering;
+            try {
+                recovering = senderPool.runStartupRecoveryStep();
+            } catch (Throwable ignored) {
+                recovering = false;
+            }
             synchronized (signalLock) {
                 if (stop) {
                     return;
                 }
-                try {
-                    signalLock.wait(intervalMillis);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
+                if (!recovering) {
+                    try {
+                        signalLock.wait(intervalMillis);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
                 }
             }
             if (stop) {
