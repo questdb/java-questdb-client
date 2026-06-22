@@ -47,7 +47,7 @@ import java.util.function.Consumer;
  * outside the pool lock; an {@code inFlightCreations} counter keeps the
  * cap check honest under concurrent acquires.
  */
-public final class QueryClientPool {
+public final class QueryClientPool implements AutoCloseable {
 
     private final long acquireTimeoutMillis;
     private final ArrayList<QueryWorker> all;

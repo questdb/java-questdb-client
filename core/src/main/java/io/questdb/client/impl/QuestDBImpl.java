@@ -109,15 +109,16 @@ public final class QuestDBImpl implements QuestDB {
             // delegates' flocks, mmap'd rings, and I/O threads -- the precise leak
             // class this teardown-hardening work exists to kill. The cleanup below
             // is best-effort and rethrows the original failure.
-            if (builtHousekeeper != null) {
-                builtHousekeeper.stop();
-            }
-            if (builtQueryPool != null) {
-                builtQueryPool.close();
-            }
-            if (builtSenderPool != null) {
-                builtSenderPool.close();
-            }
+            //
+            // Each cleanup step is independently guarded: a Throwable (e.g. an OOM
+            // from QueryClientPool.close()'s `new ArrayList<>(all)`, or an Error
+            // from the housekeeper join) must never skip the remaining closes. The
+            // SenderPool -- owner of the flock/mmap/I/O-thread resources -- is
+            // closed last, so an unguarded earlier failure would strand exactly
+            // the resources this catch exists to reclaim.
+            closeQuietly(builtHousekeeper);
+            closeQuietly(builtQueryPool);
+            closeQuietly(builtSenderPool);
             throw e;
         }
         this.senderPool = builtSenderPool;
@@ -137,9 +138,37 @@ public final class QuestDBImpl implements QuestDB {
             return;
         }
         closed = true;
-        housekeeper.stop();
-        queryPool.close();
-        senderPool.close();
+        // Independently guarded so a Throwable from one teardown step cannot skip
+        // the rest. senderPool is closed last and owns the flock/mmap/I/O-thread
+        // resources, so it must run even if housekeeper.stop()/queryPool.close()
+        // throws an Error or OOM.
+        closeQuietly(housekeeper);
+        closeQuietly(queryPool);
+        closeQuietly(senderPool);
+    }
+
+    private static void closeQuietly(PoolHousekeeper housekeeper) {
+        if (housekeeper == null) {
+            return;
+        }
+        try {
+            housekeeper.stop();
+        } catch (Throwable ignored) {
+            // Best-effort teardown: never let a stop() failure skip the
+            // subsequent pool closes.
+        }
+    }
+
+    private static void closeQuietly(AutoCloseable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (Throwable ignored) {
+            // Best-effort teardown: never let one close() failure skip the
+            // remaining closes.
+        }
     }
 
     @Override
