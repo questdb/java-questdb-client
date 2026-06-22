@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -504,60 +505,64 @@ public class SenderPoolTest {
 
     @Test
     public void testReapIdleSurvivesDelegateCloseError() throws Exception {
-        // idleTimeout=1ms so every idle slot is reap-eligible after a short sleep.
-        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 0, 3, 1_000, 1, Long.MAX_VALUE)) {
-            AtomicInteger closeAttempts = new AtomicInteger();
-            PooledSender a = pool.borrow();
-            PooledSender b = pool.borrow();
-            PooledSender c = pool.borrow();
-            installFailingCloseDelegate(a, closeAttempts);
-            installFailingCloseDelegate(b, closeAttempts);
-            installFailingCloseDelegate(c, closeAttempts);
-            pool.giveBack(a);
-            pool.giveBack(b);
-            pool.giveBack(c);
-            Assert.assertEquals(3, pool.totalSize());
+        TestUtils.assertMemoryLeak(() -> {
+            // idleTimeout=1ms so every idle slot is reap-eligible after a short sleep.
+            try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 0, 3, 1_000, 1, Long.MAX_VALUE)) {
+                AtomicInteger closeAttempts = new AtomicInteger();
+                PooledSender a = pool.borrow();
+                PooledSender b = pool.borrow();
+                PooledSender c = pool.borrow();
+                installFailingCloseDelegate(a, closeAttempts);
+                installFailingCloseDelegate(b, closeAttempts);
+                installFailingCloseDelegate(c, closeAttempts);
+                pool.giveBack(a);
+                pool.giveBack(b);
+                pool.giveBack(c);
+                Assert.assertEquals(3, pool.totalSize());
 
-            Thread.sleep(10);
-            // Must NOT throw even though every delegate.close() raises an Error.
-            pool.reapIdle();
+                Thread.sleep(10);
+                // Must NOT throw even though every delegate.close() raises an Error.
+                pool.reapIdle();
 
-            // The loop attempted to close ALL three delegates -- it did not abort
-            // after the first Error.
-            Assert.assertEquals("reap loop must not abort on a delegate close() Error",
-                    3, closeAttempts.get());
-            // Every reaped slot left `all`; capacity was not stranded.
-            Assert.assertEquals(0, pool.totalSize());
-            Assert.assertEquals(0, pool.availableSize());
+                // The loop attempted to close ALL three delegates -- it did not abort
+                // after the first Error.
+                Assert.assertEquals("reap loop must not abort on a delegate close() Error",
+                        3, closeAttempts.get());
+                // Every reaped slot left `all`; capacity was not stranded.
+                Assert.assertEquals(0, pool.totalSize());
+                Assert.assertEquals(0, pool.availableSize());
 
-            // Pool still grows back to full capacity -- no permanent leak.
-            PooledSender d = pool.borrow();
-            PooledSender e = pool.borrow();
-            PooledSender f = pool.borrow();
-            Assert.assertEquals(3, pool.totalSize());
-            pool.giveBack(d);
-            pool.giveBack(e);
-            pool.giveBack(f);
-        }
+                // Pool still grows back to full capacity -- no permanent leak.
+                PooledSender d = pool.borrow();
+                PooledSender e = pool.borrow();
+                PooledSender f = pool.borrow();
+                Assert.assertEquals(3, pool.totalSize());
+                pool.giveBack(d);
+                pool.giveBack(e);
+                pool.giveBack(f);
+            }
+        });
     }
 
     @Test
     public void testCloseSurvivesDelegateCloseError() throws Exception {
-        SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
-        AtomicInteger closeAttempts = new AtomicInteger();
-        PooledSender a = pool.borrow();
-        PooledSender b = pool.borrow();
-        installFailingCloseDelegate(a, closeAttempts);
-        installFailingCloseDelegate(b, closeAttempts);
-        pool.giveBack(a);
-        pool.giveBack(b);
+        TestUtils.assertMemoryLeak(() -> {
+            SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
+            AtomicInteger closeAttempts = new AtomicInteger();
+            PooledSender a = pool.borrow();
+            PooledSender b = pool.borrow();
+            installFailingCloseDelegate(a, closeAttempts);
+            installFailingCloseDelegate(b, closeAttempts);
+            pool.giveBack(a);
+            pool.giveBack(b);
 
-        // close() must not propagate an Error and must attempt every delegate.
-        pool.close();
-        Assert.assertEquals("close() must attempt to close every delegate despite an Error",
-                2, closeAttempts.get());
-        // Idempotent second close stays clean.
-        pool.close();
+            // close() must not propagate an Error and must attempt every delegate.
+            pool.close();
+            Assert.assertEquals("close() must attempt to close every delegate despite an Error",
+                    2, closeAttempts.get());
+            // Idempotent second close stays clean.
+            pool.close();
+        });
     }
 
     /**
