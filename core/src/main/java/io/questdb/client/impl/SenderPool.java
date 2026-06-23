@@ -1024,6 +1024,12 @@ public final class SenderPool implements AutoCloseable {
      * keeping a recovery step bounded below
      * {@code PoolHousekeeper.STOP_TIMEOUT_MILLIS}. See M1 / the residual-window
      * note on {@link #recoverOneSlotStep}.
+     * <p>
+     * Also forces {@code drain_orphans=off} (see
+     * {@link #buildManagedSlotSender}): a recovery delegate must never spin up a
+     * BackgroundDrainerPool, whose {@code close()} could block ~3s and overrun
+     * the step / {@code STOP_TIMEOUT_MILLIS} budget while still holding the slot
+     * flock.
      */
     private Sender defaultRecoverySender(int slotIndex) {
         return buildManagedSlotSender(slotIndex, true);
@@ -1063,6 +1069,27 @@ public final class SenderPool implements AutoCloseable {
             // the SYNC auto-promotion the user's reconnect_* knobs would
             // otherwise trigger.
             builder.initialConnectMode(Sender.InitialConnectMode.OFF);
+            // Force drain_orphans OFF on recovery delegates regardless of the
+            // shared config string. A recovery delegate's sole job is to drain
+            // its OWN slot (the one recoverOneSlotStep is processing); it must
+            // never start a BackgroundDrainerPool for sibling/foreign orphans.
+            // If it did, the delegate's close() -- called from
+            // drainCandidateSlotForRecovery() on the PoolHousekeeper thread,
+            // BEFORE its cursorEngine.close() releases the slot flock -- would
+            // block in BackgroundDrainerPool.close() for up to
+            // GRACEFUL_DRAIN_MILLIS + STOP_GRACE_MILLIS (3s) against a
+            // reachable-but-not-acking server. That overruns a recovery step's
+            // budget (RECOVERY_DRAIN_BUDGET_MILLIS) and PoolHousekeeper
+            // .STOP_TIMEOUT_MILLIS, so a close() landing mid-step times out its
+            // join and returns while the recoverer still holds the slot flock
+            // -- resurrecting the "sf slot already in use" window this pool's
+            // per-slot ids exist to eliminate. Sibling in-range slots are
+            // covered by recoverOneSlotStep's own passes; foreign/out-of-range
+            // orphans are covered by the LIVE pooled senders' drainers (which
+            // keep drain_orphans=on and whose close() senderPool.close() awaits
+            // synchronously, so they release their flock before close()
+            // returns).
+            builder.drainOrphans(false);
         }
         return builder.build();
     }

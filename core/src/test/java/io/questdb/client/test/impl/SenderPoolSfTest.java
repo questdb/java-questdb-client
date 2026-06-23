@@ -1453,6 +1453,99 @@ public class SenderPoolSfTest {
     }
 
     @Test
+    public void testRecoveryStepStaysBoundedWithDrainOrphansAgainstNonAckingServer() throws Exception {
+        // M-A regression: a startup-recovery delegate must NOT inherit
+        // drain_orphans=on. If it did, building the recoverer (which connects
+        // OK against a reachable server because initial_connect_mode is forced
+        // OFF) would run an orphan scan and dispatch a BackgroundDrainerPool at
+        // any foreign/out-of-range orphan. Against a reachable-but-not-acking
+        // server those background drainers never reach their target, so the
+        // recoverer's close() -- called inside the recovery step, on the
+        // housekeeper thread, BEFORE cursorEngine.close() releases the slot
+        // flock -- blocks in BackgroundDrainerPool.close() for ~3s
+        // (GRACEFUL_DRAIN_MILLIS + STOP_GRACE_MILLIS). That makes one step
+        // ~1s drain + ~3s drainerPool.close ~= 4s, far past
+        // RECOVERY_DRAIN_BUDGET_MILLIS and PoolHousekeeper.STOP_TIMEOUT_MILLIS
+        // (2s) -- and a close() landing mid-step would return with the flock
+        // still held. After the fix recovery delegates force drain_orphans=off,
+        // so no drainer pool is created and the step stays bounded by the drain
+        // budget alone.
+        final long acquireTimeoutMillis = 1_000L;
+        final int maxSize = 2;
+
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String addr = "localhost:" + silentPort;
+
+                // Phase 1a: strand unacked data in an in-range managed slot
+                // (default-0) so the recovery step has a slot to process.
+                String seedCfg = "ws::addr=" + addr + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (SenderPool seed = new SenderPool(seedCfg, 1, maxSize, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender s = seed.borrow();
+                    s.table("recover").longColumn("v", 1L).atNow();
+                    s.flush();
+                    s.close();
+                }
+                Assert.assertTrue("default-0 must hold unacked data", hasSegmentFile(slot("default-0")));
+
+                // Phase 1b: strand a FOREIGN orphan (different base) so a
+                // recovery delegate that inherited drain_orphans=on would
+                // dispatch a background drainer at it.
+                String ghostCfg = "ws::addr=" + addr + ";sf_dir=" + sfDir
+                        + ";sender_id=legacy;close_flush_timeout_millis=0;";
+                try (Sender ghost = Sender.fromConfig(ghostCfg)) {
+                    for (int i = 0; i < 3; i++) {
+                        ghost.table("foreign").longColumn("v", i).atNow();
+                        ghost.flush();
+                    }
+                } catch (Exception ignored) {
+                    // best-effort: we only need the unacked .sfa on disk
+                }
+                Assert.assertTrue("foreign leftover must hold unacked data", hasSegmentFile(slot("legacy")));
+
+                // Phase 2: a deferred drain_orphans=on pool against the SAME
+                // reachable-but-not-acking server. Drive ONE recovery step and
+                // time it: the step builds a recovery delegate on default-0,
+                // which pre-fix would dispatch a drainer at the foreign orphan
+                // and then block ~3s in drainerPool.close().
+                String cfg = "ws::addr=" + addr + ";sf_dir=" + sfDir
+                        + ";drain_orphans=on;close_flush_timeout_millis=0;";
+                SenderPool pool = newDeferredPool(cfg, 0, maxSize, acquireTimeoutMillis);
+                try {
+                    long startNanos = System.nanoTime();
+                    invokeRunStartupRecoveryStep(pool);
+                    long stepMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+                    // Headline guarantee: a recovery delegate must not stand up a
+                    // BackgroundDrainerPool, so the step is bounded by the drain
+                    // budget (~1s) -- comfortably under STOP_TIMEOUT_MILLIS. The
+                    // 2.5s ceiling clears the ~1s post-fix cost with CI margin
+                    // while decisively failing the pre-fix ~4s overrun.
+                    Assert.assertTrue(
+                            "recovery step must stay bounded with drain_orphans=on against a "
+                                    + "non-acking server (no BackgroundDrainerPool overrun): took "
+                                    + stepMillis + "ms",
+                            stepMillis < 2_500L);
+
+                    // Durability, not loss: the foreign orphan stays on disk for
+                    // a later live-sender drainer; the recovery delegate must
+                    // not have abandoned it as .failed either.
+                    Assert.assertTrue("foreign orphan data must be preserved on disk, not lost",
+                            hasSegmentFile(slot("legacy")));
+                    Assert.assertFalse("foreign orphan must not be flagged .failed by a recovery delegate",
+                            Files.exists(slot("legacy") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                } finally {
+                    pool.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testDeferredStartupRecoveryDoesNotBlockConstruction() throws Exception {
         // M2 fix: when recovery is deferred (the pooled QuestDB handle's path),
         // constructing the SenderPool must NOT run startup recovery inline, so
