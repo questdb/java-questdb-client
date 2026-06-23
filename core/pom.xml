@@ -234,8 +234,8 @@
                             <source>${javac.compile.source}</source>
                             <detectJavaApiLink>false</detectJavaApiLink>
                             <additionalJOptions>
-                                <additionalJOption>${compilerArg1}</additionalJOption>
-                                <additionalJOption>${compilerArg2}</additionalJOption>
+                                <additionalJOption>${javadocJOption1}</additionalJOption>
+                                <additionalJOption>${javadocJOption2}</additionalJOption>
                             </additionalJOptions>
                             <sourceFileExcludes>
                                 <sourceFileExclude>${excludePattern1}</sourceFileExclude>
@@ -366,8 +366,8 @@
                             <source>${javac.compile.source}</source>
                             <detectJavaApiLink>false</detectJavaApiLink>
                             <additionalJOptions>
-                                <additionalJOption>${compilerArg1}</additionalJOption>
-                                <additionalJOption>${compilerArg2}</additionalJOption>
+                                <additionalJOption>${javadocJOption1}</additionalJOption>
+                                <additionalJOption>${javadocJOption2}</additionalJOption>
                             </additionalJOptions>
                             <sourceFileExcludes>
                                 <sourceFileExclude>${excludePattern1}</sourceFileExclude>
@@ -469,6 +469,11 @@
                 <questdb.artifactid>questdb</questdb.artifactid>
                 <compilerArg1>--add-exports</compilerArg1>
                 <compilerArg2>java.base/jdk.internal.math=io.questdb.client</compilerArg2>
+                <!-- javadoc needs the same module export to resolve jdk.internal.math.FDBigInteger
+                     referenced by the src/main/java11 FdBig bridge. Kept separate from the javac
+                     compilerArgs because javadoc and javac accept different option sets. -->
+                <javadocJOption1>--add-exports</javadocJOption1>
+                <javadocJOption2>java.base/jdk.internal.math=io.questdb.client</javadocJOption2>
                 <excludePattern1>nothing-to-exclude-dummy-value-include-all-java11plus</excludePattern1>
                 <excludeTestPattern1>nothing-to-exclude-dummy-value-include-all-java11plus</excludeTestPattern1>
                 <javac.compile.source>${javac.target}</javac.compile.source>
@@ -500,6 +505,10 @@
                 <!-- JDK8 javac rejects the add-exports flag; use a harmless no-op flag instead -->
                 <compilerArg1>-Xlint:none</compilerArg1>
                 <compilerArg2>-Xlint:none</compilerArg2>
+                <!-- JDK8 javadoc rejects javac's -Xlint and needs no module export (the java8 FdBig
+                     bridge uses the open sun.misc.FDBigInteger). Pass a harmless no-op instead. -->
+                <javadocJOption1>-quiet</javadocJOption1>
+                <javadocJOption2>-quiet</javadocJOption2>
                 <!-- module-info.java cannot be compiled on JDK8; exclude it from both the main
                      (<excludes> = excludeTestPattern1) and test (<testExcludes> = excludePattern1)
                      source sets. -->
