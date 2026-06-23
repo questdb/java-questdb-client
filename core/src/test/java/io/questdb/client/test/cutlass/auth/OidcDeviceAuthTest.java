@@ -41,6 +41,7 @@ import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -139,11 +140,11 @@ public class OidcDeviceAuthTest {
                          .deviceAuthorizationEndpoint(server.httpUrl(DEVICE_PATH))
                          .tokenEndpoint(server.httpUrl(TOKEN_PATH))
                          .audience("api://questdb")
-                         .clockSkewSeconds(120) // larger than the 60s token lifetime, so getToken() refreshes
                          .allowInsecureTransport(true)
                          .prompt(noopPrompt())
                          .build()) {
                 Assert.assertEquals("ACCESS-1", auth.getToken());
+                expireCachedToken(auth); // force the silent-refresh path on the next call
                 Assert.assertEquals("ACCESS-2", auth.getToken());
                 Assert.assertTrue(refreshBody.get(), refreshBody.get().contains("audience=api%3A%2F%2Fquestdb"));
             }
@@ -424,10 +425,11 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testClockSkewSecondsForcesEarlyRefresh() throws Exception {
+    public void testClockSkewCappedAtHalfTokenLifetime() throws Exception {
         assertMemoryLeak(() -> {
-            // a clock skew larger than the token lifetime makes a freshly-issued token count as already
-            // expired, so the second getToken() refreshes instead of returning the cached token
+            // the fixed 30s clock skew is capped at half the token lifetime (matching the Python client), so a
+            // short-lived token is served from cache for the first half of its life rather than being treated
+            // as expired the instant it is issued - which a flat 30s skew would do to any sub-60s token
             AtomicInteger refreshCalls = new AtomicInteger();
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
@@ -437,19 +439,24 @@ public class OidcDeviceAuthTest {
                     refreshCalls.incrementAndGet();
                     return MockOidcServer.json(200, tokenJson("ACCESS-2", null, "REFRESH-2", 3600));
                 }
-                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 60));
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 10)); // 10s lifetime
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = OidcDeviceAuth.builder()
                          .clientId("questdb")
                          .deviceAuthorizationEndpoint(server.httpUrl(DEVICE_PATH))
                          .tokenEndpoint(server.httpUrl(TOKEN_PATH))
-                         .clockSkewSeconds(120) // larger than the 60s token lifetime
                          .allowInsecureTransport(true)
                          .prompt(noopPrompt())
                          .build()) {
+                // a flat 30s skew would mark this 10s token expired immediately (now < expiresAt - 30s is
+                // false); the lifetime/2 cap (5s) keeps it valid, so the second call is a cache hit, not a refresh
                 Assert.assertEquals("ACCESS-1", auth.getToken());
-                // the 60s token sits within the 120s skew, so it is treated as expired and refreshed
+                Assert.assertEquals("ACCESS-1", auth.getToken());
+                Assert.assertEquals("the capped skew kept the short token cached - no refresh", 0, refreshCalls.get());
+
+                // once the token is genuinely past expiry, getToken() takes the silent-refresh path
+                expireCachedToken(auth);
                 Assert.assertEquals("ACCESS-2", auth.getToken());
                 Assert.assertEquals(1, refreshCalls.get());
             }
@@ -1373,8 +1380,9 @@ public class OidcDeviceAuthTest {
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
                 Assert.assertEquals("ACCESS-1", auth.getToken());
-                // the cached token is expired vs the 30s skew, and the refresh body is garbled, so the
-                // client must re-run the interactive flow instead of throwing the parse error
+                expireCachedToken(auth);
+                // the cached token is expired and the refresh body is garbled, so the client must re-run
+                // the interactive flow instead of throwing the parse error
                 Assert.assertEquals("ACCESS-2", auth.getToken());
                 Assert.assertEquals("the interactive flow must run twice (initial + fallback)", 2, deviceCalls.get());
             }
@@ -1433,10 +1441,10 @@ public class OidcDeviceAuthTest {
     public void testGetTokenSilentlyDoesNotBlockBehindSilentRefresh() throws Exception {
         assertMemoryLeak(() -> {
             // the flush-path contract also holds when the lock is held by another thread's SILENT REFRESH, not
-            // just an interactive sign-in: getTokenSilently() must fail fast rather than queue behind it. A high
-            // clock skew keeps the cached token permanently "expired", so getTokenSilently() always refreshes;
-            // the token endpoint blocks the refresh response until the test releases it, pinning the lock on the
-            // refresher thread while the second caller races for it
+            // just an interactive sign-in: getTokenSilently() must fail fast rather than queue behind it. The
+            // cached token is forced expired so getTokenSilently() refreshes; the token endpoint blocks the
+            // refresh response until the test releases it, pinning the lock on the refresher thread while the
+            // second caller races for it
             CountDownLatch refreshInFlight = new CountDownLatch(1);
             CountDownLatch releaseRefresh = new CountDownLatch(1);
             MockOidcServer.Handler handler = (method, path, body) -> {
@@ -1462,10 +1470,10 @@ public class OidcDeviceAuthTest {
                          .deviceAuthorizationEndpoint(server.httpUrl(DEVICE_PATH))
                          .tokenEndpoint(server.httpUrl(TOKEN_PATH))
                          .allowInsecureTransport(true)
-                         .clockSkewSeconds(3600) // keep the cached token always "expired" so a refresh runs
                          .prompt(noopPrompt())
                          .build()) {
                 auth.getToken(); // sign in once: caches ACCESS-1 and a refresh token
+                expireCachedToken(auth); // so the refresher thread's getTokenSilently() takes the refresh path
                 Thread refresher = new Thread(() -> {
                     try {
                         auth.getTokenSilently();
@@ -1527,10 +1535,12 @@ public class OidcDeviceAuthTest {
                 }
                 // sign in once interactively
                 Assert.assertEquals("ACCESS-1", auth.getToken());
-                // the cached token is expired vs the 30s skew, so getTokenSilently() refreshes silently
+                expireCachedToken(auth);
+                // the cached token is expired, so getTokenSilently() refreshes silently
                 Assert.assertEquals("ACCESS-2", auth.getTokenSilently());
                 // now make the refresh fail; getTokenSilently() must throw, not start the device flow
                 refreshOk.set(false);
+                expireCachedToken(auth);
                 try {
                     auth.getTokenSilently();
                     Assert.fail("expected getTokenSilently() to fail when the refresh is rejected");
@@ -2311,6 +2321,7 @@ public class OidcDeviceAuthTest {
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
                 Assert.assertEquals("ACCESS-1", auth.getToken());
+                expireCachedToken(auth);
                 // the refresh is rejected, so the flow re-runs the interactive sign-in
                 Assert.assertEquals("ACCESS-2", auth.getToken());
                 Assert.assertEquals("the interactive flow must run twice (initial + fallback)", 2, deviceCalls.get());
@@ -2343,8 +2354,10 @@ public class OidcDeviceAuthTest {
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
                 Assert.assertEquals("ACCESS-1", auth.getToken());
+                expireCachedToken(auth);
                 // first refresh omits refresh_token, so REFRESH-1 must be kept
                 Assert.assertEquals("ACCESS-R1", auth.getToken());
+                expireCachedToken(auth);
                 // second refresh must still present the retained REFRESH-1 (asserted in the handler)
                 Assert.assertEquals("ACCESS-R2", auth.getToken());
                 Assert.assertEquals("no extra interactive sign-in", 1, deviceCalls.get());
@@ -2378,8 +2391,9 @@ public class OidcDeviceAuthTest {
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
                 Assert.assertEquals("ACCESS-1", auth.getToken());
-                // the cached token is expired vs the skew; the refresh carries an error+token, so the
-                // client must ignore the smuggled token and re-run the interactive flow
+                expireCachedToken(auth);
+                // the refresh carries an error+token, so the client must ignore the smuggled token and
+                // re-run the interactive flow
                 Assert.assertEquals("ACCESS-2", auth.getToken());
                 Assert.assertEquals("the interactive flow must run twice (initial + fallback)", 2, deviceCalls.get());
             }
@@ -2412,6 +2426,7 @@ public class OidcDeviceAuthTest {
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, true, noopPrompt())) {
                 Assert.assertEquals("ID-1", auth.getToken());
+                expireCachedToken(auth);
                 // the refresh returns no id_token, so the flow falls back to interactive sign-in and
                 // returns the fresh id token instead of throwing "returned no id_token"
                 Assert.assertEquals("ID-2", auth.getToken());
@@ -2463,7 +2478,8 @@ public class OidcDeviceAuthTest {
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, ch -> promptCalls.incrementAndGet())) {
                 Assert.assertEquals("ACCESS-1", auth.getToken());
-                // the cached token is expired vs the 30s skew, so the second call refreshes silently
+                expireCachedToken(auth);
+                // the cached token is expired, so the second call refreshes silently
                 Assert.assertEquals("ACCESS-2", auth.getToken());
                 Assert.assertEquals("the interactive flow must run only once", 1, deviceCalls.get());
                 Assert.assertEquals("the user must be prompted only once", 1, promptCalls.get());
@@ -2634,11 +2650,9 @@ public class OidcDeviceAuthTest {
     @Test(timeout = 30_000)
     public void testTokenResponseExpiresInIsClamped() throws Exception {
         assertMemoryLeak(() -> {
-            // an absurd token-response expires_in (here Integer.MAX_VALUE, ~68 years) must be clamped like
-            // the device-side value, so the client does not trust a stale cached token for decades. With the
-            // clock-skew margin set above the clamp, a clamped token reads as already-expired on the next
-            // call and getToken() re-runs the flow; an unclamped ~68-year cache would be served instead, so
-            // the device endpoint would be hit only once.
+            // an absurd token-response expires_in (here Integer.MAX_VALUE, ~68 years) must be clamped to
+            // MAX_EXPIRES_IN_SECONDS (1h) like the device-side value, so the client does not trust a stale
+            // cached token for decades (the server still enforces the real expiry).
             AtomicInteger deviceCalls = new AtomicInteger();
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
@@ -2656,14 +2670,24 @@ public class OidcDeviceAuthTest {
                          .scope("openid")
                          .prompt(noopPrompt())
                          .allowInsecureTransport(true)
-                         .clockSkewSeconds(7200) // 2h, above the 1h (MAX_EXPIRES_IN_SECONDS) clamp
                          .build()) {
+                long before = System.currentTimeMillis();
                 Assert.assertEquals("ACCESS-OK", auth.getToken());
+                long after = System.currentTimeMillis();
                 Assert.assertEquals("first sign-in runs the device flow once", 1, deviceCalls.get());
-                // the clamped 1h TTL minus the 2h skew is already in the past, so the next call re-runs the
-                // flow; without the clamp the ~68-year cache would be served and the flow would not run again
+
+                // the cached expiry must be ~1h out (the clamp), not ~68 years
+                long maxLifetimeMillis = 3600L * 1000L;
+                long expiresAt = readExpiresAtMillis(auth);
+                Assert.assertTrue("expiry must be clamped to <= 1h ahead, was " + (expiresAt - before) + "ms ahead",
+                        expiresAt <= after + maxLifetimeMillis);
+                Assert.assertTrue("expiry must be ~1h ahead (the clamp), was " + (expiresAt - after) + "ms ahead",
+                        expiresAt >= before + maxLifetimeMillis - 5_000L);
+
+                // once the clamped token is past expiry, with no refresh token getToken() re-runs the device flow
+                expireCachedToken(auth);
                 Assert.assertEquals("ACCESS-OK", auth.getToken());
-                Assert.assertEquals("clamped token expiry forces a fresh sign-in", 2, deviceCalls.get());
+                Assert.assertEquals("expired clamped token forces a fresh sign-in", 2, deviceCalls.get());
             }
         });
     }
@@ -2983,6 +3007,23 @@ public class OidcDeviceAuthTest {
     // a plaintext mock server.
     private static OidcDeviceAuth.DiscoveryOptions insecure() {
         return new OidcDeviceAuth.DiscoveryOptions().allowInsecureTransport(true).prompt(noopPrompt());
+    }
+
+    // Forces the cached access/id token to look expired WITHOUT dropping the refresh token, so the next
+    // getToken()/getTokenSilently() takes the silent-refresh (or interactive re-sign-in) path. Reflection
+    // because the field is private and there is no configurable clock skew to lean on anymore; the client is
+    // an open module, so this reaches it without widening production visibility for the test.
+    private static void expireCachedToken(OidcDeviceAuth auth) throws Exception {
+        Field f = OidcDeviceAuth.class.getDeclaredField("expiresAtMillis");
+        f.setAccessible(true);
+        f.setLong(auth, 0L); // any "now" is past 0 minus the (capped, non-negative) skew, so the token reads as expired
+    }
+
+    // Reads the cached token's absolute expiry (epoch millis) so a test can assert the lifetime clamp directly.
+    private static long readExpiresAtMillis(OidcDeviceAuth auth) throws Exception {
+        Field f = OidcDeviceAuth.class.getDeclaredField("expiresAtMillis");
+        f.setAccessible(true);
+        return f.getLong(auth);
     }
 
     // isLoopbackHost is a private static security classifier (it gates the plaintext-channel MITM pin); the

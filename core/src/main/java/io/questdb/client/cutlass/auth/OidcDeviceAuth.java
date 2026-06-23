@@ -98,7 +98,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     public static final String DEFAULT_SCOPE = "openid";
     static final String GRANT_TYPE_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
     static final String GRANT_TYPE_REFRESH_TOKEN = "refresh_token";
-    private static final int DEFAULT_CLOCK_SKEW_SECONDS = 30;
+    // fixed clock-skew margin (matches the Python client questdb.auth): getToken() treats a cached token as
+    // expired this many millis before its real exp, to absorb clock drift and request latency. Not
+    // configurable; effectiveSkewMillis() caps it at half the token lifetime so a short-lived token is not
+    // reported expired the instant it is issued.
+    private static final long CLOCK_SKEW_MILLIS = 30_000L;
     // device code TTL when the device authorization response omits (or zeroes) expires_in; matches Python
     private static final int DEFAULT_DEVICE_CODE_TTL_SECONDS = 600;
     private static final int DEFAULT_HTTP_TIMEOUT_MILLIS = 30_000;
@@ -138,7 +142,6 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final String WELL_KNOWN_OPENID_CONFIGURATION_PATH = "/.well-known/openid-configuration";
     private final String audience;
     private final String clientId;
-    private final long clockSkewMillis;
     private final DeviceAuthorizationResponseParser deviceAuthParser = new DeviceAuthorizationResponseParser();
     private final Endpoint deviceAuthorizationEndpoint;
     private final StringSink formSink = new StringSink();
@@ -161,6 +164,9 @@ public class OidcDeviceAuth implements QuietCloseable {
     private HttpClient plainClient;
     private String refreshToken;
     private HttpClient tlsClient;
+    // lifetime in millis of the currently cached token (its clamped TTL); effectiveSkewMillis() caps the
+    // clock skew at half of this so a short-lived token is not treated as expired the instant it is issued
+    private long tokenTtlMillis;
 
     private OidcDeviceAuth(Builder builder, ClientTlsConfiguration tlsConfig) {
         this.clientId = builder.clientId;
@@ -170,7 +176,6 @@ public class OidcDeviceAuth implements QuietCloseable {
         this.audience = builder.audience;
         this.groupsInToken = builder.groupsInToken;
         this.httpTimeoutMillis = builder.httpTimeoutMillis;
-        this.clockSkewMillis = builder.clockSkewSeconds * 1000L;
         this.prompt = builder.prompt;
         this.tlsConfig = tlsConfig;
         // allocate the native lexer last: an Endpoint.parse above can throw on a malformed url, and
@@ -358,6 +363,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             idToken = null;
             refreshToken = null;
             expiresAtMillis = 0;
+            tokenTtlMillis = 0;
         } finally {
             lock.unlock();
         }
@@ -417,7 +423,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             // valid and have selectToken() throw on this and every later call
             final String cachedToken = groupsInToken ? idToken : accessToken;
             if (cachedToken != null) {
-                if (System.currentTimeMillis() < expiresAtMillis - clockSkewMillis) {
+                if (System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
                     return cachedToken;
                 }
                 if (refreshToken != null && tryRefresh()) {
@@ -461,7 +467,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             throwIfClosed();
             final String cachedToken = groupsInToken ? idToken : accessToken;
             if (cachedToken != null) {
-                if (System.currentTimeMillis() < expiresAtMillis - clockSkewMillis) {
+                if (System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
                     return cachedToken;
                 }
                 if (refreshToken != null && tryRefresh()) {
@@ -886,6 +892,16 @@ public class OidcDeviceAuth implements QuietCloseable {
         sink.putAscii('&').putAscii(name).putAscii('=').putAscii(urlEncode(value));
     }
 
+    private long effectiveSkewMillis() {
+        // mirror the Python client's TokenSet.is_valid: cap the fixed 30s skew at half the token lifetime, so
+        // a short-lived (< 60s) token is not treated as expired the instant it is issued. With an unknown
+        // lifetime (no token cached yet), fall back to the full skew.
+        if (tokenTtlMillis <= 0) {
+            return CLOCK_SKEW_MILLIS;
+        }
+        return Math.min(CLOCK_SKEW_MILLIS, tokenTtlMillis / 2);
+    }
+
     private HttpClient httpClient(boolean isTls) {
         if (isTls) {
             if (tlsClient == null) {
@@ -1142,7 +1158,8 @@ public class OidcDeviceAuth implements QuietCloseable {
         // hostile or buggy token TTL cannot cache the token for decades (the server still enforces the real
         // expiry; this only bounds how long the client trusts its cached copy)
         int ttlSeconds = boundedSeconds(parser.expiresIn, DEFAULT_TOKEN_TTL_SECONDS, MAX_EXPIRES_IN_SECONDS);
-        expiresAtMillis = System.currentTimeMillis() + ttlSeconds * 1000L;
+        tokenTtlMillis = ttlSeconds * 1000L;
+        expiresAtMillis = System.currentTimeMillis() + tokenTtlMillis;
     }
 
     private void throwIfClosed() {
@@ -1202,7 +1219,6 @@ public class OidcDeviceAuth implements QuietCloseable {
         private boolean allowInsecureTransport;
         private String audience;
         private String clientId;
-        private int clockSkewSeconds = DEFAULT_CLOCK_SKEW_SECONDS;
         private String deviceAuthorizationEndpoint;
         private boolean groupsInToken;
         private int httpTimeoutMillis = DEFAULT_HTTP_TIMEOUT_MILLIS;
@@ -1265,15 +1281,6 @@ public class OidcDeviceAuth implements QuietCloseable {
 
         public Builder clientId(String clientId) {
             this.clientId = clientId;
-            return this;
-        }
-
-        /**
-         * Seconds before the real expiry at which a cached token is treated as expired, absorbing clock
-         * drift and request latency. Defaults to 30.
-         */
-        public Builder clockSkewSeconds(int clockSkewSeconds) {
-            this.clockSkewSeconds = clockSkewSeconds;
             return this;
         }
 
