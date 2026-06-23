@@ -111,6 +111,10 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final int DEFAULT_TOKEN_TTL_SECONDS = 300;
     private static final String ERROR_AUTHORIZATION_PENDING = "authorization_pending";
     private static final String ERROR_SLOW_DOWN = "slow_down";
+    // the grant_type values are constants, so url-encode them once at class load rather than on every
+    // device-code poll and token refresh
+    private static final String GRANT_TYPE_DEVICE_CODE_ENCODED = urlEncode(GRANT_TYPE_DEVICE_CODE);
+    private static final String GRANT_TYPE_REFRESH_TOKEN_ENCODED = urlEncode(GRANT_TYPE_REFRESH_TOKEN);
     private static final HttpClientConfiguration HTTP_CONFIG = DefaultHttpClientConfiguration.INSTANCE;
     // a rate-limited identity provider answers 429; the token poll treats it as a transient backoff
     private static final String HTTP_STATUS_TOO_MANY_REQUESTS = "429";
@@ -496,6 +500,21 @@ public class OidcDeviceAuth implements QuietCloseable {
         return Math.min(value, maxValue);
     }
 
+    private static String[] decodePathSegments(String path) {
+        // Repeatedly percent-decode (a server or proxy may unescape more than once, so %252e%252e -> .. )
+        // and fold backslash to slash (some proxies do), then split into segments. Comparing these decoded
+        // segments, not the raw wire string, means an encoding the server later undoes cannot hide a "..".
+        String decoded = path;
+        for (int i = 0; i < 10; i++) { // bounded; a real path needs 0-1 passes
+            String next = percentDecodeOnce(decoded);
+            if (next.equals(decoded)) {
+                break;
+            }
+            decoded = next;
+        }
+        return decoded.replace('\\', '/').split("/", -1);
+    }
+
     private static ClientTlsConfiguration defaultTlsConfig() {
         return new ClientTlsConfiguration(null, null, ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL);
     }
@@ -543,6 +562,15 @@ public class OidcDeviceAuth implements QuietCloseable {
                 "could not parse the QuestDB /settings response");
     }
 
+    private static OidcAuthException endpointNotUnderIssuer(String label, String url, String issuer) {
+        return new OidcAuthException()
+                .put("the OIDC ").put(label).put(" advertised by the QuestDB /settings response (").put(url)
+                .put(") is not under the pinned issuer (").put(issuer).put("); refusing to send credentials to ")
+                .put("an endpoint outside the trusted issuer, for example a different realm on the same host; ")
+                .put("if the identity provider places its endpoints outside the issuer path, configure them ")
+                .put("explicitly with OidcDeviceAuth.builder()");
+    }
+
     private static void fetchJson(Endpoint endpoint, String path, ClientTlsConfiguration tlsConfig, JsonParser parser, String reachError, String parseError) {
         HttpClient client = endpoint.isTls
                 ? HttpClientFactory.newTlsInstance(HTTP_CONFIG, tlsConfig)
@@ -574,6 +602,19 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private static int hexValue(char c) {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        if (c >= 'A' && c <= 'F') {
+            return c - 'A' + 10;
+        }
+        return -1;
+    }
+
     private static boolean isDottedIpv4(String host) {
         // validate a dotted IPv4 literal (four 0-255 octets) without DNS, so a hostname merely starting
         // with "127." is not mistaken for the loopback block
@@ -599,43 +640,6 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
         }
         return octets == 4 && digits > 0 && value <= 255;
-    }
-
-    private static String[] decodePathSegments(String path) {
-        // Repeatedly percent-decode (a server or proxy may unescape more than once, so %252e%252e -> .. )
-        // and fold backslash to slash (some proxies do), then split into segments. Comparing these decoded
-        // segments, not the raw wire string, means an encoding the server later undoes cannot hide a "..".
-        String decoded = path;
-        for (int i = 0; i < 10; i++) { // bounded; a real path needs 0-1 passes
-            String next = percentDecodeOnce(decoded);
-            if (next.equals(decoded)) {
-                break;
-            }
-            decoded = next;
-        }
-        return decoded.replace('\\', '/').split("/", -1);
-    }
-
-    private static OidcAuthException endpointNotUnderIssuer(String label, String url, String issuer) {
-        return new OidcAuthException()
-                .put("the OIDC ").put(label).put(" advertised by the QuestDB /settings response (").put(url)
-                .put(") is not under the pinned issuer (").put(issuer).put("); refusing to send credentials to ")
-                .put("an endpoint outside the trusted issuer, for example a different realm on the same host; ")
-                .put("if the identity provider places its endpoints outside the issuer path, configure them ")
-                .put("explicitly with OidcDeviceAuth.builder()");
-    }
-
-    private static int hexValue(char c) {
-        if (c >= '0' && c <= '9') {
-            return c - '0';
-        }
-        if (c >= 'a' && c <= 'f') {
-            return c - 'a' + 10;
-        }
-        if (c >= 'A' && c <= 'F') {
-            return c - 'A' + 10;
-        }
-        return -1;
     }
 
     private static boolean isEndpointUnderIssuerPath(String endpointUrl, String issuer) {
@@ -670,43 +674,6 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
         }
         return true;
-    }
-
-    private static String pathOnly(String url) {
-        // the path component only (drop any ?query / #fragment); a ;matrix parameter stays part of the path,
-        // so a traversal hidden in it (.../token;..%2f..) is still scanned
-        String path = Endpoint.parse(url).path;
-        for (int i = 0, n = path.length(); i < n; i++) {
-            char c = path.charAt(i);
-            if (c == '?' || c == '#') {
-                return path.substring(0, i);
-            }
-        }
-        return path;
-    }
-
-    private static String percentDecodeOnce(String s) {
-        int pct = s.indexOf('%');
-        if (pct < 0) {
-            return s; // nothing encoded
-        }
-        StringSink sink = new StringSink();
-        sink.put(s, 0, pct);
-        for (int i = pct, n = s.length(); i < n; ) {
-            char c = s.charAt(i);
-            if (c == '%' && i + 2 < n) {
-                int hi = hexValue(s.charAt(i + 1));
-                int lo = hexValue(s.charAt(i + 2));
-                if (hi >= 0 && lo >= 0) {
-                    sink.put((char) ((hi << 4) | lo));
-                    i += 3;
-                    continue;
-                }
-            }
-            sink.put(c);
-            i++;
-        }
-        return sink.toString();
     }
 
     private static boolean isLoopbackHost(String host) {
@@ -748,6 +715,43 @@ public class OidcDeviceAuth implements QuietCloseable {
         } catch (NumericException e) {
             return 0;
         }
+    }
+
+    private static String pathOnly(String url) {
+        // the path component only (drop any ?query / #fragment); a ;matrix parameter stays part of the path,
+        // so a traversal hidden in it (.../token;..%2f..) is still scanned
+        String path = Endpoint.parse(url).path;
+        for (int i = 0, n = path.length(); i < n; i++) {
+            char c = path.charAt(i);
+            if (c == '?' || c == '#') {
+                return path.substring(0, i);
+            }
+        }
+        return path;
+    }
+
+    private static String percentDecodeOnce(String s) {
+        int pct = s.indexOf('%');
+        if (pct < 0) {
+            return s; // nothing encoded
+        }
+        StringSink sink = new StringSink();
+        sink.put(s, 0, pct);
+        for (int i = pct, n = s.length(); i < n; ) {
+            char c = s.charAt(i);
+            if (c == '%' && i + 2 < n) {
+                int hi = hexValue(s.charAt(i + 1));
+                int lo = hexValue(s.charAt(i + 2));
+                if (hi >= 0 && lo >= 0) {
+                    sink.put((char) ((hi << 4) | lo));
+                    i += 3;
+                    continue;
+                }
+            }
+            sink.put(c);
+            i++;
+        }
+        return sink.toString();
     }
 
     private static void putNonNull(StringSink sink, CharSequence tag) {
@@ -977,7 +981,7 @@ public class OidcDeviceAuth implements QuietCloseable {
 
     private int pollOnce(String deviceCode) {
         formSink.clear();
-        formSink.putAscii("grant_type=").putAscii(urlEncode(GRANT_TYPE_DEVICE_CODE));
+        formSink.putAscii("grant_type=").putAscii(GRANT_TYPE_DEVICE_CODE_ENCODED);
         appendParam(formSink, "device_code", deviceCode);
         appendParam(formSink, "client_id", clientId);
 
@@ -1174,7 +1178,7 @@ public class OidcDeviceAuth implements QuietCloseable {
 
     private boolean tryRefresh() {
         formSink.clear();
-        formSink.putAscii("grant_type=").putAscii(urlEncode(GRANT_TYPE_REFRESH_TOKEN));
+        formSink.putAscii("grant_type=").putAscii(GRANT_TYPE_REFRESH_TOKEN_ENCODED);
         appendParam(formSink, "refresh_token", refreshToken);
         appendParam(formSink, "client_id", clientId);
         if (scope != null) {
