@@ -99,8 +99,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     static final String GRANT_TYPE_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
     static final String GRANT_TYPE_REFRESH_TOKEN = "refresh_token";
     private static final int DEFAULT_CLOCK_SKEW_SECONDS = 30;
-    // device code TTL when the device authorization response omits expires_in
-    private static final int DEFAULT_DEVICE_CODE_TTL_SECONDS = 300;
+    // device code TTL when the device authorization response omits (or zeroes) expires_in; matches Python
+    private static final int DEFAULT_DEVICE_CODE_TTL_SECONDS = 600;
     private static final int DEFAULT_HTTP_TIMEOUT_MILLIS = 30_000;
     private static final int DEFAULT_POLL_INTERVAL_SECONDS = 5;
     // token cache TTL when the token response omits expires_in
@@ -117,8 +117,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     // abort polling after this many consecutive transport failures instead of silently retrying
     // until the device code expires
     private static final int MAX_CONSECUTIVE_POLL_ERRORS = 3;
-    // upper bounds on the provider-reported expires_in / interval, so an absurd or hostile value
-    // cannot overflow the poll timing arithmetic or make the client wait absurdly long
+    // upper bound on the device code lifetime (the device authorization response's expires_in), so a
+    // hostile or buggy provider cannot make the client poll for an absurd duration; matches the Python client
+    private static final int MAX_DEVICE_CODE_TTL_SECONDS = 1800;
+    // upper bound on the token cache lifetime (the token response's expires_in), so an absurd or hostile
+    // value cannot overflow the timing arithmetic or make the client trust a token for absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
     private static final int MAX_POLL_INTERVAL_SECONDS = 300;
     // cap bytes drained per response so a hostile/MITM'd server cannot stream an endless body and
@@ -1072,7 +1075,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
 
         final String deviceCode = deviceAuthParser.deviceCode.toString();
-        final int expiresInSeconds = boundedSeconds(deviceAuthParser.expiresIn, DEFAULT_DEVICE_CODE_TTL_SECONDS, MAX_EXPIRES_IN_SECONDS);
+        final int expiresInSeconds = boundedSeconds(deviceAuthParser.expiresIn, DEFAULT_DEVICE_CODE_TTL_SECONDS, MAX_DEVICE_CODE_TTL_SECONDS);
         final int intervalSeconds = boundedSeconds(deviceAuthParser.interval, DEFAULT_POLL_INTERVAL_SECONDS, MAX_POLL_INTERVAL_SECONDS);
         final DeviceAuthorizationChallenge challenge = new DeviceAuthorizationChallenge(
                 sanitizeForDisplay(deviceAuthParser.userCode.toString()),

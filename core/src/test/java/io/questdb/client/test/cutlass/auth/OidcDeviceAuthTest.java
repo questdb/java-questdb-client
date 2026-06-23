@@ -544,6 +544,39 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testDeviceCodeLifetimeClamped() throws Exception {
+        assertMemoryLeak(() -> {
+            // a missing or zero expires_in defaults to 600s, and an absurd value is capped at 1800s (matching
+            // the Python client), so a hostile or buggy provider cannot make the client poll for an absurd
+            // duration; the clamped value is the one shown to the user (challenge.getExpiresInSeconds())
+            AtomicReference<DeviceAuthorizationChallenge> shown = new AtomicReference<>();
+            MockOidcServer.Handler missingExpiry = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{\"device_code\":\"DEV\",\"user_code\":\"UC\","
+                            + "\"verification_uri\":\"https://verify.example/device\",\"interval\":1}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-DEFAULT-TTL", null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(missingExpiry);
+                 OidcDeviceAuth auth = newAuth(server, false, shown::set)) {
+                Assert.assertEquals("ACCESS-DEFAULT-TTL", auth.getToken());
+                Assert.assertEquals(600, shown.get().getExpiresInSeconds());
+            }
+            MockOidcServer.Handler absurdExpiry = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 999_999));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-CAPPED-TTL", null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(absurdExpiry);
+                 OidcDeviceAuth auth = newAuth(server, false, shown::set)) {
+                Assert.assertEquals("ACCESS-CAPPED-TTL", auth.getToken());
+                Assert.assertEquals(1800, shown.get().getExpiresInSeconds());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testDeviceEndpointReturnsOauthError() throws Exception {
         assertMemoryLeak(() -> {
             // the device authorization request itself is rejected (e.g. the client is not allowed)
