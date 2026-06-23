@@ -119,6 +119,38 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testAudienceSentOnRefresh() throws Exception {
+        assertMemoryLeak(() -> {
+            // the audience must also be url-encoded into the refresh request, matching the Python client
+            AtomicReference<String> refreshBody = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    refreshBody.set(body);
+                    return MockOidcServer.json(200, tokenJson("ACCESS-2", null, "REFRESH-2", 3600));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 60));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                         .clientId("questdb")
+                         .deviceAuthorizationEndpoint(server.httpUrl(DEVICE_PATH))
+                         .tokenEndpoint(server.httpUrl(TOKEN_PATH))
+                         .audience("api://questdb")
+                         .clockSkewSeconds(120) // larger than the 60s token lifetime, so getToken() refreshes
+                         .allowInsecureTransport(true)
+                         .prompt(noopPrompt())
+                         .build()) {
+                Assert.assertEquals("ACCESS-1", auth.getToken());
+                Assert.assertEquals("ACCESS-2", auth.getToken());
+                Assert.assertTrue(refreshBody.get(), refreshBody.get().contains("audience=api%3A%2F%2Fquestdb"));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testBuilderIssuerPinAcceptsMatchingOrigin() throws Exception {
         assertMemoryLeak(() -> {
             // endpoints that belong to the pinned issuer origin are accepted; only the origin is pinned, so
@@ -707,6 +739,40 @@ public class OidcDeviceAuthTest {
                     Assert.assertEquals("ACCESS-TRUSTED", auth.getToken());
                     Assert.assertTrue(deviceBody.get(), deviceBody.get().contains("scope=openid"));
                     Assert.assertFalse(deviceBody.get(), deviceBody.get().contains("INJECTED"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDiscoveryReadsAudience() throws Exception {
+        assertMemoryLeak(() -> {
+            // the audience advertised by /settings (acl.oidc.audience) must be url-encoded into the device
+            // authorization request, matching the Python client
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            AtomicReference<String> deviceBody = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{\"config\":{"
+                            + "\"acl.oidc.enabled\":true,"
+                            + "\"acl.oidc.client.id\":\"questdb\","
+                            + "\"acl.oidc.audience\":\"api://questdb\","
+                            + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl(TOKEN_PATH) + "\","
+                            + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl(DEVICE_PATH) + "\""
+                            + "}}");
+                }
+                if (DEVICE_PATH.equals(path)) {
+                    deviceBody.set(body);
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-AUD-D", null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
+                    Assert.assertEquals("ACCESS-AUD-D", auth.getToken());
+                    Assert.assertTrue(deviceBody.get(), deviceBody.get().contains("audience=api%3A%2F%2Fquestdb"));
                 }
             }
         });

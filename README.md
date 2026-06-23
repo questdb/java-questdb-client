@@ -216,7 +216,7 @@ OidcDeviceAuth auth = OidcDeviceAuth.builder()
         .build();
 ```
 
-Discovery via `fromQuestDB(...)` reads the OIDC client id, scope and endpoints from the server's `/settings`, and the identity provider's client must have the device authorization grant enabled. When the server does not advertise its device authorization endpoint (today's servers), pin the identity provider by its issuer so the client can discover the endpoint from the issuer's `.well-known/openid-configuration` document:
+Discovery via `fromQuestDB(...)` reads the OIDC client id, scope, audience and endpoints from the server's `/settings`, and the identity provider's client must have the device authorization grant enabled. When the server does not advertise its device authorization endpoint (today's servers), pin the identity provider by its issuer so the client can discover the endpoint from the issuer's `.well-known/openid-configuration` document:
 
 ```java
 try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(

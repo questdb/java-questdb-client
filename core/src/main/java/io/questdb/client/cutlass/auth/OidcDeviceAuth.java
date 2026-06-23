@@ -319,6 +319,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 .deviceAuthorizationEndpoint(deviceAuthorizationEndpoint)
                 .tokenEndpoint(tokenEndpoint)
                 .scope(parser.scope.length() > 0 ? parser.scope.toString() : DEFAULT_SCOPE)
+                .audience(parser.audience.length() > 0 ? parser.audience.toString() : null)
                 .groupsInToken(parser.groupsInToken)
                 .issuer(resolvedIssuer)
                 .allowInsecureTransport(allowInsecureTransport)
@@ -1009,6 +1010,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (scope != null) {
             appendParam(formSink, "scope", scope);
         }
+        if (audience != null) {
+            appendParam(formSink, "audience", audience);
+        }
 
         tokenParser.clear();
         try {
@@ -1073,8 +1077,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
 
         /**
-         * Sets the {@code audience} (or {@code resource}) request parameter. Some identity providers
-         * require it so the issued token carries the {@code aud} claim QuestDB expects. Optional.
+         * Sets the {@code audience} (or {@code resource}) request parameter, sent on the device
+         * authorization and refresh requests. Some identity providers require it so the issued token
+         * carries the {@code aud} claim QuestDB expects. {@link #fromQuestDB} discovers it from
+         * {@code acl.oidc.audience}. Optional.
          */
         public Builder audience(String audience) {
             this.audience = audience;
@@ -1436,6 +1442,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static final class SettingsDiscoveryParser implements JsonParser {
+        private static final int FIELD_AUDIENCE = 7;
         private static final int FIELD_CLIENT_ID = 2;
         private static final int FIELD_DEVICE_AUTHORIZATION_ENDPOINT = 5;
         private static final int FIELD_ENABLED = 1;
@@ -1443,6 +1450,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         private static final int FIELD_NONE = 0;
         private static final int FIELD_SCOPE = 3;
         private static final int FIELD_TOKEN_ENDPOINT = 4;
+        final StringSink audience = new StringSink();
         final StringSink clientId = new StringSink();
         final StringSink deviceAuthorizationEndpoint = new StringSink();
         final StringSink scope = new StringSink();
@@ -1489,6 +1497,8 @@ public class OidcDeviceAuth implements QuietCloseable {
                             field = FIELD_DEVICE_AUTHORIZATION_ENDPOINT;
                         } else if (Chars.equals("acl.oidc.groups.encoded.in.token", tag)) {
                             field = FIELD_GROUPS_IN_TOKEN;
+                        } else if (Chars.equals("acl.oidc.audience", tag)) {
+                            field = FIELD_AUDIENCE;
                         } else {
                             field = FIELD_NONE;
                         }
@@ -1516,6 +1526,9 @@ public class OidcDeviceAuth implements QuietCloseable {
                                 break;
                             case FIELD_GROUPS_IN_TOKEN:
                                 groupsInToken = Chars.equals("true", tag);
+                                break;
+                            case FIELD_AUDIENCE:
+                                putNonNull(audience, tag);
                                 break;
                             default:
                                 break;
