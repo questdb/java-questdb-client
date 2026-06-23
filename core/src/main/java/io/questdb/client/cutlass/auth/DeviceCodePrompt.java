@@ -31,14 +31,17 @@ import io.questdb.client.std.str.StringSink;
  * in any browser (same machine or phone) and enters the code. {@link OidcDeviceAuth} calls this once
  * per interactive sign-in, just before polling the token endpoint.
  * <p>
- * The {@link #SYSTEM_OUT default implementation} prints instructions to {@code System.out}. Supply
- * your own to render the challenge elsewhere, e.g. a clickable link or a QR code in a notebook.
+ * The default is {@link #openBrowser()}: it prints instructions to {@code System.out} and also tries
+ * to open the verification URL in the local default browser when one is available. Use
+ * {@link #SYSTEM_OUT} to print only, or supply your own to render the challenge elsewhere, e.g. a
+ * clickable link or a QR code in a notebook.
  */
 @FunctionalInterface
 public interface DeviceCodePrompt {
 
     /**
-     * Prints the sign-in instructions to {@code System.out} as plain ASCII.
+     * Prints the sign-in instructions to {@code System.out} as plain ASCII, without opening a browser.
+     * The default prompt is {@link #openBrowser()}; use this to opt out of the browser launch.
      */
     DeviceCodePrompt SYSTEM_OUT = challenge -> {
         String newLine = System.lineSeparator();
@@ -61,7 +64,8 @@ public interface DeviceCodePrompt {
      * the verification URL in the local default browser. The browser open is best-effort: it is
      * skipped on a headless JVM, on a runtime without the {@code java.desktop} module, or for a
      * non-http(s) URL, and never prevents sign-in. Intended for a local terminal; on a remote or
-     * headless host the printed URL and code remain the way in.
+     * headless host the printed URL and code remain the way in. This is the default prompt when none
+     * is configured.
      *
      * @return a prompt that prints the challenge and opens the verification URL in a browser
      */

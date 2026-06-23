@@ -1054,7 +1054,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         private boolean groupsInToken;
         private int httpTimeoutMillis = DEFAULT_HTTP_TIMEOUT_MILLIS;
         private String issuer;
-        private DeviceCodePrompt prompt = DeviceCodePrompt.SYSTEM_OUT;
+        private DeviceCodePrompt prompt = DeviceCodePrompt.openBrowser();
         private String scope = DEFAULT_SCOPE;
         private ClientTlsConfiguration tlsConfig;
         private String tokenEndpoint;
@@ -1157,10 +1157,12 @@ public class OidcDeviceAuth implements QuietCloseable {
 
         /**
          * Sets how the device code challenge is shown to the user. Defaults to
-         * {@link DeviceCodePrompt#SYSTEM_OUT}.
+         * {@link DeviceCodePrompt#openBrowser()} - prints to {@code System.out} and also opens the
+         * verification URL in a browser when one is available; pass {@link DeviceCodePrompt#SYSTEM_OUT}
+         * to print only.
          */
         public Builder prompt(DeviceCodePrompt prompt) {
-            this.prompt = prompt != null ? prompt : DeviceCodePrompt.SYSTEM_OUT;
+            this.prompt = prompt != null ? prompt : DeviceCodePrompt.openBrowser();
             return this;
         }
 
@@ -1190,7 +1192,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         private boolean allowInsecureTransport;
         private String discoveryUrl;
         private String issuer;
-        private DeviceCodePrompt prompt = DeviceCodePrompt.SYSTEM_OUT;
+        private DeviceCodePrompt prompt = DeviceCodePrompt.openBrowser();
         private ClientTlsConfiguration tlsConfig;
 
         /**
@@ -1229,12 +1231,13 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
 
         /**
-         * Sets how the device code challenge is shown to the user, for example
-         * {@link DeviceCodePrompt#openBrowser()} to also open the verification URL in a browser. Defaults
-         * to {@link DeviceCodePrompt#SYSTEM_OUT}.
+         * Sets how the device code challenge is shown to the user. Defaults to
+         * {@link DeviceCodePrompt#openBrowser()} - prints to {@code System.out} and also opens the
+         * verification URL in a browser when one is available; pass {@link DeviceCodePrompt#SYSTEM_OUT}
+         * to print only.
          */
         public DiscoveryOptions prompt(DeviceCodePrompt prompt) {
-            this.prompt = prompt != null ? prompt : DeviceCodePrompt.SYSTEM_OUT;
+            this.prompt = prompt != null ? prompt : DeviceCodePrompt.openBrowser();
             return this;
         }
 

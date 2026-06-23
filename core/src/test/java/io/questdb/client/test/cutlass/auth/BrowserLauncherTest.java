@@ -50,6 +50,24 @@ public class BrowserLauncherTest {
     }
 
     @Test
+    public void testOpenRespectsDisableProperty() throws Exception {
+        // with the kill-switch off, open() returns before touching the desktop even for a valid http(s)
+        // URL; this is also what keeps the suite from launching a real browser on a developer machine
+        String prop = "questdb.client.oidc.open.browser";
+        String prev = System.getProperty(prop);
+        System.setProperty(prop, "false");
+        try {
+            invokeOpen("https://idp.example.com/device?user_code=ABCD");
+        } finally {
+            if (prev == null) {
+                System.clearProperty(prop);
+            } else {
+                System.setProperty(prop, prev);
+            }
+        }
+    }
+
+    @Test
     public void testRejectsDangerousOrMalformedUrls() throws Exception {
         // an attacker-influenced verification URI must not smuggle a non-http(s) scheme to the OS handler
         Assert.assertNull(invokeSafeHttpUri("javascript:alert(1)"));

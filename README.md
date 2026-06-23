@@ -160,7 +160,7 @@ try (Sender sender = Sender.fromConfig("https::addr=localhost:9000;tls_verify=un
 
 For QuestDB Enterprise instances secured with OIDC, `OidcDeviceAuth` signs a user in interactively using the [OAuth 2.0 Device Authorization Grant](https://www.rfc-editor.org/rfc/rfc8628). It works from environments that have no local browser — a remote notebook kernel, a container, a headless job — because the user authorizes on any device (laptop or phone) while the process only makes outbound calls to the identity provider.
 
-On first use it prints a verification URL and a short code; open the URL, enter the code, and the token is cached in memory and refreshed silently on later calls.
+On first use it prints a verification URL and a short code, and opens the URL in your default browser when one is available; authorize there (or open the URL on any device, such as your phone), enter the code, and the token is cached in memory and refreshed silently on later calls.
 
 ```java
 import io.questdb.client.Sender;
@@ -188,17 +188,16 @@ try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.c
 
 Prefer `httpTokenProvider(auth::getTokenSilently)` for a long-lived sender: it pulls a freshly refreshed token on every request, so the sender keeps working as the token rotates. A fixed `httpToken(token)` captures the token once, so a sender that outlives the token's lifetime starts failing with 401s. Either way, hand the token to the client through the builder (or the header/password fields below), not by embedding it in a `Sender.fromConfig(...)` string or the `QDB_CLIENT_CONF` environment variable, which are easily logged, persisted, or left in shell history.
 
-On a local terminal you can also open the verification URL in the default browser automatically with `DeviceCodePrompt.openBrowser()`, in addition to printing it:
+By default the prompt prints the verification URL and code to `System.out` **and** tries to open the URL in your default browser. The browser open is best-effort: it only opens an `http(s)` URL, is skipped on a headless host or a JVM without the `java.desktop` module, and never blocks sign-in — the URL and code are always printed too, so a remote or browserless process still works. To disable the browser launch for a whole process (a server, automation, CI), set the system property `-Dquestdb.client.oidc.open.browser=false`. To print only (no browser) for a single client, pass `DeviceCodePrompt.SYSTEM_OUT`; to render the challenge yourself (a clickable link or QR code in a notebook), pass any `DeviceCodePrompt`:
 
 ```java
+// print only, do not open a browser:
 try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
         "https://questdb.example.com:9000",
-        new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.openBrowser()))) {
+        new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.SYSTEM_OUT))) {
     auth.getToken();
 }
 ```
-
-The browser open is best-effort: it only opens an `http(s)` URL, is skipped on a headless host or a JVM without the `java.desktop` module, and never blocks sign-in — the URL and code are always printed too, so a remote or browserless process still works. Pass any `DeviceCodePrompt` (via `DiscoveryOptions.prompt(...)`, or `builder().prompt(...)` for explicit configuration) to render the challenge yourself, for example a clickable link or QR code in a notebook.
 
 The same token can be presented to QuestDB over any auth path the server already validates:
 

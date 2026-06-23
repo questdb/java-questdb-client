@@ -8,17 +8,19 @@ import io.questdb.client.cutlass.auth.OidcDeviceAuth;
  * (a remote notebook kernel, a container, a headless job) using the OAuth 2.0 Device
  * Authorization Grant, then shows the three ways to use the resulting token.
  * <p>
- * On first use this prints a verification URL and a short code; open the URL in any
- * browser (your laptop or your phone) and enter the code. The token is then cached in
- * memory and refreshed silently, so re-running this does not prompt again.
+ * On first use this prints a verification URL and a short code and, on a machine with a
+ * browser, opens the URL for you; otherwise open it on any device (your laptop or your
+ * phone) and enter the code. The token is then cached in memory and refreshed silently,
+ * so re-running this does not prompt again.
  */
 public class OidcDeviceFlowExample {
     public static void main(String[] args) {
         // Discover client id, scope, endpoints and the groups-in-token mode from the server.
         // Alternatively, configure the identity provider explicitly with OidcDeviceAuth.builder().
-        // On a local terminal, also open the verification URL in a browser by passing options:
+        // The default prompt prints the URL and code AND opens the URL in your browser when one is
+        // available (best-effort; skipped on a headless host). To print only, pass options:
         //   import io.questdb.client.cutlass.auth.DeviceCodePrompt;
-        //   OidcDeviceAuth.fromQuestDB(url, new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.openBrowser()))
+        //   OidcDeviceAuth.fromQuestDB(url, new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.SYSTEM_OUT))
         try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
             auth.getToken(); // sign in once (prompts on first use, then caches and refreshes silently)
 
