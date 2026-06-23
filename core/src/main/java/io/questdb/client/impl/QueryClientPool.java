@@ -148,7 +148,7 @@ public final class QueryClientPool implements AutoCloseable {
         try {
             for (int i = 0; i < minSize; i++) {
                 pending = createUnlocked();
-                startHook.accept(pending);
+                this.startHook.accept(pending);
                 all.add(pending);
                 available.add(pending);
                 pending = null;
