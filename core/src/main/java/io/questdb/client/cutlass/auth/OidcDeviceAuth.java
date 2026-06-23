@@ -116,9 +116,6 @@ public class OidcDeviceAuth implements QuietCloseable {
     // tokens fail to parse with "String is too long".
     private static final int JSON_LEXER_CACHE_SIZE = 1024;
     private static final int JSON_LEXER_MAX_VALUE_BYTES = 1 << 20;
-    // abort polling after this many consecutive transport failures instead of silently retrying
-    // until the device code expires
-    private static final int MAX_CONSECUTIVE_POLL_ERRORS = 3;
     // upper bound on the device code lifetime (the device authorization response's expires_in), so a
     // hostile or buggy provider cannot make the client poll for an absurd duration; matches the Python client
     private static final int MAX_DEVICE_CODE_TTL_SECONDS = 1800;
@@ -907,10 +904,20 @@ public class OidcDeviceAuth implements QuietCloseable {
         return responseStatus.length() > 0 && responseStatus.charAt(0) == '2';
     }
 
+    private boolean isHttpStatusTerminal4xx() {
+        // a 4xx other than 429 is a terminal client-error rejection (429 is a transient rate-limit)
+        return responseStatus.length() > 0 && responseStatus.charAt(0) == '4' && !Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus);
+    }
+
+    private boolean isHttpStatusTransient() {
+        // a 5xx server error or a 429 rate-limit is transient - keep polling; any other non-2xx (a 4xx
+        // rejection) is terminal. Mirrors the Python client's _http_status_is_transient.
+        return responseStatus.length() > 0 && (responseStatus.charAt(0) == '5' || Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus));
+    }
+
     private void pollForToken(String deviceCode, int expiresInSeconds, int intervalSeconds) {
         final long deadlineNanos = System.nanoTime() + expiresInSeconds * 1_000_000_000L;
         long intervalMillis = (long) intervalSeconds * 1000L;
-        int consecutiveTransportErrors = 0;
         while (true) {
             throwIfClosed();
             // check the deadline before polling so an expiry that elapsed during the previous sleep aborts
@@ -923,35 +930,22 @@ public class OidcDeviceAuth implements QuietCloseable {
                 if (result == POLL_SUCCESS) {
                     return;
                 }
-                if (result == POLL_TRANSIENT_ERROR) {
-                    // a non-2xx with no parseable answer; charge the transport-error budget so a
-                    // persistently failing token endpoint aborts instead of polling until the code expires
-                    if (++consecutiveTransportErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
-                        throw new OidcAuthException().put("the token endpoint returned repeated unexpected responses [httpStatus=").put(responseStatus).put(']');
-                    }
-                } else {
-                    consecutiveTransportErrors = 0;
-                    if (result == POLL_SLOW_DOWN) {
-                        // grow the interval per RFC 8628, capped at the same bound as the initial value so
-                        // repeated slow_down responses cannot inflate the wait without bound
-                        intervalMillis = Math.min(intervalMillis + SLOW_DOWN_INCREMENT_SECONDS * 1000L, MAX_POLL_INTERVAL_SECONDS * 1000L);
-                    }
+                if (result == POLL_SLOW_DOWN) {
+                    // grow the interval per RFC 8628, capped at the same bound as the initial value so
+                    // repeated slow_down / 429 responses cannot inflate the wait without bound
+                    intervalMillis = Math.min(intervalMillis + SLOW_DOWN_INCREMENT_SECONDS * 1000L, MAX_POLL_INTERVAL_SECONDS * 1000L);
                 }
+                // POLL_PENDING and POLL_TRANSIENT_ERROR (a transient 5xx) just poll again
             } catch (HttpClientException e) {
-                // a brief network blip is fine to retry, but a persistent failure (rejected TLS cert,
-                // refused connection, unresolvable host) must surface with its cause rather than
-                // masquerade as a device-code timeout
-                if (++consecutiveTransportErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
-                    throw new OidcAuthException(e).put("the token endpoint became unreachable while waiting for authorization");
-                }
+                // a transport failure (dropped connection, DNS blip, timeout) is transient: the user may
+                // already have authorized, and RFC 8628 expects polling to continue until the device code
+                // expires, so poll again rather than discard the sign-in (the deadline bounds the total
+                // wait). Matches the Python client.
             } catch (OidcAuthException e) {
-                // a garbled / non-JSON body (a JsonException cause) is a transport-class blip, retried on
-                // the same budget; a well-formed OAuth error or unexpected response (no parse cause) is a
-                // real answer from the identity provider and aborts immediately
-                if (!(e.getCause() instanceof JsonException)) {
-                    throw e;
-                }
-                if (++consecutiveTransportErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
+                // a garbled / non-JSON body (a JsonException cause) is transient too, UNLESS its HTTP status
+                // is a terminal rejection (a non-JSON 4xx from a WAF or proxy); a well-formed terminal answer
+                // - an OAuth error, a terminal 4xx, a malformed status line - always aborts
+                if (!(e.getCause() instanceof JsonException) || isHttpStatusTerminal4xx()) {
                     throw e;
                 }
             }
@@ -968,13 +962,13 @@ public class OidcDeviceAuth implements QuietCloseable {
         appendParam(formSink, "client_id", clientId);
 
         tokenParser.clear();
-        // a transport failure here propagates to pollForToken, which retries a brief blip but aborts on a
-        // persistent failure rather than swallowing it as a pending authorization
+        // a transport failure here propagates to pollForToken, which keeps polling (a transient blip) until
+        // the device-code deadline rather than swallowing it as a pending authorization
         postForm(tokenEndpoint, tokenParser);
 
         // A rate-limited identity provider answers 429; RFC 8628 does not define it, but the Python client
         // and common practice treat it as "poll slower". Back off and keep polling (like slow_down) rather
-        // than charging the transport-error budget, so transient rate limiting does not fail the sign-in.
+        // than treating it as a terminal error, so transient rate limiting does not fail the sign-in.
         if (Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus)) {
             return POLL_SLOW_DOWN;
         }
@@ -990,21 +984,24 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             throw OidcAuthException.oauthError(tokenParser.error, tokenParser.errorDescription);
         }
-        // RFC 6749 5.1: a grant is a 2xx response carrying a token; a token under a non-2xx status is
-        // malformed or hostile - charge the transport-error budget rather than trust it
-        if (tokenParser.accessToken.length() > 0 || tokenParser.idToken.length() > 0) {
-            if (isHttpStatusSuccess()) {
+        // RFC 6749 5.1: a grant is a 2xx response carrying a token; a token under a non-2xx is malformed and
+        // is not trusted (the non-2xx is classified below instead)
+        if (isHttpStatusSuccess()) {
+            if (tokenParser.accessToken.length() > 0 || tokenParser.idToken.length() > 0) {
                 storeTokens(tokenParser);
                 return POLL_SUCCESS;
             }
-            return POLL_TRANSIENT_ERROR;
-        }
-        // no tokens and no OAuth error: a 2xx is a definitive but malformed answer and aborts; a non-2xx
-        // (gateway 5xx, empty body) is a transport-class blip - retry rather than abort the sign-in
-        if (isHttpStatusSuccess()) {
+            // a 2xx with neither a token nor an OAuth error is a definitive but malformed answer
             throw new OidcAuthException().put("unexpected response from the token endpoint [httpStatus=").put(responseStatus).put(']');
         }
-        return POLL_TRANSIENT_ERROR;
+        // a non-2xx with no recognized OAuth error: a 5xx (or 429, handled above) is a transient server or
+        // gateway condition - keep polling to the deadline; any other status is a terminal rejection (a 4xx
+        // from the identity provider, a WAF or a proxy) that aborts immediately rather than polling on to a
+        // misleading "device code expired". Matches the Python client.
+        if (isHttpStatusTransient()) {
+            return POLL_TRANSIENT_ERROR;
+        }
+        throw new OidcAuthException().put("the token endpoint rejected the request [httpStatus=").put(responseStatus).put("]; refusing to keep polling");
     }
 
     private void postForm(Endpoint endpoint, JsonParser parser) {

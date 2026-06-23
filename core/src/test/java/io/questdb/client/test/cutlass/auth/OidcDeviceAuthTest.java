@@ -2186,9 +2186,8 @@ public class OidcDeviceAuthTest {
     public void testRateLimitedTokenEndpointBacksOffInsteadOfFailingFast() throws Exception {
         assertMemoryLeak(() -> {
             // HTTP 429 is a transient backoff (poll slower, keep polling), matching the Python client, not a
-            // transport error that fails fast after MAX_CONSECUTIVE_POLL_ERRORS. The token endpoint always
-            // returns 429, so the flow ends only when the short-lived device code expires - proving polling
-            // continued past the 3-error budget rather than aborting with "repeated unexpected responses".
+            // terminal rejection. The token endpoint always returns 429, so the flow ends only when the
+            // short-lived device code expires - proving polling continued rather than failing fast.
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.json(200, deviceAuthorizationJson(1, 4));
@@ -2202,22 +2201,23 @@ public class OidcDeviceAuthTest {
                     Assert.fail("expected the device code to expire while the token endpoint kept returning 429");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("repeated unexpected responses"));
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("rejected the request"));
                 }
             }
         });
     }
 
     @Test(timeout = 30_000)
-    public void testPersistentTransportFailureDuringPollingAborts() throws Exception {
+    public void testPersistentTransportFailureKeepsPollingToDeadline() throws Exception {
         assertMemoryLeak(() -> {
             // the device endpoint works, but the (co-located) token endpoint drops the connection on every
-            // poll; polling must abort with the underlying transport error after a few attempts, not retry
-            // silently until the code expires. The endpoints share one origin so the build-time co-location
-            // check passes - the mock simulates the unreachable token endpoint by dropping the connection
+            // poll. Matching the Python client, a transport failure is transient - the user may already have
+            // authorized - so polling continues until the device code expires rather than failing fast. The
+            // endpoints share one origin so the build-time co-location check passes; the mock simulates the
+            // unreachable token endpoint by dropping the connection.
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
-                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 10));
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 3));
                 }
                 return MockOidcServer.dropConnection();
             };
@@ -2230,11 +2230,59 @@ public class OidcDeviceAuthTest {
                         .prompt(noopPrompt())
                         .build()) {
                     auth.getToken();
-                    Assert.fail("expected a transport failure to abort polling");
+                    Assert.fail("expected the device code to expire while the token endpoint kept dropping");
                 } catch (OidcAuthException e) {
-                    // surfaces the transport failure, not the device-code-expired timeout
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("timed out"));
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("unreachable"));
+                    // polled to the deadline (device code expired), not a fast transport abort
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("unreachable"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testPersistent5xxDuringPollingKeepsPollingToDeadline() throws Exception {
+        assertMemoryLeak(() -> {
+            // a 5xx from the token endpoint is a transient server/gateway condition: keep polling to the
+            // device-code deadline rather than failing fast, matching the Python client
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 3));
+                }
+                return MockOidcServer.json(503, "{}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected the device code to expire while the token endpoint returned 503");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("rejected the request"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testTerminal4xxDuringPollingFailsFast() throws Exception {
+        assertMemoryLeak(() -> {
+            // a 4xx from the token endpoint with no OAuth error (e.g. a WAF or proxy rejection) is terminal:
+            // fail fast rather than poll on to a misleading "device code expired", matching the Python client
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(403, "{}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected a terminal 4xx to fail fast");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("rejected the request"));
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("device code expired"));
                 }
             }
         });
@@ -2565,9 +2613,9 @@ public class OidcDeviceAuthTest {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
                 }
-                // a 200 that carries a token but is malformed JSON: the parser fails, and the raw body
+                // a 4xx (terminal) carrying a token but malformed JSON: the parser fails, and the raw body
                 // (with the token) must NOT be echoed into the exception message
-                return MockOidcServer.json(200, "{\"access_token\":\"" + secret + "\" not-valid-json}");
+                return MockOidcServer.json(400, "{\"access_token\":\"" + secret + "\" not-valid-json}");
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
@@ -2624,8 +2672,8 @@ public class OidcDeviceAuthTest {
     public void testTokenUnderNonSuccessStatusIsNotAccepted() throws Exception {
         assertMemoryLeak(() -> {
             // RFC 6749 5.1: a token must come from a 2xx response. A token under a non-2xx status with no
-            // OAuth error is a malformed or hostile answer; the client must not cache it - it charges the
-            // response to the transport-error budget and aborts rather than trusting the token
+            // OAuth error is a malformed or hostile answer; the client must not cache it - a 4xx is a
+            // terminal rejection that fails fast rather than trusting the token
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
@@ -2639,7 +2687,7 @@ public class OidcDeviceAuthTest {
                     Assert.fail("expected a token under a 400 to be rejected, not accepted");
                 } catch (OidcAuthException e) {
                     Assert.assertFalse(e.getMessage(), e.getMessage().contains("SHOULD-NOT-BE-USED"));
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("repeated unexpected responses"));
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("rejected the request"));
                 }
             }
         });
@@ -2718,12 +2766,13 @@ public class OidcDeviceAuthTest {
     public void testTruncatedTokenResponseRejected() throws Exception {
         assertMemoryLeak(() -> {
             // a token response whose Content-Length is satisfied but whose JSON is unterminated must be
-            // rejected (parseLast catches the dangling value), not silently treated as no token
+            // rejected (parseLast catches the dangling value), not silently treated as no token. A 4xx makes
+            // the parse failure terminal so it surfaces immediately (a malformed 2xx is retried as transient).
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
                 }
-                return MockOidcServer.json(200, "{\"access_token\":\"abc");
+                return MockOidcServer.json(400, "{\"access_token\":\"abc");
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
