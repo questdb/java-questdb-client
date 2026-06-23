@@ -2866,26 +2866,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (pos < 0) {
                 throw new LineSenderException("invalid configuration string: ").put(sink);
             }
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
-                String protocolName;
-                switch (protocol) {
-                    case PROTOCOL_HTTP:
-                        protocolName = "http";
-                        break;
-                    case PROTOCOL_UDP:
-                        protocolName = "udp";
-                        break;
-                    case PROTOCOL_WEBSOCKET:
-                        protocolName = "websocket";
-                        break;
-                    default:
-                        protocolName = "tcp";
-                        break;
-                }
-                throw new LineSenderException("protocol was already configured ")
-                        .put("[protocol=")
-                        .put(protocolName).put("]");
-            }
             if (Chars.equals("http", sink)) {
                 if (tlsEnabled) {
                     throw new LineSenderException("cannot use http protocol when TLS is enabled. use https instead");
