@@ -3591,6 +3591,25 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
         }
 
+        /**
+         * Fully validates a {@code ws}/{@code wss} connect string the same way
+         * {@link #build()} does, but without connecting: it parses every value
+         * through the real fluent setters and then runs {@link #configureDefaults}
+         * and {@link #validateParameters}, exactly the prefix {@code build()} runs
+         * before opening a socket. The {@code QuestDB} facade calls this so a
+         * malformed ingest config fails at its {@code build()} time even when the
+         * sender pool min is 0 and nothing connects. Ingress value keys are
+         * registry-{@code STRING}, so only this real parse -- not the typed
+         * {@link ConfigView} getters -- validates their values. Throws
+         * {@link LineSenderException} on any malformed key or value.
+         */
+        static void validateWsConfigString(CharSequence configurationString) {
+            LineSenderBuilder builder = new LineSenderBuilder();
+            builder.fromConfig(configurationString);
+            builder.configureDefaults();
+            builder.validateParameters();
+        }
+
         private static int wsInt(ConfigView view, StringSink v, String key) {
             v.clear();
             v.put(view.getStr(key));

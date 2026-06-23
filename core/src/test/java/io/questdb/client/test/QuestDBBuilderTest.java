@@ -104,6 +104,23 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testMalformedIngressConfigRejectedAtBuildWithMinZero() {
+        // sender_pool_min=0 pre-warms nothing, so build() never constructs a
+        // Sender -- yet it must still reject a malformed ingest config up front,
+        // matching the egress side. Covers a typed enum (tls_verify), a
+        // registry-STRING value that only the real Sender parse validates
+        // (auto_flush_rows), and a WebSocket build-time check that only the full
+        // no-connect validation reaches (auto_flush_interval=off disables
+        // auto-flush, which the WebSocket transport does not support).
+        assertIngressBuildRejected(
+                "wss::addr=127.0.0.1:1;tls_verify=strict;sender_pool_min=0;sender_pool_max=2;", "tls_verify");
+        assertIngressBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;sender_pool_max=2;", "auto_flush_rows");
+        assertIngressBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;sender_pool_max=2;", "auto-flush");
+    }
+
+    @Test
     public void testMissingIngestConfigThrows() {
         try {
             QuestDB.builder().queryConfig("ws::addr=h:9000;").build().close();
@@ -204,6 +221,22 @@ public class QuestDBBuilderTest {
     @Test
     public void testUdpIngestConfigRejected() {
         assertSchemaRejected(() -> QuestDB.builder().queryConfig("udp::addr=h:9009;"));
+    }
+
+    private static void assertIngressBuildRejected(String ingest, String expectedFragment) {
+        try {
+            QuestDB.builder()
+                    .ingestConfig(ingest)
+                    .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;query_pool_max=2;")
+                    .build()
+                    .close();
+            Assert.fail("expected build() to reject the malformed ingest config: " + ingest);
+        } catch (RuntimeException e) {
+            // Ingress value errors surface as LineSenderException; both it and the
+            // egress IllegalArgumentException are RuntimeException.
+            Assert.assertNotNull(e.getMessage());
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedFragment));
+        }
     }
 
     private static void assertSchemaRejected(Runnable action) {

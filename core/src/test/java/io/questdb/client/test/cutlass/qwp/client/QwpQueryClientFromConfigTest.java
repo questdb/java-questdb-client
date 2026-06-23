@@ -486,6 +486,19 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testFailoverBackoffMaxAloneBelowDefaultInitialRejected() {
+        // failover_backoff_max_ms alone, below the 50 ms default initial backoff,
+        // makes the effective max < initial once fromConfig fills the missing
+        // initial with its default. validateConfig enforces the ordering against
+        // those effective values, so it is rejected up front (and the facade's
+        // fail-fast build path rejects it without constructing a client).
+        assertReject(
+                "ws::addr=db:9000;failover_backoff_max_ms=10;",
+                "failover_backoff_max_ms must be >= failover_backoff_initial_ms"
+        );
+    }
+
+    @Test
     public void testFailoverBackoffMaxAndInitialBothAccepted() {
         assertParses("ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=500;");
     }

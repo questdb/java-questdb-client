@@ -480,6 +480,9 @@ public class QwpQueryClient implements QuietCloseable {
         view.getInt("max_batch_rows", 0);
         view.getInt("buffer_pool_size", 0);
         view.getInt("compression_level", 0);
+        boolean hasBackoffInitial = view.has("failover_backoff_initial_ms");
+        boolean hasBackoffMax = view.has("failover_backoff_max_ms");
+        // getLong also range-validates the value; call it even for an absent key.
         long backoffInitial = view.getLong("failover_backoff_initial_ms", -1);
         long backoffMax = view.getLong("failover_backoff_max_ms", -1);
         view.getLong("failover_max_duration_ms", -1);
@@ -505,9 +508,16 @@ public class QwpQueryClient implements QuietCloseable {
         if ((tlsRoots == null) != (tlsRootsPassword == null)) {
             throw new IllegalArgumentException("tls_roots and tls_roots_password must be provided together");
         }
-        if (backoffInitial != -1 && backoffMax != -1 && backoffMax < backoffInitial) {
-            throw new IllegalArgumentException(
-                    "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
+        // Mirror fromConfig's effective values: a missing bound takes its
+        // default, so the ordering is enforced even when only one key is set
+        // (e.g. failover_backoff_max_ms alone, below the default initial backoff).
+        if (hasBackoffInitial || hasBackoffMax) {
+            long effectiveInitial = hasBackoffInitial ? backoffInitial : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
+            long effectiveMax = hasBackoffMax ? backoffMax : Math.max(effectiveInitial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
+            if (effectiveMax < effectiveInitial) {
+                throw new IllegalArgumentException(
+                        "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
+            }
         }
     }
 

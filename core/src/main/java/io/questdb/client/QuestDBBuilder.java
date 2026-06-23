@@ -104,7 +104,13 @@ public final class QuestDBBuilder {
         ConfigString queryCs = ConfigString.parse(queryConfig);
         ConfigView ingestView = new ConfigView(ingestCs, Side.INGRESS);
         ConfigView queryView = new ConfigView(queryCs, Side.EGRESS);
-        Sender.LineSenderBuilder.validateWsConfig(ingestView, "wss".equals(ingestCs.schema()));
+        // Validate both connect strings exactly as the pools will, but without
+        // connecting. The ingest string runs the full Sender parse plus
+        // validateParameters -- ingress value keys are registry-STRING, so only
+        // the real parse validates their values. The egress string runs the
+        // typed validateConfig. A malformed config therefore fails here even
+        // when a pool min is 0 and nothing connects.
+        Sender.LineSenderBuilder.validateWsConfigString(ingestConfig);
         QwpQueryClient.validateConfig(queryView, "wss".equals(queryCs.schema()));
 
         // getInt/getLong ignore the view's side, so the INGRESS/EGRESS views
