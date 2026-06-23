@@ -131,12 +131,12 @@ public class LineSenderAddrParsingTest {
         // The first entry parses cleanly; the failure must come from the
         // second entry's port, proving the comma-separated walk reaches it.
         assertConfStrError("ws::addr=h1:9000,h2:notaport;",
-                "cannot parse a port from the address");
+                "invalid port in addr");
     }
 
     @Test
     public void testAddrPortOutOfRangeInSecondEntryRejected() {
-        assertConfStrError("ws::addr=h1:9000,h2:0;", "invalid port [port=0]");
+        assertConfStrError("ws::addr=h1:9000,h2:0;", "port out of range in addr");
     }
 
     @Test

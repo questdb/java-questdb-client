@@ -24,13 +24,25 @@
 
 package io.questdb.client;
 
-import io.questdb.client.impl.ConfigStringTranslator;
+import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.impl.ConfigString;
+import io.questdb.client.impl.ConfigView;
 import io.questdb.client.impl.QuestDBImpl;
+import io.questdb.client.impl.Side;
+
+import java.util.function.IntConsumer;
+import java.util.function.LongConsumer;
 
 /**
  * Builder for {@link QuestDB}. Most callers use {@link QuestDB#connect(CharSequence)};
  * this builder is for pool sizing, idle/lifetime knobs, acquire timeout,
  * and the case where ingest and egress configs differ.
+ * <p>
+ * Both configs must use the {@code ws} or {@code wss} schema (QWP over
+ * WebSocket). A pool key (e.g. {@code sender_pool_min}) may be carried in the
+ * connect string or set with an explicit builder call; an explicit call always
+ * wins. When both connect strings carry the same pool key with different values,
+ * {@link #build()} fails.
  */
 public final class QuestDBBuilder {
 
@@ -41,16 +53,21 @@ public final class QuestDBBuilder {
     static final int DEFAULT_POOL_MAX = 4;
     static final int DEFAULT_POOL_MIN = 1;
 
-    private long acquireTimeoutMillis = DEFAULT_ACQUIRE_TIMEOUT_MILLIS;
-    private long housekeeperIntervalMillis = DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS;
-    private long idleTimeoutMillis = DEFAULT_IDLE_TIMEOUT_MILLIS;
+    // Every valid pool value is >= 0, so -1 unambiguously marks "not set
+    // explicitly". The public pool setters are the only writers of these
+    // fields, so field != UNSET is exactly the "set explicitly" bit.
+    private static final int UNSET = -1;
+
+    private long acquireTimeoutMillis = UNSET;
+    private long housekeeperIntervalMillis = UNSET;
+    private long idleTimeoutMillis = UNSET;
     private String ingestConfig;
-    private long maxLifetimeMillis = DEFAULT_MAX_LIFETIME_MILLIS;
+    private long maxLifetimeMillis = UNSET;
     private String queryConfig;
-    private int queryPoolMax = DEFAULT_POOL_MAX;
-    private int queryPoolMin = DEFAULT_POOL_MIN;
-    private int senderPoolMax = DEFAULT_POOL_MAX;
-    private int senderPoolMin = DEFAULT_POOL_MIN;
+    private int queryPoolMax = UNSET;
+    private int queryPoolMin = UNSET;
+    private int senderPoolMax = UNSET;
+    private int senderPoolMin = UNSET;
 
     QuestDBBuilder() {
     }
@@ -69,10 +86,11 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Builds the {@link QuestDB} handle. Eagerly creates {@code min}
+     * Builds the {@link QuestDB} handle. Validates both connect strings up
+     * front -- so a malformed config fails here even when both pools have
+     * {@code min == 0} and nothing connects -- then eagerly creates {@code min}
      * connections in each pool; further slots are allocated lazily up to
-     * {@code max} when load demands and reaped back to {@code min} when
-     * idle.
+     * {@code max} when load demands and reaped back to {@code min} when idle.
      */
     public QuestDB build() {
         if (ingestConfig == null) {
@@ -81,6 +99,24 @@ public final class QuestDBBuilder {
         if (queryConfig == null) {
             throw new IllegalStateException("query configuration is required; call fromConfig() or queryConfig()");
         }
+        ConfigString ingestCs = ConfigString.parse(ingestConfig);
+        ConfigString queryCs = ConfigString.parse(queryConfig);
+        ConfigView ingestView = new ConfigView(ingestCs, Side.INGRESS);
+        ConfigView queryView = new ConfigView(queryCs, Side.EGRESS);
+        Sender.LineSenderBuilder.validateWsConfig(ingestView, "wss".equals(ingestCs.schema()));
+        QwpQueryClient.validateConfig(queryView, "wss".equals(queryCs.schema()));
+
+        // getInt/getLong ignore the view's side, so the INGRESS/EGRESS views
+        // also serve the POOL reads.
+        resolvePoolInt(senderPoolMin, "sender_pool_min", ingestView, queryView, DEFAULT_POOL_MIN, this::senderPoolMin);
+        resolvePoolInt(senderPoolMax, "sender_pool_max", ingestView, queryView, DEFAULT_POOL_MAX, this::senderPoolMax);
+        resolvePoolInt(queryPoolMin, "query_pool_min", ingestView, queryView, DEFAULT_POOL_MIN, this::queryPoolMin);
+        resolvePoolInt(queryPoolMax, "query_pool_max", ingestView, queryView, DEFAULT_POOL_MAX, this::queryPoolMax);
+        resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", ingestView, queryView, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
+        resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", ingestView, queryView, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
+        resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", ingestView, queryView, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
+        resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", ingestView, queryView, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
+
         return new QuestDBImpl(
                 ingestConfig,
                 queryConfig,
@@ -96,42 +132,14 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Sets a single unified configuration string used to derive both the
-     * ingest and the egress config. Schema must be {@code http}, {@code https},
-     * {@code ws} or {@code wss}; the other half is derived by schema
-     * translation.
+     * Sets a single configuration string used for both ingest and egress. The
+     * schema must be {@code ws} or {@code wss}.
      */
     public QuestDBBuilder fromConfig(CharSequence configurationString) {
-        ConfigStringTranslator.Bundle bundle = ConfigStringTranslator.deriveBothSides(configurationString);
-        this.ingestConfig = bundle.ingestConfig;
-        this.queryConfig = bundle.queryConfig;
-        ConfigStringTranslator.PoolConfig pc = bundle.poolConfig;
-        // Apply pool keys carried in the string. Explicit builder calls AFTER
-        // fromConfig() will overwrite these -- last write wins.
-        if (pc.senderPoolMin != ConfigStringTranslator.PoolConfig.UNSET) {
-            senderPoolMin(pc.senderPoolMin);
-        }
-        if (pc.senderPoolMax != ConfigStringTranslator.PoolConfig.UNSET) {
-            senderPoolMax(pc.senderPoolMax);
-        }
-        if (pc.queryPoolMin != ConfigStringTranslator.PoolConfig.UNSET) {
-            queryPoolMin(pc.queryPoolMin);
-        }
-        if (pc.queryPoolMax != ConfigStringTranslator.PoolConfig.UNSET) {
-            queryPoolMax(pc.queryPoolMax);
-        }
-        if (pc.acquireTimeoutMillis != ConfigStringTranslator.PoolConfig.UNSET) {
-            acquireTimeoutMillis(pc.acquireTimeoutMillis);
-        }
-        if (pc.idleTimeoutMillis != ConfigStringTranslator.PoolConfig.UNSET) {
-            idleTimeoutMillis(pc.idleTimeoutMillis);
-        }
-        if (pc.maxLifetimeMillis != ConfigStringTranslator.PoolConfig.UNSET) {
-            maxLifetimeMillis(pc.maxLifetimeMillis);
-        }
-        if (pc.housekeeperIntervalMillis != ConfigStringTranslator.PoolConfig.UNSET) {
-            housekeeperIntervalMillis(pc.housekeeperIntervalMillis);
-        }
+        requireWebSocketSchema(configurationString, "connection");
+        String s = configurationString.toString();
+        this.ingestConfig = s;
+        this.queryConfig = s;
         return this;
     }
 
@@ -162,9 +170,11 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Sets the ingest-side configuration in {@link Sender#fromConfig} format.
+     * Sets the ingest-side configuration. The schema must be {@code ws} or
+     * {@code wss}.
      */
     public QuestDBBuilder ingestConfig(CharSequence configurationString) {
+        requireWebSocketSchema(configurationString, "ingest");
         this.ingestConfig = configurationString.toString();
         return this;
     }
@@ -183,11 +193,11 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Sets the query-side configuration in
-     * {@link io.questdb.client.cutlass.qwp.client.QwpQueryClient#fromConfig}
-     * format.
+     * Sets the query-side configuration. The schema must be {@code ws} or
+     * {@code wss}.
      */
     public QuestDBBuilder queryConfig(CharSequence configurationString) {
+        requireWebSocketSchema(configurationString, "query");
         this.queryConfig = configurationString.toString();
         return this;
     }
@@ -264,5 +274,63 @@ public final class QuestDBBuilder {
         this.senderPoolMin = size;
         this.senderPoolMax = size;
         return this;
+    }
+
+    private static void requireWebSocketSchema(CharSequence config, String role) {
+        String schema = ConfigString.parse(config).schema();
+        if (!"ws".equals(schema) && !"wss".equals(schema)) {
+            throw new IllegalArgumentException(
+                    role + " configuration must use the ws or wss schema; got: " + schema);
+        }
+    }
+
+    private void resolvePoolInt(int current, String key, ConfigView ingest, ConfigView query, int dflt, IntConsumer setter) {
+        if (current != UNSET) {
+            return; // explicit builder call wins; skip the conflict check
+        }
+        boolean inIngest = ingest.has(key);
+        boolean inQuery = query.has(key);
+        int value;
+        if (inIngest && inQuery) {
+            int vi = ingest.getInt(key, UNSET);
+            int vq = query.getInt(key, UNSET);
+            if (vi != vq) {
+                throw new IllegalArgumentException(
+                        "conflicting pool config: " + key + " (ingest=" + vi + ", query=" + vq + ")");
+            }
+            value = vi;
+        } else if (inIngest) {
+            value = ingest.getInt(key, UNSET);
+        } else if (inQuery) {
+            value = query.getInt(key, UNSET);
+        } else {
+            value = dflt;
+        }
+        setter.accept(value);
+    }
+
+    private void resolvePoolLong(long current, String key, ConfigView ingest, ConfigView query, long dflt, LongConsumer setter) {
+        if (current != UNSET) {
+            return; // explicit builder call wins; skip the conflict check
+        }
+        boolean inIngest = ingest.has(key);
+        boolean inQuery = query.has(key);
+        long value;
+        if (inIngest && inQuery) {
+            long vi = ingest.getLong(key, UNSET);
+            long vq = query.getLong(key, UNSET);
+            if (vi != vq) {
+                throw new IllegalArgumentException(
+                        "conflicting pool config: " + key + " (ingest=" + vi + ", query=" + vq + ")");
+            }
+            value = vi;
+        } else if (inIngest) {
+            value = ingest.getLong(key, UNSET);
+        } else if (inQuery) {
+            value = query.getLong(key, UNSET);
+        } else {
+            value = dflt;
+        }
+        setter.accept(value);
     }
 }

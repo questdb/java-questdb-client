@@ -375,17 +375,17 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testWsConfigString_dupAddr_explicitThenDefaultPort_fails() {
-        assertBadConfig("ws::addr=a:9000,a;", "duplicated addresses are not allowed");
+        assertBadConfig("ws::addr=a:9000,a;", "duplicate addr entry");
     }
 
     @Test
     public void testWsConfigString_dupAddr_defaultThenExplicitPort_fails() {
-        assertBadConfig("ws::addr=a,a:9000;", "duplicated addresses are not allowed");
+        assertBadConfig("ws::addr=a,a:9000;", "duplicate addr entry");
     }
 
     @Test
     public void testWsConfigString_dupAddr_bothDefaultPort_fails() {
-        assertBadConfig("ws::addr=a,a;", "duplicated addresses are not allowed");
+        assertBadConfig("ws::addr=a,a;", "duplicate addr entry");
     }
 
     @Test
@@ -723,7 +723,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
             // sf-client.md §4.6 now rejects unknown keys, so a valid key
             // (user=) is used to drive the parser past key parsing and
             // surface the missing-addr error on its own.
-            assertBadConfig("ws::user=foo;", "addr is missing");
+            assertBadConfig("ws::user=foo;", "missing required key: addr");
         });
     }
 
@@ -758,8 +758,13 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
-    public void testWsConfigString_withAutoFlushBytesDoubleSet_fails() {
-        assertBadConfig("ws::addr=localhost:9000;auto_flush_bytes=1024;auto_flush_bytes=2048;", "already configured");
+    public void testWsConfigString_withAutoFlushBytesDoubleSet_lastWriteWins() {
+        // Duplicate keys resolve last-write-wins on the QWP path: a repeated
+        // auto_flush_bytes is accepted, not rejected. Sender.builder() parses
+        // without connecting, so a successful parse returns a builder.
+        Sender.LineSenderBuilder builder =
+                Sender.builder("ws::addr=localhost:9000;auto_flush_bytes=1024;auto_flush_bytes=2048;");
+        Assert.assertNotNull(builder);
     }
 
     @Test
@@ -769,12 +774,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testWsConfigString_withInitBufSize_fails() {
-        assertBadConfig("ws::addr=localhost:9000;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
+        assertBadConfig("ws::addr=localhost:9000;init_buf_size=1024;", "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
     public void testWsConfigString_withMaxBufSize_fails() {
-        assertBadConfig("ws::addr=localhost:9000;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
+        assertBadConfig("ws::addr=localhost:9000;max_buf_size=1000000;", "unknown configuration key: max_buf_size (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
@@ -783,7 +788,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // mechanism. The connection string used to accept it; it must now be
         // rejected as an unknown key rather than silently swallowed.
         assertBadConfig("ws::addr=localhost:9000;max_schemas_per_connection=1024;",
-                "unknown configuration key [key=max_schemas_per_connection]");
+                "unknown configuration key: max_schemas_per_connection");
     }
 
     @Test
@@ -792,7 +797,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // The Sender rejects it on a ws:: string as an unknown key, matching the
         // QwpQueryClient (egress).
         assertBadConfig("ws::addr=localhost:9000;path=/read/v1;",
-                "unknown configuration key [key=path]");
+                "unknown configuration key: path");
     }
 
     @Test
@@ -858,7 +863,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // max_datagram_size applies to the UDP transport only; it is absent
         // from the QWP connect-string vocabulary shared with the egress client.
         assertBadConfig("ws::addr=localhost:9000;max_datagram_size=1400;",
-                "max_datagram_size is not supported for WebSocket transport");
+                "unknown configuration key: max_datagram_size (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
@@ -866,7 +871,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // multicast_ttl applies to the UDP transport only; it is absent from
         // the QWP connect-string vocabulary shared with the egress client.
         assertBadConfig("ws::addr=localhost:9000;multicast_ttl=4;",
-                "multicast_ttl is not supported for WebSocket transport");
+                "unknown configuration key: multicast_ttl (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
@@ -875,7 +880,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // all; even the no-op "auto" value is rejected on ws::, matching the
         // egress QwpQueryClient and the other language clients.
         assertBadConfig("ws::addr=localhost:9000;protocol_version=auto;",
-                "protocol_version is not supported for WebSocket transport");
+                "unknown configuration key: protocol_version (QWP negotiates the protocol version during the WebSocket upgrade)");
     }
 
     @Test
@@ -883,7 +888,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // protocol_version is a legacy ILP key, not part of the QWP
         // connect-string vocabulary; QWP negotiates its version at handshake.
         assertBadConfig("ws::addr=localhost:9000;protocol_version=2;",
-                "protocol_version is not supported for WebSocket transport");
+                "unknown configuration key: protocol_version (QWP negotiates the protocol version during the WebSocket upgrade)");
     }
 
     @Test
@@ -891,7 +896,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // request_min_throughput is an HTTP-only key, absent from the QWP
         // connect-string vocabulary.
         assertBadConfig("ws::addr=localhost:9000;request_min_throughput=102400;",
-                "request_min_throughput is not supported for WebSocket transport");
+                "unknown configuration key: request_min_throughput (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
@@ -899,7 +904,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // request_timeout is an HTTP-only key, absent from the QWP
         // connect-string vocabulary.
         assertBadConfig("ws::addr=localhost:9000;request_timeout=10000;",
-                "request_timeout is not supported for WebSocket transport");
+                "unknown configuration key: request_timeout (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
@@ -907,7 +912,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // retry_timeout is an HTTP-only key; the QWP analogue is the per-outage
         // reconnect budget (reconnect_max_duration_millis).
         assertBadConfig("ws::addr=localhost:9000;retry_timeout=10000;",
-                "retry_timeout is not supported for WebSocket transport");
+                "unknown configuration key: retry_timeout (use reconnect_max_duration_millis on ws/wss)");
     }
 
     @Test
@@ -944,12 +949,12 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testWssConfigString_withInitBufSize_fails() {
-        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
+        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;init_buf_size=1024;", "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
     public void testWssConfigString_withMaxBufSize_fails() {
-        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
+        assertBadConfig("wss::addr=localhost:9000;tls_verify=unsafe_off;max_buf_size=1000000;", "unknown configuration key: max_buf_size (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test

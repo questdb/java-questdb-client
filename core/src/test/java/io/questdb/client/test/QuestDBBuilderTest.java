@@ -25,10 +25,83 @@
 package io.questdb.client.test;
 
 import io.questdb.client.QuestDB;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.concurrent.TimeUnit;
+
 public class QuestDBBuilderTest {
+
+    @Test
+    public void testBuilderCallAfterFromConfigOverridesPoolKeysFromString() {
+        // A pool key carried in the string is overridden by a later explicit
+        // builder call (last-write-wins). min=0 so build() does only parse-only
+        // validation -- nothing connects.
+        try (QuestDB ignored = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=2;"
+                        + "query_pool_min=0;query_pool_max=2;acquire_timeout_ms=10000;")
+                .acquireTimeoutMillis(150)
+                .build()) {
+            Assert.assertNotNull(ignored);
+        }
+    }
+
+    @Test
+    public void testConflictingPoolKeysAcrossSidesRejected() {
+        // Both sides carry acquire_timeout_ms with different values -> build fails.
+        try (QuestDB ignored = QuestDB.builder()
+                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;acquire_timeout_ms=1000;")
+                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;")
+                .build()) {
+            Assert.fail("expected conflicting pool config");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("conflicting pool config: acquire_timeout_ms"));
+        }
+    }
+
+    @Test
+    public void testConnectStringWithPoolKeysAppliedToBuilder() {
+        // Pool keys supplied via separate ingest/query strings are accepted;
+        // min=0 so nothing connects.
+        try (QuestDB ignored = QuestDB.builder()
+                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=1;")
+                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;query_pool_max=1;")
+                .build()) {
+            Assert.assertNotNull(ignored);
+        }
+    }
+
+    @Test
+    public void testExplicitPoolKeyWinsOverConflictingStrings() {
+        // The two strings disagree on acquire_timeout_ms, but an explicit builder
+        // call sets it: explicit wins and the conflict check is skipped, whether
+        // the explicit call comes after or before the config strings.
+        try (QuestDB ignored = QuestDB.builder()
+                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;acquire_timeout_ms=1000;")
+                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;")
+                .acquireTimeoutMillis(500)
+                .build()) {
+            Assert.assertNotNull(ignored);
+        }
+        try (QuestDB ignored = QuestDB.builder()
+                .acquireTimeoutMillis(500)
+                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;acquire_timeout_ms=1000;")
+                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;")
+                .build()) {
+            Assert.assertNotNull(ignored);
+        }
+    }
+
+    @Test
+    public void testHttpIngestConfigRejected() {
+        assertSchemaRejected(() -> QuestDB.builder().ingestConfig("http::addr=h:9000;"));
+    }
+
+    @Test
+    public void testHttpSingleConfigRejected() {
+        assertSchemaRejected(() -> QuestDB.builder().fromConfig("http::addr=h:9000;"));
+    }
 
     @Test
     public void testMissingIngestConfigThrows() {
@@ -43,7 +116,7 @@ public class QuestDBBuilderTest {
     @Test
     public void testMissingQueryConfigThrows() {
         try {
-            QuestDB.builder().ingestConfig("http::addr=h:9000;").build().close();
+            QuestDB.builder().ingestConfig("ws::addr=h:9000;").build().close();
             Assert.fail();
         } catch (IllegalStateException e) {
             Assert.assertTrue(e.getMessage().contains("query"));
@@ -74,62 +147,71 @@ public class QuestDBBuilderTest {
     }
 
     @Test
-    public void testBuilderCallAfterFromConfigOverridesPoolKeysFromString() {
-        // Build to a dead address with a forced exhaustion timeout so we can read
-        // the timeout off the resulting LineSenderException. fromConfig() sets
-        // acquire_timeout_ms=10000; subsequent acquireTimeoutMillis(150) wins
-        // because the builder applies last-write-wins.
-        try (io.questdb.client.QuestDB ignored = QuestDB.builder()
-                .fromConfig("http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;"
-                        + "sender_pool_min=1;sender_pool_max=1;query_pool_min=1;query_pool_max=1;"
-                        + "acquire_timeout_ms=10000;idle_timeout_ms=0;max_lifetime_ms=0;")
-                .queryConfig("ws::addr=127.0.0.1:1;auth_timeout_ms=50;failover=off;query_pool_min=0;query_pool_max=0;")
-                .acquireTimeoutMillis(150)
-                .build()) {
-            Assert.fail("expected build to fail (no live server)");
-        } catch (RuntimeException expected) {
-            // Either sender or query pool build fails -- both are fine, both prove the
-            // builder is wired through. The pool-config keys in the strings did not
-            // crash the parsers (test would have thrown InvalidArgument earlier).
+    public void testQueryPoolBuildFailureUnwindsSenderPool() throws Exception {
+        // Sender pool builds against a healthy ws ingest endpoint; the query
+        // pool fails on a dead address. The handle must close the already-built
+        // sender pool (its connected senders) rather than leak them.
+        try (TestWebSocketServer ingest = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        })) {
+            ingest.start();
+            Assert.assertTrue(ingest.awaitStart(5, TimeUnit.SECONDS));
+            int port = ingest.getPort();
+            try {
+                QuestDB.builder()
+                        .ingestConfig("ws::addr=localhost:" + port + ";")
+                        .queryConfig("ws::addr=127.0.0.1:1;auth_timeout_ms=200;")
+                        .senderPoolSize(2)
+                        .queryPoolSize(2)
+                        .acquireTimeoutMillis(500)
+                        .build()
+                        .close();
+                Assert.fail("expected build to fail when query pool cannot connect");
+            } catch (RuntimeException expected) {
+                // The exact exception comes from QwpQueryClient.connect(); the
+                // build failing tells us the sender-pool unwind ran.
+            }
         }
     }
 
     @Test
-    public void testConnectStringWithPoolKeysAppliedToBuilder() {
-        // Build will fail (dead address) but we can verify the timeout came from
-        // the connect string by measuring how long borrowSender blocks would take.
-        // Easier: just assert the build path doesn't choke on the pool keys.
-        try (io.questdb.client.QuestDB ignored = QuestDB.builder()
-                .ingestConfig("http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;")
-                .queryConfig("ws::addr=127.0.0.1:1;auth_timeout_ms=100;failover=off;")
-                .senderPoolSize(1)
-                .queryPoolSize(1)
-                .acquireTimeoutMillis(100)
+    public void testSamePoolKeyValueAcrossSidesOk() {
+        // The same key at the same value on both sides builds cleanly.
+        try (QuestDB ignored = QuestDB.builder()
+                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;acquire_timeout_ms=1500;")
+                .queryConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;acquire_timeout_ms=1500;")
                 .build()) {
-            Assert.fail("build should fail with dead query address");
-        } catch (RuntimeException expected) {
-            // Validated by absence of an IllegalArgumentException for pool keys.
+            Assert.assertNotNull(ignored);
         }
     }
 
     @Test
-    public void testQueryPoolBuildFailureUnwindsSenderPool() {
-        // Sender pool builds fine (http connects lazily); query pool fails because
-        // ws::127.0.0.1:1 is not a live QuestDB. The handle must clean up the
-        // already-built sender pool rather than leaking N Senders.
+    public void testSharedWsConfigWithPoolKeys() {
+        // A shared ws:: string carries pool keys; min=0 so build does only
+        // parse-only validation (no connect).
+        try (QuestDB ignored = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=3;"
+                        + "query_pool_min=0;query_pool_max=2;acquire_timeout_ms=1234;")
+                .build()) {
+            Assert.assertNotNull(ignored);
+        }
+    }
+
+    @Test
+    public void testTcpIngestConfigRejected() {
+        assertSchemaRejected(() -> QuestDB.builder().ingestConfig("tcp::addr=h:9009;"));
+    }
+
+    @Test
+    public void testUdpIngestConfigRejected() {
+        assertSchemaRejected(() -> QuestDB.builder().queryConfig("udp::addr=h:9009;"));
+    }
+
+    private static void assertSchemaRejected(Runnable action) {
         try {
-            QuestDB.builder()
-                    .ingestConfig("http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;")
-                    .queryConfig("ws::addr=127.0.0.1:1;auth_timeout_ms=200;failover=off;")
-                    .senderPoolSize(2)
-                    .queryPoolSize(2)
-                    .acquireTimeoutMillis(500)
-                    .build()
-                    .close();
-            Assert.fail("expected build to fail when query pool cannot connect");
-        } catch (RuntimeException expected) {
-            // The exact exception type comes from QwpQueryClient.connect();
-            // we only assert the build failed so we know cleanup ran.
+            action.run();
+            Assert.fail("expected the ws/wss schema requirement to reject this config");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("ws or wss"));
         }
     }
 }

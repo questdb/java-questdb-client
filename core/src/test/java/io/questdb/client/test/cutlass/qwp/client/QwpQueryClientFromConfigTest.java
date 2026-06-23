@@ -294,6 +294,36 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testUserPassAliasesAuthenticate() {
+        // user/pass are aliases of username/password: they synthesize the same
+        // Basic auth header.
+        try (QwpQueryClient viaAlias = QwpQueryClient.fromConfig("ws::addr=db:9000;user=alice;pass=secret;");
+             QwpQueryClient viaCanonical = QwpQueryClient.fromConfig("ws::addr=db:9000;username=alice;password=secret;")) {
+            Assert.assertNotNull(viaAlias.getAuthorizationHeaderForTest());
+            Assert.assertEquals(
+                    viaCanonical.getAuthorizationHeaderForTest(),
+                    viaAlias.getAuthorizationHeaderForTest());
+        }
+    }
+
+    @Test
+    public void testUserAliasAloneRejected() {
+        // user is an alias of username, so user-alone trips the both-or-neither rule.
+        assertReject(
+                "ws::addr=db:9000;user=alice;",
+                "both username and password must be provided together"
+        );
+    }
+
+    @Test
+    public void testPassAliasAloneRejected() {
+        assertReject(
+                "ws::addr=db:9000;pass=secret;",
+                "both username and password must be provided together"
+        );
+    }
+
+    @Test
     public void testBufferPoolSizeLowerBoundRejected() {
         assertReject("ws::addr=db:9000;buffer_pool_size=0;", "buffer_pool_size must be >= 1");
     }
@@ -338,7 +368,7 @@ public class QwpQueryClientFromConfigTest {
     public void testCompressionInvalidRejected() {
         assertReject(
                 "ws::addr=db:9000;compression=gzip;",
-                "unsupported compression: gzip (expected zstd, raw, or auto)"
+                "invalid compression: gzip (expected zstd, raw, auto)"
         );
     }
 
@@ -495,7 +525,7 @@ public class QwpQueryClientFromConfigTest {
     public void testFailoverInvalidRejected() {
         assertReject(
                 "ws::addr=db:9000;failover=maybe;",
-                "invalid failover: maybe (expected on or off)"
+                "invalid failover: maybe (expected on, off)"
         );
     }
 
@@ -639,12 +669,9 @@ public class QwpQueryClientFromConfigTest {
                 "drain_orphans=on",
                 "durable_ack_keepalive_interval_millis=200",
                 "error_inbox_capacity=256",
-                "init_buf_size=65536",
                 "initial_connect_retry=on",
                 "max_background_drainers=4",
-                "max_buf_size=100m",
                 "max_name_len=127",
-                "pass=secret",
                 "reconnect_initial_backoff_millis=100",
                 "reconnect_max_backoff_millis=5000",
                 "reconnect_max_duration_millis=300000",
@@ -656,7 +683,6 @@ public class QwpQueryClientFromConfigTest {
                 "sf_max_bytes=4m",
                 "sf_max_total_bytes=10g",
                 "transaction=on",
-                "user=alice",
         };
         StringBuilder all = new StringBuilder("ws::addr=db:9000;");
         for (String kv : keys) {
@@ -669,7 +695,6 @@ public class QwpQueryClientFromConfigTest {
         // Out-of-range / malformed values are silently consumed too -- the
         // egress parser does not validate ingress-only keys.
         assertParses("ws::addr=db:9000;auto_flush_rows=-1;");
-        assertParses("ws::addr=db:9000;init_buf_size=garbage;");
         assertParses("ws::addr=db:9000;reconnect_max_duration_millis=banana;");
 
         // Empty values are well-formed and silently consumed.
@@ -809,25 +834,33 @@ public class QwpQueryClientFromConfigTest {
         // QwpQueryClient is QWP-only, so a ws:: string carrying them is
         // malformed -- the parser rejects them as unknown rather than
         // silently consuming them.
+        // Legacy keys reject with a relocated-key hint pointing at the right place.
         assertReject("ws::addr=db:9000;request_timeout=10000;",
-                "unknown configuration key: request_timeout");
+                "unknown configuration key: request_timeout (applies to legacy http/tcp/udp transports only)");
         assertReject("ws::addr=db:9000;retry_timeout=10000;",
-                "unknown configuration key: retry_timeout");
+                "unknown configuration key: retry_timeout (use reconnect_max_duration_millis on ws/wss)");
         assertReject("ws::addr=db:9000;request_min_throughput=102400;",
-                "unknown configuration key: request_min_throughput");
+                "unknown configuration key: request_min_throughput (applies to legacy http/tcp/udp transports only)");
         assertReject("ws::addr=db:9000;protocol_version=2;",
-                "unknown configuration key: protocol_version");
+                "unknown configuration key: protocol_version (QWP negotiates the protocol version during the WebSocket upgrade)");
         // protocol_version is rejected regardless of value: the egress side
         // has no "auto" pass-through.
         assertReject("ws::addr=db:9000;protocol_version=auto;",
-                "unknown configuration key: protocol_version");
+                "unknown configuration key: protocol_version (QWP negotiates the protocol version during the WebSocket upgrade)");
         // max_datagram_size and multicast_ttl apply to the UDP transport only;
         // the QWP ws:: vocabulary does not include them, so the egress parser
         // rejects them as unknown.
         assertReject("ws::addr=db:9000;max_datagram_size=1400;",
-                "unknown configuration key: max_datagram_size");
+                "unknown configuration key: max_datagram_size (applies to legacy http/tcp/udp transports only)");
         assertReject("ws::addr=db:9000;multicast_ttl=4;",
-                "unknown configuration key: multicast_ttl");
+                "unknown configuration key: multicast_ttl (applies to legacy http/tcp/udp transports only)");
+        // init_buf_size and max_buf_size size the legacy http/tcp ingest buffer;
+        // the ws Sender has fixed framing, so they are legacy-only and the egress
+        // parser rejects them with the hint rather than silently consuming them.
+        assertReject("ws::addr=db:9000;init_buf_size=65536;",
+                "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
+        assertReject("ws::addr=db:9000;max_buf_size=100m;",
+                "unknown configuration key: max_buf_size (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
@@ -875,7 +908,7 @@ public class QwpQueryClientFromConfigTest {
     public void testTargetInvalidRejected() {
         assertReject(
                 "ws::addr=db:9000;target=leader;",
-                "invalid target: leader (expected any, primary, or replica)"
+                "invalid target: leader (expected any, primary, replica)"
         );
     }
 
@@ -922,7 +955,7 @@ public class QwpQueryClientFromConfigTest {
     public void testTlsVerifyInvalidRejected() {
         assertReject(
                 "wss::addr=db:9000;tls_verify=strict;",
-                "invalid tls_verify: strict (expected on or unsafe_off)"
+                "invalid tls_verify: strict (expected on, unsafe_off)"
         );
     }
 

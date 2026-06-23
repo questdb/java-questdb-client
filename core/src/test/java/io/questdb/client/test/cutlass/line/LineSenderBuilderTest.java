@@ -223,10 +223,10 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost;auto_flush_bytes=1024;", "auto_flush_bytes is only supported for TCP and WebSocket transport");
             assertConfStrError("http::addr=localhost;protocol_version=10", "current client only supports protocol version 1(text format for all datatypes), 2(binary format for part datatypes), 3(decimal datatype) or explicitly unset");
             assertConfStrError("http::addr=localhost:48884;max_name_len=10;", "max_name_len must be at least 16 bytes [max_name_len=10]");
-            assertConfStrError("ws::addr=localhost;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
-            assertConfStrError("wss::addr=localhost;tls_verify=unsafe_off;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
-            assertConfStrError("ws::addr=localhost;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
-            assertConfStrError("wss::addr=localhost;tls_verify=unsafe_off;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
+            assertConfStrError("ws::addr=localhost;max_buf_size=1000000;", "unknown configuration key: max_buf_size (applies to legacy http/tcp/udp transports only)");
+            assertConfStrError("wss::addr=localhost;tls_verify=unsafe_off;max_buf_size=1000000;", "unknown configuration key: max_buf_size (applies to legacy http/tcp/udp transports only)");
+            assertConfStrError("ws::addr=localhost;init_buf_size=1024;", "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
+            assertConfStrError("wss::addr=localhost;tls_verify=unsafe_off;init_buf_size=1024;", "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
 
             assertConfStrOk("addr=localhost:8080", "auto_flush_rows=100", "protocol_version=1");
             assertConfStrOk("addr=localhost:8080", "auto_flush=on", "auto_flush_rows=100", "protocol_version=2");
@@ -269,7 +269,7 @@ public class LineSenderBuilderTest {
             // let language clients drift on the same connect string.
             assertConfStrError("http::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
             assertConfStrError("tcp::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
-            assertConfStrError("ws::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            assertConfStrError("ws::addr=localhost;not_a_real_key=foo;", "unknown configuration key: not_a_real_key");
             assertConfStrError("udp::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
             // The unknown-key error must surface even when the value would
             // itself be malformed -- the key is the reportable defect.
