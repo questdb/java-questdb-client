@@ -57,6 +57,40 @@ public interface DeviceCodePrompt {
     };
 
     /**
+     * Returns a prompt that prints the challenge like {@link #SYSTEM_OUT} and then also tries to open
+     * the verification URL in the local default browser. The browser open is best-effort: it is
+     * skipped on a headless JVM, on a runtime without the {@code java.desktop} module, or for a
+     * non-http(s) URL, and never prevents sign-in. Intended for a local terminal; on a remote or
+     * headless host the printed URL and code remain the way in.
+     *
+     * @return a prompt that prints the challenge and opens the verification URL in a browser
+     */
+    static DeviceCodePrompt openBrowser() {
+        return openBrowser(SYSTEM_OUT);
+    }
+
+    /**
+     * Like {@link #openBrowser()}, but renders the challenge with {@code delegate} before opening the
+     * browser, instead of the built-in {@code System.out} printer.
+     *
+     * @param delegate the prompt that shows the challenge to the user
+     * @return a prompt that runs {@code delegate} and then opens the verification URL in a browser
+     */
+    static DeviceCodePrompt openBrowser(DeviceCodePrompt delegate) {
+        return challenge -> {
+            delegate.promptUser(challenge);
+            String url = challenge.getVerificationUriComplete() != null
+                    ? challenge.getVerificationUriComplete()
+                    : challenge.getVerificationUri();
+            try {
+                BrowserLauncher.open(url);
+            } catch (LinkageError ignore) {
+                // the java.desktop module is absent from this runtime; the printed URL and code remain
+            }
+        };
+    }
+
+    /**
      * Shows the challenge to the user. Must return quickly; waiting for the user happens afterwards
      * while {@link OidcDeviceAuth} polls the token endpoint.
      *

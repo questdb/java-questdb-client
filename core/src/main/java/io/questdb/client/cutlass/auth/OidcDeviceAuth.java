@@ -189,7 +189,7 @@ public class OidcDeviceAuth implements QuietCloseable {
      * authorization. Only call {@code fromQuestDB} against a trusted server reached over {@code https}
      * (required by default; {@link Builder#allowInsecureTransport(boolean)} removes that protection).
      * For an untrusted server, configure the identity provider explicitly with {@link #builder()}, or
-     * pin it with {@link #fromQuestDB(String, String)}.
+     * pin it via {@link #fromQuestDB(String, DiscoveryOptions)} and {@link DiscoveryOptions#issuer(String)}.
      *
      * @param questdbUrl the QuestDB HTTP base URL, for example {@code https://questdb.example.com:9000}
      * @return a configured, ready-to-use instance
@@ -197,74 +197,27 @@ public class OidcDeviceAuth implements QuietCloseable {
      *                           authorization endpoint and no issuer was pinned to discover it
      */
     public static OidcDeviceAuth fromQuestDB(String questdbUrl) {
-        return fromQuestDB(questdbUrl, null, null, defaultTlsConfig(), false);
+        return fromQuestDB(questdbUrl, new DiscoveryOptions());
     }
 
     /**
-     * Like {@link #fromQuestDB(String)} but permits insecure {@code http} for the server and the
-     * discovered identity provider endpoints (see {@link Builder#allowInsecureTransport(boolean)}).
-     * Local development only.
-     */
-    public static OidcDeviceAuth fromQuestDB(String questdbUrl, boolean allowInsecureTransport) {
-        return fromQuestDB(questdbUrl, null, null, defaultTlsConfig(), allowInsecureTransport);
-    }
-
-    /**
-     * Like {@link #fromQuestDB(String)} but pins the identity provider by its {@code issuer} origin
-     * (for example {@code https://idp.example.com}). The issuer serves two roles:
-     * <ul>
-     *     <li>when the server does not advertise the device authorization endpoint (today's servers,
-     *     and older ones), it is discovered from the issuer's {@code .well-known/openid-configuration};
-     *     the discovery origin comes only from this out-of-band issuer, never from {@code /settings}, so
-     *     a tampered {@code /settings} cannot choose where credentials are sent;</li>
-     *     <li>it pins the token and device authorization endpoints: any endpoint not on the issuer
-     *     origin is rejected, so a compromised-but-TLS-valid server cannot redirect the sign-in.</li>
-     * </ul>
-     */
-    public static OidcDeviceAuth fromQuestDB(String questdbUrl, String issuer) {
-        return fromQuestDB(questdbUrl, issuer, null, defaultTlsConfig(), false);
-    }
-
-    /**
-     * Like {@link #fromQuestDB(String, String)} but permits insecure {@code http} for the server and
-     * the discovered identity provider endpoints (see {@link Builder#allowInsecureTransport(boolean)}).
-     * Local development only.
-     */
-    public static OidcDeviceAuth fromQuestDB(String questdbUrl, String issuer, boolean allowInsecureTransport) {
-        return fromQuestDB(questdbUrl, issuer, null, defaultTlsConfig(), allowInsecureTransport);
-    }
-
-    /**
-     * Like {@link #fromQuestDB(String)} but with an explicit TLS configuration, used for the discovery
-     * request, any identity provider discovery document, and the later sign-in requests.
-     */
-    public static OidcDeviceAuth fromQuestDB(String questdbUrl, ClientTlsConfiguration tlsConfig) {
-        return fromQuestDB(questdbUrl, null, null, tlsConfig, false);
-    }
-
-    /**
-     * Like {@link #fromQuestDB(String, ClientTlsConfiguration)} but permits insecure {@code http} for
-     * the server and the discovered identity provider endpoints (see
-     * {@link Builder#allowInsecureTransport(boolean)}). Local development only.
-     */
-    public static OidcDeviceAuth fromQuestDB(String questdbUrl, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport) {
-        return fromQuestDB(questdbUrl, null, null, tlsConfig, allowInsecureTransport);
-    }
-
-    /**
-     * Like {@link #fromQuestDB(String, String)} but accepts the discovery document URL directly (an
-     * alternative to {@code issuer}, which otherwise derives it as
-     * {@code {issuer}/.well-known/openid-configuration}) plus an explicit TLS configuration. Either an
-     * {@code issuer} or a {@code discoveryUrl} pins the identity provider; pass both {@code null} to
-     * trust the endpoints the server advertises.
+     * Discovers the OIDC configuration from a running QuestDB server, like {@link #fromQuestDB(String)},
+     * but with explicit {@link DiscoveryOptions}: an identity provider pin (issuer or discovery URL), a
+     * TLS configuration, an insecure-transport opt-in, and the device code prompt - for example
+     * {@link DeviceCodePrompt#openBrowser()} to also open the verification URL in a browser.
      *
-     * @param questdbUrl             the QuestDB HTTP base URL
-     * @param issuer                 the identity provider origin to pin, or {@code null}
-     * @param discoveryUrl           the identity provider discovery document URL to pin, or {@code null}
-     * @param tlsConfig              the TLS configuration for the discovery and sign-in requests
-     * @param allowInsecureTransport permits insecure {@code http} for the server and identity provider
+     * @param questdbUrl the QuestDB HTTP base URL, for example {@code https://questdb.example.com:9000}
+     * @param options    how to pin the identity provider, configure TLS, permit insecure transport, and
+     *                   show the device code challenge; see {@link DiscoveryOptions}
+     * @return a configured, ready-to-use instance
+     * @throws OidcAuthException if the server has OIDC disabled, or does not advertise a device
+     *                           authorization endpoint and no issuer or discovery URL was pinned
      */
-    public static OidcDeviceAuth fromQuestDB(String questdbUrl, String issuer, String discoveryUrl, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport) {
+    public static OidcDeviceAuth fromQuestDB(String questdbUrl, DiscoveryOptions options) {
+        String issuer = options.issuer;
+        String discoveryUrl = options.discoveryUrl;
+        ClientTlsConfiguration tlsConfig = options.tlsConfig != null ? options.tlsConfig : defaultTlsConfig();
+        boolean allowInsecureTransport = options.allowInsecureTransport;
         Endpoint server = Endpoint.parse(questdbUrl);
         if (!allowInsecureTransport) {
             requireSecureTransport(server.isTls, "QuestDB server url", questdbUrl);
@@ -370,6 +323,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 .issuer(resolvedIssuer)
                 .allowInsecureTransport(allowInsecureTransport)
                 .tlsConfig(tlsConfig)
+                .prompt(options.prompt)
                 .build();
     }
 
@@ -1192,7 +1146,7 @@ public class OidcDeviceAuth implements QuietCloseable {
          * Pins the identity provider by its {@code issuer} origin (for example
          * {@code https://idp.example.com}). When set, {@link #build()} rejects a token or device
          * authorization endpoint not on this origin, so a compromised or tampered configuration cannot
-         * redirect the device code and refresh token to an attacker. {@link #fromQuestDB(String, String)}
+         * redirect the device code and refresh token to an attacker. {@link #fromQuestDB(String, DiscoveryOptions)}
          * sets it for you when discovering from a server. A provider hosting its endpoints on a different
          * origin than its issuer is rejected when pinned; configure it without an issuer. Optional.
          */
@@ -1222,6 +1176,74 @@ public class OidcDeviceAuth implements QuietCloseable {
 
         public Builder tokenEndpoint(String tokenEndpoint) {
             this.tokenEndpoint = tokenEndpoint;
+            return this;
+        }
+    }
+
+    /**
+     * Options for {@link #fromQuestDB(String, DiscoveryOptions)}: how to pin the identity provider
+     * (issuer or discovery URL), the TLS configuration for discovery and sign-in, whether to permit
+     * insecure {@code http}, and how to show the device code challenge. Every option is optional; an
+     * instance with nothing set behaves like {@link #fromQuestDB(String)}.
+     */
+    public static final class DiscoveryOptions {
+        private boolean allowInsecureTransport;
+        private String discoveryUrl;
+        private String issuer;
+        private DeviceCodePrompt prompt = DeviceCodePrompt.SYSTEM_OUT;
+        private ClientTlsConfiguration tlsConfig;
+
+        /**
+         * Permits insecure {@code http} for both the QuestDB server and the discovered identity provider
+         * endpoints. Tokens and the device code then travel in cleartext, so this is rejected by default;
+         * enable only for local development on a trusted network. Defaults to {@code false}.
+         */
+        public DiscoveryOptions allowInsecureTransport(boolean allowInsecureTransport) {
+            this.allowInsecureTransport = allowInsecureTransport;
+            return this;
+        }
+
+        /**
+         * Pins the identity provider by its discovery document URL directly, an alternative to
+         * {@link #issuer(String)} (which otherwise derives {@code {issuer}/.well-known/openid-configuration}).
+         * Either pins where discovery - and the credential requests it resolves - are aimed, so a tampered
+         * {@code /settings} cannot redirect them. Optional.
+         */
+        public DiscoveryOptions discoveryUrl(String discoveryUrl) {
+            this.discoveryUrl = discoveryUrl;
+            return this;
+        }
+
+        /**
+         * Pins the identity provider by its {@code issuer} origin (for example
+         * {@code https://idp.example.com}). It plays two roles: when the server does not advertise the
+         * device authorization endpoint, it is discovered from the issuer's
+         * {@code .well-known/openid-configuration} (the discovery origin comes only from this out-of-band
+         * issuer, never from {@code /settings}); and it pins the token and device authorization endpoints,
+         * so any endpoint not on the issuer origin is rejected. A provider hosting its endpoints on a
+         * different origin than its issuer must be configured without an issuer. Optional.
+         */
+        public DiscoveryOptions issuer(String issuer) {
+            this.issuer = issuer;
+            return this;
+        }
+
+        /**
+         * Sets how the device code challenge is shown to the user, for example
+         * {@link DeviceCodePrompt#openBrowser()} to also open the verification URL in a browser. Defaults
+         * to {@link DeviceCodePrompt#SYSTEM_OUT}.
+         */
+        public DiscoveryOptions prompt(DeviceCodePrompt prompt) {
+            this.prompt = prompt != null ? prompt : DeviceCodePrompt.SYSTEM_OUT;
+            return this;
+        }
+
+        /**
+         * Sets the TLS configuration used for the {@code /settings} discovery request, any identity
+         * provider discovery document, and the later sign-in requests. Defaults to full validation.
+         */
+        public DiscoveryOptions tlsConfig(ClientTlsConfiguration tlsConfig) {
+            this.tlsConfig = tlsConfig;
             return this;
         }
     }

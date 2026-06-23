@@ -586,7 +586,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     auth.getToken();
                     Assert.fail("expected a malformed status code to be rejected");
                 } catch (OidcAuthException e) {
@@ -654,7 +654,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     Assert.assertEquals("ACCESS-SCOPE", auth.getToken());
                     Assert.assertTrue(deviceBody.get(), deviceBody.get().contains("scope=openid"));
                     Assert.assertFalse(deviceBody.get(), deviceBody.get().contains("groups"));
@@ -694,7 +694,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     // enabled stayed true (no DoS), groups-in-token stayed false (access token served),
                     // scope stayed "openid" (no injection)
                     Assert.assertEquals("ACCESS-TRUSTED", auth.getToken());
@@ -720,7 +720,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("client id"));
@@ -744,7 +744,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("token endpoint"));
@@ -766,7 +766,7 @@ public class OidcDeviceAuthTest {
         } // closed now - nothing listens on deadPort
         long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
         long clientMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
-        try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB("http://127.0.0.1:" + deadPort, true)) {
+        try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB("http://127.0.0.1:" + deadPort, insecure())) {
             Assert.fail("expected discovery to fail against a dead port");
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not reach the QuestDB server"));
@@ -969,7 +969,7 @@ public class OidcDeviceAuthTest {
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
                 // the issuer is the mock itself, which also serves the .well-known document and the IdP endpoints
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), server.httpUrl(""), true)) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), new OidcDeviceAuth.DiscoveryOptions().issuer(server.httpUrl("")).allowInsecureTransport(true))) {
                     // settings advertise groups.encoded.in.token=true, so getToken() returns the id token
                     Assert.assertEquals("ID-WK", auth.getToken());
                 }
@@ -998,7 +998,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, server.httpUrl(WELL_KNOWN_PATH), null, true)) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), new OidcDeviceAuth.DiscoveryOptions().discoveryUrl(server.httpUrl(WELL_KNOWN_PATH)).allowInsecureTransport(true))) {
                     Assert.assertEquals("ID-DU", auth.getToken());
                 }
             }
@@ -1024,7 +1024,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), server.httpUrl(""), true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), new OidcDeviceAuth.DiscoveryOptions().issuer(server.httpUrl("")).allowInsecureTransport(true))) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("device_authorization_endpoint"));
@@ -1049,7 +1049,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     // discovery advertises groups.encoded.in.token=true, so getToken() must return the id token
                     Assert.assertEquals("ID-D", auth.getToken());
                 }
@@ -1081,7 +1081,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, server.httpUrl(WELL_KNOWN_PATH), null, true)) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), new OidcDeviceAuth.DiscoveryOptions().discoveryUrl(server.httpUrl(WELL_KNOWN_PATH)).allowInsecureTransport(true))) {
                     Assert.assertEquals("ID-DUP", auth.getToken());
                 }
                 Assert.assertFalse("discovery must be skipped when /settings advertises both endpoints", wellKnownHit.get());
@@ -1115,7 +1115,7 @@ public class OidcDeviceAuthTest {
                         "https://attacker.example"));
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, server.httpUrl(WELL_KNOWN_PATH), null, true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), new OidcDeviceAuth.DiscoveryOptions().discoveryUrl(server.httpUrl(WELL_KNOWN_PATH)).allowInsecureTransport(true))) {
                     Assert.fail("expected the discoveryUrl pin to reject a document declaring a foreign issuer");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("different origin than the pinned discovery url"));
@@ -1137,7 +1137,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), null, "https://trusted-idp.example/.well-known/openid-configuration", null, true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), new OidcDeviceAuth.DiscoveryOptions().discoveryUrl("https://trusted-idp.example/.well-known/openid-configuration").allowInsecureTransport(true))) {
                     Assert.fail("expected the discoveryUrl pin to reject the off-origin endpoints");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
@@ -1159,7 +1159,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), "https://idp.attacker.example", true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), new OidcDeviceAuth.DiscoveryOptions().issuer("https://idp.attacker.example").allowInsecureTransport(true))) {
                     Assert.fail("expected the issuer pin to reject the off-origin endpoints");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
@@ -1183,7 +1183,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     Assert.fail("expected the CR/LF-injected token endpoint to be rejected");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("illegal character"));
@@ -1216,7 +1216,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("device authorization endpoint"));
@@ -1233,7 +1233,7 @@ public class OidcDeviceAuthTest {
                     MockOidcServer.json(200, settingsJson(false, false, serverRef.get().httpUrl(TOKEN_PATH), null));
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("OIDC is not enabled"));
@@ -1701,7 +1701,7 @@ public class OidcDeviceAuthTest {
                 serverRef.set(server);
                 String questdbUrl = "http://127.1:" + server.port();
                 // without an out-of-band pin the plaintext channel is untrusted: the pin fires
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(questdbUrl, (String) null, true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(questdbUrl, insecure())) {
                     Assert.fail("expected the plaintext-channel pin to reject /settings-supplied endpoints without a pin");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("reached over insecure http"));
@@ -1709,7 +1709,7 @@ public class OidcDeviceAuthTest {
                 // pinning the issuer to the advertised endpoints' origin satisfies the pin over the very same
                 // plaintext channel, so construction succeeds - proving the pin, not some unrelated rejection,
                 // is what gated the unpinned call above
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(questdbUrl, server.httpUrl(""), true)) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(questdbUrl, new OidcDeviceAuth.DiscoveryOptions().issuer(server.httpUrl("")).allowInsecureTransport(true))) {
                     Assert.assertNotNull(auth);
                 }
             }
@@ -1938,7 +1938,7 @@ public class OidcDeviceAuthTest {
             // connection once it crosses 4 MiB
             MockOidcServer.Handler handler = (method, path, body) -> MockOidcServer.oversizedJson(8L * 1024 * 1024);
             try (MockOidcServer server = new MockOidcServer(handler)) {
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     Assert.fail("expected discovery to abort on the response-size cap");
                 } catch (OidcAuthException e) {
                     // the size-cap failure surfaces as the cause; the body (which carries access/id/refresh
@@ -2448,7 +2448,7 @@ public class OidcDeviceAuthTest {
             MockOidcServer.Handler handler = (method, path, body) ->
                     MockOidcServer.json(200, "{\"config\":{\"acl.oidc.enabled\":true,\"acl.oidc.client.id\":\"questdb\"");
             try (MockOidcServer server = new MockOidcServer(handler)) {
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), true)) {
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure())) {
                     Assert.fail("expected discovery to reject the truncated settings body");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not parse"));
@@ -2670,6 +2670,11 @@ public class OidcDeviceAuthTest {
                 + "\"expires_in\":" + expiresIn + ","
                 + "\"interval\":" + interval
                 + "}";
+    }
+
+    // DiscoveryOptions permitting insecure http, the common shape for tests reaching a plaintext mock server
+    private static OidcDeviceAuth.DiscoveryOptions insecure() {
+        return new OidcDeviceAuth.DiscoveryOptions().allowInsecureTransport(true);
     }
 
     // isLoopbackHost is a private static security classifier (it gates the plaintext-channel MITM pin); the

@@ -16,6 +16,9 @@ public class OidcDeviceFlowExample {
     public static void main(String[] args) {
         // Discover client id, scope, endpoints and the groups-in-token mode from the server.
         // Alternatively, configure the identity provider explicitly with OidcDeviceAuth.builder().
+        // On a local terminal, also open the verification URL in a browser by passing options:
+        //   import io.questdb.client.cutlass.auth.DeviceCodePrompt;
+        //   OidcDeviceAuth.fromQuestDB(url, new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.openBrowser()))
         try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
             auth.getToken(); // sign in once (prompts on first use, then caches and refreshes silently)
 

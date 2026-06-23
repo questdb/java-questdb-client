@@ -188,6 +188,18 @@ try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.c
 
 Prefer `httpTokenProvider(auth::getTokenSilently)` for a long-lived sender: it pulls a freshly refreshed token on every request, so the sender keeps working as the token rotates. A fixed `httpToken(token)` captures the token once, so a sender that outlives the token's lifetime starts failing with 401s. Either way, hand the token to the client through the builder (or the header/password fields below), not by embedding it in a `Sender.fromConfig(...)` string or the `QDB_CLIENT_CONF` environment variable, which are easily logged, persisted, or left in shell history.
 
+On a local terminal you can also open the verification URL in the default browser automatically with `DeviceCodePrompt.openBrowser()`, in addition to printing it:
+
+```java
+try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
+        "https://questdb.example.com:9000",
+        new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.openBrowser()))) {
+    auth.getToken();
+}
+```
+
+The browser open is best-effort: it only opens an `http(s)` URL, is skipped on a headless host or a JVM without the `java.desktop` module, and never blocks sign-in — the URL and code are always printed too, so a remote or browserless process still works. Pass any `DeviceCodePrompt` (via `DiscoveryOptions.prompt(...)`, or `builder().prompt(...)` for explicit configuration) to render the challenge yourself, for example a clickable link or QR code in a notebook.
+
 The same token can be presented to QuestDB over any auth path the server already validates:
 
 - **REST API:** send it as an `Authorization: Bearer <token>` header (`auth.getAuthorizationHeaderValue()` returns the full value).
@@ -209,12 +221,13 @@ Discovery via `fromQuestDB(...)` reads the OIDC client id, scope and endpoints f
 
 ```java
 try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
-        "https://questdb.example.com:9000", "https://idp.example.com")) {
+        "https://questdb.example.com:9000",
+        new OidcDeviceAuth.DiscoveryOptions().issuer("https://idp.example.com"))) {
     auth.getToken();
 }
 ```
 
-By default the device authorization and token endpoints must use `https`, so tokens are never sent in cleartext; an `http` endpoint is rejected. For local development against an `http` endpoint, opt in explicitly with `.allowInsecureTransport(true)` on the builder, or `OidcDeviceAuth.fromQuestDB(url, true)`.
+By default the device authorization and token endpoints must use `https`, so tokens are never sent in cleartext; an `http` endpoint is rejected. For local development against an `http` endpoint, opt in explicitly with `.allowInsecureTransport(true)` on the builder, or `OidcDeviceAuth.fromQuestDB(url, new OidcDeviceAuth.DiscoveryOptions().allowInsecureTransport(true))`.
 
 `fromQuestDB(...)` takes the identity provider endpoints from the server's unauthenticated `/settings`, so it trusts that server to designate where you sign in: a spoofed, compromised, or man-in-the-middled server could redirect the sign-in to an attacker-controlled identity provider. Only use it against a server you trust, reached over `https`. Passing an issuer hardens this: the token and device authorization endpoints are then pinned to the issuer's origin, and an endpoint outside it is rejected; the issuer itself comes from you out of band, so a tampered `/settings` cannot move it. When the server is not trusted, configure the identity provider explicitly with `OidcDeviceAuth.builder()` (optionally with `.issuer(...)`) instead of discovering it.
 
