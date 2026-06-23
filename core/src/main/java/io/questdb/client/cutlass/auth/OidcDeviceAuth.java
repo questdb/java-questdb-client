@@ -251,6 +251,21 @@ public class OidcDeviceAuth implements QuietCloseable {
                     .put("connect to QuestDB over https [url=").put(questdbUrl).put(']');
         }
 
+        // For /settings-supplied endpoints with an out-of-band issuer, require each under the issuer's PATH,
+        // not just its origin (validateEndpointOrigins): a path-based identity provider shares one origin per
+        // tenant (Keycloak issuers are https://host/realms/<realm>), so the origin check alone cannot stop a
+        // tampered /settings from steering credentials to a different realm. The issuer is supplied out of
+        // band and cannot be forged. Endpoints discovered from the identity provider below are not scoped this
+        // way - some providers (for example Azure AD) place their endpoints outside the issuer path.
+        if (issuer != null && !issuer.isEmpty()) {
+            if (tokenEndpoint != null && !isEndpointUnderIssuerPath(tokenEndpoint, issuer)) {
+                throw endpointNotUnderIssuer("token endpoint", tokenEndpoint, issuer);
+            }
+            if (deviceAuthorizationEndpoint != null && !isEndpointUnderIssuerPath(deviceAuthorizationEndpoint, issuer)) {
+                throw endpointNotUnderIssuer("device authorization endpoint", deviceAuthorizationEndpoint, issuer);
+            }
+        }
+
         // Fall back to identity provider discovery when the server omits the device authorization endpoint
         // (and/or the token endpoint). The provider's origin must be pinned out of band: the discovery
         // target is never derived from a server-supplied value, else a tampered or intercepted /settings
@@ -506,9 +521,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         // and the credential POSTs it resolves - are aimed
         String url = discoveryUrl != null ? discoveryUrl : wellKnownUrl(issuer);
         Endpoint endpoint = Endpoint.parse(url);
-        if (!allowInsecureTransport) {
-            requireSecureTransport(endpoint.isTls, "OIDC issuer / discovery url", url);
-        }
+        requireSecureIdpEndpoint(endpoint, "OIDC issuer / discovery url", url, allowInsecureTransport);
         fetchJson(endpoint, endpoint.path, tlsConfig, parser,
                 "could not reach the identity provider to discover OIDC settings",
                 "could not parse the identity provider discovery document");
@@ -574,6 +587,114 @@ public class OidcDeviceAuth implements QuietCloseable {
         return octets == 4 && digits > 0 && value <= 255;
     }
 
+    private static String[] decodePathSegments(String path) {
+        // Repeatedly percent-decode (a server or proxy may unescape more than once, so %252e%252e -> .. )
+        // and fold backslash to slash (some proxies do), then split into segments. Comparing these decoded
+        // segments, not the raw wire string, means an encoding the server later undoes cannot hide a "..".
+        String decoded = path;
+        for (int i = 0; i < 10; i++) { // bounded; a real path needs 0-1 passes
+            String next = percentDecodeOnce(decoded);
+            if (next.equals(decoded)) {
+                break;
+            }
+            decoded = next;
+        }
+        return decoded.replace('\\', '/').split("/", -1);
+    }
+
+    private static OidcAuthException endpointNotUnderIssuer(String label, String url, String issuer) {
+        return new OidcAuthException()
+                .put("the OIDC ").put(label).put(" advertised by the QuestDB /settings response (").put(url)
+                .put(") is not under the pinned issuer (").put(issuer).put("); refusing to send credentials to ")
+                .put("an endpoint outside the trusted issuer, for example a different realm on the same host; ")
+                .put("if the identity provider places its endpoints outside the issuer path, configure them ")
+                .put("explicitly with OidcDeviceAuth.builder()");
+    }
+
+    private static int hexValue(char c) {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        if (c >= 'A' && c <= 'F') {
+            return c - 'A' + 10;
+        }
+        return -1;
+    }
+
+    private static boolean isEndpointUnderIssuerPath(String endpointUrl, String issuer) {
+        // The endpoint's path must be the issuer's path or a sub-path of it, compared segment by segment (so
+        // /realms/prod does not match /realms/production). A root issuer (no path) constrains the origin only.
+        // This stops a tampered /settings from redirecting credentials to a different tenant on a path-based
+        // multi-tenant identity provider (Keycloak issuers are https://host/realms/<realm>), which the origin
+        // check alone cannot catch. Mirrors the Python client.
+        String basePath = pathOnly(issuer);
+        int baseEnd = basePath.length();
+        while (baseEnd > 0 && basePath.charAt(baseEnd - 1) == '/') {
+            baseEnd--; // trailing slashes do not add a path segment
+        }
+        if (baseEnd == 0) {
+            return true; // root issuer: origin-only, every path is under it
+        }
+        String[] baseSegs = decodePathSegments(basePath.substring(0, baseEnd));
+        String[] endpointSegs = decodePathSegments(pathOnly(endpointUrl));
+        // a "." or ".." segment is rejected outright: the server normalizes it away, so a naive prefix test
+        // would pass /realms/acme/../evil/token yet it resolves to a different realm
+        for (int i = 0; i < endpointSegs.length; i++) {
+            if (".".equals(endpointSegs[i]) || "..".equals(endpointSegs[i])) {
+                return false;
+            }
+        }
+        if (endpointSegs.length < baseSegs.length) {
+            return false;
+        }
+        for (int i = 0; i < baseSegs.length; i++) {
+            if (!baseSegs[i].equals(endpointSegs[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String pathOnly(String url) {
+        // the path component only (drop any ?query / #fragment); a ;matrix parameter stays part of the path,
+        // so a traversal hidden in it (.../token;..%2f..) is still scanned
+        String path = Endpoint.parse(url).path;
+        for (int i = 0, n = path.length(); i < n; i++) {
+            char c = path.charAt(i);
+            if (c == '?' || c == '#') {
+                return path.substring(0, i);
+            }
+        }
+        return path;
+    }
+
+    private static String percentDecodeOnce(String s) {
+        int pct = s.indexOf('%');
+        if (pct < 0) {
+            return s; // nothing encoded
+        }
+        StringSink sink = new StringSink();
+        sink.put(s, 0, pct);
+        for (int i = pct, n = s.length(); i < n; ) {
+            char c = s.charAt(i);
+            if (c == '%' && i + 2 < n) {
+                int hi = hexValue(s.charAt(i + 1));
+                int lo = hexValue(s.charAt(i + 2));
+                if (hi >= 0 && lo >= 0) {
+                    sink.put((char) ((hi << 4) | lo));
+                    i += 3;
+                    continue;
+                }
+            }
+            sink.put(c);
+            i++;
+        }
+        return sink.toString();
+    }
+
     private static boolean isLoopbackHost(String host) {
         // loopback traffic never leaves the host, so a plaintext /settings fetch to it has no network
         // interception risk; match localhost and the whole IPv4 127.0.0.0/8 block
@@ -623,6 +744,23 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (!Chars.equals("null", tag)) {
             sink.put(tag);
         }
+    }
+
+    private static void requireSecureIdpEndpoint(Endpoint endpoint, String label, String url, boolean allowInsecureTransport) {
+        // https is always fine; plaintext http is allowed only to a loopback host, where the request never
+        // leaves the machine. allowInsecureTransport relaxes the QuestDB link but never the identity
+        // provider: the device code and refresh token must not cross the network in cleartext (matching
+        // the Python client)
+        if (endpoint.isTls || isLoopbackHost(endpoint.host)) {
+            return;
+        }
+        OidcAuthException ex = new OidcAuthException()
+                .put("the ").put(label).put(" uses insecure http, which would send the device code and ")
+                .put("refresh token across the network in cleartext; use an https url");
+        if (allowInsecureTransport) {
+            ex.put(" (allowInsecureTransport relaxes only the QuestDB connection, not the identity provider endpoints)");
+        }
+        throw ex.put(" [url=").put(url).put(']');
     }
 
     private static void requireSecureTransport(boolean isTls, String label, String url) {
@@ -1067,9 +1205,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
 
         /**
-         * Permits insecure {@code http} (rather than {@code https}) for the device authorization and
-         * token endpoints. Tokens then travel in cleartext, so this is rejected by default; enable only
-         * for local development on a trusted network. Defaults to {@code false}.
+         * Opts into insecure {@code http} for the QuestDB {@code /settings} link (only meaningful via
+         * {@link #fromQuestDB}). It does <b>not</b> relax the identity provider endpoints configured here:
+         * the device authorization and token endpoints always require {@code https} unless they are
+         * loopback, so the device code and refresh token never cross the network in cleartext (matching
+         * the Python client). Defaults to {@code false}.
          */
         public Builder allowInsecureTransport(boolean allowInsecureTransport) {
             this.allowInsecureTransport = allowInsecureTransport;
@@ -1103,10 +1243,8 @@ public class OidcDeviceAuth implements QuietCloseable {
             Endpoint deviceEndpoint = Endpoint.parse(deviceAuthorizationEndpoint);
             Endpoint parsedTokenEndpoint = Endpoint.parse(tokenEndpoint);
             Endpoint issuerEndpoint = issuer != null && !issuer.isEmpty() ? Endpoint.parse(issuer) : null;
-            if (!allowInsecureTransport) {
-                requireSecureTransport(deviceEndpoint.isTls, "device authorization endpoint", deviceAuthorizationEndpoint);
-                requireSecureTransport(parsedTokenEndpoint.isTls, "token endpoint", tokenEndpoint);
-            }
+            requireSecureIdpEndpoint(deviceEndpoint, "device authorization endpoint", deviceAuthorizationEndpoint, allowInsecureTransport);
+            requireSecureIdpEndpoint(parsedTokenEndpoint, "token endpoint", tokenEndpoint, allowInsecureTransport);
             // enforce the credential-endpoint co-location / issuer pin on every construction path, not just
             // discovery, so the documented guarantee holds for the explicit builder too
             validateEndpointOrigins(parsedTokenEndpoint, deviceEndpoint, issuerEndpoint);
@@ -1153,8 +1291,11 @@ public class OidcDeviceAuth implements QuietCloseable {
          * {@code https://idp.example.com}). When set, {@link #build()} rejects a token or device
          * authorization endpoint not on this origin, so a compromised or tampered configuration cannot
          * redirect the device code and refresh token to an attacker. {@link #fromQuestDB(String, DiscoveryOptions)}
-         * sets it for you when discovering from a server. A provider hosting its endpoints on a different
-         * origin than its issuer is rejected when pinned; configure it without an issuer. Optional.
+         * sets it for you when discovering from a server, and additionally requires each endpoint advertised
+         * by {@code /settings} to be under the issuer's path (not just its origin), so a tampered
+         * {@code /settings} cannot redirect credentials to a different tenant on a path-based provider (for
+         * example a Keycloak realm path like {@code /realms/acme}). A provider hosting its endpoints on a
+         * different origin than its issuer is rejected when pinned; configure it without an issuer. Optional.
          */
         public Builder issuer(String issuer) {
             this.issuer = issuer;
@@ -1202,9 +1343,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         private ClientTlsConfiguration tlsConfig;
 
         /**
-         * Permits insecure {@code http} for both the QuestDB server and the discovered identity provider
-         * endpoints. Tokens and the device code then travel in cleartext, so this is rejected by default;
-         * enable only for local development on a trusted network. Defaults to {@code false}.
+         * Permits insecure {@code http} for the QuestDB server link only (the {@code /settings} discovery
+         * request). It does <b>not</b> relax the identity provider endpoints, which always require
+         * {@code https} unless they are loopback, so the device code and refresh token are never sent in
+         * cleartext. Enable only for local development on a trusted network. Defaults to {@code false}.
          */
         public DiscoveryOptions allowInsecureTransport(boolean allowInsecureTransport) {
             this.allowInsecureTransport = allowInsecureTransport;
@@ -1228,8 +1370,11 @@ public class OidcDeviceAuth implements QuietCloseable {
          * device authorization endpoint, it is discovered from the issuer's
          * {@code .well-known/openid-configuration} (the discovery origin comes only from this out-of-band
          * issuer, never from {@code /settings}); and it pins the token and device authorization endpoints,
-         * so any endpoint not on the issuer origin is rejected. A provider hosting its endpoints on a
-         * different origin than its issuer must be configured without an issuer. Optional.
+         * so any endpoint not on the issuer origin is rejected. When the issuer has a path, an endpoint
+         * advertised by {@code /settings} must also be under that path, so a tampered {@code /settings}
+         * cannot redirect credentials to a different tenant on a path-based provider (for example a Keycloak
+         * realm path like {@code /realms/acme}). A provider hosting its endpoints on a different origin than
+         * its issuer must be configured without an issuer. Optional.
          */
         public DiscoveryOptions issuer(String issuer) {
             this.issuer = issuer;

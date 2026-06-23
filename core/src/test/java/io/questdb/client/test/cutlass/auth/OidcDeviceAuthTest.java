@@ -1645,9 +1645,10 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testInsecureEndpointsRejectedUnlessOptedIn() throws Exception {
+    public void testIdpEndpointsRequireHttpsExceptLoopback() throws Exception {
         assertMemoryLeak(() -> {
-            // http endpoints carry tokens in cleartext; the client must refuse them unless the caller opts in
+            // a non-loopback http identity-provider endpoint carries the device code and refresh token in
+            // cleartext, so it must be refused
             try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
                     .clientId("c")
                     .deviceAuthorizationEndpoint("http://idp.example/device")
@@ -1670,7 +1671,9 @@ public class OidcDeviceAuthTest {
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains("token endpoint"));
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains("insecure http"));
             }
-            // opting in allows http, for local development
+            // allowInsecureTransport must NOT relax the identity provider endpoints (unlike the QuestDB
+            // link), matching the Python client; a non-loopback http endpoint stays rejected, and the
+            // error says so
             try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
                     .clientId("c")
                     .deviceAuthorizationEndpoint("http://idp.example/device")
@@ -1678,7 +1681,101 @@ public class OidcDeviceAuthTest {
                     .allowInsecureTransport(true)
                     .build()
             ) {
-                // accepted: http endpoints are allowed once insecure transport is opted in
+                Assert.fail("allowInsecureTransport must not relax a non-loopback http identity provider endpoint");
+            } catch (OidcAuthException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("insecure http"));
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("allowInsecureTransport relaxes only the QuestDB"));
+            }
+            // loopback http is allowed without any flag: the request never leaves the host
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("http://127.0.0.1:9999/device")
+                    .tokenEndpoint("http://127.0.0.1:9999/token")
+                    .build()
+            ) {
+                // accepted: loopback endpoints never put the device code or refresh token on the network
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testIssuerPathScopingAcceptsEndpointsUnderIssuerPath() throws Exception {
+        assertMemoryLeak(() -> {
+            // a path-based identity provider (Keycloak-style /realms/{realm}): the issuer carries a path and
+            // /settings advertises the endpoints under it, so the flow completes
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{\"config\":{"
+                            + "\"acl.oidc.enabled\":true,"
+                            + "\"acl.oidc.client.id\":\"questdb\","
+                            + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl("/realms/acme/token") + "\","
+                            + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl("/realms/acme/device") + "\""
+                            + "}}");
+                }
+                if ("/realms/acme/device".equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-REALM", null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer(server.httpUrl("/realms/acme")))) {
+                    Assert.assertEquals("ACCESS-REALM", auth.getToken());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testIssuerPathScopingRejectsEncodedTraversal() throws Exception {
+        assertMemoryLeak(() -> {
+            // the device endpoint hides a parent traversal as %2e%2e; decoding must unmask it and reject it,
+            // since the server would normalize /realms/acme/../evil to a different realm
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                return MockOidcServer.json(200, "{\"config\":{"
+                        + "\"acl.oidc.enabled\":true,"
+                        + "\"acl.oidc.client.id\":\"questdb\","
+                        + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl("/realms/acme/token") + "\","
+                        + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl("/realms/acme/%2e%2e/evil/device") + "\""
+                        + "}}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer(server.httpUrl("/realms/acme")))) {
+                    Assert.fail("expected the encoded ..-traversal device endpoint to be rejected");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("not under the pinned issuer"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testIssuerPathScopingRejectsSiblingRealm() throws Exception {
+        assertMemoryLeak(() -> {
+            // a tampered /settings advertises a token endpoint under a DIFFERENT realm on the same origin; the
+            // origin check alone would accept it, but path scoping must reject it
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                return MockOidcServer.json(200, "{\"config\":{"
+                        + "\"acl.oidc.enabled\":true,"
+                        + "\"acl.oidc.client.id\":\"questdb\","
+                        + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl("/realms/evil/token") + "\","
+                        + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl("/realms/acme/device") + "\""
+                        + "}}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer(server.httpUrl("/realms/acme")))) {
+                    Assert.fail("expected the off-path (sibling realm) token endpoint to be rejected");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("not under the pinned issuer"));
+                }
             }
         });
     }
