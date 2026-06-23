@@ -547,8 +547,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         HttpClient client = endpoint.isTls
                 ? HttpClientFactory.newTlsInstance(HTTP_CONFIG, tlsConfig)
                 : HttpClientFactory.newPlainTextInstance(HTTP_CONFIG);
-        JsonLexer lexer = new JsonLexer(JSON_LEXER_CACHE_SIZE, JSON_LEXER_MAX_VALUE_BYTES);
+        // allocate the native lexer inside the try: new JsonLexer mallocs and can throw (native OOM), and
+        // the client is already allocated, so a throw before the try is entered would skip the finally and
+        // leak the client's native buffers
+        JsonLexer lexer = null;
         try {
+            lexer = new JsonLexer(JSON_LEXER_CACHE_SIZE, JSON_LEXER_MAX_VALUE_BYTES);
             HttpClient.Request request = client.newRequest(endpoint.host, endpoint.port)
                     .GET()
                     .url(path)
