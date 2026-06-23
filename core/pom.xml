@@ -231,7 +231,7 @@
                         </executions>
                         <configuration>
                             <doclint>none</doclint>
-                            <source>1.8</source>
+                            <source>${javac.compile.source}</source>
                             <detectJavaApiLink>false</detectJavaApiLink>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
@@ -363,7 +363,7 @@
                         </executions>
                         <configuration>
                             <doclint>none</doclint>
-                            <source>1.8</source>
+                            <source>${javac.compile.source}</source>
                             <detectJavaApiLink>false</detectJavaApiLink>
                             <additionalJOptions>
                                 <additionalJOption>${compilerArg1}</additionalJOption>
