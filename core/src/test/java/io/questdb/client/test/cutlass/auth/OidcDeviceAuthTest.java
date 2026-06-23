@@ -2157,6 +2157,58 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testPollIntervalClampedTo60() throws Exception {
+        assertMemoryLeak(() -> {
+            // the identity-provider-reported poll interval is capped at 60s (matching the Python client); the
+            // clamped value is the one shown to the user and used between polls. A short-lived device code
+            // ends the flow quickly via timeout, once the interval has been captured by the prompt.
+            AtomicReference<DeviceAuthorizationChallenge> shown = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(999, 2));
+                }
+                return MockOidcServer.json(400, "{\"error\":\"authorization_pending\"}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, shown::set)) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected the device code to expire");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
+                }
+                Assert.assertEquals(60, shown.get().getIntervalSeconds());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testRateLimitedTokenEndpointBacksOffInsteadOfFailingFast() throws Exception {
+        assertMemoryLeak(() -> {
+            // HTTP 429 is a transient backoff (poll slower, keep polling), matching the Python client, not a
+            // transport error that fails fast after MAX_CONSECUTIVE_POLL_ERRORS. The token endpoint always
+            // returns 429, so the flow ends only when the short-lived device code expires - proving polling
+            // continued past the 3-error budget rather than aborting with "repeated unexpected responses".
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 4));
+                }
+                return MockOidcServer.json(429, "{}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected the device code to expire while the token endpoint kept returning 429");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("repeated unexpected responses"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testPersistentTransportFailureDuringPollingAborts() throws Exception {
         assertMemoryLeak(() -> {
             // the device endpoint works, but the (co-located) token endpoint drops the connection on every

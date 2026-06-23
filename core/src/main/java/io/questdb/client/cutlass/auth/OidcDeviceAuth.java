@@ -108,6 +108,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final String ERROR_AUTHORIZATION_PENDING = "authorization_pending";
     private static final String ERROR_SLOW_DOWN = "slow_down";
     private static final HttpClientConfiguration HTTP_CONFIG = DefaultHttpClientConfiguration.INSTANCE;
+    // a rate-limited identity provider answers 429; the token poll treats it as a transient backoff
+    private static final String HTTP_STATUS_TOO_MANY_REQUESTS = "429";
     // Token responses carry JWTs (an id token with group claims can be several KB), and a single
     // value may arrive split across HTTP fragments. The lexer stashes a split value and rejects it
     // past JSON_LEXER_MAX_VALUE_BYTES, so the limit must comfortably exceed any real token or large
@@ -123,6 +125,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     // upper bound on the token cache lifetime (the token response's expires_in), so an absurd or hostile
     // value cannot overflow the timing arithmetic or make the client trust a token for absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
+    // upper bound on the poll interval, both the initial value and the growth after a slow_down or 429, so
+    // a hostile or buggy provider cannot stall the poll loop; matches the Python client
     private static final int MAX_POLL_INTERVAL_SECONDS = 60;
     // cap bytes drained per response so a hostile/MITM'd server cannot stream an endless body and
     // wedge the thread; far above any real OIDC JSON response
@@ -967,6 +971,13 @@ public class OidcDeviceAuth implements QuietCloseable {
         // a transport failure here propagates to pollForToken, which retries a brief blip but aborts on a
         // persistent failure rather than swallowing it as a pending authorization
         postForm(tokenEndpoint, tokenParser);
+
+        // A rate-limited identity provider answers 429; RFC 8628 does not define it, but the Python client
+        // and common practice treat it as "poll slower". Back off and keep polling (like slow_down) rather
+        // than charging the transport-error budget, so transient rate limiting does not fail the sign-in.
+        if (Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus)) {
+            return POLL_SLOW_DOWN;
+        }
 
         // RFC 6749 5.2: an error response is an error even if the body also carries a token, so handle the
         // OAuth error first - a token smuggled alongside an error must never count as a grant
