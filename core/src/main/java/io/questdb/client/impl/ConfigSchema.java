@@ -215,6 +215,10 @@ public final class ConfigSchema {
             this.canonical = canonical;
         }
 
+        public String canonical() {
+            return canonical;
+        }
+
         public ObjList<String> enumValues() {
             return enumValues;
         }

@@ -56,6 +56,7 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import io.questdb.client.std.str.StringSink;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.TestOnly;
 
 import javax.security.auth.DestroyFailedException;
 import java.io.Closeable;
@@ -3606,6 +3607,47 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             v.clear();
             v.put(view.getStr(key));
             return parseSizeValue(v, key);
+        }
+
+        /**
+         * Snapshot of the WebSocket (QWP) config this builder applied, keyed by
+         * connect-string key name. Drives the per-key "honored" guard test --
+         * proves each ws/wss key read from a config string reaches the builder.
+         */
+        @TestOnly
+        public java.util.Map<String, Object> wsConfigSnapshotForTest() {
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            m.put("auto_flush_rows", autoFlushRows);
+            m.put("auto_flush_bytes", autoFlushBytes);
+            m.put("auto_flush_interval", autoFlushIntervalMillis);
+            m.put("auto_flush_disabled", autoFlushRows == AUTO_FLUSH_DISABLED);
+            m.put("max_name_len", maxNameLength);
+            m.put("transaction", transactional);
+            m.put("request_durable_ack", requestDurableAck);
+            m.put("sender_id", senderId);
+            m.put("sf_dir", sfDir);
+            m.put("sf_max_bytes", sfMaxBytes);
+            m.put("sf_max_total_bytes", sfMaxTotalBytes);
+            m.put("sf_durability", sfDurability == null ? null : sfDurability.name());
+            m.put("sf_append_deadline_millis", sfAppendDeadlineMillis);
+            m.put("close_flush_timeout_millis", closeFlushTimeoutMillis);
+            m.put("durable_ack_keepalive_interval_millis", durableAckKeepaliveIntervalMillis);
+            m.put("initial_connect_retry", initialConnectMode == null ? null : initialConnectMode.name());
+            m.put("reconnect_max_duration_millis", reconnectMaxDurationMillis);
+            m.put("reconnect_initial_backoff_millis", reconnectInitialBackoffMillis);
+            m.put("reconnect_max_backoff_millis", reconnectMaxBackoffMillis);
+            m.put("drain_orphans", drainOrphans);
+            m.put("max_background_drainers", maxBackgroundDrainers);
+            m.put("error_inbox_capacity", errorInboxCapacity);
+            m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
+            m.put("token", httpToken);
+            m.put("auth_timeout_ms", authTimeoutMillis);
+            m.put("username", username);
+            m.put("password", password);
+            m.put("tls_verify", tlsValidationMode == null ? null : tlsValidationMode.name());
+            m.put("tls_roots", trustStorePath);
+            m.put("tls_roots_password", trustStorePassword == null ? null : new String(trustStorePassword));
+            return m;
         }
 
         /**

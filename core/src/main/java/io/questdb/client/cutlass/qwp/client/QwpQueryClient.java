@@ -815,6 +815,32 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Snapshot of the egress config this client applied, keyed by connect-string
+     * key name. Drives the per-key "honored" guard test -- proves each egress key
+     * read from a config string reaches the client.
+     */
+    @TestOnly
+    public java.util.Map<String, Object> configSnapshotForTest() {
+        java.util.Map<String, Object> m = new java.util.HashMap<>();
+        m.put("target", target);
+        m.put("failover", failoverEnabled);
+        m.put("failover_max_attempts", failoverMaxAttempts);
+        m.put("failover_backoff_initial_ms", failoverInitialBackoffMs);
+        m.put("failover_backoff_max_ms", failoverMaxBackoffMs);
+        m.put("failover_max_duration_ms", failoverMaxDurationMs);
+        m.put("max_batch_rows", maxBatchRows);
+        m.put("initial_credit", initialCreditBytes);
+        m.put("buffer_pool_size", bufferPoolSize);
+        m.put("compression", compressionPreference);
+        m.put("compression_level", compressionLevel);
+        m.put("client_id", clientId);
+        m.put("zone", clientZone);
+        m.put("auth_timeout_ms", authTimeoutMs);
+        m.put("authorization_header", authorizationHeader);
+        return m;
+    }
+
+    /**
      * Returns the current compression preference: one of {@code raw} (the
      * library default, no compression), {@code zstd} (demand zstd), or
      * {@code auto} (advertise zstd and raw, let the server pick). Useful for

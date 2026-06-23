@@ -29,6 +29,7 @@ import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
 import io.questdb.client.impl.QuestDBImpl;
 import io.questdb.client.impl.Side;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.function.IntConsumer;
 import java.util.function.LongConsumer;
@@ -274,6 +275,25 @@ public final class QuestDBBuilder {
         this.senderPoolMin = size;
         this.senderPoolMax = size;
         return this;
+    }
+
+    /**
+     * Snapshot of the resolved pool config, keyed by connect-string key name.
+     * Valid after {@link #build()} has run pool-key resolution. Drives the
+     * per-key "honored" guard test.
+     */
+    @TestOnly
+    public java.util.Map<String, Object> poolConfigSnapshotForTest() {
+        java.util.Map<String, Object> m = new java.util.HashMap<>();
+        m.put("sender_pool_min", senderPoolMin);
+        m.put("sender_pool_max", senderPoolMax);
+        m.put("query_pool_min", queryPoolMin);
+        m.put("query_pool_max", queryPoolMax);
+        m.put("acquire_timeout_ms", acquireTimeoutMillis);
+        m.put("idle_timeout_ms", idleTimeoutMillis);
+        m.put("max_lifetime_ms", maxLifetimeMillis);
+        m.put("housekeeper_interval_ms", housekeeperIntervalMillis);
+        return m;
     }
 
     private static void requireWebSocketSchema(CharSequence config, String role) {
