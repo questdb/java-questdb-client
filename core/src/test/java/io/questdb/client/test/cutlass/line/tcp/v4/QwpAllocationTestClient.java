@@ -187,7 +187,7 @@ public class QwpAllocationTestClient {
                 System.out.println("Skipping table drop (--no-drop)");
             }
             runTest(protocol, host, port, totalRows, batchSize, flushBytes, flushIntervalMs,
-                    inFlightWindow, maxDatagramSize, warmupRows, reportInterval, targetThroughput);
+                    maxDatagramSize, warmupRows, reportInterval, targetThroughput);
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace(System.err);
@@ -202,7 +202,6 @@ public class QwpAllocationTestClient {
             int batchSize,
             int flushBytes,
             long flushIntervalMs,
-            int inFlightWindow,
             int maxDatagramSize
     ) {
         switch (protocol) {
@@ -330,13 +329,13 @@ public class QwpAllocationTestClient {
 
     private static void runTest(String protocol, String host, int port, int totalRows,
                                 int batchSize, int flushBytes, long flushIntervalMs,
-                                int inFlightWindow, int maxDatagramSize,
+                                int maxDatagramSize,
                                 int warmupRows, int reportInterval,
                                 int targetThroughput) throws IOException {
         System.out.println("Connecting to " + host + ":" + port + "...");
 
         try (Sender sender = createSender(protocol, host, port, batchSize, flushBytes, flushIntervalMs,
-                inFlightWindow, maxDatagramSize)) {
+                maxDatagramSize)) {
             System.out.println("Connected! Protocol: " + protocol);
             System.out.println();
 
@@ -378,7 +377,7 @@ public class QwpAllocationTestClient {
                 if (nanosPerRow > 0 && (i + 1) % paceCheckInterval == 0) {
                     long expectedElapsedNanos = (long) ((i + 1) * nanosPerRow);
                     while (System.nanoTime() - startTime < expectedElapsedNanos) {
-                        Thread.onSpinWait();
+                        io.questdb.client.std.Compat.onSpinWait();
                     }
                 }
 

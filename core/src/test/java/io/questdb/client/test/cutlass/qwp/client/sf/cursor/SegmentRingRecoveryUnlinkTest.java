@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -129,7 +129,7 @@ public class SegmentRingRecoveryUnlinkTest {
             Assert.assertTrue("setup: orphan .sfa should exist", Files.exists(orphanPath));
 
             SegmentRing recovered = SegmentRing.openExisting(tmpDir, SEGMENT_SIZE);
-            try (recovered) {
+            try (SegmentRing ignored = recovered) {
                 Assert.assertNotNull("recovery dropped the valid segment", recovered);
                 Assert.assertTrue(
                         "recovery should keep the valid segment on disk",

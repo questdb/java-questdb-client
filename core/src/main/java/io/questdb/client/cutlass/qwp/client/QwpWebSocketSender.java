@@ -67,6 +67,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -285,7 +286,7 @@ public class QwpWebSocketSender implements Sender {
         if (endpoints == null || endpoints.isEmpty()) {
             throw new IllegalArgumentException("endpoints must be non-empty");
         }
-        this.endpoints = List.copyOf(endpoints);
+        this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
         this.hostTracker = new QwpHostHealthTracker(this.endpoints.size());
         this.authorizationHeader = authorizationHeader;
         this.tlsConfig = tlsConfig;
