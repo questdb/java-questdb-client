@@ -71,6 +71,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 /**
  * QWP v1 WebSocket client sender for streaming data to QuestDB.
@@ -134,7 +135,12 @@ public class QwpWebSocketSender implements Sender {
     // enough window to preserve the trailing category distribution.
     private static final int MIN_ERROR_INBOX_CAPACITY = 16;
     private static final String WRITE_PATH = "/write/v4";
-    private final String authorizationHeader;
+    // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
+    // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
+    // so the initial connect and every reconnect re-handshake carry the current token. May be null
+    // when no auth is configured. Evaluated inside buildAndConnect's per-endpoint try, so a throwing
+    // provider (e.g. a failed silent refresh) is handled as a connect failure rather than escaping.
+    private final Supplier<String> authorizationHeaderSupplier;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
     // Auto-flush configuration
@@ -274,14 +280,14 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            String authorizationHeader
+            Supplier<String> authorizationHeaderSupplier
     ) {
         if (endpoints == null || endpoints.isEmpty()) {
             throw new IllegalArgumentException("endpoints must be non-empty");
         }
         this.endpoints = List.copyOf(endpoints);
         this.hostTracker = new QwpHostHealthTracker(this.endpoints.size());
-        this.authorizationHeader = authorizationHeader;
+        this.authorizationHeaderSupplier = authorizationHeaderSupplier;
         this.tlsConfig = tlsConfig;
         this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
         this.tableBuffers = new CharSequenceObjHashMap<>();
@@ -566,7 +572,7 @@ public class QwpWebSocketSender implements Sender {
             boolean gorillaEnabled
     ) {
         return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, authorizationHeader,
+                autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
                 requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
@@ -585,7 +591,7 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            String authorizationHeader,
+            Supplier<String> authorizationHeaderSupplier,
             boolean requestDurableAck,
             CursorSendEngine cursorEngine,
             long closeFlushTimeoutMillis,
@@ -604,7 +610,7 @@ public class QwpWebSocketSender implements Sender {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                authorizationHeader
+                authorizationHeaderSupplier
         );
         try {
             sender.requestDurableAck = requestDurableAck;
@@ -656,7 +662,7 @@ public class QwpWebSocketSender implements Sender {
         return new QwpWebSocketSender(
                 singleEndpoint(host, port), null,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                authorizationHeader
+                fixedAuthHeader(authorizationHeader)
         );
     }
 
@@ -2301,6 +2307,10 @@ public class QwpWebSocketSender implements Sender {
         return terminalError;
     }
 
+    private static Supplier<String> fixedAuthHeader(String header) {
+        return header == null ? null : () -> header;
+    }
+
     private static long maskGeoHashBits(long value, int precisionBits) {
         return precisionBits >= 64 ? value : value & ((1L << precisionBits) - 1L);
     }
@@ -2440,7 +2450,12 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpRequestDurableAck(requestDurableAck);
                 newClient.connect(ep.host, ep.port);
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
-                newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
+                // Pull the current Authorization header for this handshake. For an httpTokenProvider
+                // this re-queries the provider, so a reconnect presents a freshly refreshed token. A
+                // provider that throws here (a failed silent refresh) is caught below as a connect
+                // failure for this endpoint and retried within the reconnect budget.
+                String authHeader = authorizationHeaderSupplier == null ? null : authorizationHeaderSupplier.get();
+                newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authHeader);
             } catch (HttpClientException e) {
                 HttpClientException classified = QwpUpgradeFailures.classify(newClient, ep.host, ep.port, e);
                 newClient.close();

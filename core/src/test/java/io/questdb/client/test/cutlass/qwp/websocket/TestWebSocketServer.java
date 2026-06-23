@@ -42,8 +42,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -54,6 +56,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class TestWebSocketServer implements Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(TestWebSocketServer.class);
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    // Authorization header value captured from each well-formed upgrade request ("" when absent), in
+    // arrival order. Tests poll this to assert the token a provider supplied at each (re)handshake.
+    private final BlockingQueue<String> capturedAuthHeaders = new LinkedBlockingQueue<>();
     private final List<ClientHandler> clients = new CopyOnWriteArrayList<>();
     private final boolean emitDurableAckHeader;
     private final WebSocketServerHandler handler;
@@ -162,6 +167,14 @@ public class TestWebSocketServer implements Closeable {
      */
     public int getPort() {
         return port;
+    }
+
+    /**
+     * Authorization header value seen on the next upgrade handshake ("" if the request carried none),
+     * in arrival order. Blocks up to the timeout for a handshake to arrive; returns null on timeout.
+     */
+    public String pollAuthorizationHeader(long timeout, TimeUnit unit) throws InterruptedException {
+        return capturedAuthHeaders.poll(timeout, unit);
     }
 
     /**
@@ -433,16 +446,20 @@ public class TestWebSocketServer implements Closeable {
             }
 
             String key = null;
+            String authorization = "";
             for (String line : request.toString().split("\r\n")) {
-                if (line.toLowerCase().startsWith("sec-websocket-key:")) {
+                String lower = line.toLowerCase();
+                if (lower.startsWith("sec-websocket-key:")) {
                     key = line.substring(18).trim();
-                    break;
+                } else if (lower.startsWith("authorization:")) {
+                    authorization = line.substring("authorization:".length()).trim();
                 }
             }
 
             if (key == null) {
                 return false;
             }
+            capturedAuthHeaders.add(authorization);
 
             // Arbitrary-status reject path: tests use setRejectWithStatus
             // to drive the failover loop's terminal-vs-transient

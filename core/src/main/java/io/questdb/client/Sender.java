@@ -66,6 +66,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * Influx Line Protocol client to feed data to a remote QuestDB instance.
@@ -1380,7 +1381,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
                         : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
 
-                String wsAuthHeader = buildWebSocketAuthHeader();
+                Supplier<String> wsAuthHeader = buildWebSocketAuthHeader();
 
                 ClientTlsConfiguration wsTlsConfig = null;
                 if (tlsEnabled) {
@@ -2014,12 +2015,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * instead of a fixed {@link #httpToken(String) token} captured once, so a long-lived sender follows
          * token refreshes - e.g. an OIDC device-flow token: {@code .httpTokenProvider(auth::getTokenSilently)}.
          * <br>
-         * The provider is not called at build time: the first call happens when the first row is started,
-         * then once per flush. A lazily-signing-in provider can therefore be wired before the interactive
-         * sign-in completes, as long as a token is obtainable before the first row - otherwise that row
-         * fails. Running on the flush path, the provider must return promptly and must not block on
-         * interactive input (see {@link HttpTokenProvider}). HTTP transport only, and mutually exclusive
-         * with {@link #httpToken(String)} and {@link #httpUsernamePassword(String, String)}.
+         * The provider is not called at build time. Over HTTP the first call happens when the first row is
+         * started, then once per flush. Over WebSocket the provider is queried once per connection handshake -
+         * on the initial connect and again on every reconnect - so a refreshed token is presented each time the
+         * link is (re)established; an already-established WebSocket is not re-authenticated mid-stream. A
+         * lazily-signing-in provider can therefore be wired before the interactive sign-in completes, as long
+         * as a token is obtainable before the first connect/row - otherwise that connect or row fails. Running
+         * on the send/flush and reconnect paths, the provider must return promptly and must not block on
+         * interactive input (see {@link HttpTokenProvider}). Supported over HTTP and WebSocket transport, and
+         * mutually exclusive with {@link #httpToken(String)} and {@link #httpUsernamePassword(String, String)}.
          *
          * @param httpTokenProvider supplies the current HTTP authentication token
          * @return this instance for method chaining
@@ -2832,13 +2836,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             ports.add(effectivePort);
         }
 
-        private String buildWebSocketAuthHeader() {
+        private Supplier<String> buildWebSocketAuthHeader() {
             if (username != null && password != null) {
                 String credentials = username + ":" + password;
-                return "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+                String header = "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+                return () -> header;
             }
             if (httpToken != null) {
-                return "Bearer " + httpToken;
+                String header = "Bearer " + httpToken;
+                return () -> header;
+            }
+            if (httpTokenProvider != null) {
+                // pull a fresh token at each (re)handshake so a long-lived WebSocket follows token
+                // refreshes; reject a null/empty/blank return (forbidden by the HttpTokenProvider
+                // contract) rather than send a malformed "Bearer " header the server only 401s on
+                final HttpTokenProvider provider = httpTokenProvider;
+                return () -> {
+                    CharSequence token = provider.getToken();
+                    if (Chars.isBlank(token)) {
+                        throw new LineSenderException("token provider returned a null or empty token");
+                    }
+                    return "Bearer " + token;
+                };
             }
             return null;
         }
@@ -3548,9 +3567,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (httpToken != null && (username != null || password != null)) {
                     throw new LineSenderException("cannot use both token and username/password authentication");
-                }
-                if (httpTokenProvider != null) {
-                    throw new LineSenderException("HTTP token provider authentication is not supported for WebSocket protocol");
                 }
                 if (httpPath != null) {
                     throw new LineSenderException("HTTP path is not supported for WebSocket protocol");

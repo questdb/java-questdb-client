@@ -265,11 +265,24 @@ public class SenderBuilderErrorApiTest {
     }
 
     @Test
-    public void testHttpTokenProviderRejectedForNonHttpTransport() {
-        // the provider is an HTTP-only feature; every non-HTTP transport must reject it at build time
+    public void testHttpTokenProviderAcceptedForWebSocket() {
+        // the provider is supported over WebSocket (queried at each upgrade handshake): it must pass
+        // build-time validation and fail only on the connection itself, never with a "not supported"
+        // rejection. 127.0.0.1:1 is refused promptly, and InitialConnectMode defaults to OFF (fail fast).
+        try (Sender ignored = Sender.builder(Sender.Transport.WEBSOCKET).address("127.0.0.1:1")
+                .httpTokenProvider(() -> "dynamic").build()) {
+            Assert.fail("expected a connection failure against a dead address");
+        } catch (LineSenderException e) {
+            Assert.assertFalse(e.getMessage(), e.getMessage().contains("not supported for WebSocket"));
+        }
+    }
+
+    @Test
+    public void testHttpTokenProviderRejectedForTcpAndUdp() {
+        // TCP uses challenge-response key auth and UDP has no auth; neither carries a bearer token,
+        // so both must reject the provider at build time
         assertProviderRejected(Sender.Transport.TCP, "token provider authentication is not supported for TCP protocol");
         assertProviderRejected(Sender.Transport.UDP, "token provider authentication is not supported for UDP transport");
-        assertProviderRejected(Sender.Transport.WEBSOCKET, "token provider authentication is not supported for WebSocket protocol");
     }
 
     private static void assertProviderRejected(Sender.Transport transport, String expectedMessage) {

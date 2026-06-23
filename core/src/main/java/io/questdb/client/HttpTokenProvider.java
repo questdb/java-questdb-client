@@ -25,14 +25,16 @@
 package io.questdb.client;
 
 /**
- * Supplies an HTTP authentication token to a {@link Sender} on demand. The sender calls
- * {@link #getToken()} as it builds each request, so a provider returning a freshly refreshed token
- * - e.g. {@code OidcDeviceAuth::getTokenSilently} - keeps a long-lived sender authenticated as the
- * token rotates, without rebuilding it.
+ * Supplies an HTTP authentication token to a {@link Sender} on demand, so a provider returning a
+ * freshly refreshed token - e.g. {@code OidcDeviceAuth::getTokenSilently} - keeps a long-lived sender
+ * authenticated as the token rotates, without rebuilding it. Over HTTP the sender calls
+ * {@link #getToken()} as it builds each request; over WebSocket it calls it once per connection
+ * handshake, on the initial connect and again on every reconnect.
  * <p>
- * {@link #getToken()} runs on the sender's flush path: it must return promptly and must not block on
- * interactive input. A quick silent token refresh is fine, but it must not start an interactive
- * sign-in. An exception from {@link #getToken()} fails the current flush.
+ * {@link #getToken()} runs on the sender's flush and reconnect paths: it must return promptly and must
+ * not block on interactive input. A quick silent token refresh is fine, but it must not start an
+ * interactive sign-in. An exception from {@link #getToken()} fails the in-flight flush (HTTP) or the
+ * connection attempt (WebSocket).
  *
  * @see Sender.LineSenderBuilder#httpTokenProvider(HttpTokenProvider)
  */
