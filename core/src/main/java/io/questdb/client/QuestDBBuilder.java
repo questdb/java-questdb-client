@@ -28,7 +28,6 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
 import io.questdb.client.impl.QuestDBImpl;
-import io.questdb.client.impl.Side;
 import org.jetbrains.annotations.TestOnly;
 
 import java.util.function.IntConsumer;
@@ -102,8 +101,8 @@ public final class QuestDBBuilder {
         }
         ConfigString ingestCs = ConfigString.parse(ingestConfig);
         ConfigString queryCs = ConfigString.parse(queryConfig);
-        ConfigView ingestView = new ConfigView(ingestCs, Side.INGRESS);
-        ConfigView queryView = new ConfigView(queryCs, Side.EGRESS);
+        ConfigView ingestView = new ConfigView(ingestCs);
+        ConfigView queryView = new ConfigView(queryCs);
         // Validate both connect strings exactly as the pools will, but without
         // connecting. The ingest string runs the full Sender parse plus
         // validateParameters -- ingress value keys are registry-STRING, so only
@@ -113,8 +112,8 @@ public final class QuestDBBuilder {
         Sender.LineSenderBuilder.validateWsConfigString(ingestConfig);
         QwpQueryClient.validateConfig(queryView, "wss".equals(queryCs.schema()));
 
-        // getInt/getLong ignore the view's side, so the INGRESS/EGRESS views
-        // also serve the POOL reads.
+        // A view carries no side; getInt/getLong read any key, so the ingest
+        // and query views also serve the POOL reads.
         resolvePoolInt(senderPoolMin, "sender_pool_min", ingestView, queryView, DEFAULT_POOL_MIN, this::senderPoolMin);
         resolvePoolInt(senderPoolMax, "sender_pool_max", ingestView, queryView, DEFAULT_POOL_MAX, this::senderPoolMax);
         resolvePoolInt(queryPoolMin, "query_pool_min", ingestView, queryView, DEFAULT_POOL_MIN, this::queryPoolMin);

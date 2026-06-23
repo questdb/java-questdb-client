@@ -278,6 +278,25 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testBasicAuthEmptyPasswordRejected() {
+        // A present-but-blank password is rejected up front, matching the
+        // ingress Sender, so a shared ws/wss string fails the same way on both
+        // sides instead of building a degenerate Basic auth header.
+        assertReject(
+                "ws::addr=db:9000;username=alice;password=;",
+                "password cannot be empty nor null"
+        );
+    }
+
+    @Test
+    public void testBasicAuthEmptyUsernameRejected() {
+        assertReject(
+                "ws::addr=db:9000;username=;password=secret;",
+                "username cannot be empty nor null"
+        );
+    }
+
+    @Test
     public void testBasicAuthWithPasswordOnlyRejected() {
         assertReject(
                 "ws::addr=db:9000;password=quest;",
@@ -993,6 +1012,13 @@ public class QwpQueryClientFromConfigTest {
     @Test
     public void testTokenAcceptedAlone() {
         assertParses("ws::addr=db:9000;token=ey.payload.sig;");
+    }
+
+    @Test
+    public void testTokenEmptyRejected() {
+        // A present-but-blank token is rejected up front, matching the ingress
+        // Sender, so the client never sends an empty Bearer header.
+        assertReject("ws::addr=db:9000;token=;", "token cannot be empty nor null");
     }
 
     @Test

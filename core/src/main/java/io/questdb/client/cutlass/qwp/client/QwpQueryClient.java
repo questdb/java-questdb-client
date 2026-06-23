@@ -32,7 +32,7 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
-import io.questdb.client.impl.Side;
+import io.questdb.client.std.Chars;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Zstd;
 import org.jetbrains.annotations.TestOnly;
@@ -367,7 +367,7 @@ public class QwpQueryClient implements QuietCloseable {
             throw new IllegalArgumentException(
                     "unsupported schema [schema=" + cs.schema() + ", supported-schemas=[ws, wss]]");
         }
-        ConfigView view = new ConfigView(cs, Side.EGRESS);
+        ConfigView view = new ConfigView(cs);
         validateConfig(view, tls);
 
         List<Endpoint> parsedEndpoints = new ArrayList<>();
@@ -500,6 +500,18 @@ public class QwpQueryClient implements QuietCloseable {
         String username = view.getStr("username");
         String password = view.getStr("password");
         String token = view.getStr("token");
+        // A present-but-blank credential is rejected up front, matching the
+        // ingress Sender, so a shared ws/wss string fails the same way on both
+        // sides and the client never builds an empty Authorization header.
+        if (username != null && Chars.isBlank(username)) {
+            throw new IllegalArgumentException("username cannot be empty nor null");
+        }
+        if (password != null && Chars.isBlank(password)) {
+            throw new IllegalArgumentException("password cannot be empty nor null");
+        }
+        if (token != null && Chars.isBlank(token)) {
+            throw new IllegalArgumentException("token cannot be empty nor null");
+        }
         boolean hasBasic = username != null || password != null;
         if (hasBasic && (username == null || password == null)) {
             throw new IllegalArgumentException("both username and password must be provided together");

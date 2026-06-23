@@ -48,6 +48,22 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testConflictingIntPoolKeyAcrossSidesRejected() {
+        // Both sides carry sender_pool_max (an int pool key) with different
+        // values -> build fails via resolvePoolInt's conflict check. The long
+        // pool keys are covered by testConflictingPoolKeysAcrossSidesRejected;
+        // this guards the separate int code path.
+        try (QuestDB ignored = QuestDB.builder()
+                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=2;")
+                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;sender_pool_max=5;")
+                .build()) {
+            Assert.fail("expected conflicting pool config");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("conflicting pool config: sender_pool_max"));
+        }
+    }
+
+    @Test
     public void testConflictingPoolKeysAcrossSidesRejected() {
         // Both sides carry acquire_timeout_ms with different values -> build fails.
         try (QuestDB ignored = QuestDB.builder()
@@ -104,6 +120,18 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testMalformedEgressConfigRejectedAtBuildWithMinZero() {
+        // query_pool_min=0 pre-warms nothing, so build() never constructs a
+        // QwpQueryClient -- yet it must still reject a malformed query config up
+        // front via QwpQueryClient.validateConfig, mirroring the ingress side.
+        // Covers a typed enum (compression) and a bounded int (compression_level).
+        assertEgressBuildRejected(
+                "ws::addr=127.0.0.1:1;compression=gzip;query_pool_min=0;query_pool_max=2;", "compression");
+        assertEgressBuildRejected(
+                "ws::addr=127.0.0.1:1;compression_level=99;query_pool_min=0;query_pool_max=2;", "compression_level");
+    }
+
+    @Test
     public void testMalformedIngressConfigRejectedAtBuildWithMinZero() {
         // sender_pool_min=0 pre-warms nothing, so build() never constructs a
         // Sender -- yet it must still reject a malformed ingest config up front,
@@ -118,6 +146,20 @@ public class QuestDBBuilderTest {
                 "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;sender_pool_max=2;", "auto_flush_rows");
         assertIngressBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;sender_pool_max=2;", "auto-flush");
+    }
+
+    @Test
+    public void testMalformedPoolValueRejectedAtBuild() {
+        // A non-numeric pool value is rejected at build()'s pool-key resolution,
+        // even with min=0. sender_pool_max is read through ConfigView.getInt,
+        // whose error names the offending key.
+        try (QuestDB ignored = QuestDB.builder()
+                .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=notanumber;")
+                .build()) {
+            Assert.fail("expected build to reject the malformed pool value");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("sender_pool_max"));
+        }
     }
 
     @Test
@@ -221,6 +263,20 @@ public class QuestDBBuilderTest {
     @Test
     public void testUdpIngestConfigRejected() {
         assertSchemaRejected(() -> QuestDB.builder().queryConfig("udp::addr=h:9009;"));
+    }
+
+    private static void assertEgressBuildRejected(String query, String expectedFragment) {
+        try {
+            QuestDB.builder()
+                    .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=2;")
+                    .queryConfig(query)
+                    .build()
+                    .close();
+            Assert.fail("expected build() to reject the malformed query config: " + query);
+        } catch (RuntimeException e) {
+            Assert.assertNotNull(e.getMessage());
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedFragment));
+        }
     }
 
     private static void assertIngressBuildRejected(String ingest, String expectedFragment) {

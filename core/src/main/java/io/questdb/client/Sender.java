@@ -41,7 +41,6 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
-import io.questdb.client.impl.Side;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
 import io.questdb.client.std.Chars;
@@ -3026,9 +3025,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         httpToken(sink.toString());
                     }
                 } else if (Chars.equals("retry_timeout", sink)) {
-                    if (protocol == PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("retry_timeout is not supported for WebSocket transport; use reconnect_max_duration_millis for the per-outage reconnect budget");
-                    }
                     pos = getValue(configurationString, pos, sink, "retry_timeout");
                     int timeout = parseIntValue(sink, "retry_timeout");
                     retryTimeoutMillis(timeout);
@@ -3110,24 +3106,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         throw new LineSenderException("invalid auto_flush [value=").put(sink).put(", allowed-values=[on, off]]");
                     }
                 } else if (Chars.equals("request_timeout", sink)) {
-                    if (protocol == PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("request_timeout is not supported for WebSocket transport");
-                    }
                     pos = getValue(configurationString, pos, sink, "request_timeout");
                     int requestTimeout = parseIntValue(sink, "request_timeout");
                     httpTimeoutMillis(requestTimeout);
                 } else if (Chars.equals("request_min_throughput", sink)) {
-                    if (protocol == PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("request_min_throughput is not supported for WebSocket transport");
-                    }
                     pos = getValue(configurationString, pos, sink, "request_min_throughput");
                     int requestMinThroughput = parseIntValue(sink, "request_min_throughput");
                     minRequestThroughput(requestMinThroughput);
                 } else if (Chars.equals("protocol_version", sink)) {
                     pos = getValue(configurationString, pos, sink, "protocol_version");
-                    if (protocol == PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("protocol_version is not supported for WebSocket transport; QWP negotiates the protocol version during the WebSocket upgrade");
-                    }
                     if (!Chars.equalsIgnoreCase("auto", sink)) {
                         int protocolVersion = parseIntValue(sink, "protocol_version");
                         protocolVersion(protocolVersion);
@@ -3275,16 +3262,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "reconnect_max_backoff_millis");
                     reconnectMaxBackoffMillis(parseLongValue(sink, "reconnect_max_backoff_millis"));
                 } else if (Chars.equals("max_datagram_size", sink)) {
-                    if (protocol == PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("max_datagram_size is not supported for WebSocket transport; it applies to the UDP transport only");
-                    }
                     pos = getValue(configurationString, pos, sink, "max_datagram_size");
                     int mds = parseIntValue(sink, "max_datagram_size");
                     maxDatagramSize(mds);
                 } else if (Chars.equals("multicast_ttl", sink)) {
-                    if (protocol == PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("multicast_ttl is not supported for WebSocket transport; it applies to the UDP transport only");
-                    }
                     pos = getValue(configurationString, pos, sink, "multicast_ttl");
                     int ttl = parseIntValue(sink, "multicast_ttl");
                     multicastTtl(ttl);
@@ -3376,7 +3357,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private LineSenderBuilder fromConfigWebSocket(CharSequence configurationString) {
             try {
                 ConfigString cs = ConfigString.parse(configurationString);
-                ConfigView view = new ConfigView(cs, Side.INGRESS);
+                ConfigView view = new ConfigView(cs);
                 validateWsConfig(view, tlsEnabled);
 
                 view.getHostPorts("addr", DEFAULT_WEBSOCKET_PORT, this::appendAddress);

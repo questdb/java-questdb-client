@@ -916,6 +916,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_usernameWithoutPassword_fails() {
+        // The ingress ws path rejects a username with no password
+        // (httpUsernamePassword requires a non-blank password), matching the
+        // egress QwpQueryClient so a shared ws/wss string fails on both sides.
+        assertBadConfig("ws::addr=localhost:9000;username=alice;", "password cannot be empty nor null");
+    }
+
+    @Test
     public void testWsConfigString_withToken() throws Exception {
         assertMemoryLeak(() -> {
             Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;token=mytoken;");

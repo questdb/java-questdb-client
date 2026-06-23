@@ -25,9 +25,11 @@
 package io.questdb.client.impl;
 
 /**
- * Which consumer owns a connect-string key. A {@link ConfigView} built for a
- * given side applies keys whose side is its own or {@link #COMMON}, and ignores
- * the rest.
+ * Which consumer owns a connect-string key in the {@link ConfigSchema} registry.
+ * It records intent and drives the per-key "honored" guard tests; it is not a
+ * runtime filter. {@link ConfigView} does not gate reads by side -- each consumer
+ * reads the keys it needs, and a key owned by another consumer is accepted
+ * syntactically and validated by its owning consumer.
  */
 public enum Side {
     /**

@@ -24,10 +24,8 @@
 
 package io.questdb.client.test.impl;
 
-import io.questdb.client.impl.ConfigSchema;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
-import io.questdb.client.impl.Side;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -76,80 +74,101 @@ public class ConfigViewTest {
 
     @Test
     public void testAliasNormalization() {
-        ConfigView v = view("ws::addr=h:9000;user=alice;pass=secret;", Side.EGRESS);
+        ConfigView v = view("ws::addr=h:9000;user=alice;pass=secret;");
         Assert.assertEquals("alice", v.getStr("username"));
         Assert.assertEquals("secret", v.getStr("password"));
     }
 
     @Test
     public void testEnumMessage() {
-        assertParseError("ws::addr=h:9000;compression=gzip;", Side.EGRESS,
+        assertParseError("ws::addr=h:9000;compression=gzip;",
                 v -> v.getEnum("compression"),
                 "invalid compression: gzip (expected zstd, raw, auto)");
     }
 
     @Test
     public void testGetIntRangeBounded() {
-        assertParseError("ws::addr=h:9000;compression_level=99;", Side.EGRESS,
+        assertParseError("ws::addr=h:9000;compression_level=99;",
                 v -> v.getInt("compression_level", -1),
                 "compression_level must be in [1, 22]");
     }
 
     @Test
     public void testGetIntRangeOneSided() {
-        assertParseError("ws::addr=h:9000;buffer_pool_size=0;", Side.EGRESS,
+        assertParseError("ws::addr=h:9000;buffer_pool_size=0;",
                 v -> v.getInt("buffer_pool_size", -1),
                 "buffer_pool_size must be >= 1");
     }
 
     @Test
     public void testGetLongStrictLowerBound() {
-        assertParseError("ws::addr=h:9000;auth_timeout_ms=0;", Side.EGRESS,
+        assertParseError("ws::addr=h:9000;auth_timeout_ms=0;",
                 v -> v.getLong("auth_timeout_ms", -1),
                 "auth_timeout_ms must be > 0");
     }
 
     @Test
+    public void testGetIntNonNumericRejected() {
+        assertParseError("ws::addr=h:9000;compression_level=abc;",
+                v -> v.getInt("compression_level", -1),
+                "invalid compression_level: abc");
+    }
+
+    @Test
+    public void testGetLongNonNumericRejected() {
+        assertParseError("ws::addr=h:9000;auth_timeout_ms=abc;",
+                v -> v.getLong("auth_timeout_ms", -1),
+                "invalid auth_timeout_ms: abc");
+    }
+
+    @Test
+    public void testGetBoolOnOffInvalidRejected() {
+        assertParseError("ws::addr=h:9000;failover=maybe;",
+                v -> v.getBoolOnOff("failover", false),
+                "invalid failover: maybe (expected on, off)");
+    }
+
+    @Test
     public void testLastWriteWins() {
-        ConfigView v = view("ws::addr=h:9000;client_id=a;client_id=b;", Side.EGRESS);
+        ConfigView v = view("ws::addr=h:9000;client_id=a;client_id=b;");
         Assert.assertEquals("b", v.getStr("client_id"));
     }
 
     @Test
     public void testRepeatedTlsVerifyResolvesLastWriteWins() {
-        ConfigView v = view("wss::addr=h:9000;tls_verify=on;tls_verify=unsafe_off;", Side.EGRESS);
+        ConfigView v = view("wss::addr=h:9000;tls_verify=on;tls_verify=unsafe_off;");
         Assert.assertEquals("unsafe_off", v.getEnum("tls_verify"));
     }
 
     @Test
     public void testTokenizerSemicolonEscaping() {
         // ConfStringParser escapes ';' as ';;' inside a value.
-        ConfigView v = view("ws::addr=h:9000;client_id=a;;b;", Side.EGRESS);
+        ConfigView v = view("ws::addr=h:9000;client_id=a;;b;");
         Assert.assertEquals("a;b", v.getStr("client_id"));
     }
 
     @Test
     public void testUnknownKeyRejectedWithHint() {
-        assertParseError("ws::addr=h:9000;init_buf_size=1024;", Side.INGRESS, v -> {
+        assertParseError("ws::addr=h:9000;init_buf_size=1024;", v -> {
         }, "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
     }
 
     @Test
     public void testUnknownKeyRejectedWithoutHint() {
-        assertParseError("ws::addr=h:9000;bogus=1;", Side.INGRESS, v -> {
+        assertParseError("ws::addr=h:9000;bogus=1;", v -> {
         }, "unknown configuration key: bogus");
     }
 
     private static void assertParseError(String cfg, String expected) {
         // addr-value errors (duplicate, empty, port range) surface in
         // getHostPorts, not in the constructor's reject pass.
-        assertParseError(cfg, Side.INGRESS, v -> v.getHostPorts("addr", 9000, (h, p) -> {
+        assertParseError(cfg, v -> v.getHostPorts("addr", 9000, (h, p) -> {
         }), expected);
     }
 
-    private static void assertParseError(String cfg, Side side, java.util.function.Consumer<ConfigView> use, String expected) {
+    private static void assertParseError(String cfg, java.util.function.Consumer<ConfigView> use, String expected) {
         try {
-            ConfigView v = view(cfg, side);
+            ConfigView v = view(cfg);
             use.accept(v);
             Assert.fail("expected error containing: " + expected);
         } catch (IllegalArgumentException e) {
@@ -160,7 +179,7 @@ public class ConfigViewTest {
 
     private static List<String> hostPorts(String cfg) {
         List<String> got = new ArrayList<>();
-        view(cfg, Side.INGRESS).getHostPorts("addr", 9000, (h, p) -> got.add(h + ":" + p));
+        view(cfg).getHostPorts("addr", 9000, (h, p) -> got.add(h + ":" + p));
         return got;
     }
 
@@ -172,7 +191,7 @@ public class ConfigViewTest {
         return l;
     }
 
-    private static ConfigView view(String cfg, Side side) {
-        return new ConfigView(ConfigString.parse(cfg), side);
+    private static ConfigView view(String cfg) {
+        return new ConfigView(ConfigString.parse(cfg));
     }
 }

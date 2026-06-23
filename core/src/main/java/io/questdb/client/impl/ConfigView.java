@@ -33,16 +33,17 @@ import java.util.Map;
 
 /**
  * Layer 3 of the QWP connect-string parser: a typed, validated view over a
- * {@link ConfigString} for a given {@link ConfigSchema} and consumer
- * {@link Side}. The constructor runs the reject pass once -- any key absent
- * from the schema throws {@code unknown configuration key: <key>}, plus a
- * relocated-key hint for keys that belong to the legacy http/tcp/udp transports.
+ * {@link ConfigString} for the {@link ConfigSchema} registry. The constructor
+ * runs the reject pass once -- any key absent from the schema throws
+ * {@code unknown configuration key: <key>}, plus a relocated-key hint for keys
+ * that belong to the legacy http/tcp/udp transports.
  * <p>
  * Found keys are recorded alias-normalized ({@code user}->{@code username},
  * {@code pass}->{@code password}), so a consumer pulling the canonical name sees
- * a value written under either. Non-multi keys resolve last-write-wins. A
- * consumer reads only the keys its side owns; foreign values are accepted
- * syntactically and validated by their owning consumer.
+ * a value written under either. Non-multi keys resolve last-write-wins. The view
+ * does not filter by {@link Side}: each consumer reads the keys it needs, and a
+ * key owned by another consumer is accepted syntactically here and validated by
+ * its owning consumer.
  */
 public final class ConfigView {
 
@@ -63,10 +64,8 @@ public final class ConfigView {
 
     private final ObjList<String> normKeys = new ObjList<>();
     private final ObjList<String> normValues = new ObjList<>();
-    private final Side selfSide;
 
-    public ConfigView(ConfigString cs, Side selfSide) {
-        this.selfSide = selfSide;
+    public ConfigView(ConfigString cs) {
         for (int i = 0, n = cs.size(); i < n; i++) {
             String raw = cs.key(i);
             ConfigSchema.KeySpec spec = ConfigSchema.spec(raw);
@@ -206,10 +205,6 @@ public final class ConfigView {
             }
         }
         return false;
-    }
-
-    public Side selfSide() {
-        return selfSide;
     }
 
     private static String join(ObjList<String> values) {
