@@ -123,7 +123,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     // upper bound on the token cache lifetime (the token response's expires_in), so an absurd or hostile
     // value cannot overflow the timing arithmetic or make the client trust a token for absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
-    private static final int MAX_POLL_INTERVAL_SECONDS = 300;
+    private static final int MAX_POLL_INTERVAL_SECONDS = 60;
     // cap bytes drained per response so a hostile/MITM'd server cannot stream an endless body and
     // wedge the thread; far above any real OIDC JSON response
     private static final int MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024;

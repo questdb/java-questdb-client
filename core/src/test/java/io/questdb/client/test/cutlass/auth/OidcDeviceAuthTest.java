@@ -1446,7 +1446,9 @@ public class OidcDeviceAuthTest {
                 if (body.contains("grant_type=refresh_token")) {
                     refreshInFlight.countDown();
                     try {
-                        releaseRefresh.await(20, TimeUnit.SECONDS);
+                        if (!releaseRefresh.await(30, TimeUnit.SECONDS)) {
+                            Assert.fail("token refresh timeout expired");
+                        }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
