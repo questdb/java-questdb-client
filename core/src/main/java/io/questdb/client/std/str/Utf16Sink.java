@@ -45,29 +45,33 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
     }
 
     default void putAsPrintable(CharSequence nonPrintable) {
-        for (int i = 0, n = nonPrintable.length(); i < n; i++) {
-            char c = nonPrintable.charAt(i);
-            putAsPrintable(c);
+        // Scan by code point, not UTF-16 unit. A supplementary-plane format char (e.g. a U+E00xx language
+        // tag char) arrives as a surrogate pair whose halves report SURROGATE rather than FORMAT, and a
+        // lone surrogate likewise - per-unit scanning would pass both through raw. Judging the whole code
+        // point escapes them (matching OidcAuthException.isUnsafeForDisplay), while a normal supplementary
+        // char such as an emoji is neither control nor format and is emitted verbatim.
+        for (int i = 0, n = nonPrintable.length(); i < n; ) {
+            final int cp = Character.codePointAt(nonPrintable, i);
+            final int count = Character.charCount(cp);
+            if (isDisplaySafe(cp)) {
+                for (int j = 0; j < count; j++) {
+                    put(nonPrintable.charAt(i + j));
+                }
+            } else {
+                putUnicodeEscape(cp);
+            }
+            i += count;
         }
     }
 
     default void putAsPrintable(char c) {
-        // escape control chars (C0/C1, DEL) and Unicode format chars - bidi embeddings/overrides/isolates,
-        // LRM/RLM marks, zero-width joiners, the BOM - to a visible \\uXXXX. Left raw, attacker-influenced
-        // text (an ILP server's JSON error body, a column name) could reorder, hide or forge what a human
-        // reads in a terminal or log; escaping rather than stripping keeps it visible for diagnosis. Per
-        // UTF-16-unit scanning covers every BMP threat; a supplementary-plane char (emoji surrogate pair) is
-        // neither control nor format and passes through. Emitting all four hex digits keeps a format char
-        // above U+00FF (e.g. U+202E) correct rather than truncated to its low byte.
-        if (!Character.isISOControl(c) && Character.getType(c) != Character.FORMAT) {
+        // A single UTF-16 unit: escape control chars, Unicode format chars, and a lone surrogate (which has
+        // no displayable meaning). Supplementary-plane format chars are caught by the code-point-aware
+        // putAsPrintable(CharSequence).
+        if (isDisplaySafe(c)) {
             put(c);
         } else {
-            put('\\');
-            put('u');
-            put(hexDigits[(c >> 12) & 0xF]);
-            put(hexDigits[(c >> 8) & 0xF]);
-            put(hexDigits[(c >> 4) & 0xF]);
-            put(hexDigits[c & 0xF]);
+            putUnicodeEscape(c);
         }
     }
 
@@ -97,6 +101,36 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
     default Utf16Sink putNonAscii(long lo, long hi) {
         Utf8s.utf8ToUtf16(lo, hi, this);
         return this;
+    }
+
+    // Escapes a code point to one (BMP) or two (supplementary, as its surrogate pair) visible \\uXXXX
+    // sequences, so the escaped value still names the original char. Emitting all four hex digits keeps a
+    // char above U+00FF (e.g. U+202E) correct rather than truncated to its low byte.
+    private void putUnicodeEscape(int cp) {
+        if (cp > 0xFFFF) {
+            putUnicodeEscape(Character.highSurrogate(cp));
+            putUnicodeEscape(Character.lowSurrogate(cp));
+            return;
+        }
+        put('\\');
+        put('u');
+        put(hexDigits[(cp >> 12) & 0xF]);
+        put(hexDigits[(cp >> 8) & 0xF]);
+        put(hexDigits[(cp >> 4) & 0xF]);
+        put(hexDigits[cp & 0xF]);
+    }
+
+    // A code point is display-safe unless it is a control char (C0/C1, DEL), a Unicode format char (bidi
+    // embeddings/overrides/isolates, LRM/RLM marks, zero-width joiners, the BOM, supplementary-plane tag
+    // chars) or a surrogate (a lone half, with no displayable meaning). Left raw, attacker-influenced text -
+    // an ILP server's JSON error body, a column name - could reorder, hide or forge what a human reads in a
+    // terminal or log; escaping rather than stripping keeps it visible for diagnosis.
+    private static boolean isDisplaySafe(int cp) {
+        if (Character.isISOControl(cp)) {
+            return false;
+        }
+        final int type = Character.getType(cp);
+        return type != Character.FORMAT && type != Character.SURROGATE;
     }
 
 }

@@ -54,6 +54,37 @@ public class LineSenderExceptionTest {
     }
 
     @Test
+    public void testMessage_putAsPrintableEscapesBidiOverride() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE is a BMP format char - regression guard for the existing behavior
+        LineSenderException e = new LineSenderException("char: ").putAsPrintable("a\u202Eb");
+        assertEquals("char: a\\u202eb", e.getMessage());
+    }
+
+    @Test
+    public void testMessage_putAsPrintableEscapesLoneSurrogate() {
+        // a lone high surrogate has no displayable meaning and must be escaped, not passed through raw
+        LineSenderException e = new LineSenderException("char: ").putAsPrintable("a\uD800b");
+        assertEquals("char: a\\ud800b", e.getMessage());
+    }
+
+    @Test
+    public void testMessage_putAsPrintableEscapesSupplementaryFormatChar() {
+        // U+E0001 LANGUAGE TAG is a supplementary-plane format char: it arrives as a surrogate pair and must
+        // be escaped (as both halves), not passed through raw, or it could hide or forge text in a log
+        String tagChar = new String(Character.toChars(0xE0001));
+        LineSenderException e = new LineSenderException("char: ").putAsPrintable("a" + tagChar + "b");
+        assertEquals("char: a\\udb40\\udc01b", e.getMessage());
+    }
+
+    @Test
+    public void testMessage_putAsPrintableKeepsEmoji() {
+        // U+1F600 GRINNING FACE is a normal supplementary char (not control or format) - emitted verbatim
+        String emoji = new String(Character.toChars(0x1F600));
+        LineSenderException e = new LineSenderException("char: ").putAsPrintable("a" + emoji + "b");
+        assertEquals("char: a" + emoji + "b", e.getMessage());
+    }
+
+    @Test
     public void testMessage_withErrNo() {
         LineSenderException e = new LineSenderException("message").errno(10);
         String message = e.getMessage();

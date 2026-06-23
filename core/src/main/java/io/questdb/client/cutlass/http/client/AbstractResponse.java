@@ -65,9 +65,24 @@ public abstract class AbstractResponse implements Response, Fragment {
         if (receive) {
             dataLo = bufLo;
             dataHi = bufLo;
+            // A positive timeout bounds the whole call, not each socket read. recvOrDie can return 0
+            // without consuming the full timeout - e.g. an incomplete TLS record that decrypts to no
+            // application bytes - so without one shared deadline a server dribbling such reads would
+            // re-arm the full timeout on every iteration and keep this recv() running without bound,
+            // defeating a caller's wall-clock bound (e.g. OidcDeviceAuth.parseBody). A non-positive
+            // timeout keeps the legacy "no bound" behaviour.
+            final boolean bounded = timeout > 0;
+            final long startNanos = bounded ? System.nanoTime() : 0L;
             int len = 0;
             while (len == 0) {
-                len = recvOrDie(dataHi, bufHi, timeout);
+                int callTimeout = timeout;
+                if (bounded) {
+                    callTimeout = timeout - (int) ((System.nanoTime() - startNanos) / 1_000_000L);
+                    if (callTimeout <= 0) {
+                        throw new HttpClientException("timed out reading the response body");
+                    }
+                }
+                len = recvOrDie(dataHi, bufHi, callTimeout);
             }
             dataHi += len;
         }

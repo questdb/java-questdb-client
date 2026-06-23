@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.http.client;
 
 import io.questdb.client.cutlass.http.client.AbstractResponse;
 import io.questdb.client.cutlass.http.client.Fragment;
+import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
@@ -46,6 +47,36 @@ public class ResponseTest {
                 "abcdefghjklzxnmd0123456789"
         };
         assertResponse(expectedFragments, actualFragments);
+    }
+
+    @Test(timeout = 30_000)
+    public void testRecvHonoursTotalTimeoutWhenNoApplicationBytesArrive() {
+        // A Content-Length response whose socket reads yield no application bytes - e.g. an incomplete or
+        // empty TLS record over a hostile or MITM'd link, where JavaTlsClientSocket.recv returns 0 on
+        // BUFFER_UNDERFLOW without a disconnect - must not keep a single recv() running past its timeout.
+        // recv(timeout) bounds the whole call, not each socket read, so the while (len == 0) loop aborts
+        // once the timeout elapses. Without the bound this recv() never returns and the @Test timeout
+        // fires instead.
+        final long memSize = 64;
+        final long mem = Unsafe.malloc(memSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            final AbstractResponse rsp = new AbstractResponse(mem, mem + memSize, -1) {
+                @Override
+                protected int recvOrDie(long bufLo, long bufHi, int timeout) {
+                    Os.sleep(1); // a readability wakeup that decrypts to no application bytes
+                    return 0;
+                }
+            };
+            rsp.begin(mem, mem, 16); // content length 16, nothing received yet
+            try {
+                rsp.recv(50);
+                Assert.fail("expected recv to time out when no application bytes arrive");
+            } catch (HttpClientException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
+            }
+        } finally {
+            Unsafe.free(mem, memSize, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     @Test
