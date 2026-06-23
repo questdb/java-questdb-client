@@ -412,51 +412,60 @@ public class QwpQueryClient implements QuietCloseable {
         boolean hasBasic = username != null || password != null;
         Endpoint first = parsedEndpoints.get(0);
         QwpQueryClient client = new QwpQueryClient(first.host, first.port);
-        for (int i = 1; i < parsedEndpoints.size(); i++) {
-            client.endpoints.add(parsedEndpoints.get(i));
-        }
-        client.withTarget(target);
-        if (failover != null) {
-            client.withFailover(failover);
-        }
-        if (failoverMaxAttempts != null) {
-            client.withFailoverMaxAttempts(failoverMaxAttempts);
-        }
-        if (failoverBackoffInitialMs != null || failoverBackoffMaxMs != null) {
-            long initial = failoverBackoffInitialMs != null
-                    ? failoverBackoffInitialMs
-                    : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
-            long max = failoverBackoffMaxMs != null
-                    ? failoverBackoffMaxMs
-                    : Math.max(initial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
-            client.withFailoverBackoff(initial, max);
-        }
-        if (failoverMaxDurationMs != null) {
-            client.withFailoverMaxDuration(failoverMaxDurationMs);
-        }
-        if (authTimeoutMs != null) {
-            client.withAuthTimeout(authTimeoutMs);
-        }
-        if (initialCredit != null) {
-            client.withInitialCredit(initialCredit);
-        }
-        client.withBufferPoolSize(poolSize);
-        client.withCompression(compression, compressionLevel);
-        if (tls) {
-            if (tlsRoots != null) {
-                client.withTrustStore(tlsRoots, tlsRootsPassword.toCharArray());
-            } else if (tlsValidation != null && tlsValidation == ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE) {
-                client.withInsecureTls();
-            } else {
-                client.withTls();
+        // The constructor allocated native scratch (bindValues); close it if a
+        // setter below rejects its input so a config error cannot leak it.
+        // validateConfig above already rejects every value these setters check,
+        // so this is a safety net against future drift, not a reachable path today.
+        try {
+            for (int i = 1; i < parsedEndpoints.size(); i++) {
+                client.endpoints.add(parsedEndpoints.get(i));
             }
+            client.withTarget(target);
+            if (failover != null) {
+                client.withFailover(failover);
+            }
+            if (failoverMaxAttempts != null) {
+                client.withFailoverMaxAttempts(failoverMaxAttempts);
+            }
+            if (failoverBackoffInitialMs != null || failoverBackoffMaxMs != null) {
+                long initial = failoverBackoffInitialMs != null
+                        ? failoverBackoffInitialMs
+                        : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
+                long max = failoverBackoffMaxMs != null
+                        ? failoverBackoffMaxMs
+                        : Math.max(initial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
+                client.withFailoverBackoff(initial, max);
+            }
+            if (failoverMaxDurationMs != null) {
+                client.withFailoverMaxDuration(failoverMaxDurationMs);
+            }
+            if (authTimeoutMs != null) {
+                client.withAuthTimeout(authTimeoutMs);
+            }
+            if (initialCredit != null) {
+                client.withInitialCredit(initialCredit);
+            }
+            client.withBufferPoolSize(poolSize);
+            client.withCompression(compression, compressionLevel);
+            if (tls) {
+                if (tlsRoots != null) {
+                    client.withTrustStore(tlsRoots, tlsRootsPassword.toCharArray());
+                } else if (tlsValidation != null && tlsValidation == ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE) {
+                    client.withInsecureTls();
+                } else {
+                    client.withTls();
+                }
+            }
+            if (hasBasic) client.withBasicAuth(username, password);
+            if (token != null) client.withBearerToken(token);
+            if (cid != null) client.withClientId(cid);
+            if (maxBatchRows > 0) client.withMaxBatchRows(maxBatchRows);
+            if (zone != null) client.withZone(zone);
+            return client;
+        } catch (RuntimeException e) {
+            client.close();
+            throw e;
         }
-        if (hasBasic) client.withBasicAuth(username, password);
-        if (token != null) client.withBearerToken(token);
-        if (cid != null) client.withClientId(cid);
-        if (maxBatchRows > 0) client.withMaxBatchRows(maxBatchRows);
-        if (zone != null) client.withZone(zone);
-        return client;
     }
 
     /**
