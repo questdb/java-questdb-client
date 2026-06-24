@@ -1919,6 +1919,21 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testIssuerPathScopingRejectsSplitEncodedAndBackslashSeparators() throws Exception {
+        // hardening: an encoded path separator can hide behind a SPLIT encoding (%2%66 -> %2f -> '/') or a
+        // double encoding (%252f), and a literal backslash is folded to '/' by decodePathSegments. Each lets an
+        // extra segment masquerade as being under the issuer path while a different raw path travels on the
+        // wire, so isEndpointUnderIssuerPath must reject them. Only the path is scoped; the origin matches here.
+        String issuer = "https://idp.example.com/realms/acme";
+        // a genuine sub-path endpoint stays accepted
+        Assert.assertTrue(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/protocol/token", issuer));
+        // split, double, and literal-backslash separators all resolve to a deeper /realms/acme/evil and are rejected
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%2%66evil/token", issuer));
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%252fevil/token", issuer));
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme\\evil/token", issuer));
+    }
+
+    @Test(timeout = 30_000)
     public void testLargeSplitTokenValueParsesWithConfiguredLexerSizing() throws Exception {
         assertMemoryLeak(() -> {
             // A real id_token (a JWT with group claims) runs to several KB, and a single JSON string value
@@ -2230,9 +2245,10 @@ public class OidcDeviceAuthTest {
                 Assert.assertEquals("ACCESS-CLAMP", auth.getToken());
                 DeviceAuthorizationChallenge challenge = shown.get();
                 Assert.assertNotNull(challenge);
-                // the absurd interval/expires_in are clamped to the documented maxima
-                Assert.assertTrue("interval=" + challenge.getIntervalSeconds(), challenge.getIntervalSeconds() <= 300);
-                Assert.assertTrue("expiresIn=" + challenge.getExpiresInSeconds(), challenge.getExpiresInSeconds() <= 3600);
+                // the absurd interval/expires_in are clamped to the documented maxima: the poll interval to
+                // MAX_POLL_INTERVAL_SECONDS (60) and the device-code lifetime to MAX_DEVICE_CODE_TTL_SECONDS (1800)
+                Assert.assertEquals(60, challenge.getIntervalSeconds());
+                Assert.assertEquals(1800, challenge.getExpiresInSeconds());
             }
         });
     }
@@ -3178,6 +3194,15 @@ public class OidcDeviceAuthTest {
         Field f = OidcDeviceAuth.class.getDeclaredField("expiresAtMillis");
         f.setAccessible(true);
         return f.getLong(auth);
+    }
+
+    // isEndpointUnderIssuerPath is a private static security check (it scopes a /settings-advertised endpoint
+    // to the pinned issuer's path); the client is an open module, so reflection reaches it without widening
+    // production visibility for the test
+    private static boolean invokeIsEndpointUnderIssuerPath(String endpointUrl, String issuer) throws Exception {
+        Method m = OidcDeviceAuth.class.getDeclaredMethod("isEndpointUnderIssuerPath", String.class, String.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(null, endpointUrl, issuer);
     }
 
     // isLoopbackHost is a private static security classifier (it gates the plaintext-channel MITM pin); the

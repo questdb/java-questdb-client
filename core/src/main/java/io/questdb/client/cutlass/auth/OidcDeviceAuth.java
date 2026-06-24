@@ -89,7 +89,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link OidcAuthException} rather than polling until the device code expires. Cancellation is seen
  * between polls (within ~100ms while waiting out an interval); a poll already in flight is not
  * interrupted, so the abort - and {@link #close()} - can take up to one HTTP request timeout (see
- * {@link Builder#httpTimeoutMillis(int)}), still far short of the device-code lifetime.
+ * {@link Builder#httpTimeoutMillis(int)}), still far short of the device-code lifetime (a
+ * {@link DeviceCodePrompt} that blocks in {@code promptUser}, such as the default browser launch, can
+ * extend that wait by however long it runs).
  * <p>
  * Instances are interactive and hold a network connection; close them when done. Token state is
  * in-memory only and does not survive a process restart.
@@ -380,8 +382,12 @@ public class OidcDeviceAuth implements QuietCloseable {
      * between polls (within ~100ms while waiting out a poll interval); a poll request already in flight
      * is not interrupted, so {@code close()} acquires the lock - and returns - only once that request
      * finishes or times out, i.e. after at most one HTTP request timeout
-     * (see {@link Builder#httpTimeoutMillis(int)}), not the full device-code lifetime. Idempotent. After
-     * close, {@link #getToken()} and {@link #clearCache()} throw.
+     * (see {@link Builder#httpTimeoutMillis(int)}), not the full device-code lifetime. The exception is a
+     * {@link DeviceCodePrompt} that blocks in {@code promptUser} - for example the default
+     * {@link DeviceCodePrompt#openBrowser()} prompt while it hands the verification URL to the OS browser,
+     * which is not bounded by the HTTP timeout: the flow holds the lock across that one-off prompt, so a
+     * racing {@code close()} waits it out too. Idempotent. After close, {@link #getToken()} and
+     * {@link #clearCache()} throw.
      */
     @Override
     public void close() {
@@ -574,6 +580,37 @@ public class OidcDeviceAuth implements QuietCloseable {
                 .put("explicitly with OidcDeviceAuth.builder()");
     }
 
+    private static boolean endpointPathHasEncodedSeparator(String rawEndpointPath) {
+        // Scan for a literal backslash (decodePathSegments folds it to '/') or a percent-encoded path
+        // separator - %2f ('/'), %5c ('\'), or an encoded percent %25 that gates a split or double encoding
+        // such as %2%66 or %252f - at every decode level, not just the raw string. A separator that only
+        // emerges after the server unescapes more than once would pass a single-pass scan yet split one
+        // segment in two, letting .../realms/acme%2%66evil/token slip the issuer-path scope. A real OIDC
+        // endpoint path encodes none of these. Bounded like decodePathSegments; a real path needs 0-1 passes.
+        String decoded = rawEndpointPath;
+        for (int pass = 0; pass < 10; pass++) {
+            for (int i = 0, n = decoded.length(); i < n; i++) {
+                char c = decoded.charAt(i);
+                if (c == '\\') {
+                    return true;
+                }
+                if (c == '%' && i + 2 < n) {
+                    char a = decoded.charAt(i + 1);
+                    char b = decoded.charAt(i + 2);
+                    if ((a == '2' && (b == 'f' || b == 'F' || b == '5')) || (a == '5' && (b == 'c' || b == 'C'))) {
+                        return true;
+                    }
+                }
+            }
+            String next = percentDecodeOnce(decoded);
+            if (next.equals(decoded)) {
+                break;
+            }
+            decoded = next;
+        }
+        return false;
+    }
+
     private static void fetchJson(Endpoint endpoint, String path, ClientTlsConfiguration tlsConfig, JsonParser parser, String reachError, String parseError) {
         HttpClient client = endpoint.isTls
                 ? HttpClientFactory.newTlsInstance(HTTP_CONFIG, tlsConfig)
@@ -661,18 +698,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
         String[] baseSegs = decodePathSegments(basePath.substring(0, baseEnd));
         String rawEndpointPath = pathOnly(endpointUrl);
-        // reject a percent-encoded path separator - %2f ('/'), %5c ('\'), or a double-encoded form flagged by
-        // an encoded percent %25 (e.g. %252f). decodePathSegments resolves it before the segment comparison,
-        // so it would split one path segment in two and could let .../realms/acme%2fevil/token slip the
-        // issuer-path scope. A real OIDC endpoint path never encodes a separator.
-        for (int i = 0, n = rawEndpointPath.length() - 2; i < n; i++) {
-            if (rawEndpointPath.charAt(i) == '%') {
-                char a = rawEndpointPath.charAt(i + 1);
-                char b = rawEndpointPath.charAt(i + 2);
-                if ((a == '2' && (b == 'f' || b == 'F' || b == '5')) || (a == '5' && (b == 'c' || b == 'C'))) {
-                    return false;
-                }
-            }
+        // A real OIDC endpoint path never encodes a path separator or uses a backslash; reject either before
+        // the segment comparison, since decodePathSegments resolves them and would split one path segment in
+        // two, letting .../realms/acme%2fevil/token (or its split/backslash forms) slip the issuer-path scope.
+        if (endpointPathHasEncodedSeparator(rawEndpointPath)) {
+            return false;
         }
         String[] endpointSegs = decodePathSegments(rawEndpointPath);
         // a "." or ".." segment is rejected outright: the server normalizes it away, so a naive prefix test

@@ -60,11 +60,11 @@ public class JsonLexer implements Mutable, Closeable {
     private long cache;
     private int cacheCapacity;
     private int cacheSize = 0;
+    private boolean hasEscape = false;
     private boolean ignoreNext = false;
     private int objDepth = 0;
     private int position = 0;
     private boolean quoted = false;
-    private boolean hasEscape = false;
     private int state = S_START;
     private boolean useCache = false;
 
