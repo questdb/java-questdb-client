@@ -837,7 +837,9 @@ public abstract class AbstractLineHttpSender implements Sender {
             chunkedResponseToSink(response, sink);
             LineSenderException ex = new LineSenderException("Could not flush buffer: HTTP endpoint authentication error", retryable);
             if (sink.length() > 0) {
-                ex = ex.put(": ").put(sink);
+                // sanitize the raw server body before it reaches the exception message (and any log/terminal):
+                // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
+                ex = ex.put(": ").putAsPrintable(sink);
             }
             ex.put(" [http-status=").put(statusAscii).put(']');
             client.disconnect();
@@ -855,11 +857,14 @@ public abstract class AbstractLineHttpSender implements Sender {
         }
         // ok, no JSON, let's do something more generic
         sink.clear();
-        sink.put("Could not flush buffer: ");
         chunkedResponseToSink(response, sink);
-        sink.put(" [http-status=").put(statusCode).put(']');
+        // sanitize the raw server body before it reaches the exception message (and any log/terminal):
+        // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
+        LineSenderException ex = new LineSenderException("Could not flush buffer: ", retryable)
+                .putAsPrintable(sink)
+                .put(" [http-status=").put(statusCode.asAsciiCharSequence()).put(']');
         client.disconnect();
-        throw new LineSenderException(sink, retryable);
+        throw ex;
     }
 
     private void validateNotClosed() {
@@ -1067,7 +1072,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                     while ((fragment = chunkedRsp.recv()) != null) {
                         jsonSink.putNonAscii(fragment.lo(), fragment.hi());
                     }
-                    exception.put(jsonSink).put(" [http-status=").put(httpStatus.asAsciiCharSequence()).put(']');
+                    // sanitize the raw server body before it reaches the exception message (and any log/terminal):
+                    // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
+                    exception.putAsPrintable(jsonSink).put(" [http-status=").put(httpStatus.asAsciiCharSequence()).put(']');
                     reset();
                     return exception;
                 }

@@ -33,14 +33,55 @@ import org.junit.Test;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
- * Verifies that the JSON error body a QuestDB HTTP endpoint returns on a failed flush is rendered
- * safely into the {@link LineSenderException} message. The JSON lexer resolves string escapes, so a
- * {@code message} or {@code errorId} field arrives fully decoded; a hostile or proxied endpoint could
- * otherwise smuggle real control characters or ANSI escapes that forge a log line or rewrite a
- * terminal when the exception text is printed. The sender must escape them, just as it does for column
- * names in an error message.
+ * Verifies that the error body a QuestDB HTTP endpoint returns on a failed flush is rendered safely
+ * into the {@link LineSenderException} message. A JSON error body has its string escapes resolved by the
+ * lexer, so a {@code message} or {@code errorId} field arrives fully decoded; an auth (401/403) body, a
+ * non-JSON body, and a body that fails to parse as JSON are echoed verbatim. In every case a hostile or
+ * proxied endpoint could otherwise smuggle real control characters, ANSI escapes or bidi overrides that
+ * forge a log line or rewrite a terminal when the exception text is printed. The sender must escape them,
+ * just as it does for column names in an error message.
+ * <p>
+ * The dangerous bytes are built at runtime via {@code (char) 0x1b} (ESC) and {@code (char) 0x202e} (a
+ * right-to-left override), so this source file stays pure ASCII and carries none of the chars it guards.
  */
 public class LineHttpSenderErrorResponseTest {
+
+    // ESC: the lead byte of an ANSI escape sequence (terminal hijack)
+    private static final char ESC = 0x1b;
+    // U+202E RIGHT-TO-LEFT OVERRIDE: reorders displayed text (visual spoofing)
+    private static final char RLO = 0x202e;
+
+    @Test(timeout = 30_000)
+    public void testServerAuthErrorBodyControlAndBidiAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // a 401/403 body is echoed into the exception verbatim (read as raw bytes, not through the JSON
+            // parser), so a hostile or proxied endpoint could splice raw control, ANSI or bidi chars straight
+            // into the LineSenderException; the sender must escape them just like the JSON-field path
+            String errorBody = "denied " + ESC + "[2J forged\n" + RLO + "moc.live";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(401, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's auth error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("authentication error"));
+                        Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("denied"));
+                        Assert.assertTrue("the ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                        Assert.assertTrue("the bidi override must be escaped: " + msg, msg.contains("\\u202e"));
+                        Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
+                        Assert.assertFalse("a raw newline must not leak: " + msg, msg.indexOf('\n') >= 0);
+                        Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                    }
+                }
+            }
+        });
+    }
 
     @Test(timeout = 30_000)
     public void testServerJsonErrorBidiAndZeroWidthAreEscaped() throws Exception {
@@ -117,8 +158,80 @@ public class LineHttpSenderErrorResponseTest {
                         // ...but no raw control byte reaches the message: no ESC (ANSI injection) and no
                         // newline (log-line forging); both arrive escaped instead
                         Assert.assertTrue("the decoded ESC must be escaped, not raw: " + msg, msg.contains("\\u001b"));
-                        Assert.assertFalse("a raw ESC must not leak into the message: " + msg, msg.indexOf('\u001b') >= 0);
+                        Assert.assertFalse("a raw ESC must not leak into the message: " + msg, msg.indexOf(0x1b) >= 0);
                         Assert.assertFalse("a raw newline must not leak into the message: " + msg, msg.indexOf('\n') >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerMalformedJsonErrorBodyControlAndBidiAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // a body sent as application/json but not parseable as a QuestDB error object (a proxy/WAF page,
+            // or an unexpected first key) makes the JSON parser throw; the fallback renders the raw body, which
+            // must still be escaped. The unexpected first key "forged" forces the parse failure; the ESC and
+            // bidi override ride in the value and must surface escaped, not raw
+            String errorBody = "{\"forged\":\"x " + ESC + "[2J y " + RLO + " z\"}";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the malformed server response to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("Could not flush buffer"));
+                        // the raw body is shown (so the user can diagnose the unexpected response)...
+                        Assert.assertTrue("the raw body must be preserved: " + msg, msg.contains("forged"));
+                        // ...but the smuggled control and bidi chars arrive escaped, never raw
+                        Assert.assertTrue("the ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                        Assert.assertTrue("the bidi override must be escaped: " + msg, msg.contains("\\u202e"));
+                        Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
+                        Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerNonJsonErrorBodyControlCharsAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // a proxy or WAF can return a non-JSON error body (here text/plain) with raw ANSI/control bytes;
+            // it reaches the generic error path, which must escape them before they hit a log or terminal.
+            // The body is all ASCII (a real ESC and a newline) so it survives the raw response writer's
+            // US-ASCII encoding; bidi is covered by the auth/malformed cases above
+            String body = "upstream down " + ESC + "[31m forged\nsecond line";
+            // hand-craft a chunked text/plain response: the generic path only reads the body when chunked, and
+            // a non-application/json content type keeps it off the JSON parser
+            String rawResponse = "HTTP/1.1 400 Bad Request\r\n"
+                    + "Content-Type: text/plain\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n"
+                    + Integer.toHexString(body.length()) + "\r\n" + body + "\r\n"
+                    + "0\r\n\r\n";
+            try (MockOidcServer server = new MockOidcServer((method, path, b) -> MockOidcServer.raw(rawResponse))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's non-JSON error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("Could not flush buffer"));
+                        Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("upstream down"));
+                        Assert.assertTrue("the ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                        Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
+                        Assert.assertFalse("a raw newline must not leak: " + msg, msg.indexOf('\n') >= 0);
                     }
                 }
             }
