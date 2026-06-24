@@ -156,18 +156,8 @@ public class QwpConfigKeysTest {
     }
 
     private static String sampleValue(ConfigSchema.KeySpec spec) {
-        switch (spec.type()) {
-            case INT:
-            case LONG:
-                return "1";
-            case BOOL_ON_OFF:
-                return "on";
-            case ENUM:
-                return spec.enumValues().getQuick(0);
-            case HOST_PORT_LIST:
-                return "h2:9001";
-            default:
-                return "x";
-        }
+        // The reject pass keys off the name, not the value, so any value proves
+        // recognition; a valid enum member keeps the sample honest for enum keys.
+        return spec.enumValues() != null ? spec.enumValues().getQuick(0) : "1";
     }
 }

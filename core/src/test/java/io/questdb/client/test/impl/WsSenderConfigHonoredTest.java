@@ -103,8 +103,10 @@ public class WsSenderConfigHonoredTest {
             if (!spec.name().equals(spec.canonical())) {
                 continue; // alias (user/pass) -- covered via its canonical key
             }
+            // INGRESS keys plus the COMMON keys the sender applies; addr is the
+            // endpoint list (the connection target), not an applied config value.
             boolean ingressApplied = spec.side() == Side.INGRESS
-                    || (spec.side() == Side.COMMON && spec.type() != ConfigSchema.ValueType.HOST_PORT_LIST);
+                    || (spec.side() == Side.COMMON && !spec.name().equals("addr"));
             if (ingressApplied) {
                 Assert.assertTrue("registry ingress key '" + spec.name() + "' has no honored case",
                         COVERED.contains(spec.name()));

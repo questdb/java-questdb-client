@@ -103,10 +103,10 @@ public class QwpQueryClientConfigHonoredTest {
                 continue; // alias (user/pass) -- covered via its canonical key
             }
             // The egress client applies its own EGRESS keys plus the COMMON keys
-            // (credentials, TLS, auth_timeout_ms). addr is the HOST_PORT_LIST
-            // endpoint list, not a snapshot value, so it is excluded.
+            // (credentials, TLS, auth_timeout_ms). addr is the endpoint list (the
+            // connection target), not a snapshot value, so it is excluded.
             boolean egressApplied = spec.side() == Side.EGRESS
-                    || (spec.side() == Side.COMMON && spec.type() != ConfigSchema.ValueType.HOST_PORT_LIST);
+                    || (spec.side() == Side.COMMON && !spec.name().equals("addr"));
             if (egressApplied) {
                 Assert.assertTrue("registry egress key '" + spec.name() + "' has no honored case",
                         COVERED.contains(spec.name()));
