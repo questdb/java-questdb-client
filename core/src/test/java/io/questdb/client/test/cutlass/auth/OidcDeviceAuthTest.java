@@ -2167,6 +2167,43 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testPollAbortDropsDirtyConnectionAndReconnects() throws Exception {
+        assertMemoryLeak(() -> {
+            // the token endpoint stalls the body on the first poll, so the bounded read aborts with the
+            // response half-read and unconsumed bytes left in the cached keep-alive connection. The poll loop
+            // must drop that connection and reconnect for the next poll, not reuse it: the stalled mock thread
+            // never reads a reused connection, so reusing it would leave every later poll unanswered until the
+            // device code expires (and, for a non-stalled dirty connection, would mis-frame the next response
+            // against this one's leftovers). With the reconnect, the second poll reaches a fresh connection and
+            // succeeds. Without the fix this test hangs until the 10s device-code lifetime and getToken throws.
+            AtomicInteger tokenCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    // short lifetime, well under the 30s mock stall and the 30s test timeout, so the no-fix
+                    // failure (poll the dirty connection until expiry) surfaces deterministically and fast
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 10));
+                }
+                if (tokenCalls.getAndIncrement() == 0) {
+                    return MockOidcServer.stall();
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-RECONNECTED", null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                         .clientId("questdb")
+                         .deviceAuthorizationEndpoint(server.httpUrl(DEVICE_PATH))
+                         .tokenEndpoint(server.httpUrl(TOKEN_PATH))
+                         .httpTimeoutMillis(1_000) // abort the stalled body read quickly
+                         .allowInsecureTransport(true)
+                         .prompt(noopPrompt())
+                         .build()) {
+                Assert.assertEquals("ACCESS-RECONNECTED", auth.getToken());
+                Assert.assertEquals(2, tokenCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testPollIntervalClampedTo60() throws Exception {
         assertMemoryLeak(() -> {
             // the identity-provider-reported poll interval is capped at 60s (matching the Python client); the

@@ -519,28 +519,31 @@ public class OidcDeviceAuth implements QuietCloseable {
         return new ClientTlsConfiguration(null, null, ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL);
     }
 
-    private static void discardBody(Response body, int timeoutMillis) {
+    private static boolean discardBody(Response body, int timeoutMillis) {
         // best-effort drain after a parse failure to keep the keep-alive connection usable; bounded like
-        // parseBody so a hostile server cannot wedge the thread here either
+        // parseBody so a hostile server cannot wedge the thread here either. Returns true only when the body
+        // was fully drained (so the connection can be reused); returns false when the drain stopped early -
+        // on the deadline, the byte cap, or a transport error - leaving unconsumed bytes, so the caller must
+        // drop the connection rather than parse this response's leftovers on the next request.
         final long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
         long totalBytes = 0;
         try {
             while (true) {
                 final long remainingNanos = deadlineNanos - System.nanoTime();
                 if (remainingNanos <= 0) {
-                    return;
+                    return false;
                 }
                 Fragment fragment = body.recv((int) Math.max(1, Math.min(remainingNanos / 1_000_000L, Integer.MAX_VALUE)));
                 if (fragment == null) {
-                    return;
+                    return true;
                 }
                 totalBytes += fragment.hi() - fragment.lo();
                 if (totalBytes > MAX_RESPONSE_BODY_BYTES) {
-                    return;
+                    return false;
                 }
             }
         } catch (HttpClientException ignore) {
-            // the connection is re-established on the next request if it is now unusable
+            return false;
         }
     }
 
@@ -1038,12 +1041,23 @@ public class OidcDeviceAuth implements QuietCloseable {
                 .header("User-Agent", USER_AGENT);
         request.withContent();
         request.putAscii(formSink);
-        HttpClient.ResponseHeaders response = request.send(httpTimeoutMillis);
-        response.await(httpTimeoutMillis);
-        readResponse(response, parser);
+        try {
+            HttpClient.ResponseHeaders response = request.send(httpTimeoutMillis);
+            response.await(httpTimeoutMillis);
+            readResponse(client, response, parser);
+        } catch (HttpClientException e) {
+            // a transport failure, or a bounded-read abort in parseBody (its wall-clock deadline or the
+            // MAX_RESPONSE_BODY_BYTES cap), leaves the response half-read with unconsumed bytes in this
+            // cached keep-alive connection. Drop it so the next poll or refresh reconnects with a clean
+            // socket instead of parsing the previous response's leftovers - which pollForToken would
+            // otherwise keep doing, on a corrupted connection, until the device code expires. Mirrors the
+            // disconnect-on-failure handling in AbstractLineHttpSender.flush0.
+            client.disconnect();
+            throw e;
+        }
     }
 
-    private void readResponse(HttpClient.ResponseHeaders response, JsonParser parser) {
+    private void readResponse(HttpClient client, HttpClient.ResponseHeaders response, JsonParser parser) {
         // capture only the HTTP status for diagnostics; the body is never retained or surfaced in a
         // message - it carries access, id and refresh tokens that must not reach logs or exceptions
         responseStatus.clear();
@@ -1054,12 +1068,16 @@ public class OidcDeviceAuth implements QuietCloseable {
             // token verbatim apart from SP/CR/LF, so a non-digit byte means a malformed or hostile status
             // line. Reject it rather than echo any byte (which could smuggle ESC or other control sequences
             // into a log or terminal when responseStatus is surfaced in a message below) or trust its
-            // leading digit as a success gate. Drain the body first to keep the keep-alive connection usable.
+            // leading digit as a success gate. Drain the body first to keep the keep-alive connection usable;
+            // if it could not be fully drained, drop the connection so the next request does not read this
+            // body's leftovers.
             CharSequence raw = statusCode.asAsciiCharSequence();
             for (int i = 0, n = raw.length(); i < n; i++) {
                 char c = raw.charAt(i);
                 if (c < '0' || c > '9') {
-                    discardBody(body, httpTimeoutMillis);
+                    if (!discardBody(body, httpTimeoutMillis)) {
+                        client.disconnect();
+                    }
                     throw new OidcAuthException("the identity provider returned a malformed HTTP status code");
                 }
                 responseStatus.put(c);
@@ -1070,8 +1088,11 @@ public class OidcDeviceAuth implements QuietCloseable {
             parseBody(body, jsonLexer, parser, httpTimeoutMillis);
         } catch (JsonException e) {
             // drain the rest to keep the keep-alive connection usable; never embed the body, it may carry
-            // tokens
-            discardBody(body, httpTimeoutMillis);
+            // tokens. A body too large to drain within the cap (e.g. a multi-MB malformed response) leaves
+            // unconsumed bytes, so drop the connection rather than mis-frame the next request's response.
+            if (!discardBody(body, httpTimeoutMillis)) {
+                client.disconnect();
+            }
             throw new OidcAuthException(e)
                     .put("could not parse the identity provider response [httpStatus=").put(responseStatus).put(']');
         }
