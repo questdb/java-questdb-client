@@ -105,21 +105,33 @@ public final class QueryWorker {
         } finally {
             signalLock.unlock();
         }
-        // If a query is in flight on this worker, ask the client to abort so
-        // execute() returns promptly and the thread can exit before join times
-        // out. cancel() is documented as thread-safe and is a no-op when idle.
         try {
-            client.cancel();
-        } catch (RuntimeException ignored) {
-        }
-        try {
-            thread.join(SHUTDOWN_JOIN_MILLIS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        try {
-            client.close();
-        } catch (RuntimeException ignored) {
+            // If a query is in flight on this worker, ask the client to abort so
+            // execute() returns promptly and the thread can exit before join
+            // times out. cancel() is documented as thread-safe and is a no-op
+            // when idle.
+            try {
+                client.cancel();
+            } catch (Throwable ignored) {
+                // Best-effort. Catch Throwable, not just RuntimeException: an
+                // Error (e.g. an -ea AssertionError) thrown here must not skip
+                // the join() below or the close() in finally, which would leak
+                // the worker thread and the client's native socket/buffers.
+            }
+            try {
+                thread.join(SHUTDOWN_JOIN_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            // close() must run even if cancel()/join() threw, otherwise the
+            // client's native buffer pool and socket leak for the lifetime of
+            // the process. Catch Throwable so shutdown() itself never propagates
+            // a teardown Error to its callers.
+            try {
+                client.close();
+            } catch (Throwable ignored) {
+            }
         }
     }
 

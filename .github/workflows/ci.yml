@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # JDK 8 is the source of truth: the client ships as a Java 8 artifact
+  # (io.questdb:questdb-client) and is released from JDK 8, so on JDK 8 it must
+  # compile, the full test suite must pass against the committed native
+  # libraries, and the javadoc jar must build (-P javadoc attaches it at the
+  # package phase). The committed native .so/.dylib/.dll are enough -- the only
+  # git submodule (zstd) is needed solely for C++ native rebuilds, not here.
+  build-jdk8:
+    name: Build, test & javadoc (JDK 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+          cache: maven
+
+      - name: Compile, test, and build javadoc
+        run: mvn -B -ntp -P javadoc clean install
+
+  # The client is also consumed as a submodule of the main questdb repo, which
+  # builds on JDK 25. Guard against JDK 25 compile breakage (main + test
+  # sources, both modules) and confirm the javadoc jar builds on JDK 25 too
+  # (-P javadoc attaches it at the package phase). Do NOT run the tests -- the
+  # parent repo runs them against a real server.
+  compile-jdk25:
+    name: Compile & javadoc smoke (JDK 25)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Compile (main + test) and build javadoc (no tests run)
+        run: mvn -B -ntp -P javadoc -DskipTests clean package

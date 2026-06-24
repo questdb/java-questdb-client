@@ -172,10 +172,21 @@ public final class TestUtils {
         return ((ip >> 24) & 0xff) + "." + ((ip >> 16) & 0xff) + "." + ((ip >> 8) & 0xff) + "." + (ip & 0xff);
     }
 
+    /**
+     * Java 8 stand-in for {@code String.repeat(int)} (added in Java 11).
+     */
+    public static String repeat(CharSequence s, int count) {
+        StringBuilder sb = new StringBuilder(s.length() * Math.max(0, count));
+        for (int i = 0; i < count; i++) {
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
     // Useful for debugging
     @SuppressWarnings("unused")
     public static String reverseBeHex(String hex) {
-        var sb = new char[hex.length()];
+        char[] sb = new char[hex.length()];
         for (int i = 0; i < hex.length(); i += 2) {
             sb[hex.length() - i - 1] = hex.charAt(i + 1);
             sb[hex.length() - i - 2] = hex.charAt(i);

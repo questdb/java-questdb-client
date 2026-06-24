@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -144,7 +145,7 @@ public class CloseTerminalConflationTest {
             if (System.nanoTime() > deadlineNanos) {
                 throw new AssertionError("I/O thread did not latch a terminal within 10s");
             }
-            Thread.onSpinWait();
+            io.questdb.client.std.Compat.onSpinWait();
         }
     }
 
@@ -206,7 +207,7 @@ public class CloseTerminalConflationTest {
         }
 
         @Override
-        public void onError(SenderError err) {
+        public void onError(@NotNull SenderError err) {
             if (ref.compareAndSet(null, err)) {
                 latch.countDown();
             }

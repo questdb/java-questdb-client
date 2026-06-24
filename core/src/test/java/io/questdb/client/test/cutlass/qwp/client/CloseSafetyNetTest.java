@@ -30,6 +30,7 @@ import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -61,7 +62,7 @@ public class CloseSafetyNetTest {
     public final TemporaryFolder sfDir = TemporaryFolder.builder().assureDeletion().build();
 
     @Test(timeout = 30_000)
-    public void testCloseRethrowsUnsurfacedTerminalWithoutCustomHandler() throws Exception {
+    public void testCloseRethrowsUnsurfacedTerminalWithoutCustomHandler() {
         // No server, no handler, tight reconnect budget: the I/O thread
         // latches a never-connected budget-exhaustion terminal that nothing
         // has surfaced to the user. close() must throw it.
@@ -115,7 +116,7 @@ public class CloseSafetyNetTest {
             if (System.nanoTime() > deadlineNanos) {
                 throw new AssertionError("I/O thread did not latch a terminal within 10s");
             }
-            Thread.onSpinWait();
+            io.questdb.client.std.Compat.onSpinWait();
         }
     }
 
@@ -142,7 +143,7 @@ public class CloseSafetyNetTest {
         }
 
         @Override
-        public void onError(SenderError err) {
+        public void onError(@NotNull SenderError err) {
             if (ref.compareAndSet(null, err)) {
                 latch.countDown();
             }

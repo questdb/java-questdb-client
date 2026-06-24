@@ -812,7 +812,7 @@ public class Decimal64 implements Sinkable, Decimal {
         if (isNull()) {
             return "";
         }
-        var sink = new StringSink();
+        StringSink sink = new StringSink();
         toSink(sink);
         return sink.toString();
     }
