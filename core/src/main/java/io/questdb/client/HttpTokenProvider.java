@@ -24,6 +24,9 @@
 
 package io.questdb.client;
 
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.std.Chars;
+
 /**
  * Supplies an HTTP authentication token to a {@link Sender} on demand, so a provider returning a
  * freshly refreshed token - e.g. {@code OidcDeviceAuth::getTokenSilently} - keeps a long-lived sender
@@ -41,8 +44,35 @@ package io.questdb.client;
 @FunctionalInterface
 public interface HttpTokenProvider {
     /**
+     * Validates a token returned by {@link #getToken()} before the sender writes it into an
+     * {@code Authorization: Bearer} header. Rejects a null, empty or blank token, and any token
+     * carrying a control or non-ASCII character (outside {@code 0x20}-{@code 0x7e}): a real bearer
+     * token is printable ASCII, so a stray CR/LF (which would inject into the HTTP request line) or a
+     * non-ASCII byte (silently truncated to one byte by the ASCII header writer, yielding a corrupt
+     * credential the server only answers with 401) is refused rather than sent. The token itself is
+     * never placed in the exception message - it is the secret this guards.
+     *
+     * @param token the token returned by a provider
+     * @throws LineSenderException if the token is null, empty, blank, or carries a control or
+     *                             non-ASCII character
+     */
+    static void validateToken(CharSequence token) {
+        if (Chars.isBlank(token)) {
+            throw new LineSenderException("token provider returned a null or empty token");
+        }
+        for (int i = 0, n = token.length(); i < n; i++) {
+            char c = token.charAt(i);
+            if (c < 0x20 || c > 0x7e) {
+                throw new LineSenderException("token provider returned a token containing a control or non-ASCII character; refusing to send it as a credential");
+            }
+        }
+    }
+
+    /**
      * Returns the current HTTP authentication token, without the {@code "Bearer "} prefix (the sender
-     * adds it). Must not return null or empty.
+     * adds it). Must not return null or empty, and must contain only printable ASCII (no control or
+     * non-ASCII characters) - the sender splices the value verbatim into an {@code Authorization:
+     * Bearer} header and rejects a token that violates this (see {@link #validateToken(CharSequence)}).
      *
      * @return the current HTTP authentication token
      */

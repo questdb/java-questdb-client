@@ -2851,14 +2851,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (httpTokenProvider != null) {
                 // pull a fresh token at each (re)handshake so a long-lived WebSocket follows token
-                // refreshes; reject a null/empty/blank return (forbidden by the HttpTokenProvider
-                // contract) rather than send a malformed "Bearer " header the server only 401s on
+                // refreshes; validateToken rejects a null/empty/blank return, or a token carrying a
+                // control or non-ASCII char (both forbidden by the HttpTokenProvider contract), rather
+                // than send a malformed or CR/LF-injected "Bearer " header
                 final HttpTokenProvider provider = httpTokenProvider;
                 return () -> {
                     CharSequence token = provider.getToken();
-                    if (Chars.isBlank(token)) {
-                        throw new LineSenderException("token provider returned a null or empty token");
-                    }
+                    HttpTokenProvider.validateToken(token);
                     return "Bearer " + token;
                 };
             }

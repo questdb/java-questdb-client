@@ -79,13 +79,26 @@ public class LineHttpSenderTokenProviderTest {
     }
 
     @Test
+    public void testControlOrNonAsciiProviderTokenIsRejected() {
+        // a token carrying a control or non-ASCII char is forbidden by the HttpTokenProvider contract: a
+        // CR/LF would inject into the request line and a non-ASCII byte is silently truncated by the ASCII
+        // header writer, so the sender must reject it at first use rather than splice a corrupt or injected
+        // "Authorization: Bearer " header onto the wire. Strings are built with explicit char values to keep
+        // this source pure ASCII.
+        assertProviderTokenRejected(() -> "abc" + (char) 0x0d + (char) 0x0a + "def", "control or non-ASCII character"); // CR/LF
+        assertProviderTokenRejected(() -> "tok" + (char) 0x00 + "en", "control or non-ASCII character"); // NUL
+        assertProviderTokenRejected(() -> (char) 0x1b + "[31mred", "control or non-ASCII character"); // ANSI escape
+        assertProviderTokenRejected(() -> "tok" + (char) 0xe9 + "n", "control or non-ASCII character"); // non-ASCII
+    }
+
+    @Test
     public void testNullOrEmptyProviderTokenIsRejected() {
         // the HttpTokenProvider contract forbids a null or empty token; the sender must reject it with a
         // clear LineSenderException at first use, rather than silently send a malformed "Authorization:
         // Bearer " header that the server only answers with a 401 far from the cause
-        assertProviderTokenRejected(() -> null);
-        assertProviderTokenRejected(() -> "");
-        assertProviderTokenRejected(() -> "   ");
+        assertProviderTokenRejected(() -> null, "null or empty token");
+        assertProviderTokenRejected(() -> "", "null or empty token");
+        assertProviderTokenRejected(() -> "   ", "null or empty token");
     }
 
     @Test
@@ -112,7 +125,7 @@ public class LineHttpSenderTokenProviderTest {
         }
     }
 
-    private static void assertProviderTokenRejected(HttpTokenProvider provider) {
+    private static void assertProviderTokenRejected(HttpTokenProvider provider, String expectedMessage) {
         try (Sender sender = Sender.builder(Sender.Transport.HTTP)
                 .address("127.0.0.1:1")
                 .protocolVersion(Sender.PROTOCOL_VERSION_V1)
@@ -121,9 +134,9 @@ public class LineHttpSenderTokenProviderTest {
                 .build()) {
             try {
                 sender.table("t").longColumn("v", 1L).atNow();
-                Assert.fail("expected a null or empty provider token to be rejected");
+                Assert.fail("expected an invalid provider token to be rejected");
             } catch (LineSenderException e) {
-                Assert.assertTrue(e.getMessage(), e.getMessage().contains("null or empty token"));
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
             }
         }
     }
