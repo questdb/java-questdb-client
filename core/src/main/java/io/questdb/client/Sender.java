@@ -1395,16 +1395,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     );
                 }
 
-                // Cursor is the only async ingest path. Setting sfDir enables
-                // store-and-forward (mmap'd, recoverable across sender restarts);
-                // omitting it gives memory-only mode (same lock-free architecture,
-                // no disk involvement). sf_durability != memory is a planned
-                // feature; throw today instead of silently downgrading.
-                if (sfDurability != SfDurability.MEMORY) {
-                    throw new LineSenderException(
-                            "sf_durability=" + sfDurability.name().toLowerCase()
-                                    + " is not yet supported (deferred follow-up; use sf_durability=memory)");
-                }
+                // Setting sfDir enables store-and-forward (mmap'd, recoverable
+                // across sender restarts); omitting it gives memory-only mode
+                // (same lock-free architecture, no disk involvement). The
+                // sf_durability != memory rejection lives in validateParameters
+                // so it is reached by build() and by no-connect validation alike.
                 long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
                         ? DEFAULT_SEGMENT_BYTES
                         : sfMaxBytes;
@@ -3811,6 +3806,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (autoFlushIntervalMillis == Integer.MAX_VALUE) {
                     throw new LineSenderException("disabling auto-flush is not supported for WebSocket protocol");
+                }
+                // The cursor send path does not fsync yet, so any sf_durability
+                // other than memory is rejected rather than silently downgraded.
+                // Validating it here (rather than at connect time) lets a
+                // no-connect config check reject it as a full build() does.
+                if (sfDurability != SfDurability.MEMORY) {
+                    throw new LineSenderException(
+                            "sf_durability=" + sfDurability.name().toLowerCase()
+                                    + " is not yet supported (deferred follow-up; use sf_durability=memory)");
                 }
             } else {
                 throw new LineSenderException("unsupported protocol ")

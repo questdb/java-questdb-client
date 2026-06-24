@@ -773,6 +773,15 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_withGorilla_fails() {
+        // gorilla has been removed; QWP ingestion always uses Gorilla timestamp
+        // encoding. The Sender rejects the key on a ws:: string as an unknown
+        // key, matching the QwpQueryClient (egress).
+        assertBadConfig("ws::addr=localhost:9000;gorilla=off;", "unknown configuration key: gorilla");
+        assertBadConfig("ws::addr=localhost:9000;gorilla=on;", "unknown configuration key: gorilla");
+    }
+
+    @Test
     public void testWsConfigString_withInitBufSize_fails() {
         assertBadConfig("ws::addr=localhost:9000;init_buf_size=1024;", "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
     }

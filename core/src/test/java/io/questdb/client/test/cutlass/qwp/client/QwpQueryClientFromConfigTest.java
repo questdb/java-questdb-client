@@ -672,6 +672,14 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testGorillaKeyRejected() {
+        // gorilla has been removed; QWP ingestion always uses Gorilla timestamp
+        // encoding. The egress client rejects the key like any other unknown key.
+        assertReject("ws::addr=db:9000;gorilla=off;", "unknown configuration key: gorilla");
+        assertReject("ws::addr=db:9000;gorilla=on;", "unknown configuration key: gorilla");
+    }
+
+    @Test
     public void testInFlightWindowKeyRejected() {
         // in_flight_window has been removed; the egress client rejects it like
         // any other unknown key.

@@ -77,6 +77,31 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testConnectRejectsNonWsSchemaOnSingleString() {
+        // QuestDB.connect(single string) must enforce the ws/wss schema, just
+        // like the builder's fromConfig().
+        assertSchemaRejected(() -> QuestDB.connect("http::addr=h:9000;"));
+    }
+
+    @Test
+    public void testConnectRejectsNonWsSchemaOnTwoArg() {
+        // QuestDB.connect(ingest, query) rejects a non-ws schema on either side.
+        assertSchemaRejected(() -> QuestDB.connect("tcp::addr=h:9009;", "ws::addr=h:9000;"));
+        assertSchemaRejected(() -> QuestDB.connect("ws::addr=h:9000;", "udp::addr=h:9009;"));
+    }
+
+    @Test
+    public void testConnectSingleStringValidatesAndBuilds() {
+        // QuestDB.connect(single string) hands the same ws:: string to both the
+        // ingest and query sides. min=0 on both pools validates both clients
+        // without connecting, so build() returns a live handle.
+        try (QuestDB ignored = QuestDB.connect(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;")) {
+            Assert.assertNotNull(ignored);
+        }
+    }
+
+    @Test
     public void testConnectStringWithPoolKeysAppliedToBuilder() {
         // Pool keys supplied via separate ingest/query strings are accepted;
         // min=0 so nothing connects.
@@ -84,6 +109,17 @@ public class QuestDBBuilderTest {
                 .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=1;")
                 .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;query_pool_max=1;")
                 .build()) {
+            Assert.assertNotNull(ignored);
+        }
+    }
+
+    @Test
+    public void testConnectTwoArgValidatesAndBuilds() {
+        // QuestDB.connect(ingest, query) sets the two sides independently;
+        // min=0 on each validates both clients without connecting.
+        try (QuestDB ignored = QuestDB.connect(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;",
+                "ws::addr=127.0.0.1:1;query_pool_min=0;")) {
             Assert.assertNotNull(ignored);
         }
     }
@@ -137,15 +173,18 @@ public class QuestDBBuilderTest {
         // Sender -- yet it must still reject a malformed ingest config up front,
         // matching the egress side. Covers a typed enum (tls_verify), a
         // registry-STRING value that only the real Sender parse validates
-        // (auto_flush_rows), and a WebSocket build-time check that only the full
-        // no-connect validation reaches (auto_flush_interval=off disables
-        // auto-flush, which the WebSocket transport does not support).
+        // (auto_flush_rows), and two WebSocket build-time checks that only the
+        // full no-connect validation reaches (auto_flush_interval=off disables
+        // auto-flush, and sf_durability=flush is not yet supported -- the
+        // WebSocket transport rejects both).
         assertIngressBuildRejected(
                 "wss::addr=127.0.0.1:1;tls_verify=strict;sender_pool_min=0;sender_pool_max=2;", "tls_verify");
         assertIngressBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;sender_pool_max=2;", "auto_flush_rows");
         assertIngressBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;sender_pool_max=2;", "auto-flush");
+        assertIngressBuildRejected(
+                "ws::addr=127.0.0.1:1;sf_durability=flush;sender_pool_min=0;sender_pool_max=2;", "not yet supported");
     }
 
     @Test
