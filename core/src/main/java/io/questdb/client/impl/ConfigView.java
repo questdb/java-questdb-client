@@ -28,6 +28,8 @@ import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
 import io.questdb.client.std.ObjList;
 
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 
@@ -51,16 +53,20 @@ public final class ConfigView {
      * Keys that live in the legacy http/tcp/udp vocabulary. On a {@code ws}/
      * {@code wss} string they reject with a hint pointing at the right place.
      */
-    private static final Map<String, String> RELOCATED_HINTS = Map.of(
-            "retry_timeout", "(use reconnect_max_duration_millis on ws/wss)",
-            "protocol_version", "(QWP negotiates the protocol version during the WebSocket upgrade)",
-            "init_buf_size", "(applies to legacy http/tcp/udp transports only)",
-            "max_buf_size", "(applies to legacy http/tcp/udp transports only)",
-            "request_timeout", "(applies to legacy http/tcp/udp transports only)",
-            "request_min_throughput", "(applies to legacy http/tcp/udp transports only)",
-            "max_datagram_size", "(applies to legacy http/tcp/udp transports only)",
-            "multicast_ttl", "(applies to legacy http/tcp/udp transports only)"
-    );
+    private static final Map<String, String> RELOCATED_HINTS;
+
+    static {
+        Map<String, String> hints = new HashMap<>();
+        hints.put("retry_timeout", "(use reconnect_max_duration_millis on ws/wss)");
+        hints.put("protocol_version", "(QWP negotiates the protocol version during the WebSocket upgrade)");
+        hints.put("init_buf_size", "(applies to legacy http/tcp/udp transports only)");
+        hints.put("max_buf_size", "(applies to legacy http/tcp/udp transports only)");
+        hints.put("request_timeout", "(applies to legacy http/tcp/udp transports only)");
+        hints.put("request_min_throughput", "(applies to legacy http/tcp/udp transports only)");
+        hints.put("max_datagram_size", "(applies to legacy http/tcp/udp transports only)");
+        hints.put("multicast_ttl", "(applies to legacy http/tcp/udp transports only)");
+        RELOCATED_HINTS = Collections.unmodifiableMap(hints);
+    }
 
     private final ObjList<String> normKeys = new ObjList<>();
     private final ObjList<String> normValues = new ObjList<>();
