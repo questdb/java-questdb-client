@@ -31,6 +31,7 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 public class QuestDBBuilderTest {
 
@@ -274,9 +275,21 @@ public class QuestDBBuilderTest {
                         .close();
                 Assert.fail("expected build to fail when query pool cannot connect");
             } catch (RuntimeException expected) {
-                // The exact exception comes from QwpQueryClient.connect(); the
-                // build failing tells us the sender-pool unwind ran.
+                // The exact exception comes from QwpQueryClient.connect(). The
+                // build failing only proves the query pool gave up; the
+                // assertions below prove the unwind closed the senders the
+                // sender pool had already connected, rather than leaking them.
             }
+            // The sender pool eagerly warmed senderPoolSize(2), so the server
+            // saw two ingest handshakes (proving the senders connected and the
+            // assertion below is not vacuous)...
+            awaitTrue("sender pool should have connected two ingest senders",
+                    () -> ingest.handshakeCount() >= 2);
+            // ...and the failed build() must have closed every one of them, so
+            // no sender connection is left live on the server. The server
+            // observes the client-side socket close asynchronously, so poll.
+            awaitTrue("failed build() must close the already-built sender pool, leaving no live connection",
+                    () -> ingest.liveConnectionCount() == 0);
         }
     }
 
@@ -395,5 +408,16 @@ public class QuestDBBuilderTest {
         } catch (IllegalArgumentException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("ws or wss"));
         }
+    }
+
+    private static void awaitTrue(String message, BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(20);
+        }
+        Assert.assertTrue(message, condition.getAsBoolean());
     }
 }

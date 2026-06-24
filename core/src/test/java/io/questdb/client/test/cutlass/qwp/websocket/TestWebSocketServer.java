@@ -46,6 +46,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A simple WebSocket server for client integration testing.
@@ -57,10 +58,19 @@ public class TestWebSocketServer implements Closeable {
     private final List<ClientHandler> clients = new CopyOnWriteArrayList<>();
     private final boolean emitDurableAckHeader;
     private final WebSocketServerHandler handler;
+    // Count of WebSocket connections currently live from the server's view:
+    // incremented when a handshake completes, decremented when that connection's
+    // read thread exits (the client closed its socket). Lets a test assert that a
+    // client-side pool actually closed the connections it opened.
+    private final AtomicInteger liveConnections = new AtomicInteger();
     private final int port;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final ServerSocket serverSocket;
     private final CountDownLatch startLatch = new CountDownLatch(1);
+    // Monotonic count of completed handshakes over the server's lifetime. Unlike
+    // liveConnections it never decrements, so a test can confirm how many clients
+    // connected even after they have all disconnected.
+    private final AtomicInteger totalHandshakes = new AtomicInteger();
     private Thread acceptThread;
     // X-QuestDB-Role value to emit on handshake responses. null = omit the
     // header (legacy behavior for tests written before role-aware failover).
@@ -162,6 +172,22 @@ public class TestWebSocketServer implements Closeable {
      */
     public int getPort() {
         return port;
+    }
+
+    /**
+     * Number of handshakes the server has completed over its lifetime
+     * (monotonic; never decreases when clients disconnect).
+     */
+    public int handshakeCount() {
+        return totalHandshakes.get();
+    }
+
+    /**
+     * Number of WebSocket connections currently live from the server's view.
+     * Drops back to zero once every client has closed its socket.
+     */
+    public int liveConnectionCount() {
+        return liveConnections.get();
     }
 
     /**
@@ -536,35 +562,41 @@ public class TestWebSocketServer implements Closeable {
                         LOG.error("Handshake failed");
                         return;
                     }
+                    totalHandshakes.incrementAndGet();
+                    liveConnections.incrementAndGet();
 
-                    if (sendServerInfo) {
-                        sendBinary(buildServerInfoFrame(roleByte(advertisedRole)));
-                    }
-
-                    byte[] readBuf = new byte[8192];
-
-                    while (running.get() && !isClosed) {
-                        int read;
-                        try {
-                            read = in.read(readBuf);
-                        } catch (SocketTimeoutException e) {
-                            continue;
-                        }
-                        if (read <= 0) {
-                            break;
+                    try {
+                        if (sendServerInfo) {
+                            sendBinary(buildServerInfoFrame(roleByte(advertisedRole)));
                         }
 
-                        // append to recvBuffer
-                        recvBuffer.compact();
-                        if (recvBuffer.remaining() < read) {
-                            // should not happen with 64k buffer in tests
-                            LOG.error("Receive buffer overflow");
-                            break;
-                        }
-                        recvBuffer.put(readBuf, 0, read);
-                        recvBuffer.flip();
+                        byte[] readBuf = new byte[8192];
 
-                        handleRead();
+                        while (running.get() && !isClosed) {
+                            int read;
+                            try {
+                                read = in.read(readBuf);
+                            } catch (SocketTimeoutException e) {
+                                continue;
+                            }
+                            if (read <= 0) {
+                                break;
+                            }
+
+                            // append to recvBuffer
+                            recvBuffer.compact();
+                            if (recvBuffer.remaining() < read) {
+                                // should not happen with 64k buffer in tests
+                                LOG.error("Receive buffer overflow");
+                                break;
+                            }
+                            recvBuffer.put(readBuf, 0, read);
+                            recvBuffer.flip();
+
+                            handleRead();
+                        }
+                    } finally {
+                        liveConnections.decrementAndGet();
                     }
                 } catch (IOException e) {
                     if (running.get()) {
