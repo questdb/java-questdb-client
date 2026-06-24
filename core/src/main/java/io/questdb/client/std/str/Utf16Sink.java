@@ -48,12 +48,12 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
         // Scan by code point, not UTF-16 unit. A supplementary-plane format char (e.g. a U+E00xx language
         // tag char) arrives as a surrogate pair whose halves report SURROGATE rather than FORMAT, and a
         // lone surrogate likewise - per-unit scanning would pass both through raw. Judging the whole code
-        // point escapes them (matching OidcAuthException.isUnsafeForDisplay), while a normal supplementary
-        // char such as an emoji is neither control nor format and is emitted verbatim.
+        // point (via DisplaySafe, the shared classifier) escapes them, while a normal supplementary char
+        // such as an emoji is neither control nor format and is emitted verbatim.
         for (int i = 0, n = nonPrintable.length(); i < n; ) {
             final int cp = Character.codePointAt(nonPrintable, i);
             final int count = Character.charCount(cp);
-            if (isDisplaySafe(cp)) {
+            if (DisplaySafe.isDisplaySafe(cp)) {
                 for (int j = 0; j < count; j++) {
                     put(nonPrintable.charAt(i + j));
                 }
@@ -68,7 +68,7 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
         // A single UTF-16 unit: escape control chars, Unicode format chars, and a lone surrogate (which has
         // no displayable meaning). Supplementary-plane format chars are caught by the code-point-aware
         // putAsPrintable(CharSequence).
-        if (isDisplaySafe(c)) {
+        if (DisplaySafe.isDisplaySafe(c)) {
             put(c);
         } else {
             putUnicodeEscape(c);
@@ -101,19 +101,6 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
     default Utf16Sink putNonAscii(long lo, long hi) {
         Utf8s.utf8ToUtf16(lo, hi, this);
         return this;
-    }
-
-    // A code point is display-safe unless it is a control char (C0/C1, DEL), a Unicode format char (bidi
-    // embeddings/overrides/isolates, LRM/RLM marks, zero-width joiners, the BOM, supplementary-plane tag
-    // chars) or a surrogate (a lone half, with no displayable meaning). Left raw, attacker-influenced text -
-    // an ILP server's JSON error body, a column name - could reorder, hide or forge what a human reads in a
-    // terminal or log; escaping rather than stripping keeps it visible for diagnosis.
-    private static boolean isDisplaySafe(int cp) {
-        if (Character.isISOControl(cp)) {
-            return false;
-        }
-        final int type = Character.getType(cp);
-        return type != Character.FORMAT && type != Character.SURROGATE;
     }
 
     // Escapes a code point to one (BMP) or two (supplementary, as its surrogate pair) visible \\uXXXX

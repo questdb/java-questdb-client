@@ -2863,6 +2863,39 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testTokenResponseExpiresInZeroUsesDefaultTtl() throws Exception {
+        assertMemoryLeak(() -> {
+            // a token response with a non-positive expires_in (here 0) must fall back to
+            // DEFAULT_TOKEN_TTL_SECONDS (5 min), not be treated as already-expired or cached forever.
+            // testTokenResponseExpiresInIsClamped covers the absurd-large end; this covers the <= 0 default.
+            AtomicInteger deviceCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    deviceCalls.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                // no refresh_token, so an expired cache forces a fresh device flow rather than a silent refresh
+                return MockOidcServer.json(200, tokenJson("ACCESS-DEF", null, null, 0)); // expires_in = 0
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                long before = System.currentTimeMillis();
+                Assert.assertEquals("ACCESS-DEF", auth.getToken());
+                long after = System.currentTimeMillis();
+                Assert.assertEquals("first sign-in runs the device flow once", 1, deviceCalls.get());
+
+                // the cached expiry must be ~5min out (the default), neither ~now (treated as expired) nor far
+                long defaultTtlMillis = 300L * 1000L;
+                long expiresAt = readExpiresAtMillis(auth);
+                Assert.assertTrue("expiry must be ~5min ahead (the default), was " + (expiresAt - after) + "ms ahead",
+                        expiresAt >= before + defaultTtlMillis - 5_000L);
+                Assert.assertTrue("expiry must be ~5min ahead (the default), not longer, was " + (expiresAt - before) + "ms ahead",
+                        expiresAt <= after + defaultTtlMillis);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTokenUnderNonSuccessStatusIsNotAccepted() throws Exception {
         assertMemoryLeak(() -> {
             // RFC 6749 5.1: a token must come from a 2xx response. A token under a non-2xx status with no
@@ -2910,6 +2943,34 @@ public class OidcDeviceAuthTest {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("disallowed control or non-ASCII"));
                     // the token bytes must never leak into the message
                     Assert.assertFalse(e.getMessage(), e.getMessage().contains("X-Injected"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testTokenWithNonAsciiCharRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // the > 0x7e arm of the token guard (testTokenWithControlCharsRejected covers the < 0x20 arm):
+            // a non-ASCII char (here U+00E9, not a control char) in the access token would be silently
+            // truncated to one byte by the ASCII Authorization-header writer, yielding a corrupt credential.
+            // storeTokens must reject it, and must not leak the token into the message
+            String injected = "header.payload" + jsonUnicodeEscape(0x00e9) + "SHOULD-NOT-LEAK"; // e-acute, > 0x7e
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson(injected, null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected a token with a non-ASCII character to be rejected");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("disallowed control or non-ASCII"));
+                    // the token bytes must never leak into the message
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("SHOULD-NOT-LEAK"));
                 }
             }
         });

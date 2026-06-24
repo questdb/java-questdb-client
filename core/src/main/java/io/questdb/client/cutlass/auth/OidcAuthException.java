@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.auth;
 
+import io.questdb.client.std.str.DisplaySafe;
 import io.questdb.client.std.str.StringSink;
 
 /**
@@ -66,24 +67,14 @@ public class OidcAuthException extends RuntimeException {
         return e;
     }
 
-    // Reports characters that must never reach a terminal or log line. The argument is a code point, not
-    // a UTF-16 unit: putSanitized scans with codePointAt, which joins a surrogate pair into one code point,
-    // so a supplementary-plane format/control char is judged whole rather than as two harmless-looking
-    // halves (the gap that once let an invisible U+E00xx "tag" char through). A lone unpaired surrogate
-    // surfaces as a SURROGATE code point and is stripped too, having no displayable meaning.
-    // Beyond the C0/C1 controls and DEL from isISOControl, this strips the Unicode format category (Cf:
-    // zero-width joiners, BOM, bidi embedding/override/isolate controls, U+E00xx tag chars) plus an
-    // explicit bidi/BOM set, so an attacker-influenced value (verification_uri, user_code, error string)
-    // cannot reorder, hide, or spoof displayed text - even on a JDK that categorizes these differently.
-    // Hex literals (not char escapes) keep this source ASCII, so it carries none of the chars it guards.
+    // Whether a character must never reach a terminal or log line, delegated to the shared DisplaySafe
+    // classifier so the auth layer and Utf16Sink.putAsPrintable judge display safety identically. The
+    // argument is a code point, not a UTF-16 unit: putSanitized scans with codePointAt, which joins a
+    // surrogate pair into one code point, so a supplementary-plane format/control char is judged whole
+    // rather than as two harmless-looking halves (the gap that once let an invisible U+E00xx "tag" char
+    // through). A lone unpaired surrogate surfaces as a SURROGATE code point and is stripped too.
     static boolean isUnsafeForDisplay(int c) {
-        return Character.isISOControl(c)
-                || Character.getType(c) == Character.FORMAT
-                || Character.getType(c) == Character.SURROGATE // unpaired surrogate (lone half), no displayable meaning
-                || (c >= 0x202A && c <= 0x202E) // LRE, RLE, PDF, LRO, RLO
-                || (c >= 0x2066 && c <= 0x2069) // LRI, RLI, FSI, PDI
-                || c == 0x200E || c == 0x200F   // LRM, RLM
-                || c == 0xFEFF;                 // BOM / zero-width no-break space
+        return DisplaySafe.isUnsafeForDisplay(c);
     }
 
     @Override

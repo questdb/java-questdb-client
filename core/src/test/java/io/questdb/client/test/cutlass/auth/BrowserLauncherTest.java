@@ -42,8 +42,12 @@ public class BrowserLauncherTest {
 
     @Test
     public void testOpenIsBestEffortForRejectedUrls() throws Exception {
-        // a rejected or absent URL returns before touching java.awt.Desktop, so open() must not throw
-        // (and the test never launches a real browser, so it is safe on a desktop machine too)
+        // these URLs are rejected by the scheme/parse allowlist, so open() returns at the safeHttpUri null
+        // check before touching java.awt.Desktop. Assert the rejection holds so the no-op below is provably
+        // the URL-rejection path (not an incidental headless no-op), then confirm open() tolerates each
+        // without throwing (and never launches a real browser, so the test is safe on a desktop machine too)
+        Assert.assertNull(invokeSafeHttpUri("javascript:alert(1)"));
+        Assert.assertNull(invokeSafeHttpUri("not a url"));
         invokeOpen(null);
         invokeOpen("javascript:alert(1)");
         invokeOpen("not a url");
@@ -51,13 +55,17 @@ public class BrowserLauncherTest {
 
     @Test
     public void testOpenRespectsDisableProperty() throws Exception {
-        // with the kill-switch off, open() returns before touching the desktop even for a valid http(s)
-        // URL; this is also what keeps the suite from launching a real browser on a developer machine
+        // a VALID http(s) URL: if open() did not short-circuit on the kill-switch it would proceed toward
+        // java.awt.Desktop, so asserting safeHttpUri accepts it proves the no-op below is the kill-switch,
+        // not URL rejection. This gate is also what keeps the suite from launching a real browser on a
+        // developer machine.
+        String validUrl = "https://idp.example.com/device?user_code=ABCD";
+        Assert.assertNotNull("the URL must be one open() would otherwise launch", invokeSafeHttpUri(validUrl));
         String prop = "questdb.client.oidc.open.browser";
         String prev = System.getProperty(prop);
         System.setProperty(prop, "false");
         try {
-            invokeOpen("https://idp.example.com/device?user_code=ABCD");
+            invokeOpen(validUrl); // kill-switch off: must return without launching and without throwing
         } finally {
             if (prev == null) {
                 System.clearProperty(prop);

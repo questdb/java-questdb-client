@@ -188,6 +188,38 @@ public class ChunkedResponseTest {
     }
 
     @Test(timeout = 30_000)
+    public void testNoArgRecvHonoursPositiveDefaultTimeout() {
+        // The ILP flush path reads a chunked response via the no-arg recv(), which delegates to
+        // recv(defaultTimeout). With a positive defaultTimeout (the production HttpClient timeout) the
+        // whole-call bound applies on that path too, so a server dribbling a never-terminated chunk size
+        // cannot wedge a single recv() past the timeout. The explicit recv(int) path is covered by
+        // testRecvHonoursTotalTimeoutWhileChunkSizeDribbles.
+        final long memSize = 64;
+        final long mem = Unsafe.malloc(memSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            final AbstractChunkedResponse rsp = new AbstractChunkedResponse(mem, mem + memSize, 50) { // positive default
+                @Override
+                protected int recvOrDie(long bufLo, long bufHi, int timeout) {
+                    if (bufLo >= bufHi) {
+                        return 0; // buffer full of a CRLF-less chunk size: no forward progress
+                    }
+                    Unsafe.getUnsafe().putByte(bufLo, (byte) '0'); // a hex digit, never the terminating CR
+                    return 1;
+                }
+            };
+            rsp.begin(mem, mem);
+            try {
+                rsp.recv(); // no-arg: delegates to recv(defaultTimeout=50)
+                Assert.fail("expected the no-arg recv to time out on a dribbled, never-terminated chunk size");
+            } catch (HttpClientException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
+            }
+        } finally {
+            Unsafe.free(mem, memSize, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testRecvHonoursTotalTimeoutWhileChunkSizeDribbles() {
         // a server that dribbles the chunk-size line and never sends its terminating CRLF must not keep a
         // single recv() running past its timeout. recv(timeout) bounds the whole call (not each socket read),

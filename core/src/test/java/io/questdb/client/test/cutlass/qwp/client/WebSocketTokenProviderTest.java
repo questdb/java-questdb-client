@@ -38,6 +38,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 /**
  * Verifies that the WebSocket (QWP) transport accepts an
  * {@link Sender.LineSenderBuilder#httpTokenProvider} and presents the provider's current token as the
@@ -46,104 +48,114 @@ import java.util.concurrent.atomic.AtomicLong;
  * The provider is queried at handshake time, not per data frame, because an established WebSocket is
  * not re-authenticated mid-stream. The fixed-token and username/password paths are covered too as a
  * regression guard for the refactor that turned the captured header string into a per-handshake supplier.
+ * <p>
+ * Each test runs under {@code assertMemoryLeak} so the sender's native buffers are proven freed on close.
  */
 public class WebSocketTokenProviderTest {
 
     @Test
     public void testProviderRequeriedOnEveryReconnect() throws Exception {
-        // The handler ACKs the first frame then drops the connection, forcing the I/O loop to reconnect.
-        // The reconnect runs the same buildAndConnect path, so it must re-query the provider and present
-        // the next token on the new upgrade - proving refresh-at-handshake, not a token captured once.
-        AtomicInteger tokenSeq = new AtomicInteger();
-        DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            // The handler ACKs the first frame then drops the connection, forcing the I/O loop to reconnect.
+            // The reconnect runs the same buildAndConnect path, so it must re-query the provider and present
+            // the next token on the new upgrade - proving refresh-at-handshake, not a token captured once.
+            AtomicInteger tokenSeq = new AtomicInteger();
+            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
-                    .address("localhost:" + port)
-                    .httpTokenProvider(() -> "TOKEN-" + tokenSeq.incrementAndGet())
-                    .build()) {
-                Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .httpTokenProvider(() -> "TOKEN-" + tokenSeq.incrementAndGet())
+                        .build()) {
+                    Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
 
-                // batch 1 lands, gets ACKed, then the server drops the socket -> reconnect
-                sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
+                    // batch 1 lands, gets ACKed, then the server drops the socket -> reconnect
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
 
-                // the reconnect handshake must carry a freshly pulled token (blocks for the reconnect)
-                Assert.assertEquals("Bearer TOKEN-2", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    // the reconnect handshake must carry a freshly pulled token (blocks for the reconnect)
+                    Assert.assertEquals("Bearer TOKEN-2", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
 
-                // batch 2 goes through on the new connection, end to end
-                sender.table("foo").longColumn("v", 2L).atNow();
-                sender.flush();
-                waitFor(() -> handler.totalBinaryReceived.get() >= 2, 5_000);
+                    // batch 2 goes through on the new connection, end to end
+                    sender.table("foo").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 2, 5_000);
+                }
             }
-        }
+        });
     }
 
     @Test
     public void testProviderTokenSuppliedOnInitialUpgrade() throws Exception {
-        AtomicInteger tokenSeq = new AtomicInteger();
-        try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            AtomicInteger tokenSeq = new AtomicInteger();
+            try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
-                    .address("localhost:" + port)
-                    .httpTokenProvider(() -> "TOKEN-" + tokenSeq.incrementAndGet())
-                    .build()) {
-                // the upgrade handshake runs during build(); the provider was queried exactly once for it
-                Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
-                Assert.assertEquals(1, tokenSeq.get());
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .httpTokenProvider(() -> "TOKEN-" + tokenSeq.incrementAndGet())
+                        .build()) {
+                    // the upgrade handshake runs during build(); the provider was queried exactly once for it
+                    Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    Assert.assertEquals(1, tokenSeq.get());
 
-                // sending data must NOT re-query the provider: the established socket carries no new auth
-                sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
-                Assert.assertEquals(1, tokenSeq.get());
+                    // sending data must NOT re-query the provider: the established socket carries no new auth
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    Assert.assertEquals(1, tokenSeq.get());
+                }
             }
-        }
+        });
     }
 
     @Test
     public void testStaticTokenStillSuppliedOverWebSocket() throws Exception {
-        // regression guard for the supplier refactor: a fixed httpToken still reaches the upgrade header
-        try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            // regression guard for the supplier refactor: a fixed httpToken still reaches the upgrade header
+            try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
-                    .address("localhost:" + port)
-                    .httpToken("static-token")
-                    .build()) {
-                Assert.assertEquals("Bearer static-token", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
-                sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .httpToken("static-token")
+                        .build()) {
+                    Assert.assertEquals("Bearer static-token", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                }
             }
-        }
+        });
     }
 
     @Test
     public void testUsernamePasswordStillSuppliedOverWebSocket() throws Exception {
-        // regression guard for the supplier refactor: username/password still becomes the Basic header
-        try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            // regression guard for the supplier refactor: username/password still becomes the Basic header
+            try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
-                    .address("localhost:" + port)
-                    .httpUsernamePassword("user", "pass")
-                    .build()) {
-                String expected = "Basic " + Base64.getEncoder().encodeToString(
-                        "user:pass".getBytes(StandardCharsets.UTF_8));
-                Assert.assertEquals(expected, server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
-                sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .httpUsernamePassword("user", "pass")
+                        .build()) {
+                    String expected = "Basic " + Base64.getEncoder().encodeToString(
+                            "user:pass".getBytes(StandardCharsets.UTF_8));
+                    Assert.assertEquals(expected, server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                }
             }
-        }
+        });
     }
 
     // Mirrors WebSocketResponse STATUS_OK layout: status u8 | sequence u64 | table_count u16

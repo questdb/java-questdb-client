@@ -38,6 +38,34 @@ import org.junit.Test;
 
 public class ResponseTest {
 
+    @Test(timeout = 30_000)
+    public void testNoArgRecvHonoursPositiveDefaultTimeout() {
+        // The ILP flush path reads via the no-arg recv(), which delegates to recv(defaultTimeout). With a
+        // positive defaultTimeout (the production HttpClient timeout) the whole-call bound applies on that
+        // path too, so a server yielding no application bytes cannot wedge a single recv() past the timeout.
+        // The explicit recv(int) path is covered by testRecvHonoursTotalTimeoutWhenNoApplicationBytesArrive.
+        final long memSize = 64;
+        final long mem = Unsafe.malloc(memSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            final AbstractResponse rsp = new AbstractResponse(mem, mem + memSize, 50) { // positive defaultTimeout
+                @Override
+                protected int recvOrDie(long bufLo, long bufHi, int timeout) {
+                    Os.sleep(1); // a readability wakeup that decrypts to no application bytes
+                    return 0;
+                }
+            };
+            rsp.begin(mem, mem, 16); // content length 16, nothing received yet
+            try {
+                rsp.recv(); // no-arg: delegates to recv(defaultTimeout=50)
+                Assert.fail("expected the no-arg recv to time out under a positive default timeout");
+            } catch (HttpClientException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
+            }
+        } finally {
+            Unsafe.free(mem, memSize, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     @Test
     public void testNoSplit() {
         String[] expectedFragments = {
