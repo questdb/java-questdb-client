@@ -189,7 +189,7 @@ public class SegmentManagerTotalBytesRaceTest {
             if (System.nanoTime() > deadline) {
                 throw new AssertionError("worker did not park within 5 s; state=" + s);
             }
-            Thread.onSpinWait();
+            io.questdb.client.std.Compat.onSpinWait();
         }
     }
 

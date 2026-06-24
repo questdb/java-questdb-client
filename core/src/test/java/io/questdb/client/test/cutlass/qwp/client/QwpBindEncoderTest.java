@@ -862,7 +862,7 @@ public class QwpBindEncoderTest {
     public void testEncoderGrowsBufferBeyondDefault() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpBindValues binds = new QwpBindValues()) {
-                String big = "x".repeat(20_000);
+                String big = io.questdb.client.test.tools.TestUtils.repeat("x", 20_000);
                 binds.setVarchar(0, big);
                 Assert.assertEquals(1, binds.count());
                 // type(1) + flag(1) + offset0(4) + len(4) + 20000 bytes = 20010

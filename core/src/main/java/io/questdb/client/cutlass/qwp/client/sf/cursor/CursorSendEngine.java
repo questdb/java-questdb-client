@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
@@ -412,7 +413,7 @@ public final class CursorSendEngine implements QuietCloseable {
         // The spin tightens the gap between manager-installs-spare and
         // producer-consumes-spare — usually a few µs on an idle manager thread.
         while (System.nanoTime() < spinDeadlineNanos) {
-            Thread.onSpinWait();
+            Compat.onSpinWait();
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
             if (fsn >= 0 || fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 return fsn;

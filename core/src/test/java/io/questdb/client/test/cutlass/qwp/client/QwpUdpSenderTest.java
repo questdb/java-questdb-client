@@ -44,6 +44,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -218,7 +219,7 @@ public class QwpUdpSenderTest {
             }
 
             assertRowsEqual(
-                    List.of(decodedRow(
+                    Collections.singletonList(decodedRow(
                             "arrays",
                             "la", longArrayValue(shape(2), 9, 10),
                             "da", doubleArrayValue(shape(2), 9.5, 10.5)
@@ -232,7 +233,7 @@ public class QwpUdpSenderTest {
     public void testAtMicrosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = List.of(
+            List<ScenarioRow> oversizedRow = Collections.singletonList(
                     row("t", sender -> sender.table("t")
                                     .longColumn("a", 2)
                                     .stringColumn("s", large)
@@ -272,7 +273,7 @@ public class QwpUdpSenderTest {
     public void testAtNanosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = List.of(
+            List<ScenarioRow> oversizedRow = Collections.singletonList(
                     row("tn", sender -> sender.table("tn")
                                     .longColumn("a", 2)
                                     .stringColumn("s", large)
@@ -335,7 +336,7 @@ public class QwpUdpSenderTest {
     public void testAtNowOversizeFailureRollsBackWithoutExplicitCancel() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = List.of(
+            List<ScenarioRow> oversizedRow = Collections.singletonList(
                     row("t", sender -> sender.table("t")
                                     .longColumn("a", 2)
                                     .stringColumn("s", large)
@@ -389,7 +390,7 @@ public class QwpUdpSenderTest {
                 sender.flush();
             }
 
-            assertRowsEqual(List.of(
+            assertRowsEqual(Collections.singletonList(
                     decodedRow("t", "x", 1L)
             ), decodeRows(nf.packets));
         });
@@ -875,7 +876,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(List.of(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
+            assertRowsEqual(Collections.singletonList(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
         });
     }
 
@@ -918,7 +919,7 @@ public class QwpUdpSenderTest {
     @Test
     public void testFirstRowAllowsMultipleNewColumnsAndEncodesRow() throws Exception {
         assertMemoryLeak(() -> {
-            List<ScenarioRow> rows = List.of(
+            List<ScenarioRow> rows = Collections.singletonList(
                     row("t", sender -> sender.table("t")
                                     .longColumn("a", 1)
                                     .doubleColumn("b", 2.0)
@@ -973,7 +974,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(List.of(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
+            assertRowsEqual(Collections.singletonList(decodedRow("t", "x", 1L)), decodeRows(nf.packets));
         });
     }
 
@@ -993,7 +994,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(List.of(decodedRow("ok", "x", 1L)), decodeRows(nf.packets));
+            assertRowsEqual(Collections.singletonList(decodedRow("ok", "x", 1L)), decodeRows(nf.packets));
         });
     }
 
@@ -1012,7 +1013,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(List.of(decodedRow("arrays", "x", 1L)), decodeRows(nf.packets));
+            assertRowsEqual(Collections.singletonList(decodedRow("arrays", "x", 1L)), decodeRows(nf.packets));
         });
     }
 
@@ -1034,7 +1035,7 @@ public class QwpUdpSenderTest {
             }
 
             assertRowsEqual(
-                    List.of(decodedRow(
+                    Collections.singletonList(decodedRow(
                             "arrays",
                             "la", longArrayValue(shape(2, 2), 1, 2, 3, 4)
                     )),
@@ -1158,7 +1159,7 @@ public class QwpUdpSenderTest {
                 doubleValues[i] = i + 0.25;
             }
 
-            List<ScenarioRow> rows = List.of(
+            List<ScenarioRow> rows = Collections.singletonList(
                     row("arrays", sender -> sender.table("arrays")
                                     .longColumn("x", 1)
                                     .longArray("la", longValues)
@@ -1189,7 +1190,7 @@ public class QwpUdpSenderTest {
     public void testOversizedRowAfterMidRowSchemaChangeCancelDoesNotLeakSchema() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> oversizedRow = List.of(
+            List<ScenarioRow> oversizedRow = Collections.singletonList(
                     row("t", sender -> sender.table("t")
                                     .longColumn("a", 2)
                                     .stringColumn("s", large)
@@ -1230,7 +1231,7 @@ public class QwpUdpSenderTest {
         assertMemoryLeak(() -> {
             String small = repeat('s', 32);
             String large = repeat('x', 5000);
-            List<ScenarioRow> largeRow = List.of(
+            List<ScenarioRow> largeRow = Collections.singletonList(
                     row("t", sender -> sender.table("t")
                                     .longColumn("x", 2)
                                     .stringColumn("s", large)
@@ -1257,7 +1258,7 @@ public class QwpUdpSenderTest {
             Assert.assertEquals(1, nf.sendCount);
             assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
             assertRowsEqual(
-                    List.of(decodedRow("t", "x", 1L, "s", small)),
+                    Collections.singletonList(decodedRow("t", "x", 1L, "s", small)),
                     decodeRows(nf.packets)
             );
         });
@@ -1267,7 +1268,7 @@ public class QwpUdpSenderTest {
     public void testOversizedSingleRowRejectedBeforeReplayUsesActualEncodedSize() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
-            List<ScenarioRow> rows = List.of(
+            List<ScenarioRow> rows = Collections.singletonList(
                     row("t", sender -> sender.table("t")
                                     .longColumn("x", 1)
                                     .stringColumn("s", large)
@@ -1561,7 +1562,7 @@ public class QwpUdpSenderTest {
             Assert.assertEquals(1, nf.scatterSendCount);
             Assert.assertEquals(0, nf.rawSendCount);
             Assert.assertTrue("expected multiple segments for header/schema/data", nf.segmentCounts.get(0) > 1);
-            assertRowsEqual(List.of(decodedRow("t", "x", 42L)), decodeRows(nf.packets));
+            assertRowsEqual(Collections.singletonList(decodedRow("t", "x", 42L)), decodeRows(nf.packets));
         });
     }
 
@@ -1693,7 +1694,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(List.of(
+            assertRowsEqual(Collections.singletonList(
                     decodedRow("valid", "x", 1L)
             ), decodeRows(nf.packets));
         });
@@ -1742,7 +1743,7 @@ public class QwpUdpSenderTest {
             }
 
             Assert.assertEquals(1, nf.sendCount);
-            assertRowsEqual(List.of(
+            assertRowsEqual(Collections.singletonList(
                     decodedRow("valid", "x", 1L)
             ), decodeRows(nf.packets));
         });

@@ -326,7 +326,7 @@ public class QwpWebSocketEncoderTest {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test_table")) {
 
-                String sb = "a".repeat(10_000);
+                String sb = io.questdb.client.test.tools.TestUtils.repeat("a", 10_000);
 
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("data", TYPE_VARCHAR, true);
                 col.addString(sb);

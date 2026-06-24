@@ -172,7 +172,7 @@ public class RecoveryReplayTest {
     }
 
     private static String repeat(String c, int n) {
-        return String.valueOf(c).repeat(Math.max(0, n));
+        return io.questdb.client.test.tools.TestUtils.repeat(String.valueOf(c), Math.max(0, n));
     }
 
     private static void rmDirRec(String dir) {

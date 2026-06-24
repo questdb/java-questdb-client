@@ -34,6 +34,7 @@ open module io.questdb.test {
     requires org.postgresql.jdbc;
     requires jmh.core;
     requires ch.qos.logback.classic;
+    requires ch.qos.logback.core;
 
     exports io.questdb.client.test;
     exports io.questdb.client.test.cairo;

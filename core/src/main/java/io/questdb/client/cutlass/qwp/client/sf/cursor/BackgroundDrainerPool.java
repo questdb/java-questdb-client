@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.std.Compat;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import org.slf4j.Logger;
@@ -122,7 +123,7 @@ public final class BackgroundDrainerPool implements QuietCloseable {
         // ensures every submit's executor.submit has already returned
         // before we shut the executor down.
         while (state.get() != CLOSED_BIT) {
-            Thread.onSpinWait();
+            Compat.onSpinWait();
         }
         // Reject new tasks but let in-flight drainers finish their drain
         // naturally. Without this grace window a drainer that's seconds

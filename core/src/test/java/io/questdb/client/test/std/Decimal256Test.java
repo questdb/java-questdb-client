@@ -753,7 +753,7 @@ public class Decimal256Test {
                 {Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, Long.MIN_VALUE, false, false, false, false, false, true},
         };
         Decimal256 d = new Decimal256();
-        for (var combination : combinations) {
+        for (Object[] combination : combinations) {
             d.of((long) combination[0], (long) combination[1], (long) combination[2], (long) combination[3], 0);
             Assert.assertEquals("Expected " + d + " to fit in a byte", combination[4], d.fitsInStorageSizePow2(0));
             Assert.assertEquals("Expected " + d + " to fit in a short", combination[5], d.fitsInStorageSizePow2(1));
