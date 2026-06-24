@@ -72,11 +72,11 @@ jobs:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
 
-      - name: Set up Java 11
+      - name: Set up Java 8
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
-          java-version: "11"
+          java-version: "8"
           cache: maven
 
       - name: Resolve versions and guard against re-release
@@ -168,11 +168,11 @@ jobs:
           ref: ${{ needs.resolve.outputs.source_sha }}
           submodules: true
 
-      - name: Set up Java 11
+      - name: Set up Java 8
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
-          java-version: "11"
+          java-version: "8"
 
       - name: Install toolchains
         run: |
@@ -256,13 +256,15 @@ jobs:
           tar -zxf cmake-3.29.2-linux-x86_64.tar.gz
           echo "PATH=$(pwd)/cmake-3.29.2-linux-x86_64/bin/:$PATH" >> "$GITHUB_ENV"
 
-      - name: Install GraalVM JDK 25
+      - name: Install Temurin JDK 8
         run: |
-          # TODO(pin): replace /25/latest/ with an exact GraalVM build URL and verify a sha256.
-          wget -nv -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz
-          mkdir graalvm
-          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
-          echo "JAVA_HOME=$(pwd)/graalvm" >> "$GITHUB_ENV"
+          # Build the native lib against the Java 8 JNI headers -- JDK 8 is the artifact's
+          # floor. The Adoptium "latest GA" redirect tracks the newest 8u release.
+          # TODO(pin): pin to an exact Temurin 8u build URL and verify a sha256.
+          wget -nv -O jdk8.tar.gz https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jdk/hotspot/normal/eclipse
+          mkdir jdk8
+          tar xfz jdk8.tar.gz -C jdk8 --strip-components=1
+          echo "JAVA_HOME=$(pwd)/jdk8" >> "$GITHUB_ENV"
 
       - name: Build native library
         run: |
@@ -320,13 +322,15 @@ jobs:
           yum update -y
           yum install wget nasm zstd -y
 
-      - name: Install GraalVM JDK 25
+      - name: Install Temurin JDK 8
         run: |
-          # TODO(pin): replace /25/latest/ with an exact GraalVM build URL and verify a sha256.
-          wget -v --timeout=180 -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-aarch64_bin.tar.gz
-          mkdir graalvm
-          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
-          echo "JAVA_HOME=$(pwd)/graalvm" >> "$GITHUB_ENV"
+          # Build the native lib against the Java 8 JNI headers -- JDK 8 is the artifact's
+          # floor. The Adoptium "latest GA" redirect tracks the newest 8u release.
+          # TODO(pin): pin to an exact Temurin 8u build URL and verify a sha256.
+          wget -v --timeout=180 -O jdk8.tar.gz https://api.adoptium.net/v3/binary/latest/8/ga/linux/aarch64/jdk/hotspot/normal/eclipse
+          mkdir jdk8
+          tar xfz jdk8.tar.gz -C jdk8 --strip-components=1
+          echo "JAVA_HOME=$(pwd)/jdk8" >> "$GITHUB_ENV"
 
       - name: Build native library
         run: |
@@ -382,19 +386,21 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y nasm gcc-mingw-w64 g++-mingw-w64
 
-      - name: Install GraalVM JDK 25
+      - name: Install Temurin JDK 8
         run: |
-          # TODO(pin): replace /25/latest/ with an exact GraalVM build URL and verify a sha256.
-          wget -nv -O graalvm.tar.gz https://download.oracle.com/graalvm/25/latest/graalvm-jdk-25_linux-x64_bin.tar.gz
-          mkdir graalvm
-          tar xfz graalvm.tar.gz -C graalvm --strip-components=1
-          echo "JAVA_HOME=$(pwd)/graalvm" >> "$GITHUB_ENV"
+          # Host JDK only supplies the shared JNI header (jni.h); the Windows-specific
+          # jni_md.h is fetched below. JDK 8 is the artifact's floor.
+          # TODO(pin): pin to an exact Temurin 8u build URL and verify a sha256.
+          wget -nv -O jdk8.tar.gz https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jdk/hotspot/normal/eclipse
+          mkdir jdk8
+          tar xfz jdk8.tar.gz -C jdk8 --strip-components=1
+          echo "JAVA_HOME=$(pwd)/jdk8" >> "$GITHUB_ENV"
 
-      - name: Download Windows jni_md.h from JDK 25
+      - name: Download Windows jni_md.h from JDK 8
         run: |
           cd core
-          # TODO(pin): pin to a jdk25u tag/commit instead of the moving `master` branch.
-          curl -fsSL https://raw.githubusercontent.com/openjdk/jdk25u/master/src/java.base/windows/native/include/jni_md.h > "$JAVA_HOME/include/jni_md.h"
+          # TODO(pin): pin to a jdk8u tag/commit instead of the moving `master` branch.
+          curl -fsSL https://raw.githubusercontent.com/openjdk/jdk8u/master/jdk/src/windows/javavm/export/jni_md.h > "$JAVA_HOME/include/jni_md.h"
 
       - name: Build native library
         run: |
@@ -443,11 +449,11 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
 
-      - name: Set up Java 11
+      - name: Set up Java 8
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
-          java-version: "11"
+          java-version: "8"
           cache: maven
 
       - name: Download native artifacts
@@ -537,11 +543,11 @@ jobs:
             exit 1
           fi
 
-      - name: Set up Java 11
+      - name: Set up Java 8
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
-          java-version: "11"
+          java-version: "8"
           cache: maven
 
       - name: Download native artifacts
@@ -741,11 +747,11 @@ jobs:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
 
-      - name: Set up Java 11
+      - name: Set up Java 8
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
-          java-version: "11"
+          java-version: "8"
           cache: maven
 
       - name: Open next-development-version bump PR
