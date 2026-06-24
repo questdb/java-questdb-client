@@ -194,6 +194,7 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost;pass=foo;", "password is configured, but username is missing");
             assertConfStrError("http::addr=localhost;password=foo;", "password is configured, but username is missing");
             assertConfStrError("http::addr=localhost;auth=Bearer xyz;", "unknown configuration key [key=auth]");
+            assertConfStrError("http::addr=localhost;path=/read/v1;", "unknown configuration key [key=path]");
             assertConfStrError("tcp::addr=localhost;pass=foo;", "password is not supported for TCP protocol");
             assertConfStrError("tcp::addr=localhost;password=foo;", "password is not supported for TCP protocol");
             assertConfStrError("tcp::addr=localhost;retry_timeout=;", "retry_timeout cannot be empty");

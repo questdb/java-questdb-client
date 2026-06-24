@@ -3518,8 +3518,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * config without constructing a Sender. Shared by {@link #fromConfigWebSocket}
          * and the {@code QuestDB} facade's fail-fast build path. {@code tls} is true
          * for the {@code wss} schema. Mirrors the decisions the fluent build path
-         * makes (including its leniencies -- {@code username} without
-         * {@code password} does not throw).
+         * makes, so the ingress and egress sides reject the same config with the
+         * same message.
          */
         static void validateWsConfig(ConfigView view, boolean tls) {
             view.getHostPorts("addr", DEFAULT_WEBSOCKET_PORT, (host, port) -> {
@@ -3530,8 +3530,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             String user = view.getStr("username");
             String password = view.getStr("password");
             String token = view.getStr("token");
-            if (user == null && password != null) {
-                throw new IllegalArgumentException("password is configured, but username is missing");
+            // Basic auth needs both halves; reject either half alone with the same
+            // message the egress QwpQueryClient uses, so a shared ws/wss string
+            // fails identically on both sides.
+            if ((user == null) != (password == null)) {
+                throw new IllegalArgumentException("username and password must be provided together");
             }
             if (token != null && (user != null || password != null)) {
                 throw new IllegalArgumentException("cannot use both token and username/password authentication");
@@ -3595,7 +3598,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("auto_flush_rows", autoFlushRows);
             m.put("auto_flush_bytes", autoFlushBytes);
             m.put("auto_flush_interval", autoFlushIntervalMillis);
-            m.put("auto_flush_disabled", autoFlushRows == AUTO_FLUSH_DISABLED);
             m.put("max_name_len", maxNameLength);
             m.put("transaction", transactional);
             m.put("request_durable_ack", requestDurableAck);

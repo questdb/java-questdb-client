@@ -25,6 +25,7 @@
 package io.questdb.client.test;
 
 import io.questdb.client.QuestDB;
+import io.questdb.client.QuestDBBuilder;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -38,13 +39,15 @@ public class QuestDBBuilderTest {
         // A pool key carried in the string is overridden by a later explicit
         // builder call (last-write-wins). min=0 so build() does only parse-only
         // validation -- nothing connects.
-        try (QuestDB ignored = QuestDB.builder()
+        QuestDBBuilder b = QuestDB.builder()
                 .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=2;"
                         + "query_pool_min=0;query_pool_max=2;acquire_timeout_ms=10000;")
-                .acquireTimeoutMillis(150)
-                .build()) {
+                .acquireTimeoutMillis(150);
+        try (QuestDB ignored = b.build()) {
             Assert.assertNotNull(ignored);
         }
+        // The explicit acquireTimeoutMillis(150) wins over the string's 10000.
+        Assert.assertEquals(150L, b.poolConfigSnapshotForTest().get("acquire_timeout_ms"));
     }
 
     @Test
@@ -128,21 +131,25 @@ public class QuestDBBuilderTest {
     public void testExplicitPoolKeyWinsOverConflictingStrings() {
         // The two strings disagree on acquire_timeout_ms, but an explicit builder
         // call sets it: explicit wins and the conflict check is skipped, whether
-        // the explicit call comes after or before the config strings.
-        try (QuestDB ignored = QuestDB.builder()
+        // the explicit call comes after or before the config strings. The resolved
+        // value is the explicit 500, not either string's value.
+        QuestDBBuilder after = QuestDB.builder()
                 .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;acquire_timeout_ms=1000;")
                 .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;")
-                .acquireTimeoutMillis(500)
-                .build()) {
+                .acquireTimeoutMillis(500);
+        try (QuestDB ignored = after.build()) {
             Assert.assertNotNull(ignored);
         }
-        try (QuestDB ignored = QuestDB.builder()
+        Assert.assertEquals(500L, after.poolConfigSnapshotForTest().get("acquire_timeout_ms"));
+
+        QuestDBBuilder before = QuestDB.builder()
                 .acquireTimeoutMillis(500)
                 .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;acquire_timeout_ms=1000;")
-                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;")
-                .build()) {
+                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;");
+        try (QuestDB ignored = before.build()) {
             Assert.assertNotNull(ignored);
         }
+        Assert.assertEquals(500L, before.poolConfigSnapshotForTest().get("acquire_timeout_ms"));
     }
 
     @Test
@@ -173,16 +180,18 @@ public class QuestDBBuilderTest {
         // Sender -- yet it must still reject a malformed ingest config up front,
         // matching the egress side. Covers a typed enum (tls_verify), a
         // registry-STRING value that only the real Sender parse validates
-        // (auto_flush_rows), and two WebSocket build-time checks that only the
-        // full no-connect validation reaches (auto_flush_interval=off disables
-        // auto-flush, and sf_durability=flush is not yet supported -- the
-        // WebSocket transport rejects both).
+        // (auto_flush_rows), and WebSocket build-time checks that only the full
+        // no-connect validation reaches: auto_flush=off and auto_flush_interval=off
+        // both disable auto-flush (unsupported on WebSocket), and sf_durability=flush
+        // is not yet supported.
         assertIngressBuildRejected(
                 "wss::addr=127.0.0.1:1;tls_verify=strict;sender_pool_min=0;sender_pool_max=2;", "tls_verify");
         assertIngressBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;sender_pool_max=2;", "auto_flush_rows");
         assertIngressBuildRejected(
                 "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;sender_pool_max=2;", "auto-flush");
+        assertIngressBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush=off;sender_pool_min=0;sender_pool_max=2;", "auto-flush");
         assertIngressBuildRejected(
                 "ws::addr=127.0.0.1:1;sf_durability=flush;sender_pool_min=0;sender_pool_max=2;", "not yet supported");
     }

@@ -514,10 +514,10 @@ public class QwpQueryClient implements QuietCloseable {
         }
         boolean hasBasic = username != null || password != null;
         if (hasBasic && (username == null || password == null)) {
-            throw new IllegalArgumentException("both username and password must be provided together");
+            throw new IllegalArgumentException("username and password must be provided together");
         }
         if (hasBasic && token != null) {
-            throw new IllegalArgumentException("username/password and token are mutually exclusive");
+            throw new IllegalArgumentException("cannot use both token and username/password authentication");
         }
         String tlsVerify = view.getStr("tls_verify");
         String tlsRoots = view.getStr("tls_roots");

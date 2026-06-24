@@ -38,28 +38,24 @@ import java.util.Set;
 /**
  * Proves every ingress (and ingress-applied COMMON) key read from a {@code ws}/
  * {@code wss} config string is actually applied to the WebSocket Sender -- not
- * merely accepted. {@link #testHonoredCasesCoverEveryIngressRegistryKey} fails
- * if a registry key gains coverage drift (a new key with no honored case).
+ * merely accepted. {@link #testEveryIngressKeyIsHonored} ends with a drift guard,
+ * driven by the keys the assertions themselves record, that fails if a registry
+ * ingress key has no honored assertion.
  */
 public class WsSenderConfigHonoredTest {
 
-    private static final Set<String> COVERED = new HashSet<>(Arrays.asList(
-            "auto_flush", "auto_flush_rows", "auto_flush_bytes", "auto_flush_interval",
-            "max_name_len", "transaction", "request_durable_ack", "sender_id", "sf_dir",
-            "sf_max_bytes", "sf_max_total_bytes", "sf_durability", "sf_append_deadline_millis",
-            "close_flush_timeout_millis", "durable_ack_keepalive_interval_millis",
-            "initial_connect_retry", "reconnect_max_duration_millis", "reconnect_initial_backoff_millis",
-            "reconnect_max_backoff_millis", "drain_orphans", "max_background_drainers",
-            "error_inbox_capacity", "connection_listener_inbox_capacity",
-            "token", "auth_timeout_ms", "username", "password", "tls_verify", "tls_roots", "tls_roots_password"
-    ));
+    private final Set<String> honored = new HashSet<>();
 
     @Test
     public void testEveryIngressKeyIsHonored() {
         assertHonored("auto_flush_rows=7", "auto_flush_rows", 7);
         assertHonored("auto_flush_bytes=8192", "auto_flush_bytes", 8192);
         assertHonored("auto_flush_interval=250", "auto_flush_interval", 250);
-        assertHonored("auto_flush=off", "auto_flush_disabled", true);
+        // auto_flush=off reaches disableAutoFlush(), which sets the interval to
+        // MAX_VALUE; auto_flush_rows=off leaves the interval unset, so this field
+        // distinguishes the two. That config is build-rejected on WebSocket; see
+        // QuestDBBuilderTest.testMalformedIngressConfigRejectedAtBuildWithMinZero.
+        assertHonored("auto_flush=off", "auto_flush_interval", Integer.MAX_VALUE);
         assertHonored("max_name_len=99", "max_name_len", 99);
         assertHonored("transaction=on", "transaction", true);
         assertHonored("request_durable_ack=on", "request_durable_ack", true);
@@ -89,16 +85,19 @@ public class WsSenderConfigHonoredTest {
         Map<String, Object> aliasCreds = snapshot("ws::addr=h:9000;user=bob;pass=pw;");
         Assert.assertEquals("bob", aliasCreds.get("username"));
         Assert.assertEquals("pw", aliasCreds.get("password"));
+        markHonored("username", "password");
 
         // tls keys require wss; tls_roots must be paired with its password.
         assertHonoredWss("tls_verify=unsafe_off", "tls_verify", "INSECURE");
         Map<String, Object> tls = snapshot("wss::addr=h:9000;tls_roots=/ca.p12;tls_roots_password=pw;");
         Assert.assertEquals("/ca.p12", tls.get("tls_roots"));
         Assert.assertEquals("pw", tls.get("tls_roots_password"));
-    }
+        markHonored("tls_roots", "tls_roots_password");
 
-    @Test
-    public void testHonoredCasesCoverEveryIngressRegistryKey() {
+        // Drift guard: every ingress-applied registry key must have an assertion
+        // above. The honored set is populated by the assertions themselves, so
+        // deleting one trips this -- unlike a hand-maintained list, it cannot
+        // silently drift from what is actually asserted.
         for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
             if (!spec.name().equals(spec.canonical())) {
                 continue; // alias (user/pass) -- covered via its canonical key
@@ -108,20 +107,30 @@ public class WsSenderConfigHonoredTest {
             boolean ingressApplied = spec.side() == Side.INGRESS
                     || (spec.side() == Side.COMMON && !spec.name().equals("addr"));
             if (ingressApplied) {
-                Assert.assertTrue("registry ingress key '" + spec.name() + "' has no honored case",
-                        COVERED.contains(spec.name()));
+                Assert.assertTrue("registry ingress key '" + spec.name() + "' has no honored assertion",
+                        honored.contains(spec.name()));
             }
         }
     }
 
-    private static void assertHonored(String kv, String snapKey, Object expected) {
+    private void assertHonored(String kv, String snapKey, Object expected) {
+        markHonored(keyOf(kv));
         Assert.assertEquals("config '" + kv + "' not honored at '" + snapKey + "'",
                 expected, snapshot("ws::addr=h:9000;" + kv + ";").get(snapKey));
     }
 
-    private static void assertHonoredWss(String kv, String snapKey, Object expected) {
+    private void assertHonoredWss(String kv, String snapKey, Object expected) {
+        markHonored(keyOf(kv));
         Assert.assertEquals("config '" + kv + "' not honored at '" + snapKey + "'",
                 expected, snapshot("wss::addr=h:9000;" + kv + ";").get(snapKey));
+    }
+
+    private void markHonored(String... keys) {
+        honored.addAll(Arrays.asList(keys));
+    }
+
+    private static String keyOf(String kv) {
+        return kv.substring(0, kv.indexOf('='));
     }
 
     private static Map<String, Object> snapshot(String cfg) {

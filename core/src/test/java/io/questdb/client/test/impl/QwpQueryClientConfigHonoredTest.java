@@ -42,24 +42,13 @@ import java.util.Set;
  * Proves every egress key read from a {@code ws}/{@code wss} config string is
  * actually applied to the {@code QwpQueryClient} -- not merely accepted. The
  * COMMON credential keys are verified via the synthesized Authorization header,
- * the COMMON TLS keys via the trust-store snapshot.
- * {@link #testHonoredCasesCoverEveryEgressRegistryKey} guards against drift.
+ * the COMMON TLS keys via the trust-store snapshot. {@link #testEveryEgressKeyIsHonored}
+ * ends with a drift guard, driven by the keys the assertions record, that fails
+ * if a registry egress key has no honored assertion.
  */
 public class QwpQueryClientConfigHonoredTest {
 
-    // Every EGRESS key plus the COMMON keys the egress client applies
-    // (credentials, TLS, auth_timeout_ms). addr is COMMON but HOST_PORT_LIST --
-    // applied as the endpoint list rather than a snapshot value -- so it is
-    // excluded, matching the guard formula in
-    // testHonoredCasesCoverEveryEgressRegistryKey.
-    private static final Set<String> COVERED = new HashSet<>(Arrays.asList(
-            "target", "failover", "failover_max_attempts", "failover_backoff_initial_ms",
-            "failover_backoff_max_ms", "failover_max_duration_ms", "max_batch_rows",
-            "initial_credit", "buffer_pool_size", "compression", "compression_level",
-            "client_id", "zone",
-            "username", "password", "token", "tls_verify", "tls_roots", "tls_roots_password",
-            "auth_timeout_ms"
-    ));
+    private final Set<String> honored = new HashSet<>();
 
     @Test
     public void testEveryEgressKeyIsHonored() {
@@ -85,6 +74,7 @@ public class QwpQueryClientConfigHonoredTest {
         Assert.assertEquals(basic, snapshot("ws::addr=h:9000;username=alice;password=secret;").get("authorization_header"));
         Assert.assertEquals(basic, snapshot("ws::addr=h:9000;user=alice;pass=secret;").get("authorization_header"));
         Assert.assertEquals("Bearer ey.abc", snapshot("ws::addr=h:9000;token=ey.abc;").get("authorization_header"));
+        markHonored("username", "password", "token");
 
         // COMMON TLS keys applied by egress (require the wss schema). tls_verify
         // drives the validation mode; tls_roots/tls_roots_password set the trust
@@ -94,10 +84,12 @@ public class QwpQueryClientConfigHonoredTest {
         Map<String, Object> tls = snapshot("wss::addr=h:9000;tls_roots=/ca.p12;tls_roots_password=pw;");
         Assert.assertEquals("/ca.p12", tls.get("tls_roots"));
         Assert.assertEquals("pw", tls.get("tls_roots_password"));
-    }
+        markHonored("tls_verify", "tls_roots", "tls_roots_password");
 
-    @Test
-    public void testHonoredCasesCoverEveryEgressRegistryKey() {
+        // Drift guard: every egress-applied registry key must have an assertion
+        // above. The honored set is populated by the assertions themselves, so
+        // deleting one trips this -- unlike a hand-maintained list, it cannot
+        // silently drift from what is actually asserted.
         for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
             if (!spec.name().equals(spec.canonical())) {
                 continue; // alias (user/pass) -- covered via its canonical key
@@ -108,15 +100,24 @@ public class QwpQueryClientConfigHonoredTest {
             boolean egressApplied = spec.side() == Side.EGRESS
                     || (spec.side() == Side.COMMON && !spec.name().equals("addr"));
             if (egressApplied) {
-                Assert.assertTrue("registry egress key '" + spec.name() + "' has no honored case",
-                        COVERED.contains(spec.name()));
+                Assert.assertTrue("registry egress key '" + spec.name() + "' has no honored assertion",
+                        honored.contains(spec.name()));
             }
         }
     }
 
-    private static void assertHonored(String kv, String snapKey, Object expected) {
+    private void assertHonored(String kv, String snapKey, Object expected) {
+        markHonored(keyOf(kv));
         Assert.assertEquals("config '" + kv + "' not honored at '" + snapKey + "'",
                 expected, snapshot("ws::addr=h:9000;" + kv + ";").get(snapKey));
+    }
+
+    private void markHonored(String... keys) {
+        honored.addAll(Arrays.asList(keys));
+    }
+
+    private static String keyOf(String kv) {
+        return kv.substring(0, kv.indexOf('='));
     }
 
     private static Map<String, Object> snapshot(String cfg) {

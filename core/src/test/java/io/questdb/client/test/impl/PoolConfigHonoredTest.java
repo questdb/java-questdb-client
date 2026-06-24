@@ -31,10 +31,8 @@ import io.questdb.client.impl.Side;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.util.Arrays;
-import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Proves every POOL key carried in a {@code ws}/{@code wss} connect string is
@@ -44,35 +42,40 @@ import java.util.Set;
  */
 public class PoolConfigHonoredTest {
 
-    private static final Set<String> COVERED = new HashSet<>(Arrays.asList(
-            "sender_pool_min", "sender_pool_max", "query_pool_min", "query_pool_max",
-            "acquire_timeout_ms", "idle_timeout_ms", "max_lifetime_ms", "housekeeper_interval_ms"
-    ));
-
     @Test
     public void testEveryPoolKeyIsHonored() {
-        String cfg = "ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=7;query_pool_min=0;query_pool_max=5;"
-                + "acquire_timeout_ms=1234;idle_timeout_ms=4321;max_lifetime_ms=98765;housekeeper_interval_ms=222;";
-        QuestDBBuilder b = QuestDB.builder().fromConfig(cfg);
-        // min=0 -> build() resolves the pool keys but pre-warms/connects nothing.
-        b.build().close();
-        Map<String, Object> snap = b.poolConfigSnapshotForTest();
-        Assert.assertEquals(0, snap.get("sender_pool_min"));
-        Assert.assertEquals(7, snap.get("sender_pool_max"));
-        Assert.assertEquals(0, snap.get("query_pool_min"));
-        Assert.assertEquals(5, snap.get("query_pool_max"));
-        Assert.assertEquals(1234L, snap.get("acquire_timeout_ms"));
-        Assert.assertEquals(4321L, snap.get("idle_timeout_ms"));
-        Assert.assertEquals(98765L, snap.get("max_lifetime_ms"));
-        Assert.assertEquals(222L, snap.get("housekeeper_interval_ms"));
-    }
+        // Drive both the value assertions and the drift guard from one map, so the
+        // coverage check cannot drift from what is actually asserted. min=0 keys
+        // let build() resolve the pool keys without pre-warming/connecting. Pool
+        // sizes resolve to int, the timeouts to long (the snapshot's boxed types).
+        Map<String, Object> expected = new LinkedHashMap<>();
+        expected.put("sender_pool_min", 0);
+        expected.put("sender_pool_max", 7);
+        expected.put("query_pool_min", 0);
+        expected.put("query_pool_max", 5);
+        expected.put("acquire_timeout_ms", 1234L);
+        expected.put("idle_timeout_ms", 4321L);
+        expected.put("max_lifetime_ms", 98765L);
+        expected.put("housekeeper_interval_ms", 222L);
 
-    @Test
-    public void testHonoredCasesCoverEveryPoolRegistryKey() {
+        StringBuilder cfg = new StringBuilder("ws::addr=127.0.0.1:1;");
+        for (Map.Entry<String, Object> e : expected.entrySet()) {
+            cfg.append(e.getKey()).append('=').append(e.getValue()).append(';');
+        }
+        QuestDBBuilder b = QuestDB.builder().fromConfig(cfg.toString());
+        b.build().close();
+
+        Map<String, Object> snap = b.poolConfigSnapshotForTest();
+        for (Map.Entry<String, Object> e : expected.entrySet()) {
+            Assert.assertEquals("pool key '" + e.getKey() + "' not honored", e.getValue(), snap.get(e.getKey()));
+        }
+
+        // Drift guard: every POOL registry key must appear in the map that drove
+        // the assertions above, so a new pool key with no assertion trips this.
         for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
             if (spec.side() == Side.POOL) {
-                Assert.assertTrue("registry pool key '" + spec.name() + "' has no honored case",
-                        COVERED.contains(spec.name()));
+                Assert.assertTrue("registry pool key '" + spec.name() + "' has no honored assertion",
+                        expected.containsKey(spec.name()));
             }
         }
     }

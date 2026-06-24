@@ -926,10 +926,31 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testWsConfigString_usernameWithoutPassword_fails() {
-        // The ingress ws path rejects a username with no password
-        // (httpUsernamePassword requires a non-blank password), matching the
-        // egress QwpQueryClient so a shared ws/wss string fails on both sides.
-        assertBadConfig("ws::addr=localhost:9000;username=alice;", "password cannot be empty nor null");
+        // The ingress ws path rejects a username with no password up front in
+        // validateWsConfig, with the same message the egress QwpQueryClient uses,
+        // so a shared ws/wss string fails identically on both sides.
+        assertBadConfig("ws::addr=localhost:9000;username=alice;", "username and password must be provided together");
+    }
+
+    @Test
+    public void testWsConfigString_passwordWithoutUsername_fails() {
+        // The reverse half-credential is rejected with the same message.
+        assertBadConfig("ws::addr=localhost:9000;password=secret;", "username and password must be provided together");
+    }
+
+    @Test
+    public void testWsConfigString_tokenWithBasicAuth_fails() {
+        // token and username/password are mutually exclusive on the ingress side.
+        assertBadConfig("ws::addr=localhost:9000;token=ey.abc;username=alice;password=secret;",
+                "cannot use both token and username/password authentication");
+    }
+
+    @Test
+    public void testWsConfigString_tlsKeysOnNonTlsSchema_fails() {
+        // tls_verify/tls_roots/tls_roots_password require the wss schema; on a
+        // plain ws string validateWsConfig rejects them.
+        assertBadConfig("ws::addr=localhost:9000;tls_verify=on;", "require the wss:: schema");
+        assertBadConfig("ws::addr=localhost:9000;tls_roots=/ca.p12;", "require the wss:: schema");
     }
 
     @Test

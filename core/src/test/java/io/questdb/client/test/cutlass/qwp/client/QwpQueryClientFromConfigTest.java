@@ -273,7 +273,7 @@ public class QwpQueryClientFromConfigTest {
     public void testBasicAuthAndTokenMutuallyExclusive() {
         assertReject(
                 "ws::addr=db:9000;username=admin;password=quest;token=ey.xyz;",
-                "username/password and token are mutually exclusive"
+                "cannot use both token and username/password authentication"
         );
     }
 
@@ -300,7 +300,7 @@ public class QwpQueryClientFromConfigTest {
     public void testBasicAuthWithPasswordOnlyRejected() {
         assertReject(
                 "ws::addr=db:9000;password=quest;",
-                "both username and password must be provided together"
+                "username and password must be provided together"
         );
     }
 
@@ -308,7 +308,7 @@ public class QwpQueryClientFromConfigTest {
     public void testBasicAuthWithUsernameOnlyRejected() {
         assertReject(
                 "ws::addr=db:9000;username=admin;",
-                "both username and password must be provided together"
+                "username and password must be provided together"
         );
     }
 
@@ -330,7 +330,7 @@ public class QwpQueryClientFromConfigTest {
         // user is an alias of username, so user-alone trips the both-or-neither rule.
         assertReject(
                 "ws::addr=db:9000;user=alice;",
-                "both username and password must be provided together"
+                "username and password must be provided together"
         );
     }
 
@@ -338,7 +338,7 @@ public class QwpQueryClientFromConfigTest {
     public void testPassAliasAloneRejected() {
         assertReject(
                 "ws::addr=db:9000;pass=secret;",
-                "both username and password must be provided together"
+                "username and password must be provided together"
         );
     }
 
