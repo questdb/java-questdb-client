@@ -171,7 +171,11 @@ jobs:
       - name: Set up Java 8
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
-          distribution: temurin
+          # Temurin publishes no macOS/aarch64 8u, which fails the darwin-aarch64
+          # (macos-14) leg; Zulu ships both macOS aarch64 and x64 8u. The macOS
+          # jni_md.h is ABI-identical across vendors, so building the native lib
+          # against Zulu's JDK 8 headers matches the artifact's Java 8 floor.
+          distribution: zulu
           java-version: "8"
 
       - name: Install toolchains
