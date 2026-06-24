@@ -218,7 +218,6 @@ public class QwpWebSocketSender implements Sender {
     private SenderErrorHandler errorHandler = DefaultSenderErrorHandler.INSTANCE;
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
-    private boolean gorillaEnabled = true;
     private boolean hasDeferredMessages;
     // Stickys true once any successful connect has happened. Drives the
     // CONNECTED-vs-RECONNECTED-vs-FAILED_OVER classification at the success
@@ -540,7 +539,7 @@ public class QwpWebSocketSender implements Sender {
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS, true);
+                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS);
     }
 
     /**
@@ -569,8 +568,7 @@ public class QwpWebSocketSender implements Sender {
             SenderErrorHandler errorHandler,
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
-            long authTimeoutMs,
-            boolean gorillaEnabled
+            long authTimeoutMs
     ) {
         return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, authorizationHeader,
@@ -578,7 +576,7 @@ public class QwpWebSocketSender implements Sender {
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, authTimeoutMs, gorillaEnabled,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs,
                 null, SenderConnectionDispatcher.DEFAULT_CAPACITY);
     }
 
@@ -604,7 +602,6 @@ public class QwpWebSocketSender implements Sender {
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
             long authTimeoutMs,
-            boolean gorillaEnabled,
             SenderConnectionListener connectionListener,
             int connectionListenerInboxCapacity
     ) {
@@ -616,8 +613,6 @@ public class QwpWebSocketSender implements Sender {
         try {
             sender.requestDurableAck = requestDurableAck;
             sender.authTimeoutMs = authTimeoutMs;
-            sender.gorillaEnabled = gorillaEnabled;
-            sender.encoder.setGorillaEnabled(gorillaEnabled);
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -1839,13 +1834,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns whether Gorilla encoding is enabled.
-     */
-    public boolean isGorillaEnabled() {
-        return gorillaEnabled;
-    }
-
-    /**
      * Adds a LONG256 column value to the current row.
      *
      * @param columnName the column name
@@ -2074,14 +2062,6 @@ public class QwpWebSocketSender implements Sender {
                     + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
         }
         this.errorInboxCapacity = capacity;
-    }
-
-    /**
-     * Sets whether to use Gorilla timestamp encoding.
-     */
-    public void setGorillaEnabled(boolean enabled) {
-        this.gorillaEnabled = enabled;
-        this.encoder.setGorillaEnabled(enabled);
     }
 
     public void setTransactional(boolean transactional) {

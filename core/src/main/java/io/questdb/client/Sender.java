@@ -39,6 +39,8 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.impl.ConfStringParser;
+import io.questdb.client.impl.ConfigString;
+import io.questdb.client.impl.ConfigView;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
 import io.questdb.client.std.Chars;
@@ -53,6 +55,7 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import io.questdb.client.std.str.StringSink;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.TestOnly;
 
 import javax.security.auth.DestroyFailedException;
 import java.io.Closeable;
@@ -1038,7 +1041,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Bounded inbox capacity for the async error dispatcher.
         // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
         private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean gorillaEnabled = true;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1402,16 +1404,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     );
                 }
 
-                // Cursor is the only async ingest path. Setting sfDir enables
-                // store-and-forward (mmap'd, recoverable across sender restarts);
-                // omitting it gives memory-only mode (same lock-free architecture,
-                // no disk involvement). sf_durability != memory is a planned
-                // feature; throw today instead of silently downgrading.
-                if (sfDurability != SfDurability.MEMORY) {
-                    throw new LineSenderException(
-                            "sf_durability=" + sfDurability.name().toLowerCase()
-                                    + " is not yet supported (deferred follow-up; use sf_durability=memory)");
-                }
+                // Setting sfDir enables store-and-forward (mmap'd, recoverable
+                // across sender restarts); omitting it gives memory-only mode
+                // (same lock-free architecture, no disk involvement). The
+                // sf_durability != memory rejection lives in validateParameters
+                // so it is reached by build() and by no-connect validation alike.
                 long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
                         ? DEFAULT_SEGMENT_BYTES
                         : sfMaxBytes;
@@ -1534,7 +1531,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
                             authTimeoutMillis,
-                            gorillaEnabled,
                             connectionListener,
                             actualConnectionListenerInboxCapacity
                     );
@@ -1890,14 +1886,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
             }
             this.errorInboxCapacity = capacity;
-            return this;
-        }
-
-        public LineSenderBuilder gorilla(boolean enabled) {
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("gorilla is only supported for WebSocket transport");
-            }
-            this.gorillaEnabled = enabled;
             return this;
         }
 
@@ -2874,6 +2862,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             ports.add(effectivePort);
         }
 
+        private void appendAddress(String host, int port) {
+            hosts.add(host);
+            ports.add(port);
+        }
+
         private String buildWebSocketAuthHeader() {
             if (username != null && password != null) {
                 String credentials = username + ":" + password;
@@ -2950,26 +2943,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (pos < 0) {
                 throw new LineSenderException("invalid configuration string: ").put(sink);
             }
-            if (protocol != PARAMETER_NOT_SET_EXPLICITLY) {
-                String protocolName;
-                switch (protocol) {
-                    case PROTOCOL_HTTP:
-                        protocolName = "http";
-                        break;
-                    case PROTOCOL_UDP:
-                        protocolName = "udp";
-                        break;
-                    case PROTOCOL_WEBSOCKET:
-                        protocolName = "websocket";
-                        break;
-                    default:
-                        protocolName = "tcp";
-                        break;
-                }
-                throw new LineSenderException("protocol was already configured ")
-                        .put("[protocol=")
-                        .put(protocolName).put("]");
-            }
             if (Chars.equals("http", sink)) {
                 if (tlsEnabled) {
                     throw new LineSenderException("cannot use http protocol when TLS is enabled. use https instead");
@@ -3000,6 +2973,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("TLS is not supported for UDP");
             } else {
                 throw new LineSenderException("invalid schema [schema=").put(sink).put(", supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
+            }
+
+            if (protocol == PROTOCOL_WEBSOCKET) {
+                return fromConfigWebSocket(configurationString);
             }
 
             String tcpToken = null;
@@ -3265,18 +3242,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "auth_timeout_ms");
                     authTimeoutMillis(parseLongValue(sink, "auth_timeout_ms"));
-                } else if (Chars.equals("gorilla", sink)) {
-                    if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("gorilla is only supported for WebSocket transport");
-                    }
-                    pos = getValue(configurationString, pos, sink, "gorilla");
-                    if (Chars.equals("on", sink) || Chars.equals("true", sink)) {
-                        gorilla(true);
-                    } else if (Chars.equals("off", sink) || Chars.equals("false", sink)) {
-                        gorilla(false);
-                    } else {
-                        throw new LineSenderException("invalid gorilla [value=").put(sink).put(", allowed=[on, off]]");
-                    }
                 } else if (Chars.equals("durable_ack_keepalive_interval_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException(
@@ -3366,8 +3331,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // zone-blind (pinned to v1) and silently accepts the key so
                     // the same connect string works on both sides.
                     pos = getValue(configurationString, pos, sink, "zone");
-                } else if (Chars.equals("auth", sink)
-                        || Chars.equals("buffer_pool_size", sink)
+                } else if (Chars.equals("buffer_pool_size", sink)
                         || Chars.equals("client_id", sink)
                         || Chars.equals("compression", sink)
                         || Chars.equals("compression_level", sink)
@@ -3378,7 +3342,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         || Chars.equals("failover_max_duration_ms", sink)
                         || Chars.equals("initial_credit", sink)
                         || Chars.equals("max_batch_rows", sink)
-                        || Chars.equals("path", sink)
                         || Chars.equals("target", sink)) {
                     // connect-string.md "Query client keys" and "Multi-host failover":
                     // these keys configure the QwpQueryClient (egress) only. The
@@ -3390,10 +3353,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // genuine value-parse error names the offending key.
                     String egressKey = Chars.toString(sink);
                     pos = getValue(configurationString, pos, sink, egressKey);
-                } else if (Chars.equals("in_flight_window", sink)) {
-                    // Accepted as a no-op for backward compatibility. The
-                    // store-and-forward mechanism replaces the in-flight window.
-                    pos = getValue(configurationString, pos, sink, "in_flight_window");
+                } else if (Chars.equals("on_internal_error", sink)
+                        || Chars.equals("on_parse_error", sink)
+                        || Chars.equals("on_schema_error", sink)
+                        || Chars.equals("on_security_error", sink)
+                        || Chars.equals("on_server_error", sink)
+                        || Chars.equals("on_write_error", sink)) {
+                    // connect-string.md "Error handling": the on_*_error keys select
+                    // the per-category error policy. The spec reserves them and
+                    // directs new client implementations to accept them in the
+                    // connect string. The Sender does not wire them to a policy yet,
+                    // so it consumes them as an accepted no-op rather than rejecting
+                    // them. Capture the key name before getValue clears the sink so a
+                    // genuine value-parse error names the offending key.
+                    String reservedKey = Chars.toString(sink);
+                    pos = getValue(configurationString, pos, sink, reservedKey);
                 } else {
                     // sf-client.md §4.6: parser must reject unknown keys.
                     // Forward-compat is via the spec, not silent ignore — silent
@@ -3425,6 +3399,314 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
             }
             return this;
+        }
+
+        /**
+         * Configures the WebSocket (QWP) ingress path from a {@code ws}/{@code wss}
+         * connect string, driven by {@link ConfigView} over the {@link ConfigSchema} registry.
+         * The reject pass surfaces unknown keys (with a relocated-key hint for
+         * legacy http/tcp/udp keys); {@link #validateWsConfig} runs the cross-key
+         * checks; the rest applies through the existing fluent setters, feeding
+         * the {@code PROTOCOL_WEBSOCKET} build path. Duplicate keys resolve
+         * last-write-wins. {@link ConfigView}'s {@link IllegalArgumentException}s
+         * surface as {@link LineSenderException} to keep the Sender contract.
+         */
+        private LineSenderBuilder fromConfigWebSocket(CharSequence configurationString) {
+            try {
+                ConfigString cs = ConfigString.parse(configurationString);
+                ConfigView view = new ConfigView(cs);
+                validateWsConfig(view, tlsEnabled);
+
+                view.getHostPorts("addr", DEFAULT_WEBSOCKET_PORT, this::appendAddress);
+
+                StringSink v = new StringSink();
+                String s;
+
+                String token = view.getStr("token");
+                if (token != null) {
+                    httpToken(token);
+                }
+                String user = view.getStr("username");
+                if (user != null) {
+                    httpUsernamePassword(user, view.getStr("password"));
+                }
+
+                s = view.getEnum("tls_verify");
+                if (s != null) {
+                    tlsValidationMode = "on".equals(s) ? TlsValidationMode.DEFAULT : TlsValidationMode.INSECURE;
+                }
+                s = view.getStr("tls_roots");
+                if (s != null) {
+                    trustStorePath = s;
+                }
+                s = view.getStr("tls_roots_password");
+                if (s != null) {
+                    trustStorePassword = s.toCharArray();
+                }
+                if (view.has("auth_timeout_ms")) {
+                    authTimeoutMillis(view.getLong("auth_timeout_ms", 0));
+                }
+
+                s = view.getStr("auto_flush_rows");
+                if (s != null) {
+                    int rows;
+                    if (s.equalsIgnoreCase("off")) {
+                        rows = 0;
+                    } else {
+                        v.clear();
+                        v.put(s);
+                        rows = parseIntValue(v, "auto_flush_rows");
+                        if (rows < 1) {
+                            throw new LineSenderException("invalid auto_flush_rows [value=").put(rows).put("]");
+                        }
+                    }
+                    autoFlushRows(rows);
+                }
+                s = view.getStr("auto_flush_interval");
+                if (s != null) {
+                    int interval;
+                    if (s.equalsIgnoreCase("off")) {
+                        interval = Integer.MAX_VALUE;
+                    } else {
+                        v.clear();
+                        v.put(s);
+                        interval = parseIntValue(v, "auto_flush_interval");
+                        if (interval < 1) {
+                            throw new LineSenderException("invalid auto_flush_interval [value=").put(interval).put("]");
+                        }
+                    }
+                    autoFlushIntervalMillis(interval);
+                }
+                s = view.getStr("auto_flush_bytes");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("off")) {
+                        autoFlushBytes(0);
+                    } else {
+                        v.clear();
+                        v.put(s);
+                        autoFlushBytes(parseIntValue(v, "auto_flush_bytes"));
+                    }
+                }
+                s = view.getStr("auto_flush");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("off")) {
+                        disableAutoFlush();
+                    } else if (!s.equalsIgnoreCase("on")) {
+                        throw new LineSenderException("invalid auto_flush [value=").put(s).put(", allowed-values=[on, off]]");
+                    }
+                }
+
+                if (view.has("max_name_len")) {
+                    maxNameLength(wsInt(view, v, "max_name_len"));
+                }
+                if (view.has("max_background_drainers")) {
+                    maxBackgroundDrainers(wsInt(view, v, "max_background_drainers"));
+                }
+                if (view.has("error_inbox_capacity")) {
+                    errorInboxCapacity(wsInt(view, v, "error_inbox_capacity"));
+                }
+                if (view.has("connection_listener_inbox_capacity")) {
+                    connectionListenerInboxCapacity(wsInt(view, v, "connection_listener_inbox_capacity"));
+                }
+                if (view.has("close_flush_timeout_millis")) {
+                    closeFlushTimeoutMillis(wsLong(view, v, "close_flush_timeout_millis"));
+                }
+                if (view.has("durable_ack_keepalive_interval_millis")) {
+                    durableAckKeepaliveIntervalMillis(wsLong(view, v, "durable_ack_keepalive_interval_millis"));
+                }
+                if (view.has("reconnect_max_duration_millis")) {
+                    reconnectMaxDurationMillis(wsLong(view, v, "reconnect_max_duration_millis"));
+                }
+                if (view.has("reconnect_initial_backoff_millis")) {
+                    reconnectInitialBackoffMillis(wsLong(view, v, "reconnect_initial_backoff_millis"));
+                }
+                if (view.has("reconnect_max_backoff_millis")) {
+                    reconnectMaxBackoffMillis(wsLong(view, v, "reconnect_max_backoff_millis"));
+                }
+                if (view.has("sf_append_deadline_millis")) {
+                    sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
+                }
+                if (view.has("sf_max_bytes")) {
+                    storeAndForwardMaxBytes(wsSize(view, v, "sf_max_bytes"));
+                }
+                if (view.has("sf_max_total_bytes")) {
+                    storeAndForwardMaxTotalBytes(wsSize(view, v, "sf_max_total_bytes"));
+                }
+
+                s = view.getStr("sf_dir");
+                if (s != null) {
+                    storeAndForwardDir(s);
+                }
+                s = view.getStr("sender_id");
+                if (s != null) {
+                    senderId(s);
+                }
+                s = view.getStr("sf_durability");
+                if (s != null) {
+                    v.clear();
+                    v.put(s);
+                    storeAndForwardDurability(parseDurabilityValue(v));
+                }
+                s = view.getStr("transaction");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("on")) {
+                        transactional(true);
+                    } else if (s.equalsIgnoreCase("off")) {
+                        transactional(false);
+                    } else {
+                        throw new LineSenderException("invalid transaction [value=").put(s).put(", allowed-values=[on, off]]");
+                    }
+                }
+                s = view.getStr("request_durable_ack");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("on")) {
+                        requestDurableAck(true);
+                    } else if (s.equalsIgnoreCase("off")) {
+                        requestDurableAck(false);
+                    } else {
+                        throw new LineSenderException("invalid request_durable_ack [value=").put(s).put(", allowed-values=[on, off]]");
+                    }
+                }
+                s = view.getStr("drain_orphans");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("on") || s.equalsIgnoreCase("true")) {
+                        drainOrphans(true);
+                    } else if (s.equalsIgnoreCase("off") || s.equalsIgnoreCase("false")) {
+                        drainOrphans(false);
+                    } else {
+                        throw new LineSenderException("invalid drain_orphans [value=").put(s).put(", allowed-values=[on, off, true, false]]");
+                    }
+                }
+                s = view.getStr("initial_connect_retry");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("on") || s.equalsIgnoreCase("true") || s.equalsIgnoreCase("sync")) {
+                        initialConnectMode(InitialConnectMode.SYNC);
+                    } else if (s.equalsIgnoreCase("off") || s.equalsIgnoreCase("false")) {
+                        initialConnectMode(InitialConnectMode.OFF);
+                    } else if (s.equalsIgnoreCase("async")) {
+                        initialConnectMode(InitialConnectMode.ASYNC);
+                    } else {
+                        throw new LineSenderException("invalid initial_connect_retry [value=").put(s).put(", allowed-values=[on, off, true, false, sync, async]]");
+                    }
+                }
+                return this;
+            } catch (IllegalArgumentException e) {
+                throw new LineSenderException(e.getMessage());
+            }
+        }
+
+        /**
+         * Validates the cross-key invariants of a WebSocket {@code ws}/{@code wss}
+         * config without constructing a Sender. Shared by {@link #fromConfigWebSocket}
+         * and the {@code QuestDB} facade's fail-fast build path. {@code tls} is true
+         * for the {@code wss} schema. Mirrors the decisions the fluent build path
+         * makes, so the ingress and egress sides reject the same config with the
+         * same message.
+         */
+        static void validateWsConfig(ConfigView view, boolean tls) {
+            view.getHostPorts("addr", DEFAULT_WEBSOCKET_PORT, (host, port) -> {
+            });
+            if (!view.has("addr")) {
+                throw new IllegalArgumentException("missing required key: addr");
+            }
+            String user = view.getStr("username");
+            String password = view.getStr("password");
+            String token = view.getStr("token");
+            // Basic auth needs both halves; reject either half alone with the same
+            // message the egress QwpQueryClient uses, so a shared ws/wss string
+            // fails identically on both sides.
+            if ((user == null) != (password == null)) {
+                throw new IllegalArgumentException("username and password must be provided together");
+            }
+            if (token != null && (user != null || password != null)) {
+                throw new IllegalArgumentException("cannot use both token and username/password authentication");
+            }
+            String tlsVerify = view.getStr("tls_verify");
+            String tlsRoots = view.getStr("tls_roots");
+            String tlsRootsPassword = view.getStr("tls_roots_password");
+            if (!tls && (tlsVerify != null || tlsRoots != null || tlsRootsPassword != null)) {
+                throw new IllegalArgumentException("tls_verify/tls_roots/tls_roots_password require the wss:: schema");
+            }
+            if ((tlsRoots == null) != (tlsRootsPassword == null)) {
+                throw new IllegalArgumentException("tls_roots and tls_roots_password must be provided together");
+            }
+        }
+
+        /**
+         * Fully validates a {@code ws}/{@code wss} connect string the same way
+         * {@link #build()} does, but without connecting: it parses every value
+         * through the real fluent setters and then runs {@link #configureDefaults}
+         * and {@link #validateParameters}, exactly the prefix {@code build()} runs
+         * before opening a socket. The {@code QuestDB} facade calls this so a
+         * malformed ingest config fails at its {@code build()} time even when the
+         * sender pool min is 0 and nothing connects. Ingress value keys are
+         * registry-{@code STRING}, so only this real parse -- not the typed
+         * {@link ConfigView} getters -- validates their values. Throws
+         * {@link LineSenderException} on any malformed key or value.
+         */
+        static void validateWsConfigString(CharSequence configurationString) {
+            LineSenderBuilder builder = new LineSenderBuilder();
+            builder.fromConfig(configurationString);
+            builder.configureDefaults();
+            builder.validateParameters();
+        }
+
+        private static int wsInt(ConfigView view, StringSink v, String key) {
+            v.clear();
+            v.put(view.getStr(key));
+            return parseIntValue(v, key);
+        }
+
+        private static long wsLong(ConfigView view, StringSink v, String key) {
+            v.clear();
+            v.put(view.getStr(key));
+            return parseLongValue(v, key);
+        }
+
+        private static long wsSize(ConfigView view, StringSink v, String key) {
+            v.clear();
+            v.put(view.getStr(key));
+            return parseSizeValue(v, key);
+        }
+
+        /**
+         * Snapshot of the WebSocket (QWP) config this builder applied, keyed by
+         * connect-string key name. Drives the per-key "honored" guard test --
+         * proves each ws/wss key read from a config string reaches the builder.
+         */
+        @TestOnly
+        public java.util.Map<String, Object> wsConfigSnapshotForTest() {
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            m.put("auto_flush_rows", autoFlushRows);
+            m.put("auto_flush_bytes", autoFlushBytes);
+            m.put("auto_flush_interval", autoFlushIntervalMillis);
+            m.put("max_name_len", maxNameLength);
+            m.put("transaction", transactional);
+            m.put("request_durable_ack", requestDurableAck);
+            m.put("sender_id", senderId);
+            m.put("sf_dir", sfDir);
+            m.put("sf_max_bytes", sfMaxBytes);
+            m.put("sf_max_total_bytes", sfMaxTotalBytes);
+            m.put("sf_durability", sfDurability == null ? null : sfDurability.name());
+            m.put("sf_append_deadline_millis", sfAppendDeadlineMillis);
+            m.put("close_flush_timeout_millis", closeFlushTimeoutMillis);
+            m.put("durable_ack_keepalive_interval_millis", durableAckKeepaliveIntervalMillis);
+            m.put("initial_connect_retry", initialConnectMode == null ? null : initialConnectMode.name());
+            m.put("reconnect_max_duration_millis", reconnectMaxDurationMillis);
+            m.put("reconnect_initial_backoff_millis", reconnectInitialBackoffMillis);
+            m.put("reconnect_max_backoff_millis", reconnectMaxBackoffMillis);
+            m.put("drain_orphans", drainOrphans);
+            m.put("max_background_drainers", maxBackgroundDrainers);
+            m.put("error_inbox_capacity", errorInboxCapacity);
+            m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
+            m.put("token", httpToken);
+            m.put("auth_timeout_ms", authTimeoutMillis);
+            m.put("username", username);
+            m.put("password", password);
+            m.put("tls_verify", tlsValidationMode == null ? null : tlsValidationMode.name());
+            m.put("tls_roots", trustStorePath);
+            m.put("tls_roots_password", trustStorePassword == null ? null : new String(trustStorePassword));
+            return m;
         }
 
         /**
@@ -3608,6 +3890,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (autoFlushIntervalMillis == Integer.MAX_VALUE) {
                     throw new LineSenderException("disabling auto-flush is not supported for WebSocket protocol");
+                }
+                // The cursor send path does not fsync yet, so any sf_durability
+                // other than memory is rejected rather than silently downgraded.
+                // Validating it here (rather than at connect time) lets a
+                // no-connect config check reject it as a full build() does.
+                if (sfDurability != SfDurability.MEMORY) {
+                    throw new LineSenderException(
+                            "sf_durability=" + sfDurability.name().toLowerCase()
+                                    + " is not yet supported (deferred follow-up; use sf_durability=memory)");
                 }
             } else {
                 throw new LineSenderException("unsupported protocol ")
