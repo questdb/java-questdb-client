@@ -868,6 +868,9 @@ public class QwpQueryClient implements QuietCloseable {
         m.put("zone", clientZone);
         m.put("auth_timeout_ms", authTimeoutMs);
         m.put("authorization_header", authorizationHeader);
+        m.put("tls_verify", tlsValidationMode);
+        m.put("tls_roots", trustStorePath);
+        m.put("tls_roots_password", trustStorePassword == null ? null : new String(trustStorePassword));
         return m;
     }
 

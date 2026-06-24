@@ -244,6 +244,51 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testSharedVocabularyConnectsBothPoolsLive() throws Exception {
+        // The headline use case: one connect-string vocabulary carrying BOTH
+        // ingress-only keys (auto_flush_rows, sender_id) and egress-only keys
+        // (compression, max_batch_rows, target, failover) drives both LIVE
+        // clients through the facade -- each side applies the keys it owns and
+        // silently ignores the rest. Other tests cover this validate-only
+        // (min=0) or on a single side; this one pre-warms min=1 so both pools
+        // actually connect.
+        //
+        // The mock serves ingest (ACK) and query (SERVER_INFO) semantics on
+        // separate sockets, so ingest and query connect to separate servers. A
+        // single ws:: address serving both is exercised end-to-end against a
+        // real server in the parent repo.
+        try (TestWebSocketServer ingest = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        });
+             TestWebSocketServer query = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+             })) {
+            ingest.start();
+            query.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
+            query.start();
+            Assert.assertTrue(ingest.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(query.awaitStart(5, TimeUnit.SECONDS));
+
+            // Identical vocabulary on both sides, differing only in addr -- the
+            // same mixed key set a single-string connect() would hand to both
+            // clients. The pool keys carry the same value on both sides, so the
+            // builder's cross-string conflict check passes.
+            String shared = "auto_flush_rows=100;sender_id=probe-1;"                          // ingress-only
+                    + "compression=auto;max_batch_rows=512;target=any;failover=off;"          // egress-only
+                    + "auth_timeout_ms=2000;"                                                 // COMMON
+                    + "sender_pool_min=1;sender_pool_max=2;query_pool_min=1;query_pool_max=2;"; // pool
+            try (QuestDB db = QuestDB.builder()
+                    .ingestConfig("ws::addr=localhost:" + ingest.getPort() + ";" + shared)
+                    .queryConfig("ws::addr=localhost:" + query.getPort() + ";" + shared)
+                    .build()) {
+                // build() returned, so both pools pre-warmed their min=1 slot:
+                // the shared vocabulary connected a live sender AND a live query
+                // client, not merely validated.
+                Assert.assertNotNull(db.borrowSender());
+                Assert.assertNotNull(db.query());
+            }
+        }
+    }
+
+    @Test
     public void testSharedWsConfigWithPoolKeys() {
         // A shared ws:: string carries pool keys; min=0 so build does only
         // parse-only validation (no connect).

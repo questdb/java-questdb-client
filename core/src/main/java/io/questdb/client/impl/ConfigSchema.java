@@ -145,11 +145,11 @@ public final class ConfigSchema {
     }
 
     private static void alias(String name, String canonical) {
-        add(new KeySpec(name, Side.COMMON, ValueType.STRING, false, OPEN, OPEN_MAX, false, false, null, canonical));
+        add(new KeySpec(name, Side.COMMON, ValueType.STRING, OPEN, OPEN_MAX, false, false, null, canonical));
     }
 
     private static void boolOnOff(String name, Side side) {
-        add(new KeySpec(name, side, ValueType.BOOL_ON_OFF, false, OPEN, OPEN_MAX, false, false, null, name));
+        add(new KeySpec(name, side, ValueType.BOOL_ON_OFF, OPEN, OPEN_MAX, false, false, null, name));
     }
 
     private static void enumKey(String name, Side side, String... values) {
@@ -157,23 +157,23 @@ public final class ConfigSchema {
         for (int i = 0; i < values.length; i++) {
             list.add(values[i]);
         }
-        add(new KeySpec(name, side, ValueType.ENUM, false, OPEN, OPEN_MAX, false, false, list, name));
+        add(new KeySpec(name, side, ValueType.ENUM, OPEN, OPEN_MAX, false, false, list, name));
     }
 
     private static void hostPort(String name) {
-        add(new KeySpec(name, Side.COMMON, ValueType.HOST_PORT_LIST, true, OPEN, OPEN_MAX, false, false, null, name));
+        add(new KeySpec(name, Side.COMMON, ValueType.HOST_PORT_LIST, OPEN, OPEN_MAX, false, false, null, name));
     }
 
     private static void intRange(String name, Side side, long min, long max, boolean minOpen, boolean maxOpen) {
-        add(new KeySpec(name, side, ValueType.INT, false, min, max, minOpen, maxOpen, null, name));
+        add(new KeySpec(name, side, ValueType.INT, min, max, minOpen, maxOpen, null, name));
     }
 
     private static void longRange(String name, Side side, long min, long max, boolean minOpen, boolean maxOpen) {
-        add(new KeySpec(name, side, ValueType.LONG, false, min, max, minOpen, maxOpen, null, name));
+        add(new KeySpec(name, side, ValueType.LONG, min, max, minOpen, maxOpen, null, name));
     }
 
     private static void str(String name, Side side) {
-        add(new KeySpec(name, side, ValueType.STRING, false, OPEN, OPEN_MAX, false, false, null, name));
+        add(new KeySpec(name, side, ValueType.STRING, OPEN, OPEN_MAX, false, false, null, name));
     }
 
     public enum ValueType {
@@ -193,20 +193,18 @@ public final class ConfigSchema {
         final boolean maxOpen;
         final long min;
         final boolean minOpen;
-        final boolean multi;
         final String name;
         final Side side;
         final ValueType type;
 
         KeySpec(
-                String name, Side side, ValueType type, boolean multi,
+                String name, Side side, ValueType type,
                 long min, long max, boolean minOpen, boolean maxOpen,
                 ObjList<String> enumValues, String canonical
         ) {
             this.name = name;
             this.side = side;
             this.type = type;
-            this.multi = multi;
             this.min = min;
             this.max = max;
             this.minOpen = minOpen;

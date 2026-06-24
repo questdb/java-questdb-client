@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.impl;
 
+import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.ConfigSchema;
 import io.questdb.client.impl.Side;
@@ -40,16 +41,24 @@ import java.util.Set;
 /**
  * Proves every egress key read from a {@code ws}/{@code wss} config string is
  * actually applied to the {@code QwpQueryClient} -- not merely accepted. The
- * COMMON credential keys are verified via the synthesized Authorization header.
+ * COMMON credential keys are verified via the synthesized Authorization header,
+ * the COMMON TLS keys via the trust-store snapshot.
  * {@link #testHonoredCasesCoverEveryEgressRegistryKey} guards against drift.
  */
 public class QwpQueryClientConfigHonoredTest {
 
-    private static final Set<String> EGRESS_COVERED = new HashSet<>(Arrays.asList(
+    // Every EGRESS key plus the COMMON keys the egress client applies
+    // (credentials, TLS, auth_timeout_ms). addr is COMMON but HOST_PORT_LIST --
+    // applied as the endpoint list rather than a snapshot value -- so it is
+    // excluded, matching the guard formula in
+    // testHonoredCasesCoverEveryEgressRegistryKey.
+    private static final Set<String> COVERED = new HashSet<>(Arrays.asList(
             "target", "failover", "failover_max_attempts", "failover_backoff_initial_ms",
             "failover_backoff_max_ms", "failover_max_duration_ms", "max_batch_rows",
             "initial_credit", "buffer_pool_size", "compression", "compression_level",
-            "client_id", "zone"
+            "client_id", "zone",
+            "username", "password", "token", "tls_verify", "tls_roots", "tls_roots_password",
+            "auth_timeout_ms"
     ));
 
     @Test
@@ -76,14 +85,31 @@ public class QwpQueryClientConfigHonoredTest {
         Assert.assertEquals(basic, snapshot("ws::addr=h:9000;username=alice;password=secret;").get("authorization_header"));
         Assert.assertEquals(basic, snapshot("ws::addr=h:9000;user=alice;pass=secret;").get("authorization_header"));
         Assert.assertEquals("Bearer ey.abc", snapshot("ws::addr=h:9000;token=ey.abc;").get("authorization_header"));
+
+        // COMMON TLS keys applied by egress (require the wss schema). tls_verify
+        // drives the validation mode; tls_roots/tls_roots_password set the trust
+        // store. All three read back from the snapshot.
+        Assert.assertEquals(ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE,
+                snapshot("wss::addr=h:9000;tls_verify=unsafe_off;").get("tls_verify"));
+        Map<String, Object> tls = snapshot("wss::addr=h:9000;tls_roots=/ca.p12;tls_roots_password=pw;");
+        Assert.assertEquals("/ca.p12", tls.get("tls_roots"));
+        Assert.assertEquals("pw", tls.get("tls_roots_password"));
     }
 
     @Test
     public void testHonoredCasesCoverEveryEgressRegistryKey() {
         for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
-            if (spec.side() == Side.EGRESS) {
+            if (!spec.name().equals(spec.canonical())) {
+                continue; // alias (user/pass) -- covered via its canonical key
+            }
+            // The egress client applies its own EGRESS keys plus the COMMON keys
+            // (credentials, TLS, auth_timeout_ms). addr is the HOST_PORT_LIST
+            // endpoint list, not a snapshot value, so it is excluded.
+            boolean egressApplied = spec.side() == Side.EGRESS
+                    || (spec.side() == Side.COMMON && spec.type() != ConfigSchema.ValueType.HOST_PORT_LIST);
+            if (egressApplied) {
                 Assert.assertTrue("registry egress key '" + spec.name() + "' has no honored case",
-                        EGRESS_COVERED.contains(spec.name()));
+                        COVERED.contains(spec.name()));
             }
         }
     }
