@@ -2015,18 +2015,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * instead of a fixed {@link #httpToken(String) token} captured once, so a long-lived sender follows
          * token refreshes - e.g. an OIDC device-flow token: {@code .httpTokenProvider(auth::getTokenSilently)}.
          * <br>
-         * The provider is not called at build time. Over HTTP the first call happens when the first row is
-         * started, then once per flush. Over WebSocket the provider is queried once per connection handshake -
-         * on the initial connect and again on every reconnect - so a refreshed token is presented each time the
-         * link is (re)established; an already-established WebSocket is not re-authenticated mid-stream. The two
-         * transports differ on a sustained token outage: over HTTP a failed pull is retried on the next row,
-         * but over WebSocket a pull that keeps failing past the reconnect budget terminates the sender for
-         * good, like any persistent reconnect failure. A lazily-signing-in provider can therefore be wired
-         * before the interactive sign-in completes, as long
-         * as a token is obtainable before the first connect/row - otherwise that connect or row fails. Running
-         * on the send/flush and reconnect paths, the provider must return promptly and must not block on
-         * interactive input (see {@link HttpTokenProvider}). Supported over HTTP and WebSocket transport, and
-         * mutually exclusive with {@link #httpToken(String)} and {@link #httpUsernamePassword(String, String)}.
+         * Over HTTP the provider is not called at build time: the first call happens when the first row is
+         * started, then once per flush. Over WebSocket the initial connection handshake runs during
+         * {@code build()} and queries the provider once for it, then again once per reconnect handshake - so a
+         * refreshed token is presented each time the link is (re)established; an already-established WebSocket
+         * is not re-authenticated mid-stream. The two transports differ on a sustained token outage: over HTTP
+         * a failed pull is retried on the next row, but over WebSocket a pull that keeps failing past the
+         * reconnect budget terminates the sender for good, like any persistent reconnect failure. A
+         * lazily-signing-in provider can therefore be wired before the interactive sign-in completes over HTTP,
+         * where the first pull is deferred to the first row; over WebSocket a token must already be obtainable
+         * when {@code build()} runs, since the initial handshake pulls it - otherwise that {@code build()} (or,
+         * over HTTP, the first row) fails. Running on the send/flush and reconnect paths, the provider must
+         * return promptly and must not block on interactive input (see {@link HttpTokenProvider}). Supported
+         * over HTTP and WebSocket transport, and mutually exclusive with {@link #httpToken(String)} and
+         * {@link #httpUsernamePassword(String, String)}.
          *
          * @param httpTokenProvider supplies the current HTTP authentication token
          * @return this instance for method chaining
