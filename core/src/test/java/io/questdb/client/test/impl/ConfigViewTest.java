@@ -62,6 +62,14 @@ public class ConfigViewTest {
     }
 
     @Test
+    public void testAddrPortAcceptsUnderscoreSeparator() {
+        // Numeric config keys parse with Numbers.parseInt, which treats '_' as
+        // a digit-group separator; the addr port must stay consistent.
+        Assert.assertEquals(list("h:9000"), hostPorts("ws::addr=h:9_000;"));
+        Assert.assertEquals(list("::1:9001"), hostPorts("ws::addr=[::1]:9_001;"));
+    }
+
+    @Test
     public void testAddrPortOutOfRangeRejected() {
         assertParseError("ws::addr=h:0;", "port out of range in addr");
         assertParseError("ws::addr=h:70000;", "port out of range in addr");

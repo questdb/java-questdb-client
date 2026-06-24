@@ -234,8 +234,8 @@ public final class ConfigView {
     private static int parsePort(String portStr, String entry) {
         int port;
         try {
-            port = Integer.parseInt(portStr.trim());
-        } catch (NumberFormatException e) {
+            port = Numbers.parseInt(portStr.trim());
+        } catch (NumericException e) {
             throw new IllegalArgumentException("invalid port in addr: " + entry);
         }
         if (port < 1 || port > 65535) {
