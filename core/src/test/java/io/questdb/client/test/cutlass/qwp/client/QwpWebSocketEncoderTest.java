@@ -1056,8 +1056,6 @@ public class QwpWebSocketEncoderTest {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("metrics")) {
-                encoder.setGorillaEnabled(true);
-
                 // Add many timestamps with constant delta - best case for Gorilla
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("ts", TYPE_TIMESTAMP, true);
                 for (int i = 0; i < 1000; i++) {
@@ -1067,28 +1065,11 @@ public class QwpWebSocketEncoderTest {
 
                 int sizeWithGorilla = encoder.encode(buffer);
 
-                // Calculate theoretical minimum size for Gorilla:
-                // - Header: 12 bytes
-                // - Table header, column schema, etc.
-                // - First timestamp: 8 bytes
-                // - Second timestamp: 8 bytes
-                // - Remaining 998 timestamps: 998 bits (1 bit each for DoD=0) = ~125 bytes
-
-                // Calculate size without Gorilla (1000 * 8 = 8000 bytes just for timestamps)
-                encoder.setGorillaEnabled(false);
-                buffer.reset();
-                col = buffer.getOrCreateColumn("ts", TYPE_TIMESTAMP, true);
-                for (int i = 0; i < 1000; i++) {
-                    col.addLong(1000000000L + i * 1000L);
-                    buffer.nextRow();
-                }
-
-                int sizeWithoutGorilla = encoder.encode(buffer);
-
-                // For constant delta, Gorilla should achieve significant compression
-                double compressionRatio = (double) sizeWithGorilla / sizeWithoutGorilla;
+                // Uncompressed, the timestamps alone take 1000 * 8 = 8000 bytes.
+                // For constant delta, Gorilla compresses to well under a fifth of that.
+                int uncompressedTimestampBytes = 1000 * 8;
                 Assert.assertTrue("Compression ratio should be < 0.2 for constant delta",
-                        compressionRatio < 0.2);
+                        sizeWithGorilla < uncompressedTimestampBytes / 5);
             }
         });
     }
@@ -1098,8 +1079,6 @@ public class QwpWebSocketEncoderTest {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-                encoder.setGorillaEnabled(true);
-
                 // Add multiple timestamp columns
                 for (int i = 0; i < 50; i++) {
                     QwpTableBuffer.ColumnBuffer ts1Col = buffer.getOrCreateColumn("ts1", TYPE_TIMESTAMP, true);
@@ -1113,23 +1092,11 @@ public class QwpWebSocketEncoderTest {
 
                 int sizeWithGorilla = encoder.encode(buffer);
 
-                // Compare with uncompressed
-                encoder.setGorillaEnabled(false);
-                buffer.reset();
-                for (int i = 0; i < 50; i++) {
-                    QwpTableBuffer.ColumnBuffer ts1Col = buffer.getOrCreateColumn("ts1", TYPE_TIMESTAMP, true);
-                    ts1Col.addLong(1000000000L + i * 1000L);
-
-                    QwpTableBuffer.ColumnBuffer ts2Col = buffer.getOrCreateColumn("ts2", TYPE_TIMESTAMP, true);
-                    ts2Col.addLong(2000000000L + i * 2000L);
-
-                    buffer.nextRow();
-                }
-
-                int sizeWithoutGorilla = encoder.encode(buffer);
-
+                // Two constant-delta timestamp columns of 50 rows take
+                // 2 * 50 * 8 = 800 bytes uncompressed; Gorilla compresses both.
+                int uncompressedTimestampBytes = 2 * 50 * 8;
                 Assert.assertTrue("Gorilla should compress multiple timestamp columns",
-                        sizeWithGorilla < sizeWithoutGorilla);
+                        sizeWithGorilla < uncompressedTimestampBytes);
             }
         });
     }
@@ -1139,8 +1106,6 @@ public class QwpWebSocketEncoderTest {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-                encoder.setGorillaEnabled(true);
-
                 // Add multiple timestamps with constant delta (best compression)
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 for (int i = 0; i < 100; i++) {
@@ -1150,20 +1115,11 @@ public class QwpWebSocketEncoderTest {
 
                 int sizeWithGorilla = encoder.encode(buffer);
 
-                // Now encode without Gorilla
-                encoder.setGorillaEnabled(false);
-                buffer.reset();
-                col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
-                for (int i = 0; i < 100; i++) {
-                    col.addLong(1000000000L + i * 1000L);
-                    buffer.nextRow();
-                }
-
-                int sizeWithoutGorilla = encoder.encode(buffer);
-
-                // Gorilla should produce smaller output for constant-delta timestamps
+                // 100 constant-delta timestamps take 100 * 8 = 800 bytes
+                // uncompressed; Gorilla produces a much smaller payload.
+                int uncompressedTimestampBytes = 100 * 8;
                 Assert.assertTrue("Gorilla encoding should be smaller",
-                        sizeWithGorilla < sizeWithoutGorilla);
+                        sizeWithGorilla < uncompressedTimestampBytes);
             }
         });
     }
@@ -1173,8 +1129,6 @@ public class QwpWebSocketEncoderTest {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-                encoder.setGorillaEnabled(true);
-
                 // Use TYPE_TIMESTAMP_NANOS
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("ts", TYPE_TIMESTAMP_NANOS, true);
                 for (int i = 0; i < 100; i++) {
@@ -1198,8 +1152,6 @@ public class QwpWebSocketEncoderTest {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-                encoder.setGorillaEnabled(true);
-
                 // Single timestamp - should use uncompressed
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 col.addLong(1000000L);
@@ -1216,8 +1168,6 @@ public class QwpWebSocketEncoderTest {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-                encoder.setGorillaEnabled(true);
-
                 // Only 2 timestamps - should use uncompressed (Gorilla needs 3+)
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP);
                 col.addLong(1000000L);
@@ -1241,8 +1191,6 @@ public class QwpWebSocketEncoderTest {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-                encoder.setGorillaEnabled(true);
-
                 // Varying deltas that exercise different buckets
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("ts", TYPE_TIMESTAMP, true);
                 long[] timestamps = {
@@ -1271,42 +1219,17 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
-    public void testGorillaFlagDisabled() throws Exception {
+    public void testGorillaFlagAlwaysSet() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
                  QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-                encoder.setGorillaEnabled(false);
-                Assert.assertFalse(encoder.isGorillaEnabled());
-
                 QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("ts", TYPE_TIMESTAMP, true);
                 col.addLong(1000000L);
                 buffer.nextRow();
 
                 encoder.encode(buffer);
 
-                // Check flags byte doesn't have Gorilla bit set
-                QwpBufferWriter buf = encoder.getBuffer();
-                byte flags = Unsafe.getUnsafe().getByte(buf.getBufferPtr() + 5);
-                Assert.assertEquals(0, flags & FLAG_GORILLA);
-            }
-        });
-    }
-
-    @Test
-    public void testGorillaFlagEnabled() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
-                 QwpTableBuffer buffer = new QwpTableBuffer("test")) {
-                encoder.setGorillaEnabled(true);
-                Assert.assertTrue(encoder.isGorillaEnabled());
-
-                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("ts", TYPE_TIMESTAMP, true);
-                col.addLong(1000000L);
-                buffer.nextRow();
-
-                encoder.encode(buffer);
-
-                // Check flags byte has Gorilla bit set
+                // The Gorilla flag is always set on QWP ingress messages.
                 QwpBufferWriter buf = encoder.getBuffer();
                 byte flags = Unsafe.getUnsafe().getByte(buf.getBufferPtr() + 5);
                 Assert.assertEquals(FLAG_GORILLA, (byte) (flags & FLAG_GORILLA));

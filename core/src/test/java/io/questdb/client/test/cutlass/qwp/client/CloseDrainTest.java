@@ -358,14 +358,20 @@ public class CloseDrainTest {
                         + ";reconnect_initial_backoff_millis=20"
                         + ";reconnect_max_backoff_millis=100"
                         + ";close_flush_timeout_millis=3000;";
-                long t0 = System.nanoTime();
                 try (Sender sender = Sender.fromConfig(cfg)) {
                     sender.table("foo").longColumn("v", i).atNow();
                     sender.flush();
+                    // Time only close(): the 2500ms budget covers close()'s
+                    // drain latency. Building the first store-and-forward
+                    // sender carries a one-time cold-start cost (class
+                    // loading, JIT, sf buffer mmap) that belongs to
+                    // construction, not to close().
+                    long t0 = System.nanoTime();
+                    sender.close();
+                    long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                    Assert.assertTrue("iteration " + i + " close() took " + elapsedMs + "ms",
+                            elapsedMs < 2500);
                 }
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
-                Assert.assertTrue("iteration " + i + " close() took " + elapsedMs + "ms",
-                        elapsedMs < 2500);
             }
         }
     }

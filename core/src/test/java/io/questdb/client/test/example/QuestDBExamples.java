@@ -44,10 +44,9 @@ import java.util.concurrent.TimeUnit;
 public class QuestDBExamples {
 
     public static void main(String[] args) throws Exception {
-        // 1. Connect with a single configuration string. The same server list
-        //    serves both ingest (HTTP) and egress (WebSocket on the same port);
-        //    QuestDB derives the egress URL automatically.
-        try (QuestDB db = QuestDB.connect("http::addr=localhost:9000;")) {
+        // 1. Connect with a single configuration string. Both sides run over
+        //    QWP/WebSocket, so one ws:: string configures ingest and egress.
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
             ingestWithBorrowedSender(db);
             ingestWithThreadAffineSender(db);
             queryOneShot(db);
@@ -55,19 +54,19 @@ public class QuestDBExamples {
             cancelExample(db);
         }
 
-        // 2. Authenticated connect: token auth is translated to a Bearer
-        //    Authorization header on the egress side.
+        // 2. Authenticated connect: token auth becomes a Bearer Authorization
+        //    header on both the ingest and egress WebSocket upgrades.
         try (QuestDB db = QuestDB.connect(
-                "http::addr=db.questdb.cloud:9000;token=YOUR_TOKEN_HERE;")) {
+                "wss::addr=db.questdb.cloud:9000;token=YOUR_TOKEN_HERE;")) {
             // ... use db ...
             db.executeSql("SELECT 1", new PrintingHandler()).await();
         }
 
         // 3. Custom pool sizing and timeouts via the builder. Use this when
-        //    ingest and egress configs differ (different transports, separate
-        //    address lists), or when you need to override defaults.
+        //    ingest and egress use separate address lists, or when you need to
+        //    override defaults.
         try (QuestDB db = QuestDB.builder()
-                .ingestConfig("http::addr=ingest.cluster:9000;")
+                .ingestConfig("ws::addr=ingest.cluster:9000;")
                 .queryConfig("ws::addr=read-replica.cluster:9000;")
                 .senderPoolSize(8)
                 .queryPoolSize(4)

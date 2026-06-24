@@ -405,15 +405,6 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
-    public void testGorillaEnabledByDefault() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
-                Assert.assertTrue(sender.isGorillaEnabled());
-            }
-        });
-    }
-
-    @Test
     public void testIpv4ColumnStringNullReturnsThis() throws Exception {
         // A null reference is the explicit "skip the setter for this row"
         // signal -- the column gets null-padded by nextRow() if it already
@@ -629,18 +620,6 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
-            }
-        });
-    }
-
-    @Test
-    public void testSetGorillaEnabled() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
-                sender.setGorillaEnabled(false);
-                Assert.assertFalse(sender.isGorillaEnabled());
-                sender.setGorillaEnabled(true);
-                Assert.assertTrue(sender.isGorillaEnabled());
             }
         });
     }
