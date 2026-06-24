@@ -73,6 +73,13 @@ public final class QuestDBBuilder {
      * connections in each pool; further slots are allocated lazily up to
      * {@code max} when load demands and reaped back to {@code min} when
      * idle.
+     * <p>
+     * Non-blocking on startup recovery: when store-and-forward is enabled,
+     * unacked data a previous run left in this pool's managed slots is
+     * recovered on a background housekeeper thread shortly after this method
+     * returns -- so {@code build()} does not block on a slow or
+     * reachable-but-not-acking server. The recovered data is durable on disk
+     * and is delivered once the server acks; until then it stays preserved.
      */
     public QuestDB build() {
         if (ingestConfig == null) {

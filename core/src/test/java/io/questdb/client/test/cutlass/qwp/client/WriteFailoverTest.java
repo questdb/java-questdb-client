@@ -337,7 +337,7 @@ public class WriteFailoverTest {
         // sits on the cause chain via initCause().
         TestWebSocketServer replica = new TestWebSocketServer(new AckHandler());
         int port = replica.getPort();
-        try (replica) {
+        try (TestWebSocketServer replicaResource = replica) {
             replica.setRejectWithRole("REPLICA");
             replica.start();
             Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));

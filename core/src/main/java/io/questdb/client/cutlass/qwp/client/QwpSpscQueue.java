@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -23,6 +23,8 @@
  ******************************************************************************/
 
 package io.questdb.client.cutlass.qwp.client;
+
+import io.questdb.client.std.Compat;
 
 import java.util.concurrent.locks.LockSupport;
 
@@ -112,7 +114,6 @@ public final class QwpSpscQueue<T> {
      * {@link InterruptedException} when the consumer thread was interrupted
      * while waiting.
      */
-    @SuppressWarnings("unchecked")
     public T take() throws InterruptedException {
         // Fast path: the producer beat us here and the value is already visible.
         T value = poll();
@@ -123,7 +124,7 @@ public final class QwpSpscQueue<T> {
         // inside the window. onSpinWait lets the CPU slow its pipeline while
         // waiting -- meaningful on hyperthreaded cores.
         for (int i = 0; i < SPIN_ITERATIONS; i++) {
-            Thread.onSpinWait();
+            Compat.onSpinWait();
             if ((value = poll()) != null) {
                 return value;
             }

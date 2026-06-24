@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -99,7 +99,7 @@ public class CursorWebSocketSendLoopReconnectLeakTest {
                                             + wss.getTotalReconnectsSucceeded()
                                             + " successful reconnects");
                         }
-                        Thread.onSpinWait();
+                        io.questdb.client.std.Compat.onSpinWait();
                     }
 
                     // Reach into the loop to capture the live client BEFORE we
@@ -200,7 +200,7 @@ public class CursorWebSocketSendLoopReconnectLeakTest {
                             "client never reported processing the ACK within 5s "
                                     + "(baseline=" + baseline + ", current=" + s.getTotalAcks() + ")");
                 }
-                Thread.onSpinWait();
+                io.questdb.client.std.Compat.onSpinWait();
             }
         }
 

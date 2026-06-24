@@ -230,7 +230,7 @@ public class DeltaSymbolDictionaryTest {
             GlobalSymbolDictionary globalDict = new GlobalSymbolDictionary();
 
             // Create a very long symbol (1000 chars)
-            String longSymbol = "X".repeat(1000);
+            String longSymbol = io.questdb.client.test.tools.TestUtils.repeat("X", 1000);
 
             int id = globalDict.getOrAddSymbol(longSymbol);
             Assert.assertEquals(0, id);
