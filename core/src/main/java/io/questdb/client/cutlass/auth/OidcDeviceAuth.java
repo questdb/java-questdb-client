@@ -82,7 +82,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link #getToken()} serves a cached token while valid, silently refreshes when a refresh token
  * exists, otherwise re-runs the interactive flow. An instance lock serializes calls, so two
  * sign-ins never start at once. A sign-in waiting for the user holds that lock for the device code
- * lifetime (up to an hour), so a concurrent {@link #getToken()} or {@link #clearCache()} blocks
+ * lifetime (up to 30 minutes), so a concurrent {@link #getToken()} or {@link #clearCache()} blocks
  * behind it - but {@link #getTokenSilently()} never waits: it fails fast with an
  * {@link OidcAuthException} so a request/flush path never stalls. To abort a waiting sign-in, call
  * {@link #close()} from another thread; it signals the flow to stop, which then fails with an
@@ -461,7 +461,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     public String getTokenSilently() {
         throwIfClosed();
         // never wait on the flush path: getToken()'s sign-in holds the lock for the whole device-code
-        // lifetime (up to an hour), so tryLock and fail fast if held. A sign-in in progress means there
+        // lifetime (up to 30 minutes), so tryLock and fail fast if held. A sign-in in progress means there
         // is no token to serve yet, so the caller gets a prompt exception to retry rather than a stalled
         // flush
         if (!lock.tryLock()) {
@@ -660,7 +660,21 @@ public class OidcDeviceAuth implements QuietCloseable {
             return true; // root issuer: origin-only, every path is under it
         }
         String[] baseSegs = decodePathSegments(basePath.substring(0, baseEnd));
-        String[] endpointSegs = decodePathSegments(pathOnly(endpointUrl));
+        String rawEndpointPath = pathOnly(endpointUrl);
+        // reject a percent-encoded path separator - %2f ('/'), %5c ('\'), or a double-encoded form flagged by
+        // an encoded percent %25 (e.g. %252f). decodePathSegments resolves it before the segment comparison,
+        // so it would split one path segment in two and could let .../realms/acme%2fevil/token slip the
+        // issuer-path scope. A real OIDC endpoint path never encodes a separator.
+        for (int i = 0, n = rawEndpointPath.length() - 2; i < n; i++) {
+            if (rawEndpointPath.charAt(i) == '%') {
+                char a = rawEndpointPath.charAt(i + 1);
+                char b = rawEndpointPath.charAt(i + 2);
+                if ((a == '2' && (b == 'f' || b == 'F' || b == '5')) || (a == '5' && (b == 'c' || b == 'C'))) {
+                    return false;
+                }
+            }
+        }
+        String[] endpointSegs = decodePathSegments(rawEndpointPath);
         // a "." or ".." segment is rejected outright: the server normalizes it away, so a naive prefix test
         // would pass /realms/acme/../evil/token yet it resolves to a different realm
         for (int i = 0; i < endpointSegs.length; i++) {
@@ -993,15 +1007,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         // the device-code deadline rather than swallowing it as a pending authorization
         postForm(tokenEndpoint, tokenParser);
 
-        // A rate-limited identity provider answers 429; RFC 8628 does not define it, but the Python client
-        // and common practice treat it as "poll slower". Back off and keep polling (like slow_down) rather
-        // than treating it as a terminal error, so transient rate limiting does not fail the sign-in.
-        if (Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus)) {
-            return POLL_SLOW_DOWN;
-        }
-
-        // RFC 6749 5.2: an error response is an error even if the body also carries a token, so handle the
-        // OAuth error first - a token smuggled alongside an error must never count as a grant
+        // RFC 6749 5.2: an error response is an error even if the body also carries a token, or the status is
+        // 429 - so handle the OAuth error first. A terminal error (e.g. access_denied) must abort even when
+        // the identity provider also rate-limits, and a token smuggled alongside an error must never count as
+        // a grant.
         if (tokenParser.error.length() > 0) {
             if (Chars.equals(ERROR_AUTHORIZATION_PENDING, tokenParser.error)) {
                 return POLL_PENDING;
@@ -1010,6 +1019,14 @@ public class OidcDeviceAuth implements QuietCloseable {
                 return POLL_SLOW_DOWN;
             }
             throw OidcAuthException.oauthError(tokenParser.error, tokenParser.errorDescription);
+        }
+
+        // A rate-limited identity provider answers 429 with no OAuth error; RFC 8628 does not define it, but
+        // the Python client and common practice treat it as "poll slower". Back off and keep polling (like
+        // slow_down) rather than treating it as a terminal error, so transient rate limiting does not fail
+        // the sign-in.
+        if (Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus)) {
+            return POLL_SLOW_DOWN;
         }
         // RFC 6749 5.1: a grant is a 2xx response carrying a token; a token under a non-2xx is malformed and
         // is not trusted (the non-2xx is classified below instead)
@@ -1122,18 +1139,32 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (!isHttpStatusSuccess()) {
             throw new OidcAuthException().put("unexpected response from the device authorization endpoint [httpStatus=").put(responseStatus).put(']');
         }
-        if (deviceAuthParser.deviceCode.length() == 0 || deviceAuthParser.userCode.length() == 0
-                || deviceAuthParser.verificationUri.length() == 0) {
+        // the device code is sent in the poll requests, not shown, so check it on the wire; the user code and
+        // verification URL are shown to the user, so sanitize them first and require them non-empty after
+        // sanitizing - a value made entirely of control/format chars is non-empty on the wire but would
+        // otherwise display as a blank code or URL
+        final String deviceCode = deviceAuthParser.deviceCode.toString();
+        final String userCode = sanitizeForDisplay(deviceAuthParser.userCode.toString());
+        final String verificationUri = sanitizeForDisplay(deviceAuthParser.verificationUri.toString());
+        if (deviceCode.isEmpty() || userCode.isEmpty() || verificationUri.isEmpty()) {
             throw new OidcAuthException().put("incomplete device authorization response from the identity provider [httpStatus=").put(responseStatus).put(']');
         }
+        // a verification_uri_complete that is non-empty on the wire but sanitizes to empty is treated as
+        // absent (null), so the prompt prints no blank "(or open this URL ...)" line and the browser launcher
+        // is never handed an empty string
+        String verificationUriComplete = deviceAuthParser.verificationUriComplete.length() > 0
+                ? sanitizeForDisplay(deviceAuthParser.verificationUriComplete.toString())
+                : null;
+        if (verificationUriComplete != null && verificationUriComplete.isEmpty()) {
+            verificationUriComplete = null;
+        }
 
-        final String deviceCode = deviceAuthParser.deviceCode.toString();
         final int expiresInSeconds = boundedSeconds(deviceAuthParser.expiresIn, DEFAULT_DEVICE_CODE_TTL_SECONDS, MAX_DEVICE_CODE_TTL_SECONDS);
         final int intervalSeconds = boundedSeconds(deviceAuthParser.interval, DEFAULT_POLL_INTERVAL_SECONDS, MAX_POLL_INTERVAL_SECONDS);
         final DeviceAuthorizationChallenge challenge = new DeviceAuthorizationChallenge(
-                sanitizeForDisplay(deviceAuthParser.userCode.toString()),
-                sanitizeForDisplay(deviceAuthParser.verificationUri.toString()),
-                deviceAuthParser.verificationUriComplete.length() > 0 ? sanitizeForDisplay(deviceAuthParser.verificationUriComplete.toString()) : null,
+                userCode,
+                verificationUri,
+                verificationUriComplete,
                 expiresInSeconds,
                 intervalSeconds
         );
@@ -1601,9 +1632,32 @@ public class OidcDeviceAuth implements QuietCloseable {
                 throw new OidcAuthException().put("invalid url, expected http or https [url=").put(url).put(']');
             }
             int hostStart = schemeEnd + 3;
-            int pathStart = url.indexOf('/', hostStart);
-            String hostPort = pathStart < 0 ? url.substring(hostStart) : url.substring(hostStart, pathStart);
-            String path = pathStart < 0 ? "/" : url.substring(pathStart);
+            // the authority ([userinfo@]host[:port]) ends at the first '/', '?' or '#'; splitting only on
+            // '/' (as before) folded a query/fragment - or userinfo - into the host on a path-less url
+            int authorityEnd = url.length();
+            for (int i = hostStart, n = url.length(); i < n; i++) {
+                char c = url.charAt(i);
+                if (c == '/' || c == '?' || c == '#') {
+                    authorityEnd = i;
+                    break;
+                }
+            }
+            String hostPort = url.substring(hostStart, authorityEnd);
+            // a path-less url uses '/'; a query/fragment with no path is prefixed with '/' so the request
+            // line stays well-formed (a '/'-terminated authority already carries its own leading slash)
+            String path;
+            if (authorityEnd == url.length()) {
+                path = "/";
+            } else if (url.charAt(authorityEnd) == '/') {
+                path = url.substring(authorityEnd);
+            } else {
+                path = "/" + url.substring(authorityEnd);
+            }
+            if (hostPort.indexOf('@') >= 0) {
+                // userinfo (user[:pass]@host) is unsupported: the HTTP layer would connect to the literal
+                // "user@host". Reject it clearly rather than mis-resolve it or surface a misleading port error
+                throw new OidcAuthException().put("invalid url, userinfo (user@host) is not supported [url=").put(url).put(']');
+            }
             if (hostPort.startsWith("[")) {
                 // bracketed IPv6 literal: the client's HTTP layer does not bracket the Host header, so
                 // reject it clearly rather than mis-parse it on a ':' inside the address

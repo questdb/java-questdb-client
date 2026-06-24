@@ -64,7 +64,7 @@ public class JsonLexer implements Mutable, Closeable {
     private int objDepth = 0;
     private int position = 0;
     private boolean quoted = false;
-    private boolean sawEscape = false;
+    private boolean hasEscape = false;
     private int state = S_START;
     private boolean useCache = false;
 
@@ -87,7 +87,7 @@ public class JsonLexer implements Mutable, Closeable {
         arrayDepth = 0;
         ignoreNext = false;
         quoted = false;
-        sawEscape = false;
+        hasEscape = false;
         cacheSize = 0;
         useCache = false;
         position = 0;
@@ -112,7 +112,7 @@ public class JsonLexer implements Mutable, Closeable {
         int state = this.state;
         boolean quoted = this.quoted;
         boolean ignoreNext = this.ignoreNext;
-        boolean sawEscape = this.sawEscape;
+        boolean hasEscape = this.hasEscape;
         boolean useCache = this.useCache;
         int objDepth = this.objDepth;
         int arrayDepth = this.arrayDepth;
@@ -129,7 +129,7 @@ public class JsonLexer implements Mutable, Closeable {
                 if (quoted) {
                     if (c == '\\') {
                         ignoreNext = true;
-                        sawEscape = true;
+                        hasEscape = true;
                         continue;
                     }
 
@@ -142,10 +142,10 @@ public class JsonLexer implements Mutable, Closeable {
 
                 int vp = (int) (posAtStart + valueStart - lo + 1 - cacheSize);
                 if (state == S_EXPECT_NAME || state == S_EXPECT_FIRST_NAME) {
-                    listener.onEvent(EVT_NAME, getCharSequence(valueStart, p, vp, sawEscape), vp);
+                    listener.onEvent(EVT_NAME, getCharSequence(valueStart, p, vp, hasEscape), vp);
                     state = S_EXPECT_COLON;
                 } else {
-                    listener.onEvent(arrayDepth > 0 ? EVT_ARRAY_VALUE : EVT_VALUE, getCharSequence(valueStart, p, vp, sawEscape), vp);
+                    listener.onEvent(arrayDepth > 0 ? EVT_ARRAY_VALUE : EVT_VALUE, getCharSequence(valueStart, p, vp, hasEscape), vp);
                     state = S_EXPECT_COMMA;
                 }
 
@@ -245,7 +245,7 @@ public class JsonLexer implements Mutable, Closeable {
                     }
                     valueStart = p;
                     quoted = true;
-                    sawEscape = false;
+                    hasEscape = false;
                     break;
                 default:
                     if (state != S_EXPECT_VALUE) {
@@ -254,7 +254,7 @@ public class JsonLexer implements Mutable, Closeable {
                     // this isn't a quote, include this character
                     valueStart = p - 1;
                     quoted = false;
-                    sawEscape = false;
+                    hasEscape = false;
                     break;
             }
         }
@@ -264,7 +264,7 @@ public class JsonLexer implements Mutable, Closeable {
         this.state = state;
         this.quoted = quoted;
         this.ignoreNext = ignoreNext;
-        this.sawEscape = sawEscape;
+        this.hasEscape = hasEscape;
         this.objDepth = objDepth;
         this.arrayDepth = arrayDepth;
 

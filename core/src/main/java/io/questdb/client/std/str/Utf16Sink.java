@@ -103,6 +103,19 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
         return this;
     }
 
+    // A code point is display-safe unless it is a control char (C0/C1, DEL), a Unicode format char (bidi
+    // embeddings/overrides/isolates, LRM/RLM marks, zero-width joiners, the BOM, supplementary-plane tag
+    // chars) or a surrogate (a lone half, with no displayable meaning). Left raw, attacker-influenced text -
+    // an ILP server's JSON error body, a column name - could reorder, hide or forge what a human reads in a
+    // terminal or log; escaping rather than stripping keeps it visible for diagnosis.
+    private static boolean isDisplaySafe(int cp) {
+        if (Character.isISOControl(cp)) {
+            return false;
+        }
+        final int type = Character.getType(cp);
+        return type != Character.FORMAT && type != Character.SURROGATE;
+    }
+
     // Escapes a code point to one (BMP) or two (supplementary, as its surrogate pair) visible \\uXXXX
     // sequences, so the escaped value still names the original char. Emitting all four hex digits keeps a
     // char above U+00FF (e.g. U+202E) correct rather than truncated to its low byte.
@@ -119,18 +132,4 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
         put(hexDigits[(cp >> 4) & 0xF]);
         put(hexDigits[cp & 0xF]);
     }
-
-    // A code point is display-safe unless it is a control char (C0/C1, DEL), a Unicode format char (bidi
-    // embeddings/overrides/isolates, LRM/RLM marks, zero-width joiners, the BOM, supplementary-plane tag
-    // chars) or a surrogate (a lone half, with no displayable meaning). Left raw, attacker-influenced text -
-    // an ILP server's JSON error body, a column name - could reorder, hide or forge what a human reads in a
-    // terminal or log; escaping rather than stripping keeps it visible for diagnosis.
-    private static boolean isDisplaySafe(int cp) {
-        if (Character.isISOControl(cp)) {
-            return false;
-        }
-        final int type = Character.getType(cp);
-        return type != Character.FORMAT && type != Character.SURROGATE;
-    }
-
 }

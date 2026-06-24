@@ -93,6 +93,68 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testAllControlVerificationUriCompleteTreatedAsAbsent() throws Exception {
+        assertMemoryLeak(() -> {
+            // a verification_uri_complete that is all control chars is non-empty on the wire but sanitizes to
+            // empty; it must be treated as absent (null), so the prompt shows no blank "(or open this URL ...)"
+            // line and the browser launcher is never handed an empty string
+            String allControl = jsonUnicodeEscape(0x0001) + jsonUnicodeEscape(0x0002) + jsonUnicodeEscape(0x0003);
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEV\","
+                            + "\"user_code\":\"WDJB-MJHT\","
+                            + "\"verification_uri\":\"https://verify.example/device\","
+                            + "\"verification_uri_complete\":\"" + allControl + "\","
+                            + "\"expires_in\":300,"
+                            + "\"interval\":1"
+                            + "}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-OK", null, null, 3600));
+            };
+            AtomicReference<DeviceAuthorizationChallenge> shown = new AtomicReference<>();
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, shown::set)) {
+                Assert.assertEquals("ACCESS-OK", auth.getToken());
+                DeviceAuthorizationChallenge challenge = shown.get();
+                Assert.assertNotNull(challenge);
+                Assert.assertNull(challenge.getVerificationUriComplete());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testAllControlVerificationUriRejectedAsIncomplete() throws Exception {
+        assertMemoryLeak(() -> {
+            // a verification_uri made entirely of control chars is non-empty on the wire but sanitizes to empty
+            // - it would display as a blank URL the user cannot open, so the response is rejected as incomplete
+            // (the valid token below would let an unfixed client proceed to a successful but unusable sign-in)
+            String allControl = jsonUnicodeEscape(0x0001) + jsonUnicodeEscape(0x0002);
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEV\","
+                            + "\"user_code\":\"WDJB-MJHT\","
+                            + "\"verification_uri\":\"" + allControl + "\","
+                            + "\"expires_in\":300,"
+                            + "\"interval\":1"
+                            + "}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-OK", null, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected an all-control verification_uri to be rejected as incomplete");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("incomplete"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testAudienceParameterSentToDeviceEndpoint() throws Exception {
         assertMemoryLeak(() -> {
             // the optional audience builder parameter must be url-encoded into the device authorization request
@@ -956,6 +1018,10 @@ public class OidcDeviceAuthTest {
         assertBuildFails("https://idp/d", "https://idp:notaport/t", "could not parse the port");
         assertBuildFails("https:///d", "https://idp/t", "the host is empty");
         assertBuildFails("https://[::1]:9000/d", "https://idp/t", "IPv6 literal hosts are not supported");
+        // userinfo (user@host or user:pass@host) is unsupported: the HTTP layer would connect to the literal
+        // "user@host", so reject it rather than mis-resolve it or report a misleading port-parse error
+        assertBuildFails("https://user@idp/d", "https://idp/t", "userinfo");
+        assertBuildFails("https://idp/d", "https://user:pass@idp/t", "userinfo");
         // an out-of-range port (0, negative, or above 65535) is rejected rather than passed to the transport
         assertBuildFails("https://idp:99999/d", "https://idp/t", "between 1 and 65535");
         assertBuildFails("https://idp:0/d", "https://idp/t", "between 1 and 65535");
@@ -1774,6 +1840,33 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testIssuerPathScopingRejectsEncodedSlash() throws Exception {
+        assertMemoryLeak(() -> {
+            // the device endpoint hides an extra path segment behind a %2f-encoded slash; decoding it would
+            // split acme%2fevil into acme/evil and slip the "/realms/acme" scope, so an encoded path separator
+            // must be rejected outright
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                return MockOidcServer.json(200, "{\"config\":{"
+                        + "\"acl.oidc.enabled\":true,"
+                        + "\"acl.oidc.client.id\":\"questdb\","
+                        + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl("/realms/acme/token") + "\","
+                        + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl("/realms/acme%2fevil/device") + "\""
+                        + "}}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer(server.httpUrl("/realms/acme")))) {
+                    Assert.fail("expected the %2f-encoded device endpoint to be rejected");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("not under the pinned issuer"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testIssuerPathScopingRejectsEncodedTraversal() throws Exception {
         assertMemoryLeak(() -> {
             // the device endpoint hides a parent traversal as %2e%2e; decoding must unmask it and reject it,
@@ -2225,6 +2318,30 @@ public class OidcDeviceAuthTest {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
                 }
                 Assert.assertEquals(60, shown.get().getIntervalSeconds());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testRateLimited429WithTerminalErrorAbortsImmediately() throws Exception {
+        assertMemoryLeak(() -> {
+            // a 429 that ALSO carries a terminal OAuth error must fail fast on the error, not back off and poll
+            // to the device-code deadline: pollOnce handles the OAuth error before the 429 rate-limit backoff
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 5));
+                }
+                return MockOidcServer.json(429, "{\"error\":\"access_denied\",\"error_description\":\"the user declined\"}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected the terminal OAuth error to abort despite the 429 status");
+                } catch (OidcAuthException e) {
+                    Assert.assertEquals("access_denied", e.getOauthError());
+                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("device code expired"));
+                }
             }
         });
     }
