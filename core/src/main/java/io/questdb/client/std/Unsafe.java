@@ -28,7 +28,6 @@ import io.questdb.client.cairo.CairoException;
 
 import java.lang.reflect.AccessibleObject;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.concurrent.atomic.LongAdder;
 
 public final class Unsafe {
@@ -36,7 +35,6 @@ public final class Unsafe {
     // These are off-heap allocated atomic counters for memory usage tracking.
 
     public static final long BYTE_OFFSET;
-    public static final Module JAVA_BASE_MODULE = System.class.getModule();
     private static final LongAdder[] COUNTERS = new LongAdder[MemoryTag.SIZE];
     private static final long FREE_COUNT_ADDR;
     private static final long MALLOC_COUNT_ADDR;
@@ -46,17 +44,8 @@ public final class Unsafe {
     private static final long REALLOC_COUNT_ADDR;
     private static final long RSS_MEM_USED_ADDR;
     private static final sun.misc.Unsafe UNSAFE;
-    private static final Method implAddExports;
 
     private Unsafe() {
-    }
-
-    public static void addExports(Module from, Module to, String packageName) {
-        try {
-            implAddExports.invoke(from, packageName, to);
-        } catch (ReflectiveOperationException e) {
-            e.printStackTrace(System.out);
-        }
     }
 
     public static int byteArrayGetInt(byte[] array, int index) {
@@ -266,11 +255,9 @@ public final class Unsafe {
             BYTE_OFFSET = Unsafe.getUnsafe().arrayBaseOffset(byte[].class);
 
             OVERRIDE = AccessibleObject_override_fieldOffset();
-            implAddExports = Module.class.getDeclaredMethod("implAddExports", String.class, Module.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
-        makeAccessible(implAddExports);
 
         // A single allocation for all the off-heap native memory counters.
         // Might help with locality, given they're often incremented together.

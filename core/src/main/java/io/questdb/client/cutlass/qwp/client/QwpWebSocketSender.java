@@ -67,6 +67,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -223,7 +224,6 @@ public class QwpWebSocketSender implements Sender {
     private SenderErrorHandler errorHandler = DefaultSenderErrorHandler.INSTANCE;
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
-    private boolean gorillaEnabled = true;
     private boolean hasDeferredMessages;
     // Stickys true once any successful connect has happened. Drives the
     // CONNECTED-vs-RECONNECTED-vs-FAILED_OVER classification at the success
@@ -240,6 +240,12 @@ public class QwpWebSocketSender implements Sender {
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
     private boolean ownsCursorEngine;
     private long pendingBytes;
+    // Set true by close() once the SF slot flock has been released (the normal
+    // teardown path). Stays false if close() bailed early with the I/O thread
+    // still running -- then cursorEngine.close() never ran and the flock is
+    // still held, so the owning pool MUST keep the slot reserved rather than
+    // hand the still-locked dir to the next borrow ("sf slot already in use").
+    private boolean slotLockReleased;
     private int pendingRowCount;
     private SenderProgressDispatcher progressDispatcher;
     // Async-delivery sink for ack-watermark advances. Default no-op; a
@@ -285,7 +291,7 @@ public class QwpWebSocketSender implements Sender {
         if (endpoints == null || endpoints.isEmpty()) {
             throw new IllegalArgumentException("endpoints must be non-empty");
         }
-        this.endpoints = List.copyOf(endpoints);
+        this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
         this.hostTracker = new QwpHostHealthTracker(this.endpoints.size());
         this.authorizationHeaderSupplier = authorizationHeaderSupplier;
         this.tlsConfig = tlsConfig;
@@ -539,7 +545,7 @@ public class QwpWebSocketSender implements Sender {
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS, true);
+                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS);
     }
 
     /**
@@ -568,8 +574,7 @@ public class QwpWebSocketSender implements Sender {
             SenderErrorHandler errorHandler,
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
-            long authTimeoutMs,
-            boolean gorillaEnabled
+            long authTimeoutMs
     ) {
         return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
@@ -577,7 +582,7 @@ public class QwpWebSocketSender implements Sender {
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, authTimeoutMs, gorillaEnabled,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs,
                 null, SenderConnectionDispatcher.DEFAULT_CAPACITY);
     }
 
@@ -603,7 +608,6 @@ public class QwpWebSocketSender implements Sender {
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
             long authTimeoutMs,
-            boolean gorillaEnabled,
             SenderConnectionListener connectionListener,
             int connectionListenerInboxCapacity
     ) {
@@ -615,8 +619,6 @@ public class QwpWebSocketSender implements Sender {
         try {
             sender.requestDurableAck = requestDurableAck;
             sender.authTimeoutMs = authTimeoutMs;
-            sender.gorillaEnabled = gorillaEnabled;
-            sender.encoder.setGorillaEnabled(gorillaEnabled);
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -1093,6 +1095,10 @@ public class QwpWebSocketSender implements Sender {
                 cursorEngine = null;
                 ownsCursorEngine = false;
             }
+            // Past the ioThreadStopped guard => cursorEngine.close() ran and
+            // released the SF flock in its finally (or this sender owned no
+            // engine holding one). Signal the pool it may reuse the slot.
+            slotLockReleased = true;
 
             // Shutdown order: dispatcher last, after the I/O loop has stopped
             // producing into it. close() drains pending entries with a short
@@ -1133,6 +1139,16 @@ public class QwpWebSocketSender implements Sender {
             }
             rethrowTerminal(terminalError);
         }
+    }
+
+    /**
+     * True once {@link #close()} has released the store-and-forward slot
+     * flock. False means close() leaked the still-running I/O thread (and its
+     * resources), so the flock is still held; the owning pool must keep the
+     * slot index reserved instead of reusing the still-locked slot dir.
+     */
+    public boolean isSlotLockReleased() {
+        return slotLockReleased;
     }
 
     @Override
@@ -1824,13 +1840,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns whether Gorilla encoding is enabled.
-     */
-    public boolean isGorillaEnabled() {
-        return gorillaEnabled;
-    }
-
-    /**
      * Adds a LONG256 column value to the current row.
      *
      * @param columnName the column name
@@ -2059,14 +2068,6 @@ public class QwpWebSocketSender implements Sender {
                     + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
         }
         this.errorInboxCapacity = capacity;
-    }
-
-    /**
-     * Sets whether to use Gorilla timestamp encoding.
-     */
-    public void setGorillaEnabled(boolean enabled) {
-        this.gorillaEnabled = enabled;
-        this.encoder.setGorillaEnabled(enabled);
     }
 
     public void setTransactional(boolean transactional) {

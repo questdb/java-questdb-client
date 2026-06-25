@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -330,7 +331,7 @@ public class InitialConnectAsyncTest {
                 throw new AssertionError(
                         "I/O thread did not log a connect attempt within 5s");
             }
-            Thread.onSpinWait();
+            io.questdb.client.std.Compat.onSpinWait();
         }
     }
 
@@ -427,7 +428,7 @@ public class InitialConnectAsyncTest {
         }
 
         @Override
-        public void onError(SenderError err) {
+        public void onError(@NotNull SenderError err) {
             if (ref.compareAndSet(null, err)) {
                 latch.countDown();
             }

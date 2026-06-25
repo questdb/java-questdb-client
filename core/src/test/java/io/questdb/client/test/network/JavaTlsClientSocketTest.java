@@ -204,7 +204,7 @@ public class JavaTlsClientSocketTest {
     }
 
     private static JavaTlsClientSocket newSocket() throws Exception {
-        var constructor = JavaTlsClientSocket.class.getDeclaredConstructor(
+        java.lang.reflect.Constructor<JavaTlsClientSocket> constructor = JavaTlsClientSocket.class.getDeclaredConstructor(
                 NetworkFacade.class,
                 org.slf4j.Logger.class,
                 ClientTlsConfiguration.class

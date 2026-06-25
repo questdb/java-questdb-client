@@ -124,7 +124,7 @@ public class JavaTlsClientSocketHandshakeOverflowTest {
 
     public static final class HandshakeOverflowProvider extends Provider {
         public HandshakeOverflowProvider() {
-            super(PROVIDER_NAME, "1.0", "test-only");
+            super(PROVIDER_NAME, 1.0, "test-only");
             put("SSLContext.TLS", HandshakeOverflowSslContextSpi.class.getName());
         }
     }
