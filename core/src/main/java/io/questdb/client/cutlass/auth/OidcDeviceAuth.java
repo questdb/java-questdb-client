@@ -45,8 +45,8 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.str.DirectUtf8Sequence;
 import io.questdb.client.std.str.StringSink;
 
-import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -146,8 +146,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final int SLOW_DOWN_INCREMENT_SECONDS = 5;
     private static final String USER_AGENT = "questdb/java-client-oidc";
     private static final String WELL_KNOWN_OPENID_CONFIGURATION_PATH = "/.well-known/openid-configuration";
-    private final String audience;
-    private final String clientId;
+    private final String audienceEncoded;
+    private final String clientIdEncoded;
     private final DeviceAuthorizationResponseParser deviceAuthParser = new DeviceAuthorizationResponseParser();
     private final Endpoint deviceAuthorizationEndpoint;
     private final StringSink formSink = new StringSink();
@@ -158,7 +158,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     private final ReentrantLock lock = new ReentrantLock();
     private final DeviceCodePrompt prompt;
     private final StringSink responseStatus = new StringSink();
-    private final String scope;
+    private final String scopeEncoded;
     private final ClientTlsConfiguration tlsConfig;
     private final Endpoint tokenEndpoint;
     private final TokenResponseParser tokenParser = new TokenResponseParser();
@@ -175,11 +175,16 @@ public class OidcDeviceAuth implements QuietCloseable {
     private long tokenTtlMillis;
 
     private OidcDeviceAuth(Builder builder, ClientTlsConfiguration tlsConfig) {
-        this.clientId = builder.clientId;
+        String clientId = builder.clientId;
+        // pre-encode the invariant form params once here, so the poll loop and silent refresh do not
+        // re-run URLEncoder on every request (mirrors the pre-encoded GRANT_TYPE_* constants)
+        this.clientIdEncoded = urlEncode(clientId);
         this.deviceAuthorizationEndpoint = Endpoint.parse(builder.deviceAuthorizationEndpoint);
         this.tokenEndpoint = Endpoint.parse(builder.tokenEndpoint);
-        this.scope = builder.scope;
-        this.audience = builder.audience;
+        String scope = builder.scope;
+        this.scopeEncoded = urlEncode(scope);
+        String audience = builder.audience;
+        this.audienceEncoded = audience != null ? urlEncode(audience) : null;
         this.groupsInToken = builder.groupsInToken;
         this.httpTimeoutMillis = builder.httpTimeoutMillis;
         this.prompt = builder.prompt;
@@ -407,39 +412,6 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Returns a valid token to present to QuestDB: the cached token while still valid, otherwise a
-     * silent refresh when possible, otherwise the interactive device flow. The token is the id token
-     * when the server expects groups encoded in the token, the access token otherwise.
-     *
-     * @return a non-null, non-empty token
-     * @throws OidcAuthException if the interactive flow fails, times out, or the identity provider
-     *                           does not return the expected token
-     */
-    public String signIn() {
-        lock.lock();
-        try {
-            throwIfClosed();
-            // only the kind of token signIn() actually serves counts as a cache hit; a grant that
-            // returned the other kind (access token when the server wants the id token, or vice versa)
-            // leaves the served token null, so re-run the flow rather than report the unusable grant as
-            // valid and have selectToken() throw on this and every later call
-            final String cachedToken = groupsInToken ? idToken : accessToken;
-            if (cachedToken != null) {
-                if (System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
-                    return cachedToken;
-                }
-                if (refreshToken != null && tryRefresh()) {
-                    return selectToken();
-                }
-            }
-            runDeviceFlow();
-            return selectToken();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
      * Like {@link #signIn()} but never starts the interactive device flow, never prompts, and never waits
      * on interactive input: returns the cached token while valid, silently refreshes when a refresh token is
      * available, otherwise throws. Designed for the request/flush path of a long-lived client, for example
@@ -480,6 +452,39 @@ public class OidcDeviceAuth implements QuietCloseable {
                 throw new OidcAuthException("the cached token expired and could not be refreshed without an interactive sign-in; call signIn() to sign in again");
             }
             throw new OidcAuthException("no token has been obtained yet; call signIn() to sign in before using getToken()");
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Returns a valid token to present to QuestDB: the cached token while still valid, otherwise a
+     * silent refresh when possible, otherwise the interactive device flow. The token is the id token
+     * when the server expects groups encoded in the token, the access token otherwise.
+     *
+     * @return a non-null, non-empty token
+     * @throws OidcAuthException if the interactive flow fails, times out, or the identity provider
+     *                           does not return the expected token
+     */
+    public String signIn() {
+        lock.lock();
+        try {
+            throwIfClosed();
+            // only the kind of token signIn() actually serves counts as a cache hit; a grant that
+            // returned the other kind (access token when the server wants the id token, or vice versa)
+            // leaves the served token null, so re-run the flow rather than report the unusable grant as
+            // valid and have selectToken() throw on this and every later call
+            final String cachedToken = groupsInToken ? idToken : accessToken;
+            if (cachedToken != null) {
+                if (System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
+                    return cachedToken;
+                }
+                if (refreshToken != null && tryRefresh()) {
+                    return selectToken();
+                }
+            }
+            runDeviceFlow();
+            return selectToken();
         } finally {
             lock.unlock();
         }
@@ -887,13 +892,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static String urlEncode(String value) {
-        try {
-            // the Charset overload is Java 10; the client targets Java 8, so use the String-charset form
-            return URLEncoder.encode(value, "UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            // UTF-8 is guaranteed present on every JVM, so this is unreachable; rethrow defensively
-            throw new OidcAuthException(e).put("UTF-8 encoding is not supported");
-        }
+        // the Charset overload is Java 10; the client targets Java 8, so use the String-charset form
+        return URLEncoder.encode(value, StandardCharsets.UTF_8);
     }
 
     private static void validateEndpointOrigins(Endpoint tokenEndpoint, Endpoint deviceAuthorizationEndpoint, Endpoint issuer) {
@@ -953,6 +953,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         return trimmed + WELL_KNOWN_OPENID_CONFIGURATION_PATH;
     }
 
+    private void appendEncodedParam(StringSink sink, String name, String encodedValue) {
+        sink.putAscii('&').putAscii(name).putAscii('=').putAscii(encodedValue);
+    }
+
     private void appendParam(StringSink sink, String name, String value) {
         sink.putAscii('&').putAscii(name).putAscii('=').putAscii(urlEncode(value));
     }
@@ -1001,6 +1005,9 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void pollForToken(String deviceCode, int expiresInSeconds, int intervalSeconds) {
+        // url-encode the opaque device code once here, not on every poll: it is invariant for the whole
+        // poll loop (the grant_type and client_id are likewise pre-encoded)
+        final String deviceCodeEncoded = urlEncode(deviceCode);
         final long deadlineNanos = System.nanoTime() + expiresInSeconds * 1_000_000_000L;
         long intervalMillis = (long) intervalSeconds * 1000L;
         while (true) {
@@ -1011,7 +1018,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 throw new OidcAuthException("timed out waiting for authorization, the device code expired; please retry");
             }
             try {
-                int result = pollOnce(deviceCode);
+                int result = pollOnce(deviceCodeEncoded);
                 if (result == POLL_SUCCESS) {
                     return;
                 }
@@ -1040,11 +1047,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
-    private int pollOnce(String deviceCode) {
+    private int pollOnce(String deviceCodeEncoded) {
         formSink.clear();
         formSink.putAscii("grant_type=").putAscii(GRANT_TYPE_DEVICE_CODE_ENCODED);
-        appendParam(formSink, "device_code", deviceCode);
-        appendParam(formSink, "client_id", clientId);
+        appendEncodedParam(formSink, "device_code", deviceCodeEncoded);
+        appendEncodedParam(formSink, "client_id", clientIdEncoded);
 
         tokenParser.clear();
         // a transport failure here propagates to pollForToken, which keeps polling (a transient blip) until
@@ -1161,10 +1168,10 @@ public class OidcDeviceAuth implements QuietCloseable {
 
     private void runDeviceFlow() {
         formSink.clear();
-        formSink.putAscii("client_id=").putAscii(urlEncode(clientId));
-        appendParam(formSink, "scope", scope);
-        if (audience != null) {
-            appendParam(formSink, "audience", audience);
+        formSink.putAscii("client_id=").putAscii(clientIdEncoded);
+        appendEncodedParam(formSink, "scope", scopeEncoded);
+        if (audienceEncoded != null) {
+            appendEncodedParam(formSink, "audience", audienceEncoded);
         }
 
         deviceAuthParser.clear();
@@ -1281,12 +1288,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         formSink.clear();
         formSink.putAscii("grant_type=").putAscii(GRANT_TYPE_REFRESH_TOKEN_ENCODED);
         appendParam(formSink, "refresh_token", refreshToken);
-        appendParam(formSink, "client_id", clientId);
-        if (scope != null) {
-            appendParam(formSink, "scope", scope);
+        appendEncodedParam(formSink, "client_id", clientIdEncoded);
+        if (scopeEncoded != null) {
+            appendEncodedParam(formSink, "scope", scopeEncoded);
         }
-        if (audience != null) {
-            appendParam(formSink, "audience", audience);
+        if (audienceEncoded != null) {
+            appendEncodedParam(formSink, "audience", audienceEncoded);
         }
 
         tokenParser.clear();

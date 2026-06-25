@@ -168,15 +168,15 @@ import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 
 // Discover the client id, scope and endpoints from the QuestDB server's /settings:
 try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
-    auth.getToken(); // sign in once: prompts on first use, then caches and refreshes
+    auth.signIn(); // sign in once: prompts on first use, then caches and refreshes
 
     // Pass a token provider, not a fixed string: the sender pulls a freshly refreshed token on each
-    // request, so a long-lived sender keeps working as the token rotates. getTokenSilently() refreshes
+    // request, so a long-lived sender keeps working as the token rotates. getToken() refreshes
     // silently and never prompts on the flush path.
     try (Sender sender = Sender.builder(Sender.Transport.HTTP)
             .address("questdb.example.com:9000")
             .enableTls()
-            .httpTokenProvider(auth::getTokenSilently)
+            .httpTokenProvider(auth::getToken)
             .build()) {
         sender.table("trades")
                 .symbol("symbol", "ETH-USD")
@@ -186,7 +186,7 @@ try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.c
 }
 ```
 
-Prefer `httpTokenProvider(auth::getTokenSilently)` for a long-lived sender: it pulls a freshly refreshed token on every request, so the sender keeps working as the token rotates. A fixed `httpToken(token)` captures the token once, so a sender that outlives the token's lifetime starts failing with 401s. Either way, hand the token to the client through the builder (or the header/password fields below), not by embedding it in a `Sender.fromConfig(...)` string or the `QDB_CLIENT_CONF` environment variable, which are easily logged, persisted, or left in shell history.
+Prefer `httpTokenProvider(auth::getToken)` for a long-lived sender: it pulls a freshly refreshed token on every request, so the sender keeps working as the token rotates. A fixed `httpToken(token)` captures the token once, so a sender that outlives the token's lifetime starts failing with 401s. Either way, hand the token to the client through the builder (or the header/password fields below), not by embedding it in a `Sender.fromConfig(...)` string or the `QDB_CLIENT_CONF` environment variable, which are easily logged, persisted, or left in shell history.
 
 By default the prompt prints the verification URL and code to `System.out` **and** tries to open the URL in your default browser. The browser open is best-effort: it only opens an `http(s)` URL, is skipped on a headless host or a JVM without the `java.desktop` module, and never blocks sign-in — the URL and code are always printed too, so a remote or browserless process still works. To disable the browser launch for a whole process (a server, automation, CI), set the system property `-Dquestdb.client.oidc.open.browser=false`. To print only (no browser) for a single client, pass `DeviceCodePrompt.SYSTEM_OUT`; to render the challenge yourself (a clickable link or QR code in a notebook), pass any `DeviceCodePrompt`:
 
@@ -195,7 +195,7 @@ By default the prompt prints the verification URL and code to `System.out` **and
 try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
         "https://questdb.example.com:9000",
         new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.SYSTEM_OUT))) {
-    auth.getToken();
+    auth.signIn();
 }
 ```
 
@@ -222,7 +222,7 @@ Discovery via `fromQuestDB(...)` reads the OIDC client id, scope, audience and e
 try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
         "https://questdb.example.com:9000",
         new OidcDeviceAuth.DiscoveryOptions().issuer("https://idp.example.com"))) {
-    auth.getToken();
+    auth.signIn();
 }
 ```
 

@@ -564,7 +564,7 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testConcurrentGetTokenStartsSingleSignIn() throws Exception {
+    public void testConcurrentSignInStartsSingleSignIn() throws Exception {
         assertMemoryLeak(() -> {
             // several callers race signIn() on a fresh instance; the synchronized method must serialize
             // them so exactly one interactive sign-in runs and the rest get the cached token
@@ -1388,7 +1388,7 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testGetTokenSilentlyDoesNotBlockBehindInteractiveSignIn() throws Exception {
+    public void testGetTokenDoesNotBlockBehindInteractiveSignIn() throws Exception {
         assertMemoryLeak(() -> {
             // an interactive signIn() is parked polling (authorization_pending), holding the instance
             // lock for the whole device-code lifetime. A flush-path getToken() on another thread
@@ -1436,7 +1436,7 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testGetTokenSilentlyDoesNotBlockBehindSilentRefresh() throws Exception {
+    public void testGetTokenDoesNotBlockBehindSilentRefresh() throws Exception {
         assertMemoryLeak(() -> {
             // the flush-path contract also holds when the lock is held by another thread's SILENT REFRESH, not
             // just an interactive sign-in: getToken() must fail fast rather than queue behind it. The
@@ -1503,7 +1503,7 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testGetTokenSilentlyRefreshesWithoutPrompting() throws Exception {
+    public void testGetTokenRefreshesWithoutPrompting() throws Exception {
         assertMemoryLeak(() -> {
             // getToken() returns the cached token, silently refreshes it when it expires, and never
             // prompts; if it cannot produce a token without an interactive sign-in, it throws
