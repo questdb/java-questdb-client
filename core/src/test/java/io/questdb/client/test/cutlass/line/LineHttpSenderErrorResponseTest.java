@@ -52,6 +52,38 @@ public class LineHttpSenderErrorResponseTest {
     private static final char RLO = 0x202e;
 
     @Test(timeout = 30_000)
+    public void testProtocolDetectionErrorBodyControlAndBidiAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // when the caller does not pin a protocol version, build() probes the server for one; a
+            // non-success, non-404 probe response body is captured into the "Failed to detect server line
+            // protocol version" exception. A hostile or proxied endpoint must not splice control, ANSI or
+            // bidi chars into that message any more than into a flush error
+            String errorBody = "probe denied " + ESC + "[2J forged\n" + RLO + "moc.live";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try {
+                    // no protocolVersion(...) -> build() runs the detection probe; retryTimeoutMillis(0) makes
+                    // it give up after the first failed probe instead of retrying to a deadline
+                    Sender.builder(Sender.Transport.HTTP)
+                            .address("127.0.0.1:" + server.port())
+                            .retryTimeoutMillis(0)
+                            .build()
+                            .close();
+                    Assert.fail("expected protocol detection to fail and surface the server body");
+                } catch (LineSenderException e) {
+                    String msg = e.getMessage();
+                    Assert.assertTrue(msg, msg.contains("Failed to detect server line protocol version"));
+                    Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("probe denied"));
+                    Assert.assertTrue("the ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                    Assert.assertTrue("the bidi override must be escaped: " + msg, msg.contains("\\u202e"));
+                    Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
+                    Assert.assertFalse("a raw newline must not leak: " + msg, msg.indexOf('\n') >= 0);
+                    Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testServerAuthErrorBodyControlAndBidiAreEscaped() throws Exception {
         assertMemoryLeak(() -> {
             // a 401/403 body is echoed into the exception verbatim (read as raw bytes, not through the JSON
@@ -77,6 +109,46 @@ public class LineHttpSenderErrorResponseTest {
                         Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
                         Assert.assertFalse("a raw newline must not leak: " + msg, msg.indexOf('\n') >= 0);
                         Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerErrorStatusLineControlCharsAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // the HTTP status-line token is echoed into the exception as "[http-status=...]". The header parser
+            // copies it verbatim between the two spaces, so a hostile or proxied endpoint can smuggle control or
+            // ANSI bytes there; a non-3-char token bypasses the numeric status checks and reaches the generic
+            // error path, so the status render must escape them too, not just the body. A bidi override is a
+            // multi-byte char the raw-response writer's US-ASCII encoding would drop, so this case uses an ESC;
+            // the bidi cases above cover the body
+            String body = "upstream error";
+            // a malformed status code "400<ESC>[m" (6 chars, not 3) carries an ESC between the two spaces;
+            // text/plain keeps it off the JSON parser, so it reaches the generic path that renders the status
+            String rawResponse = "HTTP/1.1 400" + ESC + "[m FORGED\r\n"
+                    + "Content-Type: text/plain\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n"
+                    + Integer.toHexString(body.length()) + "\r\n" + body + "\r\n"
+                    + "0\r\n\r\n";
+            try (MockOidcServer server = new MockOidcServer((method, path, b) -> MockOidcServer.raw(rawResponse))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("Could not flush buffer"));
+                        // the ESC smuggled into the status token arrives escaped, never as a raw byte that
+                        // could drive an ANSI terminal sequence
+                        Assert.assertTrue("the status-line ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                        Assert.assertFalse("a raw ESC must not leak from the status line: " + msg, msg.indexOf(0x1b) >= 0);
                     }
                 }
             }

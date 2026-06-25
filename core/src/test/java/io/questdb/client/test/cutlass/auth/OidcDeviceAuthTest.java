@@ -1863,6 +1863,10 @@ public class OidcDeviceAuthTest {
         Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%2%66evil/token", issuer));
         Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%252fevil/token", issuer));
         Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme\\evil/token", issuer));
+        // a percent-encoded backslash (%5c / %5C) is the encoded form of the literal '\' above; the scan
+        // rejects it at the encoded level too, before decodePathSegments would fold it to '/'
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%5cevil/token", issuer));
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%5Cevil/token", issuer));
     }
 
     @Test(timeout = 30_000)

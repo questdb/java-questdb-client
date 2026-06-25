@@ -334,7 +334,9 @@ public abstract class AbstractLineHttpSender implements Sender {
         if (protocolVersion == PROTOCOL_VERSION_NOT_SET_EXPLICIT) {
             Misc.free(cli);
             if (lastErrorSink != null) {
-                throw new LineSenderException("Failed to detect server line protocol version: " + lastErrorSink);
+                // sanitize the raw server body before it reaches the exception message (and any log/terminal):
+                // a hostile or proxied endpoint must not splice control, ANSI or bidi chars into the render
+                throw new LineSenderException("Failed to detect server line protocol version: ").putAsPrintable(lastErrorSink);
             }
             throw new LineSenderException("Failed to detect server line protocol version");
         }
@@ -841,7 +843,7 @@ public abstract class AbstractLineHttpSender implements Sender {
                 // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
                 ex = ex.put(": ").putAsPrintable(sink);
             }
-            ex.put(" [http-status=").put(statusAscii).put(']');
+            ex.put(" [http-status=").putAsPrintable(statusAscii).put(']');
             client.disconnect();
             throw ex;
         }
@@ -862,7 +864,7 @@ public abstract class AbstractLineHttpSender implements Sender {
         // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
         LineSenderException ex = new LineSenderException("Could not flush buffer: ", retryable)
                 .putAsPrintable(sink)
-                .put(" [http-status=").put(statusCode.asAsciiCharSequence()).put(']');
+                .put(" [http-status=").putAsPrintable(statusCode.asAsciiCharSequence()).put(']');
         client.disconnect();
         throw ex;
     }
@@ -1032,7 +1034,7 @@ public abstract class AbstractLineHttpSender implements Sender {
         private void drainAndReset(LineSenderException sink, DirectUtf8Sequence httpStatus) {
             assert state == State.INIT;
 
-            sink.putAsPrintable(messageSink).put(" [http-status=").put(httpStatus.asAsciiCharSequence());
+            sink.putAsPrintable(messageSink).put(" [http-status=").putAsPrintable(httpStatus.asAsciiCharSequence());
             if (codeSink.length() != 0 || errorIdSink.length() != 0 || lineSink.length() != 0) {
                 if (errorIdSink.length() != 0) {
                     sink.put(", id: ").putAsPrintable(errorIdSink);
@@ -1074,7 +1076,7 @@ public abstract class AbstractLineHttpSender implements Sender {
                     }
                     // sanitize the raw server body before it reaches the exception message (and any log/terminal):
                     // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
-                    exception.putAsPrintable(jsonSink).put(" [http-status=").put(httpStatus.asAsciiCharSequence()).put(']');
+                    exception.putAsPrintable(jsonSink).put(" [http-status=").putAsPrintable(httpStatus.asAsciiCharSequence()).put(']');
                     reset();
                     return exception;
                 }

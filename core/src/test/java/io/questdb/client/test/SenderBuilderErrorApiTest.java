@@ -265,6 +265,27 @@ public class SenderBuilderErrorApiTest {
     }
 
     @Test
+    public void testHttpTokenProviderNullRejectedAndExclusiveWithLaterUsernamePassword() {
+        // a null provider is rejected up front
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000").httpTokenProvider(null);
+            Assert.fail("expected a null provider to be rejected");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token provider cannot be null"));
+        }
+        // the reverse of the mutual-exclusion case above: provider first, then username/password. This hits a
+        // distinct guard in httpUsernamePassword(), which the provider-then-token / token-then-provider /
+        // username-then-provider orderings above do not reach
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000")
+                    .httpTokenProvider(() -> "dynamic").httpUsernamePassword("u", "p");
+            Assert.fail("expected token-provider-already-configured");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token provider authentication is already configured"));
+        }
+    }
+
+    @Test
     public void testHttpTokenProviderAcceptedForWebSocket() {
         // the provider is supported over WebSocket (queried at each upgrade handshake): it must pass
         // build-time validation and fail only on the connection itself, never with a "not supported"
