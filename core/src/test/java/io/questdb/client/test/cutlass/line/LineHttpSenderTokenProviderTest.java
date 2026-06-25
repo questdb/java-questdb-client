@@ -39,7 +39,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * Verifies that a {@link Sender} built with {@link Sender.LineSenderBuilder#httpTokenProvider}
  * does not query the provider on the build path: the first token pull is deferred to the first
  * row. That lets a provider which signs in lazily - the documented
- * {@code .httpTokenProvider(auth::getTokenSilently)} - be wired before the interactive sign-in
+ * {@code .httpTokenProvider(auth::getToken)} - be wired before the interactive sign-in
  * has completed.
  * <p>
  * An explicit {@code protocol_version} keeps {@link Sender.LineSenderBuilder#build()} from probing
@@ -52,7 +52,7 @@ public class LineHttpSenderTokenProviderTest {
     @Test
     public void testBuildSucceedsWhenProviderHasNotSignedInYet() throws Exception {
         assertMemoryLeak(() -> {
-            // a provider that throws until the caller has signed in, mirroring OidcDeviceAuth::getTokenSilently
+            // a provider that throws until the caller has signed in, mirroring OidcDeviceAuth::getToken
             AtomicBoolean signedIn = new AtomicBoolean(false);
             HttpTokenProvider provider = () -> {
                 if (!signedIn.get()) {

@@ -22,14 +22,14 @@ public class OidcDeviceFlowExample {
         //   import io.questdb.client.cutlass.auth.DeviceCodePrompt;
         //   OidcDeviceAuth.fromQuestDB(url, new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.SYSTEM_OUT))
         try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
-            auth.getToken(); // sign in once (prompts on first use, then caches and refreshes silently)
+            auth.signIn(); // sign in once (prompts on first use, then caches and refreshes silently)
 
             // 1. Ingest with the QuestDB client over ILP-over-HTTP, presenting the token as a Bearer.
             //    Pass a provider, not the fixed token, so a long-lived sender follows silent refreshes.
             try (Sender sender = Sender.builder(Sender.Transport.HTTP)
                     .address("questdb.example.com:9000")
                     .enableTls()
-                    .httpTokenProvider(auth::getTokenSilently)
+                    .httpTokenProvider(auth::getToken)
                     .build()) {
                 sender.table("trades")
                         .symbol("symbol", "ETH-USD")

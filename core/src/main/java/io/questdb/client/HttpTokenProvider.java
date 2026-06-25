@@ -29,7 +29,7 @@ import io.questdb.client.std.Chars;
 
 /**
  * Supplies an HTTP authentication token to a {@link Sender} on demand, so a provider returning a
- * freshly refreshed token - e.g. {@code OidcDeviceAuth::getTokenSilently} - keeps a long-lived sender
+ * freshly refreshed token - e.g. {@code OidcDeviceAuth::getToken} - keeps a long-lived sender
  * authenticated as the token rotates, without rebuilding it. Over HTTP the sender calls
  * {@link #getToken()} as it builds each request; over WebSocket it calls it once per connection
  * handshake, on the initial connect and again on every reconnect.

@@ -412,7 +412,7 @@ public abstract class AbstractLineHttpSender implements Sender {
         if (httpTokenProvider != null) {
             // The constructor already built the initial request without a token. Defer the first
             // getToken() off this build path to the first row (table()), so a provider that signs in
-            // lazily - e.g. OidcDeviceAuth::getTokenSilently - can be wired before sign-in completes,
+            // lazily - e.g. OidcDeviceAuth::getToken - can be wired before sign-in completes,
             // and the token pull stays on the use/flush path the provider documents.
             sender.httpTokenProvider = httpTokenProvider;
             sender.isTokenPending = true;
@@ -816,7 +816,7 @@ public abstract class AbstractLineHttpSender implements Sender {
     private void stampTokenIfPending() {
         if (isTokenPending) {
             // The construct/flush path deferred the token so a lazily-signing-in provider (e.g.
-            // OidcDeviceAuth::getTokenSilently) could be wired before sign-in completed, and so a provider
+            // OidcDeviceAuth::getToken) could be wired before sign-in completed, and so a provider
             // failure never strikes after a successful send. The caller is now starting the first row, so
             // rebuild the still-empty request to carry the token before any row data goes in. Clear the
             // flag only after newRequest(true) succeeds: a pull that throws (not signed in yet, or a failed

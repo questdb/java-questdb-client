@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.ClientTlsConfiguration;
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
@@ -285,6 +286,11 @@ public class QwpQueryClient implements QuietCloseable {
     private boolean tlsEnabled;
     // Only meaningful when tlsEnabled. Default is full validation against the JVM's trust store.
     private int tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
+    // Supplies a fresh Bearer token at each WebSocket upgrade (the initial
+    // connect and every failover reconnect), so a long-lived client follows
+    // token rotation. Mutually exclusive with the fixed authorizationHeader
+    // synthesized by withBearerToken/withBasicAuth; null when unset.
+    private HttpTokenProvider tokenProvider;
     private char[] trustStorePassword;
     private String trustStorePath;
     private volatile WebSocketClient webSocketClient;
@@ -838,11 +844,12 @@ public class QwpQueryClient implements QuietCloseable {
     /**
      * Test-only hook: the synthesized {@code Authorization} header value
      * ({@code Basic ...} or {@code Bearer ...}), or null when no credentials
-     * were configured.
+     * were configured. When a token provider is configured, queries it and
+     * validates the returned token, exactly as a real upgrade would.
      */
     @TestOnly
     public String getAuthorizationHeaderForTest() {
-        return authorizationHeader;
+        return resolveAuthorizationHeader();
     }
 
     /**
@@ -1003,6 +1010,9 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public QwpQueryClient withBasicAuth(String username, String password) {
         checkPreConnect("withBasicAuth");
+        if (tokenProvider != null) {
+            throw new IllegalStateException("withBasicAuth cannot be combined with withBearerTokenProvider");
+        }
         if (username == null || password == null) {
             throw new IllegalArgumentException("username and password must not be null");
         }
@@ -1020,10 +1030,43 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public QwpQueryClient withBearerToken(String token) {
         checkPreConnect("withBearerToken");
+        if (tokenProvider != null) {
+            throw new IllegalStateException("withBearerToken cannot be combined with withBearerTokenProvider");
+        }
         if (token == null) {
             throw new IllegalArgumentException("token must not be null");
         }
         this.authorizationHeader = "Bearer " + token;
+        return this;
+    }
+
+    /**
+     * Configures HTTP Bearer authentication with a token supplied on demand by
+     * {@code provider}, instead of the fixed token captured once by
+     * {@link #withBearerToken(String)}. The provider is queried for a fresh
+     * token at every WebSocket upgrade -- the initial {@link #connect()} and
+     * each failover reconnect -- so a long-lived client keeps working as the
+     * token rotates (for example an OIDC device-flow token:
+     * {@code .withBearerTokenProvider(auth::getToken)}).
+     * <p>
+     * {@link HttpTokenProvider#getToken()} runs on the connect and reconnect
+     * paths, so it must return promptly and must not block on interactive
+     * input; a quick silent refresh is fine. Each returned token is validated
+     * ({@link HttpTokenProvider#validateToken(CharSequence)}) before it is sent,
+     * and a provider that throws fails that connection attempt. Mutually
+     * exclusive with {@link #withBearerToken(String)} and
+     * {@link #withBasicAuth(String, String)}. Must be called before
+     * {@link #connect}.
+     */
+    public QwpQueryClient withBearerTokenProvider(HttpTokenProvider provider) {
+        checkPreConnect("withBearerTokenProvider");
+        if (provider == null) {
+            throw new IllegalArgumentException("provider must not be null");
+        }
+        if (authorizationHeader != null) {
+            throw new IllegalStateException("withBearerTokenProvider cannot be combined with withBearerToken or withBasicAuth");
+        }
+        this.tokenProvider = provider;
         return this;
     }
 
@@ -1744,11 +1787,27 @@ public class QwpQueryClient implements QuietCloseable {
                         + ", lastError=" + (lastError == null ? "<none>" : lastError.getMessage()) + ']');
     }
 
+    private String resolveAuthorizationHeader() {
+        // With a token provider, re-query it at each upgrade so a reconnect
+        // presents a freshly refreshed token; validateToken rejects a
+        // null/empty/blank return, or one carrying a control or non-ASCII
+        // character, before it reaches the "Bearer " header. A provider that
+        // throws (a failed silent refresh) propagates and fails this connection
+        // attempt, matching the QWP ingress sender.
+        if (tokenProvider != null) {
+            CharSequence token = tokenProvider.getToken();
+            HttpTokenProvider.validateToken(token);
+            return "Bearer " + token;
+        }
+        return authorizationHeader;
+    }
+
     private void runUpgradeWithTimeout(Endpoint ep) {
         int timeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
+        String authHeader = resolveAuthorizationHeader();
         try {
             webSocketClient.connect(ep.host, ep.port);
-            webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authorizationHeader);
+            webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authHeader);
         } catch (HttpClientException ex) {
             if (ex.isTimeout()) {
                 HttpClientException timeout = new HttpClientException("WebSocket upgrade to ")

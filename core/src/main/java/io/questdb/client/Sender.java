@@ -2018,7 +2018,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Supplies the HTTP authentication token from a provider queried as the sender builds each request,
          * instead of a fixed {@link #httpToken(String) token} captured once, so a long-lived sender follows
-         * token refreshes - e.g. an OIDC device-flow token: {@code .httpTokenProvider(auth::getTokenSilently)}.
+         * token refreshes - e.g. an OIDC device-flow token: {@code .httpTokenProvider(auth::getToken)}.
          * <br>
          * Over HTTP the provider is not called at build time: the first call happens when the first row is
          * started, then once per flush. Over WebSocket the initial connection handshake runs during

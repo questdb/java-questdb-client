@@ -65,7 +65,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * Typical use, discovering everything from the QuestDB server:
  * <pre>{@code
  * try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
- *     String token = auth.getToken(); // signs in on first use, then caches and refreshes
+ *     String token = auth.signIn(); // signs in on first use, then caches and refreshes
  *     // ... use token as an HTTP Bearer header or a PG-wire _sso password ...
  * }
  * }</pre>
@@ -79,11 +79,11 @@ import java.util.concurrent.locks.ReentrantLock;
  *         .groupsInToken(true)
  *         .build();
  * }</pre>
- * {@link #getToken()} serves a cached token while valid, silently refreshes when a refresh token
+ * {@link #signIn()} serves a cached token while valid, silently refreshes when a refresh token
  * exists, otherwise re-runs the interactive flow. An instance lock serializes calls, so two
  * sign-ins never start at once. A sign-in waiting for the user holds that lock for the device code
- * lifetime (up to 30 minutes), so a concurrent {@link #getToken()} or {@link #clearCache()} blocks
- * behind it - but {@link #getTokenSilently()} never waits: it fails fast with an
+ * lifetime (up to 30 minutes), so a concurrent {@link #signIn()} or {@link #clearCache()} blocks
+ * behind it - but {@link #getToken()} never waits: it fails fast with an
  * {@link OidcAuthException} so a request/flush path never stalls. To abort a waiting sign-in, call
  * {@link #close()} from another thread; it signals the flow to stop, which then fails with an
  * {@link OidcAuthException} rather than polling until the device code expires. Cancellation is seen
@@ -153,8 +153,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     private final StringSink formSink = new StringSink();
     private final boolean groupsInToken;
     private final int httpTimeoutMillis;
-    // serializes getToken()/getTokenSilently()/clearCache()/close(); getToken() holds it for the whole
-    // interactive flow, getTokenSilently() uses tryLock so the flush path never stalls behind a sign-in
+    // serializes signIn()/getToken()/clearCache()/close(); signIn() holds it for the whole
+    // interactive flow, getToken() uses tryLock so the flush path never stalls behind a sign-in
     private final ReentrantLock lock = new ReentrantLock();
     private final DeviceCodePrompt prompt;
     private final StringSink responseStatus = new StringSink();
@@ -351,7 +351,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Drops any cached token so the next {@link #getToken()} starts a fresh interactive sign-in.
+     * Drops any cached token so the next {@link #signIn()} starts a fresh interactive sign-in.
      */
     public void clearCache() {
         lock.lock();
@@ -368,7 +368,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Frees the network connections and native buffers this instance holds. If a {@link #getToken()}
+     * Frees the network connections and native buffers this instance holds. If a {@link #signIn()}
      * sign-in is in flight on another thread, signals it to stop so it fails with an
      * {@link OidcAuthException} instead of polling until the device code expires. The signal is observed
      * between polls (within ~100ms while waiting out a poll interval); a poll request already in flight
@@ -378,12 +378,12 @@ public class OidcDeviceAuth implements QuietCloseable {
      * {@link DeviceCodePrompt} that blocks in {@code promptUser} - for example the default
      * {@link DeviceCodePrompt#openBrowser()} prompt while it hands the verification URL to the OS browser,
      * which is not bounded by the HTTP timeout: the flow holds the lock across that one-off prompt, so a
-     * racing {@code close()} waits it out too. Idempotent. After close, {@link #getToken()} and
-     * {@link #clearCache()} throw.
+     * racing {@code close()} waits it out too. Idempotent. After close, {@link #signIn()},
+     * {@link #getToken()} and {@link #clearCache()} throw.
      */
     @Override
     public void close() {
-        // flag cancellation before taking the lock: getToken() holds it for the whole flow, so signal the
+        // flag cancellation before taking the lock: signIn() holds it for the whole flow, so signal the
         // in-flight sign-in to stop via a lock-free volatile write, then acquire the lock - released by the
         // cancelled flow once it observes the flag (between polls, or after an in-flight poll returns) - and
         // free the native resources. close() never frees while a flow holds the lock, so no use-after-free
@@ -399,11 +399,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * @return {@code "Bearer " + getToken()}, ready to use as the value of an HTTP
+     * @return {@code "Bearer " + signIn()}, ready to use as the value of an HTTP
      * {@code Authorization} header.
      */
     public String getAuthorizationHeaderValue() {
-        return "Bearer " + getToken();
+        return "Bearer " + signIn();
     }
 
     /**
@@ -415,11 +415,11 @@ public class OidcDeviceAuth implements QuietCloseable {
      * @throws OidcAuthException if the interactive flow fails, times out, or the identity provider
      *                           does not return the expected token
      */
-    public String getToken() {
+    public String signIn() {
         lock.lock();
         try {
             throwIfClosed();
-            // only the kind of token getToken() actually serves counts as a cache hit; a grant that
+            // only the kind of token signIn() actually serves counts as a cache hit; a grant that
             // returned the other kind (access token when the server wants the id token, or vice versa)
             // leaves the served token null, so re-run the flow rather than report the unusable grant as
             // valid and have selectToken() throw on this and every later call
@@ -440,13 +440,13 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Like {@link #getToken()} but never starts the interactive device flow, never prompts, and never waits
+     * Like {@link #signIn()} but never starts the interactive device flow, never prompts, and never waits
      * on interactive input: returns the cached token while valid, silently refreshes when a refresh token is
      * available, otherwise throws. Designed for the request/flush path of a long-lived client, for example
-     * {@code Sender.builder(...).httpTokenProvider(auth::getTokenSilently)}, where an interactive prompt is
-     * inappropriate. Call {@link #getToken()} once to sign in first.
+     * {@code Sender.builder(...).httpTokenProvider(auth::getToken)}, where an interactive prompt is
+     * inappropriate. Call {@link #signIn()} once to sign in first.
      * <p>
-     * It does not wait behind an interactive {@link #getToken()} running on another thread (which would stall
+     * It does not wait behind an interactive {@link #signIn()} running on another thread (which would stall
      * the flush for the whole device-code lifetime): if such a sign-in holds the lock it fails fast, and the
      * caller should retry once the sign-in completes. It is not, however, instantaneous - when the cached
      * token has expired it makes one synchronous refresh round-trip to the token endpoint, bounded by
@@ -458,9 +458,9 @@ public class OidcDeviceAuth implements QuietCloseable {
      *                           not be refreshed without an interactive sign-in, or if a sign-in or
      *                           refresh is already in progress on another thread
      */
-    public String getTokenSilently() {
+    public String getToken() {
         throwIfClosed();
-        // never wait on the flush path: getToken()'s sign-in holds the lock for the whole device-code
+        // never wait on the flush path: signIn()'s sign-in holds the lock for the whole device-code
         // lifetime (up to 30 minutes), so tryLock and fail fast if held. A sign-in in progress means there
         // is no token to serve yet, so the caller gets a prompt exception to retry rather than a stalled
         // flush
@@ -477,9 +477,9 @@ public class OidcDeviceAuth implements QuietCloseable {
                 if (refreshToken != null && tryRefresh()) {
                     return selectToken();
                 }
-                throw new OidcAuthException("the cached token expired and could not be refreshed without an interactive sign-in; call getToken() to sign in again");
+                throw new OidcAuthException("the cached token expired and could not be refreshed without an interactive sign-in; call signIn() to sign in again");
             }
-            throw new OidcAuthException("no token has been obtained yet; call getToken() to sign in before using getTokenSilently()");
+            throw new OidcAuthException("no token has been obtained yet; call signIn() to sign in before using getToken()");
         } finally {
             lock.unlock();
         }
