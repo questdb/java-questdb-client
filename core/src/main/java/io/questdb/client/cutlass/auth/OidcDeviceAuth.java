@@ -1294,9 +1294,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         formSink.putAscii("grant_type=").putAscii(GRANT_TYPE_REFRESH_TOKEN_ENCODED);
         appendParam(formSink, "refresh_token", refreshToken);
         appendEncodedParam(formSink, "client_id", clientIdEncoded);
-        if (scopeEncoded != null) {
-            appendEncodedParam(formSink, "scope", scopeEncoded);
-        }
+        appendEncodedParam(formSink, "scope", scopeEncoded);
         if (audienceEncoded != null) {
             appendEncodedParam(formSink, "audience", audienceEncoded);
         }
@@ -1421,6 +1419,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
 
         public Builder httpTimeoutMillis(int httpTimeoutMillis) {
+            if (httpTimeoutMillis <= 0) {
+                throw new OidcAuthException("httpTimeoutMillis must be positive");
+            }
             this.httpTimeoutMillis = httpTimeoutMillis;
             return this;
         }

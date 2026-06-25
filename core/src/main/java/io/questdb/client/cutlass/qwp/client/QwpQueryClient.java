@@ -684,6 +684,11 @@ public class QwpQueryClient implements QuietCloseable {
      * observed so callers can distinguish "no primary available" from "all
      * endpoints unreachable" (the latter surfaces as a plain
      * {@link HttpClientException}).
+     * <p>
+     * A configured token provider is queried once here, before the walk. A
+     * provider failure (not signed in, a failed silent refresh, a rejected
+     * token) is cluster-wide, so it fails fast with the provider's own error
+     * rather than being retried across endpoints as a transport failure.
      */
     public synchronized void connect() {
         if (closedFlag.get()) {
@@ -702,6 +707,12 @@ public class QwpQueryClient implements QuietCloseable {
         QwpServerInfo lastObservedMismatch = null;
         QwpIngressRoleRejectedException lastUpgradeRoleReject = null;
         Throwable lastTransportError = null;
+        // Resolve the bearer credential once, before the endpoint walk: a token is cluster-wide, so a
+        // token-provider failure (not signed in, a failed silent refresh, a rejected token) is not a
+        // per-endpoint transport fault. Resolving here lets it propagate as the provider's own error
+        // instead of being folded into "all endpoints unreachable", and avoids re-querying the provider
+        // once per endpoint.
+        String authHeader = resolveAuthorizationHeader();
         while (true) {
             int i = hostTracker.pickNext();
             if (i < 0) {
@@ -709,7 +720,7 @@ public class QwpQueryClient implements QuietCloseable {
             }
             Endpoint ep = endpoints.get(i);
             try {
-                connectToEndpoint(ep);
+                connectToEndpoint(ep, authHeader);
             } catch (QwpAuthFailedException ae) {
                 cleanupFailedConnect();
                 throw ae;
@@ -1401,7 +1412,7 @@ public class QwpQueryClient implements QuietCloseable {
         currentEndpointIndex = -1;
     }
 
-    private void connectToEndpoint(Endpoint ep) {
+    private void connectToEndpoint(Endpoint ep, String authHeader) {
         if (tlsEnabled) {
             webSocketClient = WebSocketClientFactory.newTlsInstance(
                     new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode));
@@ -1412,7 +1423,7 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.setQwpClientId(clientId != null ? clientId : defaultClientId());
         webSocketClient.setQwpAcceptEncoding(buildAcceptEncodingHeader());
         webSocketClient.setQwpMaxBatchRows(maxBatchRows);
-        runUpgradeWithTimeout(ep);
+        runUpgradeWithTimeout(ep, authHeader);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
         negotiatedZstdLevel = webSocketClient.getServerNegotiatedZstdLevel();
 
@@ -1730,6 +1741,10 @@ public class QwpQueryClient implements QuietCloseable {
         QwpServerInfo lastMismatch = null;
         Throwable lastError = null;
         boolean retriedAfterReset = false;
+        // Resolve the bearer credential once per reconnect, before the endpoint walk, for the same
+        // reason as connect(): a provider failure is cluster-wide, so surface it directly rather than
+        // as a per-endpoint transport error retried across every host.
+        String authHeader = resolveAuthorizationHeader();
         while (true) {
             int i = hostTracker.pickNext();
             if (i < 0) {
@@ -1742,7 +1757,7 @@ public class QwpQueryClient implements QuietCloseable {
             }
             Endpoint ep = endpoints.get(i);
             try {
-                connectToEndpoint(ep);
+                connectToEndpoint(ep, authHeader);
             } catch (QwpAuthFailedException ae) {
                 cleanupFailedConnect();
                 throw ae;
@@ -1788,12 +1803,11 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     private String resolveAuthorizationHeader() {
-        // With a token provider, re-query it at each upgrade so a reconnect
-        // presents a freshly refreshed token; validateToken rejects a
-        // null/empty/blank return, or one carrying a control or non-ASCII
-        // character, before it reaches the "Bearer " header. A provider that
-        // throws (a failed silent refresh) propagates and fails this connection
-        // attempt, matching the QWP ingress sender.
+        // With a token provider, query it once per connect()/reconnect (the caller resolves before the
+        // endpoint walk) so a reconnect presents a freshly refreshed token; validateToken rejects a
+        // null/empty/blank return, or one carrying a control or non-ASCII character, before it reaches
+        // the "Bearer " header. A provider that throws (a failed silent refresh, or not signed in yet)
+        // propagates out of connect()/reconnect with its own message, matching the QWP ingress sender.
         if (tokenProvider != null) {
             CharSequence token = tokenProvider.getToken();
             HttpTokenProvider.validateToken(token);
@@ -1802,9 +1816,8 @@ public class QwpQueryClient implements QuietCloseable {
         return authorizationHeader;
     }
 
-    private void runUpgradeWithTimeout(Endpoint ep) {
+    private void runUpgradeWithTimeout(Endpoint ep, String authHeader) {
         int timeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
-        String authHeader = resolveAuthorizationHeader();
         try {
             webSocketClient.connect(ep.host, ep.port);
             webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authHeader);

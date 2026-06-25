@@ -128,9 +128,9 @@ public class QwpQueryClientTokenProviderTest {
 
     @Test(timeout = 15_000)
     public void testProviderTokenSentOnRealUpgrade() throws Exception {
-        // drive the REAL connect path (runUpgradeWithTimeout -> resolveAuthorizationHeader), not the test
-        // hook: the upgrade request must carry the freshly pulled "Bearer <token>". The mock answers 404
-        // (not auth-failed, not terminal) so connect() fails fast after the header was already sent.
+        // drive the REAL connect path (connect() -> resolveAuthorizationHeader -> runUpgradeWithTimeout),
+        // not the test hook: the upgrade request must carry the freshly pulled "Bearer <token>". The mock
+        // answers 404 (not auth-failed, not terminal) so connect() fails fast after the header was sent.
         List<String> authHeaders = Collections.synchronizedList(new ArrayList<>());
         ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
         int port = listener.getLocalPort();
@@ -213,8 +213,8 @@ public class QwpQueryClientTokenProviderTest {
     @Test(timeout = 10_000)
     public void testThrowingProviderFailsConnect() throws Exception {
         // a provider that throws must fail the connection attempt on the REAL connect path:
-        // resolveAuthorizationHeader runs inside runUpgradeWithTimeout, before the socket connect, so the
-        // throw aborts the upgrade; connect() exhausts the single endpoint and surfaces the provider failure
+        // resolveAuthorizationHeader runs once before the endpoint walk, so the throw propagates straight
+        // out of connect() as the provider's own error (not wrapped as "all endpoints unreachable")
         try (
                 ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
                 QwpQueryClient client = QwpQueryClient.fromConfig(
@@ -227,7 +227,11 @@ public class QwpQueryClientTokenProviderTest {
                 client.connect();
                 Assert.fail("a throwing provider must fail the connection attempt");
             } catch (RuntimeException expected) {
+                // the provider's own exception propagates directly (the header is resolved before the
+                // endpoint walk), not wrapped as a transport "all endpoints unreachable" error
+                Assert.assertTrue(expected.getClass().getName(), expected instanceof LineSenderException);
                 Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("provider down"));
+                Assert.assertFalse(expected.getMessage(), expected.getMessage().contains("unreachable"));
             }
         }
     }

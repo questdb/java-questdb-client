@@ -267,6 +267,20 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testBuilderRejectsNonPositiveHttpTimeout() {
+        // every other timing input is clamped; a non-positive HTTP timeout yields an already-expired read
+        // deadline and an unbounded recv(int), so the setter rejects it (matching Sender.Builder)
+        for (int bad : new int[]{0, -1}) {
+            try {
+                OidcDeviceAuth.builder().httpTimeoutMillis(bad);
+                Assert.fail("expected httpTimeoutMillis(" + bad + ") to be rejected");
+            } catch (OidcAuthException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("httpTimeoutMillis"));
+            }
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testBuilderRejectsSplitOriginEndpoints() {
         // the token and device authorization endpoints are on different origins; RFC 8628 co-locates them
         // on one authorization server, so build() must refuse to spread the credential POSTs across hosts
