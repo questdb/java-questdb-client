@@ -440,16 +440,18 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Like {@link #getToken()} but never starts the interactive device flow and never blocks: returns
-     * the cached token while valid, silently refreshes when a refresh token is available, otherwise
-     * throws. Designed for the request/flush path of a long-lived client, for example
-     * {@code Sender.builder(...).httpTokenProvider(auth::getTokenSilently)}, where an interactive prompt
-     * is inappropriate and a stalled flush unacceptable. Call {@link #getToken()} once to sign in first.
+     * Like {@link #getToken()} but never starts the interactive device flow, never prompts, and never waits
+     * on interactive input: returns the cached token while valid, silently refreshes when a refresh token is
+     * available, otherwise throws. Designed for the request/flush path of a long-lived client, for example
+     * {@code Sender.builder(...).httpTokenProvider(auth::getTokenSilently)}, where an interactive prompt is
+     * inappropriate. Call {@link #getToken()} once to sign in first.
      * <p>
-     * To keep the flush path responsive it returns or throws promptly - it never waits for an interactive
-     * {@link #getToken()} on another thread (which would stall the flush for the whole device-code
-     * lifetime). While such a sign-in runs there is no token to return anyway, so it throws and the caller
-     * should retry once the sign-in completes.
+     * It does not wait behind an interactive {@link #getToken()} running on another thread (which would stall
+     * the flush for the whole device-code lifetime): if such a sign-in holds the lock it fails fast, and the
+     * caller should retry once the sign-in completes. It is not, however, instantaneous - when the cached
+     * token has expired it makes one synchronous refresh round-trip to the token endpoint, bounded by
+     * {@link Builder#httpTimeoutMillis(int)} (30s by default). That is the "quick silent refresh" the
+     * {@code HttpTokenProvider} contract permits on the flush path, not an unbounded interactive wait.
      *
      * @return a non-null, non-empty token
      * @throws OidcAuthException if no token has been obtained yet, if the cached token expired and could
@@ -979,19 +981,23 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private boolean isHttpStatusSuccess() {
-        // responseStatus is the numeric HTTP status captured by readResponse; a 2xx starts with '2'
-        return responseStatus.length() > 0 && responseStatus.charAt(0) == '2';
+        // responseStatus is the bare-digit HTTP status captured by readResponse. A real status is exactly 3
+        // digits, so require that before reading the leading digit: a malformed short status such as "2" must
+        // not be mistaken for a 2xx success and accepted as a grant.
+        return responseStatus.length() == 3 && responseStatus.charAt(0) == '2';
     }
 
     private boolean isHttpStatusTerminal4xx() {
-        // a 4xx other than 429 is a terminal client-error rejection (429 is a transient rate-limit)
-        return responseStatus.length() > 0 && responseStatus.charAt(0) == '4' && !Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus);
+        // a 4xx other than 429 is a terminal client-error rejection (429 is a transient rate-limit); require a
+        // full 3-digit status so a malformed short "4" is not classified as a terminal 4xx
+        return responseStatus.length() == 3 && responseStatus.charAt(0) == '4' && !Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus);
     }
 
     private boolean isHttpStatusTransient() {
         // a 5xx server error or a 429 rate-limit is transient - keep polling; any other non-2xx (a 4xx
-        // rejection) is terminal. Mirrors the Python client's _http_status_is_transient.
-        return responseStatus.length() > 0 && (responseStatus.charAt(0) == '5' || Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus));
+        // rejection) is terminal. Mirrors the Python client's _http_status_is_transient. Require a full
+        // 3-digit status so a malformed short "5" is not classified as a transient 5xx.
+        return responseStatus.length() == 3 && (responseStatus.charAt(0) == '5' || Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus));
     }
 
     private void pollForToken(String deviceCode, int expiresInSeconds, int intervalSeconds) {
@@ -1241,11 +1247,16 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void storeTokens(TokenResponseParser parser) {
-        // reject a token with control or non-ASCII chars before caching: getToken() serves it verbatim as
-        // an HTTP Authorization header value and a PG-wire password, where a decoded CR/LF would inject
-        // into the request line sent to the trusted QuestDB server
-        validateTokenChars(parser.accessToken, "access_token");
-        validateTokenChars(parser.idToken, "id_token");
+        // reject a token with control or non-ASCII chars before caching: getToken() serves it verbatim as an
+        // HTTP Authorization header value and a PG-wire password, where a decoded CR/LF would inject into the
+        // request line sent to the trusted QuestDB server. Validate only the kind getToken() actually serves
+        // (the one that reaches the wire); the other kind is cached but never sent, so a stray char in it must
+        // not abort an otherwise-usable grant.
+        if (groupsInToken) {
+            validateTokenChars(parser.idToken, "id_token");
+        } else {
+            validateTokenChars(parser.accessToken, "access_token");
+        }
         accessToken = parser.accessToken.length() > 0 ? parser.accessToken.toString() : null;
         idToken = parser.idToken.length() > 0 ? parser.idToken.toString() : null;
         // a refresh response usually omits a new refresh token; keep the current one in that case

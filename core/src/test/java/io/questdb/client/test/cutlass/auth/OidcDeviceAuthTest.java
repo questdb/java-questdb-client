@@ -3176,6 +3176,69 @@ public class OidcDeviceAuthTest {
         return new OidcDeviceAuth.DiscoveryOptions().allowInsecureTransport(true).prompt(noopPrompt());
     }
 
+    @Test(timeout = 30_000)
+    public void testControlCharInUnusedTokenKindDoesNotAbortGrant() throws Exception {
+        assertMemoryLeak(() -> {
+            // groupsInToken=false, so getToken() serves and sends only the access_token; the id_token is
+            // cached but never placed in a header or a PG-wire password. A control char in that unused id_token
+            // must not reject an otherwise-usable grant - only the served kind is validated for wire safety
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEV\","
+                            + "\"user_code\":\"WDJB-MJHT\","
+                            + "\"verification_uri\":\"https://verify.example/device\","
+                            + "\"expires_in\":300,"
+                            + "\"interval\":1"
+                            + "}");
+                }
+                // a clean access_token (the served kind) alongside an id_token carrying a decoded control char
+                return MockOidcServer.json(200, tokenJson("CLEAN-ACCESS", "bad" + jsonUnicodeEscape(0x0001) + "id", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("CLEAN-ACCESS", auth.getToken());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testShortAllDigitStatusIsNotTreatedAsSuccess() throws Exception {
+        assertMemoryLeak(() -> {
+            // a real HTTP status is exactly 3 digits; a malformed 1-digit "2" (all digits, so readResponse
+            // accepts it) must not be classified as a 2xx success by its leading digit and accepted as a grant
+            String tokenBody = tokenJson("SHOULD-NOT-ACCEPT", null, null, 3600);
+            String rawToken = "HTTP/1.1 2 OK\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n"
+                    + Integer.toHexString(tokenBody.length()) + "\r\n" + tokenBody + "\r\n"
+                    + "0\r\n\r\n";
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEV\","
+                            + "\"user_code\":\"WDJB-MJHT\","
+                            + "\"verification_uri\":\"https://verify.example/device\","
+                            + "\"expires_in\":300,"
+                            + "\"interval\":1"
+                            + "}");
+                }
+                return MockOidcServer.raw(rawToken);
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.getToken();
+                    Assert.fail("expected a malformed 1-digit status to be rejected, not accepted as success");
+                } catch (OidcAuthException e) {
+                    String msg = e.getMessage();
+                    Assert.assertTrue(msg, msg.contains("rejected the request") || msg.contains("refusing to keep polling"));
+                    Assert.assertFalse("the unaccepted token must not leak: " + msg, msg.contains("SHOULD-NOT-ACCEPT"));
+                }
+            }
+        });
+    }
+
     // Forces the cached access/id token to look expired WITHOUT dropping the refresh token, so the next
     // getToken()/getTokenSilently() takes the silent-refresh (or interactive re-sign-in) path. Reflection
     // because the field is private and there is no configurable clock skew to lean on anymore; the client is
