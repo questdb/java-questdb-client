@@ -30,11 +30,11 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
-import io.questdb.client.impl.ConfStringParser;
+import io.questdb.client.impl.ConfigString;
+import io.questdb.client.impl.ConfigView;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Zstd;
-import io.questdb.client.std.str.StringSink;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -205,7 +205,6 @@ public class QwpQueryClient implements QuietCloseable {
     // user thread's write is visible to a concurrent cancel caller; 64-bit writes
     // are atomic under {@code volatile long}.
     private volatile long currentRequestId = -1L;
-    private String endpointPath = DEFAULT_ENDPOINT_PATH;
     // True by default: on transport failure during execute(), reconnect to
     // another endpoint and replay the query. Callers that prefer to see the
     // error themselves opt out via {@code failover=off} in the connection
@@ -318,15 +317,13 @@ public class QwpQueryClient implements QuietCloseable {
      *       {@link #execute}, reconnect to another endpoint and re-submit the query.
      *       The user handler sees {@link QwpColumnBatchHandler#onFailoverReset} before
      *       replayed batches begin arriving (batch_seq restarts at 0 on the new node).</li>
-     *   <li>{@code path=/read/v1} -- egress endpoint. Default {@value #DEFAULT_ENDPOINT_PATH}.</li>
-     *   <li>{@code auth=<value>} -- sent verbatim as the HTTP {@code Authorization} header during the upgrade handshake.
-     *       Mutually exclusive with {@code username}/{@code password} and {@code token}.</li>
-     *   <li>{@code username=<name>;password=<secret>} -- HTTP Basic authentication. Server verifies the credentials
+     *   <li>{@code username=<name>;password=<secret>} -- HTTP Basic authentication. The client builds the
+     *       {@code Authorization: Basic <base64>} header from these. Server verifies the credentials
      *       against the same user store the Postgres wire protocol uses, so a user created via
      *       {@code CREATE USER ... WITH PASSWORD ...} can log in unchanged.
-     *       Both keys must be present together; mutually exclusive with {@code auth} and {@code token}.</li>
+     *       Both keys must be present together; mutually exclusive with {@code token}.</li>
      *   <li>{@code token=<access_token>} -- HTTP Bearer authentication with an OIDC access token (sent as
-     *       {@code Authorization: Bearer <token>}). Mutually exclusive with {@code auth} and
+     *       {@code Authorization: Bearer <token>}). Mutually exclusive with
      *       {@code username}/{@code password}.</li>
      *   <li>{@code client_id=<id>} -- sent as the {@code X-QWP-Client-Id} header.</li>
      *   <li>{@code buffer_pool_size=N} -- depth of the I/O thread's batch buffer pool. Default 4.</li>
@@ -355,350 +352,194 @@ public class QwpQueryClient implements QuietCloseable {
      * Examples:
      * <pre>
      *   ws::addr=localhost:9000;
-     *   ws::addr=db.internal:9000;path=/read/v1;auth=Bearer abc123;client_id=dashboard/2.0;
+     *   ws::addr=db.internal:9000;token=abc123;client_id=dashboard/2.0;
      *   ws::addr=db-a:9000,db-b:9000,db-c:9000;target=primary;failover=on;
      * </pre>
      */
     public static QwpQueryClient fromConfig(CharSequence configurationString) {
-        if (configurationString == null || configurationString.length() == 0) {
-            throw new IllegalArgumentException("configuration string cannot be empty");
-        }
-        StringSink sink = new StringSink();
-        int pos = ConfStringParser.of(configurationString, sink);
-        if (pos < 0) {
-            throw new IllegalArgumentException("invalid configuration string: " + sink);
-        }
+        ConfigString cs = ConfigString.parse(configurationString);
         boolean tls;
-        if (Chars.equals("ws", sink)) {
+        if ("ws".equals(cs.schema())) {
             tls = false;
-        } else if (Chars.equals("wss", sink)) {
+        } else if ("wss".equals(cs.schema())) {
             tls = true;
         } else {
             throw new IllegalArgumentException(
-                    "unsupported schema [schema=" + sink + ", supported-schemas=[ws, wss]]");
+                    "unsupported schema [schema=" + cs.schema() + ", supported-schemas=[ws, wss]]");
         }
+        ConfigView view = new ConfigView(cs);
+        validateConfig(view, tls);
 
         List<Endpoint> parsedEndpoints = new ArrayList<>();
-        String path = DEFAULT_ENDPOINT_PATH;
-        String target = TARGET_ANY;
-        Boolean failover = null;
-        Integer failoverMaxAttempts = null;
-        Long failoverBackoffInitialMs = null;
-        Long failoverBackoffMaxMs = null;
-        Long failoverMaxDurationMs = null;
-        Long authTimeoutMs = null;
-        Long initialCredit = null;
-        String auth = null;
-        String username = null;
-        String password = null;
-        String token = null;
-        String cid = null;
-        int poolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
-        // Default matches the field initializer in QwpQueryClient: raw wire,
-        // zstd opt-in.
-        String compression = "raw";
-        int compressionLevel = 1;
-        int maxBatchRows = 0;  // 0 = omit header, server uses its default
-        // TLS validation mode: null means "unset in config". Explicit values kick in only when tls is true.
-        Integer tlsValidation = null;
-        String tlsRoots = null;
-        String tlsRootsPassword = null;
-        String zone = null;
+        view.getHostPorts("addr", DEFAULT_WS_PORT, (h, p) -> parsedEndpoints.add(new Endpoint(h, p)));
 
-        while (ConfStringParser.hasNext(configurationString, pos)) {
-            pos = ConfStringParser.nextKey(configurationString, pos, sink);
-            if (pos < 0) {
-                throw new IllegalArgumentException("invalid configuration string [error=" + sink + "]");
-            }
-            String key = sink.toString();
-            pos = ConfStringParser.value(configurationString, pos, sink);
-            if (pos < 0) {
-                throw new IllegalArgumentException("invalid configuration string [error=" + sink + "]");
-            }
-            String value = sink.toString();
-            switch (key) {
-                case "addr":
-                    // failover.md §1: comma syntax and repeated addr= keys must
-                    // accumulate. parseEndpointList rejects empty entries.
-                    parsedEndpoints.addAll(parseEndpointList(value));
-                    break;
-                case "target":
-                    if (!TARGET_ANY.equals(value) && !TARGET_PRIMARY.equals(value) && !TARGET_REPLICA.equals(value)) {
-                        throw new IllegalArgumentException(
-                                "invalid target: " + value + " (expected any, primary, or replica)");
-                    }
-                    target = value;
-                    break;
-                case "failover":
-                    if ("on".equals(value)) {
-                        failover = Boolean.TRUE;
-                    } else if ("off".equals(value)) {
-                        failover = Boolean.FALSE;
-                    } else {
-                        throw new IllegalArgumentException("invalid failover: " + value + " (expected on or off)");
-                    }
-                    break;
-                case "failover_max_attempts":
-                    try {
-                        failoverMaxAttempts = Integer.parseInt(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid failover_max_attempts: " + value);
-                    }
-                    if (failoverMaxAttempts < 1) {
-                        throw new IllegalArgumentException("failover_max_attempts must be >= 1");
-                    }
-                    break;
-                case "failover_backoff_initial_ms":
-                    try {
-                        failoverBackoffInitialMs = Long.parseLong(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid failover_backoff_initial_ms: " + value);
-                    }
-                    if (failoverBackoffInitialMs < 0L) {
-                        throw new IllegalArgumentException("failover_backoff_initial_ms must be >= 0");
-                    }
-                    break;
-                case "failover_backoff_max_ms":
-                    try {
-                        failoverBackoffMaxMs = Long.parseLong(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid failover_backoff_max_ms: " + value);
-                    }
-                    if (failoverBackoffMaxMs < 0L) {
-                        throw new IllegalArgumentException("failover_backoff_max_ms must be >= 0");
-                    }
-                    break;
-                case "failover_max_duration_ms": {
-                    long parsed;
-                    try {
-                        parsed = Long.parseLong(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid failover_max_duration_ms: " + value);
-                    }
-                    if (parsed < 0L) {
-                        throw new IllegalArgumentException("failover_max_duration_ms must be >= 0");
-                    }
-                    failoverMaxDurationMs = parsed;
-                    break;
-                }
-                case "auth_timeout_ms": {
-                    long parsed;
-                    try {
-                        parsed = Long.parseLong(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid auth_timeout_ms: " + value);
-                    }
-                    if (parsed <= 0L) {
-                        throw new IllegalArgumentException("auth_timeout_ms must be > 0");
-                    }
-                    authTimeoutMs = parsed;
-                    break;
-                }
-                case "path":
-                    path = value;
-                    break;
-                case "auth":
-                    auth = value;
-                    break;
-                case "username":
-                    username = value;
-                    break;
-                case "password":
-                    password = value;
-                    break;
-                case "token":
-                    token = value;
-                    break;
-                case "client_id":
-                    cid = value;
-                    break;
-                case "buffer_pool_size":
-                    try {
-                        poolSize = Integer.parseInt(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid buffer_pool_size: " + value);
-                    }
-                    if (poolSize < 1) {
-                        throw new IllegalArgumentException("buffer_pool_size must be >= 1");
-                    }
-                    break;
-                case "initial_credit":
-                    try {
-                        initialCredit = Long.parseLong(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid initial_credit: " + value);
-                    }
-                    if (initialCredit < 0L) {
-                        throw new IllegalArgumentException("initial_credit must be >= 0");
-                    }
-                    break;
-                case "compression":
-                    if (!"zstd".equals(value) && !"raw".equals(value) && !"auto".equals(value)) {
-                        throw new IllegalArgumentException(
-                                "unsupported compression: " + value + " (expected zstd, raw, or auto)");
-                    }
-                    compression = value;
-                    break;
-                case "compression_level":
-                    try {
-                        compressionLevel = Integer.parseInt(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid compression_level: " + value);
-                    }
-                    if (compressionLevel < 1 || compressionLevel > 22) {
-                        throw new IllegalArgumentException("compression_level must be in [1, 22]");
-                    }
-                    break;
-                case "max_batch_rows":
-                    try {
-                        maxBatchRows = Integer.parseInt(value);
-                    } catch (NumberFormatException e) {
-                        throw new IllegalArgumentException("invalid max_batch_rows: " + value);
-                    }
-                    if (maxBatchRows < 1 || maxBatchRows > MAX_BATCH_ROWS_UPPER_BOUND) {
-                        throw new IllegalArgumentException(
-                                "max_batch_rows must be in [1, " + MAX_BATCH_ROWS_UPPER_BOUND + "]");
-                    }
-                    break;
-                case "tls_verify":
-                    if ("on".equals(value)) {
-                        tlsValidation = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
-                    } else if ("unsafe_off".equals(value)) {
-                        tlsValidation = ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE;
-                    } else {
-                        throw new IllegalArgumentException(
-                                "invalid tls_verify: " + value + " (expected on or unsafe_off)");
-                    }
-                    break;
-                case "tls_roots":
-                    tlsRoots = value;
-                    break;
-                case "tls_roots_password":
-                    tlsRootsPassword = value;
-                    break;
-                case "zone":
-                    zone = value;
-                    break;
-                // connect-string.md "Auto-flushing", "Buffer sizing", "Store-and-forward",
-                // "Durable ACK", "Reconnect and failover", "Error handling", and
-                // legacy ILP aliases: these keys configure the Sender (ingress) only.
-                // The QwpQueryClient silently consumes them so the same connect string
-                // can be shared between the Sender and the QwpQueryClient without an
-                // "unknown configuration key" error. Validation and effect are the
-                // Sender parser's job; the egress parser does not interpret the value.
-                case "auto_flush":
-                case "auto_flush_bytes":
-                case "auto_flush_interval":
-                case "auto_flush_rows":
-                case "close_flush_timeout_millis":
-                case "connection_listener_inbox_capacity":
-                case "drain_orphans":
-                case "durable_ack_keepalive_interval_millis":
-                case "error_inbox_capacity":
-                case "in_flight_window":
-                case "init_buf_size":
-                case "initial_connect_retry":
-                case "max_background_drainers":
-                case "max_buf_size":
-                case "max_datagram_size":
-                case "max_name_len":
-                case "multicast_ttl":
-                case "pass":
-                case "protocol_version":
-                case "reconnect_initial_backoff_millis":
-                case "reconnect_max_backoff_millis":
-                case "reconnect_max_duration_millis":
-                case "request_durable_ack":
-                case "request_min_throughput":
-                case "request_timeout":
-                case "retry_timeout":
-                case "sender_id":
-                case "sf_append_deadline_millis":
-                case "sf_dir":
-                case "sf_durability":
-                case "sf_max_bytes":
-                case "sf_max_total_bytes":
-                case "user":
-                    break;
-                default:
-                    throw new IllegalArgumentException("unknown configuration key: " + key);
-            }
+        String target = view.getEnum("target");
+        if (target == null) {
+            target = TARGET_ANY;
         }
-        if (parsedEndpoints.isEmpty()) {
+        Boolean failover = view.has("failover") ? view.getBoolOnOff("failover", false) : null;
+        Integer failoverMaxAttempts = view.has("failover_max_attempts")
+                ? view.getInt("failover_max_attempts", 0) : null;
+        Long failoverBackoffInitialMs = view.has("failover_backoff_initial_ms")
+                ? view.getLong("failover_backoff_initial_ms", 0) : null;
+        Long failoverBackoffMaxMs = view.has("failover_backoff_max_ms")
+                ? view.getLong("failover_backoff_max_ms", 0) : null;
+        Long failoverMaxDurationMs = view.has("failover_max_duration_ms")
+                ? view.getLong("failover_max_duration_ms", 0) : null;
+        Long authTimeoutMs = view.has("auth_timeout_ms") ? view.getLong("auth_timeout_ms", 0) : null;
+        Long initialCredit = view.has("initial_credit") ? view.getLong("initial_credit", 0) : null;
+        int poolSize = view.getInt("buffer_pool_size", DEFAULT_IO_BUFFER_POOL_SIZE);
+        String compression = view.getEnum("compression");
+        if (compression == null) {
+            compression = "raw";
+        }
+        int compressionLevel = view.getInt("compression_level", 1);
+        int maxBatchRows = view.getInt("max_batch_rows", 0);
+        String username = view.getStr("username");
+        String password = view.getStr("password");
+        String token = view.getStr("token");
+        String cid = view.getStr("client_id");
+        String zone = view.getStr("zone");
+        String tlsRoots = view.getStr("tls_roots");
+        String tlsRootsPassword = view.getStr("tls_roots_password");
+        Integer tlsValidation = null;
+        String tlsVerify = view.getEnum("tls_verify");
+        if ("on".equals(tlsVerify)) {
+            tlsValidation = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
+        } else if ("unsafe_off".equals(tlsVerify)) {
+            tlsValidation = ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE;
+        }
+        boolean hasBasic = username != null || password != null;
+        Endpoint first = parsedEndpoints.get(0);
+        QwpQueryClient client = new QwpQueryClient(first.host, first.port);
+        // The constructor allocated native scratch (bindValues); close it if a
+        // setter below rejects its input so a config error cannot leak it.
+        // validateConfig above already rejects every value these setters check,
+        // so this is a safety net against future drift, not a reachable path today.
+        try {
+            for (int i = 1; i < parsedEndpoints.size(); i++) {
+                client.endpoints.add(parsedEndpoints.get(i));
+            }
+            client.withTarget(target);
+            if (failover != null) {
+                client.withFailover(failover);
+            }
+            if (failoverMaxAttempts != null) {
+                client.withFailoverMaxAttempts(failoverMaxAttempts);
+            }
+            if (failoverBackoffInitialMs != null || failoverBackoffMaxMs != null) {
+                long initial = failoverBackoffInitialMs != null
+                        ? failoverBackoffInitialMs
+                        : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
+                long max = failoverBackoffMaxMs != null
+                        ? failoverBackoffMaxMs
+                        : Math.max(initial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
+                client.withFailoverBackoff(initial, max);
+            }
+            if (failoverMaxDurationMs != null) {
+                client.withFailoverMaxDuration(failoverMaxDurationMs);
+            }
+            if (authTimeoutMs != null) {
+                client.withAuthTimeout(authTimeoutMs);
+            }
+            if (initialCredit != null) {
+                client.withInitialCredit(initialCredit);
+            }
+            client.withBufferPoolSize(poolSize);
+            client.withCompression(compression, compressionLevel);
+            if (tls) {
+                if (tlsRoots != null) {
+                    client.withTrustStore(tlsRoots, tlsRootsPassword.toCharArray());
+                } else if (tlsValidation != null && tlsValidation == ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE) {
+                    client.withInsecureTls();
+                } else {
+                    client.withTls();
+                }
+            }
+            if (hasBasic) client.withBasicAuth(username, password);
+            if (token != null) client.withBearerToken(token);
+            if (cid != null) client.withClientId(cid);
+            if (maxBatchRows > 0) client.withMaxBatchRows(maxBatchRows);
+            if (zone != null) client.withZone(zone);
+            return client;
+        } catch (RuntimeException e) {
+            client.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Validates the cross-key invariants of an egress {@code ws}/{@code wss}
+     * config without constructing a client. Shared by {@link #fromConfig} and
+     * the {@code QuestDB} facade's fail-fast build path. {@code tls} is true for
+     * the {@code wss} schema.
+     */
+    public static void validateConfig(ConfigView view, boolean tls) {
+        view.getHostPorts("addr", DEFAULT_WS_PORT, (h, p) -> {
+        });
+        if (!view.has("addr")) {
             throw new IllegalArgumentException("missing required key: addr");
+        }
+        // Trigger range/enum validation of every typed value.
+        view.getEnum("target");
+        view.getEnum("compression");
+        view.getEnum("tls_verify");
+        view.getBoolOnOff("failover", false);
+        view.getInt("failover_max_attempts", 0);
+        view.getInt("max_batch_rows", 0);
+        view.getInt("buffer_pool_size", 0);
+        view.getInt("compression_level", 0);
+        boolean hasBackoffInitial = view.has("failover_backoff_initial_ms");
+        boolean hasBackoffMax = view.has("failover_backoff_max_ms");
+        // getLong also range-validates the value; call it even for an absent key.
+        long backoffInitial = view.getLong("failover_backoff_initial_ms", -1);
+        long backoffMax = view.getLong("failover_backoff_max_ms", -1);
+        view.getLong("failover_max_duration_ms", -1);
+        view.getLong("initial_credit", -1);
+        view.getLong("auth_timeout_ms", -1);
+        String username = view.getStr("username");
+        String password = view.getStr("password");
+        String token = view.getStr("token");
+        // A present-but-blank credential is rejected up front, matching the
+        // ingress Sender, so a shared ws/wss string fails the same way on both
+        // sides and the client never builds an empty Authorization header.
+        if (username != null && Chars.isBlank(username)) {
+            throw new IllegalArgumentException("username cannot be empty nor null");
+        }
+        if (password != null && Chars.isBlank(password)) {
+            throw new IllegalArgumentException("password cannot be empty nor null");
+        }
+        if (token != null && Chars.isBlank(token)) {
+            throw new IllegalArgumentException("token cannot be empty nor null");
         }
         boolean hasBasic = username != null || password != null;
         if (hasBasic && (username == null || password == null)) {
-            throw new IllegalArgumentException("both username and password must be provided together");
+            throw new IllegalArgumentException("username and password must be provided together");
         }
-        int authModesSet = (auth != null ? 1 : 0) + (hasBasic ? 1 : 0) + (token != null ? 1 : 0);
-        if (authModesSet > 1) {
-            throw new IllegalArgumentException(
-                    "auth, username/password, and token are mutually exclusive");
+        if (hasBasic && token != null) {
+            throw new IllegalArgumentException("cannot use both token and username/password authentication");
         }
-        if (!tls && (tlsValidation != null || tlsRoots != null || tlsRootsPassword != null)) {
+        String tlsVerify = view.getStr("tls_verify");
+        String tlsRoots = view.getStr("tls_roots");
+        String tlsRootsPassword = view.getStr("tls_roots_password");
+        if (!tls && (tlsVerify != null || tlsRoots != null || tlsRootsPassword != null)) {
             throw new IllegalArgumentException(
                     "tls_verify/tls_roots/tls_roots_password require the wss:: schema");
         }
         if ((tlsRoots == null) != (tlsRootsPassword == null)) {
-            throw new IllegalArgumentException(
-                    "tls_roots and tls_roots_password must be provided together");
+            throw new IllegalArgumentException("tls_roots and tls_roots_password must be provided together");
         }
-        if (failoverBackoffInitialMs != null
-                && failoverBackoffMaxMs != null
-                && failoverBackoffMaxMs < failoverBackoffInitialMs) {
-            throw new IllegalArgumentException(
-                    "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
-        }
-        Endpoint first = parsedEndpoints.get(0);
-        QwpQueryClient client = new QwpQueryClient(first.host, first.port);
-        for (int i = 1; i < parsedEndpoints.size(); i++) {
-            client.endpoints.add(parsedEndpoints.get(i));
-        }
-        client.withTarget(target);
-        if (failover != null) {
-            client.withFailover(failover);
-        }
-        if (failoverMaxAttempts != null) {
-            client.withFailoverMaxAttempts(failoverMaxAttempts);
-        }
-        if (failoverBackoffInitialMs != null || failoverBackoffMaxMs != null) {
-            long initial = failoverBackoffInitialMs != null
-                    ? failoverBackoffInitialMs
-                    : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
-            long max = failoverBackoffMaxMs != null
-                    ? failoverBackoffMaxMs
-                    : Math.max(initial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
-            client.withFailoverBackoff(initial, max);
-        }
-        if (failoverMaxDurationMs != null) {
-            client.withFailoverMaxDuration(failoverMaxDurationMs);
-        }
-        if (authTimeoutMs != null) {
-            client.withAuthTimeout(authTimeoutMs);
-        }
-        if (initialCredit != null) {
-            client.withInitialCredit(initialCredit);
-        }
-        client.withEndpointPath(path);
-        client.withBufferPoolSize(poolSize);
-        client.withCompression(compression, compressionLevel);
-        if (tls) {
-            if (tlsRoots != null) {
-                client.withTrustStore(tlsRoots, tlsRootsPassword.toCharArray());
-            } else if (tlsValidation != null && tlsValidation == ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE) {
-                client.withInsecureTls();
-            } else {
-                client.withTls();
+        // Mirror fromConfig's effective values: a missing bound takes its
+        // default, so the ordering is enforced even when only one key is set
+        // (e.g. failover_backoff_max_ms alone, below the default initial backoff).
+        if (hasBackoffInitial || hasBackoffMax) {
+            long effectiveInitial = hasBackoffInitial ? backoffInitial : DEFAULT_FAILOVER_INITIAL_BACKOFF_MS;
+            long effectiveMax = hasBackoffMax ? backoffMax : Math.max(effectiveInitial, DEFAULT_FAILOVER_MAX_BACKOFF_MS);
+            if (effectiveMax < effectiveInitial) {
+                throw new IllegalArgumentException(
+                        "failover_backoff_max_ms must be >= failover_backoff_initial_ms");
             }
         }
-        if (auth != null) client.withAuthorization(auth);
-        if (hasBasic) client.withBasicAuth(username, password);
-        if (token != null) client.withBearerToken(token);
-        if (cid != null) client.withClientId(cid);
-        if (maxBatchRows > 0) client.withMaxBatchRows(maxBatchRows);
-        if (zone != null) client.withZone(zone);
-        return client;
     }
 
     /**
@@ -1017,6 +858,45 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
+     * Test-only hook: the synthesized {@code Authorization} header value
+     * ({@code Basic ...} or {@code Bearer ...}), or null when no credentials
+     * were configured.
+     */
+    @TestOnly
+    public String getAuthorizationHeaderForTest() {
+        return authorizationHeader;
+    }
+
+    /**
+     * Snapshot of the egress config this client applied, keyed by connect-string
+     * key name. Drives the per-key "honored" guard test -- proves each egress key
+     * read from a config string reaches the client.
+     */
+    @TestOnly
+    public java.util.Map<String, Object> configSnapshotForTest() {
+        java.util.Map<String, Object> m = new java.util.HashMap<>();
+        m.put("target", target);
+        m.put("failover", failoverEnabled);
+        m.put("failover_max_attempts", failoverMaxAttempts);
+        m.put("failover_backoff_initial_ms", failoverInitialBackoffMs);
+        m.put("failover_backoff_max_ms", failoverMaxBackoffMs);
+        m.put("failover_max_duration_ms", failoverMaxDurationMs);
+        m.put("max_batch_rows", maxBatchRows);
+        m.put("initial_credit", initialCreditBytes);
+        m.put("buffer_pool_size", bufferPoolSize);
+        m.put("compression", compressionPreference);
+        m.put("compression_level", compressionLevel);
+        m.put("client_id", clientId);
+        m.put("zone", clientZone);
+        m.put("auth_timeout_ms", authTimeoutMs);
+        m.put("authorization_header", authorizationHeader);
+        m.put("tls_verify", tlsValidationMode);
+        m.put("tls_roots", trustStorePath);
+        m.put("tls_roots_password", trustStorePassword == null ? null : new String(trustStorePassword));
+        return m;
+    }
+
+    /**
      * Returns the current compression preference: one of {@code raw} (the
      * library default, no compression), {@code zstd} (demand zstd), or
      * {@code auto} (advertise zstd and raw, let the server pick). Useful for
@@ -1136,11 +1016,6 @@ public class QwpQueryClient implements QuietCloseable {
         return this;
     }
 
-    public void withAuthorization(String authorizationHeader) {
-        checkPreConnect("withAuthorization");
-        this.authorizationHeader = authorizationHeader;
-    }
-
     /**
      * Configures HTTP Basic authentication for the WebSocket upgrade request.
      * The server verifies the credentials against the same user store the
@@ -1213,11 +1088,6 @@ public class QwpQueryClient implements QuietCloseable {
         }
         this.compressionPreference = preference;
         this.compressionLevel = level;
-    }
-
-    public void withEndpointPath(String endpointPath) {
-        checkPreConnect("withEndpointPath");
-        this.endpointPath = endpointPath;
     }
 
     /**
@@ -1422,96 +1292,6 @@ public class QwpQueryClient implements QuietCloseable {
             return role == QwpEgressMsgKind.ROLE_REPLICA;
         }
         return true;
-    }
-
-    /**
-     * Parses an {@code addr=} value that may be a single {@code host[:port]}
-     * or a comma-separated list of such entries. A single entry without a
-     * port falls back to {@link #DEFAULT_WS_PORT}. The port (when present)
-     * must be in {@code [1, 65535]}.
-     * <p>
-     * IPv6 addresses must be wrapped in brackets when carrying a port, per
-     * RFC 3986: {@code [::1]:9000}, {@code [fe80::1]}. An unbracketed entry
-     * containing more than one colon is treated as a bare IPv6 host with
-     * the default port (no syntactic way to distinguish {@code host:port}
-     * from a bare IPv6 address otherwise; users wanting a custom port on
-     * IPv6 must bracket).
-     */
-    private static List<Endpoint> parseEndpointList(String value) {
-        List<Endpoint> list = new ArrayList<>();
-        int start = 0;
-        int len = value.length();
-        for (int i = 0; i <= len; i++) {
-            if (i == len || value.charAt(i) == ',') {
-                if (i == start) {
-                    throw new IllegalArgumentException("empty addr entry");
-                }
-                String entry = value.substring(start, i).trim();
-                if (entry.isEmpty()) {
-                    throw new IllegalArgumentException("empty addr entry");
-                }
-                String host;
-                int port;
-                if (entry.charAt(0) == '[') {
-                    // Bracketed IPv6: [host] or [host]:port.
-                    int closeBracket = entry.indexOf(']');
-                    if (closeBracket < 0) {
-                        throw new IllegalArgumentException(
-                                "missing closing ']' in IPv6 addr entry: " + entry);
-                    }
-                    host = entry.substring(1, closeBracket);
-                    if (closeBracket == entry.length() - 1) {
-                        port = DEFAULT_WS_PORT;
-                    } else if (entry.charAt(closeBracket + 1) != ':') {
-                        throw new IllegalArgumentException(
-                                "expected ':' after ']' in IPv6 addr entry: " + entry);
-                    } else {
-                        port = parsePort(entry.substring(closeBracket + 2), entry);
-                    }
-                } else if (entry.indexOf(':') != entry.lastIndexOf(':')) {
-                    // Multi-colon, unbracketed: treat as bare IPv6 host with
-                    // the default port. Custom port on IPv6 requires brackets.
-                    host = entry;
-                    port = DEFAULT_WS_PORT;
-                } else {
-                    int colon = entry.indexOf(':');
-                    if (colon < 0) {
-                        host = entry;
-                        port = DEFAULT_WS_PORT;
-                    } else {
-                        host = entry.substring(0, colon).trim();
-                        port = parsePort(entry.substring(colon + 1), entry);
-                    }
-                }
-                if (host.isEmpty()) {
-                    throw new IllegalArgumentException("empty host in addr entry: " + entry);
-                }
-                list.add(new Endpoint(host, port));
-                start = i + 1;
-            }
-        }
-        return list;
-    }
-
-    /**
-     * Parses {@code portStr} into a TCP port in the inclusive range
-     * {@code [1, 65535]}. Surrounding whitespace is tolerated so config
-     * strings hand-edited around the {@code :} don't surface as opaque
-     * "invalid port" errors. {@code entry} is the full
-     * {@code host[:port]} fragment, used only for the error message.
-     */
-    private static int parsePort(String portStr, String entry) {
-        int port;
-        try {
-            port = Integer.parseInt(portStr.trim());
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("invalid port in addr: " + entry);
-        }
-        if (port < 1 || port > 65535) {
-            throw new IllegalArgumentException(
-                    "port out of range in addr: " + entry + " (must be 1-65535)");
-        }
-        return port;
     }
 
     /**
@@ -2001,7 +1781,7 @@ public class QwpQueryClient implements QuietCloseable {
         int timeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
         try {
             webSocketClient.connect(ep.host, ep.port);
-            webSocketClient.upgrade(endpointPath, timeoutMs, authorizationHeader);
+            webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authorizationHeader);
         } catch (HttpClientException ex) {
             if (ex.isTimeout()) {
                 HttpClientException timeout = new HttpClientException("WebSocket upgrade to ")

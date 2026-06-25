@@ -59,16 +59,15 @@ public interface QuestDB extends Closeable {
 
     /**
      * Connects with a single configuration string used for both ingest and
-     * egress. The schema must be {@code http}, {@code https}, {@code ws} or
-     * {@code wss}; the other half of the deployment is derived by schema
-     * translation ({@code http}&lt;-&gt;{@code ws}, {@code https}&lt;-&gt;{@code wss}).
+     * egress. The schema must be {@code ws} or {@code wss}: QuestDB ingests and
+     * queries over QWP (the QuestDB WebSocket protocol), so one string
+     * configures both clients.
      * <p>
      * Use {@link #connect(CharSequence, CharSequence)} or {@link #builder()}
-     * for ingest transports other than HTTP/HTTPS, or when ingest and egress
-     * use different addresses.
+     * when ingest and egress use different addresses or credentials.
      *
-     * @param configurationString a Sender- or QwpQueryClient-style config
-     *                            string (see {@link Sender#fromConfig} or
+     * @param configurationString a {@code ws}/{@code wss} config string (see
+     *                            {@link Sender#fromConfig} or
      *                            {@link io.questdb.client.cutlass.qwp.client.QwpQueryClient#fromConfig})
      * @return a connected QuestDB handle
      */
