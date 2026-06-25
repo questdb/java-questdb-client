@@ -441,7 +441,7 @@ public class OidcDeviceAuthTest {
     public void testChunkedTokenResponseParses() throws Exception {
         assertMemoryLeak(() -> {
             // real IdPs use Transfer-Encoding: chunked; a multi-KB id token split across chunks must parse
-            String idToken = "a".repeat(3000);
+            String idToken = TestUtils.repeat("a", 3000);
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.chunkedJson(200, deviceAuthorizationJson(1, 300));
@@ -1877,7 +1877,7 @@ public class OidcDeviceAuthTest {
             // such a split value still parses. This mirrors OidcDeviceAuth's production sizing
             // (JSON_LEXER_CACHE_SIZE / JSON_LEXER_MAX_VALUE_BYTES); the original (1024, 1024) sizing
             // rejected a >1024-byte split value with "String is too long".
-            String json = "{\"id_token\":\"" + "a".repeat(4000) + "\"}";
+            String json = "{\"id_token\":\"" + TestUtils.repeat("a", 4000) + "\"}";
             int len = json.length();
             int split = "{\"id_token\":\"".length() + 1300; // boundary inside the value, past the old 1024 limit
             long address = TestUtils.toMemory(json);
