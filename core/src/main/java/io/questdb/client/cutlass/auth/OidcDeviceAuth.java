@@ -45,8 +45,8 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.str.DirectUtf8Sequence;
 import io.questdb.client.std.str.StringSink;
 
+import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -885,7 +885,13 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static String urlEncode(String value) {
-        return URLEncoder.encode(value, StandardCharsets.UTF_8);
+        try {
+            // the Charset overload is Java 10; the client targets Java 8, so use the String-charset form
+            return URLEncoder.encode(value, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            // UTF-8 is guaranteed present on every JVM, so this is unreachable; rethrow defensively
+            throw new OidcAuthException(e).put("UTF-8 encoding is not supported");
+        }
     }
 
     private static void validateEndpointOrigins(Endpoint tokenEndpoint, Endpoint deviceAuthorizationEndpoint, Endpoint issuer) {

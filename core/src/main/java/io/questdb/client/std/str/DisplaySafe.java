@@ -24,6 +24,8 @@
 
 package io.questdb.client.std.str;
 
+import static io.questdb.client.std.Numbers.hexDigits;
+
 /**
  * Shared classifier for whether a code point is safe to show in a terminal or a log line. It is the one
  * source of truth for the client's display-escaping: {@link Utf16Sink#putAsPrintable(CharSequence)} escapes
@@ -70,5 +72,23 @@ public final class DisplaySafe {
      */
     public static boolean isUnsafeForDisplay(int cp) {
         return !isDisplaySafe(cp);
+    }
+
+    // Escapes a code point to one (BMP) or two (supplementary, as its surrogate pair) visible \\uXXXX
+    // sequences, so the escaped value still names the original char. Emitting all four hex digits keeps a
+    // char above U+00FF (e.g. U+202E) correct rather than truncated to its low byte. A static helper here
+    // (not a private method on Utf16Sink) keeps the source Java 8 - private interface methods are Java 9.
+    static void putUnicodeEscape(Utf16Sink sink, int cp) {
+        if (cp > 0xFFFF) {
+            putUnicodeEscape(sink, Character.highSurrogate(cp));
+            putUnicodeEscape(sink, Character.lowSurrogate(cp));
+            return;
+        }
+        sink.put('\\');
+        sink.put('u');
+        sink.put(hexDigits[(cp >> 12) & 0xF]);
+        sink.put(hexDigits[(cp >> 8) & 0xF]);
+        sink.put(hexDigits[(cp >> 4) & 0xF]);
+        sink.put(hexDigits[cp & 0xF]);
     }
 }

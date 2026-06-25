@@ -26,8 +26,6 @@ package io.questdb.client.std.str;
 
 import org.jetbrains.annotations.Nullable;
 
-import static io.questdb.client.std.Numbers.hexDigits;
-
 /**
  * Family of sinks that write out <b>character</b> value as UTF16 encoded bytes. This interface
  * is separate from {@link CharSink} to achieve two goals:
@@ -58,7 +56,7 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
                     put(nonPrintable.charAt(i + j));
                 }
             } else {
-                putUnicodeEscape(cp);
+                DisplaySafe.putUnicodeEscape(this, cp);
             }
             i += count;
         }
@@ -71,7 +69,7 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
         if (DisplaySafe.isDisplaySafe(c)) {
             put(c);
         } else {
-            putUnicodeEscape(c);
+            DisplaySafe.putUnicodeEscape(this, c);
         }
     }
 
@@ -101,22 +99,5 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
     default Utf16Sink putNonAscii(long lo, long hi) {
         Utf8s.utf8ToUtf16(lo, hi, this);
         return this;
-    }
-
-    // Escapes a code point to one (BMP) or two (supplementary, as its surrogate pair) visible \\uXXXX
-    // sequences, so the escaped value still names the original char. Emitting all four hex digits keeps a
-    // char above U+00FF (e.g. U+202E) correct rather than truncated to its low byte.
-    private void putUnicodeEscape(int cp) {
-        if (cp > 0xFFFF) {
-            putUnicodeEscape(Character.highSurrogate(cp));
-            putUnicodeEscape(Character.lowSurrogate(cp));
-            return;
-        }
-        put('\\');
-        put('u');
-        put(hexDigits[(cp >> 12) & 0xF]);
-        put(hexDigits[(cp >> 8) & 0xF]);
-        put(hexDigits[(cp >> 4) & 0xF]);
-        put(hexDigits[cp & 0xF]);
     }
 }
