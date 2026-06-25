@@ -948,7 +948,18 @@ public class QwpQueryClient implements QuietCloseable {
      * before the reset should be discarded by the handler.
      */
     public void execute(CharSequence sql, QwpColumnBatchHandler handler) {
-        execute(sql, null, handler);
+        execute(sql, null, handler, false);
+    }
+
+    /**
+     * As {@link #execute(CharSequence, QwpColumnBatchHandler)}, but when
+     * {@code resetSymbolDict} is set the server resets the connection-scoped
+     * SYMBOL dict before this query, scoping the dict to this query's symbols.
+     * The flag reaches the wire only when the server advertised
+     * {@link QwpEgressMsgKind#CAP_QUERY_FLAGS}; otherwise it is silently ignored.
+     */
+    public void execute(CharSequence sql, QwpColumnBatchHandler handler, boolean resetSymbolDict) {
+        execute(sql, null, handler, resetSymbolDict);
     }
 
     /**
@@ -963,6 +974,17 @@ public class QwpQueryClient implements QuietCloseable {
      * defeats this reuse.
      */
     public void execute(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+        execute(sql, binds, handler, false);
+    }
+
+    /**
+     * As {@link #execute(CharSequence, QwpBindSetter, QwpColumnBatchHandler)},
+     * but when {@code resetSymbolDict} is set the server resets the
+     * connection-scoped SYMBOL dict before this query, scoping the dict to this
+     * query's symbols. The flag reaches the wire only when the server advertised
+     * {@link QwpEgressMsgKind#CAP_QUERY_FLAGS}; otherwise it is silently ignored.
+     */
+    public void execute(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler, boolean resetSymbolDict) {
         if (!executing.compareAndSet(false, true)) {
             throw new IllegalStateException(
                     "QwpQueryClient.execute called while another execute is in flight; one query at a time per client");
@@ -974,7 +996,7 @@ public class QwpQueryClient implements QuietCloseable {
         // is intentionally NOT cleared inside executeOnce().
         pendingCancel = false;
         try {
-            executeImpl(sql, binds, handler);
+            executeImpl(sql, binds, handler, resetSymbolDict);
         } finally {
             executing.set(false);
         }
@@ -1612,7 +1634,7 @@ public class QwpQueryClient implements QuietCloseable {
         }
     }
 
-    private void executeImpl(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+    private void executeImpl(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler, boolean resetSymbolDict) {
         if (closedFlag.get()) {
             throw new IllegalStateException("QwpQueryClient is closed");
         }
@@ -1636,7 +1658,7 @@ public class QwpQueryClient implements QuietCloseable {
         while (true) {
             attempt++;
             FailoverProbeHandler probe = new FailoverProbeHandler(handler);
-            executeOnce(sql, binds, probe);
+            executeOnce(sql, binds, probe, resetSymbolDict);
             if (!probe.transportFailureIntercepted) {
                 return;
             }
@@ -1729,7 +1751,7 @@ public class QwpQueryClient implements QuietCloseable {
      * the user's handler in a {@link FailoverProbeHandler} so that the outer
      * loop can intercept transport failures before they reach the user.
      */
-    private void executeOnce(CharSequence sql, QwpBindSetter binds, FailoverProbeHandler probe) {
+    private void executeOnce(CharSequence sql, QwpBindSetter binds, FailoverProbeHandler probe, boolean resetSymbolDict) {
         // Cache the I/O thread reference at entry: close() may null the field while
         // we are inside this loop, so reading the field per-iteration would NPE
         // exactly when the user is mid-execute() and close() races. The queue and
@@ -1773,7 +1795,8 @@ public class QwpQueryClient implements QuietCloseable {
             io.requestCancel(requestId);
         }
         try {
-            io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen());
+            io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen(),
+                    resolveQueryFlags(resetSymbolDict));
             while (true) {
                 QueryEvent ev = io.takeEvent();
                 try {
@@ -1962,6 +1985,16 @@ public class QwpQueryClient implements QuietCloseable {
         throw new HttpClientException(
                 "all QWP endpoints unreachable on failover [count=" + total
                         + ", lastError=" + (lastError == null ? "<none>" : lastError.getMessage()) + ']');
+    }
+
+    private long resolveQueryFlags(boolean resetSymbolDict) {
+        if (!resetSymbolDict) {
+            return 0L;
+        }
+        QwpServerInfo info = serverInfo;
+        return info != null && (info.getCapabilities() & QwpEgressMsgKind.CAP_QUERY_FLAGS) != 0
+                ? QwpEgressMsgKind.QUERY_FLAG_RESET_DICT
+                : 0L;
     }
 
     private void runUpgradeWithTimeout(Endpoint ep) {

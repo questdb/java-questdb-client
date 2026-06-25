@@ -39,6 +39,13 @@ public final class QwpEgressMsgKind {
     public static final byte CACHE_RESET = 0x17;
     public static final byte CANCEL = 0x14;
     /**
+     * {@code SERVER_INFO.capabilities} bit: the server parses the optional
+     * {@code query_flags:varint} trailer on {@code QUERY_REQUEST}. The client
+     * appends the trailer only when this bit is set. Mirrors the server-side
+     * constant {@code io.questdb.cutlass.qwp.codec.QwpEgressMsgKind#CAP_QUERY_FLAGS}.
+     */
+    public static final int CAP_QUERY_FLAGS = 0x00000002;
+    /**
      * {@code SERVER_INFO.capabilities} bit advertising that the frame ends with
      * an additional {@code zone_id:u16_len+utf8} field after {@code node_id}.
      * Mirrors the server-side constant in
@@ -54,6 +61,12 @@ public final class QwpEgressMsgKind {
      */
     public static final byte EXEC_DONE = 0x16;
     public static final byte QUERY_ERROR = 0x13;
+    /**
+     * {@code QUERY_REQUEST.query_flags} bit: reset the connection-scoped SYMBOL
+     * dict before this query, scoping it to the query. Sent only when the server
+     * advertised {@link #CAP_QUERY_FLAGS}.
+     */
+    public static final byte QUERY_FLAG_RESET_DICT = 0x01;
     public static final byte QUERY_REQUEST = 0x10;
     /**
      * Reset mask bit: clear the connection-scoped SYMBOL dict.
