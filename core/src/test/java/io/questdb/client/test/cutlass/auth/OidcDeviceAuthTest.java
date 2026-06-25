@@ -1157,34 +1157,6 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testFromQuestDbDiscoversFromDiscoveryUrl() throws Exception {
-        assertMemoryLeak(() -> {
-            // a discovery url pins the identity provider directly (an alternative to an issuer); the device
-            // endpoint and the issuer to pin against both come from the discovery document
-            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
-            MockOidcServer.Handler handler = (method, path, body) -> {
-                MockOidcServer server = serverRef.get();
-                if (SETTINGS_PATH.equals(path)) {
-                    return MockOidcServer.json(200, settingsJson(true, false, server.httpUrl(TOKEN_PATH), null));
-                }
-                if (WELL_KNOWN_PATH.equals(path)) {
-                    return MockOidcServer.json(200, wellKnownJson(server.httpUrl(DEVICE_PATH), server.httpUrl(TOKEN_PATH), server.httpUrl("")));
-                }
-                if (DEVICE_PATH.equals(path)) {
-                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
-                }
-                return MockOidcServer.json(200, tokenJson("ACCESS-DU", "ID-DU", null, 3600));
-            };
-            try (MockOidcServer server = new MockOidcServer(handler)) {
-                serverRef.set(server);
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().discoveryUrl(server.httpUrl(WELL_KNOWN_PATH)))) {
-                    Assert.assertEquals("ID-DU", auth.getToken());
-                }
-            }
-        });
-    }
-
-    @Test(timeout = 30_000)
     public void testFromQuestDbDiscoveryDocMissingDeviceEndpointRejected() throws Exception {
         assertMemoryLeak(() -> {
             // discovery runs against the pinned issuer, but the discovery document does not advertise a
@@ -1237,89 +1209,49 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testFromQuestDbDiscoveryUrlPinAcceptsOnOriginAdvertisedEndpoints() throws Exception {
+    public void testFromQuestDbIssuerPinAcceptsOffOriginDiscoveredEndpoints() throws Exception {
         assertMemoryLeak(() -> {
-            // /settings advertises both endpoints on the same origin as the pinned discoveryUrl, so the pin
-            // is satisfied and the flow completes - and without a discovery round-trip, since the discovery
-            // branch is skipped when both endpoints are already advertised
-            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
-            AtomicBoolean wellKnownHit = new AtomicBoolean(false);
-            MockOidcServer.Handler handler = (method, path, body) -> {
-                MockOidcServer server = serverRef.get();
-                if (SETTINGS_PATH.equals(path)) {
-                    return MockOidcServer.json(200, settingsJson(true, true, server.httpUrl(TOKEN_PATH), server.httpUrl(DEVICE_PATH)));
-                }
-                if (WELL_KNOWN_PATH.equals(path)) {
-                    wellKnownHit.set(true);
-                    return MockOidcServer.json(200, wellKnownJson(server.httpUrl(DEVICE_PATH), server.httpUrl(TOKEN_PATH), server.httpUrl("")));
-                }
+            // The Google case: the pinned issuer hosts its discovery document on one origin but serves its
+            // token and device endpoints on another. /settings advertises neither endpoint, so both are
+            // discovered from the issuer's own .well-known (a trusted, out-of-band source) and must be accepted
+            // wherever the issuer hosts them, NOT origin-pinned to the issuer. An endpoint the untrusted
+            // /settings advertised IS still origin-pinned - see testFromQuestDbIssuerPinRejectsOffOriginAdvertisedEndpoint.
+            AtomicReference<MockOidcServer> idpRef = new AtomicReference<>();
+            AtomicReference<MockOidcServer> issuerRef = new AtomicReference<>();
+            // the IdP endpoint host: a different origin (port) than the issuer below
+            MockOidcServer.Handler idpHandler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
                 }
-                return MockOidcServer.json(200, tokenJson("ACCESS-DUP", "ID-DUP", null, 3600));
+                return MockOidcServer.json(200, tokenJson("ACCESS-OFF", null, null, 3600));
             };
-            try (MockOidcServer server = new MockOidcServer(handler)) {
-                serverRef.set(server);
-                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().discoveryUrl(server.httpUrl(WELL_KNOWN_PATH)))) {
-                    Assert.assertEquals("ID-DUP", auth.getToken());
-                }
-                Assert.assertFalse("discovery must be skipped when /settings advertises both endpoints", wellKnownHit.get());
-            }
-        });
-    }
-
-    @Test(timeout = 30_000)
-    public void testFromQuestDbDiscoveryUrlPinRejectsForeignIssuerInDocument() throws Exception {
-        assertMemoryLeak(() -> {
-            // RFC 8414 section 3.3: discovery runs against the pinned discoveryUrl, and the document it
-            // returns declares an issuer - with co-located token and device endpoints - on an attacker
-            // origin. The discoveryUrl pins the identity provider to its own origin, so a document that
-            // vouches for a foreign issuer (and would route the device code and the long-lived refresh token
-            // there) must be rejected, rather than trusted just because its endpoints agree with its own
-            // self-declared issuer and the co-location check passes trivially.
-            MockOidcServer.Handler handler = (method, path, body) -> {
-                if (SETTINGS_PATH.equals(path)) {
-                    // OIDC enabled, with a client id, but neither endpoint advertised - so both the token and
-                    // the device endpoint must be read from the discovery document below
-                    return MockOidcServer.json(200, "{\"config\":{"
-                            + "\"acl.oidc.enabled\":true,"
-                            + "\"acl.oidc.client.id\":\"questdb\","
-                            + "\"acl.oidc.scope\":\"openid groups\""
-                            + "}}");
-                }
-                // the document served at the pinned (loopback) discoveryUrl points everything at an attacker origin
-                return MockOidcServer.json(200, wellKnownJson(
-                        "https://attacker.example/device",
-                        "https://attacker.example/token",
-                        "https://attacker.example"));
-            };
-            try (MockOidcServer server = new MockOidcServer(handler)) {
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().discoveryUrl(server.httpUrl(WELL_KNOWN_PATH)))) {
-                    Assert.fail("expected the discoveryUrl pin to reject a document declaring a foreign issuer");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("different origin than the pinned discovery url"));
-                }
-            }
-        });
-    }
-
-    @Test(timeout = 30_000)
-    public void testFromQuestDbDiscoveryUrlPinRejectsOffOriginAdvertisedEndpoints() throws Exception {
-        assertMemoryLeak(() -> {
-            // /settings advertises both endpoints directly (so the discovery branch is skipped), but they do
-            // not belong to the pinned discoveryUrl origin; the discoveryUrl pin must reject them just as an
-            // issuer pin does, rather than let a compromised server redirect the sign-in to its chosen origin
-            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
-            MockOidcServer.Handler handler = (method, path, body) -> {
-                MockOidcServer server = serverRef.get();
-                return MockOidcServer.json(200, settingsJson(true, true, server.httpUrl(TOKEN_PATH), server.httpUrl(DEVICE_PATH)));
-            };
-            try (MockOidcServer server = new MockOidcServer(handler)) {
-                serverRef.set(server);
-                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().discoveryUrl("https://trusted-idp.example/.well-known/openid-configuration"))) {
-                    Assert.fail("expected the discoveryUrl pin to reject the off-origin endpoints");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
+            try (MockOidcServer idp = new MockOidcServer(idpHandler)) {
+                idpRef.set(idp);
+                // the QuestDB server doubles as the pinned issuer: it serves /settings (advertising neither
+                // endpoint) and the .well-known document, which points the device/token endpoints at the
+                // off-origin idp
+                MockOidcServer.Handler issuerHandler = (method, path, body) -> {
+                    MockOidcServer endpointHost = idpRef.get();
+                    MockOidcServer iss = issuerRef.get();
+                    if (SETTINGS_PATH.equals(path)) {
+                        return MockOidcServer.json(200, "{\"config\":{"
+                                + "\"acl.oidc.enabled\":true,"
+                                + "\"acl.oidc.client.id\":\"questdb\","
+                                + "\"acl.oidc.scope\":\"openid\""
+                                + "}}");
+                    }
+                    if (WELL_KNOWN_PATH.equals(path)) {
+                        return MockOidcServer.json(200, wellKnownJson(
+                                endpointHost.httpUrl(DEVICE_PATH), endpointHost.httpUrl(TOKEN_PATH), iss.httpUrl("")));
+                    }
+                    return MockOidcServer.json(404, "{}");
+                };
+                try (MockOidcServer issuer = new MockOidcServer(issuerHandler)) {
+                    issuerRef.set(issuer);
+                    try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(issuer.httpUrl(""), insecure().issuer(issuer.httpUrl("")))) {
+                        // the off-origin discovered endpoints are accepted; the device flow completes against them
+                        Assert.assertEquals("ACCESS-OFF", auth.getToken());
+                    }
                 }
             }
         });
@@ -1341,7 +1273,7 @@ public class OidcDeviceAuthTest {
                 try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer("https://idp.attacker.example"))) {
                     Assert.fail("expected the issuer pin to reject the off-origin endpoints");
                 } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("does not match the issuer origin"));
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("is not on the pinned identity-provider origin"));
                 }
             }
         });
