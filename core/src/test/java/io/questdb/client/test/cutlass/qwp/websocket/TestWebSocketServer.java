@@ -83,6 +83,7 @@ public class TestWebSocketServer implements Closeable {
     // QwpQueryClient tests enable this; ingress sender tests leave it off so their
     // connections carry only ACK frames.
     private volatile boolean sendServerInfo;
+    private volatile int capabilities;
     // When non-null the next handshake responds with HTTP 421 Misdirected
     // Request + X-QuestDB-Role: <rejectingRole>, mimicking a server whose
     // QwpServerInfoProvider reports REPLICA / PRIMARY_CATCHUP. Set after
@@ -229,7 +230,13 @@ public class TestWebSocketServer implements Closeable {
         this.sendServerInfo = sendServerInfo;
     }
 
-    private static byte[] buildServerInfoFrame(byte role) {
+    // Advertised SERVER_INFO capabilities. CAP_ZONE is unsupported here: the
+    // frame builder emits no zone_id trailer.
+    public void setCapabilities(int capabilities) {
+        this.capabilities = capabilities;
+    }
+
+    private static byte[] buildServerInfoFrame(byte role, int capabilities) {
         byte[] clusterId = "questdb".getBytes(StandardCharsets.UTF_8);
         byte[] nodeId = "test-node".getBytes(StandardCharsets.UTF_8);
         int bodyLen = 1 + 1 + 8 + 4 + 8 + 2 + clusterId.length + 2 + nodeId.length;
@@ -242,7 +249,7 @@ public class TestWebSocketServer implements Closeable {
         bb.put((byte) 0x18);    // SERVER_INFO msg_kind
         bb.put(role);
         bb.putLong(0L);         // epoch
-        bb.putInt(0);           // capabilities (no CAP_ZONE -> no zone_id trailer)
+        bb.putInt(capabilities); // CAP_ZONE unsupported here -> no zone_id trailer
         bb.putLong(1L);         // server_wall_ns (positive)
         bb.putShort((short) clusterId.length);
         bb.put(clusterId);
@@ -567,7 +574,7 @@ public class TestWebSocketServer implements Closeable {
 
                     try {
                         if (sendServerInfo) {
-                            sendBinary(buildServerInfoFrame(roleByte(advertisedRole)));
+                            sendBinary(buildServerInfoFrame(roleByte(advertisedRole), capabilities));
                         }
 
                         byte[] readBuf = new byte[8192];
