@@ -64,9 +64,10 @@ public final class QwpEgressMsgKind {
     /**
      * {@code QUERY_REQUEST.query_flags} bit: reset the connection-scoped SYMBOL
      * dict before this query, scoping it to the query. Sent only when the server
-     * advertised {@link #CAP_QUERY_FLAGS}.
+     * advertised {@link #CAP_QUERY_FLAGS}. Declared {@code int} so masking against
+     * the 64-bit {@code query_flags} varint never sign-extends a flag constant.
      */
-    public static final byte QUERY_FLAG_RESET_DICT = 0x01;
+    public static final int QUERY_FLAG_RESET_DICT = 0x01;
     public static final byte QUERY_REQUEST = 0x10;
     /**
      * Reset mask bit: clear the connection-scoped SYMBOL dict.
