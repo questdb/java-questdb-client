@@ -226,9 +226,16 @@ jobs:
     timeout-minutes: 60
     container:
       image: quay.io/pypa/manylinux2014_x86_64
+      # GitHub's runner now forces JS actions (actions/checkout) onto Node 24, but
+      # Node 24 needs glibc >= 2.28 while this container is glibc 2.17 -- the stock
+      # /__e/node24 binary aborts with `GLIBC_2.27'/`GLIBC_2.28' not found`. There is
+      # no glibc-2.17 build of Node 24, so shadow BOTH /__e/node20 AND /__e/node24
+      # with the glibc-2.17 Node 20 binary installed below; checkout's JS runs fine
+      # on it regardless of the runtime the runner advertises.
       volumes:
         - /node20217:/node20217
         - /node20217:/__e/node20
+        - /node20217:/__e/node24
     steps:
       - name: Install tools
         run: |
@@ -242,11 +249,14 @@ jobs:
           rpmbuild --rebuild ./nasm-2.16.03-0.fc39.src.rpm
           rpm -i ~/rpmbuild/RPMS/x86_64/nasm-2.16.03-0.el7.x86_64.rpm
 
-      - name: Install Node.js 20 glibc2.17
+      - name: Install Node.js 20 glibc2.17 (shadows /__e/node20 and /__e/node24)
         run: |
           curl -LO https://unofficial-builds.nodejs.org/download/release/v20.9.0/node-v20.9.0-linux-x64-glibc-217.tar.xz
           tar -xf node-v20.9.0-linux-x64-glibc-217.tar.xz --strip-components 1 -C /node20217
+          # The same /node20217 source is bind-mounted over both runtime paths, so the
+          # glibc-2.17 binary is what runs whether the runner picks node20 or node24.
           ldd /__e/node20/bin/node
+          ldd /__e/node24/bin/node
 
       - name: Check out release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
