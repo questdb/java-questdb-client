@@ -5,8 +5,8 @@
 # "Build and Push Release CXX Libraries" GitHub Action. So the test CI has to
 # compile them locally before running the tests.
 #
-# macOS ships the committed libquestdb.dylib, so there is no build step for it
-# here (all steps are guarded to skip on Darwin).
+# All three platforms are built on their own native runner: Linux (.so),
+# Windows (.dll) and macOS (.dylib). None of these binaries are committed.
 #
 # CMake writes the artifact to:
 #   core/target/classes/io/questdb/client/bin-local/libquestdb.<ext>
@@ -19,13 +19,13 @@
 #
 # JAVA_HOME (set to GraalVM JDK 25 by setup.yaml) provides jni.h / jni_md.h:
 #   - Linux:   $JAVA_HOME/include + $JAVA_HOME/include/linux
+#   - macOS:   $JAVA_HOME/include + $JAVA_HOME/include/darwin
 #   - Windows: %JAVA_HOME%\include + %JAVA_HOME%\include\win32
 steps:
   - bash: |
       set -eux
       git submodule update --init --recursive core/src/main/c/share/zstd
     displayName: "Init zstd submodule"
-    condition: ne(variables['Agent.OS'], 'Darwin')
 
   - bash: |
       set -eux
@@ -45,6 +45,29 @@ steps:
       cp "$lib" src/main/resources/io/questdb/client/bin/linux-x86-64/libquestdb.so
     displayName: "Build native libquestdb.so (Linux x86-64)"
     condition: eq(variables['Agent.OS'], 'Linux')
+
+  - bash: |
+      set -eux
+      command -v cmake >/dev/null 2>&1 || brew install cmake
+      command -v nasm  >/dev/null 2>&1 || brew install nasm
+      # darwin-aarch64 on Apple silicon agents, darwin-x86-64 on Intel agents.
+      case "$(uname -m)" in
+        arm64)  platform="darwin-aarch64" ;;
+        x86_64) platform="darwin-x86-64" ;;
+        *) echo "unsupported macOS arch: $(uname -m)"; exit 1 ;;
+      esac
+      cd core
+      # Pin the dylib's minimum macOS version so the artifact stays loadable on
+      # older macOS, matching the release build.
+      export MACOSX_DEPLOYMENT_TARGET=13.0
+      cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S.
+      cmake --build cmake-build-release --config Release
+      lib="target/classes/io/questdb/client/bin-local/libquestdb.dylib"
+      test -f "$lib"
+      mkdir -p "src/main/resources/io/questdb/client/bin/${platform}"
+      cp "$lib" "src/main/resources/io/questdb/client/bin/${platform}/libquestdb.dylib"
+    displayName: "Build native libquestdb.dylib (macOS)"
+    condition: eq(variables['Agent.OS'], 'Darwin')
 
   - powershell: |
       $ErrorActionPreference = "Stop"
