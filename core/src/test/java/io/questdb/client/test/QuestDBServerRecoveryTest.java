@@ -1,0 +1,134 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test;
+
+import io.questdb.client.QuestDB;
+import io.questdb.client.Sender;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+
+/**
+ * End-to-end resilience: the facade starts with the server down, the producer
+ * keeps writing (buffered), and once the server comes up the write side
+ * reconnects and the read side -- previously deferred so it could not fail-fast
+ * the build -- can connect.
+ * <p>
+ * The mock cannot answer a real SELECT (result frames are exercised against a
+ * real server in the parent repo), so the read step asserts the query client
+ * <em>connects</em> once the server is up, not the row contents.
+ */
+public class QuestDBServerRecoveryTest {
+
+    private static final QwpColumnBatchHandler NOOP = new QwpColumnBatchHandler() {
+        @Override
+        public void onBatch(QwpColumnBatch batch) {
+        }
+
+        @Override
+        public void onEnd(long totalRows) {
+        }
+
+        @Override
+        public void onError(byte errorCode, String message) {
+        }
+    };
+
+    @Test(timeout = 60_000)
+    public void testFacadeStartsWhileServerDownThenWritesAndReaderConnectsOnRecovery() throws Exception {
+        // Two mock servers, bound (so the ports are known) but NOT accepting
+        // yet: the address is reachable but no WebSocket upgrade completes, so
+        // the server is effectively "down". One serves ingest ACK, the other
+        // query SERVER_INFO.
+        TestWebSocketServer ingest = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        });
+        TestWebSocketServer query = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        });
+        query.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
+        try {
+            // ingest: async initial connect so the producer thread never blocks
+            // and writes buffer until the wire is up.
+            String ingestCfg = "ws::addr=localhost:" + ingest.getPort()
+                    + ";sender_pool_min=1;sender_pool_max=1;initial_connect_retry=async"
+                    + ";auth_timeout_ms=200;reconnect_initial_backoff_millis=20"
+                    + ";reconnect_max_backoff_millis=100;reconnect_max_duration_millis=600000"
+                    + ";close_flush_timeout_millis=1000;";
+            // query: lazy (min=0) so the otherwise fail-fast reader never sinks
+            // the build while the server is down.
+            String queryCfg = "ws::addr=localhost:" + query.getPort()
+                    + ";query_pool_min=0;query_pool_max=1;auth_timeout_ms=2000;";
+
+            // (1) server down + (2) client starts:
+            QuestDB db = QuestDB.builder().ingestConfig(ingestCfg).queryConfig(queryCfg).build();
+            try {
+                Assert.assertEquals("no ingest handshake while the server is down", 0, ingest.handshakeCount());
+                Assert.assertEquals("no query handshake while the server is down", 0, query.handshakeCount());
+
+                // (3) client writes -> buffers in the cursor SF engine; the call
+                // must not throw even though the server is down.
+                Sender sender = db.borrowSender();
+                sender.table("t").longColumn("v", 1L).atNow();
+
+                // (4) server starts:
+                ingest.start();
+                query.start();
+                Assert.assertTrue(ingest.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertTrue(query.awaitStart(5, TimeUnit.SECONDS));
+
+                // The write side reconnects on its own once the server is up.
+                awaitTrue("ingest must connect after the server comes up",
+                        () -> ingest.handshakeCount() >= 1);
+
+                // (5) client can now read: the deferred reader connects on the
+                // first query (the mock does not serve rows, so we assert the
+                // connection, not the result).
+                db.executeSql("select 1", NOOP);
+                awaitTrue("query client must connect after the server comes up",
+                        () -> query.handshakeCount() >= 1);
+            } finally {
+                db.close();
+            }
+        } finally {
+            ingest.close();
+            query.close();
+        }
+    }
+
+    private static void awaitTrue(String message, BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(20);
+        }
+        Assert.assertTrue(message, condition.getAsBoolean());
+    }
+}
