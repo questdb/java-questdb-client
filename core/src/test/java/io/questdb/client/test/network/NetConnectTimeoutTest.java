@@ -27,6 +27,7 @@ package io.questdb.client.test.network;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.net.InetSocketAddress;
@@ -95,13 +96,20 @@ public class NetConnectTimeoutTest {
             long start = System.nanoTime();
             int rc = NF.connectAddrInfoTimeout(fd, addrInfo, 500);
             long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
-            if (rc == 0) {
-                // Extremely unusual: some network appliance accepted the SYN.
-                // Don't fail the build on a hostile network; just skip.
-                return;
-            }
+
+            // Whatever the outcome, the key guarantee is that we never blocked
+            // on the (multi-minute) OS connect timeout.
+            Assert.assertTrue("connect must return near the budget, was " + elapsedMs + "ms", elapsedMs < 5_000);
+
+            // The deterministic outcome depends on the runner's routing for
+            // TEST-NET-1: a dropped SYN yields a real timeout (the path under
+            // test), while a runner with no route to 192.0.2.0/24 fails fast
+            // with ENETUNREACH/EHOSTUNREACH (rc == -1) and a rare appliance may
+            // even accept it (rc == 0). Only the timeout case is assertable; the
+            // others can't exercise the timeout, so skip rather than flake.
+            Assume.assumeTrue("no route to blackhole on this runner (rc=" + rc + ")",
+                    rc == NetworkFacade.CONNECT_TIMEOUT);
             Assert.assertEquals("blackhole connect should time out", NetworkFacade.CONNECT_TIMEOUT, rc);
-            Assert.assertTrue("timeout should fire near the budget, was " + elapsedMs + "ms", elapsedMs < 5_000);
         } finally {
             NF.freeAddrInfo(addrInfo);
             NF.close(fd);
