@@ -35,6 +35,7 @@
 #include <string.h>
 #include <poll.h>
 #include <time.h>
+#include "glibc_compat.h"
 #include "net.h"
 #include <netdb.h>
 #include "sysutil.h"

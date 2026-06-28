@@ -74,6 +74,13 @@ jobs:
     # inside the glibc-2.17 image (the old Node-20-glibc-217 override hack only
     # patched /__e/node20, not /__e/node24). 2.28 still runs stock Node 24 and
     # matches the linux-aarch64 job, which already ships glibc-2.28 binaries.
+    #
+    # NOTE: the build container's glibc (2.28) does NOT dictate the artifact's
+    # runtime glibc floor. clock_gettime is pinned back to GLIBC_2.2.5 via
+    # src/main/c/share/glibc_compat.h so the linux-x86-64 .so keeps loading on
+    # glibc 2.14+ (its floor is memcpy@GLIBC_2.14), unchanged from before the
+    # container move. If you add a symbol with a higher version node here, the
+    # floor will rise -- check with: objdump -T libquestdb.so | grep GLIBC_.
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
     steps:
