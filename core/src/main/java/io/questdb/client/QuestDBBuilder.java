@@ -59,6 +59,10 @@ public final class QuestDBBuilder {
     private static final int UNSET = -1;
 
     private long acquireTimeoutMillis = UNSET;
+    // Optional ingest-side async callbacks. Null -> each pooled Sender uses its
+    // loud-not-silent default. Applied to every Sender the pool builds.
+    private SenderConnectionListener connectionListener;
+    private SenderErrorHandler errorHandler;
     private long housekeeperIntervalMillis = UNSET;
     private long idleTimeoutMillis = UNSET;
     private String ingestConfig;
@@ -82,6 +86,39 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException("acquireTimeoutMillis must be >= 0");
         }
         this.acquireTimeoutMillis = millis;
+        return this;
+    }
+
+    /**
+     * Sets the async connection-event listener applied to every pooled ingest
+     * {@link Sender}. The listener observes connect / disconnect / failover
+     * transitions across the whole sender pool; events are delivered on the
+     * senders' I/O threads, so the listener must be thread-safe and must not
+     * block. Pass {@code null} (the default) to keep each sender's
+     * loud-not-silent default listener.
+     *
+     * @param listener the shared connection listener, or {@code null} for the default
+     * @return this instance for method chaining
+     */
+    public QuestDBBuilder connectionListener(SenderConnectionListener listener) {
+        this.connectionListener = listener;
+        return this;
+    }
+
+    /**
+     * Sets the async error handler applied to every pooled ingest
+     * {@link Sender}. The handler receives terminal/async ingest errors
+     * (connect-budget exhaustion, terminal upgrade failures, write errors)
+     * from across the whole sender pool; notifications are delivered on the
+     * senders' I/O threads, so the handler must be thread-safe and must not
+     * block. Pass {@code null} (the default) to keep each sender's
+     * loud-not-silent default handler.
+     *
+     * @param handler the shared error handler, or {@code null} for the default
+     * @return this instance for method chaining
+     */
+    public QuestDBBuilder errorHandler(SenderErrorHandler handler) {
+        this.errorHandler = handler;
         return this;
     }
 
@@ -141,7 +178,9 @@ public final class QuestDBBuilder {
                 acquireTimeoutMillis,
                 idleTimeoutMillis,
                 maxLifetimeMillis,
-                housekeeperIntervalMillis
+                housekeeperIntervalMillis,
+                errorHandler,
+                connectionListener
         );
     }
 

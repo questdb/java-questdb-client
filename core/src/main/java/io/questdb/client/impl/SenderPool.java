@@ -25,6 +25,8 @@
 package io.questdb.client.impl;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderConnectionListener;
+import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
@@ -96,6 +98,10 @@ public final class SenderPool implements AutoCloseable {
     private final ArrayList<PooledSender> all;
     private final ArrayDeque<PooledSender> available;
     private final String configurationString;
+    // User-supplied ingest callbacks, shared across every pooled Sender this
+    // pool builds. Null -> each sender keeps its loud-not-silent default.
+    private final SenderConnectionListener connectionListener;
+    private final SenderErrorHandler errorHandler;
     private final long idleTimeoutMillis;
     // Test seam. Production builds delegates via defaultSender(); white-box
     // tests in io.questdb.client.test.impl reach the package-private
@@ -228,9 +234,32 @@ public final class SenderPool implements AutoCloseable {
             IntFunction<Sender> senderFactory,
             boolean deferStartupRecovery
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, senderFactory,
+                deferStartupRecovery, null, null);
+    }
+
+    // Full constructor adding the user-supplied ingest callbacks (error handler
+    // and connection listener), applied to every Sender the pool builds (see
+    // buildManagedSlotSender). The 8-arg overload above is the unchanged
+    // white-box test seam and delegates here with null callbacks.
+    SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory,
+            boolean deferStartupRecovery,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
+        this.errorHandler = errorHandler;
+        this.connectionListener = connectionListener;
         this.senderFactory = senderFactory != null ? senderFactory : this::defaultSender;
         // An injected factory (tests) drives recovery too, preserving the
         // white-box recovery seam; production recovery forces OFF-mode connects
@@ -1035,9 +1064,21 @@ public final class SenderPool implements AutoCloseable {
         return buildManagedSlotSender(slotIndex, true);
     }
 
+    // Applies the user-supplied ingest callbacks to a sender builder. Null
+    // callbacks are skipped so the sender keeps its loud-not-silent default.
+    private Sender.LineSenderBuilder applyUserCallbacks(Sender.LineSenderBuilder builder) {
+        if (errorHandler != null) {
+            builder.errorHandler(errorHandler);
+        }
+        if (connectionListener != null) {
+            builder.connectionListener(connectionListener);
+        }
+        return builder;
+    }
+
     private Sender buildManagedSlotSender(int slotIndex, boolean forRecovery) {
         if (!storeAndForward) {
-            return Sender.fromConfig(configurationString);
+            return applyUserCallbacks(Sender.builder(configurationString)).build();
         }
         // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
         // so concurrent SF senders sharing one sf_dir never collide on
@@ -1091,7 +1132,9 @@ public final class SenderPool implements AutoCloseable {
             // returns).
             builder.drainOrphans(false);
         }
-        return builder.build();
+        // Recovery delegates are internal, short-lived, OFF-mode drain senders;
+        // don't surface their connect/error events to the user's callbacks.
+        return (forRecovery ? builder : applyUserCallbacks(builder)).build();
     }
 
     /**
