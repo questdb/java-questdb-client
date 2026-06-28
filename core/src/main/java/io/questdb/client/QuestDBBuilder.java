@@ -72,6 +72,10 @@ public final class QuestDBBuilder {
     private int queryPoolMin = UNSET;
     private int senderPoolMax = UNSET;
     private int senderPoolMin = UNSET;
+    // When true, build() creates only the ingest (Sender) side: no query pool
+    // is constructed, so the facade starts even when the server / read primary
+    // is down, and query() is disabled. A query config is not required.
+    private boolean writeOnly;
 
     QuestDBBuilder() {
     }
@@ -86,6 +90,21 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException("acquireTimeoutMillis must be >= 0");
         }
         this.acquireTimeoutMillis = millis;
+        return this;
+    }
+
+    /**
+     * Builds an ingest-only (write-only) handle: no query/read pool is created,
+     * so the facade starts even when the server / read primary is unavailable
+     * (the read side is normally fail-fast and would sink the whole facade).
+     * {@link QuestDB#query()} / {@link QuestDB#newQuery()} are disabled and a
+     * query configuration is not required (any query config set is ignored).
+     * <p>
+     * Pair with {@code initial_connect_retry=async} (or {@code sender_pool_min=0})
+     * on the ingest config so the write side does not fail-fast either.
+     */
+    public QuestDBBuilder writeOnly() {
+        this.writeOnly = true;
         return this;
     }
 
@@ -141,6 +160,9 @@ public final class QuestDBBuilder {
         if (ingestConfig == null) {
             throw new IllegalStateException("ingest configuration is required; call fromConfig() or ingestConfig()");
         }
+        if (writeOnly) {
+            return buildWriteOnly();
+        }
         if (queryConfig == null) {
             throw new IllegalStateException("query configuration is required; call fromConfig() or queryConfig()");
         }
@@ -175,6 +197,34 @@ public final class QuestDBBuilder {
                 senderPoolMax,
                 queryPoolMin,
                 queryPoolMax,
+                acquireTimeoutMillis,
+                idleTimeoutMillis,
+                maxLifetimeMillis,
+                housekeeperIntervalMillis,
+                errorHandler,
+                connectionListener
+        );
+    }
+
+    // Ingest-only build path: validates and resolves the sender + shared pool
+    // knobs from the ingest config alone and constructs a QuestDBImpl with no
+    // query pool. Never touches the read side, so a down server cannot fail it.
+    private QuestDB buildWriteOnly() {
+        ConfigString ingestCs = ConfigString.parse(ingestConfig);
+        ConfigView ingestView = new ConfigView(ingestCs);
+        Sender.LineSenderBuilder.validateWsConfigString(ingestConfig);
+        // Only the ingest view applies; pass it for both sides so the existing
+        // resolvers (which cross-check ingest vs query) read a single source.
+        resolvePoolInt(senderPoolMin, "sender_pool_min", ingestView, ingestView, DEFAULT_POOL_MIN, this::senderPoolMin);
+        resolvePoolInt(senderPoolMax, "sender_pool_max", ingestView, ingestView, DEFAULT_POOL_MAX, this::senderPoolMax);
+        resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", ingestView, ingestView, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
+        resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", ingestView, ingestView, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
+        resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", ingestView, ingestView, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
+        resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", ingestView, ingestView, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
+        return new QuestDBImpl(
+                ingestConfig,
+                senderPoolMin,
+                senderPoolMax,
                 acquireTimeoutMillis,
                 idleTimeoutMillis,
                 maxLifetimeMillis,
