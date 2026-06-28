@@ -101,6 +101,10 @@ public abstract class WebSocketClient implements QuietCloseable {
     private final WebSocketSendBuffer sendBuffer;
     // volatile: written by user thread in close(), read by I/O thread in checkConnected()/sendFrame()/receiveFrame()
     private volatile boolean closed;
+    // Upper bound (ms) on the TCP connect. <= 0 disables the application-level
+    // timeout and falls back to the OS connect timeout. Seeded from the
+    // configuration; the QWP sender may override it via setConnectTimeout().
+    private int connectTimeoutMillis;
     private int fragmentBufPos;
     private long fragmentBufPtr;       // native buffer for accumulating fragment payloads
     private int fragmentBufSize;
@@ -168,6 +172,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         this.nf = configuration.getNetworkFacade();
         this.socket = socketFactory.newInstance(nf, LOG);
         this.defaultTimeout = configuration.getTimeout();
+        this.connectTimeoutMillis = configuration.getConnectTimeout();
 
         int sendBufSize = Math.max(configuration.getInitialRequestBufferSize(), DEFAULT_SEND_BUFFER_SIZE);
         int maxSendBufSize = Math.max(configuration.getMaximumRequestBufferSize(), sendBufSize);
@@ -479,6 +484,16 @@ public abstract class WebSocketClient implements QuietCloseable {
         } finally {
             controlFrameBuffer.reset();
         }
+    }
+
+    /**
+     * Overrides the TCP connect timeout (milliseconds) for subsequent
+     * {@link #connect} calls. {@code <= 0} disables the application-level
+     * timeout and falls back to the OS connect timeout. Must be called before
+     * {@link #connect}.
+     */
+    public void setConnectTimeout(int connectTimeoutMillis) {
+        this.connectTimeoutMillis = connectTimeoutMillis;
     }
 
     /**
@@ -922,10 +937,18 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("could not resolve host [host=").put(host).put(']');
         }
 
-        if (nf.connectAddrInfo(fd, addrInfo) != 0) {
+        final int connectResult = connectTimeoutMillis > 0
+                ? nf.connectAddrInfoTimeout(fd, addrInfo, connectTimeoutMillis)
+                : nf.connectAddrInfo(fd, addrInfo);
+        if (connectResult != 0) {
             int errno = nf.errno();
             nf.freeAddrInfo(addrInfo);
             disconnect();
+            if (connectResult == NetworkFacade.CONNECT_TIMEOUT) {
+                throw new HttpClientException("connect timed out [host=").put(host)
+                        .put(", port=").put(port)
+                        .put(", timeout=").put(connectTimeoutMillis).put(']').flagAsTimeout();
+            }
             throw new HttpClientException("could not connect [host=").put(host)
                     .put(", port=").put(port)
                     .put(", errno=").put(errno).put(']');

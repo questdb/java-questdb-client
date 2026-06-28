@@ -165,6 +165,9 @@ public class QwpQueryClient implements QuietCloseable {
     private final Random failoverRandom = new Random();
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private String authorizationHeader;
+    // Upper bound (ms) on each TCP connect attempt. 0 (default) falls back to
+    // the OS connect timeout.
+    private int connectTimeoutMs = 0;
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private String clientId;
     // Client-configured zone (failover.md §1.1), opaque case-insensitive
@@ -387,6 +390,7 @@ public class QwpQueryClient implements QuietCloseable {
         Long failoverMaxDurationMs = view.has("failover_max_duration_ms")
                 ? view.getLong("failover_max_duration_ms", 0) : null;
         Long authTimeoutMs = view.has("auth_timeout_ms") ? view.getLong("auth_timeout_ms", 0) : null;
+        Integer connectTimeout = view.has("connect_timeout") ? (int) view.getLong("connect_timeout", 0) : null;
         Long initialCredit = view.has("initial_credit") ? view.getLong("initial_credit", 0) : null;
         int poolSize = view.getInt("buffer_pool_size", DEFAULT_IO_BUFFER_POOL_SIZE);
         String compression = view.getEnum("compression");
@@ -441,6 +445,9 @@ public class QwpQueryClient implements QuietCloseable {
             }
             if (authTimeoutMs != null) {
                 client.withAuthTimeout(authTimeoutMs);
+            }
+            if (connectTimeout != null) {
+                client.withConnectTimeout(connectTimeout);
             }
             if (initialCredit != null) {
                 client.withInitialCredit(initialCredit);
@@ -497,6 +504,7 @@ public class QwpQueryClient implements QuietCloseable {
         view.getLong("failover_max_duration_ms", -1);
         view.getLong("initial_credit", -1);
         view.getLong("auth_timeout_ms", -1);
+        view.getLong("connect_timeout", -1);
         String username = view.getStr("username");
         String password = view.getStr("password");
         String token = view.getStr("token");
@@ -867,6 +875,7 @@ public class QwpQueryClient implements QuietCloseable {
         m.put("client_id", clientId);
         m.put("zone", clientZone);
         m.put("auth_timeout_ms", authTimeoutMs);
+        m.put("connect_timeout", connectTimeoutMs);
         m.put("authorization_header", authorizationHeader);
         m.put("tls_verify", tlsValidationMode);
         m.put("tls_roots", trustStorePath);
@@ -991,6 +1000,22 @@ public class QwpQueryClient implements QuietCloseable {
             throw new IllegalArgumentException("authTimeoutMs must be > 0");
         }
         this.authTimeoutMs = authTimeoutMs;
+        return this;
+    }
+
+    /**
+     * Upper bound, in milliseconds, on establishing the TCP connection to an
+     * endpoint. Unlike {@link #withAuthTimeout(long)} this DOES bound the TCP
+     * connect itself (via a non-blocking connect), so a routing blackhole that
+     * never returns SYN-ACK is aborted within this budget instead of riding the
+     * OS connect timeout. {@code 0} (default) keeps the OS connect timeout.
+     */
+    public QwpQueryClient withConnectTimeout(int connectTimeoutMs) {
+        checkPreConnect("withConnectTimeout");
+        if (connectTimeoutMs <= 0) {
+            throw new IllegalArgumentException("connectTimeoutMs must be > 0");
+        }
+        this.connectTimeoutMs = connectTimeoutMs;
         return this;
     }
 
@@ -1369,6 +1394,7 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.setQwpClientId(clientId != null ? clientId : defaultClientId());
         webSocketClient.setQwpAcceptEncoding(buildAcceptEncodingHeader());
         webSocketClient.setQwpMaxBatchRows(maxBatchRows);
+        webSocketClient.setConnectTimeout(connectTimeoutMs);
         runUpgradeWithTimeout(ep);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
         negotiatedZstdLevel = webSocketClient.getServerNegotiatedZstdLevel();

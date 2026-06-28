@@ -66,6 +66,7 @@ public abstract class HttpClient implements QuietCloseable {
     protected final NetworkFacade nf;
     protected final Socket socket;
     private final ObjectPool<DirectUtf8String> csPool = new ObjectPool<>(DirectUtf8String.FACTORY, 64);
+    private final int connectTimeout;
     private final int defaultTimeout;
     private final boolean fixBrokenConnection;
     private final int maxBufferSize;
@@ -84,6 +85,7 @@ public abstract class HttpClient implements QuietCloseable {
         this.nf = configuration.getNetworkFacade();
         this.socket = socketFactory.newInstance(nf, LOG);
         this.defaultTimeout = configuration.getTimeout();
+        this.connectTimeout = configuration.getConnectTimeout();
         this.bufferSize = configuration.getInitialRequestBufferSize();
         this.maxBufferSize = configuration.getMaximumRequestBufferSize();
         this.responseParserBufSize = configuration.getResponseBufferSize();
@@ -617,10 +619,16 @@ public abstract class HttpClient implements QuietCloseable {
                 throw new HttpClientException("could not resolve host ").put("[host=").put(host).put("]");
             }
 
-            if (nf.connectAddrInfo(fd, addrInfo) != 0) {
+            final int connectResult = connectTimeout > 0
+                    ? nf.connectAddrInfoTimeout(fd, addrInfo, connectTimeout)
+                    : nf.connectAddrInfo(fd, addrInfo);
+            if (connectResult != 0) {
                 int errno = nf.errno();
                 nf.freeAddrInfo(addrInfo);
                 disconnect();
+                if (connectResult == NetworkFacade.CONNECT_TIMEOUT) {
+                    throw new HttpClientException("connect timed out ").put("[host=").put(host).put(", port=").put(port).put(", timeout=").put(connectTimeout).put(']').flagAsTimeout();
+                }
                 throw new HttpClientException("could not connect to host ").put("[host=").put(host).put(", port=").put(port).put(", errno=").put(errno).put(']');
             }
             nf.freeAddrInfo(addrInfo);

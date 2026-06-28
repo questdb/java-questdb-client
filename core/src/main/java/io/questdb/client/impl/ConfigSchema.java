@@ -56,6 +56,7 @@ public final class ConfigSchema {
         str("tls_roots", Side.COMMON);
         str("tls_roots_password", Side.COMMON);
         longRange("auth_timeout_ms", Side.COMMON, 0, OPEN_MAX, true, false); // > 0
+        longRange("connect_timeout", Side.COMMON, 0, OPEN_MAX, true, false); // > 0
 
         // INGRESS -- the WebSocket Sender applies. STRING in the registry; the
         // Sender parses suffix/mode values (off/on, 64k, durability) with its

@@ -13,6 +13,8 @@ extern "C" {
 #define com_questdb_network_Net_EPEERDISCONNECT -1L
 #undef com_questdb_network_Net_EOTHERDISCONNECT
 #define com_questdb_network_Net_EOTHERDISCONNECT -2L
+#undef com_questdb_network_Net_ECONNTIMEOUT
+#define com_questdb_network_Net_ECONNTIMEOUT -3L
 
 /*
  * Class:     io_questdb_client_network_Net

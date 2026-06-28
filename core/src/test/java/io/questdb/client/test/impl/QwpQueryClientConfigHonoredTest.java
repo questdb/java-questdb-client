@@ -67,6 +67,7 @@ public class QwpQueryClientConfigHonoredTest {
         assertHonored("zone=us-east", "zone", "us-east");
         // COMMON applied by egress.
         assertHonored("auth_timeout_ms=7777", "auth_timeout_ms", 7777L);
+        assertHonored("connect_timeout=6000", "connect_timeout", 6000);
 
         // Credentials become the Authorization header, including the user/pass aliases.
         String basic = "Basic " + Base64.getEncoder()

@@ -1011,6 +1011,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
         private int bufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         private long closeFlushTimeoutMillis = CLOSE_FLUSH_TIMEOUT_NOT_SET;
+        // Upper bound (ms) on the TCP connect. PARAMETER_NOT_SET_EXPLICITLY ->
+        // 0 (no application-level connect timeout; OS connect timeout applies).
+        private int connectTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         // Optional user-supplied async connection-event listener. When null,
         // the sender uses DefaultSenderConnectionListener.INSTANCE
         // (loud-not-silent log of every transition).
@@ -1077,6 +1080,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             @Override
             public int getTimeout() {
                 return httpTimeout == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_HTTP_TIMEOUT : httpTimeout;
+            }
+
+            @Override
+            public int getConnectTimeout() {
+                return connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis;
             }
         };
         private long minRequestThroughput = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1197,6 +1205,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("TLS validation was already disabled");
             }
             return new AdvancedTlsSettings();
+        }
+
+        /**
+         * Upper bound, in milliseconds, on establishing the TCP connection to a
+         * QuestDB endpoint. When set, a connect that does not complete within
+         * this budget is aborted (instead of riding the much longer OS-level
+         * connect timeout). Applies to both HTTP/WebSocket transports. Default
+         * is unset (0), which falls back to the OS connect timeout.
+         *
+         * @param millis connect timeout in milliseconds; must be &gt; 0
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder connectTimeoutMillis(int millis) {
+            if (this.connectTimeoutMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("connect timeout was already configured ")
+                        .put("[connect_timeout=").put(this.connectTimeoutMillis).put("]");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("connect_timeout must be > 0: ").put(millis);
+            }
+            this.connectTimeoutMillis = millis;
+            return this;
         }
 
         /**
@@ -1531,6 +1561,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
                             authTimeoutMillis,
+                            connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis,
                             connectionListener,
                             actualConnectionListenerInboxCapacity
                     );
@@ -3166,6 +3197,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "request_timeout");
                     int requestTimeout = parseIntValue(sink, "request_timeout");
                     httpTimeoutMillis(requestTimeout);
+                } else if (Chars.equals("connect_timeout", sink)) {
+                    pos = getValue(configurationString, pos, sink, "connect_timeout");
+                    connectTimeoutMillis(parseIntValue(sink, "connect_timeout"));
                 } else if (Chars.equals("request_min_throughput", sink)) {
                     pos = getValue(configurationString, pos, sink, "request_min_throughput");
                     int requestMinThroughput = parseIntValue(sink, "request_min_throughput");
@@ -3446,6 +3480,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("auth_timeout_ms")) {
                     authTimeoutMillis(view.getLong("auth_timeout_ms", 0));
                 }
+                if (view.has("connect_timeout")) {
+                    connectTimeoutMillis((int) view.getLong("connect_timeout", 0));
+                }
 
                 s = view.getStr("auto_flush_rows");
                 if (s != null) {
@@ -3701,6 +3738,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);
             m.put("auth_timeout_ms", authTimeoutMillis);
+            m.put("connect_timeout", connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis);
             m.put("username", username);
             m.put("password", password);
             m.put("tls_verify", tlsValidationMode == null ? null : tlsValidationMode.name());

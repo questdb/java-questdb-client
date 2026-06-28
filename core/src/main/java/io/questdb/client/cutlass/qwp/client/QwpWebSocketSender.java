@@ -154,6 +154,9 @@ public class QwpWebSocketSender implements Sender {
     private final ClientTlsConfiguration tlsConfig;
     private MicrobatchBuffer activeBuffer;
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
+    // Upper bound (ms) on each TCP connect attempt. 0 (default) falls back to
+    // the OS connect timeout. Applied to every WebSocketClient before connect.
+    private int connectTimeoutMs = 0;
     // Double-buffering for async I/O
     private MicrobatchBuffer buffer0;
     // Cached column references to avoid repeated hashmap lookups
@@ -577,7 +580,7 @@ public class QwpWebSocketSender implements Sender {
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
                 durableAckKeepaliveIntervalMillis, authTimeoutMs,
-                null, SenderConnectionDispatcher.DEFAULT_CAPACITY);
+                0, null, SenderConnectionDispatcher.DEFAULT_CAPACITY);
     }
 
     /**
@@ -602,6 +605,7 @@ public class QwpWebSocketSender implements Sender {
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
             long authTimeoutMs,
+            int connectTimeoutMs,
             SenderConnectionListener connectionListener,
             int connectionListenerInboxCapacity
     ) {
@@ -613,6 +617,7 @@ public class QwpWebSocketSender implements Sender {
         try {
             sender.requestDurableAck = requestDurableAck;
             sender.authTimeoutMs = authTimeoutMs;
+            sender.connectTimeoutMs = connectTimeoutMs;
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -2439,6 +2444,7 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpRequestDurableAck(requestDurableAck);
+                newClient.setConnectTimeout(connectTimeoutMs);
                 newClient.connect(ep.host, ep.port);
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
                 newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);

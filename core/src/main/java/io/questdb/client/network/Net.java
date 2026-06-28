@@ -36,6 +36,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public final class Net {
 
+    // Sentinel returned by connectAddrInfoTimeout when the connect did not
+    // complete within the supplied budget. Distinct from -1 (generic error) and
+    // the disconnect codes so callers can flag a timeout without decoding errno.
+    @SuppressWarnings("unused")
+    public static final int CONNECT_TIMEOUT = -3;
     @SuppressWarnings("unused")
     public static final int EOTHERDISCONNECT = -2;
     @SuppressWarnings("unused")
@@ -87,6 +92,14 @@ public final class Net {
     public static native int connect(int fd, long sockaddr);
 
     public static native int connectAddrInfo(int fd, long lpAddrInfo);
+
+    /**
+     * Non-blocking connect bounded by {@code timeoutMillis}. Returns 0 on
+     * success, {@link #CONNECT_TIMEOUT} on timeout, or -1 on failure (errno set,
+     * readable via {@link io.questdb.client.std.Os#errno()}). The socket is left
+     * non-blocking on success.
+     */
+    public static native int connectAddrInfoTimeout(int fd, long lpAddrInfo, int timeoutMillis);
 
     public static void freeAddrInfo(long pAddrInfo) {
         if (pAddrInfo != 0) {

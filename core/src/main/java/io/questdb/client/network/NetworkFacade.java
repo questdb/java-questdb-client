@@ -27,6 +27,12 @@ package io.questdb.client.network;
 import org.slf4j.Logger;
 
 public interface NetworkFacade {
+    /**
+     * Return value of {@link #connectAddrInfoTimeout(int, long, int)} when the
+     * connect did not complete within the supplied budget.
+     */
+    int CONNECT_TIMEOUT = Net.CONNECT_TIMEOUT;
+
     int close(int fd);
 
     void close(int fd, Logger logger);
@@ -38,6 +44,13 @@ public interface NetworkFacade {
     int connect(int fd, long pSockaddr);
 
     int connectAddrInfo(int fd, long pAddrInfo);
+
+    /**
+     * Non-blocking connect bounded by {@code timeoutMillis}. Returns 0 on
+     * success, {@link #CONNECT_TIMEOUT} on timeout, or -1 on failure (with
+     * {@link #errno()} set). The socket is left non-blocking on success.
+     */
+    int connectAddrInfoTimeout(int fd, long pAddrInfo, int timeoutMillis);
 
     int errno();
 
