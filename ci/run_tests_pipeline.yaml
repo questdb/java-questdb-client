@@ -82,6 +82,11 @@ stages:
                 maven | "$(Agent.OS)"
               path: $(HOME)/.m2/repository
             displayName: "Cache Maven repository"
+          # Compile the native libquestdb.so/.dll on the runner (Linux/Windows
+          # binaries are no longer committed). Must run before the client jar is
+          # installed so the freshly built lib is packaged into it. macOS uses
+          # the committed .dylib and is skipped inside the template.
+          - template: build_native.yaml
           - bash: |
               BRANCH="${SYSTEM_PULLREQUEST_SOURCEBRANCH:-$BUILD_SOURCEBRANCHNAME}"
               BRANCH="${BRANCH#refs/heads/}"
