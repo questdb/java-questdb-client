@@ -89,6 +89,15 @@ public class QuestDBServerRecoveryTest {
             try {
                 Assert.assertEquals("no handshake while the server is down", 0, server.handshakeCount());
 
+                // This is NOT a write-only handle: reads stay ENABLED, just
+                // deferred. query() must hand back a usable builder even while
+                // the server is down -- it connects lazily on the first submit
+                // once the server is up. (Contrast write-only, where query()
+                // throws "query/read is disabled" for the life of the handle.)
+                Assert.assertNotNull(
+                        "reads must stay enabled on a resilient (non-write-only) handle even before the server is up",
+                        db.query());
+
                 // (3) client writes -> buffers in the cursor SF engine; the call
                 // must not throw even though the server is down.
                 Sender sender = db.borrowSender();
