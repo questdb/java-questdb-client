@@ -150,6 +150,9 @@ stages:
                 maven | "$(Agent.OS)"
               path: $(HOME)/.m2/repository
             displayName: "Cache Maven repository"
+          # Native binaries are no longer committed; compile libquestdb.so on the
+          # runner so the coverage test run can load it (same as BuildAndTest).
+          - template: build_native.yaml
           - task: Maven@3
             displayName: "Run tests with coverage"
             inputs:
