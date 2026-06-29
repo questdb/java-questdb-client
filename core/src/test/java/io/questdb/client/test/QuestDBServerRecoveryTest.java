@@ -52,9 +52,8 @@ public class QuestDBServerRecoveryTest {
         // completes, so the server is effectively "down". It serves ingest ACK
         // on the write path and a SERVER_INFO frame on the read path -- the read
         // path is gated so the ingest connection's ACK stream is never disturbed.
-        TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-        });
-        try (server) {
+        try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        })) {
             server.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
             // One cluster config drives both pools:
             // lazy_connect=true expands to exactly this resilience: the ingest
