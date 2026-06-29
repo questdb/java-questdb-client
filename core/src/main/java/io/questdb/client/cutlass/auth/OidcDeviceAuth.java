@@ -1499,9 +1499,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void warnPersistence(String operation, Throwable cause) {
-        // best-effort persistence: report to System.err and carry on with the in-memory token. The store
-        // never puts token bytes in its messages, so this cannot leak the secret.
-        String detail = cause.getMessage();
+        // best-effort persistence: report to System.err and carry on with the in-memory token. The store never
+        // puts token bytes in its messages, but an IO error can carry the operator-supplied store path, which
+        // could itself hold terminal-spoofing characters - sanitize the detail before printing, as every other
+        // untrusted display string is sanitized (sanitizeForDisplay is null-safe).
+        String detail = sanitizeForDisplay(cause.getMessage());
         System.err.println("questdb client: OIDC token store " + operation
                 + " failed; continuing without persistence" + (detail != null ? " [" + detail + ']' : ""));
     }

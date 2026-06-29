@@ -40,6 +40,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -245,6 +246,7 @@ public final class FileTokenStore implements TokenStore {
         byte[] content = serialize(key, token);
         try {
             ensureDirectory();
+            sweepStaleTempFiles(key.hash());
             Path target = tokenFile(key);
             Path tmp = createTempFile(key.hash());
             boolean moved = false;
@@ -457,16 +459,20 @@ public final class FileTokenStore implements TokenStore {
 
     private static void restrictToOwner(Path directory) {
         // best-effort: the at-rest protection of the plaintext token files is exactly these owner-only
-        // directory permissions, so tighten a pre-existing directory rather than trust whatever it had. On a
-        // non-POSIX filesystem (Windows) this is unsupported and falls back to the directory's existing ACL
+        // directory permissions, so re-tighten a pre-existing directory another tool/umask left loose rather
+        // than trust whatever it had. ensureDirectory runs this on every save and every inLock, so only chmod
+        // on detected drift - skip the write syscall in the common case where the permissions already match. On
+        // a non-POSIX filesystem (Windows) this is unsupported and falls back to the directory's existing ACL
         // (owner-only hardening there, via AclFileAttributeView, is a separate follow-up)
         try {
-            Files.setPosixFilePermissions(directory, DIR_PERMS);
+            if (!DIR_PERMS.equals(Files.getPosixFilePermissions(directory))) {
+                Files.setPosixFilePermissions(directory, DIR_PERMS);
+            }
         } catch (UnsupportedOperationException e) {
             // non-POSIX FS (e.g. Windows): cannot enforce owner-only perms; keep the inherited ACL
             warnNoPosixPermsOnce();
         } catch (IOException ignore) {
-            // the directory is not ours to chmod: keep the existing permissions
+            // the directory is not ours to inspect/chmod: keep the existing permissions
         }
     }
 
@@ -614,6 +620,28 @@ public final class FileTokenStore implements TokenStore {
         return directory.resolve(key.hash() + ".lock");
     }
 
+    private void sweepStaleTempFiles(String hashPrefix) {
+        // a crash between createTempFile and the atomic rename orphans a <hash>*.tmp holding a
+        // valid-at-the-time refresh token; unlike the lock file nothing ever steals it, so it would accumulate
+        // across crashes. Best-effort sweep on save: delete only temps older than the lock-staleness window, so
+        // a temp a concurrent writer is actively using (its mtime is seconds old) is never removed. A separate
+        // random suffix per writer keeps concurrent saves from colliding, which is why temps are not a fixed name
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory, hashPrefix + "*.tmp")) {
+            final long now = System.currentTimeMillis();
+            for (Path tmp : stream) {
+                try {
+                    if (now - Files.getLastModifiedTime(tmp).toMillis() > lockStaleMillis) {
+                        Files.deleteIfExists(tmp);
+                    }
+                } catch (IOException ignore) {
+                    // best-effort; skip this entry and let a later sweep retry
+                }
+            }
+        } catch (IOException ignore) {
+            // best-effort; a sweep failure must never fail a save
+        }
+    }
+
     private Path tokenFile(TokenStoreKey key) {
         return directory.resolve(key.hash() + ".json");
     }
@@ -643,7 +671,7 @@ public final class FileTokenStore implements TokenStore {
         long expiresAtMillis;
         boolean groupsInToken;
         long tokenTtlMillis;
-        int version;
+        long version;
         private int depth;
         private int field = FIELD_NONE;
         private boolean malformed;
@@ -698,7 +726,9 @@ public final class FileTokenStore implements TokenStore {
                     if (depth == 1) {
                         switch (field) {
                             case FIELD_VERSION:
-                                version = (int) parseLongOrZero(tag);
+                                // keep the full long: an over-32-bit value (e.g. 1 + 2^32) must not narrow to
+                                // SCHEMA_VERSION and slip through the schema gate, so compare it as a long
+                                version = parseLongOrZero(tag);
                                 break;
                             case FIELD_CLIENT_ID:
                                 putValue(clientId, tag);

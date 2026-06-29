@@ -710,6 +710,30 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testStaleTempFilesAreSweptOnSave() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            // 1s staleness window so the test does not have to wait
+            FileTokenStore store = new FileTokenStore(dir, 3_000, 1_000);
+            TokenStoreKey key = sampleKey();
+            // an orphan temp left by a crashed save (backdated past the staleness window) must be reaped on the
+            // next save; a fresh temp (recent mtime - a concurrent writer's) must be left untouched
+            Path staleTmp = dir.resolve(key.hash() + "stale.tmp");
+            Files.createFile(staleTmp);
+            Files.setLastModifiedTime(staleTmp, FileTime.fromMillis(System.currentTimeMillis() - 10_000));
+            Path freshTmp = dir.resolve(key.hash() + "fresh.tmp");
+            Files.createFile(freshTmp);
+
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            Assert.assertFalse("a stale orphan temp must be swept on save", Files.exists(staleTmp));
+            Assert.assertTrue("a fresh temp (a concurrent writer's) must not be swept", Files.exists(freshTmp));
+            Assert.assertNotNull("the save must still succeed", store.load(key));
+        });
+    }
+
+    @Test
     public void testTokenStoreKeyRejectsNullRequiredFields() throws Exception {
         assertMemoryLeak(() -> {
             // the identity fields are required; a null must fail fast with a clear OidcAuthException rather than
@@ -754,6 +778,23 @@ public class FileTokenStoreTest {
             Files.write(tokenFile(dir, key),
                     "{\"v\":1,\"client_id\":\"questdb\"".getBytes(StandardCharsets.UTF_8));
             Assert.assertNull("a truncated-but-prefix-valid file must be ignored", store.load(key));
+        });
+    }
+
+    @Test
+    public void testVersionOverflowReturnsNull() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            // a tampered version that narrows to SCHEMA_VERSION when cast to int (1 + 2^32) must not pass the
+            // schema gate: the parser keeps the version as a long and compares it as a long
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+            Assert.assertNotNull("the valid entry must load", store.load(key));
+            byte[] valid = Files.readAllBytes(tokenFile(dir, key));
+            String tampered = new String(valid, StandardCharsets.UTF_8).replace("\"v\":1", "\"v\":4294967297");
+            Files.write(tokenFile(dir, key), tampered.getBytes(StandardCharsets.UTF_8));
+            Assert.assertNull("a version that truncates to 1 as an int must be rejected", store.load(key));
         });
     }
 
