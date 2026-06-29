@@ -24,11 +24,11 @@
 
 package io.questdb.client.test.impl;
 
-import io.questdb.client.Query;
 import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
+import io.questdb.client.std.str.StringSink;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -45,13 +45,14 @@ public class QueryImplResetTest {
      * when {@code borrowQuery()} hands the pre-allocated handle out. It must
      * clear the builder state (SQL, binds, handler) so a follow-up
      * {@code submit()} cannot silently reuse a prior borrow's handler/binds,
-     * and it must mark the handle borrowed and idle.
+     * and it must leave the handle idle (done).
      * <p>
-     * Unlike the old per-thread {@code query()} reset, this one is
-     * unconditional: the leased worker was just acquired from the pool, so it
-     * is always idle (done) at borrow time. This test reaches into
+     * The reset is unconditional: the leased worker was just acquired from the
+     * pool, so it is always idle (done) at borrow time. This test reaches into
      * {@code QueryImpl} by reflection (the class is package-private and lives
-     * in a different package from this test).
+     * in a different package from this test). Builder state is seeded directly
+     * via reflection rather than through the {@code Query} API because the
+     * lease-generation guard on the setters would dereference the (null) worker.
      */
     @Test
     public void testResetForBorrowClearsBuilderState() throws Exception {
@@ -62,29 +63,28 @@ public class QueryImplResetTest {
         ctor.setAccessible(true);
         // resetForBorrow() never dereferences the worker; a null worker is fine
         // for this state-only test.
-        Query q = (Query) ctor.newInstance(new Object[]{null});
-
-        // Configure builder state as a prior borrow would have left it.
-        QwpColumnBatchHandler h = new NoopHandler();
-        QwpBindSetter b = values -> {
-            // no-op
-        };
-        q.sql("SELECT 1").binds(b).handler(h);
-
-        Method reset = queryImplClass.getDeclaredMethod("resetForBorrow");
-        reset.setAccessible(true);
-        reset.invoke(q);
+        Object q = ctor.newInstance(new Object[]{null});
 
         Field handlerF = queryImplClass.getDeclaredField("userHandler");
         Field bindsF = queryImplClass.getDeclaredField("userBinds");
         Field sqlBufF = queryImplClass.getDeclaredField("sqlBuffer");
-        Field borrowedF = queryImplClass.getDeclaredField("borrowed");
         Field doneF = queryImplClass.getDeclaredField("done");
         handlerF.setAccessible(true);
         bindsF.setAccessible(true);
         sqlBufF.setAccessible(true);
-        borrowedF.setAccessible(true);
         doneF.setAccessible(true);
+
+        // Seed builder state as a prior borrow would have left it.
+        handlerF.set(q, new NoopHandler());
+        bindsF.set(q, (QwpBindSetter) values -> {
+            // no-op
+        });
+        ((StringSink) sqlBufF.get(q)).put("SELECT 1");
+        doneF.setBoolean(q, false);
+
+        Method reset = queryImplClass.getDeclaredMethod("resetForBorrow");
+        reset.setAccessible(true);
+        reset.invoke(q);
 
         Assert.assertNull("userHandler must be cleared so a follow-up submit() without .handler() fails fast",
                 handlerF.get(q));
@@ -93,8 +93,6 @@ public class QueryImplResetTest {
         CharSequence sqlBuffer = (CharSequence) sqlBufF.get(q);
         Assert.assertEquals("sqlBuffer must be empty so a follow-up submit() without .sql() throws 'sql is required'",
                 0, sqlBuffer.length());
-        Assert.assertTrue("borrowed must be set so submit() is allowed on the freshly leased handle",
-                borrowedF.getBoolean(q));
         Assert.assertTrue("done must be true so the handle starts idle, not in flight",
                 doneF.getBoolean(q));
     }

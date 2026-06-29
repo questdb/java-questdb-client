@@ -54,14 +54,23 @@ public class SenderPoolTest {
             "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
 
     @Test
-    public void testBorrowReturnRecyclesSameDecorator() {
+    public void testBorrowReturnRecyclesSameDecorator() throws Exception {
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
             Sender first = pool.borrow();
             first.close();
             Sender second = pool.borrow();
-            Assert.assertSame("returned decorator should be reused after close()", first, second);
+            // Each borrow is a fresh PooledSender wrapper; what the pool recycles
+            // is the underlying slot, so compare those rather than the handles.
+            Assert.assertSame("returned slot should be recycled after close()",
+                    slotOf(first), slotOf(second));
             second.close();
         }
+    }
+
+    private static Object slotOf(Sender pooledWrapper) throws Exception {
+        Field f = PooledSender.class.getDeclaredField("slot");
+        f.setAccessible(true);
+        return f.get(pooledWrapper);
     }
 
     @Test
@@ -401,9 +410,12 @@ public class SenderPoolTest {
      * while the test does not leak native memory.
      */
     private static void installFailingCloseDelegate(PooledSender ps, AtomicInteger closeAttempts) throws Exception {
-        Field f = PooledSender.class.getDeclaredField("delegate");
+        Field slotF = PooledSender.class.getDeclaredField("slot");
+        slotF.setAccessible(true);
+        Object slot = slotF.get(ps);
+        Field f = slot.getClass().getDeclaredField("delegate");
         f.setAccessible(true);
-        Sender real = (Sender) f.get(ps);
+        Sender real = (Sender) f.get(slot);
         Sender failing = (Sender) Proxy.newProxyInstance(
                 Sender.class.getClassLoader(),
                 new Class[]{Sender.class},
@@ -424,6 +436,6 @@ public class SenderPoolTest {
                     }
                     return method.invoke(real, args);
                 });
-        f.set(ps, failing);
+        f.set(slot, failing);
     }
 }

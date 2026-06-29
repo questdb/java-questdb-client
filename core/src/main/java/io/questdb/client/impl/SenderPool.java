@@ -96,8 +96,8 @@ public final class SenderPool implements AutoCloseable {
     // transport has no application-level connect timeout to clamp it.
     private static final long RECOVERY_DRAIN_BUDGET_MILLIS = 1_000;
     private final long acquireTimeoutMillis;
-    private final ArrayList<PooledSender> all;
-    private final ArrayDeque<PooledSender> available;
+    private final ArrayList<SenderSlot> all;
+    private final ArrayDeque<SenderSlot> available;
     private final String configurationString;
     // User-supplied ingest callbacks, shared across every pooled Sender this
     // pool builds. Null -> each sender keeps its loud-not-silent default.
@@ -295,7 +295,7 @@ public final class SenderPool implements AutoCloseable {
                 if (storeAndForward) {
                     slotInUse[i] = true;
                 }
-                PooledSender ps = createUnlocked(storeAndForward ? i : -1);
+                SenderSlot ps = createUnlocked(storeAndForward ? i : -1);
                 all.add(ps);
                 available.add(ps);
                 built++;
@@ -604,7 +604,7 @@ public final class SenderPool implements AutoCloseable {
         // createRecoverer() takes the slot flock on <base>-slotIndex, and
         // delegate().close() can early-return with the I/O thread still running
         // (flock still held).
-        PooledSender recoverer = null;
+        SenderSlot recoverer = null;
         boolean stopScan = false;
         try {
             if (!OrphanScanner.isCandidateOrphan(slotPath)) {
@@ -630,7 +630,7 @@ public final class SenderPool implements AutoCloseable {
                 // on a timeout: a server that fails to ack within the budget
                 // will very likely do the same for every remaining slot -- the
                 // same reasoning as the build-failure case above.
-                if (!recoverer.drain(remainingMillis)) {
+                if (!recoverer.delegate().drain(remainingMillis)) {
                     LOG.warn("startup SF recovery: drain did not ack slot {} "
                             + "within {}ms; skipping remaining slots",
                             slotPath, remainingMillis);
@@ -669,9 +669,12 @@ public final class SenderPool implements AutoCloseable {
                     throw new LineSenderException("QuestDB handle is closed");
                 }
                 if (!available.isEmpty()) {
-                    PooledSender s = available.pollFirst();
-                    s.markInUse();
-                    return s;
+                    SenderSlot s = available.pollFirst();
+                    // Stamp a fresh lease id under the lock so the PooledSender
+                    // wrapper handed out can be told apart from any prior,
+                    // now-stale borrow of the same slot.
+                    s.bumpGeneration();
+                    return new PooledSender(s, s.generation());
                 }
                 if (all.size() + inFlightCreations + closingSlots + leakedSlots + recoveringSlots < maxSize) {
                     inFlightCreations++;
@@ -680,7 +683,7 @@ public final class SenderPool implements AutoCloseable {
                     // SF is off (no per-slot identity needed).
                     int slotIndex = storeAndForward ? allocateSlotIndex() : -1;
                     lock.unlock();
-                    PooledSender created;
+                    SenderSlot created;
                     try {
                         created = createUnlocked(slotIndex);
                     } catch (Throwable e) {
@@ -718,8 +721,8 @@ public final class SenderPool implements AutoCloseable {
                         throw new LineSenderException("QuestDB handle is closed");
                     }
                     all.add(created);
-                    created.markInUse();
-                    return created;
+                    created.bumpGeneration();
+                    return new PooledSender(created, created.generation());
                 }
                 if (remainingNanos <= 0) {
                     throw new LineSenderException(
@@ -754,7 +757,7 @@ public final class SenderPool implements AutoCloseable {
 
     @Override
     public void close() {
-        PooledSender[] snapshot;
+        SenderSlot[] snapshot;
         lock.lock();
         try {
             if (closeStarted) {
@@ -770,7 +773,7 @@ public final class SenderPool implements AutoCloseable {
             // it now performs; the snapshot is belt-and-braces for any
             // future code path that mutates `all` outside this lock's
             // happens-before chain.
-            snapshot = all.toArray(new PooledSender[0]);
+            snapshot = all.toArray(new SenderSlot[0]);
             slotReleased.signalAll();
         } finally {
             lock.unlock();
@@ -800,13 +803,22 @@ public final class SenderPool implements AutoCloseable {
      * {@code ArrayList} and the {@code delegate.close()} below would be a
      * double-close on a delegate {@code close()} has already shut down.
      */
-    void discardBroken(PooledSender s) {
+    void discardBroken(PooledSender ps) {
+        SenderSlot s = ps.slot();
+        long gen = ps.generation();
         boolean reserved = false;
         lock.lock();
         try {
             if (closed) {
                 return;
             }
+            if (s.generation() != gen) {
+                // Stale discard: the slot was already returned/discarded and
+                // possibly re-borrowed. Dropping it avoids evicting a slot a
+                // different borrower now owns and double-closing its delegate.
+                return;
+            }
+            s.bumpGeneration();
             boolean removed = all.remove(s);
             // For an SF slot, keep its index reserved (move the reservation
             // from `all` to `closingSlots`) until the delegate below releases
@@ -851,15 +863,26 @@ public final class SenderPool implements AutoCloseable {
         }
     }
 
-    public void giveBack(PooledSender s) {
-        long now = System.currentTimeMillis();
-        s.markIdleAt(now);
+    public void giveBack(PooledSender ps) {
+        SenderSlot s = ps.slot();
+        long gen = ps.generation();
         lock.lock();
         try {
             if (closed) {
                 // Pool already shut down: don't requeue; let close() finish destroying.
                 return;
             }
+            if (s.generation() != gen) {
+                // Stale return: this lease was already given back and the slot
+                // possibly re-borrowed (or this is a duplicate close). Dropping
+                // it keeps Sender.close() idempotent under a concurrent
+                // re-borrow -- without it a double close would enqueue the slot
+                // twice and hand it to two borrowers writing into one delegate.
+                return;
+            }
+            s.bumpGeneration();
+            s.markIdleAt(System.currentTimeMillis());
+            assert !available.contains(s) : "slot already present in available deque on giveBack";
             available.addLast(s);
             slotReleased.signal();
         } finally {
@@ -877,15 +900,15 @@ public final class SenderPool implements AutoCloseable {
             return;
         }
         long now = System.currentTimeMillis();
-        ArrayList<PooledSender> toClose = null;
+        ArrayList<SenderSlot> toClose = null;
         lock.lock();
         try {
             if (closed) {
                 return;
             }
-            Iterator<PooledSender> it = available.iterator();
+            Iterator<SenderSlot> it = available.iterator();
             while (it.hasNext() && all.size() > minSize) {
-                PooledSender s = it.next();
+                SenderSlot s = it.next();
                 boolean idleExpired = idleTimeoutMillis < Long.MAX_VALUE
                         && (now - s.idleSinceMillis()) >= idleTimeoutMillis;
                 boolean overAge = maxLifetimeMillis < Long.MAX_VALUE
@@ -927,7 +950,7 @@ public final class SenderPool implements AutoCloseable {
                 lock.lock();
                 try {
                     for (int i = 0, n = toClose.size(); i < n; i++) {
-                        PooledSender s = toClose.get(i);
+                        SenderSlot s = toClose.get(i);
                         if (s.slotIndex() >= 0) {
                             reclaimSlot(s, " during idle reaping");
                         }
@@ -977,19 +1000,19 @@ public final class SenderPool implements AutoCloseable {
         }
     }
 
-    private PooledSender createUnlocked(int slotIndex) {
-        return new PooledSender(senderFactory.apply(slotIndex), this, slotIndex);
+    private SenderSlot createUnlocked(int slotIndex) {
+        return new SenderSlot(senderFactory.apply(slotIndex), this, slotIndex);
     }
 
     /**
-     * Builds a {@link PooledSender} for startup recovery of one stranded slot.
+     * Builds a {@link SenderSlot} for startup recovery of one stranded slot.
      * Routes through {@link #recoverySenderFactory}, which in production forces
      * a non-blocking initial connect ({@link #defaultRecoverySender}) so a
      * single recovery step stays bounded -- see that method and
      * {@link #drainCandidateSlotForRecovery}.
      */
-    private PooledSender createRecoverer(int slotIndex) {
-        return new PooledSender(recoverySenderFactory.apply(slotIndex), this, slotIndex);
+    private SenderSlot createRecoverer(int slotIndex) {
+        return new SenderSlot(recoverySenderFactory.apply(slotIndex), this, slotIndex);
     }
 
     private Sender defaultSender(int slotIndex) {
@@ -1125,7 +1148,7 @@ public final class SenderPool implements AutoCloseable {
      * {@link QwpWebSocketSender#isSlotLockReleased()} -- false means close()
      * bailed early with the I/O thread still running and the flock still held.
      */
-    private static boolean flockReleased(PooledSender s) {
+    private static boolean flockReleased(SenderSlot s) {
         Sender d = s.delegate();
         return !(d instanceof QwpWebSocketSender) || ((QwpWebSocketSender) d).isSlotLockReleased();
     }
@@ -1148,7 +1171,7 @@ public final class SenderPool implements AutoCloseable {
      *                path (e.g. {@code ""} or {@code " during idle reaping"})
      * @return {@code true} if the index was freed, {@code false} if retired
      */
-    private boolean reclaimSlot(PooledSender s, String context) {
+    private boolean reclaimSlot(SenderSlot s, String context) {
         closingSlots--;
         if (flockReleased(s)) {
             freeSlotIndex(s.slotIndex());

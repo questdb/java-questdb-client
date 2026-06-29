@@ -36,9 +36,11 @@ import java.io.Closeable;
  * {@link #close()} it to release the client back to the pool (typically via
  * try-with-resources).
  * <p>
- * Allocation: zero at steady state -- {@code borrowQuery()} returns a
- * pre-allocated handle bound to the leased pool slot, and the
- * {@link Completion} is a field on it reused across submits.
+ * Allocation: the per-submit path is allocation-free -- the heavy query state
+ * is pre-allocated on the leased pool slot and reused, and {@link #submit()}
+ * returns this same handle as its {@link Completion}. {@code borrowQuery()}
+ * creates one small lease handle per borrow (often scalar-replaced by the JIT
+ * when used with try-with-resources).
  * <p>
  * Lifecycle: configure with {@link #sql}, optional {@link #binds}, and
  * {@link #handler}, then call {@link #submit()} to obtain a {@link Completion}
@@ -83,10 +85,10 @@ public interface Query extends Closeable {
     Query sql(CharSequence sql);
 
     /**
-     * Submits the query for execution on the leased client. Returns the
-     * {@link Completion} field cached on this handle; never allocates. The
-     * handle is single-flight: {@code await()} the returned Completion before
-     * the next {@code submit()}.
+     * Submits the query for execution on the leased client. Returns this handle
+     * as its own {@link Completion}; never allocates. The handle is
+     * single-flight: {@code await()} the returned Completion before the next
+     * {@code submit()}.
      *
      * @return the single-flight Completion bound to this Query handle
      */

@@ -38,9 +38,11 @@ import java.util.function.IntFunction;
 /**
  * Implementation of {@link QuestDB}. Owns the elastic {@link SenderPool} and
  * {@link QueryClientPool} and a {@link PoolHousekeeper} that reaps idle slots.
- * {@link #borrowQuery()} leases a pooled {@link QueryWorker} and hands back its
- * pre-allocated {@link QueryImpl}, so a borrow is allocation-free at steady
- * state.
+ * {@link #borrowQuery()} leases a pooled {@link QueryWorker} and hands back a
+ * thin {@link QueryLease} over its reused {@link QueryImpl}; the heavy per-query
+ * state is pre-allocated on the worker and the per-submit path is
+ * allocation-free, so only the small lease handle is created per borrow (and is
+ * routinely scalar-replaced by the JIT in the try-with-resources case).
  */
 public final class QuestDBImpl implements QuestDB {
 

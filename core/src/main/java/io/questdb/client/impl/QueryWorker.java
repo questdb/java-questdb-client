@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
@@ -52,6 +53,15 @@ public final class QueryWorker {
     private final ReentrantLock signalLock = new ReentrantLock();
     private final Thread thread;
     private volatile QueryImpl current;
+    // Monotonic lease id. Mutated only under the QueryClientPool lock
+    // (bumped once in acquire() when the worker is handed out and once in
+    // release() when it is returned), so successive borrows of the same
+    // worker get distinct ids. A QueryLease captures the value live during
+    // its borrow; once the worker is released or re-borrowed the captured id
+    // no longer matches, which is how a stale handle's close()/cancel()/
+    // submit() are detected and dropped. Volatile so a stale handle on another
+    // thread observes the latest value without taking the pool lock.
+    private volatile long generation;
     private volatile long idleSinceMillis;
     private volatile boolean shuttingDown;
 
@@ -68,6 +78,23 @@ public final class QueryWorker {
 
     long createdAtMillis() {
         return createdAtMillis;
+    }
+
+    /**
+     * Advances the lease generation. Called by {@link QueryClientPool} under
+     * the pool lock when this worker is handed out (acquire) and when it is
+     * returned (release).
+     */
+    void bumpGeneration() {
+        generation++;
+    }
+
+    /**
+     * Current lease generation. See {@link #generation} for the visibility and
+     * mutation contract.
+     */
+    long generation() {
+        return generation;
     }
 
     long idleSinceMillis() {
@@ -100,22 +127,26 @@ public final class QueryWorker {
     }
 
     /**
-     * Resets and returns this worker's pre-allocated {@link QueryImpl} as the
-     * borrowed lease. Called by {@link QuestDBImpl#borrowQuery()} right after
-     * {@link QueryClientPool#acquire()} hands this worker out. Zero-allocation:
-     * the handle is created once in the constructor and reused across borrows.
+     * Resets the worker's reused {@link QueryImpl} and returns a fresh
+     * {@link QueryLease} stamped with the current lease {@link #generation}.
+     * Called by {@link QuestDBImpl#borrowQuery()} right after
+     * {@link QueryClientPool#acquire()} hands this worker out (which bumped the
+     * generation under the pool lock). The lease is a small per-borrow handle;
+     * the heavy state stays on the reused {@link QueryImpl}, and the per-submit
+     * path remains allocation-free.
      */
-    QueryImpl lease() {
+    Query lease() {
         query.resetForBorrow();
-        return query;
+        return new QueryLease(query, generation);
     }
 
     /**
-     * Returns this worker to the pool. Called by {@link QueryImpl#close()} when
-     * the borrowed lease is released.
+     * Returns this worker to the pool. Called by {@link QueryImpl#close(long)}
+     * when the borrowed lease is released; the captured lease {@code gen} lets
+     * the pool reject a stale release whose worker has already been re-borrowed.
      */
-    void releaseToPool() {
-        pool.release(this);
+    void releaseToPool(long gen) {
+        pool.release(this, gen);
     }
 
     void shutdown() {

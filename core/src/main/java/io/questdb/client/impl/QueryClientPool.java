@@ -198,7 +198,12 @@ public final class QueryClientPool implements AutoCloseable {
                     throw new QueryException((byte) 0, "QuestDB handle is closed");
                 }
                 if (!available.isEmpty()) {
-                    return available.pollFirst();
+                    QueryWorker w = available.pollFirst();
+                    // Stamp a fresh lease id under the lock so the QueryLease
+                    // about to be handed out can be distinguished from any
+                    // prior, now-stale borrow of the same worker.
+                    w.bumpGeneration();
+                    return w;
                 }
                 if (all.size() + inFlightCreations < maxSize) {
                     inFlightCreations++;
@@ -249,6 +254,8 @@ public final class QueryClientPool implements AutoCloseable {
                         throw new QueryException((byte) 0, "QuestDB handle is closed");
                     }
                     all.add(created);
+                    // Stamp the first lease id for this freshly built worker.
+                    created.bumpGeneration();
                     return created;
                 }
                 if (remainingNanos <= 0) {
@@ -341,14 +348,30 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
-    void release(QueryWorker w) {
-        long now = System.currentTimeMillis();
-        w.markIdleAt(now);
+    void release(QueryWorker w, long gen) {
         lock.lock();
         try {
             if (closed) {
                 return;
             }
+            if (w.generation() != gen) {
+                // Stale release: this lease was already returned and the worker
+                // has since been re-borrowed (or this is a duplicate close of an
+                // already-released lease). Dropping it is what makes
+                // Query.close() idempotent even under a concurrent re-borrow --
+                // without this guard a double close would enqueue the worker
+                // twice and hand it to two borrowers at once, corrupting the
+                // whole pool. The flag a stale close() reads is no longer its
+                // own lease's, so a non-validated release path could not catch
+                // this; the generation captured at borrow time can.
+                return;
+            }
+            // Invalidate the just-returned lease so a duplicate release with the
+            // same generation is also dropped and the in-flight handle can no
+            // longer drive this worker.
+            w.bumpGeneration();
+            w.markIdleAt(System.currentTimeMillis());
+            assert !available.contains(w) : "worker already present in available deque on release";
             available.addLast(w);
             workerReleased.signal();
         } finally {

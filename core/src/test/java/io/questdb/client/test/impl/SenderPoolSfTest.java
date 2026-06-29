@@ -206,7 +206,10 @@ public class SenderPoolSfTest {
                     first.close();
                     PooledSender second = pool.borrow();
                     try {
-                        Assert.assertSame("returned slot must be recycled", first, second);
+                        // borrow() now returns a fresh wrapper each time; the
+                        // recycled thing is the underlying slot.
+                        Assert.assertSame("returned slot must be recycled",
+                                getField(first, "slot"), getField(second, "slot"));
                         Assert.assertEquals("no new slot dir on recycle", 1, countSlotDirs());
                         Assert.assertTrue(Files.exists(slot("default-0")));
                     } finally {
@@ -1882,9 +1885,12 @@ public class SenderPoolSfTest {
     }
 
     private static Sender getDelegate(PooledSender ps) throws Exception {
-        Field f = PooledSender.class.getDeclaredField("delegate");
+        Field slotF = PooledSender.class.getDeclaredField("slot");
+        slotF.setAccessible(true);
+        Object slot = slotF.get(ps);
+        Field f = slot.getClass().getDeclaredField("delegate");
         f.setAccessible(true);
-        return (Sender) f.get(ps);
+        return (Sender) f.get(slot);
     }
 
     // Invokes one of the pool's private managed-slot delegate factories

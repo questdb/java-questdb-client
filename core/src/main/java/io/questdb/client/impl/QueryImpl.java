@@ -24,8 +24,6 @@
 
 package io.questdb.client.impl;
 
-import io.questdb.client.Completion;
-import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpBindValues;
@@ -40,32 +38,45 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Implementation of {@link Query}: the pooled lease handle. One instance is
- * pre-allocated per {@link QueryWorker} and reused across borrows. Holds the
- * configured query state (SQL, optional binds, handler), an inner
- * {@link Completion}, and a wrapping {@link QwpColumnBatchHandler} that forwards
- * callbacks to the user handler and signals the Completion on terminal events.
+ * Reusable per-{@link QueryWorker} query state: the configured SQL, optional
+ * binds, handler, terminal-event signalling, and a wrapping
+ * {@link QwpColumnBatchHandler} that forwards callbacks to the user handler and
+ * signals completion on terminal events. One instance is pre-allocated per
+ * worker in the constructor and reused across every borrow.
  * <p>
- * Lifecycle: {@link QueryWorker#lease()} resets this handle and hands it out
- * when {@link QuestDBImpl#borrowQuery()} acquires the worker. {@link #submit()}
- * dispatches on the held worker (single-flight) and returns the cached
- * {@link Completion}; {@link #close()} returns the worker to the pool.
+ * Because the instance is shared across borrows, it must never be handed to a
+ * caller directly -- a stale reference would leak into a later borrow's
+ * lifecycle. Callers instead receive a thin, per-borrow {@link QueryLease} that
+ * carries the lease {@code generation} stamped at borrow time and passes it
+ * into every operation here. Each operation validates that generation against
+ * {@link QueryWorker#generation()}:
+ * <ul>
+ *   <li>builder/await operations on a stale generation throw
+ *       {@code IllegalStateException} ("query handle is closed"),</li>
+ *   <li>{@link #close(long)} and {@link #cancel(long)} on a stale generation are
+ *       no-ops -- this is what makes {@code Query.close()} idempotent and
+ *       prevents a stale handle from releasing, or cancelling the in-flight
+ *       query of, a worker a different borrower now owns.</li>
+ * </ul>
+ * <p>
+ * Lifecycle: {@link QueryWorker#lease()} resets this state and wraps it in a
+ * fresh {@link QueryLease} when {@link QuestDBImpl#borrowQuery()} acquires the
+ * worker. {@link #submit(long)} dispatches on the held worker (single-flight);
+ * {@link #close(long)} returns the worker to the pool.
  */
-final class QueryImpl implements Query {
+final class QueryImpl {
 
-    private final InnerCompletion completion = new InnerCompletion();
     private final Condition doneCondition;
     private final ReentrantLock doneLock = new ReentrantLock();
     private final StringSink sqlBuffer = new StringSink();
     private final QueryWorker worker;
+    private final QwpBindSetter wireBinds = this::applyBinds;
     private final WrappingHandler wrappingHandler = new WrappingHandler();
-    private boolean borrowed;
     private volatile boolean done = true;
     private volatile String resultMessage;
     private volatile byte resultStatus;
     private volatile Throwable unexpectedError;
     private QwpBindSetter userBinds;
-    private final QwpBindSetter wireBinds = this::applyBinds;
     private QwpColumnBatchHandler userHandler;
 
     QueryImpl(QueryWorker worker) {
@@ -73,8 +84,8 @@ final class QueryImpl implements Query {
         this.doneCondition = doneLock.newCondition();
     }
 
-    @Override
-    public void abandon() {
+    void abandon(long gen) {
+        checkLive(gen);
         if (!done) {
             throw new IllegalStateException("a previous submit() is still in flight; await the Completion first");
         }
@@ -83,15 +94,56 @@ final class QueryImpl implements Query {
         sqlBuffer.clear();
     }
 
-    @Override
-    public Query binds(QwpBindSetter binds) {
-        this.userBinds = binds;
-        return this;
+    void await(long gen) throws InterruptedException {
+        checkLive(gen);
+        doneLock.lock();
+        try {
+            while (!done) {
+                doneCondition.await();
+            }
+        } finally {
+            doneLock.unlock();
+        }
+        throwIfFailed();
     }
 
-    @Override
-    public void close() {
-        if (!borrowed) {
+    boolean await(long gen, long timeout, TimeUnit unit) throws InterruptedException {
+        checkLive(gen);
+        long remaining = unit.toNanos(timeout);
+        doneLock.lock();
+        try {
+            while (!done) {
+                if (remaining <= 0) {
+                    return false;
+                }
+                remaining = doneCondition.awaitNanos(remaining);
+            }
+        } finally {
+            doneLock.unlock();
+        }
+        throwIfFailed();
+        return true;
+    }
+
+    void cancel(long gen) {
+        // No-op on a stale lease: the worker may now be running a different
+        // borrower's query, and cancelling here would abort it.
+        if (gen != worker.generation()) {
+            return;
+        }
+        if (!done) {
+            worker.cancelInFlight();
+        }
+    }
+
+    void close(long gen) {
+        // A stale generation means this lease was already released and the
+        // worker may now be owned by another borrower. Dropping the call is
+        // what keeps close() idempotent without releasing someone else's
+        // worker or cancelling their in-flight query. release() re-checks the
+        // generation under the pool lock, so the worker can never be enqueued
+        // twice even if two threads race a close on the same live lease.
+        if (gen != worker.generation()) {
             return;
         }
         // If a submit is still in flight (the caller did not await), cancel it
@@ -109,28 +161,32 @@ final class QueryImpl implements Query {
                 doneLock.unlock();
             }
         }
-        borrowed = false;
-        worker.releaseToPool();
+        worker.releaseToPool(gen);
     }
 
-    @Override
-    public Query handler(QwpColumnBatchHandler handler) {
+    boolean isDone(long gen) {
+        checkLive(gen);
+        return done;
+    }
+
+    void setBinds(long gen, QwpBindSetter binds) {
+        checkLive(gen);
+        this.userBinds = binds;
+    }
+
+    void setHandler(long gen, QwpColumnBatchHandler handler) {
+        checkLive(gen);
         this.userHandler = handler;
-        return this;
     }
 
-    @Override
-    public Query sql(CharSequence sql) {
+    void setSql(long gen, CharSequence sql) {
+        checkLive(gen);
         sqlBuffer.clear();
         sqlBuffer.put(sql);
-        return this;
     }
 
-    @Override
-    public Completion submit() {
-        if (!borrowed) {
-            throw new IllegalStateException("query handle is not borrowed (closed or never leased)");
-        }
+    void submit(long gen) {
+        checkLive(gen);
         if (sqlBuffer.length() == 0) {
             throw new IllegalStateException("sql is required");
         }
@@ -152,13 +208,18 @@ final class QueryImpl implements Query {
             doneLock.unlock();
         }
         worker.dispatch(this);
-        return completion;
     }
 
     private void applyBinds(QwpBindValues binds) {
         QwpBindSetter setter = userBinds;
         if (setter != null) {
             setter.apply(binds);
+        }
+    }
+
+    private void checkLive(long gen) {
+        if (gen != worker.generation()) {
+            throw new IllegalStateException("query handle is not borrowed (closed or never leased)");
         }
     }
 
@@ -178,13 +239,23 @@ final class QueryImpl implements Query {
         }
     }
 
+    private void throwIfFailed() {
+        Throwable unexpected = unexpectedError;
+        if (unexpected != null) {
+            throw new QueryException(resultStatus, resultMessage, unexpected);
+        }
+        if (resultStatus != 0) {
+            throw new QueryException(resultStatus, resultMessage);
+        }
+    }
+
     /**
-     * Resets builder state to empty and marks this handle borrowed. Called by
-     * {@link QueryWorker#lease()} when {@link QuestDBImpl#borrowQuery()} hands
-     * the pre-allocated handle out, so each borrow starts from the documented
-     * "reset to empty" contract on {@link io.questdb.client.Query}. The leased
-     * worker is idle at this point (just acquired from the pool), so the reset
-     * is unconditional.
+     * Resets builder and terminal state to empty. Called by
+     * {@link QueryWorker#lease()} when {@link QuestDBImpl#borrowQuery()} hands a
+     * freshly stamped {@link QueryLease} out, so each borrow starts from the
+     * documented "reset to empty" contract on {@link io.questdb.client.Query}.
+     * The leased worker is idle at this point (just acquired from the pool), so
+     * the reset is unconditional.
      */
     void resetForBorrow() {
         userBinds = null;
@@ -194,7 +265,6 @@ final class QueryImpl implements Query {
         resultMessage = null;
         unexpectedError = null;
         done = true;
-        borrowed = true;
     }
 
     void runOn(QwpQueryClient client) {
@@ -212,62 +282,6 @@ final class QueryImpl implements Query {
      */
     void signalUnexpected(Throwable t) {
         signalDone((byte) 0, t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName(), t);
-    }
-
-    private final class InnerCompletion implements Completion {
-
-        @Override
-        public void await() throws InterruptedException {
-            doneLock.lock();
-            try {
-                while (!done) {
-                    doneCondition.await();
-                }
-            } finally {
-                doneLock.unlock();
-            }
-            throwIfFailed();
-        }
-
-        @Override
-        public boolean await(long timeout, TimeUnit unit) throws InterruptedException {
-            long remaining = unit.toNanos(timeout);
-            doneLock.lock();
-            try {
-                while (!done) {
-                    if (remaining <= 0) {
-                        return false;
-                    }
-                    remaining = doneCondition.awaitNanos(remaining);
-                }
-            } finally {
-                doneLock.unlock();
-            }
-            throwIfFailed();
-            return true;
-        }
-
-        @Override
-        public void cancel() {
-            if (!done) {
-                worker.cancelInFlight();
-            }
-        }
-
-        @Override
-        public boolean isDone() {
-            return done;
-        }
-
-        private void throwIfFailed() {
-            Throwable unexpected = unexpectedError;
-            if (unexpected != null) {
-                throw new QueryException(resultStatus, resultMessage, unexpected);
-            }
-            if (resultStatus != 0) {
-                throw new QueryException(resultStatus, resultMessage);
-            }
-        }
     }
 
     private final class WrappingHandler implements QwpColumnBatchHandler {

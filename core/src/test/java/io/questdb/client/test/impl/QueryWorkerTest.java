@@ -68,9 +68,10 @@ public class QueryWorkerTest {
      * state directly: it parks the worker on its condition, then takes the
      * worker's own {@code signalLock} and atomically sets both
      * {@code current} and {@code shuttingDown} before signalling. After the
-     * worker thread exits, the test asserts the {@link Completion} has been
-     * signalled. Today the assertion fails because the run loop's early
-     * return strands the {@code QueryImpl}.
+     * worker thread exits, the test asserts the {@code QueryImpl} was signalled
+     * to done. Without the fix the assertion fails because the run loop's early
+     * return strands the {@code QueryImpl} with {@code done==false}, so any
+     * caller blocked in {@code Completion.await()} would hang forever.
      */
     @Test(timeout = 30_000)
     public void testShutdownRacingDispatchMustNotStrandCaller() throws Exception {
@@ -86,9 +87,9 @@ public class QueryWorkerTest {
         }
 
         Field doneF = queryImplClass.getDeclaredField("done");
-        Field completionF = queryImplClass.getDeclaredField("completion");
+        Field unexpectedF = queryImplClass.getDeclaredField("unexpectedError");
         doneF.setAccessible(true);
-        completionF.setAccessible(true);
+        unexpectedF.setAccessible(true);
 
         // No QwpQueryClient is constructed here: runLoop exits at the
         // shuttingDown check before reaching the first reference to
@@ -126,7 +127,6 @@ public class QueryWorkerTest {
         ctor.setAccessible(true);
         Object queryImpl = ctor.newInstance(new Object[]{null});
         doneF.setBoolean(queryImpl, false);
-        Completion completion = (Completion) completionF.get(queryImpl);
 
         // Atomically force the racy state under the worker's own lock:
         // current set AND shuttingDown set before the worker wakes.
@@ -144,20 +144,15 @@ public class QueryWorkerTest {
         Assert.assertFalse("worker thread did not exit after shuttingDown=true",
                 t.isAlive());
 
-        // The Completion must have been signalled. Without the fix, await(2s)
-        // returns false because signalDone is never called.
-        boolean completed;
-        try {
-            completed = completion.await(2, TimeUnit.SECONDS);
-        } catch (RuntimeException expectedAfterFix) {
-            // Once fixed, the worker is expected to call signalUnexpected
-            // with a QueryException("QuestDB handle is closed") which
-            // await() rethrows. Either form of "completed" is acceptable;
-            // the bug is the silent hang.
-            completed = true;
-        }
+        // The QueryImpl must have been signalled to done. Without the fix,
+        // done stays false because signalDone is never called, so a caller in
+        // Completion.await() would hang forever. The worker reaches the
+        // shutdown-race branch and calls signalUnexpected("QuestDB handle is
+        // closed"), which sets done=true and records the unexpected error.
         Assert.assertTrue("BUG: QueryWorker.runLoop returned with shuttingDown=true "
                 + "while current!=null, never invoking runOn or signalUnexpected. "
-                + "The caller's Completion.await() hangs forever.", completed);
+                + "The caller's Completion.await() hangs forever.", doneF.getBoolean(queryImpl));
+        Assert.assertNotNull("signalUnexpected must record the closed-handle error",
+                unexpectedF.get(queryImpl));
     }
 }
