@@ -111,7 +111,7 @@ public final class ConfigView {
         if ("false".equals(v) || "off".equals(v)) {
             return false;
         }
-        throw new IllegalArgumentException("invalid " + key + ": " + v + " (expected true, false)");
+        throw new IllegalArgumentException("invalid " + key + ": " + v + " (expected true, false, on, off)");
     }
 
     public boolean getBoolOnOff(String key, boolean dflt) {
