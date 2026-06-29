@@ -63,8 +63,7 @@ public class QuestDBFacadeCallbacksTest {
             }
         };
         try (QuestDB ignored = QuestDB.builder()
-                .ingestConfig(ingestConfig(port))
-                .queryConfig(queryConfig(port))
+                .fromConfig(config(port))
                 .connectionListener(listener)
                 .build()) {
             Assert.assertTrue(
@@ -78,8 +77,7 @@ public class QuestDBFacadeCallbacksTest {
         int port = TestPorts.findUnusedPort();
         ErrorInbox inbox = new ErrorInbox();
         try (QuestDB ignored = QuestDB.builder()
-                .ingestConfig(ingestConfig(port))
-                .queryConfig(queryConfig(port))
+                .fromConfig(config(port))
                 .errorHandler(inbox)
                 .build()) {
             Assert.assertTrue(
@@ -89,20 +87,18 @@ public class QuestDBFacadeCallbacksTest {
         }
     }
 
-    // Eagerly prewarm one sender (sender_pool_min=1) so build() exercises the
-    // production buildManagedSlotSender path that applies the facade callbacks.
-    // async + tight budget -> the I/O thread fails fast against the dead port.
-    private static String ingestConfig(int port) {
+    // One cluster config drives both pools. Eagerly prewarm one sender
+    // (sender_pool_min=1) so build() exercises the production
+    // buildManagedSlotSender path that applies the facade callbacks; async + a
+    // tight budget -> the I/O thread fails fast against the dead port.
+    // query_pool_min=0 -> the query pool never connects, so the test is isolated
+    // to the ingest callbacks.
+    private static String config(int port) {
         return "ws::addr=localhost:" + port + ";sender_pool_min=1;sender_pool_max=1"
+                + ";query_pool_min=0;query_pool_max=1"
                 + ";initial_connect_retry=async;reconnect_max_duration_millis=400"
                 + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50"
                 + ";close_flush_timeout_millis=0;";
-    }
-
-    // query_pool_min=0 -> the query pool never connects, so the test is isolated
-    // to the ingest callbacks.
-    private static String queryConfig(int port) {
-        return "ws::addr=localhost:" + port + ";query_pool_min=0;query_pool_max=1;";
     }
 
     private static final class ErrorInbox implements SenderErrorHandler {

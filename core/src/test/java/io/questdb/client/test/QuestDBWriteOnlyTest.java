@@ -38,11 +38,12 @@ import org.junit.Test;
 public class QuestDBWriteOnlyTest {
 
     @Test
-    public void testWriteOnlyDoesNotRequireQueryConfig() {
+    public void testWriteOnlyDoesNotConnectQueryPool() {
         int port = TestPorts.findUnusedPort();
-        // Only an ingest config is supplied -- no queryConfig()/fromConfig().
+        // writeOnly() skips the query pool: a down server can't fail the build
+        // even though the single cluster config is also the query config.
         try (QuestDB db = QuestDB.builder()
-                .ingestConfig("ws::addr=localhost:" + port + ";sender_pool_min=0;")
+                .fromConfig("ws::addr=localhost:" + port + ";sender_pool_min=0;")
                 .writeOnly()
                 .build()) {
             Assert.assertNotNull(db);

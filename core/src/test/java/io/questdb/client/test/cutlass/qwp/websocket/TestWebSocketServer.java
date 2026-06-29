@@ -83,6 +83,12 @@ public class TestWebSocketServer implements Closeable {
     // QwpQueryClient tests enable this; ingress sender tests leave it off so their
     // connections carry only ACK frames.
     private volatile boolean sendServerInfo;
+    // When true, the server fails the WebSocket upgrade on the egress read path
+    // (/read...) by dropping the connection before the 101, while still serving
+    // the ingest write path (/write...) normally. Lets one server + one cluster
+    // config drive a build where the sender pool connects but the query pool
+    // cannot. Set via setRejectReadUpgrade().
+    private volatile boolean rejectReadUpgrade;
     // When non-null the next handshake responds with HTTP 421 Misdirected
     // Request + X-QuestDB-Role: <rejectingRole>, mimicking a server whose
     // QwpServerInfoProvider reports REPLICA / PRIMARY_CATCHUP. Set after
@@ -209,6 +215,18 @@ public class TestWebSocketServer implements Closeable {
     }
 
     /**
+     * When enabled, the server fails the WebSocket upgrade on the egress read
+     * path ({@code /read/...}) while still serving the ingest write path
+     * ({@code /write/...}) normally. This lets a single server, addressed by a
+     * single cluster config, accept ingest senders but reject query clients --
+     * e.g. to exercise build()'s unwind of an already-built sender pool when the
+     * query pool fails.
+     */
+    public void setRejectReadUpgrade(boolean rejectReadUpgrade) {
+        this.rejectReadUpgrade = rejectReadUpgrade;
+    }
+
+    /**
      * Configure the server to reject the next handshake with an arbitrary
      * HTTP status code (e.g. 401, 403, 404, 426, 503). Pass {@code 0} to
      * clear and resume normal 101 upgrades. Tests use this to drive the
@@ -221,9 +239,12 @@ public class TestWebSocketServer implements Closeable {
 
     /**
      * When enabled, the server sends a {@code SERVER_INFO} frame immediately
-     * after a successful 101 upgrade, the way a real egress endpoint does. The
-     * advertised role follows {@link #setAdvertisedRole}, defaulting to
-     * {@code STANDALONE}. Leave disabled for ingress (Sender) tests.
+     * after a successful 101 upgrade on the egress read path ({@code /read/...}),
+     * the way a real egress endpoint does. Ingest write-path ({@code /write/...})
+     * connections never receive it -- their ACK-only response stream would choke
+     * on an unexpected frame -- so one server can serve both an ingest and a
+     * query pool from a single cluster config. The advertised role follows
+     * {@link #setAdvertisedRole}, defaulting to {@code STANDALONE}.
      */
     public void setSendServerInfo(boolean sendServerInfo) {
         this.sendServerInfo = sendServerInfo;
@@ -249,6 +270,10 @@ public class TestWebSocketServer implements Closeable {
         bb.putShort((short) nodeId.length);
         bb.put(nodeId);
         return bb.array();
+    }
+
+    private static boolean isReadPath(String path) {
+        return path != null && path.startsWith("/read");
     }
 
     private static byte roleByte(String role) {
@@ -313,6 +338,10 @@ public class TestWebSocketServer implements Closeable {
         private boolean isClosed;
         private OutputStream out;
         private Thread readThread;
+        // Request path from the WebSocket upgrade GET line (e.g. /write/v4,
+        // /read/v1). Captured during the handshake so the post-upgrade logic can
+        // distinguish ingest from egress connections.
+        private String requestPath = "";
 
         ClientHandler(Socket socket) {
             this.socket = socket;
@@ -459,7 +488,15 @@ public class TestWebSocketServer implements Closeable {
             }
 
             String key = null;
-            for (String line : request.toString().split("\r\n")) {
+            String[] lines = request.toString().split("\r\n");
+            if (lines.length > 0) {
+                // GET <path> HTTP/1.1
+                String[] parts = lines[0].split(" ");
+                if (parts.length >= 2) {
+                    requestPath = parts[1];
+                }
+            }
+            for (String line : lines) {
                 if (line.toLowerCase().startsWith("sec-websocket-key:")) {
                     key = line.substring(18).trim();
                     break;
@@ -467,6 +504,13 @@ public class TestWebSocketServer implements Closeable {
             }
 
             if (key == null) {
+                return false;
+            }
+
+            // Read-path reject: drop the egress upgrade before the 101 so the
+            // query pool's connect fails fast, while ingest write-path upgrades
+            // still complete on this same server.
+            if (rejectReadUpgrade && isReadPath(requestPath)) {
                 return false;
             }
 
@@ -566,7 +610,11 @@ public class TestWebSocketServer implements Closeable {
                     liveConnections.incrementAndGet();
 
                     try {
-                        if (sendServerInfo) {
+                        // SERVER_INFO is an egress-only frame: send it only on a
+                        // read-path (query) connection. An ingest write-path
+                        // connection parses every inbound frame as an ACK and
+                        // would fail on it.
+                        if (sendServerInfo && isReadPath(requestPath)) {
                             sendBinary(buildServerInfoFrame(roleByte(advertisedRole)));
                         }
 

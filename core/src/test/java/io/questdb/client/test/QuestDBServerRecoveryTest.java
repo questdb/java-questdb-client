@@ -63,33 +63,31 @@ public class QuestDBServerRecoveryTest {
 
     @Test(timeout = 60_000)
     public void testFacadeStartsWhileServerDownThenWritesAndReaderConnectsOnRecovery() throws Exception {
-        // Two mock servers, bound (so the ports are known) but NOT accepting
-        // yet: the address is reachable but no WebSocket upgrade completes, so
-        // the server is effectively "down". One serves ingest ACK, the other
-        // query SERVER_INFO.
-        TestWebSocketServer ingest = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        // One mock server (the whole "cluster"), bound so the port is known but
+        // NOT accepting yet: the address is reachable but no WebSocket upgrade
+        // completes, so the server is effectively "down". It serves ingest ACK
+        // on the write path and a SERVER_INFO frame on the read path -- the read
+        // path is gated so the ingest connection's ACK stream is never disturbed.
+        TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
         });
-        TestWebSocketServer query = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-        });
-        query.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
+        server.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
         try {
-            // ingest: async initial connect so the producer thread never blocks
-            // and writes buffer until the wire is up.
-            String ingestCfg = "ws::addr=localhost:" + ingest.getPort()
+            // One cluster config drives both pools:
+            // - ingest: async initial connect so the producer thread never blocks
+            //   and writes buffer until the wire is up.
+            // - query: lazy (query_pool_min=0) so the otherwise fail-fast reader
+            //   never sinks the build while the server is down.
+            String cfg = "ws::addr=localhost:" + server.getPort()
                     + ";sender_pool_min=1;sender_pool_max=1;initial_connect_retry=async"
-                    + ";auth_timeout_ms=200;reconnect_initial_backoff_millis=20"
+                    + ";query_pool_min=0;query_pool_max=1"
+                    + ";auth_timeout_ms=2000;reconnect_initial_backoff_millis=20"
                     + ";reconnect_max_backoff_millis=100;reconnect_max_duration_millis=600000"
                     + ";close_flush_timeout_millis=1000;";
-            // query: lazy (min=0) so the otherwise fail-fast reader never sinks
-            // the build while the server is down.
-            String queryCfg = "ws::addr=localhost:" + query.getPort()
-                    + ";query_pool_min=0;query_pool_max=1;auth_timeout_ms=2000;";
 
             // (1) server down + (2) client starts:
-            QuestDB db = QuestDB.builder().ingestConfig(ingestCfg).queryConfig(queryCfg).build();
+            QuestDB db = QuestDB.builder().fromConfig(cfg).build();
             try {
-                Assert.assertEquals("no ingest handshake while the server is down", 0, ingest.handshakeCount());
-                Assert.assertEquals("no query handshake while the server is down", 0, query.handshakeCount());
+                Assert.assertEquals("no handshake while the server is down", 0, server.handshakeCount());
 
                 // (3) client writes -> buffers in the cursor SF engine; the call
                 // must not throw even though the server is down.
@@ -97,27 +95,25 @@ public class QuestDBServerRecoveryTest {
                 sender.table("t").longColumn("v", 1L).atNow();
 
                 // (4) server starts:
-                ingest.start();
-                query.start();
-                Assert.assertTrue(ingest.awaitStart(5, TimeUnit.SECONDS));
-                Assert.assertTrue(query.awaitStart(5, TimeUnit.SECONDS));
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 // The write side reconnects on its own once the server is up.
                 awaitTrue("ingest must connect after the server comes up",
-                        () -> ingest.handshakeCount() >= 1);
+                        () -> server.handshakeCount() >= 1);
 
                 // (5) client can now read: the deferred reader connects on the
                 // first query (the mock does not serve rows, so we assert the
                 // connection, not the result).
+                int handshakesBeforeQuery = server.handshakeCount();
                 db.executeSql("select 1", NOOP);
                 awaitTrue("query client must connect after the server comes up",
-                        () -> query.handshakeCount() >= 1);
+                        () -> server.handshakeCount() >= handshakesBeforeQuery + 1);
             } finally {
                 db.close();
             }
         } finally {
-            ingest.close();
-            query.close();
+            server.close();
         }
     }
 

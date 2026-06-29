@@ -52,53 +52,10 @@ public class QuestDBBuilderTest {
     }
 
     @Test
-    public void testConflictingIntPoolKeyAcrossSidesRejected() {
-        // Both sides carry sender_pool_max (an int pool key) with different
-        // values -> build fails via resolvePoolInt's conflict check. The long
-        // pool keys are covered by testConflictingPoolKeysAcrossSidesRejected;
-        // this guards the separate int code path.
-        try (QuestDB ignored = QuestDB.builder()
-                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=2;")
-                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;sender_pool_max=5;")
-                .build()) {
-            Assert.fail("expected conflicting pool config");
-        } catch (IllegalArgumentException e) {
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("conflicting pool config: sender_pool_max"));
-        }
-    }
-
-    @Test
-    public void testConflictingPoolKeysAcrossSidesRejected() {
-        // Both sides carry acquire_timeout_ms with different values -> build fails.
-        try (QuestDB ignored = QuestDB.builder()
-                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;acquire_timeout_ms=1000;")
-                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;")
-                .build()) {
-            Assert.fail("expected conflicting pool config");
-        } catch (IllegalArgumentException e) {
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("conflicting pool config: acquire_timeout_ms"));
-        }
-    }
-
-    @Test
-    public void testConnectRejectsNonWsSchemaOnSingleString() {
-        // QuestDB.connect(single string) must enforce the ws/wss schema, just
-        // like the builder's fromConfig().
-        assertSchemaRejected(() -> QuestDB.connect("http::addr=h:9000;"));
-    }
-
-    @Test
-    public void testConnectRejectsNonWsSchemaOnTwoArg() {
-        // QuestDB.connect(ingest, query) rejects a non-ws schema on either side.
-        assertSchemaRejected(() -> QuestDB.connect("tcp::addr=h:9009;", "ws::addr=h:9000;"));
-        assertSchemaRejected(() -> QuestDB.connect("ws::addr=h:9000;", "udp::addr=h:9009;"));
-    }
-
-    @Test
     public void testConnectSingleStringValidatesAndBuilds() {
-        // QuestDB.connect(single string) hands the same ws:: string to both the
-        // ingest and query sides. min=0 on both pools validates both clients
-        // without connecting, so build() returns a live handle.
+        // QuestDB.connect(single string) hands the same ws:: cluster string to
+        // both the ingest and query pools. min=0 on both pools validates both
+        // clients without connecting, so build() returns a live handle.
         try (QuestDB ignored = QuestDB.connect(
                 "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;")) {
             Assert.assertNotNull(ignored);
@@ -106,95 +63,38 @@ public class QuestDBBuilderTest {
     }
 
     @Test
-    public void testConnectStringWithPoolKeysAppliedToBuilder() {
-        // Pool keys supplied via separate ingest/query strings are accepted;
-        // min=0 so nothing connects.
-        try (QuestDB ignored = QuestDB.builder()
-                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=1;")
-                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;query_pool_max=1;")
-                .build()) {
-            Assert.assertNotNull(ignored);
-        }
-    }
-
-    @Test
-    public void testConnectTwoArgValidatesAndBuilds() {
-        // QuestDB.connect(ingest, query) sets the two sides independently;
-        // min=0 on each validates both clients without connecting.
-        try (QuestDB ignored = QuestDB.connect(
-                "ws::addr=127.0.0.1:1;sender_pool_min=0;",
-                "ws::addr=127.0.0.1:1;query_pool_min=0;")) {
-            Assert.assertNotNull(ignored);
-        }
-    }
-
-    @Test
-    public void testExplicitPoolKeyWinsOverConflictingStrings() {
-        // The two strings disagree on acquire_timeout_ms, but an explicit builder
-        // call sets it: explicit wins and the conflict check is skipped, whether
-        // the explicit call comes after or before the config strings. The resolved
-        // value is the explicit 500, not either string's value.
-        QuestDBBuilder after = QuestDB.builder()
-                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;acquire_timeout_ms=1000;")
-                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;")
-                .acquireTimeoutMillis(500);
-        try (QuestDB ignored = after.build()) {
-            Assert.assertNotNull(ignored);
-        }
-        Assert.assertEquals(500L, after.poolConfigSnapshotForTest().get("acquire_timeout_ms"));
-
-        QuestDBBuilder before = QuestDB.builder()
-                .acquireTimeoutMillis(500)
-                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;acquire_timeout_ms=1000;")
-                .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;acquire_timeout_ms=2000;");
-        try (QuestDB ignored = before.build()) {
-            Assert.assertNotNull(ignored);
-        }
-        Assert.assertEquals(500L, before.poolConfigSnapshotForTest().get("acquire_timeout_ms"));
-    }
-
-    @Test
-    public void testHttpIngestConfigRejected() {
-        assertSchemaRejected(() -> QuestDB.builder().ingestConfig("http::addr=h:9000;"));
-    }
-
-    @Test
-    public void testHttpSingleConfigRejected() {
-        assertSchemaRejected(() -> QuestDB.builder().fromConfig("http::addr=h:9000;"));
-    }
-
-    @Test
     public void testMalformedEgressConfigRejectedAtBuildWithMinZero() {
         // query_pool_min=0 pre-warms nothing, so build() never constructs a
-        // QwpQueryClient -- yet it must still reject a malformed query config up
-        // front via QwpQueryClient.validateConfig, mirroring the ingress side.
+        // QwpQueryClient -- yet it must still reject a malformed egress key in
+        // the single cluster config up front, mirroring the ingress side.
         // Covers a typed enum (compression) and a bounded int (compression_level).
-        assertEgressBuildRejected(
-                "ws::addr=127.0.0.1:1;compression=gzip;query_pool_min=0;query_pool_max=2;", "compression");
-        assertEgressBuildRejected(
-                "ws::addr=127.0.0.1:1;compression_level=99;query_pool_min=0;query_pool_max=2;", "compression_level");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;compression=gzip;sender_pool_min=0;query_pool_min=0;query_pool_max=2;",
+                "compression");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;compression_level=99;sender_pool_min=0;query_pool_min=0;query_pool_max=2;",
+                "compression_level");
     }
 
     @Test
     public void testMalformedIngressConfigRejectedAtBuildWithMinZero() {
         // sender_pool_min=0 pre-warms nothing, so build() never constructs a
-        // Sender -- yet it must still reject a malformed ingest config up front,
-        // matching the egress side. Covers a typed enum (tls_verify), a
+        // Sender -- yet it must still reject a malformed ingress key in the
+        // single cluster config up front. Covers a typed enum (tls_verify), a
         // registry-STRING value that only the real Sender parse validates
-        // (auto_flush_rows), and WebSocket build-time checks that only the full
-        // no-connect validation reaches: auto_flush=off and auto_flush_interval=off
-        // both disable auto-flush (unsupported on WebSocket), and sf_durability=flush
-        // is not yet supported.
-        assertIngressBuildRejected(
-                "wss::addr=127.0.0.1:1;tls_verify=strict;sender_pool_min=0;sender_pool_max=2;", "tls_verify");
-        assertIngressBuildRejected(
-                "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;sender_pool_max=2;", "auto_flush_rows");
-        assertIngressBuildRejected(
-                "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;sender_pool_max=2;", "auto-flush");
-        assertIngressBuildRejected(
-                "ws::addr=127.0.0.1:1;auto_flush=off;sender_pool_min=0;sender_pool_max=2;", "auto-flush");
-        assertIngressBuildRejected(
-                "ws::addr=127.0.0.1:1;sf_durability=flush;sender_pool_min=0;sender_pool_max=2;", "not yet supported");
+        // (auto_flush_rows), and WebSocket build-time checks: auto_flush=off and
+        // auto_flush_interval=off both disable auto-flush (unsupported on
+        // WebSocket), and sf_durability=flush is not yet supported.
+        assertBuildRejected(
+                "wss::addr=127.0.0.1:1;tls_verify=strict;sender_pool_min=0;query_pool_min=0;", "tls_verify");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush_rows=abc;sender_pool_min=0;query_pool_min=0;", "auto_flush_rows");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush_interval=off;sender_pool_min=0;query_pool_min=0;", "auto-flush");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;auto_flush=off;sender_pool_min=0;query_pool_min=0;", "auto-flush");
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;sf_durability=flush;sender_pool_min=0;query_pool_min=0;", "not yet supported");
     }
 
     @Test
@@ -212,22 +112,12 @@ public class QuestDBBuilderTest {
     }
 
     @Test
-    public void testMissingIngestConfigThrows() {
+    public void testMissingConfigThrows() {
         try {
-            QuestDB.builder().queryConfig("ws::addr=h:9000;").build().close();
+            QuestDB.builder().build().close();
             Assert.fail();
         } catch (IllegalStateException e) {
-            Assert.assertTrue(e.getMessage().contains("ingest"));
-        }
-    }
-
-    @Test
-    public void testMissingQueryConfigThrows() {
-        try {
-            QuestDB.builder().ingestConfig("ws::addr=h:9000;").build().close();
-            Assert.fail();
-        } catch (IllegalStateException e) {
-            Assert.assertTrue(e.getMessage().contains("query"));
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("configuration"));
         }
     }
 
@@ -255,25 +145,36 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testNonWsSchemaRejected() {
+        // The single cluster config (and QuestDB.connect) must use ws/wss.
+        assertSchemaRejected(() -> QuestDB.builder().fromConfig("http::addr=h:9000;"));
+        assertSchemaRejected(() -> QuestDB.builder().fromConfig("tcp::addr=h:9009;"));
+        assertSchemaRejected(() -> QuestDB.builder().fromConfig("udp::addr=h:9009;"));
+        assertSchemaRejected(() -> QuestDB.connect("http::addr=h:9000;"));
+    }
+
+    @Test
     public void testQueryPoolBuildFailureUnwindsSenderPool() throws Exception {
-        // Sender pool builds against a healthy ws ingest endpoint; the query
-        // pool fails on a dead address. The handle must close the already-built
-        // sender pool (its connected senders) rather than leak them.
-        try (TestWebSocketServer ingest = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        // One server, one cluster config: the server accepts ingest write-path
+        // upgrades but rejects egress read-path upgrades, so the sender pool
+        // connects while the query pool's connect fails. The failed build() must
+        // close the already-built sender pool (its connected senders) rather than
+        // leak them.
+        try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
         })) {
-            ingest.start();
-            Assert.assertTrue(ingest.awaitStart(5, TimeUnit.SECONDS));
-            int port = ingest.getPort();
+            server.setRejectReadUpgrade(true);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            int port = server.getPort();
             try {
                 QuestDB.builder()
-                        .ingestConfig("ws::addr=localhost:" + port + ";")
-                        .queryConfig("ws::addr=127.0.0.1:1;auth_timeout_ms=200;")
+                        .fromConfig("ws::addr=localhost:" + port + ";auth_timeout_ms=200;")
                         .senderPoolSize(2)
                         .queryPoolSize(2)
                         .acquireTimeoutMillis(500)
                         .build()
                         .close();
-                Assert.fail("expected build to fail when query pool cannot connect");
+                Assert.fail("expected build to fail when the query pool cannot connect");
             } catch (RuntimeException expected) {
                 // The exact exception comes from QwpQueryClient.connect(). The
                 // build failing only proves the query pool gave up; the
@@ -284,65 +185,39 @@ public class QuestDBBuilderTest {
             // saw two ingest handshakes (proving the senders connected and the
             // assertion below is not vacuous)...
             awaitTrue("sender pool should have connected two ingest senders",
-                    () -> ingest.handshakeCount() >= 2);
+                    () -> server.handshakeCount() >= 2);
             // ...and the failed build() must have closed every one of them, so
             // no sender connection is left live on the server. The server
             // observes the client-side socket close asynchronously, so poll.
             awaitTrue("failed build() must close the already-built sender pool, leaving no live connection",
-                    () -> ingest.liveConnectionCount() == 0);
-        }
-    }
-
-    @Test
-    public void testSamePoolKeyValueAcrossSidesOk() {
-        // The same key at the same value on both sides builds cleanly.
-        try (QuestDB ignored = QuestDB.builder()
-                .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;acquire_timeout_ms=1500;")
-                .queryConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;acquire_timeout_ms=1500;")
-                .build()) {
-            Assert.assertNotNull(ignored);
+                    () -> server.liveConnectionCount() == 0);
         }
     }
 
     @Test
     public void testSharedVocabularyConnectsBothPoolsLive() throws Exception {
-        // The headline use case: one connect-string vocabulary carrying BOTH
+        // The headline use case: one cluster connect-string carrying BOTH
         // ingress-only keys (auto_flush_rows, sender_id) and egress-only keys
-        // (compression, max_batch_rows, target, failover) drives both LIVE
-        // clients through the facade -- each side applies the keys it owns and
-        // silently ignores the rest. Other tests cover this validate-only
-        // (min=0) or on a single side; this one pre-warms min=1 so both pools
-        // actually connect.
-        //
-        // The mock serves ingest (ACK) and query (SERVER_INFO) semantics on
-        // separate sockets, so ingest and query connect to separate servers. A
-        // single ws:: address serving both is exercised end-to-end against a
-        // real server in the parent repo.
-        try (TestWebSocketServer ingest = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-        });
-             TestWebSocketServer query = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-             })) {
-            ingest.start();
-            query.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
-            query.start();
-            Assert.assertTrue(ingest.awaitStart(5, TimeUnit.SECONDS));
-            Assert.assertTrue(query.awaitStart(5, TimeUnit.SECONDS));
+        // (compression, max_batch_rows, target, failover) drives both LIVE pools
+        // -- each side applies the keys it owns and silently ignores the rest.
+        // One mock server serves both: an ACK stream on the ingest write path and
+        // a SERVER_INFO frame on the egress read path (the read path is gated so
+        // the ingest connection's ACK stream is never disturbed).
+        try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        })) {
+            server.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            // Identical vocabulary on both sides, differing only in addr -- the
-            // same mixed key set a single-string connect() would hand to both
-            // clients. The pool keys carry the same value on both sides, so the
-            // builder's cross-string conflict check passes.
-            String shared = "auto_flush_rows=100;sender_id=probe-1;"                          // ingress-only
-                    + "compression=auto;max_batch_rows=512;target=any;failover=off;"          // egress-only
-                    + "auth_timeout_ms=2000;"                                                 // COMMON
+            // A single cluster config carrying the mixed key set. The pools
+            // pre-warm min=1, so the shared vocabulary connects a live sender AND
+            // a live query client, not merely validates.
+            String cfg = "ws::addr=localhost:" + server.getPort() + ";"
+                    + "auto_flush_rows=100;sender_id=probe-1;"                          // ingress-only
+                    + "compression=auto;max_batch_rows=512;target=any;failover=off;"    // egress-only
+                    + "auth_timeout_ms=2000;"                                           // common
                     + "sender_pool_min=1;sender_pool_max=2;query_pool_min=1;query_pool_max=2;"; // pool
-            try (QuestDB db = QuestDB.builder()
-                    .ingestConfig("ws::addr=localhost:" + ingest.getPort() + ";" + shared)
-                    .queryConfig("ws::addr=localhost:" + query.getPort() + ";" + shared)
-                    .build()) {
-                // build() returned, so both pools pre-warmed their min=1 slot:
-                // the shared vocabulary connected a live sender AND a live query
-                // client, not merely validated.
+            try (QuestDB db = QuestDB.builder().fromConfig(cfg).build()) {
                 Assert.assertNotNull(db.borrowSender());
                 Assert.assertNotNull(db.query());
             }
@@ -351,8 +226,8 @@ public class QuestDBBuilderTest {
 
     @Test
     public void testSharedWsConfigWithPoolKeys() {
-        // A shared ws:: string carries pool keys; min=0 so build does only
-        // parse-only validation (no connect).
+        // A cluster ws:: string carries pool keys for both pools; min=0 so build
+        // does only parse-only validation (no connect).
         try (QuestDB ignored = QuestDB.builder()
                 .fromConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=3;"
                         + "query_pool_min=0;query_pool_max=2;acquire_timeout_ms=1234;")
@@ -361,41 +236,13 @@ public class QuestDBBuilderTest {
         }
     }
 
-    @Test
-    public void testTcpIngestConfigRejected() {
-        assertSchemaRejected(() -> QuestDB.builder().ingestConfig("tcp::addr=h:9009;"));
-    }
-
-    @Test
-    public void testUdpIngestConfigRejected() {
-        assertSchemaRejected(() -> QuestDB.builder().queryConfig("udp::addr=h:9009;"));
-    }
-
-    private static void assertEgressBuildRejected(String query, String expectedFragment) {
+    private static void assertBuildRejected(String config, String expectedFragment) {
         try {
-            QuestDB.builder()
-                    .ingestConfig("ws::addr=127.0.0.1:1;sender_pool_min=0;sender_pool_max=2;")
-                    .queryConfig(query)
-                    .build()
-                    .close();
-            Assert.fail("expected build() to reject the malformed query config: " + query);
+            QuestDB.builder().fromConfig(config).build().close();
+            Assert.fail("expected build() to reject the malformed config: " + config);
         } catch (RuntimeException e) {
-            Assert.assertNotNull(e.getMessage());
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedFragment));
-        }
-    }
-
-    private static void assertIngressBuildRejected(String ingest, String expectedFragment) {
-        try {
-            QuestDB.builder()
-                    .ingestConfig(ingest)
-                    .queryConfig("ws::addr=127.0.0.1:1;query_pool_min=0;query_pool_max=2;")
-                    .build()
-                    .close();
-            Assert.fail("expected build() to reject the malformed ingest config: " + ingest);
-        } catch (RuntimeException e) {
-            // Ingress value errors surface as LineSenderException; both it and the
-            // egress IllegalArgumentException are RuntimeException.
+            // Ingress value errors surface as LineSenderException; egress errors
+            // as IllegalArgumentException -- both are RuntimeException.
             Assert.assertNotNull(e.getMessage());
             Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedFragment));
         }

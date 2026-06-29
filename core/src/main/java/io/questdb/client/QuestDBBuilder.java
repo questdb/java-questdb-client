@@ -35,14 +35,15 @@ import java.util.function.LongConsumer;
 
 /**
  * Builder for {@link QuestDB}. Most callers use {@link QuestDB#connect(CharSequence)};
- * this builder is for pool sizing, idle/lifetime knobs, acquire timeout,
- * and the case where ingest and egress configs differ.
+ * this builder adds pool sizing, idle/lifetime knobs, the acquire timeout, the
+ * ingest callbacks, and write-only mode.
  * <p>
- * Both configs must use the {@code ws} or {@code wss} schema (QWP over
- * WebSocket). A pool key (e.g. {@code sender_pool_min}) may be carried in the
- * connect string or set with an explicit builder call; an explicit call always
- * wins. When both connect strings carry the same pool key with different values,
- * {@link #build()} fails.
+ * One configuration string describes the whole QuestDB cluster (see
+ * {@link #fromConfig}): list every node in a single {@code addr} server list and
+ * both the ingest and query pools connect across it. The schema must be
+ * {@code ws} or {@code wss} (QWP over WebSocket). A pool key (e.g.
+ * {@code sender_pool_min}) may be carried in the connect string or set with an
+ * explicit builder call; an explicit call always wins.
  */
 public final class QuestDBBuilder {
 
@@ -64,10 +65,9 @@ public final class QuestDBBuilder {
     private SenderConnectionListener connectionListener;
     private SenderErrorHandler errorHandler;
     private long housekeeperIntervalMillis = UNSET;
+    private String config;
     private long idleTimeoutMillis = UNSET;
-    private String ingestConfig;
     private long maxLifetimeMillis = UNSET;
-    private String queryConfig;
     private int queryPoolMax = UNSET;
     private int queryPoolMin = UNSET;
     private int senderPoolMax = UNSET;
@@ -157,42 +157,36 @@ public final class QuestDBBuilder {
      * and is delivered once the server acks; until then it stays preserved.
      */
     public QuestDB build() {
-        if (ingestConfig == null) {
-            throw new IllegalStateException("ingest configuration is required; call fromConfig() or ingestConfig()");
+        if (config == null) {
+            throw new IllegalStateException("configuration is required; call fromConfig()");
         }
         if (writeOnly) {
             return buildWriteOnly();
         }
-        if (queryConfig == null) {
-            throw new IllegalStateException("query configuration is required; call fromConfig() or queryConfig()");
-        }
-        ConfigString ingestCs = ConfigString.parse(ingestConfig);
-        ConfigString queryCs = ConfigString.parse(queryConfig);
-        ConfigView ingestView = new ConfigView(ingestCs);
-        ConfigView queryView = new ConfigView(queryCs);
-        // Validate both connect strings exactly as the pools will, but without
-        // connecting. The ingest string runs the full Sender parse plus
-        // validateParameters -- ingress value keys are registry-STRING, so only
-        // the real parse validates their values. The egress string runs the
-        // typed validateConfig. A malformed config therefore fails here even
-        // when a pool min is 0 and nothing connects.
-        Sender.LineSenderBuilder.validateWsConfigString(ingestConfig);
-        QwpQueryClient.validateConfig(queryView, "wss".equals(queryCs.schema()));
+        ConfigString cs = ConfigString.parse(config);
+        ConfigView view = new ConfigView(cs);
+        // Validate the single cluster config exactly as both pools will, but
+        // without connecting: the full Sender parse plus validateParameters
+        // (ingress value keys are registry-STRING, so only the real parse
+        // validates their values), then the typed egress validateConfig. Each
+        // side applies the keys it owns and silently ignores the rest, so one
+        // string drives both. A malformed config therefore fails here even when
+        // a pool min is 0 and nothing connects.
+        Sender.LineSenderBuilder.validateWsConfigString(config);
+        QwpQueryClient.validateConfig(view, "wss".equals(cs.schema()));
 
-        // A view carries no side; getInt/getLong read any key, so the ingest
-        // and query views also serve the POOL reads.
-        resolvePoolInt(senderPoolMin, "sender_pool_min", ingestView, queryView, DEFAULT_POOL_MIN, this::senderPoolMin);
-        resolvePoolInt(senderPoolMax, "sender_pool_max", ingestView, queryView, DEFAULT_POOL_MAX, this::senderPoolMax);
-        resolvePoolInt(queryPoolMin, "query_pool_min", ingestView, queryView, DEFAULT_POOL_MIN, this::queryPoolMin);
-        resolvePoolInt(queryPoolMax, "query_pool_max", ingestView, queryView, DEFAULT_POOL_MAX, this::queryPoolMax);
-        resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", ingestView, queryView, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
-        resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", ingestView, queryView, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
-        resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", ingestView, queryView, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
-        resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", ingestView, queryView, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
+        resolvePoolInt(senderPoolMin, "sender_pool_min", view, DEFAULT_POOL_MIN, this::senderPoolMin);
+        resolvePoolInt(senderPoolMax, "sender_pool_max", view, DEFAULT_POOL_MAX, this::senderPoolMax);
+        resolvePoolInt(queryPoolMin, "query_pool_min", view, DEFAULT_POOL_MIN, this::queryPoolMin);
+        resolvePoolInt(queryPoolMax, "query_pool_max", view, DEFAULT_POOL_MAX, this::queryPoolMax);
+        resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", view, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
+        resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", view, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
+        resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", view, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
+        resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
 
         return new QuestDBImpl(
-                ingestConfig,
-                queryConfig,
+                config,
+                config,
                 senderPoolMin,
                 senderPoolMax,
                 queryPoolMin,
@@ -210,19 +204,17 @@ public final class QuestDBBuilder {
     // knobs from the ingest config alone and constructs a QuestDBImpl with no
     // query pool. Never touches the read side, so a down server cannot fail it.
     private QuestDB buildWriteOnly() {
-        ConfigString ingestCs = ConfigString.parse(ingestConfig);
-        ConfigView ingestView = new ConfigView(ingestCs);
-        Sender.LineSenderBuilder.validateWsConfigString(ingestConfig);
-        // Only the ingest view applies; pass it for both sides so the existing
-        // resolvers (which cross-check ingest vs query) read a single source.
-        resolvePoolInt(senderPoolMin, "sender_pool_min", ingestView, ingestView, DEFAULT_POOL_MIN, this::senderPoolMin);
-        resolvePoolInt(senderPoolMax, "sender_pool_max", ingestView, ingestView, DEFAULT_POOL_MAX, this::senderPoolMax);
-        resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", ingestView, ingestView, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
-        resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", ingestView, ingestView, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
-        resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", ingestView, ingestView, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
-        resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", ingestView, ingestView, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
+        ConfigString cs = ConfigString.parse(config);
+        ConfigView view = new ConfigView(cs);
+        Sender.LineSenderBuilder.validateWsConfigString(config);
+        resolvePoolInt(senderPoolMin, "sender_pool_min", view, DEFAULT_POOL_MIN, this::senderPoolMin);
+        resolvePoolInt(senderPoolMax, "sender_pool_max", view, DEFAULT_POOL_MAX, this::senderPoolMax);
+        resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", view, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
+        resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", view, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
+        resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", view, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
+        resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
         return new QuestDBImpl(
-                ingestConfig,
+                config,
                 senderPoolMin,
                 senderPoolMax,
                 acquireTimeoutMillis,
@@ -235,14 +227,15 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Sets a single configuration string used for both ingest and egress. The
-     * schema must be {@code ws} or {@code wss}.
+     * Sets the single configuration string for the whole QuestDB cluster --
+     * used for both ingest and egress. List every cluster node in one
+     * {@code addr} (comma-separated, or by repeating the key); the ingest and
+     * query pools each connect across that one server list. The schema must be
+     * {@code ws} or {@code wss}.
      */
     public QuestDBBuilder fromConfig(CharSequence configurationString) {
-        requireWebSocketSchema(configurationString, "connection");
-        String s = configurationString.toString();
-        this.ingestConfig = s;
-        this.queryConfig = s;
+        requireWebSocketSchema(configurationString, "cluster");
+        this.config = configurationString.toString();
         return this;
     }
 
@@ -273,16 +266,6 @@ public final class QuestDBBuilder {
     }
 
     /**
-     * Sets the ingest-side configuration. The schema must be {@code ws} or
-     * {@code wss}.
-     */
-    public QuestDBBuilder ingestConfig(CharSequence configurationString) {
-        requireWebSocketSchema(configurationString, "ingest");
-        this.ingestConfig = configurationString.toString();
-        return this;
-    }
-
-    /**
      * Maximum age of a pooled connection before the housekeeper recycles it
      * (next time it is idle). Useful for picking up DNS / load-balancer
      * changes and bounding leaked server state. Defaults to 30 minutes.
@@ -292,16 +275,6 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException("maxLifetimeMillis must be >= 0");
         }
         this.maxLifetimeMillis = millis == 0 ? Long.MAX_VALUE : millis;
-        return this;
-    }
-
-    /**
-     * Sets the query-side configuration. The schema must be {@code ws} or
-     * {@code wss}.
-     */
-    public QuestDBBuilder queryConfig(CharSequence configurationString) {
-        requireWebSocketSchema(configurationString, "query");
-        this.queryConfig = configurationString.toString();
         return this;
     }
 
@@ -406,53 +379,17 @@ public final class QuestDBBuilder {
         }
     }
 
-    private void resolvePoolInt(int current, String key, ConfigView ingest, ConfigView query, int dflt, IntConsumer setter) {
+    private void resolvePoolInt(int current, String key, ConfigView view, int dflt, IntConsumer setter) {
         if (current != UNSET) {
-            return; // explicit builder call wins; skip the conflict check
+            return; // explicit builder call wins
         }
-        boolean inIngest = ingest.has(key);
-        boolean inQuery = query.has(key);
-        int value;
-        if (inIngest && inQuery) {
-            int vi = ingest.getInt(key, UNSET);
-            int vq = query.getInt(key, UNSET);
-            if (vi != vq) {
-                throw new IllegalArgumentException(
-                        "conflicting pool config: " + key + " (ingest=" + vi + ", query=" + vq + ")");
-            }
-            value = vi;
-        } else if (inIngest) {
-            value = ingest.getInt(key, UNSET);
-        } else if (inQuery) {
-            value = query.getInt(key, UNSET);
-        } else {
-            value = dflt;
-        }
-        setter.accept(value);
+        setter.accept(view.has(key) ? view.getInt(key, UNSET) : dflt);
     }
 
-    private void resolvePoolLong(long current, String key, ConfigView ingest, ConfigView query, long dflt, LongConsumer setter) {
+    private void resolvePoolLong(long current, String key, ConfigView view, long dflt, LongConsumer setter) {
         if (current != UNSET) {
-            return; // explicit builder call wins; skip the conflict check
+            return; // explicit builder call wins
         }
-        boolean inIngest = ingest.has(key);
-        boolean inQuery = query.has(key);
-        long value;
-        if (inIngest && inQuery) {
-            long vi = ingest.getLong(key, UNSET);
-            long vq = query.getLong(key, UNSET);
-            if (vi != vq) {
-                throw new IllegalArgumentException(
-                        "conflicting pool config: " + key + " (ingest=" + vi + ", query=" + vq + ")");
-            }
-            value = vi;
-        } else if (inIngest) {
-            value = ingest.getLong(key, UNSET);
-        } else if (inQuery) {
-            value = query.getLong(key, UNSET);
-        } else {
-            value = dflt;
-        }
-        setter.accept(value);
+        setter.accept(view.has(key) ? view.getLong(key, UNSET) : dflt);
     }
 }

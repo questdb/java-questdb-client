@@ -38,10 +38,10 @@ import java.io.Closeable;
  * and the {@link Completion} associated with each query is a field on that
  * cached handle.
  * <p>
- * Configuration: use {@link #connect(CharSequence)} when the same address list
- * and credentials serve both ingest and egress -- the most common case.
- * Use {@link #connect(CharSequence, CharSequence)} or {@link #builder()} when
- * ingest and egress endpoints differ.
+ * Configuration: one {@code ws}/{@code wss} string describes the whole cluster
+ * (a single {@code addr} server list) and both the ingest and query pools
+ * connect across it. Use {@link #connect(CharSequence)} for the common case, or
+ * {@link #builder()} for pool sizing, the ingest callbacks, and write-only mode.
  * <p>
  * Thread safety: instances are safe to share. {@link #borrowSender()} and
  * {@link #query()} may be called concurrently from any thread; the pool
@@ -51,20 +51,21 @@ public interface QuestDB extends Closeable {
 
     /**
      * Builder for advanced configuration (pool sizes, acquisition timeouts,
-     * differing ingest/egress configs).
+     * ingest callbacks, write-only mode).
      */
     static QuestDBBuilder builder() {
         return new QuestDBBuilder();
     }
 
     /**
-     * Connects with a single configuration string used for both ingest and
-     * egress. The schema must be {@code ws} or {@code wss}: QuestDB ingests and
-     * queries over QWP (the QuestDB WebSocket protocol), so one string
-     * configures both clients.
+     * Connects with a single configuration string for the whole QuestDB cluster,
+     * used for both ingest and egress. The schema must be {@code ws} or
+     * {@code wss}: QuestDB ingests and queries over QWP (the QuestDB WebSocket
+     * protocol), so one string configures both clients. List every cluster node
+     * in a single {@code addr} server list and both pools connect across it.
      * <p>
-     * Use {@link #connect(CharSequence, CharSequence)} or {@link #builder()}
-     * when ingest and egress use different addresses or credentials.
+     * Use {@link #builder()} for pool sizing, the ingest callbacks, and
+     * write-only mode.
      *
      * @param configurationString a {@code ws}/{@code wss} config string (see
      *                            {@link Sender#fromConfig} or
@@ -73,22 +74,6 @@ public interface QuestDB extends Closeable {
      */
     static QuestDB connect(CharSequence configurationString) {
         return builder().fromConfig(configurationString).build();
-    }
-
-    /**
-     * Connects with explicit ingest and egress configuration strings.
-     *
-     * @param ingestConfigurationString config for the {@link Sender} pool
-     *                                  ({@link Sender#fromConfig} format)
-     * @param queryConfigurationString  config for the query pool
-     *                                  ({@link io.questdb.client.cutlass.qwp.client.QwpQueryClient#fromConfig} format)
-     * @return a connected QuestDB handle
-     */
-    static QuestDB connect(CharSequence ingestConfigurationString, CharSequence queryConfigurationString) {
-        return builder()
-                .ingestConfig(ingestConfigurationString)
-                .queryConfig(queryConfigurationString)
-                .build();
     }
 
     /**

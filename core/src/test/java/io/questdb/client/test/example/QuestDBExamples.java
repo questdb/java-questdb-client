@@ -44,9 +44,10 @@ import java.util.concurrent.TimeUnit;
 public class QuestDBExamples {
 
     public static void main(String[] args) throws Exception {
-        // 1. Connect with a single configuration string. Both sides run over
-        //    QWP/WebSocket, so one ws:: string configures ingest and egress.
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        // 1. Connect with a single configuration string for the whole cluster.
+        //    Both sides run over QWP/WebSocket, so one ws:: string configures
+        //    ingest and egress; list every node in one addr server list.
+        try (QuestDB db = QuestDB.connect("ws::addr=node1:9000,node2:9000,node3:9000;")) {
             ingestWithBorrowedSender(db);
             ingestWithThreadAffineSender(db);
             queryOneShot(db);
@@ -62,12 +63,11 @@ public class QuestDBExamples {
             db.executeSql("SELECT 1", new PrintingHandler()).await();
         }
 
-        // 3. Custom pool sizing and timeouts via the builder. Use this when
-        //    ingest and egress use separate address lists, or when you need to
-        //    override defaults.
+        // 3. Custom pool sizing and timeouts via the builder. One cluster config
+        //    (a single addr server list) drives both pools; use the builder to
+        //    override pool/timeout defaults.
         try (QuestDB db = QuestDB.builder()
-                .ingestConfig("ws::addr=ingest.cluster:9000;")
-                .queryConfig("ws::addr=read-replica.cluster:9000;")
+                .fromConfig("ws::addr=node1.cluster:9000,node2.cluster:9000;")
                 .senderPoolSize(8)
                 .queryPoolSize(4)
                 .acquireTimeoutMillis(10_000)
