@@ -126,10 +126,7 @@ final class PoolHousekeeper {
                 // thread and stop all future reaping for the life of the handle.
             }
             try {
-                // queryPool is null for a write-only (ingest-only) handle.
-                if (queryPool != null) {
-                    queryPool.reapIdle();
-                }
+                queryPool.reapIdle();
             } catch (Throwable ignored) {
                 // Same rationale as the senderPool guard above: best-effort,
                 // must never propagate, and Throwable (not RuntimeException) so
