@@ -85,8 +85,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * exists, otherwise re-runs the interactive flow. An instance lock serializes calls, so two
  * sign-ins never start at once. A sign-in waiting for the user holds that lock for the device code
  * lifetime (up to 30 minutes), so a concurrent {@link #signIn()} or {@link #clearCache()} blocks
- * behind it - but {@link #getToken()} never waits: it fails fast with an
- * {@link OidcAuthException} so a request/flush path never stalls. To abort a waiting sign-in, call
+ * behind it - but {@link #getToken()} never waits behind an interactive sign-in: it fails fast with an
+ * {@link OidcAuthException} rather than stall a request/flush path (a needed silent refresh still runs,
+ * bounded by {@link Builder#httpTimeoutMillis(int)} plus, with a coordinating {@link TokenStore}, a brief
+ * cross-process lock wait - see {@link #getToken()}). To abort a waiting sign-in, call
  * {@link #close()} from another thread; it signals the flow to stop, which then fails with an
  * {@link OidcAuthException} rather than polling until the device code expires. Cancellation is seen
  * between polls (within ~100ms while waiting out an interval); a poll already in flight is not

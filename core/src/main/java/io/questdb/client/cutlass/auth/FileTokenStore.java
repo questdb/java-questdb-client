@@ -105,6 +105,12 @@ public final class FileTokenStore implements TokenStore {
     // reject a token file larger than this; a real entry is a few KB even with a group-laden id token, so
     // anything past this is corrupt or hostile and is not read into memory
     private static final long MAX_FILE_BYTES = 1 << 20;
+    // upper bound on the configurable lock acquire budget. getToken() can take this lock on the
+    // latency-sensitive flush path, so a caller-supplied budget is kept short: a real peer refresh is
+    // sub-second, and bounding the wait stops a misconfigured budget from stalling a flush before it degrades
+    // to a lock-free refresh (Layer 1 still guards integrity). Stays well below DEFAULT_LOCK_STALE_MILLIS so a
+    // waiter degrades long before it could begin stealing live locks.
+    private static final long MAX_LOCK_ACQUIRE_BUDGET_MILLIS = 30_000L;
     private static final int SCHEMA_VERSION = 1;
     // set once if the platform cannot enforce owner-only POSIX permissions on the token files (e.g. Windows),
     // so the at-rest protection falls back to the directory's inherited ACL; warns the user once
@@ -124,7 +130,9 @@ public final class FileTokenStore implements TokenStore {
      *
      * @param directory               the directory to hold the token files
      * @param lockAcquireBudgetMillis  how long {@code inLock} waits to acquire a peer's lock before degrading
-     *                                 to a lock-free refresh rather than stalling a sign-in
+     *                                 to a lock-free refresh rather than stalling a sign-in. Must be positive
+     *                                 and at most 30_000 (30s): {@code getToken()} can wait it out on the
+     *                                 latency-sensitive flush path, so it is kept short
      * @param lockStaleMillis          a lock older than this is treated as abandoned by a crashed holder and
      *                                 stolen. It MUST exceed the longest a live holder can hold the lock: one
      *                                 refresh under the lock runs send + await + parse plus a body drain, each
@@ -141,6 +149,12 @@ public final class FileTokenStore implements TokenStore {
         }
         if (lockAcquireBudgetMillis <= 0) {
             throw new OidcAuthException("the token store lockAcquireBudgetMillis must be positive");
+        }
+        if (lockAcquireBudgetMillis > MAX_LOCK_ACQUIRE_BUDGET_MILLIS) {
+            // getToken() can wait out this budget on the latency-sensitive flush path, so an unbounded value
+            // would let a misconfiguration stall a flush; keep it short - it degrades to a lock-free refresh
+            throw new OidcAuthException()
+                    .put("the token store lockAcquireBudgetMillis must not exceed ").put(MAX_LOCK_ACQUIRE_BUDGET_MILLIS);
         }
         // a non-positive staleness window makes every freshly created lock look abandoned, so acquirers would
         // steal each other's live locks; keep it well above one refresh round-trip (see the default)

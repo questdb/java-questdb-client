@@ -86,6 +86,53 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testAdvancedConstructorRejectsOverCapAcquireBudget() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            // the acquire budget is capped: getToken() can wait it out on the latency-sensitive flush path, so
+            // an unbounded budget would let a misconfiguration stall a flush; the cap also keeps a waiter
+            // degrading well before it could begin stealing live locks
+            try {
+                new FileTokenStore(dir, 30_001, 600_000);
+                Assert.fail("an over-cap lock acquire budget must be rejected");
+            } catch (OidcAuthException expected) {
+                Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("lockAcquireBudgetMillis"));
+            }
+            // the cap boundary itself is accepted
+            new FileTokenStore(dir, 30_000, 600_000);
+        });
+    }
+
+    @Test
+    public void testAudienceNullVersusEmptyFingerprint() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey nullAud = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid", null, false);
+            TokenStoreKey withAud = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid", "api://billing", false);
+
+            // a null audience round-trips: the writer omits the member, and nullableEquals matches an absent
+            // file value against a null key audience
+            store.save(nullAud, sampleToken("ACCESS-1", "REFRESH-1"));
+            Assert.assertNotNull(store.load(nullAud));
+            byte[] nullAudBytes = Files.readAllBytes(tokenFile(dir, nullAud));
+
+            store.save(withAud, sampleToken("ACCESS-2", "REFRESH-2"));
+            byte[] withAudBytes = Files.readAllBytes(tokenFile(dir, withAud));
+
+            // place each file under the *other* key's name to isolate the in-file audience fingerprint check
+            // from the hash-based file naming: a recorded audience must not match a null-audience key, and an
+            // absent audience must not match an audience-bearing key
+            Files.write(tokenFile(dir, nullAud), withAudBytes);
+            Assert.assertNull("a recorded audience must not match a null-audience key", store.load(nullAud));
+            Files.write(tokenFile(dir, withAud), nullAudBytes);
+            Assert.assertNull("an absent audience must not match an audience-bearing key", store.load(withAud));
+        });
+    }
+
+    @Test
     public void testClearDeletesFile() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -99,6 +146,26 @@ public class FileTokenStoreTest {
             Assert.assertNull(store.load(key));
             // clearing a missing entry is a no-op, not an error
             store.clear(key);
+        });
+    }
+
+    @Test
+    public void testControlCharactersRoundTrip() throws Exception {
+        assertMemoryLeak(() -> {
+            FileTokenStore store = new FileTokenStore(storeDir());
+            TokenStoreKey key = sampleKey();
+            // a refresh token carrying every control-escape branch of the JSON writer - the short escapes
+            // (\b \f \n \r \t) and the \\u00XX arm - plus a quote and a backslash must round-trip byte for byte;
+            // the served-token char check lives in OidcDeviceAuth, so the store itself must preserve these
+            String refresh = "R\b\f\n\r\t\"\\Z";
+            // also exercise the hex-escape branch: control chars below 0x20 that are not one of the short escapes
+            refresh = refresh + (char) 0x01 + (char) 0x1f;
+            store.save(key, new PersistedToken("ACCESS-1", null, refresh, 1L, 1000L));
+
+            PersistedToken loaded = store.load(key);
+            Assert.assertNotNull(loaded);
+            Assert.assertEquals("ACCESS-1", loaded.getAccessToken());
+            Assert.assertEquals(refresh, loaded.getRefreshToken());
         });
     }
 
@@ -160,6 +227,34 @@ public class FileTokenStoreTest {
             // the file exists under other.hash(), but its in-file fingerprint says client_id=questdb, so the
             // load for `other` must reject it rather than serve questdb's token
             Assert.assertNull(store.load(other));
+        });
+    }
+
+    @Test
+    public void testHashMatchesFrozenCrossLanguageContract() throws Exception {
+        assertMemoryLeak(() -> {
+            // the file name is a frozen cross-language contract (the Python client mirrors it byte for byte):
+            // lowercase-hex SHA-256 of "questdb-oidc-token-v1" and the six identity fields, NUL-separated, a
+            // null audience rendered as "" and groups_in_token as '1'/'0'. Pin it to golden values so a change
+            // to the prefix, separator, field order, or null/boolean encoding that would silently stop two
+            // clients sharing one file is caught here.
+            TokenStoreKey withAudience = new TokenStoreKey("questdb",
+                    "https://idp.example.com:443/as/token", "https://idp.example.com:443/as/device",
+                    "openid", "api://billing", false);
+            Assert.assertEquals("eee1a742a27499d176bcdaed8635c14a3edbdef1d68b61c05c3c2158a5bfbcca", withAudience.hash());
+
+            // a null audience hashes as an empty field, not the literal "null"
+            TokenStoreKey nullAudience = new TokenStoreKey("questdb",
+                    "https://idp.example.com:443/as/token", "https://idp.example.com:443/as/device",
+                    "openid", null, false);
+            Assert.assertEquals("1dca0e8192ae529b94c1ac5493f09f8a45e641e4e0ec316333c0cbfeeccfef0e", nullAudience.hash());
+
+            // groups_in_token participates in the identity, so it flips the hash to a different file
+            TokenStoreKey groups = new TokenStoreKey("questdb",
+                    "https://idp.example.com:443/as/token", "https://idp.example.com:443/as/device",
+                    "openid", "api://billing", true);
+            Assert.assertEquals("5193f668130b28cd9430f5271011f1044b3b1c1e78bfc4f45d7688a3d9b1ceb0", groups.hash());
+            Assert.assertNotEquals(withAudience.hash(), groups.hash());
         });
     }
 
@@ -341,6 +436,29 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testLockFilePermissionsOwnerOnly() throws Exception {
+        Assume.assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            // the lock file is created owner-only too: it briefly records pid@host and sits beside the 0600
+            // token file, so it must not widen the directory's exposure. Assert while the lock is held; inLock
+            // deletes it on return and propagates a thrown AssertionError after releasing it.
+            store.inLock(key, () -> {
+                try {
+                    Assert.assertEquals("the lock file must be owner-only (0600)",
+                            PosixFilePermissions.fromString("rw-------"), Files.getPosixFilePermissions(lock));
+                } catch (java.io.IOException e) {
+                    throw new AssertionError(e);
+                }
+                return true;
+            });
+        });
+    }
+
+    @Test
     public void testNoLeftoverTempFileAfterSave() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -377,6 +495,39 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testPerFieldFingerprintMismatchReturnsNull() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey saved = sampleKey();
+            store.save(saved, sampleToken("ACCESS-1", "REFRESH-1"));
+            byte[] bytes = Files.readAllBytes(tokenFile(dir, saved));
+
+            // each key differs from the saved fingerprint in exactly one field; writing the saved bytes under
+            // the differing key's file name isolates the in-file fingerprint re-check (the file is found, but
+            // its recorded identity does not match), so a hash collision or a copied file never serves another
+            // identity's token. groups_in_token (id-token vs access-token credential) and audience (the
+            // distinct nullableEquals path) are the riskiest fields.
+            TokenStoreKey[] mismatches = {
+                    new TokenStoreKey("questdb", "https://idp.example.com:443/OTHER-token",
+                            "https://idp.example.com:443/device", "openid", null, false),
+                    new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                            "https://idp.example.com:443/OTHER-device", "openid", null, false),
+                    new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                            "https://idp.example.com:443/device", "openid groups", null, false),
+                    new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                            "https://idp.example.com:443/device", "openid", "api://other", false),
+                    new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                            "https://idp.example.com:443/device", "openid", null, true),
+            };
+            for (TokenStoreKey other : mismatches) {
+                Files.write(tokenFile(dir, other), bytes);
+                Assert.assertNull("a fingerprint mismatch must be rejected: " + other.hash(), store.load(other));
+            }
+        });
+    }
+
+    @Test
     public void testPermissionsOwnerOnly() throws Exception {
         Assume.assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
         assertMemoryLeak(() -> {
@@ -406,6 +557,31 @@ public class FileTokenStoreTest {
             Assert.assertEquals("REFRESH-1", loaded.getRefreshToken());
             Assert.assertEquals(1_730_000_000_000L, loaded.getExpiresAtMillis());
             Assert.assertEquals(300_000L, loaded.getTokenTtlMillis());
+        });
+    }
+
+    @Test
+    public void testSchemaVersionMismatchReturnsNull() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            Files.createDirectories(dir);
+            // a future schema version with an otherwise-matching fingerprint must be ignored, not served: the
+            // version is the forward-compat guard the frozen cross-language contract rests on
+            String v2 = "{\"v\":2,\"client_id\":\"questdb\","
+                    + "\"token_endpoint\":\"https://idp.example.com:443/token\","
+                    + "\"device_authorization_endpoint\":\"https://idp.example.com:443/device\","
+                    + "\"scope\":\"openid\",\"groups_in_token\":false,"
+                    + "\"access_token\":\"ACCESS-1\",\"refresh_token\":\"REFRESH-1\","
+                    + "\"expires_at_millis\":1730000000000,\"token_ttl_millis\":300000}";
+            Files.write(tokenFile(dir, key), v2.getBytes(StandardCharsets.UTF_8));
+            Assert.assertNull("a future schema version must be rejected", store.load(key));
+
+            // sanity: the identical body at the live version IS accepted, proving the rejection is the version
+            // and not a malformed document
+            Files.write(tokenFile(dir, key), v2.replace("\"v\":2", "\"v\":1").getBytes(StandardCharsets.UTF_8));
+            Assert.assertNotNull("the same body at the live schema version must load", store.load(key));
         });
     }
 

@@ -36,8 +36,10 @@ import io.questdb.client.std.Chars;
  * <p>
  * {@link #getToken()} runs on the sender's flush and reconnect paths: it must return promptly and must
  * not block on interactive input. A quick silent token refresh is fine, but it must not start an
- * interactive sign-in. An exception from {@link #getToken()} fails the in-flight flush (HTTP) or the
- * connection attempt (WebSocket).
+ * interactive sign-in; a provider that coordinates a shared token store across processes (for example
+ * {@code OidcDeviceAuth} with a {@code FileTokenStore}) may add a brief, bounded wait to acquire that
+ * store's cross-process lock before such a refresh, which still counts as a quick silent refresh. An
+ * exception from {@link #getToken()} fails the in-flight flush (HTTP) or the connection attempt (WebSocket).
  *
  * @see Sender.LineSenderBuilder#httpTokenProvider(HttpTokenProvider)
  */

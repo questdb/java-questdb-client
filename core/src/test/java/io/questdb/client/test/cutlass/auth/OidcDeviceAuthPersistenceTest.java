@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.auth;
 
 import io.questdb.client.cutlass.auth.FileTokenStore;
+import io.questdb.client.cutlass.auth.OidcAuthException;
 import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 import io.questdb.client.cutlass.auth.PersistedToken;
 import io.questdb.client.cutlass.auth.TokenStore;
@@ -56,6 +57,30 @@ public class OidcDeviceAuthPersistenceTest {
     public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
 
     @Test(timeout = 30_000)
+    public void testBuilderRejectsHttpTimeoutAboveCap() throws Exception {
+        assertMemoryLeak(() -> {
+            // the HTTP timeout is capped (120s): a token-endpoint round-trip never needs longer, and bounding
+            // it keeps a refresh held under the FileTokenStore cross-process lock safely shorter than that
+            // store's staleness window, so a slow refresh's live lock is not stolen by a peer. Above the cap is
+            // rejected; the boundary value builds.
+            try {
+                OidcDeviceAuth.builder().httpTimeoutMillis(120_001);
+                Assert.fail("a httpTimeoutMillis above the cap must be rejected");
+            } catch (OidcAuthException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("httpTimeoutMillis"));
+            }
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                    .clientId("questdb")
+                    .deviceAuthorizationEndpoint("https://idp.example/device")
+                    .tokenEndpoint("https://idp.example/token")
+                    .httpTimeoutMillis(120_000)
+                    .build()) {
+                // building at the cap boundary succeeds
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testClearCacheDeletesPersistedEntry() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();
@@ -85,6 +110,41 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testClearCacheDoesNotReloadStaleEntry() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-NEW", null, "REFRESH-NEW", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // load() keeps returning a valid entry even after clear() (loadReturns is not cleared); this
+                // proves clearCache() does not re-read the store - it relies on storeLoadAttempted, not on the
+                // store having actually forgotten the entry - so a fresh device flow runs rather than re-adopting
+                fake.loadReturns = new PersistedToken("ACCESS-OLD", null, "REFRESH-OLD",
+                        System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("ACCESS-OLD", auth.signIn());
+                    int loadsAfterFirst = fake.loads.get();
+
+                    auth.clearCache();
+                    Assert.assertEquals("clearCache must clear the persisted entry exactly once", 1, fake.clears.get());
+
+                    // even though load() would still hand back ACCESS-OLD, clearCache must not let it be reloaded
+                    Assert.assertEquals("ACCESS-NEW", auth.signIn());
+                    Assert.assertEquals("clearCache must not trigger a re-read of the store",
+                            loadsAfterFirst, fake.loads.get());
+                    Assert.assertEquals("a cleared cache must re-run the device flow", 1, device.get());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testGetTokenAsFirstCallAfterRestore() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();
@@ -100,6 +160,33 @@ public class OidcDeviceAuthPersistenceTest {
                 }
                 Assert.assertEquals(0, device.get());
                 Assert.assertEquals(0, token.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testGetTokenDegradesWhenStoreLockHeld() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-1", "REFRESH-1", "ACCESS-2", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                Path dir = storeDir();
+                // a small acquire budget so the test does not wait the 3s default; a large staleness window so
+                // the pre-created lock is treated as a live peer's and not stolen
+                new FileTokenStore(dir, 200, 600_000).save(keyFor(server),
+                        new PersistedToken("OLD-ACCESS", null, "REFRESH-1", System.currentTimeMillis() - 60_000, 300_000));
+                // a peer holds the per-identity lock: getToken() must wait out only its short acquire budget,
+                // then degrade to a lock-free refresh rather than stall the flush path or fail
+                Files.createFile(dir.resolve(keyFor(server).hash() + ".lock"));
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(new FileTokenStore(dir, 200, 600_000)).build()) {
+                    long start = System.currentTimeMillis();
+                    Assert.assertEquals("ACCESS-2", auth.getToken());
+                    long elapsed = System.currentTimeMillis() - start;
+                    Assert.assertTrue("getToken must degrade promptly, not stall, was " + elapsed, elapsed < 10_000);
+                }
+                Assert.assertEquals("device flow must not run; getToken degrades to a lock-free refresh", 0, device.get());
+                Assert.assertTrue("the refresh must hit the token endpoint", token.get() >= 1);
             }
         });
     }
@@ -261,6 +348,7 @@ public class OidcDeviceAuthPersistenceTest {
                     Assert.assertEquals("ACCESS-2", auth.signIn());
                 }
                 Assert.assertEquals(0, device.get());
+                Assert.assertEquals("the coordinated refresh must run through the store's cross-process lock", 1, fake.locks.get());
                 Assert.assertEquals("a rotated refresh token must be persisted", 1, fake.saves.get());
                 Assert.assertEquals("REFRESH-2", fake.stored.getRefreshToken());
             }
@@ -332,6 +420,31 @@ public class OidcDeviceAuthPersistenceTest {
                     Assert.assertEquals("ACCESS-3", auth.signIn());
                 }
                 Assert.assertEquals("a swallowed save must not force the device flow on the next refresh", 0, device.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testStoreLoadedAtMostOncePerInstance() throws Exception {
+        assertMemoryLeak(() -> {
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // a valid persisted token, so every getToken()/signIn() is a cache hit
+                fake.loadReturns = new PersistedToken("ACCESS-1", null, "REFRESH-1",
+                        System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    auth.getToken();
+                    auth.signIn();
+                    auth.getToken();
+                    Assert.assertEquals("the store must be read at most once per instance, not on every call",
+                            1, fake.loads.get());
+                }
             }
         });
     }
