@@ -481,6 +481,31 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testTamperedFarPastExpiryIsNotServedAsValid() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-FRESH", "REFRESH-FRESH", "ACCESS-2", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // a tampered entry claims an absurd, far-PAST expiry near Long.MIN_VALUE. adopt() clamps the
+                // expiry to [0, now + maxLife]; flooring at 0 is what keeps the validity check
+                // (now < expiresAtMillis - skew) underflow-safe - without the floor a near-Long.MIN_VALUE
+                // expiry wraps that subtraction to a huge positive and would serve the garbage-expiry token as
+                // valid forever. It must instead read as expired and fall back to a silent refresh.
+                fake.loadReturns = new PersistedToken("ACCESS-1", null, "REFRESH-1", Long.MIN_VALUE, Long.MIN_VALUE);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    String result = auth.signIn();
+                    Assert.assertEquals("a far-past expiry must not be served; the refresh token supplies a fresh one", "ACCESS-2", result);
+                    Assert.assertNotEquals("a garbage-expiry token must never be served as valid", "ACCESS-1", result);
+                }
+                Assert.assertEquals("a valid refresh token needs no device flow", 0, device.get());
+                Assert.assertTrue("the expired persisted token must trigger a token-endpoint refresh", token.get() >= 1);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTamperedFileWithCrlfTokenFallsBackToDeviceFlow() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();

@@ -52,6 +52,7 @@ import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * The default {@link TokenStore}: one plaintext JSON file per identity under a directory, with the
@@ -199,26 +200,25 @@ public final class FileTokenStore implements TokenStore {
     @Override
     public boolean inLock(TokenStoreKey key, CriticalSection action) {
         Path lock = null;
-        boolean held;
+        // the unique owner nonce stamped into the lock when we acquired it, or null if we did not (or could
+        // not) acquire one and are running lock-free; releaseLock deletes the lock only when it still carries
+        // this nonce, so we never delete a lock a peer has since stolen
+        String nonce = null;
         try {
             ensureDirectory();
             lock = lockFile(key);
-            held = acquireLock(lock);
+            nonce = acquireLock(lock);
         } catch (IOException e) {
             // could not prepare the lock directory or file; run without the lock. Layer-1 atomic
             // replacement still keeps every reader consistent - only a rotating-refresh-token race across
             // processes is left unguarded for this one refresh.
-            held = false;
+            nonce = null;
         }
         try {
             return action.run();
         } finally {
-            if (held) {
-                try {
-                    Files.deleteIfExists(lock);
-                } catch (IOException ignore) {
-                    // best-effort release; a leftover lock goes stale and the next acquirer steals it
-                }
+            if (nonce != null) {
+                releaseLock(lock, nonce);
             }
         }
     }
@@ -279,6 +279,15 @@ public final class FileTokenStore implements TokenStore {
             warnNoPosixPermsOnce();
             Files.createFile(lock);
         }
+    }
+
+    private static String newLockNonce() {
+        // a per-acquisition owner stamp: the pid@host and the acquire time are human-readable debugging aids,
+        // and the random UUID guarantees two acquisitions never share a stamp even within one pid and one
+        // millisecond, so releaseLock's ownership check is exact rather than probabilistic
+        return ManagementFactory.getRuntimeMXBean().getName() // typically pid@host
+                + ' ' + System.currentTimeMillis()
+                + ' ' + UUID.randomUUID();
     }
 
     private static boolean nullableEquals(String keyValue, StringSink fileValue) {
@@ -402,6 +411,27 @@ public final class FileTokenStore implements TokenStore {
         putString(sink, value);
     }
 
+    private static void releaseLock(Path lock, String nonce) {
+        // release our own lock only: re-read it and delete it solely when it still carries our nonce. A hold
+        // that outran lockStaleMillis may have been judged stale and stolen (deleted and recreated) by a peer;
+        // deleting by bare path would then remove the peer's live lock and admit a third acquirer alongside it,
+        // defeating the mutual exclusion this lock exists to provide. A microscopic window remains if a steal
+        // lands between the read and the delete, but that is bounded to one syscall gap rather than the whole
+        // hold, so a misconfigured staleness window degrades to at most the documented double-refresh rather
+        // than corrupting a peer's lock state.
+        try {
+            byte[] content = Files.readAllBytes(lock);
+            if (nonce.equals(new String(content, StandardCharsets.UTF_8))) {
+                Files.deleteIfExists(lock);
+            }
+            // otherwise a peer now owns this lock file; leave it for that owner (or staleness) to reclaim
+        } catch (NoSuchFileException e) {
+            // already gone (stolen and not yet recreated, or removed elsewhere); nothing to release
+        } catch (IOException ignore) {
+            // best-effort release; a leftover lock goes stale and the next acquirer steals it
+        }
+    }
+
     private static void restrictToOwner(Path directory) {
         // best-effort: the at-rest protection of the plaintext token files is exactly these owner-only
         // directory permissions, so tighten a pre-existing directory rather than trust whatever it had. On a
@@ -467,25 +497,40 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
-    private static void writeLockHolder(Path lock) {
-        // record the holder (pid@host) and a creation timestamp for debugging only; never fail acquisition
-        // over it. Staleness is judged by the file's mtime, not by parsing this content
+    private static boolean writeLockHolder(Path lock, String nonce) {
+        // stamp the lock with the owner nonce. Unlike the staleness mtime (which only needs to be recent),
+        // this content is what releaseLock checks before deleting, so it must be written reliably; report a
+        // failure so acquireLock drops an unverifiable lock rather than hold one it cannot safely release.
+        // Writing also refreshes the mtime, which is what isStale reads
         try {
-            String holder = ManagementFactory.getRuntimeMXBean().getName() // typically pid@host
-                    + ' ' + System.currentTimeMillis();
-            Files.write(lock, holder.getBytes(StandardCharsets.UTF_8), StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
-        } catch (Exception ignore) {
-            // best-effort metadata only
+            Files.write(lock, nonce.getBytes(StandardCharsets.UTF_8), StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+            return true;
+        } catch (Exception e) {
+            return false;
         }
     }
 
-    private boolean acquireLock(Path lock) {
+    private String acquireLock(Path lock) {
+        // returns the unique owner nonce stamped into the lock on success, or null if it could not be acquired
+        // within the budget. releaseLock uses the nonce to verify ownership before deleting, so a hold that
+        // outran lockStaleMillis (and was stolen by a peer) never deletes the peer's lock on release
+        final String nonce = newLockNonce();
         final long deadline = System.currentTimeMillis() + lockAcquireBudgetMillis;
         while (true) {
             try {
                 createLockFile(lock);
-                writeLockHolder(lock);
-                return true;
+                if (writeLockHolder(lock, nonce)) {
+                    return nonce;
+                }
+                // the exclusive create won the lock but the owner nonce could not be stamped, so releaseLock
+                // could not later prove ownership and would risk deleting a peer's lock; drop the file we just
+                // created and degrade to a lock-free refresh rather than hold an unverifiable lock
+                try {
+                    Files.deleteIfExists(lock);
+                } catch (IOException ignore) {
+                    // another acquirer may have removed it; the next createLockFile settles the race
+                }
+                return null;
             } catch (FileAlreadyExistsException e) {
                 if (isStale(lock)) {
                     // a crashed holder left the lock behind; steal it
@@ -498,11 +543,11 @@ public final class FileTokenStore implements TokenStore {
                     // between several acquirers (or a misconfigured tiny lockStaleMillis) must not hot-spin
                 }
                 if (System.currentTimeMillis() >= deadline) {
-                    return false; // give up and run without the lock rather than stall a sign-in
+                    return null; // give up and run without the lock rather than stall a sign-in
                 }
                 Os.sleep(LOCK_POLL_SLICE_MILLIS);
             } catch (IOException e) {
-                return false; // unexpected IO; degrade to no lock
+                return null; // unexpected IO; degrade to no lock
             }
         }
     }

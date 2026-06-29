@@ -343,6 +343,37 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testInLockReleaseDoesNotDeleteAStolenLock() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            // a tiny staleness window so our own in-progress hold is judged stale and a peer can steal it
+            FileTokenStore store = new FileTokenStore(dir, 1000, 50);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+
+            // our critical section outlives the 50ms staleness window; while we are still inside it, a peer
+            // process judges our lock stale, steals it (deletes and recreates) and writes its own owner stamp.
+            // releaseLock must verify ownership and leave the peer's live lock intact, not delete it by bare
+            // path - otherwise a third acquirer could enter alongside the peer, defeating mutual exclusion.
+            store.inLock(key, () -> {
+                Os.sleep(120);
+                try {
+                    Files.deleteIfExists(lock);
+                    Files.write(lock, "peer-owner-stamp".getBytes(StandardCharsets.UTF_8));
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+                return true;
+            });
+
+            Assert.assertTrue("releaseLock must not delete a lock a peer has stolen", Files.exists(lock));
+            Assert.assertEquals("the peer's lock content must survive our release",
+                    "peer-owner-stamp", new String(Files.readAllBytes(lock), StandardCharsets.UTF_8));
+        });
+    }
+
+    @Test
     public void testInLockReleasesLockWhenActionThrows() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -543,6 +574,37 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testSaveFailureLeavesNoTempFileAndThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            // make the atomic rename fail: the target path already exists as a NON-EMPTY directory, which a
+            // file-over-directory replace cannot overwrite, driving save() down its IOException path
+            Path target = tokenFile(dir, key);
+            Files.createDirectories(target);
+            Files.createFile(target.resolve("blocker"));
+
+            try {
+                store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+                Assert.fail("save must throw when it cannot replace the target");
+            } catch (OidcAuthException expected) {
+                // the write-temp / flush / atomic-rename protocol must surface a wrapped failure, never a raw
+                // IOException, and never a half-written credential
+            }
+
+            // the temp file is the durability point of the protocol; a failed save must clean it up rather than
+            // leave a *.tmp credential fragment behind
+            boolean hasTmp;
+            try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(dir, "*.tmp")) {
+                hasTmp = entries.iterator().hasNext();
+            }
+            Assert.assertFalse("a failed save must not leave a *.tmp file behind", hasTmp);
+        });
+    }
+
+    @Test
     public void testSaveThenLoadRoundTrip() throws Exception {
         assertMemoryLeak(() -> {
             FileTokenStore store = new FileTokenStore(storeDir());
@@ -601,6 +663,22 @@ public class FileTokenStoreTest {
             Assert.assertNull(loaded.getIdToken());
             Assert.assertEquals("REFRESH-\t-1", loaded.getRefreshToken());
             Assert.assertEquals(42L, loaded.getExpiresAtMillis());
+        });
+    }
+
+    @Test
+    public void testTruncatedJsonReturnsNull() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            // a crash mid-write on a filesystem without atomic rename, or a torn read, can leave a valid JSON
+            // prefix cut off before the closing brace. parseLast() must reject the truncated document rather
+            // than serve a half-parsed credential
+            Files.write(tokenFile(dir, key),
+                    "{\"v\":1,\"client_id\":\"questdb\"".getBytes(StandardCharsets.UTF_8));
+            Assert.assertNull("a truncated-but-prefix-valid file must be ignored", store.load(key));
         });
     }
 

@@ -1031,11 +1031,15 @@ public class OidcDeviceAuth implements QuietCloseable {
         refreshToken = token.getRefreshToken();
         // the file is attacker-writable (and may have been written under a skewed clock), so bound how long
         // the loaded token is trusted exactly as storeTokens() bounds a token from the wire: never past
-        // MAX_EXPIRES_IN_SECONDS from now. Capping (not flooring) the expiry preserves an already-expired
-        // entry, so a stale access token still falls through to a refresh rather than being served forever.
+        // MAX_EXPIRES_IN_SECONDS from now. Clamp the expiry to [0, now + maxLife]: the ceiling stops a tampered
+        // far-future expiry from being trusted for decades, and the floor of 0 keeps a tampered far-past expiry
+        // in the past (1970, well before now) while keeping the validity check (now < expiresAtMillis - skew)
+        // underflow-safe - a near-Long.MIN_VALUE expiry would otherwise wrap that subtraction to a huge
+        // positive and serve a garbage-expiry token as valid forever. An already-expired entry still reads as
+        // expired and falls through to a refresh rather than being served.
         long maxTokenLifeMillis = MAX_EXPIRES_IN_SECONDS * 1000L;
         tokenTtlMillis = Math.max(0L, Math.min(token.getTokenTtlMillis(), maxTokenLifeMillis));
-        expiresAtMillis = Math.min(token.getExpiresAtMillis(), System.currentTimeMillis() + maxTokenLifeMillis);
+        expiresAtMillis = Math.max(0L, Math.min(token.getExpiresAtMillis(), System.currentTimeMillis() + maxTokenLifeMillis));
         // it is already on disk, so a later non-rotating refresh must not rewrite the file
         lastPersistedRefreshToken = refreshToken;
         return true;

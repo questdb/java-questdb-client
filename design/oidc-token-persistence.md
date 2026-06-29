@@ -369,16 +369,24 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   `Files.createFile`, Python `os.open(..., O_CREAT|O_EXCL)` / `open(p,"x")`) is a plain
   filesystem primitive that interoperates trivially. The contract mandates the lock-file
   scheme; OS advisory locks are out.
-- **Lock file:** `<hex>.lock` beside the token file, containing the holder's
-  `pid@host` and a creation timestamp for debugging. Acquire by exclusive-create; on
-  contention, spin with short backoff up to a small acquire budget (~3s); if it still
-  cannot be acquired, **proceed without it** (degrade to Layer 1) rather than fail a
-  sign-in. A lock older than a staleness timeout (10 minutes) is treated as abandoned
-  and stolen, so a crashed holder cannot wedge others. The window must dominate the
-  worst-case time a live holder can hold the lock: the refresh under the lock runs
-  send + await + parse, plus a body drain on a parse failure, each separately bounded by
-  the HTTP timeout (capped at 120s), so up to ~4×120s = ~480s — never the interactive
-  wait, which is not held under the lock. 10 minutes stays safely above that ~480s.
+- **Lock file:** `<hex>.lock` beside the token file, containing a unique per-acquisition
+  owner stamp — the holder's `pid@host`, a creation timestamp, and a random nonce.
+  Acquire by exclusive-create; on contention, spin with short backoff up to a small
+  acquire budget (~3s); if it still cannot be acquired, **proceed without it** (degrade to
+  Layer 1) rather than fail a sign-in. A lock older than a staleness timeout (10 minutes)
+  is treated as abandoned and stolen, so a crashed holder cannot wedge others. The window
+  must dominate the worst-case time a live holder can hold the lock: the refresh under the
+  lock runs send + await + parse, plus a body drain on a parse failure, each separately
+  bounded by the HTTP timeout (capped at 120s), so up to ~4×120s = ~480s — never the
+  interactive wait, which is not held under the lock. 10 minutes stays safely above that
+  ~480s.
+- **Release verifies ownership.** A holder releases by re-reading the lock and deleting it
+  **only when it still carries that holder's own owner stamp**, never by bare path. Should
+  a hold ever outrun the staleness window and be stolen and recreated by a peer, the
+  original holder must not delete the peer's live lock on release (which would admit a
+  third acquirer alongside the peer and break mutual exclusion). Each implementation
+  checks only its own stamp; it never has to parse another implementation's stamp, so the
+  random nonce keeps the check exact without coupling the language clients.
 - **Protocol (under the existing in-process `ReentrantLock`, only when a refresh is
   needed):**
   1. acquire `<hex>.lock`;
@@ -387,7 +395,7 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
      `validateTokenChars`) and **skip the network**;
   4. else POST the refresh with the current refresh token; `storeTokens()` writes the
      new token atomically *inside* the lock;
-  5. release (delete `<hex>.lock`).
+  5. release (delete `<hex>.lock` only if it still carries our own owner stamp).
 
   The interactive device flow does **not** hold the lock file (coordinating human prompts
   across processes is overkill and would hold a cross-process lock for up to 30 min); two
