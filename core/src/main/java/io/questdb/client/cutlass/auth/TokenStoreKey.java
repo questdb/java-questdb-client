@@ -70,13 +70,24 @@ public final class TokenStoreKey {
             String audience,
             boolean groupsInToken
     ) {
+        // the identity fields are required; reject a null up front with a clear error rather than letting it
+        // surface later as a raw NullPointerException deep inside a TokenStore's serialize/fingerprint path
+        // the identity fields are required; reject a null up front with a clear error rather than letting it
+        // surface later as a raw NullPointerException deep inside a TokenStore's serialize/fingerprint path
+        if (clientId == null || tokenEndpoint == null || deviceAuthorizationEndpoint == null || scope == null) {
+            throw new OidcAuthException(
+                    "clientId, tokenEndpoint, deviceAuthorizationEndpoint and scope are required for a token store key");
+        }
         this.clientId = clientId;
         this.tokenEndpoint = tokenEndpoint;
         this.deviceAuthorizationEndpoint = deviceAuthorizationEndpoint;
         this.scope = scope;
-        this.audience = audience;
+        // normalise an empty audience to null so getAudience(), hash() (which already folds null and "" together
+        // via nullToEmpty), and a TokenStore's save/load round-trip all agree that an absent audience is null -
+        // matching how OidcDeviceAuth builds the key
+        this.audience = audience != null && !audience.isEmpty() ? audience : null;
         this.groupsInToken = groupsInToken;
-        this.hash = computeHash(clientId, tokenEndpoint, deviceAuthorizationEndpoint, scope, audience, groupsInToken);
+        this.hash = computeHash(clientId, tokenEndpoint, deviceAuthorizationEndpoint, scope, this.audience, groupsInToken);
     }
 
     public String getAudience() {

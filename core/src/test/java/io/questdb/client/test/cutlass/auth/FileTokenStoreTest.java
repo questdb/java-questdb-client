@@ -104,6 +104,27 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testArrayWrappedJsonReturnsNull() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            // a valid entry, then the same object wrapped in a top-level array. The wrapper leaves the
+            // fingerprint fields untouched, so only the non-object-root rejection - not a fingerprint mismatch -
+            // can reject it: the parser must refuse a shape that is not a single flat JSON object
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+            Assert.assertNotNull("the plain object must load", store.load(key));
+            byte[] obj = Files.readAllBytes(tokenFile(dir, key));
+            byte[] wrapped = new byte[obj.length + 2];
+            wrapped[0] = '[';
+            System.arraycopy(obj, 0, wrapped, 1, obj.length);
+            wrapped[wrapped.length - 1] = ']';
+            Files.write(tokenFile(dir, key), wrapped);
+            Assert.assertNull("an array-wrapped object must be rejected as a malformed shape", store.load(key));
+        });
+    }
+
+    @Test
     public void testAudienceNullVersusEmptyFingerprint() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -178,6 +199,28 @@ public class FileTokenStoreTest {
             Files.createDirectories(dir);
             Files.write(tokenFile(dir, key), "this is not json {{{".getBytes(StandardCharsets.UTF_8));
             Assert.assertNull(store.load(key));
+        });
+    }
+
+    @Test
+    public void testEmptyAudienceNormalizesToNull() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            // an empty-string audience is normalised to null: getAudience() reports null, it shares the
+            // null-audience identity hash/file, and its save->load round-trips (the pre-fix "" broke its own
+            // round-trip because the writer recorded "audience":"" but the fingerprint treated it as absent)
+            TokenStoreKey emptyAud = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid", "", false);
+            TokenStoreKey nullAud = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid", null, false);
+            Assert.assertNull("an empty audience must normalise to null", emptyAud.getAudience());
+            Assert.assertEquals("null and empty audiences must share one identity hash", nullAud.hash(), emptyAud.hash());
+
+            store.save(emptyAud, sampleToken("ACCESS-1", "REFRESH-1"));
+            PersistedToken loaded = store.load(emptyAud);
+            Assert.assertNotNull("an empty-audience key must load the entry it just saved", loaded);
+            Assert.assertEquals("ACCESS-1", loaded.getAccessToken());
         });
     }
 
@@ -663,6 +706,38 @@ public class FileTokenStoreTest {
             Assert.assertNull(loaded.getIdToken());
             Assert.assertEquals("REFRESH-\t-1", loaded.getRefreshToken());
             Assert.assertEquals(42L, loaded.getExpiresAtMillis());
+        });
+    }
+
+    @Test
+    public void testTokenStoreKeyRejectsNullRequiredFields() throws Exception {
+        assertMemoryLeak(() -> {
+            // the identity fields are required; a null must fail fast with a clear OidcAuthException rather than
+            // surface later as a raw NullPointerException inside save()/load() (audience stays optional)
+            try {
+                new TokenStoreKey(null, "https://idp/token", "https://idp/device", "openid", null, false);
+                Assert.fail("a null clientId must be rejected");
+            } catch (OidcAuthException expected) {
+                // required identity field
+            }
+            try {
+                new TokenStoreKey("questdb", null, "https://idp/device", "openid", null, false);
+                Assert.fail("a null tokenEndpoint must be rejected");
+            } catch (OidcAuthException expected) {
+                // required identity field
+            }
+            try {
+                new TokenStoreKey("questdb", "https://idp/token", null, "openid", null, false);
+                Assert.fail("a null deviceAuthorizationEndpoint must be rejected");
+            } catch (OidcAuthException expected) {
+                // required identity field
+            }
+            try {
+                new TokenStoreKey("questdb", "https://idp/token", "https://idp/device", null, null, false);
+                Assert.fail("a null scope must be rejected");
+            } catch (OidcAuthException expected) {
+                // required identity field
+            }
         });
     }
 

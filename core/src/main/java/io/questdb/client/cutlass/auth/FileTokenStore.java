@@ -228,19 +228,14 @@ public final class FileTokenStore implements TokenStore {
         Path file = tokenFile(key);
         byte[] bytes;
         try {
-            if (!Files.exists(file)) {
-                return null;
-            }
-            long size = Files.size(file);
-            if (size <= 0 || size > MAX_FILE_BYTES) {
-                // an empty or implausibly large file is not a usable entry; ignore it rather than read it
-                return null;
-            }
-            bytes = Files.readAllBytes(file);
+            bytes = readBounded(file);
         } catch (NoSuchFileException e) {
             return null;
         } catch (IOException e) {
             throw new OidcAuthException(e).put("could not read the OIDC token store file");
+        }
+        if (bytes == null) {
+            return null;
         }
         return parseAndVerify(key, bytes);
     }
@@ -313,10 +308,8 @@ public final class FileTokenStore implements TokenStore {
         TokenFileParser parser = new TokenFileParser();
         try (DirectUtf8Sink mem = new DirectUtf8Sink(bytes.length);
              JsonLexer lexer = new JsonLexer(JSON_LEXER_CACHE_SIZE, JSON_LEXER_MAX_VALUE_BYTES)) {
-            for (int i = 0; i < bytes.length; i++) {
-                // putAny accepts any byte; put(byte) is asserted for non-ASCII bytes only
-                mem.putAny(bytes[i]);
-            }
+            // bulk-copy the file bytes into native memory in one go rather than byte by byte
+            mem.put(bytes, 0, bytes.length);
             long lo = mem.ptr();
             lexer.parse(lo, lo + mem.size(), parser);
             lexer.parseLast(); // reject a truncated document
@@ -325,8 +318,9 @@ public final class FileTokenStore implements TokenStore {
             return null;
         }
         // schema and fingerprint must match the live identity; a mismatch is a hash collision or a file
-        // copied from a different identity, so ignore it rather than serve the wrong identity's token
-        if (parser.version != SCHEMA_VERSION) {
+        // copied from a different identity, so ignore it rather than serve the wrong identity's token. A
+        // malformed shape (an array anywhere - the schema is a single flat object) is likewise rejected.
+        if (parser.malformed || parser.version != SCHEMA_VERSION) {
             return null;
         }
         if (!Chars.equals(key.getClientId(), parser.clientId)
@@ -409,6 +403,35 @@ public final class FileTokenStore implements TokenStore {
         sink.put(',');
         putName(sink, name);
         putString(sink, value);
+    }
+
+    private static byte[] readBounded(Path file) throws IOException {
+        // read with a hard cap instead of Files.readAllBytes after a separate Files.size: the file is
+        // attacker-writable, so a size-check-then-read races a concurrent grow - a file enlarged past the cap
+        // between the two would make readAllBytes allocate gigabytes and throw OutOfMemoryError (an Error, which
+        // the best-effort RuntimeException guard in OidcDeviceAuth.maybeLoadFromStore would not catch, so a bad
+        // file would abort sign-in instead of degrading). Cap the buffer at the reported size (already bounded
+        // by MAX_FILE_BYTES) plus one byte, so a file that grew past its reported size is rejected, not allocated.
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            long size = channel.size();
+            if (size <= 0 || size > MAX_FILE_BYTES) {
+                // an empty or implausibly large file is not a usable entry; ignore it rather than read it in
+                return null;
+            }
+            ByteBuffer buffer = ByteBuffer.allocate((int) size + 1);
+            while (buffer.hasRemaining() && channel.read(buffer) >= 0) {
+                // read until EOF or the (size + 1)-byte buffer fills
+            }
+            int read = buffer.position();
+            if (read == 0 || read > size) {
+                // empty, or grew past its reported size between the stat and the read: treat as corrupt/hostile
+                return null;
+            }
+            byte[] bytes = new byte[read];
+            buffer.flip();
+            buffer.get(bytes);
+            return bytes;
+        }
     }
 
     private static void releaseLock(Path lock, String nonce) {
@@ -623,10 +646,17 @@ public final class FileTokenStore implements TokenStore {
         int version;
         private int depth;
         private int field = FIELD_NONE;
+        private boolean malformed;
 
         @Override
         public void onEvent(int code, CharSequence tag, int position) {
             switch (code) {
+                case JsonLexer.EVT_ARRAY_START:
+                    // the on-disk schema is a single flat JSON object; an array anywhere (for example a
+                    // top-level [ {..} ] wrapper) is a malformed or hostile shape - mark the document invalid
+                    // rather than extract fields from it through the object-depth gate
+                    malformed = true;
+                    break;
                 case JsonLexer.EVT_OBJ_START:
                     depth++;
                     break;
