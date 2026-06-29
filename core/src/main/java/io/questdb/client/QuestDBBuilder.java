@@ -97,11 +97,16 @@ public final class QuestDBBuilder {
      * Builds an ingest-only (write-only) handle: no query/read pool is created,
      * so the facade starts even when the server / read primary is unavailable
      * (the read side is normally fail-fast and would sink the whole facade).
-     * {@link QuestDB#query()} / {@link QuestDB#newQuery()} are disabled and a
-     * query configuration is not required (any query config set is ignored).
+     * {@link QuestDB#query()} / {@link QuestDB#newQuery()} are disabled, and the
+     * read-side config keys are ignored.
      * <p>
-     * Pair with {@code initial_connect_retry=async} (or {@code sender_pool_min=0})
-     * on the ingest config so the write side does not fail-fast either.
+     * Write-only also defaults the ingest side to a non-blocking async initial
+     * connect, so {@code build()} returns promptly even with the server down and
+     * the sender pool warm ({@code sender_pool_min >= 1}); writes buffer until
+     * the wire comes up. Override by setting {@code initial_connect_retry}
+     * explicitly in the config.
+     * <p>
+     * Equivalent to the {@code write_only=on} connect-string key.
      */
     public QuestDBBuilder writeOnly() {
         this.writeOnly = true;
@@ -160,11 +165,13 @@ public final class QuestDBBuilder {
         if (config == null) {
             throw new IllegalStateException("configuration is required; call fromConfig()");
         }
-        if (writeOnly) {
-            return buildWriteOnly();
-        }
         ConfigString cs = ConfigString.parse(config);
         ConfigView view = new ConfigView(cs);
+        // Write-only may be requested via the builder (writeOnly()) or the
+        // connect string (write_only=on); either skips the read pool.
+        if (writeOnly || view.getBoolOnOff("write_only", false)) {
+            return buildWriteOnly(view);
+        }
         // Validate the single cluster config exactly as both pools will, but
         // without connecting: the full Sender parse plus validateParameters
         // (ingress value keys are registry-STRING, so only the real parse
@@ -203,10 +210,14 @@ public final class QuestDBBuilder {
     // Ingest-only build path: validates and resolves the sender + shared pool
     // knobs from the ingest config alone and constructs a QuestDBImpl with no
     // query pool. Never touches the read side, so a down server cannot fail it.
-    private QuestDB buildWriteOnly() {
-        ConfigString cs = ConfigString.parse(config);
-        ConfigView view = new ConfigView(cs);
+    private QuestDB buildWriteOnly(ConfigView view) {
         Sender.LineSenderBuilder.validateWsConfigString(config);
+        // writeOnly() owns "starts even when the server is down": default the
+        // ingest side to a non-blocking async initial connect so prewarming a
+        // sender (sender_pool_min >= 1) against a down server cannot fail-fast
+        // the build. An explicit initial_connect_retry in the user's string still
+        // wins (last-write-wins -- see withDefaultAsyncConnect).
+        String senderConfig = withDefaultAsyncConnect(config);
         resolvePoolInt(senderPoolMin, "sender_pool_min", view, DEFAULT_POOL_MIN, this::senderPoolMin);
         resolvePoolInt(senderPoolMax, "sender_pool_max", view, DEFAULT_POOL_MAX, this::senderPoolMax);
         resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", view, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
@@ -214,7 +225,7 @@ public final class QuestDBBuilder {
         resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", view, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
         resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
         return new QuestDBImpl(
-                config,
+                senderConfig,
                 senderPoolMin,
                 senderPoolMax,
                 acquireTimeoutMillis,
@@ -369,6 +380,17 @@ public final class QuestDBBuilder {
         m.put("max_lifetime_ms", maxLifetimeMillis);
         m.put("housekeeper_interval_ms", housekeeperIntervalMillis);
         return m;
+    }
+
+    // writeOnly() owns "starts even when the server is down". Inject a
+    // non-blocking async initial connect right after the schema separator so
+    // build() never blocks or fail-fast on a down server. Placed first so an
+    // explicit initial_connect_retry later in the user's string overrides it
+    // (last-write-wins).
+    private static String withDefaultAsyncConnect(String config) {
+        int sep = config.indexOf("::");
+        // sep >= 0: fromConfig() validated a ws/wss schema, so "::" is present.
+        return config.substring(0, sep + 2) + "initial_connect_retry=async;" + config.substring(sep + 2);
     }
 
     private static void requireWebSocketSchema(CharSequence config, String role) {

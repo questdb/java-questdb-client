@@ -85,6 +85,51 @@ public class QuestDBWriteOnlyTest {
         }
     }
 
+    @Test(timeout = 30_000)
+    public void testWriteOnlyDefaultsWriteSideToNonBlocking() {
+        int port = TestPorts.findUnusedPort();
+        // sender_pool_min defaults to 1 and the config sets NO
+        // initial_connect_retry. writeOnly() must default the ingest side to a
+        // non-blocking async initial connect, so prewarming the sender against
+        // the dead port does not fail-fast the build. Without that default the
+        // prewarm's synchronous connect attempt would throw (connection refused)
+        // and build() would fail here.
+        try (QuestDB db = QuestDB.builder()
+                .fromConfig("ws::addr=localhost:" + port
+                        + ";reconnect_max_duration_millis=200;reconnect_initial_backoff_millis=10"
+                        + ";reconnect_max_backoff_millis=50;close_flush_timeout_millis=0;")
+                .writeOnly()
+                .build()) {
+            Sender sender = db.borrowSender();
+            Assert.assertNotNull("a sender must be available with no server present", sender);
+            // Buffering a row against the unconnected sender must not throw.
+            sender.table("t").longColumn("v", 1L).atNow();
+        }
+    }
+
+    @Test
+    public void testWriteOnlyFromConnectString() {
+        int port = TestPorts.findUnusedPort();
+        // write_only=on in the connect string is equivalent to .writeOnly():
+        // the read pool is skipped and query()/newQuery() are disabled.
+        try (QuestDB db = QuestDB.builder()
+                .fromConfig("ws::addr=localhost:" + port + ";write_only=on;sender_pool_min=0;")
+                .build()) {
+            assertQueryDisabled(db::query);
+            assertQueryDisabled(db::newQuery);
+        }
+    }
+
+    @Test
+    public void testWriteOnlyFromConnectStringViaConnect() {
+        int port = TestPorts.findUnusedPort();
+        // The connect-string flag also works through QuestDB.connect(...).
+        try (QuestDB db = QuestDB.connect(
+                "ws::addr=localhost:" + port + ";write_only=on;sender_pool_min=0;")) {
+            assertQueryDisabled(db::query);
+        }
+    }
+
     private static void assertQueryDisabled(Runnable read) {
         try {
             read.run();
