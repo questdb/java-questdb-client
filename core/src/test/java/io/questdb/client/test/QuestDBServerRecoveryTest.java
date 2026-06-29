@@ -73,13 +73,14 @@ public class QuestDBServerRecoveryTest {
         server.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
         try {
             // One cluster config drives both pools:
-            // - ingest: async initial connect so the producer thread never blocks
-            //   and writes buffer until the wire is up.
-            // - query: lazy (query_pool_min=0) so the otherwise fail-fast reader
-            //   never sinks the build while the server is down.
+            // lazy_connect=true expands to exactly this resilience: the ingest
+            // side goes async (the producer never blocks; writes buffer until the
+            // wire is up) and the read pool defaults to min=0 (the otherwise
+            // fail-fast reader never sinks the build while the server is down,
+            // and connects lazily on the first query).
             String cfg = "ws::addr=localhost:" + server.getPort()
-                    + ";sender_pool_min=1;sender_pool_max=1;initial_connect_retry=async"
-                    + ";query_pool_min=0;query_pool_max=1"
+                    + ";lazy_connect=true"
+                    + ";sender_pool_min=1;sender_pool_max=1;query_pool_max=1"
                     + ";auth_timeout_ms=2000;reconnect_initial_backoff_millis=20"
                     + ";reconnect_max_backoff_millis=100;reconnect_max_duration_millis=600000"
                     + ";close_flush_timeout_millis=1000;";
@@ -89,13 +90,11 @@ public class QuestDBServerRecoveryTest {
             try {
                 Assert.assertEquals("no handshake while the server is down", 0, server.handshakeCount());
 
-                // This is NOT a write-only handle: reads stay ENABLED, just
-                // deferred. query() must hand back a usable builder even while
-                // the server is down -- it connects lazily on the first submit
-                // once the server is up. (Contrast write-only, where query()
-                // throws "query/read is disabled" for the life of the handle.)
+                // lazy_connect keeps reads ENABLED, just deferred. query() must
+                // hand back a usable builder even while the server is down -- it
+                // connects lazily on the first submit once the server is up.
                 Assert.assertNotNull(
-                        "reads must stay enabled on a resilient (non-write-only) handle even before the server is up",
+                        "reads must stay enabled under lazy_connect even before the server is up",
                         db.query());
 
                 // (3) client writes -> buffers in the cursor SF engine; the call

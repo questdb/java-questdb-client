@@ -66,26 +66,7 @@ public final class QuestDBImpl implements QuestDB {
     ) {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
-                housekeeperIntervalMillis, null, null, errorHandler, connectionListener, false);
-    }
-
-    // Write-only (ingest-only) handle: no query pool is created, so build()
-    // never touches the read side and the facade starts even when the
-    // server / read primary is unavailable. query()/newQuery() are disabled.
-    public QuestDBImpl(
-            String ingestConfig,
-            int senderMin,
-            int senderMax,
-            long acquireTimeoutMillis,
-            long idleTimeoutMillis,
-            long maxLifetimeMillis,
-            long housekeeperIntervalMillis,
-            SenderErrorHandler errorHandler,
-            SenderConnectionListener connectionListener
-    ) {
-        this(ingestConfig, null, senderMin, senderMax, 0, 0,
-                acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
-                housekeeperIntervalMillis, null, null, errorHandler, connectionListener, true);
+                housekeeperIntervalMillis, null, null, errorHandler, connectionListener);
     }
 
     // Package-private constructor exposing the senderFactory and connectHook test
@@ -110,7 +91,7 @@ public final class QuestDBImpl implements QuestDB {
     ) {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
-                housekeeperIntervalMillis, senderFactory, connectHook, null, null, false);
+                housekeeperIntervalMillis, senderFactory, connectHook, null, null);
     }
 
     // Full constructor adding the ingest-side errorHandler/connectionListener,
@@ -131,8 +112,7 @@ public final class QuestDBImpl implements QuestDB {
             IntFunction<Sender> senderFactory,
             Consumer<QwpQueryClient> connectHook,
             SenderErrorHandler errorHandler,
-            SenderConnectionListener connectionListener,
-            boolean writeOnly
+            SenderConnectionListener connectionListener
     ) {
         SenderPool builtSenderPool = null;
         QueryClientPool builtQueryPool = null;
@@ -146,13 +126,9 @@ public final class QuestDBImpl implements QuestDB {
                     // server; the housekeeper drives it via runStartupRecoveryStep().
                     true,
                     errorHandler, connectionListener);
-            // Write-only: skip the read side entirely so a down server / read
-            // primary cannot fail the facade build.
-            if (!writeOnly) {
-                builtQueryPool = new QueryClientPool(
-                        queryConfig, queryMin, queryMax, acquireTimeoutMillis,
-                        idleTimeoutMillis, maxLifetimeMillis, connectHook);
-            }
+            builtQueryPool = new QueryClientPool(
+                    queryConfig, queryMin, queryMax, acquireTimeoutMillis,
+                    idleTimeoutMillis, maxLifetimeMillis, connectHook);
             builtHousekeeper = new PoolHousekeeper(builtSenderPool, builtQueryPool, housekeeperIntervalMillis);
             builtHousekeeper.start();
         } catch (Throwable e) {
@@ -182,7 +158,7 @@ public final class QuestDBImpl implements QuestDB {
         this.senderPool = builtSenderPool;
         this.queryPool = builtQueryPool;
         this.housekeeper = builtHousekeeper;
-        this.queryThreadLocal = writeOnly ? null : ThreadLocal.withInitial(() -> new QueryImpl(queryPool));
+        this.queryThreadLocal = ThreadLocal.withInitial(() -> new QueryImpl(queryPool));
     }
 
     @Override
@@ -243,22 +219,14 @@ public final class QuestDBImpl implements QuestDB {
 
     @Override
     public Query newQuery() {
-        requireQueryEnabled();
         return new QueryImpl(queryPool);
     }
 
     @Override
     public Query query() {
-        requireQueryEnabled();
         QueryImpl q = queryThreadLocal.get();
         q.resetIfDone();
         return q;
-    }
-
-    private void requireQueryEnabled() {
-        if (queryPool == null) {
-            throw new IllegalStateException("query/read is disabled on a write-only QuestDB client");
-        }
     }
 
     @Override

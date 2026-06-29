@@ -35,8 +35,13 @@ import java.util.function.LongConsumer;
 
 /**
  * Builder for {@link QuestDB}. Most callers use {@link QuestDB#connect(CharSequence)};
- * this builder adds pool sizing, idle/lifetime knobs, the acquire timeout, the
- * ingest callbacks, and write-only mode.
+ * this builder adds pool sizing, idle/lifetime knobs, the acquire timeout, and
+ * the ingest callbacks.
+ * <p>
+ * To tolerate the server being down at startup, set {@code lazy_connect=true}
+ * in the config: the ingest side connects asynchronously (writes buffer until
+ * the wire is up) and the read pool connects lazily on first use. Reads stay
+ * fully enabled -- they just connect once the server is available.
  * <p>
  * One configuration string describes the whole QuestDB cluster (see
  * {@link #fromConfig}): list every node in a single {@code addr} server list and
@@ -72,10 +77,6 @@ public final class QuestDBBuilder {
     private int queryPoolMin = UNSET;
     private int senderPoolMax = UNSET;
     private int senderPoolMin = UNSET;
-    // When true, build() creates only the ingest (Sender) side: no query pool
-    // is constructed, so the facade starts even when the server / read primary
-    // is down, and query() is disabled. A query config is not required.
-    private boolean writeOnly;
 
     QuestDBBuilder() {
     }
@@ -90,26 +91,6 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException("acquireTimeoutMillis must be >= 0");
         }
         this.acquireTimeoutMillis = millis;
-        return this;
-    }
-
-    /**
-     * Builds an ingest-only (write-only) handle: no query/read pool is created,
-     * so the facade starts even when the server / read primary is unavailable
-     * (the read side is normally fail-fast and would sink the whole facade).
-     * {@link QuestDB#query()} / {@link QuestDB#newQuery()} are disabled, and the
-     * read-side config keys are ignored.
-     * <p>
-     * Write-only also defaults the ingest side to a non-blocking async initial
-     * connect, so {@code build()} returns promptly even with the server down and
-     * the sender pool warm ({@code sender_pool_min >= 1}); writes buffer until
-     * the wire comes up. Override by setting {@code initial_connect_retry}
-     * explicitly in the config.
-     * <p>
-     * Equivalent to the {@code write_only=on} connect-string key.
-     */
-    public QuestDBBuilder writeOnly() {
-        this.writeOnly = true;
         return this;
     }
 
@@ -167,11 +148,6 @@ public final class QuestDBBuilder {
         }
         ConfigString cs = ConfigString.parse(config);
         ConfigView view = new ConfigView(cs);
-        // Write-only may be requested via the builder (writeOnly()) or the
-        // connect string (write_only=on); either skips the read pool.
-        if (writeOnly || view.getBoolOnOff("write_only", false)) {
-            return buildWriteOnly(view);
-        }
         // Validate the single cluster config exactly as both pools will, but
         // without connecting: the full Sender parse plus validateParameters
         // (ingress value keys are registry-STRING, so only the real parse
@@ -182,9 +158,20 @@ public final class QuestDBBuilder {
         Sender.LineSenderBuilder.validateWsConfigString(config);
         QwpQueryClient.validateConfig(view, "wss".equals(cs.schema()));
 
+        // lazy_connect: tolerate a down server at startup without disabling
+        // reads. The ingest side connects asynchronously (writes buffer until the
+        // wire is up) and the read pool defaults to min=0 -- it connects lazily
+        // on the first query once the server is up. Reads stay enabled.
+        boolean lazyConnect = view.getBool("lazy_connect", false);
+        String ingestConfig = config;
+        if (lazyConnect) {
+            ingestConfig = resolveLazyConnect(view);
+        }
+
         resolvePoolInt(senderPoolMin, "sender_pool_min", view, DEFAULT_POOL_MIN, this::senderPoolMin);
         resolvePoolInt(senderPoolMax, "sender_pool_max", view, DEFAULT_POOL_MAX, this::senderPoolMax);
-        resolvePoolInt(queryPoolMin, "query_pool_min", view, DEFAULT_POOL_MIN, this::queryPoolMin);
+        // lazy_connect makes the read pool lazy (min=0); without it the default min is 1.
+        resolvePoolInt(queryPoolMin, "query_pool_min", view, lazyConnect ? 0 : DEFAULT_POOL_MIN, this::queryPoolMin);
         resolvePoolInt(queryPoolMax, "query_pool_max", view, DEFAULT_POOL_MAX, this::queryPoolMax);
         resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", view, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
         resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", view, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
@@ -192,7 +179,7 @@ public final class QuestDBBuilder {
         resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
 
         return new QuestDBImpl(
-                config,
+                ingestConfig,
                 config,
                 senderPoolMin,
                 senderPoolMax,
@@ -207,34 +194,43 @@ public final class QuestDBBuilder {
         );
     }
 
-    // Ingest-only build path: validates and resolves the sender + shared pool
-    // knobs from the ingest config alone and constructs a QuestDBImpl with no
-    // query pool. Never touches the read side, so a down server cannot fail it.
-    private QuestDB buildWriteOnly(ConfigView view) {
-        Sender.LineSenderBuilder.validateWsConfigString(config);
-        // writeOnly() owns "starts even when the server is down": default the
-        // ingest side to a non-blocking async initial connect so prewarming a
-        // sender (sender_pool_min >= 1) against a down server cannot fail-fast
-        // the build. An explicit initial_connect_retry in the user's string still
-        // wins (last-write-wins -- see withDefaultAsyncConnect).
-        String senderConfig = withDefaultAsyncConnect(config);
-        resolvePoolInt(senderPoolMin, "sender_pool_min", view, DEFAULT_POOL_MIN, this::senderPoolMin);
-        resolvePoolInt(senderPoolMax, "sender_pool_max", view, DEFAULT_POOL_MAX, this::senderPoolMax);
-        resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", view, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
-        resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", view, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
-        resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", view, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
-        resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
-        return new QuestDBImpl(
-                senderConfig,
-                senderPoolMin,
-                senderPoolMax,
-                acquireTimeoutMillis,
-                idleTimeoutMillis,
-                maxLifetimeMillis,
-                housekeeperIntervalMillis,
-                errorHandler,
-                connectionListener
-        );
+    // Validates the lazy_connect contract and returns the ingest config to use:
+    // the original string with a non-blocking async initial connect injected
+    // when the user did not set one. lazy_connect requires BOTH sides to start
+    // non-blocking, so an explicit knob that forces a blocking / fail-fast
+    // startup is a configuration conflict and is rejected with a clear remedy.
+    private String resolveLazyConnect(ConfigView view) {
+        // (1) ingest side: only initial_connect_retry=async is non-blocking;
+        // off/false/on/true/sync all block or fail-fast at startup.
+        String mode = view.getStr("initial_connect_retry");
+        if (mode != null && !"async".equalsIgnoreCase(mode)) {
+            throw new IllegalArgumentException(
+                    "conflicting configuration: lazy_connect=true needs a non-blocking startup, but "
+                            + "initial_connect_retry=" + mode + " makes the initial connect block / fail-fast. "
+                            + "Resolve by removing initial_connect_retry (lazy_connect implies "
+                            + "initial_connect_retry=async) or setting initial_connect_retry=async.");
+        }
+        // (2) read side: lazy_connect requires query_pool_min=0 so the read pool
+        // does not eagerly fail-fast at startup. An explicit query_pool_min > 0
+        // (builder call or connect string) contradicts that.
+        int explicitQueryMin;
+        if (queryPoolMin != UNSET) {
+            explicitQueryMin = queryPoolMin; // explicit builder call
+        } else if (view.has("query_pool_min")) {
+            explicitQueryMin = view.getInt("query_pool_min", UNSET); // connect string
+        } else {
+            explicitQueryMin = 0; // unset -> lazy default of 0
+        }
+        if (explicitQueryMin > 0) {
+            throw new IllegalArgumentException(
+                    "conflicting configuration: lazy_connect=true needs query_pool_min=0 (the read pool "
+                            + "connects lazily on first use and must not fail-fast at startup), but query_pool_min="
+                            + explicitQueryMin + " was set. Resolve by removing query_pool_min (lazy_connect "
+                            + "defaults it to 0) or setting query_pool_min=0.");
+        }
+        // No explicit initial_connect_retry -> inject async so the ingest build
+        // is non-blocking. An explicit async needs no injection.
+        return mode == null ? withDefaultAsyncConnect(config) : config;
     }
 
     /**
@@ -382,11 +378,11 @@ public final class QuestDBBuilder {
         return m;
     }
 
-    // writeOnly() owns "starts even when the server is down". Inject a
-    // non-blocking async initial connect right after the schema separator so
-    // build() never blocks or fail-fast on a down server. Placed first so an
-    // explicit initial_connect_retry later in the user's string overrides it
-    // (last-write-wins).
+    // Inject a non-blocking async initial connect right after the schema
+    // separator so lazy_connect's build never blocks or fail-fast on a down
+    // server. Only used when the user set no initial_connect_retry of their own
+    // (resolveLazyConnect rejects an explicit blocking mode rather than silently
+    // overriding it), so placement is immaterial -- there is no competing value.
     private static String withDefaultAsyncConnect(String config) {
         int sep = config.indexOf("::");
         // sep >= 0: fromConfig() validated a ws/wss schema, so "::" is present.

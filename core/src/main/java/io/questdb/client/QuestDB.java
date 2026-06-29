@@ -41,7 +41,10 @@ import java.io.Closeable;
  * Configuration: one {@code ws}/{@code wss} string describes the whole cluster
  * (a single {@code addr} server list) and both the ingest and query pools
  * connect across it. Use {@link #connect(CharSequence)} for the common case, or
- * {@link #builder()} for pool sizing, the ingest callbacks, and write-only mode.
+ * {@link #builder()} for pool sizing and the ingest callbacks. To tolerate the
+ * server being down at startup, set {@code lazy_connect=true} in the config
+ * (async ingest + lazy reads; reads stay enabled and connect once the server
+ * is up).
  * <p>
  * Thread safety: instances are safe to share. {@link #borrowSender()} and
  * {@link #query()} may be called concurrently from any thread; the pool
@@ -51,7 +54,7 @@ public interface QuestDB extends Closeable {
 
     /**
      * Builder for advanced configuration (pool sizes, acquisition timeouts,
-     * ingest callbacks, write-only mode).
+     * ingest callbacks).
      */
     static QuestDBBuilder builder() {
         return new QuestDBBuilder();
@@ -64,8 +67,9 @@ public interface QuestDB extends Closeable {
      * protocol), so one string configures both clients. List every cluster node
      * in a single {@code addr} server list and both pools connect across it.
      * <p>
-     * Use {@link #builder()} for pool sizing, the ingest callbacks, and
-     * write-only mode.
+     * Use {@link #builder()} for pool sizing and the ingest callbacks. To
+     * tolerate the server being down at startup, set {@code lazy_connect=true}
+     * in the config (async ingest + lazy reads, reads still enabled).
      *
      * @param configurationString a {@code ws}/{@code wss} config string (see
      *                            {@link Sender#fromConfig} or

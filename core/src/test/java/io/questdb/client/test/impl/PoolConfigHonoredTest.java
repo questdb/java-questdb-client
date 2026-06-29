@@ -74,10 +74,10 @@ public class PoolConfigHonoredTest {
         // the assertions above, so a new pool key with no assertion trips this.
         for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
             if (spec.side() == Side.POOL) {
-                // write_only is a facade routing flag (build()'s write-only branch,
-                // covered by QuestDBWriteOnlyTest), not a numeric pool-sizing knob
-                // resolved into the snapshot.
-                if ("write_only".equals(spec.name())) {
+                // lazy_connect is a facade flag (build()'s tolerant-startup
+                // branch, covered by QuestDBLazyConnectTest), not a numeric
+                // pool-sizing knob resolved into the snapshot.
+                if ("lazy_connect".equals(spec.name())) {
                     continue;
                 }
                 Assert.assertTrue("registry pool key '" + spec.name() + "' has no honored assertion",

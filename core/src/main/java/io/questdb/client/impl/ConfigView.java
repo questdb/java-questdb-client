@@ -95,6 +95,25 @@ public final class ConfigView {
         return RELOCATED_HINTS.get(key);
     }
 
+    /**
+     * A boolean flag accepting {@code true}/{@code false} (and {@code on}/{@code off}
+     * for consistency with the rest of the connect-string surface). Returns
+     * {@code dflt} when the key is absent; throws on any other value.
+     */
+    public boolean getBool(String key, boolean dflt) {
+        String v = getStr(key);
+        if (v == null) {
+            return dflt;
+        }
+        if ("true".equals(v) || "on".equals(v)) {
+            return true;
+        }
+        if ("false".equals(v) || "off".equals(v)) {
+            return false;
+        }
+        throw new IllegalArgumentException("invalid " + key + ": " + v + " (expected true, false)");
+    }
+
     public boolean getBoolOnOff(String key, boolean dflt) {
         String v = getStr(key);
         if (v == null) {

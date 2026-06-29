@@ -112,7 +112,7 @@ public final class ConfigSchema {
         longRange("idle_timeout_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("max_lifetime_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("housekeeper_interval_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
-        boolOnOff("write_only", Side.POOL); // facade routing flag: build an ingest-only handle
+        boolOnOff("lazy_connect", Side.POOL); // facade flag: tolerant non-blocking startup (async ingest + lazy reads)
 
         // RESERVED -- accepted no-op (error-policy keys reserved by the spec).
         str("on_internal_error", Side.RESERVED);
