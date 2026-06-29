@@ -63,7 +63,9 @@ String cfg = "ws::addr=replica-a:9000,replica-b:9000,replica-c:9000;"
         + "failover=on;";      // default; affects execute()-time recovery only
 
 try (QuestDB db = QuestDB.connect(cfg)) {
-    db.executeSql("select * from telemetry limit 10", myBatchHandler);
+    try (Query q = db.borrowQuery()) {
+        q.sql("select * from telemetry limit 10").handler(myBatchHandler).submit().await();
+    }
 }
 ```
 
@@ -116,7 +118,7 @@ eagerly creates `min` connections per pool. Consequences:
 | Configuration | Build-time network behavior |
 | --- | --- |
 | defaults (`min=1` both) | creates one sender + one query client; build fails if either cannot connect — unless ingest uses `initial_connect_retry=async` |
-| `sender_pool_min=0` | no sender at build; first `borrowSender()`/`sender()` creates it (then follows the ingest initial-connect mode) |
+| `sender_pool_min=0` | no sender at build; first `borrowSender()` creates it (then follows the ingest initial-connect mode) |
 | `query_pool_min=0` | no query client at build; first query `submit()` creates it |
 | both mins `0` | config-only validation at build; all network work is lazy |
 

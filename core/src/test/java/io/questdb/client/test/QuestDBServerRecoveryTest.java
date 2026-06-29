@@ -26,8 +26,6 @@ package io.questdb.client.test;
 
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
-import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
-import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -47,20 +45,6 @@ import java.util.function.BooleanSupplier;
  */
 public class QuestDBServerRecoveryTest {
 
-    private static final QwpColumnBatchHandler NOOP = new QwpColumnBatchHandler() {
-        @Override
-        public void onBatch(QwpColumnBatch batch) {
-        }
-
-        @Override
-        public void onEnd(long totalRows) {
-        }
-
-        @Override
-        public void onError(byte errorCode, String message) {
-        }
-    };
-
     @Test(timeout = 60_000)
     public void testFacadeStartsWhileServerDownThenWritesAndReaderConnectsOnRecovery() throws Exception {
         // One mock server (the whole "cluster"), bound so the port is known but
@@ -70,8 +54,8 @@ public class QuestDBServerRecoveryTest {
         // path is gated so the ingest connection's ACK stream is never disturbed.
         TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
         });
-        server.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
-        try {
+        try (server) {
+            server.setSendServerInfo(true); // the egress client's connect() waits for SERVER_INFO
             // One cluster config drives both pools:
             // lazy_connect=true expands to exactly this resilience: the ingest
             // side goes async (the producer never blocks; writes buffer until the
@@ -86,16 +70,13 @@ public class QuestDBServerRecoveryTest {
                     + ";close_flush_timeout_millis=1000;";
 
             // (1) server down + (2) client starts:
-            QuestDB db = QuestDB.builder().fromConfig(cfg).build();
-            try {
+            try (QuestDB db = QuestDB.builder().fromConfig(cfg).build()) {
                 Assert.assertEquals("no handshake while the server is down", 0, server.handshakeCount());
 
-                // lazy_connect keeps reads ENABLED, just deferred. query() must
-                // hand back a usable builder even while the server is down -- it
-                // connects lazily on the first submit once the server is up.
-                Assert.assertNotNull(
-                        "reads must stay enabled under lazy_connect even before the server is up",
-                        db.query());
+                // lazy_connect keeps reads ENABLED, just deferred: the read pool
+                // defaults to min=0, so nothing connects while the server is
+                // down. The read client connects lazily on the first
+                // borrowQuery() once the server is up (step 5).
 
                 // (3) client writes -> buffers in the cursor SF engine; the call
                 // must not throw even though the server is down.
@@ -111,17 +92,13 @@ public class QuestDBServerRecoveryTest {
                         () -> server.handshakeCount() >= 1);
 
                 // (5) client can now read: the deferred reader connects on the
-                // first query (the mock does not serve rows, so we assert the
-                // connection, not the result).
+                // first borrowQuery() (the mock does not serve rows, so we
+                // assert the connection, not the result).
                 int handshakesBeforeQuery = server.handshakeCount();
-                db.executeSql("select 1", NOOP);
+                db.borrowQuery().close();
                 awaitTrue("query client must connect after the server comes up",
                         () -> server.handshakeCount() >= handshakesBeforeQuery + 1);
-            } finally {
-                db.close();
             }
-        } finally {
-            server.close();
         }
     }
 

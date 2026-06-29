@@ -33,8 +33,6 @@ import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -44,8 +42,8 @@ import java.util.function.Consumer;
 // OutOfMemoryError); the old catches let that Error skip cleanup.
 //
 // QwpQueryClient is a concrete class with no fake seam, so these tests inject an
-// Error at the real connect step via the package-private connectHook constructor
-// (reached by reflection -- the main module is declared `open`). fromConfig()
+// Error at the real connect step via the public connectHook constructor.
+// fromConfig()
 // still runs for real, committing the NATIVE_DEFAULT scratch the cleanup must
 // reclaim, so the memory assertions are meaningful.
 public class QueryClientPoolErrorSafetyTest {
@@ -232,30 +230,21 @@ public class QueryClientPoolErrorSafetyTest {
         };
     }
 
-    private static int inFlightCreations(QueryClientPool pool) throws Exception {
-        Method m = QueryClientPool.class.getDeclaredMethod("inFlightCreations");
-        m.setAccessible(true);
-        return (int) m.invoke(pool);
+    private static int inFlightCreations(QueryClientPool pool) {
+        return pool.inFlightCreations();
     }
 
     private static QueryClientPool newPool(
             String cfg, int min, int max, long acquireMs, Consumer<QwpQueryClient> connectHook
-    ) throws Exception {
-        Constructor<QueryClientPool> c = QueryClientPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class, Consumer.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, connectHook);
+    ) {
+        return new QueryClientPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, connectHook);
     }
 
     private static QueryClientPool newPool(
             String cfg, int min, int max, long acquireMs,
             Consumer<QwpQueryClient> connectHook, Consumer<QueryWorker> startHook
-    ) throws Exception {
-        Constructor<QueryClientPool> c = QueryClientPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class,
-                Consumer.class, Consumer.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE,
+    ) {
+        return new QueryClientPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE,
                 connectHook, startHook);
     }
 }

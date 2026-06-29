@@ -43,7 +43,6 @@ import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -1931,27 +1930,20 @@ public class SenderPoolSfTest {
         m.invoke(pool, ps);
     }
 
-    // Reaches the package-private senderFactory test seam by reflection so a
-    // test can inject a fake/forged delegate (mirrors SenderPoolErrorSafetyTest).
+    // Uses the @TestOnly senderFactory seam so a test can inject a fake/forged
+    // delegate (mirrors SenderPoolErrorSafetyTest).
     private static SenderPool newPoolWithFactory(
             String cfg, int min, int max, long acquireMs, IntFunction<Sender> senderFactory
-    ) throws Exception {
-        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class, IntFunction.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
+    ) {
+        return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
     }
 
-    // Reaches the package-private 8-arg constructor (deferStartupRecovery=true)
-    // by reflection so a test can build a pool whose SF startup recovery is NOT
-    // run inline -- mirroring the pooled QuestDB handle, which defers it to the
-    // housekeeper. senderFactory=null -> the real defaultSender().
-    private static SenderPool newDeferredPool(String cfg, int min, int max, long acquireMs) throws Exception {
-        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class,
-                IntFunction.class, boolean.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, null, true);
+    // Uses the @TestOnly 8-arg constructor (deferStartupRecovery=true) so a test
+    // can build a pool whose SF startup recovery is NOT run inline -- mirroring
+    // the pooled QuestDB handle, which defers it to the housekeeper.
+    // senderFactory=null -> the real defaultSender().
+    private static SenderPool newDeferredPool(String cfg, int min, int max, long acquireMs) {
+        return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, null, true);
     }
 
     // Drives a deferred pool's startup recovery to completion (the housekeeper
@@ -1982,12 +1974,8 @@ public class SenderPoolSfTest {
     // test can drive the housekeeper recovery path against fully controlled
     // (fake) recoverers.
     private static SenderPool newDeferredPoolWithFactory(
-            String cfg, int min, int max, long acquireMs, IntFunction<Sender> factory) throws Exception {
-        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class,
-                IntFunction.class, boolean.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, factory, true);
+            String cfg, int min, int max, long acquireMs, IntFunction<Sender> factory) {
+        return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, factory, true);
     }
 
     // Fake Sender whose drain() (for slot 0 only) parks until released, opening a

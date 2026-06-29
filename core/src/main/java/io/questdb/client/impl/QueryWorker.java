@@ -47,6 +47,7 @@ public final class QueryWorker {
     private final QwpQueryClient client;
     private final long createdAtMillis;
     private final QueryClientPool pool;
+    private final QueryImpl query;
     private final Condition signalCondition;
     private final ReentrantLock signalLock = new ReentrantLock();
     private final Thread thread;
@@ -57,6 +58,7 @@ public final class QueryWorker {
     public QueryWorker(QwpQueryClient client, QueryClientPool pool, int slotIndex) {
         this.client = client;
         this.pool = pool;
+        this.query = new QueryImpl(this);
         this.signalCondition = signalLock.newCondition();
         this.thread = new Thread(this::runLoop, "questdb-query-worker-" + slotIndex);
         this.thread.setDaemon(true);
@@ -95,6 +97,25 @@ public final class QueryWorker {
      */
     public QwpQueryClient client() {
         return client;
+    }
+
+    /**
+     * Resets and returns this worker's pre-allocated {@link QueryImpl} as the
+     * borrowed lease. Called by {@link QuestDBImpl#borrowQuery()} right after
+     * {@link QueryClientPool#acquire()} hands this worker out. Zero-allocation:
+     * the handle is created once in the constructor and reused across borrows.
+     */
+    QueryImpl lease() {
+        query.resetForBorrow();
+        return query;
+    }
+
+    /**
+     * Returns this worker to the pool. Called by {@link QueryImpl#close()} when
+     * the borrowed lease is released.
+     */
+    void releaseToPool() {
+        pool.release(this);
     }
 
     void shutdown() {
@@ -140,8 +161,10 @@ public final class QueryWorker {
     }
 
     /**
-     * Hands a configured {@link QueryImpl} to this worker. The caller must
-     * have just acquired this worker via QueryClientPool#acquire(long).
+     * Hands a configured {@link QueryImpl} to this worker for execution. The
+     * worker is held by an open {@link io.questdb.client.Query} lease (see
+     * {@link #lease()}), so a lease may dispatch repeatedly (single-flight)
+     * until it is closed.
      */
     void dispatch(QueryImpl q) {
         signalLock.lock();
@@ -190,7 +213,6 @@ public final class QueryWorker {
                 q.signalUnexpected(t);
             } finally {
                 current = null;
-                pool.release(this);
             }
         }
     }

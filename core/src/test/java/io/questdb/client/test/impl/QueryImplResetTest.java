@@ -39,58 +39,52 @@ import java.lang.reflect.Method;
 public class QueryImplResetTest {
 
     /**
-     * Regression test for the state-carryover bug between consecutive
-     * submits on the per-thread {@code QuestDB#query()} handle.
+     * The Javadoc on both {@code Query} and {@code QuestDB#borrowQuery()}
+     * promises the leased handle is handed out "reset to empty". The reset is
+     * {@code QueryImpl.resetForBorrow()}, invoked from {@code QueryWorker.lease()}
+     * when {@code borrowQuery()} hands the pre-allocated handle out. It must
+     * clear the builder state (SQL, binds, handler) so a follow-up
+     * {@code submit()} cannot silently reuse a prior borrow's handler/binds,
+     * and it must mark the handle borrowed and idle.
      * <p>
-     * The Javadoc on both {@code Query} and {@code QuestDB#query()} promises
-     * that the returned instance is "reset to empty" / "in a reset state".
-     * Before the fix, {@code QuestDBImpl.query()} returned the bare
-     * thread-local without nulling {@code userHandler} / {@code userBinds},
-     * so the second call below would silently reuse {@code h1}:
-     * <pre>
-     *   db.query().sql("SELECT 1").handler(h1).submit().await();
-     *   db.query().sql("SELECT 2").submit();    // no .handler() -- reuses h1
-     * </pre>
-     * The {@code if (userHandler == null)} check in {@code submit()} could
-     * not catch the misuse because the field was still set from the prior
-     * submit.
-     * <p>
-     * The fix is {@code QueryImpl.resetIfDone()}, invoked from
-     * {@code QuestDBImpl.query()} before the per-thread handle is returned.
-     * This test reaches into {@code QueryImpl} via reflection (the class is
-     * package-private and lives in a different package from this test) and
-     * asserts the reset clears all three configured fields when the prior
-     * run is in a terminal state.
+     * Unlike the old per-thread {@code query()} reset, this one is
+     * unconditional: the leased worker was just acquired from the pool, so it
+     * is always idle (done) at borrow time. This test reaches into
+     * {@code QueryImpl} by reflection (the class is package-private and lives
+     * in a different package from this test).
      */
     @Test
-    public void testResetIfDoneClearsBuilderStateInTerminalState() throws Exception {
+    public void testResetForBorrowClearsBuilderState() throws Exception {
         Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
-        Class<?> poolClass = Class.forName("io.questdb.client.impl.QueryClientPool");
+        Class<?> workerClass = Class.forName("io.questdb.client.impl.QueryWorker");
 
-        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(poolClass);
+        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(workerClass);
         ctor.setAccessible(true);
-        // QueryImpl never dereferences the pool outside of submit(); a null
-        // pool is fine for this state-only test.
+        // resetForBorrow() never dereferences the worker; a null worker is fine
+        // for this state-only test.
         Query q = (Query) ctor.newInstance(new Object[]{null});
 
-        // Mirror the post-submit().await() state: builder fields set,
-        // done flag true (the constructor default).
+        // Configure builder state as a prior borrow would have left it.
         QwpColumnBatchHandler h = new NoopHandler();
         QwpBindSetter b = values -> {
             // no-op
         };
         q.sql("SELECT 1").binds(b).handler(h);
 
-        Method reset = queryImplClass.getDeclaredMethod("resetIfDone");
+        Method reset = queryImplClass.getDeclaredMethod("resetForBorrow");
         reset.setAccessible(true);
         reset.invoke(q);
 
         Field handlerF = queryImplClass.getDeclaredField("userHandler");
         Field bindsF = queryImplClass.getDeclaredField("userBinds");
         Field sqlBufF = queryImplClass.getDeclaredField("sqlBuffer");
+        Field borrowedF = queryImplClass.getDeclaredField("borrowed");
+        Field doneF = queryImplClass.getDeclaredField("done");
         handlerF.setAccessible(true);
         bindsF.setAccessible(true);
         sqlBufF.setAccessible(true);
+        borrowedF.setAccessible(true);
+        doneF.setAccessible(true);
 
         Assert.assertNull("userHandler must be cleared so a follow-up submit() without .handler() fails fast",
                 handlerF.get(q));
@@ -99,53 +93,10 @@ public class QueryImplResetTest {
         CharSequence sqlBuffer = (CharSequence) sqlBufF.get(q);
         Assert.assertEquals("sqlBuffer must be empty so a follow-up submit() without .sql() throws 'sql is required'",
                 0, sqlBuffer.length());
-    }
-
-    /**
-     * Symmetric guard: when a submit is in flight ({@code done == false}),
-     * {@code resetIfDone()} must NOT touch the configured fields. The
-     * dispatched worker thread is reading {@code sqlBuffer} in
-     * {@code runOn()} and {@code userHandler} via the wrapping handler;
-     * clearing them mid-flight would race.
-     */
-    @Test
-    public void testResetIfDoneIsNoOpWhileSubmitInFlight() throws Exception {
-        Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
-        Class<?> poolClass = Class.forName("io.questdb.client.impl.QueryClientPool");
-
-        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(poolClass);
-        ctor.setAccessible(true);
-        Query q = (Query) ctor.newInstance(new Object[]{null});
-
-        QwpColumnBatchHandler h = new NoopHandler();
-        QwpBindSetter b = values -> {
-            // no-op
-        };
-        q.sql("SELECT 1").binds(b).handler(h);
-
-        // Flip the in-flight flag by setting done=false directly.
-        Field doneF = queryImplClass.getDeclaredField("done");
-        doneF.setAccessible(true);
-        doneF.setBoolean(q, false);
-
-        Method reset = queryImplClass.getDeclaredMethod("resetIfDone");
-        reset.setAccessible(true);
-        reset.invoke(q);
-
-        Field handlerF = queryImplClass.getDeclaredField("userHandler");
-        Field bindsF = queryImplClass.getDeclaredField("userBinds");
-        Field sqlBufF = queryImplClass.getDeclaredField("sqlBuffer");
-        handlerF.setAccessible(true);
-        bindsF.setAccessible(true);
-        sqlBufF.setAccessible(true);
-
-        Assert.assertSame("userHandler must survive resetIfDone() while a submit is in flight",
-                h, handlerF.get(q));
-        Assert.assertSame("userBinds must survive resetIfDone() while a submit is in flight",
-                b, bindsF.get(q));
-        CharSequence sqlBuffer = (CharSequence) sqlBufF.get(q);
-        Assert.assertEquals("sqlBuffer must survive resetIfDone() while a submit is in flight",
-                "SELECT 1", sqlBuffer.toString());
+        Assert.assertTrue("borrowed must be set so submit() is allowed on the freshly leased handle",
+                borrowedF.getBoolean(q));
+        Assert.assertTrue("done must be true so the handle starts idle, not in flight",
+                doneF.getBoolean(q));
     }
 
     private static final class NoopHandler implements QwpColumnBatchHandler {

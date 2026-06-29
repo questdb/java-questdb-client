@@ -29,7 +29,6 @@ import io.questdb.client.impl.SenderPool;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Proxy;
 import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -246,10 +245,7 @@ public class SenderPoolErrorSafetyTest {
 
     private static SenderPool newPool(
             String cfg, int min, int max, long acquireMs, IntFunction<Sender> senderFactory
-    ) throws Exception {
-        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class, IntFunction.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
+    ) {
+        return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
     }
 }

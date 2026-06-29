@@ -49,7 +49,6 @@ public class QuestDBExamples {
         //    ingest and egress; list every node in one addr server list.
         try (QuestDB db = QuestDB.connect("ws::addr=node1:9000,node2:9000,node3:9000;")) {
             ingestWithBorrowedSender(db);
-            ingestWithThreadAffineSender(db);
             queryOneShot(db);
             queryWithBinds(db);
             cancelExample(db);
@@ -60,7 +59,9 @@ public class QuestDBExamples {
         try (QuestDB db = QuestDB.connect(
                 "wss::addr=db.questdb.cloud:9000;token=YOUR_TOKEN_HERE;")) {
             // ... use db ...
-            db.executeSql("SELECT 1", new PrintingHandler()).await();
+            try (Query q = db.borrowQuery()) {
+                q.sql("SELECT 1").handler(new PrintingHandler()).submit().await();
+            }
         }
 
         // 3. Custom pool sizing and timeouts via the builder. One cluster config
@@ -73,7 +74,9 @@ public class QuestDBExamples {
                 .acquireTimeoutMillis(10_000)
                 .build()) {
             // ... use db ...
-            db.executeSql("SELECT 1", new PrintingHandler()).await();
+            try (Query q = db.borrowQuery()) {
+                q.sql("SELECT 1").handler(new PrintingHandler()).submit().await();
+            }
         }
     }
 
@@ -84,15 +87,17 @@ public class QuestDBExamples {
      * returns normally; either way the Completion reaches a terminal state.
      */
     static void cancelExample(QuestDB db) {
-        Completion c = db.executeSql(
-                "SELECT * FROM big_table ORDER BY ts",
-                new PrintingHandler());
-        // ... some condition decides to abort ...
-        c.cancel();
-        try {
-            c.await();
-        } catch (Exception cancelled) {
-            // expected when cancel won the race
+        try (Query q = db.borrowQuery()) {
+            Completion c = q.sql("SELECT * FROM big_table ORDER BY ts")
+                    .handler(new PrintingHandler())
+                    .submit();
+            // ... some condition decides to abort ...
+            c.cancel();
+            try {
+                c.await();
+            } catch (Exception cancelled) {
+                // expected when cancel won the race
+            }
         }
     }
 
@@ -113,62 +118,42 @@ public class QuestDBExamples {
     }
 
     /**
-     * Thread-affine Sender: the first call on a thread leases one and pins it;
-     * subsequent calls on the same thread return the same instance with zero
-     * borrow overhead. Best for long-lived dedicated producer threads.
-     * <p>
-     * Call {@link QuestDB#releaseSender()} on threads borrowed from pools you
-     * don't own (Netty event loops, etc.) before they're recycled.
-     */
-    static void ingestWithThreadAffineSender(QuestDB db) {
-        Sender s = db.sender();
-        for (int i = 0; i < 1_000; i++) {
-            s.table("trades")
-                    .symbol("symbol", "BTC-USD")
-                    .doubleColumn("price", 42_500.50 + i)
-                    .longColumn("size", 100)
-                    .atNow();
-        }
-        s.flush();
-        // Not strictly required: db.close() reaps pinned Senders. Call it
-        // only when handing this thread back to a foreign pool.
-        // db.releaseSender();
-    }
-
-    /**
-     * One-shot query, no bind parameters. {@link QuestDB#executeSql} returns
-     * a {@link Completion} that you can {@code await()} synchronously, time
+     * One-shot query, no bind parameters. Borrow a {@link Query} handle,
+     * submit, await, and close it (try-with-resources). {@code submit()}
+     * returns a {@link Completion} you can {@code await()} synchronously, time
      * out on, or cancel.
      */
     static void queryOneShot(QuestDB db) throws InterruptedException {
-        Completion c = db.executeSql(
-                "SELECT price FROM trades WHERE symbol = 'BTC-USD' LIMIT 10",
-                new PrintingHandler());
-        c.await();
+        try (Query q = db.borrowQuery()) {
+            q.sql("SELECT price FROM trades WHERE symbol = 'BTC-USD' LIMIT 10")
+                    .handler(new PrintingHandler())
+                    .submit()
+                    .await();
+        }
     }
 
     /**
-     * Query with bind parameters. Use {@link QuestDB#query()} to get the
-     * per-thread Query builder, then set SQL, binds (via QwpBindSetter), and
-     * handler.
+     * Query with bind parameters. Borrow a {@link Query} handle, then set SQL,
+     * binds (via QwpBindSetter), and handler.
      * <p>
      * The same SQL text reuses the server's compiled-factory cache -- bind
      * values supply the per-call inputs. Interpolating values into the SQL
      * string defeats that cache.
      */
     static void queryWithBinds(QuestDB db) throws InterruptedException {
-        Query q = db.query()
-                .sql("SELECT price FROM trades WHERE symbol = $1 LIMIT $2")
-                .binds(binds -> {
-                    binds.setVarchar(0, "BTC-USD");
-                    binds.setLong(1, 10L);
-                })
-                .handler(new PrintingHandler());
-        Completion c = q.submit();
-        // Optional timeout: returns false if the query is still in flight.
-        if (!c.await(5, TimeUnit.SECONDS)) {
-            c.cancel();
-            c.await();
+        try (Query q = db.borrowQuery()) {
+            q.sql("SELECT price FROM trades WHERE symbol = $1 LIMIT $2")
+                    .binds(binds -> {
+                        binds.setVarchar(0, "BTC-USD");
+                        binds.setLong(1, 10L);
+                    })
+                    .handler(new PrintingHandler());
+            Completion c = q.submit();
+            // Optional timeout: returns false if the query is still in flight.
+            if (!c.await(5, TimeUnit.SECONDS)) {
+                c.cancel();
+                c.await();
+            }
         }
     }
 

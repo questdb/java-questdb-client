@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntList;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -138,7 +139,6 @@ public final class SenderPool implements AutoCloseable {
     private final Condition slotReleased;
     // True iff the configuration enables store-and-forward (sf_dir set).
     private final boolean storeAndForward;
-    private final ThreadLocal<PooledSender> threadAffine = new ThreadLocal<>();
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
     // flock drops, so the cap check and the slot allocator stay consistent
@@ -195,16 +195,17 @@ public final class SenderPool implements AutoCloseable {
             long maxLifetimeMillis
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, null);
+                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null);
     }
 
-    // Package-private constructor exposing the senderFactory test seam:
-    // production passes null (-> the real defaultSender()). White-box tests in
-    // io.questdb.client.test.impl reach this by reflection to inject a factory
-    // that throws a non-RuntimeException Throwable mid-prewarm. Recovery runs
-    // inline here (deferStartupRecovery=false); the pooled QuestDB handle uses
-    // the 8-arg overload to defer it to the housekeeper thread.
-    SenderPool(
+    // Test-only constructor exposing the senderFactory seam: production builds
+    // via the full constructor below (senderFactory null -> the real
+    // defaultSender()). White-box tests inject a factory that throws a
+    // non-RuntimeException Throwable mid-prewarm. Recovery runs inline here
+    // (deferStartupRecovery=false); the pooled QuestDB handle uses the 8-arg
+    // overload to defer it to the housekeeper thread.
+    @TestOnly
+    public SenderPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -217,14 +218,16 @@ public final class SenderPool implements AutoCloseable {
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory, false);
     }
 
-    // Full constructor. deferStartupRecovery=true skips the inline,
-    // construction-time SF recovery (recoverOneSlotStep) so
-    // QuestDB.build() never blocks on a slow or reachable-but-not-acking
-    // server; the owner (QuestDBImpl) then drives recovery one slot per tick on
-    // the PoolHousekeeper thread via runStartupRecoveryStep(). The in-range
-    // recovery pass is concurrency-safe against borrow()/return on that
+    // Test-only constructor adding the deferStartupRecovery toggle.
+    // deferStartupRecovery=true skips the inline, construction-time SF recovery
+    // (recoverOneSlotStep) so QuestDB.build() never blocks on a slow or
+    // reachable-but-not-acking server; the owner (QuestDBImpl) then drives
+    // recovery one slot per tick on the PoolHousekeeper thread via
+    // runStartupRecoveryStep(). White-box SF tests call this directly; the
+    // in-range recovery pass is concurrency-safe against borrow()/return on the
     // deferred path -- see recoverOneSlotStep().
-    SenderPool(
+    @TestOnly
+    public SenderPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -241,8 +244,9 @@ public final class SenderPool implements AutoCloseable {
 
     // Full constructor adding the user-supplied ingest callbacks (error handler
     // and connection listener), applied to every Sender the pool builds (see
-    // buildManagedSlotSender). The 8-arg overload above is the unchanged
-    // white-box test seam and delegates here with null callbacks.
+    // buildManagedSlotSender). The public 6-arg ctor and the test-only
+    // senderFactory overloads above both delegate here with null callbacks; the
+    // pooled QuestDB handle calls this directly.
     SenderPool(
             String configurationString,
             int minSize,
@@ -760,14 +764,6 @@ public final class SenderPool implements AutoCloseable {
             // Raise the shutdown signal too (a direct, non-pooled caller may
             // close() without a prior markClosing()); harmless if already set.
             closed = true;
-            // Mark every pooled wrapper invalidated so pinToCurrentThread()
-            // on other threads -- which never takes this lock -- can detect
-            // that its cached entry no longer wraps a live delegate. Removing
-            // the calling thread's ThreadLocal only clears one slot; other
-            // threads' slots survive until they read the flag.
-            for (int i = 0; i < all.size(); i++) {
-                all.get(i).markInvalidated();
-            }
             // Snapshot under the lock so the delegate-close loop below is
             // immune to concurrent mutation of `all`. discardBroken running
             // on another thread can still bail thanks to the `closed` check
@@ -775,7 +771,6 @@ public final class SenderPool implements AutoCloseable {
             // future code path that mutates `all` outside this lock's
             // happens-before chain.
             snapshot = all.toArray(new PooledSender[0]);
-            threadAffine.remove();
             slotReleased.signalAll();
         } finally {
             lock.unlock();
@@ -793,26 +788,10 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
-     * Clears the current thread's pin if it currently references {@code s}.
-     * Invoked from {@link PooledSender#close()} before the wrapper is
-     * returned to the pool, so a subsequent {@link #pinToCurrentThread()}
-     * on this thread cannot hand the wrapper back after another consumer
-     * has borrowed the slot. No-op when the caller never pinned, or pinned
-     * a different wrapper.
-     */
-    void clearPinIfCurrent(PooledSender s) {
-        if (threadAffine.get() == s) {
-            threadAffine.remove();
-        }
-    }
-
-    /**
      * Evicts a slot whose delegate has failed (typically a {@code flush()}
-     * failure observed in {@link PooledSender#close()}). The wrapper is
-     * marked invalidated so any thread-pinned reference gets rejected on the
-     * next {@link #pinToCurrentThread()} call; the slot is removed from
-     * {@code all} so the pool can grow back into a fresh slot on demand. The
-     * underlying delegate is closed outside the lock so a slow real-close
+     * failure observed in {@link PooledSender#close()}). The slot is removed
+     * from {@code all} so the pool can grow back into a fresh slot on demand.
+     * The underlying delegate is closed outside the lock so a slow real-close
      * does not stall other borrowers.
      * <p>
      * Bails when the pool is already closed: {@link #close()} owns the
@@ -822,7 +801,6 @@ public final class SenderPool implements AutoCloseable {
      * double-close on a delegate {@code close()} has already shut down.
      */
     void discardBroken(PooledSender s) {
-        s.markInvalidated();
         boolean reserved = false;
         lock.lock();
         try {
@@ -887,19 +865,6 @@ public final class SenderPool implements AutoCloseable {
         } finally {
             lock.unlock();
         }
-    }
-
-    public PooledSender pinToCurrentThread() {
-        PooledSender pinned = threadAffine.get();
-        if (pinned != null && !pinned.isInvalidated()) {
-            return pinned;
-        }
-        if (pinned != null) {
-            threadAffine.remove();
-        }
-        PooledSender s = borrow();
-        threadAffine.set(s);
-        return s;
     }
 
     /**
@@ -1010,19 +975,6 @@ public final class SenderPool implements AutoCloseable {
         } finally {
             lock.unlock();
         }
-    }
-
-    public void releaseCurrentThread() {
-        PooledSender pinned = threadAffine.get();
-        if (pinned == null) {
-            return;
-        }
-        threadAffine.remove();
-        if (pinned.isInvalidated()) {
-            // Pool was closed: delegate is already closed, skip flush/giveBack.
-            return;
-        }
-        pinned.close();
     }
 
     private PooledSender createUnlocked(int slotIndex) {

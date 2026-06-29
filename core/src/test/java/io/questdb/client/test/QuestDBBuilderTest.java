@@ -150,7 +150,7 @@ public class QuestDBBuilderTest {
         assertSchemaRejected(() -> QuestDB.builder().fromConfig("http::addr=h:9000;"));
         assertSchemaRejected(() -> QuestDB.builder().fromConfig("tcp::addr=h:9009;"));
         assertSchemaRejected(() -> QuestDB.builder().fromConfig("udp::addr=h:9009;"));
-        assertSchemaRejected(() -> QuestDB.connect("http::addr=h:9000;"));
+        assertSchemaRejected(() -> QuestDB.connect("http::addr=h:9000;").close());
     }
 
     @Test
@@ -219,7 +219,9 @@ public class QuestDBBuilderTest {
                     + "sender_pool_min=1;sender_pool_max=2;query_pool_min=1;query_pool_max=2;"; // pool
             try (QuestDB db = QuestDB.builder().fromConfig(cfg).build()) {
                 Assert.assertNotNull(db.borrowSender());
-                Assert.assertNotNull(db.query());
+                try (io.questdb.client.Query q = db.borrowQuery()) {
+                    Assert.assertNotNull(q);
+                }
             }
         }
     }

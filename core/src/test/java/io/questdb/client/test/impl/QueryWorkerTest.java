@@ -75,7 +75,6 @@ public class QueryWorkerTest {
     @Test(timeout = 30_000)
     public void testShutdownRacingDispatchMustNotStrandCaller() throws Exception {
         Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
-        Class<?> poolClass = Class.forName("io.questdb.client.impl.QueryClientPool");
 
         Field lockF = QueryWorker.class.getDeclaredField("signalLock");
         Field condF = QueryWorker.class.getDeclaredField("signalCondition");
@@ -123,7 +122,7 @@ public class QueryWorkerTest {
 
         // Construct a QueryImpl with done=false, mimicking the state set up
         // by QueryImpl.submit() just before it calls worker.dispatch().
-        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(poolClass);
+        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(QueryWorker.class);
         ctor.setAccessible(true);
         Object queryImpl = ctor.newInstance(new Object[]{null});
         doneF.setBoolean(queryImpl, false);

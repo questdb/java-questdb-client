@@ -24,8 +24,6 @@
 
 package io.questdb.client;
 
-import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-
 import java.io.Closeable;
 
 /**
@@ -34,9 +32,9 @@ import java.io.Closeable;
  * share across threads.
  * <p>
  * Steady-state allocation is zero: pooled instances are pre-allocated and
- * reused, the per-thread {@link Query} handle is cached in a {@code ThreadLocal},
- * and the {@link Completion} associated with each query is a field on that
- * cached handle.
+ * reused, each borrowed {@link Query} handle is a pre-allocated front bound to
+ * its pool slot, and the {@link Completion} associated with each query is a
+ * field on that handle.
  * <p>
  * Configuration: one {@code ws}/{@code wss} string describes the whole cluster
  * (a single {@code addr} server list) and both the ingest and query pools
@@ -47,7 +45,7 @@ import java.io.Closeable;
  * is up).
  * <p>
  * Thread safety: instances are safe to share. {@link #borrowSender()} and
- * {@link #query()} may be called concurrently from any thread; the pool
+ * {@link #borrowQuery()} may be called concurrently from any thread; the pool
  * guarantees mutual exclusion of pooled resources.
  */
 public interface QuestDB extends Closeable {
@@ -79,6 +77,31 @@ public interface QuestDB extends Closeable {
     static QuestDB connect(CharSequence configurationString) {
         return builder().fromConfig(configurationString).build();
     }
+
+    /**
+     * Borrows a {@link Query} handle from the pool. The caller MUST call
+     * {@link Query#close()} on the returned instance to release it back to the
+     * pool (typically via try-with-resources). The handle leases one pooled
+     * query client (one WebSocket + I/O thread) for the borrow's lifetime;
+     * submit one or more queries on it, then close it.
+     * <p>
+     * Allocation: zero at steady state -- the returned instance is a
+     * pre-allocated handle bound to the leased pool slot.
+     * <p>
+     * Blocking: blocks up to the builder's
+     * {@link QuestDBBuilder#acquireTimeoutMillis(long) acquire timeout} when
+     * the pool is exhausted; throws on timeout.
+     * <p>
+     * Concurrency: a single handle is single-flight. To run queries
+     * concurrently, borrow one handle per concurrent query (up to
+     * {@code query_pool_max}).
+     *
+     * @return a Query handle leased from the pool; release with
+     * {@link Query#close()}
+     * @throws QueryException if the pool is exhausted beyond the acquire
+     *                        timeout, or if this handle is closed
+     */
+    Query borrowQuery();
 
     /**
      * Borrows a {@link Sender} from the pool. The caller MUST call
@@ -114,61 +137,4 @@ public interface QuestDB extends Closeable {
      */
     @Override
     void close();
-
-    /**
-     * One-shot convenience for queries with no bind parameters. Equivalent to
-     * {@code query().sql(sql).handler(handler).submit()}. Returns the same
-     * thread-local {@link Completion} instance that {@link #query()} would,
-     * so this method is also zero-allocation at steady state.
-     *
-     * @param sql     the SQL text; the buffer is not retained after submit
-     * @param handler the result-batch handler; invoked on the pooled query
-     *                client's I/O thread
-     * @return a single-flight handle for the in-flight query
-     */
-    Completion executeSql(CharSequence sql, QwpColumnBatchHandler handler);
-
-    /**
-     * Allocates a fresh {@link Query} handle. Unlike {@link #query()}, this
-     * does NOT return the per-thread cached instance; every call allocates.
-     * <p>
-     * Use this when one thread needs to hold multiple in-flight queries
-     * concurrently (each {@code submit()} acquires its own worker from the
-     * query pool, so up to {@code queryPoolSize} concurrent queries on a
-     * single thread is fine). For the common case of one query at a time,
-     * prefer {@link #query()} -- it is allocation-free.
-     */
-    Query newQuery();
-
-    /**
-     * Opens a query builder for the calling thread. Returns the same
-     * thread-local instance on every call: callers do not need to cache it
-     * themselves. The returned {@code Query} is in a reset state and is not
-     * thread-safe -- one in-flight query per thread.
-     * <p>
-     * For multiple concurrent in-flight queries from a single thread, use
-     * {@link #newQuery()} instead.
-     */
-    Query query();
-
-    /**
-     * Releases the thread-affine {@link Sender} (if any) currently attached
-     * to the calling thread back to the pool. Call this on threads borrowed
-     * from pools you do not own (for example, Netty event loops) before they
-     * are recycled, to avoid pinning a {@link Sender} for the lifetime of
-     * a thread that no longer needs it.
-     */
-    void releaseSender();
-
-    /**
-     * Returns a {@link Sender} pinned to the calling thread. First call on
-     * a thread takes one from the pool and pins it; subsequent calls on the
-     * same thread return the same instance. The pin is released by
-     * {@link #releaseSender()} or by {@link #close()} on this handle.
-     * <p>
-     * Use this for long-lived, dedicated producer threads where borrow/return
-     * overhead would dominate. For short-lived or event-loop callers, prefer
-     * {@link #borrowSender()}.
-     */
-    Sender sender();
 }

@@ -27,19 +27,27 @@ package io.questdb.client;
 import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 
+import java.io.Closeable;
+
 /**
- * Per-thread, reusable builder for one query. Obtained from
- * {@link QuestDB#query()}: every call on the same thread returns the same
- * instance, reset to empty.
+ * A query handle leased from the {@link QuestDB} pool via
+ * {@link QuestDB#borrowQuery()}. The handle holds one pooled query client (one
+ * WebSocket + I/O thread) for the lifetime of the borrow; the caller MUST
+ * {@link #close()} it to release the client back to the pool (typically via
+ * try-with-resources).
+ * <p>
+ * Allocation: zero at steady state -- {@code borrowQuery()} returns a
+ * pre-allocated handle bound to the leased pool slot, and the
+ * {@link Completion} is a field on it reused across submits.
  * <p>
  * Lifecycle: configure with {@link #sql}, optional {@link #binds}, and
- * {@link #handler}, then call {@link #submit()} to obtain a {@link Completion}.
- * After the Completion terminates, the next {@code QuestDB.query()} call on
- * the same thread returns this same instance with its state reset.
+ * {@link #handler}, then call {@link #submit()} to obtain a {@link Completion}
+ * and {@code await()} it before the next {@link #submit()}.
  * <p>
- * Thread safety: not thread-safe. One in-flight query per thread.
+ * Thread safety: not thread-safe and single-flight -- one in-flight query per
+ * handle. To run queries concurrently, borrow one handle per concurrent query.
  */
-public interface Query {
+public interface Query extends Closeable {
 
     /** Discards the current configuration without submitting. */
     void abandon();
@@ -51,6 +59,16 @@ public interface Query {
      * field) to keep submission zero-allocation.
      */
     Query binds(QwpBindSetter binds);
+
+    /**
+     * Releases the leased pooled query client back to the pool. The caller
+     * MUST call this (typically via try-with-resources). If a submit is still
+     * in flight, {@code close()} cancels it and waits for the terminal event
+     * before returning the client. A real disconnect only happens at
+     * {@link QuestDB#close()}. Idempotent.
+     */
+    @Override
+    void close();
 
     /**
      * Sets the result-batch handler. The handler is invoked on the pooled
@@ -65,11 +83,12 @@ public interface Query {
     Query sql(CharSequence sql);
 
     /**
-     * Submits the query for execution. Returns the {@link Completion} field
-     * cached on this instance; never allocates. Blocks up to the builder's
-     * configured acquire timeout if the query pool is exhausted.
+     * Submits the query for execution on the leased client. Returns the
+     * {@link Completion} field cached on this handle; never allocates. The
+     * handle is single-flight: {@code await()} the returned Completion before
+     * the next {@code submit()}.
      *
-     * @return the single-flight Completion bound to this Query instance
+     * @return the single-flight Completion bound to this Query handle
      */
     Completion submit();
 }

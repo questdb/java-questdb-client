@@ -40,24 +40,26 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Per-thread implementation of {@link Query}. Holds the configured query
- * state (SQL, optional binds, handler), an inner {@link Completion}, and a
- * wrapping {@link QwpColumnBatchHandler} that forwards callbacks to the user
- * handler and signals the Completion on terminal events.
+ * Implementation of {@link Query}: the pooled lease handle. One instance is
+ * pre-allocated per {@link QueryWorker} and reused across borrows. Holds the
+ * configured query state (SQL, optional binds, handler), an inner
+ * {@link Completion}, and a wrapping {@link QwpColumnBatchHandler} that forwards
+ * callbacks to the user handler and signals the Completion on terminal events.
  * <p>
- * Lifecycle: {@link QuestDBImpl#query()} returns a per-thread instance, reset
- * to empty if it was in a terminal state. {@link #submit()} acquires a
- * worker, dispatches, and returns the cached {@link Completion}.
+ * Lifecycle: {@link QueryWorker#lease()} resets this handle and hands it out
+ * when {@link QuestDBImpl#borrowQuery()} acquires the worker. {@link #submit()}
+ * dispatches on the held worker (single-flight) and returns the cached
+ * {@link Completion}; {@link #close()} returns the worker to the pool.
  */
 final class QueryImpl implements Query {
 
     private final InnerCompletion completion = new InnerCompletion();
     private final Condition doneCondition;
     private final ReentrantLock doneLock = new ReentrantLock();
-    private final QueryClientPool pool;
     private final StringSink sqlBuffer = new StringSink();
+    private final QueryWorker worker;
     private final WrappingHandler wrappingHandler = new WrappingHandler();
-    private volatile QueryWorker currentWorker;
+    private boolean borrowed;
     private volatile boolean done = true;
     private volatile String resultMessage;
     private volatile byte resultStatus;
@@ -66,8 +68,8 @@ final class QueryImpl implements Query {
     private final QwpBindSetter wireBinds = this::applyBinds;
     private QwpColumnBatchHandler userHandler;
 
-    QueryImpl(QueryClientPool pool) {
-        this.pool = pool;
+    QueryImpl(QueryWorker worker) {
+        this.worker = worker;
         this.doneCondition = doneLock.newCondition();
     }
 
@@ -88,6 +90,30 @@ final class QueryImpl implements Query {
     }
 
     @Override
+    public void close() {
+        if (!borrowed) {
+            return;
+        }
+        // If a submit is still in flight (the caller did not await), cancel it
+        // and wait for the terminal event so the leased worker is idle before
+        // it returns to the pool -- otherwise the next borrower would inherit a
+        // running execute().
+        if (!done) {
+            worker.cancelInFlight();
+            doneLock.lock();
+            try {
+                while (!done) {
+                    doneCondition.awaitUninterruptibly();
+                }
+            } finally {
+                doneLock.unlock();
+            }
+        }
+        borrowed = false;
+        worker.releaseToPool();
+    }
+
+    @Override
     public Query handler(QwpColumnBatchHandler handler) {
         this.userHandler = handler;
         return this;
@@ -102,6 +128,9 @@ final class QueryImpl implements Query {
 
     @Override
     public Completion submit() {
+        if (!borrowed) {
+            throw new IllegalStateException("query handle is not borrowed (closed or never leased)");
+        }
         if (sqlBuffer.length() == 0) {
             throw new IllegalStateException("sql is required");
         }
@@ -111,7 +140,6 @@ final class QueryImpl implements Query {
         if (!done) {
             throw new IllegalStateException("a previous submit() is still in flight; await the Completion first");
         }
-        QueryWorker w = pool.acquire();
         // Reset terminal state under the lock so a stale signal from a prior
         // run can't be observed by the upcoming await().
         doneLock.lock();
@@ -120,11 +148,10 @@ final class QueryImpl implements Query {
             resultStatus = 0;
             resultMessage = null;
             unexpectedError = null;
-            currentWorker = w;
         } finally {
             doneLock.unlock();
         }
-        w.dispatch(this);
+        worker.dispatch(this);
         return completion;
     }
 
@@ -145,7 +172,6 @@ final class QueryImpl implements Query {
             this.resultMessage = message;
             this.unexpectedError = unexpected;
             this.done = true;
-            this.currentWorker = null;
             doneCondition.signalAll();
         } finally {
             doneLock.unlock();
@@ -153,19 +179,22 @@ final class QueryImpl implements Query {
     }
 
     /**
-     * Drops any prior builder state (SQL, binds, handler) if no submit is
-     * currently in flight. {@link QuestDBImpl#query()} invokes this before
-     * returning the per-thread instance so callers see the "reset to empty"
-     * contract documented on {@link io.questdb.client.Query} regardless of
-     * whether the previous use ended at a terminal handler callback or at
-     * {@link #abandon()}.
+     * Resets builder state to empty and marks this handle borrowed. Called by
+     * {@link QueryWorker#lease()} when {@link QuestDBImpl#borrowQuery()} hands
+     * the pre-allocated handle out, so each borrow starts from the documented
+     * "reset to empty" contract on {@link io.questdb.client.Query}. The leased
+     * worker is idle at this point (just acquired from the pool), so the reset
+     * is unconditional.
      */
-    void resetIfDone() {
-        if (done) {
-            userBinds = null;
-            userHandler = null;
-            sqlBuffer.clear();
-        }
+    void resetForBorrow() {
+        userBinds = null;
+        userHandler = null;
+        sqlBuffer.clear();
+        resultStatus = 0;
+        resultMessage = null;
+        unexpectedError = null;
+        done = true;
+        borrowed = true;
     }
 
     void runOn(QwpQueryClient client) {
@@ -220,9 +249,8 @@ final class QueryImpl implements Query {
 
         @Override
         public void cancel() {
-            QueryWorker w = currentWorker;
-            if (w != null && !done) {
-                w.cancelInFlight();
+            if (!done) {
+                worker.cancelInFlight();
             }
         }
 

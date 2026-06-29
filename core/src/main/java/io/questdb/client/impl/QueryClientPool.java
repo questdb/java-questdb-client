@@ -26,6 +26,7 @@ package io.questdb.client.impl;
 
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -89,11 +90,12 @@ public final class QueryClientPool implements AutoCloseable {
                 idleTimeoutMillis, maxLifetimeMillis, null);
     }
 
-    // Package-private constructor exposing the connectHook test seam: production
-    // passes null (-> the real QwpQueryClient.connect()). White-box tests in
-    // io.questdb.client.test.impl reach this by reflection to inject a hook that
-    // throws a non-RuntimeException Throwable from the native connect path.
-    QueryClientPool(
+    // Constructor exposing the connectHook seam. Production (QuestDBImpl) passes
+    // null -> the real QwpQueryClient.connect(); white-box tests pass a hook that
+    // throws a non-RuntimeException Throwable from the native connect path. This
+    // is the construction path QuestDBImpl uses, so it is a real (public) ctor,
+    // not test-only.
+    public QueryClientPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -106,13 +108,12 @@ public final class QueryClientPool implements AutoCloseable {
                 idleTimeoutMillis, maxLifetimeMillis, connectHook, null);
     }
 
-    // Package-private constructor exposing both the connectHook and startHook
-    // test seams: production passes null for each (-> the real
-    // QwpQueryClient.connect() and QueryWorker.start()). White-box tests in
-    // io.questdb.client.test.impl reach this by reflection to inject a hook that
-    // throws a Throwable from either the native connect path (connectHook) or
-    // the worker thread-start path (startHook).
-    QueryClientPool(
+    // Constructor exposing both the connectHook and startHook seams. Production
+    // reaches it via the overload above (both null -> the real
+    // QwpQueryClient.connect() and QueryWorker.start()); white-box tests pass a
+    // hook that throws a Throwable from either the native connect path
+    // (connectHook) or the worker thread-start path (startHook).
+    public QueryClientPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -355,11 +356,12 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
-    // Package-private white-box accessor for tests: reports the current
-    // in-flight creation count under the pool lock. A non-zero value after a
-    // failed acquire() means the slot reservation was never released -- the
-    // capacity-shrink bug this guards against.
-    int inFlightCreations() {
+    // White-box accessor for tests: reports the current in-flight creation count
+    // under the pool lock. A non-zero value after a failed acquire() means the
+    // slot reservation was never released -- the capacity-shrink bug this guards
+    // against.
+    @TestOnly
+    public int inFlightCreations() {
         lock.lock();
         try {
             return inFlightCreations;
