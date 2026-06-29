@@ -235,6 +235,17 @@ public final class QueryWorker {
                     return;
                 }
                 q = current;
+                // Clear the hand-off slot under signalLock, at the moment of
+                // consumption -- NOT after runOn() returns. A lease is
+                // single-flight but reused: the user thread loops submit() ->
+                // await() on the same handle. The terminal callback inside
+                // runOn() wakes the user thread, which can call submit() ->
+                // dispatch() (current = q; signal) before this worker thread
+                // returns from runOn(). Clearing current after runOn() would
+                // race that dispatch, clobber the freshly-set job, drop its
+                // already-consumed signal, and park the worker forever while
+                // the user thread waits on a Completion that never fires.
+                current = null;
             } finally {
                 signalLock.unlock();
             }
@@ -242,8 +253,6 @@ public final class QueryWorker {
                 q.runOn(client);
             } catch (Throwable t) {
                 q.signalUnexpected(t);
-            } finally {
-                current = null;
             }
         }
     }
