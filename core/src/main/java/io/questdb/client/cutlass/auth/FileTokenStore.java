@@ -191,11 +191,22 @@ public final class FileTokenStore implements TokenStore {
 
     @Override
     public void clear(TokenStoreKey key) {
-        try {
-            Files.deleteIfExists(tokenFile(key));
-        } catch (IOException e) {
-            throw new OidcAuthException(e).put("could not remove the OIDC token store file");
+        if (!Files.isDirectory(directory)) {
+            return; // nothing is persisted yet; do not create the directory just to clear it
         }
+        // delete under the cross-process lock, like the read-refresh-write, so a peer's in-flight refresh
+        // cannot resurrect the entry by atomically renaming a fresh file in just after we delete. inLock cleans
+        // up its own lock file and degrades to lock-free if it cannot acquire one. Cross-process clear is still
+        // best-effort: a peer holding a live in-memory token may legitimately re-persist later - clearing forces
+        // a fresh sign-in for THIS process regardless, since the caller resets its in-memory token state.
+        inLock(key, () -> {
+            try {
+                Files.deleteIfExists(tokenFile(key));
+            } catch (IOException e) {
+                throw new OidcAuthException(e).put("could not remove the OIDC token store file");
+            }
+            return true;
+        });
     }
 
     @Override
@@ -295,14 +306,6 @@ public final class FileTokenStore implements TokenStore {
         return fileHasValue && Chars.equals(keyValue, fileValue);
     }
 
-    private static long parseLongOrZero(CharSequence value) {
-        try {
-            return Numbers.parseLong(value);
-        } catch (NumericException e) {
-            return 0;
-        }
-    }
-
     private static PersistedToken parseAndVerify(TokenStoreKey key, byte[] bytes) {
         if (bytes.length == 0) {
             return null;
@@ -337,6 +340,14 @@ public final class FileTokenStore implements TokenStore {
         String idToken = parser.idToken.length() > 0 ? parser.idToken.toString() : null;
         String refreshToken = parser.refreshToken.length() > 0 ? parser.refreshToken.toString() : null;
         return new PersistedToken(accessToken, idToken, refreshToken, parser.expiresAtMillis, parser.tokenTtlMillis);
+    }
+
+    private static long parseLongOrZero(CharSequence value) {
+        try {
+            return Numbers.parseLong(value);
+        } catch (NumericException e) {
+            return 0;
+        }
     }
 
     private static void putBooleanMember(StringSink sink, String name, boolean value) {

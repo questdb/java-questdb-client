@@ -57,6 +57,35 @@ public class OidcDeviceAuthPersistenceTest {
     public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
 
     @Test(timeout = 30_000)
+    public void testAdoptDerivesTtlFromExpiry() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-FRESH", "REFRESH-FRESH", "ACCESS-2", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // a (tampered) entry whose stored ttl (5m) disagrees with its absolute expiry (now + 10m).
+                // adopt() must derive the trusted lifetime from the authoritative expiry, not the stored ttl, so
+                // the effectiveSkewMillis basis matches the real remaining lifetime
+                long now = System.currentTimeMillis();
+                fake.loadReturns = new PersistedToken("ACCESS-1", null, "REFRESH-1", now + 600_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("the still-valid persisted token is served", "ACCESS-1", auth.signIn());
+                    long ttl = readPrivateLong(auth, "tokenTtlMillis");
+                    long expiry = readPrivateLong(auth, "expiresAtMillis");
+                    Assert.assertTrue("ttl must be derived from the ~10m expiry, not the stored 5m: " + ttl,
+                            ttl >= 9 * 60_000L);
+                    Assert.assertTrue("ttl must not exceed the clamped 1h lifetime: " + ttl, ttl <= 60 * 60_000L);
+                    Assert.assertTrue("ttl must match expiresAtMillis - now within tolerance",
+                            Math.abs(ttl - (expiry - now)) < 5_000L);
+                }
+                Assert.assertEquals("no device flow for a valid persisted token", 0, device.get());
+                Assert.assertEquals("no refresh for a valid persisted token", 0, token.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testBuilderRejectsHttpTimeoutAboveCap() throws Exception {
         assertMemoryLeak(() -> {
             // the HTTP timeout is capped (120s): a token-endpoint round-trip never needs longer, and bounding

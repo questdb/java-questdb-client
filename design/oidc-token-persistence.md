@@ -337,6 +337,10 @@ serving — but it defeats *sharing*, leaving each client to re-prompt).
   encoding under which every present value round-trips verbatim (a token equal to the string
   `"null"` included); a reader treats an absent field as null. The Python client MUST do the
   same: omit null fields on write, and treat an absent field as null on read.
+
+  The document MUST be a single flat JSON object. A reader rejects any other shape - an array
+  anywhere (for example a top-level `[ {…} ]` wrapper) or a non-object root - rather than
+  extract fields from a malformed structure. The Python client MUST do the same.
 - **Write protocol (atomicity):** write a sibling temp file created with 0600, flush, then
   **atomically rename** over the target — Java `Files.move(tmp, target, ATOMIC_MOVE,
   REPLACE_EXISTING)`, Python `os.replace(tmp, target)`. Both are `rename(2)` on POSIX

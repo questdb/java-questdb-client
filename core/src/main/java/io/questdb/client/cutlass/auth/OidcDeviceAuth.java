@@ -1038,8 +1038,13 @@ public class OidcDeviceAuth implements QuietCloseable {
         // positive and serve a garbage-expiry token as valid forever. An already-expired entry still reads as
         // expired and falls through to a refresh rather than being served.
         long maxTokenLifeMillis = MAX_EXPIRES_IN_SECONDS * 1000L;
-        tokenTtlMillis = Math.max(0L, Math.min(token.getTokenTtlMillis(), maxTokenLifeMillis));
-        expiresAtMillis = Math.max(0L, Math.min(token.getExpiresAtMillis(), System.currentTimeMillis() + maxTokenLifeMillis));
+        long now = System.currentTimeMillis();
+        expiresAtMillis = Math.max(0L, Math.min(token.getExpiresAtMillis(), now + maxTokenLifeMillis));
+        // derive the trusted lifetime from the clamped absolute expiry, not the file's separately-stored ttl, so
+        // a tampered file cannot make the two disagree and throw off effectiveSkewMillis (which caps the skew at
+        // half the lifetime); for a legitimate file the two already agree, and the expiry clamp bounds this to
+        // [0, maxLife]
+        tokenTtlMillis = Math.max(0L, expiresAtMillis - now);
         // it is already on disk, so a later non-rotating refresh must not rewrite the file
         lastPersistedRefreshToken = refreshToken;
         return true;

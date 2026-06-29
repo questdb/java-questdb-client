@@ -171,6 +171,18 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testClearOnEmptyStoreIsNoOp() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir(); // a non-existent subdirectory
+            FileTokenStore store = new FileTokenStore(dir);
+            // clearing an identity that was never saved must be a no-op and must not create the store directory
+            // just to run the now-locked delete
+            store.clear(sampleKey());
+            Assert.assertFalse("clear must not create the store directory", Files.exists(dir));
+        });
+    }
+
+    @Test
     public void testControlCharactersRoundTrip() throws Exception {
         assertMemoryLeak(() -> {
             FileTokenStore store = new FileTokenStore(storeDir());
