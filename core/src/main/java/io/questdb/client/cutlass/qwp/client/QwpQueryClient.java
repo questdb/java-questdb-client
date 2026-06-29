@@ -1771,12 +1771,21 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     private void runUpgradeWithTimeout(Endpoint ep) {
+        // Connect first, OUTSIDE the upgrade try. A connect-phase failure --
+        // including a connect_timeout overage flagged via flagAsTimeout() -- must
+        // keep its own message ("connect timed out ...") and must NOT be relabeled
+        // as an auth_timeout overage below. doConnect() tears down its own socket
+        // on failure; the failover walker treats the propagated HttpClientException
+        // as a transport error and moves on to the next endpoint.
+        webSocketClient.connect(ep.host, ep.port);
+
         int timeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
         try {
-            webSocketClient.connect(ep.host, ep.port);
             webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authorizationHeader);
         } catch (HttpClientException ex) {
             if (ex.isTimeout()) {
+                // Reachable only for an upgrade/auth-phase timeout now, so the
+                // auth_timeout attribution is accurate.
                 HttpClientException timeout = new HttpClientException("WebSocket upgrade to ")
                         .put(ep.host).put(':').put(ep.port)
                         .put(" exceeded auth_timeout=").put(authTimeoutMs).put("ms");
