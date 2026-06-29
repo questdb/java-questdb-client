@@ -47,6 +47,8 @@ import io.questdb.client.std.str.StringSink;
 
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -94,7 +96,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * extend that wait by however long it runs).
  * <p>
  * Instances are interactive and hold a network connection; close them when done. Token state is
- * in-memory only and does not survive a process restart.
+ * in-memory only by default; pass a {@link TokenStore} (via {@link Builder#tokenStore(TokenStore)} or
+ * {@link DiscoveryOptions#tokenStore(TokenStore)}) to persist it across process restarts, so a restarted
+ * process resumes from a saved refresh token instead of running the interactive flow again.
  */
 public class OidcDeviceAuth implements QuietCloseable {
     public static final String DEFAULT_SCOPE = "openid";
@@ -132,6 +136,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     // upper bound on the token cache lifetime (the token response's expires_in), so an absurd or hostile
     // value cannot overflow the timing arithmetic or make the client trust a token for absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
+    // upper bound on the configurable HTTP request timeout. A token-endpoint round-trip never needs longer,
+    // and bounding it keeps a refresh held under the FileTokenStore cross-process lock (send + await + parse,
+    // plus a body drain on a parse failure - each separately bounded by this, so up to ~4x this) safely
+    // shorter than that store's lock-staleness window, so a slow refresh's live lock is not stolen by a peer
+    private static final int MAX_HTTP_TIMEOUT_MILLIS = 120_000;
     // upper bound on the poll interval, both the initial value and the growth after a slow_down or 429, so
     // a hostile or buggy provider cannot stall the poll loop; matches the Python client
     private static final int MAX_POLL_INTERVAL_SECONDS = 60;
@@ -159,16 +168,20 @@ public class OidcDeviceAuth implements QuietCloseable {
     private final DeviceCodePrompt prompt;
     private final StringSink responseStatus = new StringSink();
     private final String scopeEncoded;
+    private final TokenStoreKey storeKey;
     private final ClientTlsConfiguration tlsConfig;
     private final Endpoint tokenEndpoint;
     private final TokenResponseParser tokenParser = new TokenResponseParser();
+    private final TokenStore tokenStore;
     private String accessToken;
     private volatile boolean closed;
     private long expiresAtMillis;
     private String idToken;
     private JsonLexer jsonLexer;
+    private String lastPersistedRefreshToken;
     private HttpClient plainClient;
     private String refreshToken;
+    private boolean storeLoadAttempted;
     private HttpClient tlsClient;
     // lifetime in millis of the currently cached token (its clamped TTL); effectiveSkewMillis() caps the
     // clock skew at half of this so a short-lived token is not treated as expired the instant it is issued
@@ -189,6 +202,18 @@ public class OidcDeviceAuth implements QuietCloseable {
         this.httpTimeoutMillis = builder.httpTimeoutMillis;
         this.prompt = builder.prompt;
         this.tlsConfig = tlsConfig;
+        this.tokenStore = builder.tokenStore;
+        // key any persisted token by the identity it belongs to, built before the native lexer alloc so a
+        // throw here cannot leak it. Canonicalise the endpoints (lower-case scheme/host, explicit port) and
+        // normalise an empty audience to null, so the hash matches across processes and language clients.
+        this.storeKey = tokenStore == null ? null : new TokenStoreKey(
+                clientId,
+                canonicalEndpoint(this.tokenEndpoint),
+                canonicalEndpoint(this.deviceAuthorizationEndpoint),
+                scope,
+                audience != null && !audience.isEmpty() ? audience : null,
+                this.groupsInToken
+        );
         // allocate the native lexer last: an Endpoint.parse above can throw on a malformed url, and
         // the half-built instance is never returned, so close() could not free an earlier alloc
         this.jsonLexer = new JsonLexer(JSON_LEXER_CACHE_SIZE, JSON_LEXER_MAX_VALUE_BYTES);
@@ -352,6 +377,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 .allowInsecureTransport(allowInsecureTransport)
                 .tlsConfig(tlsConfig)
                 .prompt(options.prompt)
+                .tokenStore(options.tokenStore)
                 .build();
     }
 
@@ -367,6 +393,16 @@ public class OidcDeviceAuth implements QuietCloseable {
             refreshToken = null;
             expiresAtMillis = 0;
             tokenTtlMillis = 0;
+            lastPersistedRefreshToken = null;
+            if (tokenStore != null) {
+                try {
+                    tokenStore.clear(storeKey);
+                } catch (RuntimeException e) {
+                    warnPersistence("clear", e);
+                }
+            }
+            // do not reload the entry we just removed on the next signIn()/getToken()
+            storeLoadAttempted = true;
         } finally {
             lock.unlock();
         }
@@ -422,8 +458,11 @@ public class OidcDeviceAuth implements QuietCloseable {
      * the flush for the whole device-code lifetime): if such a sign-in holds the lock it fails fast, and the
      * caller should retry once the sign-in completes. It is not, however, instantaneous - when the cached
      * token has expired it makes one synchronous refresh round-trip to the token endpoint, bounded by
-     * {@link Builder#httpTimeoutMillis(int)} (30s by default). That is the "quick silent refresh" the
-     * {@code HttpTokenProvider} contract permits on the flush path, not an unbounded interactive wait.
+     * {@link Builder#httpTimeoutMillis(int)} (30s by default); when a {@link TokenStore} coordinates the
+     * refresh across processes it may first wait briefly to acquire the store's per-identity lock (a few
+     * seconds at most for {@link FileTokenStore}, then it proceeds without the lock) before that round-trip.
+     * That is the "quick silent refresh" the {@code HttpTokenProvider} contract permits on the flush path,
+     * not an unbounded interactive wait.
      *
      * @return a non-null, non-empty token
      * @throws OidcAuthException if no token has been obtained yet, if the cached token expired and could
@@ -441,12 +480,13 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
         try {
             throwIfClosed();
+            maybeLoadFromStore();
             final String cachedToken = groupsInToken ? idToken : accessToken;
             if (cachedToken != null) {
                 if (System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
                     return cachedToken;
                 }
-                if (refreshToken != null && tryRefresh()) {
+                if (refreshToken != null && tryRefreshCoordinated()) {
                     return selectToken();
                 }
                 throw new OidcAuthException("the cached token expired and could not be refreshed without an interactive sign-in; call signIn() to sign in again");
@@ -470,6 +510,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         lock.lock();
         try {
             throwIfClosed();
+            maybeLoadFromStore();
             // only the kind of token signIn() actually serves counts as a cache hit; a grant that
             // returned the other kind (access token when the server wants the id token, or vice versa)
             // leaves the served token null, so re-run the flow rather than report the unusable grant as
@@ -479,7 +520,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 if (System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
                     return cachedToken;
                 }
-                if (refreshToken != null && tryRefresh()) {
+                if (refreshToken != null && tryRefreshCoordinated()) {
                     return selectToken();
                 }
             }
@@ -503,6 +544,13 @@ public class OidcDeviceAuth implements QuietCloseable {
             return defaultValue;
         }
         return Math.min(value, maxValue);
+    }
+
+    private static String canonicalEndpoint(Endpoint endpoint) {
+        // scheme and host lower-cased, port explicit, path verbatim: a stable rendering that hashes to the
+        // same TokenStoreKey across processes and language clients sharing this identity
+        return (endpoint.isTls ? "https://" : "http://")
+                + endpoint.host.toLowerCase(Locale.ROOT) + ':' + endpoint.port + endpoint.path;
     }
 
     private static String[] decodePathSegments(String path) {
@@ -647,6 +695,16 @@ public class OidcDeviceAuth implements QuietCloseable {
             Misc.free(lexer);
             Misc.free(client);
         }
+    }
+
+    private static boolean hasOnlyTokenChars(CharSequence token) {
+        for (int i = 0, n = token.length(); i < n; i++) {
+            char c = token.charAt(i);
+            if (c < 0x20 || c > 0x7e) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static int hexValue(char c) {
@@ -940,13 +998,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         // byte by the ASCII header writer. A real OAuth token is printable ASCII, so reject anything else
         // rather than route a tampered or corrupt credential onto the wire. Token bytes are never embedded
         // in the message: they are the secret this class protects.
-        for (int i = 0, n = token.length(); i < n; i++) {
-            char c = token.charAt(i);
-            if (c < 0x20 || c > 0x7e) {
-                throw new OidcAuthException()
-                        .put("the identity provider returned an ").put(tokenName)
-                        .put(" containing a disallowed control or non-ASCII character; refusing to use it as a credential");
-            }
+        if (!hasOnlyTokenChars(token)) {
+            throw new OidcAuthException()
+                    .put("the identity provider returned an ").put(tokenName)
+                    .put(" containing a disallowed control or non-ASCII character; refusing to use it as a credential");
         }
     }
 
@@ -956,6 +1011,32 @@ public class OidcDeviceAuth implements QuietCloseable {
             trimmed = trimmed.substring(0, trimmed.length() - 1);
         }
         return trimmed + WELL_KNOWN_OPENID_CONFIGURATION_PATH;
+    }
+
+    private boolean adopt(PersistedToken token) {
+        if (token == null) {
+            return false;
+        }
+        // the file is attacker-writable, so treat the served token (the one getToken() puts verbatim into an
+        // Authorization header or a PG-wire password) as untrusted: reject a control/non-ASCII char - and the
+        // whole entry - rather than route a tampered credential onto the wire. A null served token is unusable.
+        String servedToken = groupsInToken ? token.getIdToken() : token.getAccessToken();
+        if (servedToken == null || !hasOnlyTokenChars(servedToken)) {
+            return false;
+        }
+        accessToken = token.getAccessToken();
+        idToken = token.getIdToken();
+        refreshToken = token.getRefreshToken();
+        // the file is attacker-writable (and may have been written under a skewed clock), so bound how long
+        // the loaded token is trusted exactly as storeTokens() bounds a token from the wire: never past
+        // MAX_EXPIRES_IN_SECONDS from now. Capping (not flooring) the expiry preserves an already-expired
+        // entry, so a stale access token still falls through to a refresh rather than being served forever.
+        long maxTokenLifeMillis = MAX_EXPIRES_IN_SECONDS * 1000L;
+        tokenTtlMillis = Math.max(0L, Math.min(token.getTokenTtlMillis(), maxTokenLifeMillis));
+        expiresAtMillis = Math.min(token.getExpiresAtMillis(), System.currentTimeMillis() + maxTokenLifeMillis);
+        // it is already on disk, so a later non-rotating refresh must not rewrite the file
+        lastPersistedRefreshToken = refreshToken;
+        return true;
     }
 
     private void appendEncodedParam(StringSink sink, String name, String encodedValue) {
@@ -1007,6 +1088,44 @@ public class OidcDeviceAuth implements QuietCloseable {
         // rejection) is terminal. Mirrors the Python client's _http_status_is_transient. Require a full
         // 3-digit status so a malformed short "5" is not classified as a transient 5xx.
         return responseStatus.length() == 3 && (responseStatus.charAt(0) == '5' || Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus));
+    }
+
+    private void maybeLoadFromStore() {
+        if (tokenStore == null || storeLoadAttempted) {
+            return;
+        }
+        // attempt the disk read once per instance, even if it yields nothing, so a missing or bad file is
+        // not re-read on every call
+        storeLoadAttempted = true;
+        PersistedToken token;
+        try {
+            token = tokenStore.load(storeKey);
+        } catch (RuntimeException e) {
+            // best-effort: a store read failure must not break sign-in
+            warnPersistence("load", e);
+            return;
+        }
+        adopt(token);
+    }
+
+    private void persistIfRotated() {
+        if (tokenStore == null) {
+            return;
+        }
+        // persist on a new or rotated refresh token (the interactive sign-in, or a provider that rotates the
+        // refresh token on every refresh); skip when it is unchanged, so the hot getToken() refresh path does
+        // not rewrite the file every few minutes. The on-disk access token then goes stale, which costs only
+        // one silent refresh on the next restart. With no refresh token there is nothing worth persisting.
+        if (Objects.equals(refreshToken, lastPersistedRefreshToken)) {
+            return;
+        }
+        try {
+            tokenStore.save(storeKey, snapshot());
+            lastPersistedRefreshToken = refreshToken;
+        } catch (RuntimeException e) {
+            // best-effort: a save failure never fails an otherwise-valid sign-in; the token is valid in memory
+            warnPersistence("save", e);
+        }
     }
 
     private void pollForToken(String deviceCode, int expiresInSeconds, int intervalSeconds) {
@@ -1171,6 +1290,35 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private boolean refreshUnderLock() {
+        // runs inside the store's cross-process lock: re-read first, since another process sharing this
+        // identity may have refreshed (and rotated the refresh token) since our last load. Adopt a fresher
+        // entry and skip the network when it already yields a valid token; otherwise refresh with the freshest
+        // known refresh token (the one just adopted, so a rotated token is not replayed).
+        //
+        // Only re-read when the in-memory refresh token still matches what we last persisted. If they differ,
+        // a previous save failed (persistence is best-effort), so the in-memory token is newer than the
+        // on-disk one; re-adopting would regress it to the stale - and, on a rotating identity provider,
+        // already-revoked - on-disk token and force a needless re-prompt. In that case keep the in-memory
+        // token and refresh with it.
+        if (Objects.equals(refreshToken, lastPersistedRefreshToken)) {
+            PersistedToken fresh;
+            try {
+                fresh = tokenStore.load(storeKey);
+            } catch (RuntimeException e) {
+                warnPersistence("load", e);
+                fresh = null;
+            }
+            if (adopt(fresh)) {
+                final String servedToken = groupsInToken ? idToken : accessToken;
+                if (servedToken != null && System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
+                    return true;
+                }
+            }
+        }
+        return tryRefresh();
+    }
+
     private void runDeviceFlow() {
         formSink.clear();
         formSink.putAscii("client_id=").putAscii(clientIdEncoded);
@@ -1258,6 +1406,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private PersistedToken snapshot() {
+        return new PersistedToken(accessToken, idToken, refreshToken, expiresAtMillis, tokenTtlMillis);
+    }
+
     private void storeTokens(TokenResponseParser parser) {
         // reject a token with control or non-ASCII chars before caching: getToken() serves it verbatim as an
         // HTTP Authorization header value and a PG-wire password, where a decoded CR/LF would inject into the
@@ -1281,6 +1433,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         int ttlSeconds = boundedSeconds(parser.expiresIn, DEFAULT_TOKEN_TTL_SECONDS, MAX_EXPIRES_IN_SECONDS);
         tokenTtlMillis = ttlSeconds * 1000L;
         expiresAtMillis = System.currentTimeMillis() + tokenTtlMillis;
+        persistIfRotated();
     }
 
     private void throwIfClosed() {
@@ -1330,6 +1483,23 @@ public class OidcDeviceAuth implements QuietCloseable {
         return false;
     }
 
+    private boolean tryRefreshCoordinated() {
+        if (tokenStore == null) {
+            return tryRefresh();
+        }
+        // serialise the read-refresh-write across processes (and adopt a peer's just-rotated refresh token)
+        // through the store's per-identity lock; a store that does not coordinate just runs the refresh
+        return tokenStore.inLock(storeKey, this::refreshUnderLock);
+    }
+
+    private void warnPersistence(String operation, Throwable cause) {
+        // best-effort persistence: report to System.err and carry on with the in-memory token. The store
+        // never puts token bytes in its messages, so this cannot leak the secret.
+        String detail = cause.getMessage();
+        System.err.println("questdb client: OIDC token store " + operation
+                + " failed; continuing without persistence" + (detail != null ? " [" + detail + ']' : ""));
+    }
+
     /**
      * Fluent builder for an {@link OidcDeviceAuth} configured against a known identity provider.
      * The client id, device authorization endpoint and token endpoint are required.
@@ -1346,6 +1516,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         private String scope = DEFAULT_SCOPE;
         private ClientTlsConfiguration tlsConfig;
         private String tokenEndpoint;
+        private TokenStore tokenStore;
 
         private Builder() {
         }
@@ -1422,6 +1593,12 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (httpTimeoutMillis <= 0) {
                 throw new OidcAuthException("httpTimeoutMillis must be positive");
             }
+            if (httpTimeoutMillis > MAX_HTTP_TIMEOUT_MILLIS) {
+                throw new OidcAuthException()
+                        .put("httpTimeoutMillis must not exceed ").put(MAX_HTTP_TIMEOUT_MILLIS)
+                        .put("; a token-endpoint round-trip never needs longer, and a larger value could let a ")
+                        .put("slow refresh outlast the token store's cross-process lock staleness window");
+            }
             this.httpTimeoutMillis = httpTimeoutMillis;
             return this;
         }
@@ -1469,6 +1646,17 @@ public class OidcDeviceAuth implements QuietCloseable {
             this.tokenEndpoint = tokenEndpoint;
             return this;
         }
+
+        /**
+         * Persists the obtained token through the given {@link TokenStore}, so a restarted process can resume
+         * from the saved refresh token instead of running the device flow again. Defaults to {@code null}
+         * (in-memory only). Use {@link FileTokenStore#atDefaultLocation()} for the default file-backed store,
+         * or supply your own to back persistence with an OS keychain or a secrets manager. Optional.
+         */
+        public Builder tokenStore(TokenStore tokenStore) {
+            this.tokenStore = tokenStore;
+            return this;
+        }
     }
 
     /**
@@ -1482,6 +1670,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         private String issuer;
         private DeviceCodePrompt prompt = DeviceCodePrompt.openBrowser();
         private ClientTlsConfiguration tlsConfig;
+        private TokenStore tokenStore;
 
         /**
          * Permits insecure {@code http} for the QuestDB server link only (the {@code /settings} discovery
@@ -1529,6 +1718,16 @@ public class OidcDeviceAuth implements QuietCloseable {
          */
         public DiscoveryOptions tlsConfig(ClientTlsConfiguration tlsConfig) {
             this.tlsConfig = tlsConfig;
+            return this;
+        }
+
+        /**
+         * Persists the obtained token through the given {@link TokenStore}, so a restarted process can resume
+         * from the saved refresh token instead of running the device flow again. Defaults to {@code null}
+         * (in-memory only). See {@link FileTokenStore#atDefaultLocation()} for the default file-backed store.
+         */
+        public DiscoveryOptions tokenStore(TokenStore tokenStore) {
+            this.tokenStore = tokenStore;
             return this;
         }
     }

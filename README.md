@@ -230,6 +230,26 @@ The identity provider's device authorization and token endpoints must use `https
 
 `fromQuestDB(...)` takes the identity provider endpoints from the server's unauthenticated `/settings`, so it trusts that server to designate where you sign in: a spoofed, compromised, or man-in-the-middled server could redirect the sign-in to an attacker-controlled identity provider. Only use it against a server you trust, reached over `https`. Passing an issuer hardens this: the token and device authorization endpoints are then pinned to the issuer's origin (and, when the issuer has a path, an endpoint advertised by `/settings` must also be under that path — so a tampered `/settings` cannot redirect to a different tenant on a path-based provider such as Keycloak `…/realms/{realm}`), and an endpoint outside it is rejected; the issuer itself comes from you out of band, so a tampered `/settings` cannot move it. When the server is not trusted, configure the identity provider explicitly with `OidcDeviceAuth.builder()` (optionally with `.issuer(...)`) instead of discovering it.
 
+#### Persisting the Token Across Restarts
+
+By default the token lives in memory only, so a process that restarts has to run the device flow again. Pass a `TokenStore` to persist it; the restarted process then resumes from the saved refresh token — a silent call to the token endpoint — instead of prompting the user again:
+
+```java
+import io.questdb.client.cutlass.auth.FileTokenStore;
+
+try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
+        "https://questdb.example.com:9000",
+        new OidcDeviceAuth.DiscoveryOptions().tokenStore(FileTokenStore.atDefaultLocation()))) {
+    auth.signIn(); // prompts the first time; after a restart it refreshes silently from the saved token
+}
+```
+
+`FileTokenStore.atDefaultLocation()` writes one file per identity under `${user.home}/.questdb/oidc-tokens/` (override the directory with the `questdb.client.oidc.token.store.dir` system property). The file name is a hash of the endpoints, client id, scope, audience and groups-in-token mode, so tokens for different servers or identities never collide. After a restart, `getToken()` also works as the first call — no explicit `signIn()` needed — which suits a long-lived `Sender` built with `httpTokenProvider(auth::getToken)`. `clearCache()` removes the persisted entry and forces a fresh sign-in next time.
+
+The token is stored as **plaintext JSON protected by file permissions** — `0600` file, `0700` directory on POSIX systems (Linux, macOS), the same approach `gcloud`, `aws` and `gh` take. On Windows these POSIX permissions cannot be enforced, so the file currently relies on the user-profile directory's default ACL (owner-only ACL hardening is a follow-up); the client prints a one-line warning to `System.err` the first time it cannot enforce them. Enabling persistence therefore writes a long-lived refresh token to disk: anyone who can read the file holds a credential until it expires or is revoked. To encrypt it at rest, supply your own `TokenStore` (backed by an OS keychain or a secrets manager) instead of `FileTokenStore`. A persisted file is treated as untrusted input on load — a tampered, corrupt, oversized, or identity-mismatched entry is ignored (the client falls back to a refresh or an interactive sign-in), and a token carrying control or non-ASCII characters is never placed on the wire.
+
+`FileTokenStore` is safe to share between processes that sign in as the same identity: each update is written atomically (so a concurrent reader never sees a half-written credential), and when the identity provider rotates the refresh token on each refresh, the read-refresh-write is serialized across processes with a lock file so they do not race each other into an unnecessary re-prompt.
+
 ### Explicit Timestamps
 
 ```java

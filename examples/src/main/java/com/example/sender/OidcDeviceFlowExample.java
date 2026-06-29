@@ -21,6 +21,10 @@ public class OidcDeviceFlowExample {
         // available (best-effort; skipped on a headless host). To print only, pass options:
         //   import io.questdb.client.cutlass.auth.DeviceCodePrompt;
         //   OidcDeviceAuth.fromQuestDB(url, new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.SYSTEM_OUT))
+        // To survive a restart without prompting again, persist the token with a TokenStore - the restarted
+        // process resumes from the saved refresh token instead of re-running the device flow:
+        //   import io.questdb.client.cutlass.auth.FileTokenStore;
+        //   OidcDeviceAuth.fromQuestDB(url, new OidcDeviceAuth.DiscoveryOptions().tokenStore(FileTokenStore.atDefaultLocation()))
         try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
             auth.signIn(); // sign in once (prompts on first use, then caches and refreshes silently)
 
