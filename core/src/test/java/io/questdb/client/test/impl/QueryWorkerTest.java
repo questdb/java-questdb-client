@@ -39,6 +39,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
+/**
+ * Unit tests for {@link QueryWorker}.
+ * <p>
+ * Coverage boundary: the lost-dispatch fix for the single-flight-reuse race
+ * (clearing {@code current} under {@code signalLock} at the moment of
+ * consumption rather than in a post-{@code runOn()} finally) has no
+ * deterministic unit reproduction here. Reproducing the clobber needs the
+ * worker to be mid-{@code runOn(client)} when the user thread re-dispatches on
+ * the same lease, which requires a live query client to drive
+ * {@code client.execute(...)} to its terminal callback. That regression is
+ * guarded end-to-end by {@code QuestDBFacadeE2ETest.testSustainedMixedConcurrency}
+ * in the parent questdb repo (more threads than pool slots, repeated
+ * submit/await per lease). {@link #testShutdownRacingDispatchMustNotStrandCaller()}
+ * below covers the adjacent but distinct shutdown-vs-dispatch branch only --
+ * reverting the lost-dispatch hunk would not fail it.
+ */
 public class QueryWorkerTest {
 
     /**

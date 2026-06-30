@@ -74,15 +74,16 @@ public class SenderPoolTest {
     }
 
     @Test
-    public void testBrokenSenderIsNotReturnedToPool() {
+    public void testBrokenSenderIsNotReturnedToPool() throws Exception {
         // Borrowing, buffering a row, and then closing forces flush() against
-        // the unreachable address, which throws. The broken wrapper must not
-        // be returned to the pool: its delegate's buffer still holds the
-        // failed row, and on transports with terminal-failure semantics the
-        // delegate is also unusable. Either way, the next borrower must get
-        // a fresh wrapper.
+        // the unreachable address, which throws. The broken slot must not be
+        // returned to the pool: its delegate's buffer still holds the failed
+        // row, and on transports with terminal-failure semantics the delegate
+        // is also unusable. Either way, the next borrower must get a fresh
+        // slot, not the broken one.
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
             Sender first = pool.borrow();
+            Object firstSlot = slotOf(first);
             first.table("t").longColumn("v", 1).atNow();
             try {
                 first.close();
@@ -92,11 +93,23 @@ public class SenderPoolTest {
             }
             Sender second = pool.borrow();
             try {
-                Assert.assertNotSame("broken sender must not be handed back to next borrower",
-                        first, second);
+                // borrow() always hands out a FRESH PooledSender wrapper, so
+                // assertNotSame(first, second) on the wrappers is vacuously
+                // true and proves nothing -- it stays true whether or not the
+                // broken slot was discarded. What the pool recycles is the
+                // underlying slot, so a broken slot leaking back to the next
+                // borrower shows up as the SAME slot. Assert the slot differs.
+                Assert.assertNotSame("broken slot must not be handed back to next borrower",
+                        firstSlot, slotOf(second));
             } finally {
-                if (second != first) {
+                // On the failing path (broken slot recycled) second.close()
+                // re-throws, since its delegate's buffer still holds the
+                // failed row; swallow it so the assertion above is what
+                // surfaces rather than this incidental close() failure.
+                try {
                     second.close();
+                } catch (LineSenderException ignored) {
+                    // expected only when the regression is present
                 }
             }
         }
