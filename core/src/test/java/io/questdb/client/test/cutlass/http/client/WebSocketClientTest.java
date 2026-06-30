@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.network.Socket;
+import io.questdb.client.network.SocketReadinessWaiter;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -263,7 +264,7 @@ public class WebSocketClientTest {
         }
 
         @Override
-        public void startTlsSession(CharSequence peerName) {
+        public void startTlsSession(CharSequence peerName, SocketReadinessWaiter waiter) {
             throw new UnsupportedOperationException();
         }
 

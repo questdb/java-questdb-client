@@ -25,9 +25,11 @@
 package io.questdb.client.test.network;
 
 import io.questdb.client.ClientTlsConfiguration;
+import io.questdb.client.network.IOOperation;
 import io.questdb.client.network.JavaTlsClientSocket;
 import io.questdb.client.network.NetworkFacade;
 import io.questdb.client.network.NetworkFacadeImpl;
+import io.questdb.client.network.SocketReadinessWaiter;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -40,9 +42,11 @@ import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 
 import static org.junit.Assert.assertEquals;
@@ -190,6 +194,89 @@ public class JavaTlsClientSocketTest {
         }
     }
 
+    /**
+     * Regression test for the TLS handshake busy-spin / unbounded handshake.
+     * On a non-blocking socket, a peer that completes TCP but stalls before
+     * sending its half of the handshake leaves the engine in NEED_UNWRAP with
+     * the socket returning "would block" (recv == 0). The handshake must hand
+     * control to the readiness waiter -- which in production parks on the event
+     * loop bounded by the connect deadline -- instead of re-reading in a tight
+     * loop. Here the waiter stands in for that deadline: it records the wait
+     * and then throws, exactly as the bounded ioWait() does once the budget is
+     * spent. The method-level timeout fails the test if the handshake ever
+     * busy-spins past the waiter (i.e. if the deadline-aware wait is removed).
+     */
+    @Test(timeout = 30_000)
+    public void testHandshakeWaitsForReadabilityInsteadOfBusySpinning() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (JavaTlsClientSocket socket = newSocket()) {
+                invoke(socket, "prepareInternalBuffers");
+                setField(socket, "sslEngine", new StallingUnwrapSslEngine());
+
+                Method runHandshake = JavaTlsClientSocket.class.getDeclaredMethod(
+                        "runHandshake", SocketReadinessWaiter.class);
+                runHandshake.setAccessible(true);
+
+                AtomicInteger readWaits = new AtomicInteger();
+                AtomicInteger writeWaits = new AtomicInteger();
+                SocketReadinessWaiter waiter = op -> {
+                    if (op == IOOperation.READ) {
+                        readWaits.incrementAndGet();
+                    } else {
+                        writeWaits.incrementAndGet();
+                    }
+                    // Stand in for the connect deadline firing inside ioWait().
+                    throw new DeadlineReached();
+                };
+
+                try {
+                    runHandshake.invoke(socket, waiter);
+                    Assert.fail("runHandshake must not complete the handshake against a stalled peer");
+                } catch (InvocationTargetException e) {
+                    Assert.assertTrue(
+                            "handshake must surface the readiness waiter's deadline, was: " + e.getCause(),
+                            e.getCause() instanceof DeadlineReached);
+                }
+
+                Assert.assertEquals(
+                        "handshake must wait for the socket to become readable instead of busy-spinning",
+                        1, readWaits.get());
+                Assert.assertEquals(
+                        "a NEED_UNWRAP stall must not trigger a write wait", 0, writeWaits.get());
+            }
+        });
+    }
+
+    /**
+     * Happy-path guard for the refactor: when the engine makes progress (a
+     * complete record is available, unwrap returns OK and the handshake
+     * finishes), runHandshake must complete without ever parking on socket
+     * readiness. The would-block waits only fire on recv/send == 0, so a
+     * responsive peer never triggers them.
+     */
+    @Test(timeout = 30_000)
+    public void testHandshakeCompletesWithoutWaitingWhenEngineMakesProgress() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (JavaTlsClientSocket socket = newSocket()) {
+                invoke(socket, "prepareInternalBuffers");
+                setField(socket, "sslEngine", new ProgressingUnwrapSslEngine());
+
+                Method runHandshake = JavaTlsClientSocket.class.getDeclaredMethod(
+                        "runHandshake", SocketReadinessWaiter.class);
+                runHandshake.setAccessible(true);
+
+                AtomicInteger waits = new AtomicInteger();
+                SocketReadinessWaiter waiter = op -> waits.incrementAndGet();
+
+                runHandshake.invoke(socket, waiter); // must return normally (handshake finished)
+
+                Assert.assertEquals(
+                        "a handshake that makes progress must not wait on socket readiness",
+                        0, waits.get());
+            }
+        });
+    }
+
     private static void assertBytes(String expected, long ptr, int len) {
         Assert.assertEquals(expected.length(), len);
         for (int i = 0; i < len; i++) {
@@ -329,6 +416,48 @@ public class JavaTlsClientSocketTest {
                     SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
                     consumed,
                     payload.length
+            );
+        }
+    }
+
+    private static final class DeadlineReached extends RuntimeException {
+    }
+
+    private static final class ProgressingUnwrapSslEngine extends StubSslEngine {
+        @Override
+        public SSLEngineResult.HandshakeStatus getHandshakeStatus() {
+            return SSLEngineResult.HandshakeStatus.NEED_UNWRAP;
+        }
+
+        @Override
+        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) {
+            // A complete record was available: consume it and finish the
+            // handshake, so the loop exits without waiting.
+            return new SSLEngineResult(
+                    SSLEngineResult.Status.OK,
+                    SSLEngineResult.HandshakeStatus.FINISHED,
+                    0,
+                    0
+            );
+        }
+    }
+
+    private static final class StallingUnwrapSslEngine extends StubSslEngine {
+        @Override
+        public SSLEngineResult.HandshakeStatus getHandshakeStatus() {
+            return SSLEngineResult.HandshakeStatus.NEED_UNWRAP;
+        }
+
+        @Override
+        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) {
+            // No complete TLS record buffered yet: ask for more bytes from the
+            // socket. The stalled peer never sends them, so the handshake must
+            // wait on readability rather than spin.
+            return new SSLEngineResult(
+                    SSLEngineResult.Status.BUFFER_UNDERFLOW,
+                    SSLEngineResult.HandshakeStatus.NEED_UNWRAP,
+                    0,
+                    0
             );
         }
     }

@@ -962,19 +962,35 @@ public abstract class WebSocketClient implements QuietCloseable {
                     .put(", errno=").put(errno).put(']');
         }
 
+        // Register the fd with the event loop before the TLS handshake so the
+        // handshake can park on socket readiness via ioWait() instead of
+        // busy-spinning on the non-blocking socket.
+        setupIoWait();
+
         if (socket.supportsTls()) {
+            // Bound the TLS handshake by the connect budget (falling back to the
+            // request timeout when connect_timeout is unset), so a peer that
+            // completes TCP but stalls mid-handshake cannot hang or pin a CPU.
+            final long tlsHandshakeStartNanos = System.nanoTime();
+            final int tlsHandshakeBudgetMillis = connectTimeoutMillis > 0 ? connectTimeoutMillis : defaultTimeout;
             try {
-                socket.startTlsSession(host);
+                socket.startTlsSession(host, op -> ioWait(getRemainingTimeOrThrow(tlsHandshakeBudgetMillis, tlsHandshakeStartNanos), op));
             } catch (TlsSessionInitFailedException e) {
                 int errno = nf.errno();
                 disconnect();
                 throw new HttpClientException("could not start TLS session [fd=").put(fd)
                         .put(", error=").put(e.getFlyweightMessage())
                         .put(", errno=").put(errno).put(']');
+            } catch (Throwable t) {
+                // ioWait() throws a timeout-flagged HttpClientException when the
+                // handshake budget is exhausted; any other error can also surface
+                // mid-handshake. Disconnect so the fd and native buffers do not
+                // leak, then propagate.
+                disconnect();
+                throw t;
             }
         }
 
-        setupIoWait();
         if (LOG.isDebugEnabled()) {
             LOG.debug("Connected to [host={}, port={}]", host, port);
         }
