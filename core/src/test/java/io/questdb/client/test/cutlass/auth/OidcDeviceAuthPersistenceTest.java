@@ -86,6 +86,34 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testBuildRejectsFileTokenStoreWithTooSmallStaleWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(200, "{}"))) {
+                Path dir = storeDir();
+                // a lock-staleness window below LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE (4) x httpTimeoutMillis would let a
+                // peer judge a live holder's lock stale and steal it mid-refresh, reopening the rotating-refresh-
+                // token race the lock prevents; build() must reject the combination rather than ship the race
+                try {
+                    baseBuilder(server)
+                            .httpTimeoutMillis(30_000)
+                            .tokenStore(new FileTokenStore(dir, 3_000, 119_999))
+                            .build();
+                    Assert.fail("a lockStaleMillis below 4x httpTimeoutMillis must be rejected");
+                } catch (OidcAuthException expected) {
+                    Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("lockStaleMillis"));
+                }
+                // exactly 4x httpTimeoutMillis is the boundary and builds
+                try (OidcDeviceAuth ignored = baseBuilder(server)
+                        .httpTimeoutMillis(30_000)
+                        .tokenStore(new FileTokenStore(dir, 3_000, 120_000))
+                        .build()) {
+                    // building at the boundary succeeds
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testBuilderRejectsHttpTimeoutAboveCap() throws Exception {
         assertMemoryLeak(() -> {
             // the HTTP timeout is capped (120s): a token-endpoint round-trip never needs longer, and bounding
@@ -558,6 +586,37 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testTamperedIdTokenRejectedOnLoadWithGroupsInToken() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                token.incrementAndGet();
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", "ID-FRESH", "REFRESH-FRESH", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                Path dir = storeDir();
+                // groups-in-token mode serves the ID token, so adopt() must validate the ID token, not the access
+                // token. A genuine on-disk file (valid groups fingerprint) with a CLEAN access token but a CR/LF
+                // id token must be rejected and fall back to the device flow, never routing the tampered id token
+                // onto the wire. A bug that validated the access token would accept this entry and serve "I\r\nD".
+                new FileTokenStore(dir).save(keyForGroups(server),
+                        new PersistedToken("ACCESS-CLEAN", "I\r\nD", "REFRESH-1", System.currentTimeMillis() + 300_000, 300_000));
+                try (OidcDeviceAuth auth = baseBuilder(server).groupsInToken(true).tokenStore(new FileTokenStore(dir)).build()) {
+                    String result = auth.signIn();
+                    Assert.assertEquals("ID-FRESH", result);
+                    Assert.assertNotEquals("I\r\nD", result);
+                }
+                Assert.assertTrue("a rejected on-disk id token must fall back to the device flow", device.get() >= 1);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTamperedServedTokenRejectedOnLoad() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();
@@ -578,6 +637,33 @@ public class OidcDeviceAuthPersistenceTest {
                     Assert.assertNotEquals("AC\r\nCESS", result);
                 }
                 Assert.assertTrue("a rejected persisted token must fall back to the device flow", device.get() >= 1);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testTamperedServedTokenWithNonAsciiRejectedOnLoad() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // hasOnlyTokenChars rejects a non-ASCII char (> 0x7e), not just a control char: a persisted served
+                // token carrying one (here U+00E9) is the byte the ASCII Authorization-header writer would
+                // truncate, so adopt() must reject the entry and fall back rather than serve a corrupt credential
+                fake.loadReturns = new PersistedToken("ACC\u00e9SS", null, "REFRESH-1", System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    String result = auth.signIn();
+                    Assert.assertEquals("ACCESS-FRESH", result);
+                    Assert.assertNotEquals("ACC\u00e9SS", result);
+                }
+                Assert.assertTrue("a rejected non-ASCII persisted token must fall back to the device flow", device.get() >= 1);
             }
         });
     }

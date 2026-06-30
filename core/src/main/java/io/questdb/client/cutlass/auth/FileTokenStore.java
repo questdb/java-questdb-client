@@ -280,6 +280,12 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
+    long getLockStaleMillis() {
+        // exposed package-private so OidcDeviceAuth.build() can verify this window dominates the worst-case time
+        // a coordinated refresh holds the lock, before a peer could otherwise judge a live lock stale and steal it
+        return lockStaleMillis;
+    }
+
     private static void createLockFile(Path lock) throws IOException {
         try {
             Files.createFile(lock, FILE_ATTRS);

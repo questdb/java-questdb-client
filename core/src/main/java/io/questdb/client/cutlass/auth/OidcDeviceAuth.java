@@ -132,6 +132,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     // tokens fail to parse with "String is too long".
     private static final int JSON_LEXER_CACHE_SIZE = 1024;
     private static final int JSON_LEXER_MAX_VALUE_BYTES = 1 << 20;
+    // the worst case a coordinated refresh can hold a FileTokenStore cross-process lock, as a multiple of
+    // httpTimeoutMillis: one refresh under the lock runs send + await + parse, plus a body drain on a parse
+    // failure, each separately bounded by httpTimeoutMillis. build() rejects a FileTokenStore whose
+    // lock-staleness window does not exceed this, so a peer never judges a live holder's lock stale mid-refresh
+    private static final int LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE = 4;
     // upper bound on the device code lifetime (the device authorization response's expires_in), so a
     // hostile or buggy provider cannot make the client poll for an absurd duration; matches the Python client
     private static final int MAX_DEVICE_CODE_TTL_SECONDS = 1800;
@@ -1579,6 +1584,23 @@ public class OidcDeviceAuth implements QuietCloseable {
             // discovery, so the documented guarantee holds for the explicit builder too
             validateEndpointOrigins(parsedTokenEndpoint, deviceEndpoint, issuerEndpoint);
             ClientTlsConfiguration tls = tlsConfig != null ? tlsConfig : defaultTlsConfig();
+            // a FileTokenStore steals a lock older than its staleness window, presuming a crashed holder; that
+            // window must exceed the worst-case time a live refresh holds the lock (the refresh under the lock is
+            // bounded by httpTimeoutMillis, up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE times it), or a peer could steal
+            // a live holder's lock mid-refresh and reopen the rotating-refresh-token race the lock prevents. The
+            // store cannot see this client's timeout, so enforce the invariant here, where both are known, rather
+            // than leave the caller to size it by hand. A non-coordinating TokenStore is exempt - it takes no lock.
+            if (tokenStore instanceof FileTokenStore) {
+                long minStaleMillis = (long) LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE * httpTimeoutMillis;
+                long staleMillis = ((FileTokenStore) tokenStore).getLockStaleMillis();
+                if (staleMillis < minStaleMillis) {
+                    throw new OidcAuthException()
+                            .put("the FileTokenStore lockStaleMillis (").put(staleMillis)
+                            .put(") must be at least ").put(LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE)
+                            .put("x httpTimeoutMillis (").put(minStaleMillis)
+                            .put("), otherwise a slow refresh's live cross-process lock could be stolen by a peer mid-refresh");
+                }
+            }
             return new OidcDeviceAuth(this, tls);
         }
 
