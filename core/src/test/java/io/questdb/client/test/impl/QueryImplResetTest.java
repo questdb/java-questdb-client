@@ -97,6 +97,41 @@ public class QueryImplResetTest {
                 doneF.getBoolean(q));
     }
 
+    /**
+     * {@code QuestDB#borrowQuery()} returns a thin lease that is freshly
+     * allocated per borrow, but the heavy state it wraps -- the per-worker
+     * {@code QueryImpl} -- is pre-allocated once and reused across borrows. This
+     * pins that contract: two {@code lease()} calls on the same worker return
+     * distinct lease wrappers that delegate to the same pooled {@code QueryImpl}.
+     * Reaches both package-private classes by reflection.
+     */
+    @Test
+    public void testLeaseWrapsSamePooledQueryImpl() throws Exception {
+        Class<?> workerClass = Class.forName("io.questdb.client.impl.QueryWorker");
+        Class<?> poolClass = Class.forName("io.questdb.client.impl.QueryClientPool");
+        Class<?> clientClass = Class.forName("io.questdb.client.cutlass.qwp.client.QwpQueryClient");
+        Class<?> leaseClass = Class.forName("io.questdb.client.impl.QueryLease");
+
+        // lease() never dereferences the client or pool (it only resets the
+        // reused QueryImpl and stamps the current generation), so nulls are fine
+        // for this structure-only test -- mirrors the null-worker shortcut above.
+        Constructor<?> ctor = workerClass.getDeclaredConstructor(clientClass, poolClass, int.class);
+        ctor.setAccessible(true);
+        Object worker = ctor.newInstance(null, null, 0);
+
+        Method leaseM = workerClass.getDeclaredMethod("lease");
+        leaseM.setAccessible(true);
+        Object leaseA = leaseM.invoke(worker);
+        Object leaseB = leaseM.invoke(worker);
+
+        Assert.assertNotSame("each borrow must hand back a fresh lease wrapper", leaseA, leaseB);
+
+        Field implF = leaseClass.getDeclaredField("impl");
+        implF.setAccessible(true);
+        Assert.assertSame("both leases must wrap the same pooled QueryImpl (zero-allocation reuse of the heavy state)",
+                implF.get(leaseA), implF.get(leaseB));
+    }
+
     private static final class NoopHandler implements QwpColumnBatchHandler {
         @Override
         public void onBatch(QwpColumnBatch batch) {
