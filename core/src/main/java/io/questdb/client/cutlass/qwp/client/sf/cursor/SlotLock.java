@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
@@ -154,7 +155,7 @@ public final class SlotLock implements QuietCloseable {
     private static void writePid(String pidPath) {
         long pid;
         try {
-            pid = ProcessHandle.current().pid();
+            pid = Compat.currentPid();
         } catch (Throwable ignored) {
             // Diagnostic-only — never block lock acquisition on it.
             pid = -1L;

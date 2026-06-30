@@ -129,7 +129,7 @@ public class LineHttpSenderV3 extends LineHttpSenderV2 {
         } catch (NumericException e) {
             throw new LineSenderException("Failed to parse sent decimal value: " + value, e);
         }
-        var request = writeFieldName(name);
+        HttpClient.Request request = writeFieldName(name);
         request.put(value).putAscii('d');
         return this;
     }
@@ -139,7 +139,7 @@ public class LineHttpSenderV3 extends LineHttpSenderV2 {
         if (value == null || value.isNull()) {
             return this;
         }
-        var request = writeFieldName(name)
+        HttpClient.Request request = writeFieldName(name)
                 .putAscii('=')
                 .put(EntityTypes.DECIMAL)
                 .put((byte) value.getScale())
@@ -156,7 +156,7 @@ public class LineHttpSenderV3 extends LineHttpSenderV2 {
         if (value == null || value.isNull()) {
             return this;
         }
-        var request = writeFieldName(name)
+        HttpClient.Request request = writeFieldName(name)
                 .putAscii('=')
                 .put(EntityTypes.DECIMAL)
                 .put((byte) value.getScale())
@@ -171,7 +171,7 @@ public class LineHttpSenderV3 extends LineHttpSenderV2 {
         if (value == null || value.isNull()) {
             return this;
         }
-        var request = writeFieldName(name)
+        HttpClient.Request request = writeFieldName(name)
                 .putAscii('=')
                 .put(EntityTypes.DECIMAL)
                 .put((byte) value.getScale())

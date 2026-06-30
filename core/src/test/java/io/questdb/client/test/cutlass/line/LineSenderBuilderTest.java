@@ -193,6 +193,8 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost;username=foo;", "password cannot be empty nor null");
             assertConfStrError("http::addr=localhost;pass=foo;", "password is configured, but username is missing");
             assertConfStrError("http::addr=localhost;password=foo;", "password is configured, but username is missing");
+            assertConfStrError("http::addr=localhost;auth=Bearer xyz;", "unknown configuration key [key=auth]");
+            assertConfStrError("http::addr=localhost;path=/read/v1;", "unknown configuration key [key=path]");
             assertConfStrError("tcp::addr=localhost;pass=foo;", "password is not supported for TCP protocol");
             assertConfStrError("tcp::addr=localhost;password=foo;", "password is not supported for TCP protocol");
             assertConfStrError("tcp::addr=localhost;retry_timeout=;", "retry_timeout cannot be empty");
@@ -222,10 +224,10 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost;auto_flush_bytes=1024;", "auto_flush_bytes is only supported for TCP and WebSocket transport");
             assertConfStrError("http::addr=localhost;protocol_version=10", "current client only supports protocol version 1(text format for all datatypes), 2(binary format for part datatypes), 3(decimal datatype) or explicitly unset");
             assertConfStrError("http::addr=localhost:48884;max_name_len=10;", "max_name_len must be at least 16 bytes [max_name_len=10]");
-            assertConfStrError("ws::addr=localhost;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
-            assertConfStrError("wss::addr=localhost;tls_verify=unsafe_off;max_buf_size=1000000;", "maximum buffer capacity is not supported for WebSocket transport");
-            assertConfStrError("ws::addr=localhost;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
-            assertConfStrError("wss::addr=localhost;tls_verify=unsafe_off;init_buf_size=1024;", "buffer capacity is not supported for WebSocket transport");
+            assertConfStrError("ws::addr=localhost;max_buf_size=1000000;", "unknown configuration key: max_buf_size (applies to legacy http/tcp/udp transports only)");
+            assertConfStrError("wss::addr=localhost;tls_verify=unsafe_off;max_buf_size=1000000;", "unknown configuration key: max_buf_size (applies to legacy http/tcp/udp transports only)");
+            assertConfStrError("ws::addr=localhost;init_buf_size=1024;", "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
+            assertConfStrError("wss::addr=localhost;tls_verify=unsafe_off;init_buf_size=1024;", "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
 
             assertConfStrOk("addr=localhost:8080", "auto_flush_rows=100", "protocol_version=1");
             assertConfStrOk("addr=localhost:8080", "auto_flush=on", "auto_flush_rows=100", "protocol_version=2");
@@ -268,17 +270,17 @@ public class LineSenderBuilderTest {
             // let language clients drift on the same connect string.
             assertConfStrError("http::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
             assertConfStrError("tcp::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
-            assertConfStrError("ws::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
+            assertConfStrError("ws::addr=localhost;not_a_real_key=foo;", "unknown configuration key: not_a_real_key");
             assertConfStrError("udp::addr=localhost;not_a_real_key=foo;", "unknown configuration key [key=not_a_real_key]");
             // The unknown-key error must surface even when the value would
             // itself be malformed -- the key is the reportable defect.
             assertConfStrError("http::addr=localhost;not_a_real_key=", "unknown configuration key [key=not_a_real_key]");
 
-            // in_flight_window is silently accepted as a no-op for backward
-            // compatibility. The store-and-forward mechanism replaces it.
-            assertConfStrOk("http::addr=localhost;in_flight_window=10000;protocol_version=2;");
-            assertConfStrOk("udp::addr=localhost;in_flight_window=10000;");
-            assertConfStrOk("http::addr=localhost;in_flight_window=;protocol_version=2;");
+            // in_flight_window has been removed; it is now rejected like any
+            // other unknown configuration key.
+            assertConfStrError("http::addr=localhost;in_flight_window=10000;protocol_version=2;", "unknown configuration key [key=in_flight_window]");
+            assertConfStrError("udp::addr=localhost;in_flight_window=10000;", "unknown configuration key [key=in_flight_window]");
+            assertConfStrError("http::addr=localhost;in_flight_window=;protocol_version=2;", "unknown configuration key [key=in_flight_window]");
         });
     }
 
@@ -360,7 +362,6 @@ public class LineSenderBuilderTest {
             // Each egress-only key on its own with a representative happy-path
             // value. Covers query-client knobs and per-Execute failover knobs.
             String[] keys = {
-                    "auth=Bearer xyz",
                     "client_id=batch-job/42",
                     "compression=zstd",
                     "compression_level=5",
@@ -371,7 +372,6 @@ public class LineSenderBuilderTest {
                     "failover_max_duration_ms=30000",
                     "initial_credit=1048576",
                     "max_batch_rows=10000",
-                    "path=/api/v2/query",
                     "target=primary",
             };
             StringBuilder all = new StringBuilder("http::addr=").append(LOCALHOST).append(";protocol_version=2;");
@@ -379,7 +379,7 @@ public class LineSenderBuilderTest {
                 assertConfStrOk("http::addr=" + LOCALHOST + ";" + kv + ";protocol_version=2;");
                 all.append(kv).append(';');
             }
-            // All 13 keys at once -- a typical shared-config connect string.
+            // All 11 keys at once -- a typical shared-config connect string.
             assertConfStrOk(all.toString());
 
             // Out-of-range / malformed values are silently consumed too -- the
@@ -394,7 +394,6 @@ public class LineSenderBuilderTest {
             // Empty values are well-formed and silently consumed.
             assertConfStrOk("http::addr=" + LOCALHOST + ";compression=;protocol_version=2;");
             assertConfStrOk("http::addr=" + LOCALHOST + ";target=;protocol_version=2;");
-            assertConfStrOk("http::addr=" + LOCALHOST + ";path=;protocol_version=2;");
         });
     }
 

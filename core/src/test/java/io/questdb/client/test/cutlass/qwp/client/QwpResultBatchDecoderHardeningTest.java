@@ -52,27 +52,72 @@ import java.util.concurrent.atomic.AtomicReference;
 public class QwpResultBatchDecoderHardeningTest {
 
     /**
-     * Regression: an ARRAY column row whose dimension list contains a zero
-     * must be rejected. Without the fix the multiplicative cap is
-     * short-circuited the moment {@code elements} hits zero, so subsequent
-     * dimensions can hold any value (including {@code Integer.MAX_VALUE})
-     * without the decoder ever firing the {@code MAX_ARRAY_ELEMENTS}
-     * guard. The encoder side never produces dl == 0 -- the existing
-     * nDims >= 1 check at the start of {@code parseArrayColumn} confirms
-     * the design intent that arrays are non-empty in every dimension.
+     * The per-dimension bound matches the server's {@code DIM_MAX_LEN}
+     * ({@code (1 << 28) - 1}): an empty array carrying a dimension exactly at
+     * that ceiling decodes, while one element past it is rejected. Pins the
+     * boundary so the client accepts every shape the server can emit and no
+     * more. The 0-length sibling keeps the element-count product at 0, so this
+     * exercises the per-dimension cap rather than the product cap.
      */
     @Test
-    public void testArrayDimZeroIsRejected() throws Exception {
+    public void testArrayDimAtServerLimitBoundary() throws Exception {
+        final int dimMaxLen = (1 << 28) - 1;
         TestUtils.assertMemoryLeak(() -> {
             QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
             QwpBatchBuffer buffer = new QwpBatchBuffer(256);
             long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
             try {
-                int len = writeArrayResultBatchWithDims(staging, new int[]{0, 5});
+                // {0, DIM_MAX_LEN}: empty array (product 0) with a sibling at the
+                // server's per-dimension ceiling -- decodes without error.
+                int len = writeArrayResultBatchWithDims(staging, new int[]{0, dimMaxLen});
+                buffer.copyFromPayload(staging, len);
+                decoder.decode(buffer);
+
+                // {0, DIM_MAX_LEN + 1}: one past the ceiling -- rejected.
+                len = writeArrayResultBatchWithDims(staging, new int[]{0, dimMaxLen + 1});
                 buffer.copyFromPayload(staging, len);
                 try {
                     decoder.decode(buffer);
-                    Assert.fail("decoder must reject ARRAY with dim == 0");
+                    Assert.fail("decoder must reject an ARRAY dim above DIM_MAX_LEN");
+                } catch (QwpDecodeException expected) {
+                    Assert.assertTrue("error must blame the ARRAY dim: " + expected.getMessage(),
+                            expected.getMessage().contains("ARRAY dim"));
+                }
+            } finally {
+                Unsafe.free(staging, 256, MemoryTag.NATIVE_DEFAULT);
+                buffer.close();
+                decoder.close();
+            }
+        });
+    }
+
+    /**
+     * A 0-length dimension is a valid empty array (cardinality 0), distinct
+     * from a NULL array (carried in the null bitmap), so {@code {0, 5}} must
+     * decode without error. The original concern -- that a 0 collapses the
+     * element-count product and lets a sibling dimension smuggle an arbitrary
+     * value past the {@code MAX_ARRAY_ELEMENTS} cap -- is now handled by a
+     * per-dimension bound, so {@code {0, Integer.MAX_VALUE}} is still rejected.
+     */
+    @Test
+    public void testArrayDimZeroIsEmptyArrayButHostileDimRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            QwpResultBatchDecoder decoder = new QwpResultBatchDecoder();
+            QwpBatchBuffer buffer = new QwpBatchBuffer(256);
+            long staging = Unsafe.malloc(256, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // {0, 5}: a legitimate empty array -- decodes without error.
+                int len = writeArrayResultBatchWithDims(staging, new int[]{0, 5});
+                buffer.copyFromPayload(staging, len);
+                decoder.decode(buffer);
+
+                // {0, Integer.MAX_VALUE}: the per-dimension cap must still fire
+                // even though the element-count product collapses to 0.
+                len = writeArrayResultBatchWithDims(staging, new int[]{0, Integer.MAX_VALUE});
+                buffer.copyFromPayload(staging, len);
+                try {
+                    decoder.decode(buffer);
+                    Assert.fail("decoder must reject a hostile oversized ARRAY dim");
                 } catch (QwpDecodeException expected) {
                     Assert.assertTrue("error must blame the ARRAY dim: " + expected.getMessage(),
                             expected.getMessage().contains("ARRAY dim"));

@@ -54,13 +54,13 @@ public class CloseDrainTest {
         // Server delays every ACK by 800ms. With the default
         // close_flush_timeout_millis=60000, close() must wait for that
         // ACK before returning. Pre-fix close() returned within milliseconds.
-        int port = TestPorts.findUnusedPort();
         long ackDelayMs = 800;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port + ";";  // memory mode
             long elapsedMs;
             try (Sender sender = Sender.fromConfig(cfg)) {
@@ -82,13 +82,13 @@ public class CloseDrainTest {
         // Same delayed-ACK server, but with close_flush_timeout_millis=0
         // (fast close). close() must return immediately, well before the
         // ACK delay would have elapsed.
-        int port = TestPorts.findUnusedPort();
         long ackDelayMs = 1500;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port
                     + ";close_flush_timeout_millis=0;";
             long elapsedMs;
@@ -115,13 +115,13 @@ public class CloseDrainTest {
         // sentinel in LineSenderBuilder, so the build path silently substitutes
         // DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS (60s) and close() blocks for the
         // full ACK delay instead of returning fast.
-        int port = TestPorts.findUnusedPort();
         long ackDelayMs = 1500;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port
                     + ";close_flush_timeout_millis=-1;";
             long elapsedMs;
@@ -144,13 +144,13 @@ public class CloseDrainTest {
         // Server that buffers frames silently and never ACKs. close() must
         // throw a drain-timeout LineSenderException after roughly the
         // configured timeout — not hang forever and not return immediately.
-        int port = TestPorts.findUnusedPort();
         long timeoutMs = 500;
         SilentHandler handler = new SilentHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port
                     + ";close_flush_timeout_millis=" + timeoutMs + ";";
             long elapsedMs;
@@ -182,13 +182,13 @@ public class CloseDrainTest {
         // testCloseBlocksUntilAckArrives, but the wait happens inside the
         // explicit drain() call. The subsequent close() should be a near-
         // instant no-op because everything is already acked.
-        int port = TestPorts.findUnusedPort();
         long ackDelayMs = 600;
         DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port + ";";
             try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
@@ -210,6 +210,47 @@ public class CloseDrainTest {
         }
     }
 
+    /**
+     * Regression test for #7142: drain() after a prior flush() with unacked
+     * frames must block for those frames, even though the inner
+     * flushAndGetSequence() publishes nothing and returns -1.
+     * <p>
+     * On buggy code (no drain() override): drain() calls the default
+     * Sender.drain() → flushAndGetSequence() returns -1 → awaitAckedFsn(-1, ...)
+     * returns true immediately (ackedFsn >= -1 is always true) at elapsed≈0ms.
+     * The elapsed >= 300 assertion fails deterministically.
+     * <p>
+     * On fixed code: drain() uses the watermark override → waits for the
+     * delayed ACK (~600ms) → passes.
+     */
+    @Test
+    public void testDrainAfterFlushWaitsForPriorUnackedFrames() throws Exception {
+        long ackDelayMs = 600;
+        DelayingAckHandler handler = new DelayingAckHandler(ackDelayMs);
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            int port = server.getPort();
+            String cfg = "ws::addr=localhost:" + port + ";";
+            try (Sender sender = Sender.fromConfig(cfg)) {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();                         // publish FSN 0; ACK delayed ~600ms
+
+                long t0 = System.nanoTime();
+                boolean drained = sender.drain(5_000);  // empty flush → -1 on buggy code
+                long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+
+                Assert.assertTrue("drain() must return true when ACK arrives within budget",
+                        drained);
+                Assert.assertTrue(
+                        "drain() must wait for prior unacked frame, but returned in only "
+                                + elapsedMs + "ms (expected >= " + (ackDelayMs / 2) + "ms)",
+                        elapsedMs >= ackDelayMs / 2);
+            }
+        }
+    }
+
     @Test
     public void testDrainReturnsFalseOnTimeoutAndSenderStillUsable() throws Exception {
         // Server never ACKs. drain() with a small timeout must return false
@@ -218,12 +259,12 @@ public class CloseDrainTest {
         // usable for further row writes after a false return; the
         // outstanding frames remain pending and close()'s own drain still
         // runs.
-        int port = TestPorts.findUnusedPort();
         SilentHandler handler = new SilentHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port + ";close_flush_timeout_millis=0;";
             try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
@@ -246,12 +287,12 @@ public class CloseDrainTest {
         // Fast server: every frame is acked promptly. drain(longTimeout)
         // must return true quickly -- no spurious wait when there is
         // nothing to wait for.
-        int port = TestPorts.findUnusedPort();
         DelayingAckHandler handler = new DelayingAckHandler(0);
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port + ";";
             try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
@@ -266,9 +307,9 @@ public class CloseDrainTest {
 
     @Test
     public void testAsyncCloseDrainSucceedsWhenServerStartsDuringDrain() throws Exception {
-        int port = TestPorts.findUnusedPort();
         DelayingAckHandler handler = new DelayingAckHandler(0);
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            int port = server.getPort();
             String cfg = "ws::addr=localhost:" + port
                     + sfDirOpt()
                     + ";initial_connect_retry=async"
@@ -303,12 +344,12 @@ public class CloseDrainTest {
 
     @Test
     public void testAsyncCloseDrainSucceedsWhenServerWasUpAllAlong() throws Exception {
-        int port = TestPorts.findUnusedPort();
         DelayingAckHandler handler = new DelayingAckHandler(0);
-        try (TestWebSocketServer server = new TestWebSocketServer(port, handler)) {
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+            int port = server.getPort();
             for (int i = 0; i < 20; i++) {
                 String cfg = "ws::addr=localhost:" + port
                         + sfDirOpt()
@@ -317,14 +358,20 @@ public class CloseDrainTest {
                         + ";reconnect_initial_backoff_millis=20"
                         + ";reconnect_max_backoff_millis=100"
                         + ";close_flush_timeout_millis=3000;";
-                long t0 = System.nanoTime();
                 try (Sender sender = Sender.fromConfig(cfg)) {
                     sender.table("foo").longColumn("v", i).atNow();
                     sender.flush();
+                    // Time only close(): the 2500ms budget covers close()'s
+                    // drain latency. Building the first store-and-forward
+                    // sender carries a one-time cold-start cost (class
+                    // loading, JIT, sf buffer mmap) that belongs to
+                    // construction, not to close().
+                    long t0 = System.nanoTime();
+                    sender.close();
+                    long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                    Assert.assertTrue("iteration " + i + " close() took " + elapsedMs + "ms",
+                            elapsedMs < 2500);
                 }
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
-                Assert.assertTrue("iteration " + i + " close() took " + elapsedMs + "ms",
-                        elapsedMs < 2500);
             }
         }
     }

@@ -73,9 +73,9 @@ public class BackgroundDrainerEndToEndTest {
     @Test
     public void testDrainerEmptiesOrphanSlotAgainstAckServer() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            int port1 = TestPorts.findUnusedPort();
             // Phase 1: ghost sender against silent server. 30 frames; close fast.
-            try (TestWebSocketServer silent = new TestWebSocketServer(port1, new SilentHandler())) {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port1 = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
 
@@ -95,9 +95,9 @@ public class BackgroundDrainerEndToEndTest {
                     1, OrphanScanner.scan(sfDir, "primary").size());
 
             // Phase 2: foreground sender against ack server, with drain_orphans=on.
-            int port2 = TestPorts.findUnusedPort();
             AckHandler ack = new AckHandler();
-            try (TestWebSocketServer good = new TestWebSocketServer(port2, ack)) {
+            try (TestWebSocketServer good = new TestWebSocketServer(ack)) {
+                int port2 = good.getPort();
                 good.start();
                 Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
 
@@ -139,8 +139,8 @@ public class BackgroundDrainerEndToEndTest {
     public void testDrainerLeavesFailedSentinelOnTerminalError() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Drainer can't connect → exhausts its budget → drops .failed.
-            int port1 = TestPorts.findUnusedPort();
-            try (TestWebSocketServer silent = new TestWebSocketServer(port1, new SilentHandler())) {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port1 = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
                 String cfg1 = "ws::addr=localhost:" + port1
@@ -158,10 +158,10 @@ public class BackgroundDrainerEndToEndTest {
             // drainer should give up and drop .failed.
             // The foreground sender does need to start successfully, so we
             // give it its own working server on a different port.
-            int port2 = TestPorts.findUnusedPort();
             int unreachablePort = TestPorts.findUnusedPort();
             AckHandler fgAck = new AckHandler();
-            try (TestWebSocketServer fgServer = new TestWebSocketServer(port2, fgAck)) {
+            try (TestWebSocketServer fgServer = new TestWebSocketServer(fgAck)) {
+                int port2 = fgServer.getPort();
                 fgServer.start();
                 Assert.assertTrue(fgServer.awaitStart(5, TimeUnit.SECONDS));
                 // Sender targets fgServer; drainer would inherit the same

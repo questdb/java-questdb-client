@@ -39,22 +39,23 @@ public class QwpWebSocketEncoder implements QuietCloseable {
 
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
     private NativeBufferWriter buffer;
-    private byte flags;
+    // QWP ingress always advertises Gorilla timestamp encoding. The column
+    // writer still emits a per-column encoding byte and falls back to raw
+    // values when delta-of-delta overflows int32.
+    private byte flags = FLAG_GORILLA;
     private int payloadStart;
     private byte version = VERSION;
 
     public QwpWebSocketEncoder() {
         this.buffer = new NativeBufferWriter();
-        this.flags = 0;
     }
 
     public QwpWebSocketEncoder(int bufferSize) {
         this.buffer = new NativeBufferWriter(bufferSize);
-        this.flags = 0;
     }
 
     public void addTable(QwpTableBuffer tableBuffer) {
-        columnWriter.encodeTable(tableBuffer, true, isGorillaEnabled());
+        columnWriter.encodeTable(tableBuffer, true, true);
     }
 
     public void beginMessage(
@@ -94,7 +95,7 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         writeHeader(1, 0);
         int payloadStart = buffer.getPosition();
         columnWriter.setBuffer(buffer);
-        columnWriter.encodeTable(tableBuffer, false, isGorillaEnabled());
+        columnWriter.encodeTable(tableBuffer, false, true);
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
         return buffer.getPosition();
@@ -121,23 +122,11 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         return buffer;
     }
 
-    public boolean isGorillaEnabled() {
-        return (flags & FLAG_GORILLA) != 0;
-    }
-
     public void setDeferCommit(boolean defer) {
         if (defer) {
             flags |= FLAG_DEFER_COMMIT;
         } else {
             flags &= ~FLAG_DEFER_COMMIT;
-        }
-    }
-
-    public void setGorillaEnabled(boolean enabled) {
-        if (enabled) {
-            flags |= FLAG_GORILLA;
-        } else {
-            flags &= ~FLAG_GORILLA;
         }
     }
 

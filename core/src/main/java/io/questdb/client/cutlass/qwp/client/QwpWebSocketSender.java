@@ -67,6 +67,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -217,7 +218,6 @@ public class QwpWebSocketSender implements Sender {
     private SenderErrorHandler errorHandler = DefaultSenderErrorHandler.INSTANCE;
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
-    private boolean gorillaEnabled = true;
     private boolean hasDeferredMessages;
     // Stickys true once any successful connect has happened. Drives the
     // CONNECTED-vs-RECONNECTED-vs-FAILED_OVER classification at the success
@@ -234,6 +234,12 @@ public class QwpWebSocketSender implements Sender {
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
     private boolean ownsCursorEngine;
     private long pendingBytes;
+    // Set true by close() once the SF slot flock has been released (the normal
+    // teardown path). Stays false if close() bailed early with the I/O thread
+    // still running -- then cursorEngine.close() never ran and the flock is
+    // still held, so the owning pool MUST keep the slot reserved rather than
+    // hand the still-locked dir to the next borrow ("sf slot already in use").
+    private boolean slotLockReleased;
     private int pendingRowCount;
     private SenderProgressDispatcher progressDispatcher;
     // Async-delivery sink for ack-watermark advances. Default no-op; a
@@ -279,7 +285,7 @@ public class QwpWebSocketSender implements Sender {
         if (endpoints == null || endpoints.isEmpty()) {
             throw new IllegalArgumentException("endpoints must be non-empty");
         }
-        this.endpoints = List.copyOf(endpoints);
+        this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
         this.hostTracker = new QwpHostHealthTracker(this.endpoints.size());
         this.authorizationHeader = authorizationHeader;
         this.tlsConfig = tlsConfig;
@@ -533,7 +539,7 @@ public class QwpWebSocketSender implements Sender {
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS, true);
+                durableAckKeepaliveIntervalMillis, DEFAULT_AUTH_TIMEOUT_MS);
     }
 
     /**
@@ -562,8 +568,7 @@ public class QwpWebSocketSender implements Sender {
             SenderErrorHandler errorHandler,
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
-            long authTimeoutMs,
-            boolean gorillaEnabled
+            long authTimeoutMs
     ) {
         return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, authorizationHeader,
@@ -571,7 +576,7 @@ public class QwpWebSocketSender implements Sender {
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, authTimeoutMs, gorillaEnabled,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs,
                 null, SenderConnectionDispatcher.DEFAULT_CAPACITY);
     }
 
@@ -597,7 +602,6 @@ public class QwpWebSocketSender implements Sender {
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
             long authTimeoutMs,
-            boolean gorillaEnabled,
             SenderConnectionListener connectionListener,
             int connectionListenerInboxCapacity
     ) {
@@ -609,8 +613,6 @@ public class QwpWebSocketSender implements Sender {
         try {
             sender.requestDurableAck = requestDurableAck;
             sender.authTimeoutMs = authTimeoutMs;
-            sender.gorillaEnabled = gorillaEnabled;
-            sender.encoder.setGorillaEnabled(gorillaEnabled);
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -928,14 +930,20 @@ public class QwpWebSocketSender implements Sender {
             // SCHEMA_MISMATCH HALT) from users who only call close() and
             // never call flush() afterwards.
             Throwable terminalError = null;
-            // Snapshot the latched terminal error that the user thread has
-            // ALREADY caught (via flush()/at()) before close() ran. If
-            // flushPendingRows/drainOnClose below also rethrow the same
+            // Snapshot the exact terminal error instance that a user-thread
+            // API call ALREADY caught (via flush()/at()) before close() ran.
+            // If flushPendingRows/drainOnClose below also rethrow the same
             // instance, dropping it at the final rethrow avoids
             // try-with-resources self-suppression: Throwable.addSuppressed
             // raises IllegalArgumentException when primary == suppressed.
-            Throwable alreadyOwnedByUser = (cursorSendLoop != null && !cursorSendLoop.hasUnsurfacedError())
-                    ? cursorSendLoop.getLastError() : null;
+            // Must stay this single read: the snapshot needs the identity of
+            // the error the user already owns, and only
+            // getSynchronouslySurfacedError() holds it. Deriving it from two
+            // separate latch reads races the I/O thread -- a terminal latched
+            // between the reads would be adopted as user-owned and silently
+            // dropped (see CloseOwnershipRaceTest).
+            Throwable alreadyOwnedByUser = cursorSendLoop != null
+                    ? cursorSendLoop.getSynchronouslySurfacedError() : null;
 
             try {
                 // Only drain when both the engine and the I/O loop are wired
@@ -953,35 +961,42 @@ public class QwpWebSocketSender implements Sender {
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
                     }
-                    // 2) Safety-net rethrow: surface a latched terminal error
-                    //    only when no other channel has already delivered it
-                    //    to the user. "Already delivered" means either the
-                    //    producer thread saw it synchronously via
-                    //    flush()/append() (errorSurfacedSynchronously) or the
-                    //    async dispatcher delivered it to a user-installed
-                    //    custom handler at any point in this sender's life
-                    //    (deliveredToCustomHandler). The latter survives a
-                    //    setErrorHandler(null) cleanup in test helpers --
-                    //    once the user has owned an error, close() should
-                    //    not double-signal it. The default no-op logging
-                    //    handler does not count as "delivered to user", so a
-                    //    config-string-only caller still gets the loud
-                    //    rethrow on shutdown.
-                    boolean alreadyDeliveredToCustomHandler = errorDispatcher != null
-                            && errorDispatcher.hasDeliveredToCustomHandler();
-                    if (!alreadyDeliveredToCustomHandler
-                            && cursorSendLoop.hasUnsurfacedError()) {
-                        cursorSendLoop.checkError();
+                    // 2) Safety-net rethrow: surface the latched terminal
+                    //    error only when no other channel has already
+                    //    delivered THIS terminal to the user. "Already
+                    //    delivered" means either the producer thread saw it
+                    //    synchronously via flush()/append() (checkUnsurfacedError
+                    //    is silent in that case) or the async dispatcher
+                    //    actually delivered the latched terminal to a
+                    //    user-installed custom handler
+                    //    (hasDeliveredTerminalToCustomHandler, checked here).
+                    //    The test is terminal-specific on purpose: an earlier
+                    //    routine DROP_AND_CONTINUE rejection delivered to the
+                    //    handler must NOT suppress a later genuine HALT
+                    //    terminal (the "any error ever" flag did, silently
+                    //    losing it). It also stays false when the terminal
+                    //    reached only the default handler after a
+                    //    setErrorHandler(null) revert, or is still
+                    //    queued/abandoned behind a slow handler -- so a
+                    //    config-string-only caller, and a reverting caller,
+                    //    both still get the loud rethrow on shutdown.
+                    boolean terminalOwnedByCustomHandler = errorDispatcher != null
+                            && errorDispatcher.hasDeliveredTerminalToCustomHandler();
+                    if (!terminalOwnedByCustomHandler) {
+                        cursorSendLoop.checkUnsurfacedError();
                     }
                     // 3) Bounded drain: block until the server has ACK'd
                     //    everything we just published, or until the
                     //    configured timeout elapses. closeFlushTimeoutMillis
                     //    <= 0 opts out (fast close, may lose memory-mode
-                    //    data on JVM exit). Errors still surface via the
-                    //    safety-net checkError() above and via the async
-                    //    error handler.
+                    //    data on JVM exit). Pass the same ownership flag the
+                    //    step-2 safety net used: when the custom handler
+                    //    already owns THIS terminal, the drain must stop on it
+                    //    without re-throwing (re-throwing would double-signal
+                    //    an error the user already handled). Otherwise the
+                    //    drain keeps the loud safety net and surfaces it.
                     if (closeFlushTimeoutMillis > 0L) {
-                        drainOnClose();
+                        drainOnClose(terminalOwnedByCustomHandler);
                     }
                 }
             } catch (Throwable t) {
@@ -1074,6 +1089,10 @@ public class QwpWebSocketSender implements Sender {
                 cursorEngine = null;
                 ownsCursorEngine = false;
             }
+            // Past the ioThreadStopped guard => cursorEngine.close() ran and
+            // released the SF flock in its finally (or this sender owned no
+            // engine holding one). Signal the pool it may reuse the slot.
+            slotLockReleased = true;
 
             // Shutdown order: dispatcher last, after the I/O loop has stopped
             // producing into it. close() drains pending entries with a short
@@ -1114,6 +1133,16 @@ public class QwpWebSocketSender implements Sender {
             }
             rethrowTerminal(terminalError);
         }
+    }
+
+    /**
+     * True once {@link #close()} has released the store-and-forward slot
+     * flock. False means close() leaked the still-running I/O thread (and its
+     * resources), so the flock is still held; the owning pool must keep the
+     * slot index reserved instead of reusing the still-locked slot dir.
+     */
+    public boolean isSlotLockReleased() {
+        return slotLockReleased;
     }
 
     @Override
@@ -1341,6 +1370,8 @@ public class QwpWebSocketSender implements Sender {
         ensureNoInProgressRow();
         ensureConnected();
 
+        long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+
         // Cursor SF: SF.append happens on the user thread inside
         // sealAndSwapBuffer, so by the time we reach here every encoded
         // batch is durable on its mmap'd segment. No processingCount to
@@ -1354,7 +1385,40 @@ public class QwpWebSocketSender implements Sender {
         }
         cursorSendLoop.checkError();
         checkConnectionError();
-        return cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+
+        long afterFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+        return afterFsn > beforeFsn ? afterFsn : -1L;
+    }
+
+    /**
+     * Flushes pending rows and blocks until the server has acknowledged
+     * every frame published so far (the current published-FSN watermark),
+     * or until {@code timeoutMillis} elapses.
+     * <p>
+     * This override uses <b>watermark semantics</b> rather than per-call
+     * semantics: it waits for the global {@code publishedFsn()}, not just
+     * the FSN returned by the flush in this call. This is necessary because
+     * {@link #flushAndGetSequence()} now returns {@code -1} when no data
+     * was published by the call, and the default {@link Sender#drain}
+     * implementation ({@code awaitAckedFsn(flushAndGetSequence(), timeout)})
+     * would short-circuit immediately on an empty flush even when prior
+     * publishes remain unacknowledged.
+     * <p>
+     * Close-time drain ({@link #drainOnClose()}) already uses the same
+     * watermark approach directly.
+     *
+     * @param timeoutMillis upper bound on the wait; {@code <= 0} returns
+     *                      the current state without blocking (the flush
+     *                      still happens before the check)
+     * @return {@code true} if the server has acknowledged every published
+     *         frame on return, {@code false} on timeout
+     * @throws LineSenderException if the transport has latched a terminal error
+     */
+    @Override
+    public boolean drain(long timeoutMillis) {
+        flush();
+        long targetFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+        return awaitAckedFsn(targetFsn, timeoutMillis);
     }
 
     /**
@@ -1770,13 +1834,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Returns whether Gorilla encoding is enabled.
-     */
-    public boolean isGorillaEnabled() {
-        return gorillaEnabled;
-    }
-
-    /**
      * Adds a LONG256 column value to the current row.
      *
      * @param columnName the column name
@@ -2005,14 +2062,6 @@ public class QwpWebSocketSender implements Sender {
                     + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
         }
         this.errorInboxCapacity = capacity;
-    }
-
-    /**
-     * Sets whether to use Gorilla timestamp encoding.
-     */
-    public void setGorillaEnabled(boolean enabled) {
-        this.gorillaEnabled = enabled;
-        this.encoder.setGorillaEnabled(enabled);
     }
 
     public void setTransactional(boolean transactional) {
@@ -2558,7 +2607,7 @@ public class QwpWebSocketSender implements Sender {
             error.fillInStackTrace();
             throw error;
         }
-        // Poll the cursor I/O loop's lastError too. Without this, a fatal
+        // Poll the cursor I/O loop's terminalError too. Without this, a fatal
         // wire / server-rejection error recorded by the I/O thread would
         // only surface on the next flush() / close() — every row-level
         // method (table, longColumn, atNow, etc.) routes through
@@ -2638,8 +2687,30 @@ public class QwpWebSocketSender implements Sender {
      * SF-mode users can recover the unacked tail by reopening a sender on
      * the same SF directory; memory-mode users have no recovery path and
      * must treat this as fatal.
+     * <p>
+     * A latched terminal error means the server will never ACK up to
+     * {@code target}, so the drain must stop on it regardless. Whether it is
+     * also re-thrown from close() is a separate surfacing policy that mirrors
+     * the step-2 safety net in {@link #close()}:
+     * <ul>
+     *   <li>{@code errorOwnedByCustomHandler == true}: a custom error handler
+     *   has already delivered this terminal to the user, so stop silently —
+     *   re-throwing here would double-signal it (the M3 drainOnClose
+     *   double-signal).</li>
+     *   <li>{@code errorOwnedByCustomHandler == false}: re-throw via
+     *   {@code checkError()} to preserve the loud safety net (a
+     *   config-string-only caller's only channel). The throw also breaks the
+     *   loop; an error a synchronous {@code flush()}/{@code at()} caller
+     *   already owns is then suppressed by close()'s
+     *   {@code terminalError == alreadyOwnedByUser} check, so it is not
+     *   double-signalled either.</li>
+     * </ul>
+     *
+     * @param errorOwnedByCustomHandler whether the async dispatcher has
+     *                                  already delivered a terminal to a
+     *                                  user-installed handler
      */
-    private void drainOnClose() {
+    private void drainOnClose(boolean errorOwnedByCustomHandler) {
         if (closeFlushTimeoutMillis <= 0L) {
             return;
         }
@@ -2649,7 +2720,15 @@ public class QwpWebSocketSender implements Sender {
         }
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
         while (cursorEngine.ackedFsn() < target) {
-            cursorSendLoop.checkError();
+            // Stop on a latched terminal (acks will never reach target);
+            // surface it only when no other channel already delivered it.
+            if (errorOwnedByCustomHandler) {
+                if (cursorSendLoop.getTerminalError() != null) {
+                    return;
+                }
+            } else {
+                cursorSendLoop.checkError();
+            }
             if (System.nanoTime() >= deadlineNanos) {
                 long acked = cursorEngine.ackedFsn();
                 LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost",

@@ -27,7 +27,6 @@ package io.questdb.client.std;
 import io.questdb.client.std.fastdouble.FastDoubleParser;
 import io.questdb.client.std.str.CharSink;
 import io.questdb.client.std.str.Utf8Sequence;
-import jdk.internal.math.FDBigInteger;
 
 import java.util.Arrays;
 
@@ -658,12 +657,12 @@ public final class Numbers {
                     lowDigitDifference = (b << 1) - tens;
                 }
             } else {
-                FDBigInteger sVal = FDBigInteger.valueOfPow52(S5, S2);
+                FdBig sVal = FdBig.valueOfPow52(S5, S2);
                 final int shiftBias = sVal.getNormalizationBias();
                 sVal = sVal.leftShift(shiftBias);
-                FDBigInteger bVal = FDBigInteger.valueOfMulPow52(fractionBits, B5, B2 + shiftBias);
-                FDBigInteger mVal = FDBigInteger.valueOfPow52(B5 + 1, M2 + shiftBias + 1);
-                FDBigInteger tensVal = FDBigInteger.valueOfPow52(S5 + 1, S2 + shiftBias + 1);
+                FdBig bVal = FdBig.valueOfMulPow52(fractionBits, B5, B2 + shiftBias);
+                FdBig mVal = FdBig.valueOfPow52(B5 + 1, M2 + shiftBias + 1);
+                FdBig tensVal = FdBig.valueOfPow52(S5 + 1, S2 + shiftBias + 1);
                 digitIndex = 0;
                 q = bVal.quoRemIteration(sVal);
                 low = bVal.cmp(mVal) < 0;
@@ -1453,11 +1452,6 @@ public final class Numbers {
     @FunctionalInterface
     private interface LongHexAppender {
         void append(CharSink<?> sink, long value);
-    }
-
-    static {
-        Module currentModule = Numbers.class.getModule();
-        Unsafe.addExports(Unsafe.JAVA_BASE_MODULE, currentModule, "jdk.internal.math");
     }
 
     static {

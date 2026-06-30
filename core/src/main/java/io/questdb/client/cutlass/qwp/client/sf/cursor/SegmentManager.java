@@ -30,6 +30,7 @@ import io.questdb.client.std.Numbers;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.str.DirectUtf8Sink;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,17 +87,18 @@ public final class SegmentManager implements QuietCloseable {
     private final long segmentSizeBytes;
     // Test seam: runs on the worker thread just before the install path's
     // synchronized(lock) entry (the one that performs installHotSpare + the
-    // totalBytes += segmentSize commit). Null in production; only
-    // SegmentManagerInstallDeregisterRaceTest installs it, to deterministically
-    // inject a deregister(ring) call into the exact race window that the
-    // stillRegistered guard inside the install block closes.
-    volatile Runnable beforeInstallSyncHook;
+    // totalBytes += segmentSize commit). Null in production; tests use it to
+    // pause after the worker has snapshotted a RingEntry and created a spare,
+    // but before ownership/accounting commit. Callers may inject a deregister
+    // or hold this stale worker snapshot while caller-side cleanup runs.
+    private volatile Runnable beforeInstallSyncHook;
     // Test seam: runs on the worker thread just before the trim block's
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
     // inject a deregister(ring) call into the exact race window that the
-    // stillRegistered guard inside the trim block closes.
-    volatile Runnable beforeTrimSyncHook;
+    // registered flag check inside the trim block closes for watermark writes
+    // and totalBytes accounting.
+    private volatile Runnable beforeTrimSyncHook;
     private long lastDiskFullLogNs;
     private volatile boolean running;
     // Total bytes currently allocated across every segment owned by every
@@ -122,23 +124,23 @@ public final class SegmentManager implements QuietCloseable {
      * Full constructor.
      *
      * @param segmentSizeBytes per-segment file size in bytes
-     * @param pollNanos how often the worker polls each registered ring;
-     *                  default {@link #DEFAULT_POLL_NANOS}
-     * @param maxTotalBytes upper bound on total bytes the manager tracks
-     *                      across all registered rings — counts every segment
-     *                      the ring owns (initial active + sealed + hot
-     *                      spare), including bytes already on disk at
-     *                      register-time (e.g. after recovery or orphan
-     *                      adoption). When provisioning a hot spare would
-     *                      exceed this, the manager skips the install — the
-     *                      requesting ring stays in the
-     *                      {@link SegmentRing#BACKPRESSURE_NO_SPARE} state
-     *                      until ACK-driven trim frees space. Pass
-     *                      {@link #UNLIMITED_TOTAL_BYTES} to disable. Must be
-     *                      at least one {@code segmentSizeBytes}; a sensible
-     *                      lower bound for a single ring is
-     *                      {@code 2 × segmentSizeBytes} so the manager can
-     *                      hold an initial active plus one hot spare.
+     * @param pollNanos        how often the worker polls each registered ring;
+     *                         default {@link #DEFAULT_POLL_NANOS}
+     * @param maxTotalBytes    upper bound on total bytes the manager tracks
+     *                         across all registered rings — counts every segment
+     *                         the ring owns (initial active + sealed + hot
+     *                         spare), including bytes already on disk at
+     *                         register-time (e.g. after recovery or orphan
+     *                         adoption). When provisioning a hot spare would
+     *                         exceed this, the manager skips the install — the
+     *                         requesting ring stays in the
+     *                         {@link SegmentRing#BACKPRESSURE_NO_SPARE} state
+     *                         until ACK-driven trim frees space. Pass
+     *                         {@link #UNLIMITED_TOTAL_BYTES} to disable. Must be
+     *                         at least one {@code segmentSizeBytes}; a sensible
+     *                         lower bound for a single ring is
+     *                         {@code 2 × segmentSizeBytes} so the manager can
+     *                         hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
         if (segmentSizeBytes < MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1) {
@@ -157,18 +159,26 @@ public final class SegmentManager implements QuietCloseable {
     @Override
     public synchronized void close() {
         running = false;
-        if (workerThread != null) {
-            LockSupport.unpark(workerThread);
+        Thread t = workerThread;
+        if (t != null) {
+            LockSupport.unpark(t);
             try {
-                workerThread.join(5_000);
+                t.join(5_000);
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
+            if (t.isAlive()) {
+                LOG.warn("SegmentManager worker did not stop before close wait completed; "
+                        + "leaving worker-owned resources allocated");
+                return;
+            }
             workerThread = null;
         }
-        // Free the rotation-path native scratch buffer. Safe to do here
-        // (after the worker has joined) since the buffer is only touched
-        // on the worker thread.
+        // Free the rotation-path native scratch buffer only after worker
+        // termination has been observed. The worker is the only thread that
+        // touches the buffer, but close() uses a bounded join; if the worker is
+        // still alive, leaking this one scratch allocation is safer than freeing
+        // native memory it may still read or write.
         pathScratch.close();
     }
 
@@ -181,7 +191,8 @@ public final class SegmentManager implements QuietCloseable {
     public void deregister(SegmentRing ring) {
         synchronized (lock) {
             for (int i = 0, n = rings.size(); i < n; i++) {
-                if (rings.get(i).ring == ring) {
+                RingEntry e = rings.get(i);
+                if (e.ring == ring) {
                     // Reverse the ring's contribution to totalBytes —
                     // mirrors the seed in register(). Any spares the
                     // manager provisioned during the ring's lifetime
@@ -189,6 +200,7 @@ public final class SegmentManager implements QuietCloseable {
                     // single subtraction covers both the initial seed
                     // and the net manager activity (provisions minus
                     // trims) for this ring.
+                    e.registered = false;
                     totalBytes -= ring.totalSegmentBytes();
                     rings.remove(i);
                     return;
@@ -222,31 +234,30 @@ public final class SegmentManager implements QuietCloseable {
      * {@code lowestSurvivingBaseSeq - 1}.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark) {
+        // Account for bytes the ring already owns when it joins. A recovered
+        // ring (post-restart, orphan adoption) can come up at-or-above the cap;
+        // without this seed, totalBytes stays at 0 and the per-tick cap check
+        // at serviceRing would let the manager keep provisioning new spares on
+        // top of the recovered set, effectively doubling the documented cap.
+        long ringBytes = ring.totalSegmentBytes();
+        // Skip the file-generation counter past whatever's already on disk in
+        // this slot. Without this, on recovery the manager would mint a new
+        // spare at sf-0000000000000000.sfa — and openCleanRW would truncate the
+        // user's existing active file out from under the I/O loop, scrambling
+        // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
+        long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
+        Runnable managerWakeup = this::wakeWorker;
+        RingEntry e = new RingEntry(ring, dir, watermark);
+        // ObjList.add either throws before storing e or makes the entry visible.
+        // Once visible, only non-throwing state commits may remain.
         synchronized (lock) {
-            rings.add(new RingEntry(ring, dir, watermark));
-            // Account for bytes the ring already owns when it joins. A
-            // recovered ring (post-restart, orphan adoption) can come up
-            // at-or-above the cap; without this seed, totalBytes stays
-            // at 0 and the per-tick cap check at serviceRing would let
-            // the manager keep provisioning new spares on top of the
-            // recovered set, effectively doubling the documented cap.
-            totalBytes += ring.totalSegmentBytes();
-            // Skip the file-generation counter past whatever's already on
-            // disk in this slot. Without this, on recovery the manager
-            // would mint a new spare at sf-0000000000000000.sfa — and
-            // openCleanRW would truncate the user's existing active file
-            // out from under the I/O loop, scrambling the in-flight mmap.
-            // Memory-mode rings have no dir; nothing to scan there.
             if (dir != null) {
-                long minNext = scanMaxGeneration(dir) + 1L;
-                while (true) {
-                    long cur = fileGeneration.get();
-                    if (cur >= minNext) break;
-                    if (fileGeneration.compareAndSet(cur, minNext)) break;
-                }
+                advanceFileGeneration(minNextGeneration);
             }
+            rings.add(e);
+            totalBytes += ringBytes;
         }
-        ring.setManagerWakeup(this::wakeWorker);
+        ring.setManagerWakeup(managerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
         // iteration. Without this, register-after-start has a race window:
         // start() schedules the worker thread, and if that thread reaches
@@ -258,6 +269,16 @@ public final class SegmentManager implements QuietCloseable {
         // wakeWorker is cheap (a single LockSupport.unpark) and a no-op
         // when the worker has not been started yet.
         wakeWorker();
+    }
+
+    @TestOnly
+    public void setBeforeInstallSyncHook(Runnable hook) {
+        this.beforeInstallSyncHook = hook;
+    }
+
+    @TestOnly
+    public void setBeforeTrimSyncHook(Runnable hook) {
+        this.beforeTrimSyncHook = hook;
     }
 
     public synchronized void start() {
@@ -320,6 +341,14 @@ public final class SegmentManager implements QuietCloseable {
             Files.findClose(find);
         }
         return max;
+    }
+
+    private void advanceFileGeneration(long minNext) {
+        while (true) {
+            long cur = fileGeneration.get();
+            if (cur >= minNext) break;
+            if (fileGeneration.compareAndSet(cur, minNext)) break;
+        }
     }
 
     /**
@@ -411,19 +440,12 @@ public final class SegmentManager implements QuietCloseable {
                     // spare, since it wasn't installed yet) so a commit at
                     // this point would inflate totalBytes by one segment
                     // with no future subtractor. By holding `lock` across
-                    // installHotSpare AND the += commit AND the still-
-                    // registered check, deregister is forced to either
+                    // installHotSpare AND the += commit AND the registration
+                    // check, deregister is forced to either
                     // observe the spare in the ring (and subtract it) or
                     // run before installation (so no install happens).
                     synchronized (lock) {
-                        boolean stillRegistered = false;
-                        for (int i = 0, n = rings.size(); i < n; i++) {
-                            if (rings.get(i) == e) {
-                                stillRegistered = true;
-                                break;
-                            }
-                        }
-                        if (stillRegistered) {
+                        if (e.registered) {
                             e.ring.installHotSpare(spare);
                             totalBytes += segmentSizeBytes;
                             installed = true;
@@ -458,74 +480,47 @@ public final class SegmentManager implements QuietCloseable {
         //    memory-mode rings, "trim" is just close() (Unsafe.free) — no
         //    file to unlink.
         //
-        //    drainTrimmable + the totalBytes commit run together under
-        //    `lock` so deregister cannot observe the intermediate state
-        //    where segments have left ring.sealedSegments but the worker
-        //    has not yet subtracted their bytes. Two interleavings would
-        //    otherwise drift the counter:
-        //      (a) deregister snapshots ring.totalSegmentBytes() before
-        //          drainTrimmable mutates the ring → deregister subtracts
-        //          including the about-to-be-drained bytes, then this
-        //          loop subtracts them again. Drift: -drained.
-        //      (b) drainTrimmable runs first (without holding lock) so
-        //          ring.totalSegmentBytes() at deregister-time is already
-        //          short by the drained bytes; if the worker then skips
-        //          the subtract on a stillRegistered=false check, those
-        //          bytes are never accounted. Drift: +drained.
-        //    Atomic drain+commit under lock collapses both windows: any
-        //    deregister sees either the pre-drain ring (with everything
-        //    still counted) or the post-drain ring with the worker's
-        //    subtraction already applied. Mirrors the spare-install
-        //    path's stillRegistered guard above.
+        //    The watermark write and totalBytes commit are registration-gated
+        //    under `lock` so stale worker snapshots cannot touch the
+        //    engine-owned watermark or mutate accounting after deregister()
+        //    returns. drainTrimmable still runs for stale snapshots: it
+        //    transfers ownership of fully-acked sealed segments to this
+        //    worker, preserving the old close + unlink behavior.
         //
         //    munmap + unlink stay outside the lock — they can be slow
         //    and shouldn't block register/deregister or sibling rings.
-        // Persist the current ackedFsn watermark BEFORE the trim runs.
-        // On host crash between the persist and the unlinks below, the
-        // segments survive and the watermark is correct. On crash AFTER
-        // the unlinks but before next tick, the segments are gone and
-        // the watermark is stale, but recovery clamps with
-        // max(lowestSurvivingBaseSeq - 1, watermark) so either ordering
-        // is safe. Memory-mode rings (and callers that didn't supply a
-        // watermark) skip the write.
-        // Persist only on advance to avoid pointless mmap stores when
-        // ackedFsn is steady. The store is a single 8-byte put against
-        // an already-mapped region -- no syscall, no allocation -- but
-        // the gate keeps the dirty-page footprint minimal under
-        // steady-state load with no new acks arriving.
-        if (e.watermark != null) {
-            long currentAck = e.ring.ackedFsn();
-            if (currentAck > e.lastPersistedAck) {
-                e.watermark.write(currentAck);
-                e.lastPersistedAck = currentAck;
-            }
-        }
         ObjList<MmapSegment> trim;
         Runnable hook = beforeTrimSyncHook;
         if (hook != null) {
             hook.run();
         }
         synchronized (lock) {
+            boolean registered = e.registered;
+            // Persist the current ackedFsn watermark BEFORE the trim runs.
+            // On host crash between the persist and the unlinks below, the
+            // segments survive and the watermark is correct. On crash AFTER
+            // the unlinks but before next tick, the segments are gone and
+            // the watermark is stale, but recovery clamps with
+            // max(lowestSurvivingBaseSeq - 1, watermark) so either ordering
+            // is safe. Memory-mode rings (and callers that didn't supply a
+            // watermark) skip the write.
+            // Persist only on advance to avoid pointless mmap stores when
+            // ackedFsn is steady. The store is a single 8-byte put against
+            // an already-mapped region -- no syscall, no allocation -- but
+            // the gate keeps the dirty-page footprint minimal under
+            // steady-state load with no new acks arriving.
+            if (registered && e.watermark != null) {
+                long currentAck = e.ring.ackedFsn();
+                if (currentAck > e.lastPersistedAck) {
+                    e.watermark.write(currentAck);
+                    e.lastPersistedAck = currentAck;
+                }
+            }
             trim = e.ring.drainTrimmable();
-            if (trim != null) {
-                boolean stillRegistered = false;
-                for (int i = 0, n = rings.size(); i < n; i++) {
-                    if (rings.get(i) == e) {
-                        stillRegistered = true;
-                        break;
-                    }
+            if (registered && trim != null) {
+                for (int i = 0, n = trim.size(); i < n; i++) {
+                    totalBytes -= trim.get(i).sizeBytes();
                 }
-                if (stillRegistered) {
-                    for (int i = 0, n = trim.size(); i < n; i++) {
-                        totalBytes -= trim.get(i).sizeBytes();
-                    }
-                }
-                // else: deregister already subtracted these bytes via
-                // ring.totalSegmentBytes() (the drained segments were
-                // still in sealedSegments at that read), so subtracting
-                // again here would double-count. The segments are still
-                // ours to close + unlink below — drainTrimmable has
-                // already transferred ownership.
             }
         }
         if (trim != null) {
@@ -581,6 +576,11 @@ public final class SegmentManager implements QuietCloseable {
         // Survives across multiple serviceRing ticks and avoids a
         // write-storm when ackedFsn is steady.
         long lastPersistedAck = -1L;
+        // Guarded by SegmentManager.lock. A worker snapshot may retain this
+        // entry after deregister() removes it from rings; registered=false is
+        // the O(1) ownership check that prevents post-deregister writes through
+        // the engine-owned watermark, hot-spare installs, and accounting.
+        boolean registered = true;
 
         RingEntry(SegmentRing ring, String dir, AckWatermark watermark) {
             this.ring = ring;

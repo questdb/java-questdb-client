@@ -52,8 +52,6 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class DurableAckIntegrationTest {
 
-    private static int nextPort = 19_500;
-
     private String sfDir;
 
     @Before
@@ -89,12 +87,12 @@ public class DurableAckIntegrationTest {
         // the connection succeeds against a server that does NOT echo the
         // durable-ack confirmation, because the client never asked for it.
         TestUtils.assertMemoryLeak(() -> {
-            int port = allocPort();
             DurableAckCapableHandler handler = new DurableAckCapableHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler, false)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, false)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";request_durable_ack=off;";
                 try (Sender sender = Sender.fromConfig(config)) {
                     sender.table("trades").longColumn("v", 1L).atNow();
@@ -110,12 +108,12 @@ public class DurableAckIntegrationTest {
         // Opting in must throw at connect, not silently leave the SF store
         // to grow until disk fills.
         TestUtils.assertMemoryLeak(() -> {
-            int port = allocPort();
             DurableAckCapableHandler handler = new DurableAckCapableHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler, false)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, false)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";request_durable_ack=on;";
                 try (Sender ignored = Sender.fromConfig(config)) {
                     Assert.fail("expected connect to fail with QwpDurableAckMismatchException");
@@ -135,12 +133,12 @@ public class DurableAckIntegrationTest {
         // drains. The pair "OK-but-no-durable" -> grow, "durable-ack" -> drain
         // is the central durable-mode contract.
         TestUtils.assertMemoryLeak(() -> {
-            int port = allocPort();
             DurableAckCapableHandler handler = new DurableAckCapableHandler();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, handler, true)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                int port = server.getPort();
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
                         + ";request_durable_ack=on;close_flush_timeout_millis=5000;";
                 try (Sender sender = Sender.fromConfig(config)) {
@@ -169,10 +167,6 @@ public class DurableAckIntegrationTest {
                 // never advances.
             }
         });
-    }
-
-    private static int allocPort() {
-        return nextPort++;
     }
 
     private static byte[] buildDurableAckFrame(long seqTxn) {
