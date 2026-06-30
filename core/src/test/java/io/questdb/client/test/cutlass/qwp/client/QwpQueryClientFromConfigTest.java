@@ -211,27 +211,11 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testAuthAndBasicMutuallyExclusive() {
-        assertReject(
-                "ws::addr=db:9000;auth=Bearer xyz;username=admin;password=quest;",
-                "auth, username/password, and token are mutually exclusive"
-        );
-    }
-
-    @Test
-    public void testAuthAndTokenMutuallyExclusive() {
-        assertReject(
-                "ws::addr=db:9000;auth=Bearer xyz;token=ey.xyz;",
-                "auth, username/password, and token are mutually exclusive"
-        );
-    }
-
-    @Test
-    public void testAuthHeaderAcceptedAlone() {
-        // Each of the three auth modes has a dedicated mutual-exclusion test;
-        // the positive happy path is asserted here so the parser's per-key
-        // dispatch and the post-loop "no auth set" path both have coverage.
-        assertParses("ws::addr=db:9000;auth=Bearer xyz;");
+    public void testAuthKeyRejected() {
+        // The raw auth= header key is removed. Credentials are supplied as
+        // token= or username=/password=, from which the client synthesizes the
+        // Authorization header downstream.
+        assertReject("ws::addr=db:9000;auth=Bearer xyz;", "unknown configuration key: auth");
     }
 
     @Test
@@ -289,7 +273,26 @@ public class QwpQueryClientFromConfigTest {
     public void testBasicAuthAndTokenMutuallyExclusive() {
         assertReject(
                 "ws::addr=db:9000;username=admin;password=quest;token=ey.xyz;",
-                "auth, username/password, and token are mutually exclusive"
+                "cannot use both token and username/password authentication"
+        );
+    }
+
+    @Test
+    public void testBasicAuthEmptyPasswordRejected() {
+        // A present-but-blank password is rejected up front, matching the
+        // ingress Sender, so a shared ws/wss string fails the same way on both
+        // sides instead of building a degenerate Basic auth header.
+        assertReject(
+                "ws::addr=db:9000;username=alice;password=;",
+                "password cannot be empty nor null"
+        );
+    }
+
+    @Test
+    public void testBasicAuthEmptyUsernameRejected() {
+        assertReject(
+                "ws::addr=db:9000;username=;password=secret;",
+                "username cannot be empty nor null"
         );
     }
 
@@ -297,7 +300,7 @@ public class QwpQueryClientFromConfigTest {
     public void testBasicAuthWithPasswordOnlyRejected() {
         assertReject(
                 "ws::addr=db:9000;password=quest;",
-                "both username and password must be provided together"
+                "username and password must be provided together"
         );
     }
 
@@ -305,7 +308,37 @@ public class QwpQueryClientFromConfigTest {
     public void testBasicAuthWithUsernameOnlyRejected() {
         assertReject(
                 "ws::addr=db:9000;username=admin;",
-                "both username and password must be provided together"
+                "username and password must be provided together"
+        );
+    }
+
+    @Test
+    public void testUserPassAliasesAuthenticate() {
+        // user/pass are aliases of username/password: they synthesize the same
+        // Basic auth header.
+        try (QwpQueryClient viaAlias = QwpQueryClient.fromConfig("ws::addr=db:9000;user=alice;pass=secret;");
+             QwpQueryClient viaCanonical = QwpQueryClient.fromConfig("ws::addr=db:9000;username=alice;password=secret;")) {
+            Assert.assertNotNull(viaAlias.getAuthorizationHeaderForTest());
+            Assert.assertEquals(
+                    viaCanonical.getAuthorizationHeaderForTest(),
+                    viaAlias.getAuthorizationHeaderForTest());
+        }
+    }
+
+    @Test
+    public void testUserAliasAloneRejected() {
+        // user is an alias of username, so user-alone trips the both-or-neither rule.
+        assertReject(
+                "ws::addr=db:9000;user=alice;",
+                "username and password must be provided together"
+        );
+    }
+
+    @Test
+    public void testPassAliasAloneRejected() {
+        assertReject(
+                "ws::addr=db:9000;pass=secret;",
+                "username and password must be provided together"
         );
     }
 
@@ -354,7 +387,7 @@ public class QwpQueryClientFromConfigTest {
     public void testCompressionInvalidRejected() {
         assertReject(
                 "ws::addr=db:9000;compression=gzip;",
-                "unsupported compression: gzip (expected zstd, raw, or auto)"
+                "invalid compression: gzip (expected zstd, raw, auto)"
         );
     }
 
@@ -472,6 +505,19 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testFailoverBackoffMaxAloneBelowDefaultInitialRejected() {
+        // failover_backoff_max_ms alone, below the 50 ms default initial backoff,
+        // makes the effective max < initial once fromConfig fills the missing
+        // initial with its default. validateConfig enforces the ordering against
+        // those effective values, so it is rejected up front (and the facade's
+        // fail-fast build path rejects it without constructing a client).
+        assertReject(
+                "ws::addr=db:9000;failover_backoff_max_ms=10;",
+                "failover_backoff_max_ms must be >= failover_backoff_initial_ms"
+        );
+    }
+
+    @Test
     public void testFailoverBackoffMaxAndInitialBothAccepted() {
         assertParses("ws::addr=db:9000;failover_backoff_initial_ms=100;failover_backoff_max_ms=500;");
     }
@@ -511,7 +557,7 @@ public class QwpQueryClientFromConfigTest {
     public void testFailoverInvalidRejected() {
         assertReject(
                 "ws::addr=db:9000;failover=maybe;",
-                "invalid failover: maybe (expected on or off)"
+                "invalid failover: maybe (expected on, off)"
         );
     }
 
@@ -616,13 +662,28 @@ public class QwpQueryClientFromConfigTest {
         // Verifies the parser's cross-key validation doesn't reject an otherwise
         // legal combination, and that the happy-path client construction works.
         String conf = "wss::addr=a.internal:9443,b.internal:9443,c.internal:9443;"
-                + "path=/read/v1;target=primary;failover=on;"
+                + "target=primary;failover=on;"
                 + "username=admin;password=quest;"
                 + "client_id=batch-job/42;buffer_pool_size=8;"
                 + "compression=zstd;compression_level=5;"
                 + "max_batch_rows=512;"
                 + "tls_verify=on;";
         assertParses(conf);
+    }
+
+    @Test
+    public void testGorillaKeyRejected() {
+        // gorilla has been removed; QWP ingestion always uses Gorilla timestamp
+        // encoding. The egress client rejects the key like any other unknown key.
+        assertReject("ws::addr=db:9000;gorilla=off;", "unknown configuration key: gorilla");
+        assertReject("ws::addr=db:9000;gorilla=on;", "unknown configuration key: gorilla");
+    }
+
+    @Test
+    public void testInFlightWindowKeyRejected() {
+        // in_flight_window has been removed; the egress client rejects it like
+        // any other unknown key.
+        assertReject("ws::addr=db:9000;in_flight_window=10000;", "unknown configuration key: in_flight_window");
     }
 
     @Test
@@ -648,30 +709,20 @@ public class QwpQueryClientFromConfigTest {
                 "drain_orphans=on",
                 "durable_ack_keepalive_interval_millis=200",
                 "error_inbox_capacity=256",
-                "in_flight_window=10000",
-                "init_buf_size=65536",
                 "initial_connect_retry=on",
                 "max_background_drainers=4",
-                "max_buf_size=100m",
-                "max_datagram_size=1400",
                 "max_name_len=127",
-                "multicast_ttl=1",
-                "pass=secret",
-                "protocol_version=2",
                 "reconnect_initial_backoff_millis=100",
                 "reconnect_max_backoff_millis=5000",
                 "reconnect_max_duration_millis=300000",
                 "request_durable_ack=on",
-                "request_min_throughput=102400",
-                "request_timeout=10000",
-                "retry_timeout=10000",
                 "sender_id=ingest-1",
                 "sf_append_deadline_millis=30000",
                 "sf_dir=/var/lib/qdb-sf",
                 "sf_durability=memory",
                 "sf_max_bytes=4m",
                 "sf_max_total_bytes=10g",
-                "user=alice",
+                "transaction=on",
         };
         StringBuilder all = new StringBuilder("ws::addr=db:9000;");
         for (String kv : keys) {
@@ -684,7 +735,6 @@ public class QwpQueryClientFromConfigTest {
         // Out-of-range / malformed values are silently consumed too -- the
         // egress parser does not validate ingress-only keys.
         assertParses("ws::addr=db:9000;auto_flush_rows=-1;");
-        assertParses("ws::addr=db:9000;init_buf_size=garbage;");
         assertParses("ws::addr=db:9000;reconnect_max_duration_millis=banana;");
 
         // Empty values are well-formed and silently consumed.
@@ -817,13 +867,76 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
+    public void testNonQwpKeysRejectedOnEgress() {
+        // request_timeout, retry_timeout, request_min_throughput, and
+        // protocol_version are legacy ILP HTTP/TCP keys, absent from the QWP
+        // connect-string vocabulary (connect-string.md Key index). The
+        // QwpQueryClient is QWP-only, so a ws:: string carrying them is
+        // malformed -- the parser rejects them as unknown rather than
+        // silently consuming them.
+        // Legacy keys reject with a relocated-key hint pointing at the right place.
+        assertReject("ws::addr=db:9000;request_timeout=10000;",
+                "unknown configuration key: request_timeout (applies to legacy http/tcp/udp transports only)");
+        assertReject("ws::addr=db:9000;retry_timeout=10000;",
+                "unknown configuration key: retry_timeout (use reconnect_max_duration_millis on ws/wss)");
+        assertReject("ws::addr=db:9000;request_min_throughput=102400;",
+                "unknown configuration key: request_min_throughput (applies to legacy http/tcp/udp transports only)");
+        assertReject("ws::addr=db:9000;protocol_version=2;",
+                "unknown configuration key: protocol_version (QWP negotiates the protocol version during the WebSocket upgrade)");
+        // protocol_version is rejected regardless of value: the egress side
+        // has no "auto" pass-through.
+        assertReject("ws::addr=db:9000;protocol_version=auto;",
+                "unknown configuration key: protocol_version (QWP negotiates the protocol version during the WebSocket upgrade)");
+        // max_datagram_size and multicast_ttl apply to the UDP transport only;
+        // the QWP ws:: vocabulary does not include them, so the egress parser
+        // rejects them as unknown.
+        assertReject("ws::addr=db:9000;max_datagram_size=1400;",
+                "unknown configuration key: max_datagram_size (applies to legacy http/tcp/udp transports only)");
+        assertReject("ws::addr=db:9000;multicast_ttl=4;",
+                "unknown configuration key: multicast_ttl (applies to legacy http/tcp/udp transports only)");
+        // init_buf_size and max_buf_size size the legacy http/tcp ingest buffer;
+        // the ws Sender has fixed framing, so they are legacy-only and the egress
+        // parser rejects them with the hint rather than silently consuming them.
+        assertReject("ws::addr=db:9000;init_buf_size=65536;",
+                "unknown configuration key: init_buf_size (applies to legacy http/tcp/udp transports only)");
+        assertReject("ws::addr=db:9000;max_buf_size=100m;",
+                "unknown configuration key: max_buf_size (applies to legacy http/tcp/udp transports only)");
+    }
+
+    @Test
     public void testNullStringRejected() {
         assertReject(null, "configuration string cannot be empty");
     }
 
     @Test
-    public void testPathOverrideAccepted() {
-        assertParses("ws::addr=db:9000;path=/custom/read;");
+    public void testPathKeyRejected() {
+        // path has been removed; the egress client rejects it like any other
+        // unknown key.
+        assertReject("ws::addr=db:9000;path=/custom/read;", "unknown configuration key: path");
+    }
+
+    @Test
+    public void testReservedErrorPolicyKeysSilentlyAccepted() {
+        // connect-string.md "Error handling": the on_*_error keys are reserved
+        // by the spec, which directs new clients to accept them in the connect
+        // string. The Java client does not wire them to a policy yet, so the
+        // egress parser consumes them as an accepted no-op -- it must not reject
+        // them as unknown keys. Mirror of the Sender (ingress) behavior so one
+        // connect string carrying these keys configures both clients.
+        String[] keys = {
+                "on_internal_error=halt",
+                "on_parse_error=halt",
+                "on_schema_error=drop",
+                "on_security_error=halt",
+                "on_server_error=auto",
+                "on_write_error=drop",
+        };
+        StringBuilder all = new StringBuilder("ws::addr=db:9000;");
+        for (String kv : keys) {
+            assertParses("ws::addr=db:9000;" + kv + ";");
+            all.append(kv).append(';');
+        }
+        assertParses(all.toString());
     }
 
     @Test
@@ -835,7 +948,7 @@ public class QwpQueryClientFromConfigTest {
     public void testTargetInvalidRejected() {
         assertReject(
                 "ws::addr=db:9000;target=leader;",
-                "invalid target: leader (expected any, primary, or replica)"
+                "invalid target: leader (expected any, primary, replica)"
         );
     }
 
@@ -882,7 +995,7 @@ public class QwpQueryClientFromConfigTest {
     public void testTlsVerifyInvalidRejected() {
         assertReject(
                 "wss::addr=db:9000;tls_verify=strict;",
-                "invalid tls_verify: strict (expected on or unsafe_off)"
+                "invalid tls_verify: strict (expected on, unsafe_off)"
         );
     }
 
@@ -907,6 +1020,13 @@ public class QwpQueryClientFromConfigTest {
     @Test
     public void testTokenAcceptedAlone() {
         assertParses("ws::addr=db:9000;token=ey.payload.sig;");
+    }
+
+    @Test
+    public void testTokenEmptyRejected() {
+        // A present-but-blank token is rejected up front, matching the ingress
+        // Sender, so the client never sends an empty Bearer header.
+        assertReject("ws::addr=db:9000;token=;", "token cannot be empty nor null");
     }
 
     @Test

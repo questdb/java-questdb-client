@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -86,7 +86,7 @@ public class SegmentManagerRecoveryCapTest {
             Assert.assertNotNull("recovery should produce a ring", ring);
 
             SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000_000L /* 1ms */, cap);
-            try (manager) {
+            try (SegmentManager ignored = manager) {
                 manager.start();
                 manager.register(ring, slotDir);
                 // Give the manager several ticks. With the bug, it provisions

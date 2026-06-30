@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -118,7 +118,7 @@ public class SegmentManagerTest {
                             throw new AssertionError(
                                     "stuck waiting for spare at i=" + i + ", needsSpare=" + ring.needsHotSpare());
                         }
-                        Thread.onSpinWait();
+                        io.questdb.client.std.Compat.onSpinWait();
                     }
                     assertEquals(i, fsn);
                 }

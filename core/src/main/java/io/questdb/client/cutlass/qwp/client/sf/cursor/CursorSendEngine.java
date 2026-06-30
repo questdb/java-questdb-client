@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
@@ -284,20 +285,18 @@ public final class CursorSendEngine implements QuietCloseable {
             this.ring = ringInProgress;
             this.watermark = watermarkInProgress;
         } catch (Throwable t) {
-            // Order: ring first (releases mmap/fd), then manager (joins
-            // worker thread, but only if we started it AND we own it),
-            // then watermark (releases its own mmap/fd), then slot lock.
-            // Each in its own try/catch so a single failure doesn't
-            // strand later cleanups.
-            if (ringInProgress != null) {
-                try {
-                    ringInProgress.close();
-                } catch (Throwable ignored) {
-                }
-            }
+            // Stop an owned manager before freeing the ring and watermark it may
+            // touch, then release the slot lock. Each cleanup is in its own
+            // try/catch so a single failure doesn't strand later cleanups.
             if (ownsManager && managerStarted) {
                 try {
                     manager.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (ringInProgress != null) {
+                try {
+                    ringInProgress.close();
                 } catch (Throwable ignored) {
                 }
             }
@@ -414,7 +413,7 @@ public final class CursorSendEngine implements QuietCloseable {
         // The spin tightens the gap between manager-installs-spare and
         // producer-consumes-spare — usually a few µs on an idle manager thread.
         while (System.nanoTime() < spinDeadlineNanos) {
-            Thread.onSpinWait();
+            Compat.onSpinWait();
             fsn = ring.appendOrFsn(payloadAddr, payloadLen);
             if (fsn >= 0 || fsn == SegmentRing.PAYLOAD_TOO_LARGE) {
                 return fsn;

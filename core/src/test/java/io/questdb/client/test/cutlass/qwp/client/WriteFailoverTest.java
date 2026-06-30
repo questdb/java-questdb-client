@@ -84,8 +84,8 @@ public class WriteFailoverTest {
             acceptor.start();
 
             AckHandler ack = new AckHandler();
-            goodPort = TestPorts.findUnusedPort();
-            try (TestWebSocketServer good = new TestWebSocketServer(goodPort, ack, false, "PRIMARY")) {
+            try (TestWebSocketServer good = new TestWebSocketServer(ack, false, "PRIMARY")) {
+                goodPort = good.getPort();
                 good.start();
                 Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
 
@@ -117,12 +117,12 @@ public class WriteFailoverTest {
         // Two servers: server1 always rejects with 421 + REPLICA, server2
         // accepts with 101 + PRIMARY. The sender's connect path must walk
         // past server1 and land on server2 within the reconnect budget.
-        int port1 = TestPorts.findUnusedPort();
-        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
-        TestWebSocketServer replica = new TestWebSocketServer(port1, ack);
+        TestWebSocketServer replica = new TestWebSocketServer(ack);
+        int port1 = replica.getPort();
         replica.setRejectWithRole("REPLICA");
-        TestWebSocketServer primary = new TestWebSocketServer(port2, ack, false, "PRIMARY");
+        TestWebSocketServer primary = new TestWebSocketServer(ack, false, "PRIMARY");
+        int port2 = primary.getPort();
         try {
             replica.start();
             primary.start();
@@ -152,12 +152,12 @@ public class WriteFailoverTest {
         // is promoted (clear the reject) and we verify the sender stays on
         // server2 — currentAddressIndex stickiness means we don't rotate
         // off a healthy primary just because another node became writable.
-        int port1 = TestPorts.findUnusedPort();
-        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
-        TestWebSocketServer s1 = new TestWebSocketServer(port1, ack);
+        TestWebSocketServer s1 = new TestWebSocketServer(ack);
+        int port1 = s1.getPort();
         s1.setRejectWithRole("REPLICA");
-        TestWebSocketServer s2 = new TestWebSocketServer(port2, ack, false, "PRIMARY");
+        TestWebSocketServer s2 = new TestWebSocketServer(ack, false, "PRIMARY");
+        int port2 = s2.getPort();
         try {
             s1.start();
             s2.start();
@@ -194,11 +194,11 @@ public class WriteFailoverTest {
         // Off-mode walk that hits only replicas must surface
         // QwpRoleMismatchException — the walked address list resembles
         // a deployment mid-failover, distinguishable from "all hosts down".
-        int port1 = TestPorts.findUnusedPort();
-        int port2 = TestPorts.findUnusedPort();
-        TestWebSocketServer r1 = new TestWebSocketServer(port1, new AckHandler());
+        TestWebSocketServer r1 = new TestWebSocketServer(new AckHandler());
+        int port1 = r1.getPort();
         r1.setRejectWithRole("REPLICA");
-        TestWebSocketServer r2 = new TestWebSocketServer(port2, new AckHandler());
+        TestWebSocketServer r2 = new TestWebSocketServer(new AckHandler());
+        int port2 = r2.getPort();
         r2.setRejectWithRole("PRIMARY_CATCHUP");
         try {
             r1.start();
@@ -232,12 +232,12 @@ public class WriteFailoverTest {
         // with NO inter-host backoff; only after every host has been
         // tried does it fail terminally. Java's prior off-mode tried
         // hosts[0] alone.
-        int port1 = TestPorts.findUnusedPort();
-        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
-        TestWebSocketServer replica = new TestWebSocketServer(port1, ack);
+        TestWebSocketServer replica = new TestWebSocketServer(ack);
+        int port1 = replica.getPort();
         replica.setRejectWithRole("REPLICA");
-        TestWebSocketServer primary = new TestWebSocketServer(port2, ack, false, "PRIMARY");
+        TestWebSocketServer primary = new TestWebSocketServer(ack, false, "PRIMARY");
+        int port2 = primary.getPort();
         try {
             replica.start();
             primary.start();
@@ -265,12 +265,12 @@ public class WriteFailoverTest {
         // QwpRoleMismatchException (not a generic LineSenderException) so
         // operators can distinguish "no primary elected yet" from
         // "everything is down".
-        int port1 = TestPorts.findUnusedPort();
-        int port2 = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
-        TestWebSocketServer r1 = new TestWebSocketServer(port1, ack);
+        TestWebSocketServer r1 = new TestWebSocketServer(ack);
+        int port1 = r1.getPort();
         r1.setRejectWithRole("REPLICA");
-        TestWebSocketServer r2 = new TestWebSocketServer(port2, ack);
+        TestWebSocketServer r2 = new TestWebSocketServer(ack);
+        int port2 = r2.getPort();
         r2.setRejectWithRole("PRIMARY_CATCHUP");
         try {
             r1.start();
@@ -311,9 +311,9 @@ public class WriteFailoverTest {
         // OSS / single-node deployments advertise STANDALONE. The client
         // must accept that handshake without rotation since standalone
         // nodes are writable.
-        int port = TestPorts.findUnusedPort();
         AckHandler ack = new AckHandler();
-        try (TestWebSocketServer standalone = new TestWebSocketServer(port, ack, false, "STANDALONE")) {
+        try (TestWebSocketServer standalone = new TestWebSocketServer(ack, false, "STANDALONE")) {
+            int port = standalone.getPort();
             standalone.start();
             Assert.assertTrue(standalone.awaitStart(5, TimeUnit.SECONDS));
 
@@ -335,9 +335,9 @@ public class WriteFailoverTest {
         // diagnostics. With a single-replica config the off-mode walk
         // wraps it in QwpRoleMismatchException; the WebSocketUpgradeException
         // sits on the cause chain via initCause().
-        int port = TestPorts.findUnusedPort();
-        TestWebSocketServer replica = new TestWebSocketServer(port, new AckHandler());
-        try (replica) {
+        TestWebSocketServer replica = new TestWebSocketServer(new AckHandler());
+        int port = replica.getPort();
+        try (TestWebSocketServer replicaResource = replica) {
             replica.setRejectWithRole("REPLICA");
             replica.start();
             Assert.assertTrue(replica.awaitStart(5, TimeUnit.SECONDS));

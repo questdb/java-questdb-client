@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.IntList;
 import io.questdb.client.std.ObjList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,13 +76,51 @@ public final class OrphanScanner {
      * "no orphans" answer in that case.
      */
     public static ObjList<String> scan(String sfDir, String excludeSlotName) {
+        // Thin delegate to the managed-aware scan: a null managedBase disables
+        // managed-slot exclusion, so this is exactly the unmanaged scan. Kept
+        // as a convenience overload for callers (and tests) with no pool-minted
+        // slot namespace to skip.
+        return scan(sfDir, excludeSlotName, null, 0);
+    }
+
+    /**
+     * As {@link #scan(String, String)}, but excludes only the <em>exact</em>
+     * set of slot dirs a connection pool can re-create and self-recover:
+     * {@code <managedBase>-<i>} for {@code 0 <= i < managedSlotCount}.
+     * <p>
+     * The exclusion is bounded to the canonical pool-minted slots rather than
+     * the <em>whole</em> {@code <base>-} namespace, so unacked data is never
+     * stranded after a {@code maxSize} shrink across restarts: a slot like
+     * {@code <base>-3} left over from a larger pool is neither re-created (out
+     * of the new {@code [0,maxSize)} index range) nor silently excluded. By
+     * bounding the exclusion to {@code [0,managedSlotCount)},
+     * any same-base slot with an index at or above {@code managedSlotCount} is
+     * treated like a foreign leftover and becomes a drainable orphan. Its data
+     * is recovered either by the pool's startup recovery (which adopts these
+     * out-of-range same-base slots regardless of {@code drain_orphans}; see
+     * {@link #listStrandedOutOfRangeManagedSlots}) or, when
+     * {@code drain_orphans=on}, by the per-sender drain path -- never silently
+     * stranded.
+     * <p>
+     * Only canonical, pool-minted names are excluded: the suffix after
+     * {@code <managedBase>-} must be a canonical non-negative decimal
+     * ({@code 0,1,2,...} with no leading zeros, sign, or non-digits). Anything
+     * else under the same base ({@code <base>-foo}, {@code <base>-007}) is not a
+     * name the pool creates and is reported as a candidate.
+     * <p>
+     * When {@code managedBase} is null/empty or {@code managedSlotCount <= 0}
+     * no exclusion is applied (every sibling with data is a candidate).
+     */
+    public static ObjList<String> scan(String sfDir, String excludeSlotName, String managedBase, int managedSlotCount) {
         ObjList<String> orphans = new ObjList<>();
         if (sfDir == null || !Files.exists(sfDir)) {
             return orphans;
         }
+        boolean hasManaged = managedBase != null && !managedBase.isEmpty() && managedSlotCount > 0;
+        String managedPrefix = hasManaged ? managedBase + "-" : null;
         long find = Files.findFirst(sfDir);
         if (find < 0) {
-            LOG.warn("orphan scan could not enumerate {} — treating as no orphans, "
+            LOG.warn("orphan scan could not enumerate {} \u2014 treating as no orphans, "
                     + "but this may indicate a permission or transient error", sfDir);
             return orphans;
         }
@@ -99,6 +138,9 @@ public final class OrphanScanner {
                 if (excludeSlotName != null && excludeSlotName.equals(name)) {
                     continue;
                 }
+                if (hasManaged && isManagedSlot(name, managedPrefix, managedSlotCount)) {
+                    continue;
+                }
                 String slotPath = sfDir + "/" + name;
                 if (!isCandidateOrphan(slotPath)) {
                     continue;
@@ -109,6 +151,116 @@ public final class OrphanScanner {
             Files.findClose(find);
         }
         return orphans;
+    }
+
+    /**
+     * Lists the canonical indices of this pool's OWN same-base slots that a
+     * previous run left behind out of the current index range, i.e.
+     * {@code <managedBase>-<i>} for {@code i >= managedSlotCount} that still
+     * hold unacked data (no failure sentinel).
+     * <p>
+     * These are not foreign orphans: they are the pool's own canonical,
+     * pool-minted slots from a run with a larger {@code maxSize}. Because the
+     * current run's index range is {@code [0, managedSlotCount)} they are never
+     * re-created and so never recovered by the pool's normal (re)creation path,
+     * yet their unacked data is durable on disk. Startup recovery uses this to
+     * adopt and drain them once, at construction -- so their data is delivered
+     * under the default config, without waiting for {@code drain_orphans=on}.
+     * <p>
+     * Only exact, pool-minted names match: the suffix after
+     * {@code <managedBase>-} must be a canonical non-negative decimal
+     * ({@code 0,1,2,...} with no leading zeros, sign, or non-digits). Anything
+     * else under the same base is a foreign leftover, not a slot the pool
+     * created, and is left to the {@code drain_orphans} path.
+     *
+     * @return canonical indices ({@code >= managedSlotCount}) of same-base
+     * slots holding unacked data; empty when none, or when inputs are invalid
+     */
+    public static IntList listStrandedOutOfRangeManagedSlots(String sfDir, String managedBase, int managedSlotCount) {
+        IntList out = new IntList();
+        if (sfDir == null || managedBase == null || managedBase.isEmpty()
+                || managedSlotCount < 0 || !Files.exists(sfDir)) {
+            return out;
+        }
+        String managedPrefix = managedBase + "-";
+        long find = Files.findFirst(sfDir);
+        if (find < 0) {
+            LOG.warn("orphan scan could not enumerate {} \u2014 treating as no stranded slots, "
+                    + "but this may indicate a permission or transient error", sfDir);
+            return out;
+        }
+        if (find == 0) {
+            return out;
+        }
+        try {
+            int rc = 1;
+            while (rc > 0) {
+                String name = Files.utf8ToString(Files.findName(find));
+                rc = Files.findNext(find);
+                if (name == null || ".".equals(name) || "..".equals(name)) {
+                    continue;
+                }
+                if (!name.startsWith(managedPrefix)) {
+                    continue;
+                }
+                int idx = parseCanonicalIndex(name, managedPrefix.length());
+                if (idx < managedSlotCount) {
+                    // Negative (non-canonical) or in-range: not our concern here.
+                    continue;
+                }
+                if (!isCandidateOrphan(sfDir + "/" + name)) {
+                    continue;
+                }
+                out.add(idx);
+            }
+        } finally {
+            Files.findClose(find);
+        }
+        return out;
+    }
+
+    /**
+     * True iff {@code name} is a slot the pool actively co-manages, i.e.
+     * {@code <managedPrefix><i>} where {@code i} is a canonical non-negative
+     * decimal in {@code [0, managedSlotCount)}. Visible for testing.
+     */
+    public static boolean isManagedSlot(String name, String managedPrefix, int managedSlotCount) {
+        if (name == null || managedPrefix == null || !name.startsWith(managedPrefix)) {
+            return false;
+        }
+        int idx = parseCanonicalIndex(name, managedPrefix.length());
+        return idx >= 0 && idx < managedSlotCount;
+    }
+
+    /**
+     * Parses the canonical non-negative decimal that makes up the rest of
+     * {@code name} from {@code from}. Returns {@code -1} for an empty suffix,
+     * a non-digit, a leading zero (e.g. {@code "007"}), or anything that would
+     * overflow {@code int}. Only the exact form the pool emits
+     * ({@code Integer.toString(index)}) is accepted, so foreign or malformed
+     * same-base names never get mistaken for a managed slot.
+     */
+    private static int parseCanonicalIndex(String name, int from) {
+        int len = name.length();
+        if (from >= len) {
+            return -1;
+        }
+        // Reject leading zeros unless the whole suffix is exactly "0".
+        if (name.charAt(from) == '0' && len - from > 1) {
+            return -1;
+        }
+        long acc = 0;
+        for (int i = from; i < len; i++) {
+            char c = name.charAt(i);
+            if (c < '0' || c > '9') {
+                return -1;
+            }
+            acc = acc * 10 + (c - '0');
+            if (acc > Integer.MAX_VALUE) {
+                return -1;
+            }
+        }
+        return (int) acc;
     }
 
     /**

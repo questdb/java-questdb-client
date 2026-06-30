@@ -334,9 +334,9 @@ public class QwpWebSocketSenderTest {
     @Test
     public void testFlushAppendFailureDoesNotLeaveMicrobatchBufferInUse() throws Exception {
         assertMemoryLeak(() -> {
-            int port = TestPorts.findUnusedPort();
-            try (TestWebSocketServer server = new TestWebSocketServer(port, new TestWebSocketServer.WebSocketServerHandler() {
+            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
             })) {
+                int port = server.getPort();
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
@@ -400,15 +400,6 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
-            }
-        });
-    }
-
-    @Test
-    public void testGorillaEnabledByDefault() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
-                Assert.assertTrue(sender.isGorillaEnabled());
             }
         });
     }
@@ -629,18 +620,6 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("closed"));
-            }
-        });
-    }
-
-    @Test
-    public void testSetGorillaEnabled() throws Exception {
-        assertMemoryLeak(() -> {
-            try (QwpWebSocketSender sender = createUnconnectedSender()) {
-                sender.setGorillaEnabled(false);
-                Assert.assertFalse(sender.isGorillaEnabled());
-                sender.setGorillaEnabled(true);
-                Assert.assertTrue(sender.isGorillaEnabled());
             }
         });
     }

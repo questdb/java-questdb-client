@@ -43,6 +43,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -143,7 +144,7 @@ public class SegmentManagerTrimDeregisterRaceTest {
                     AtomicBoolean fired = new AtomicBoolean();
                     CountDownLatch hookDone = new CountDownLatch(1);
                     AtomicReference<Throwable> hookErr = new AtomicReference<>();
-                    setBeforeTrimSyncHook(mgr, () -> {
+                    mgr.setBeforeTrimSyncHook(() -> {
                         if (!fired.compareAndSet(false, true)) return;
                         try {
                             mgr.deregister(ring);
@@ -185,8 +186,14 @@ public class SegmentManagerTrimDeregisterRaceTest {
                                     + "`totalBytes -= sz` on a stillRegistered re-check "
                                     + "under the same lock that covers deregister.",
                             0L, observed);
+                    assertFalse("stale SegmentManager snapshot skipped drainTrimmable() "
+                                    + "after deregister and left a fully-acked sealed "
+                                    + "segment on disk. The registration guard should "
+                                    + "protect watermark/accounting only; trim ownership "
+                                    + "transfer must still close and unlink " + activePath,
+                            Files.exists(activePath));
                 } finally {
-                    setBeforeTrimSyncHook(mgr, null);
+                    mgr.setBeforeTrimSyncHook(null);
                     Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
                     try {
                         ring.close();
@@ -206,7 +213,7 @@ public class SegmentManagerTrimDeregisterRaceTest {
             if (System.nanoTime() > deadline) {
                 throw new AssertionError("worker did not park within 5 s; state=" + s);
             }
-            Thread.onSpinWait();
+            io.questdb.client.std.Compat.onSpinWait();
         }
     }
 
@@ -216,14 +223,8 @@ public class SegmentManagerTrimDeregisterRaceTest {
             if (System.nanoTime() > deadline) {
                 throw new AssertionError("spare never installed " + where);
             }
-            Thread.onSpinWait();
+            io.questdb.client.std.Compat.onSpinWait();
         }
-    }
-
-    private static void setBeforeTrimSyncHook(SegmentManager mgr, Runnable hook) throws Exception {
-        Field f = SegmentManager.class.getDeclaredField("beforeTrimSyncHook");
-        f.setAccessible(true);
-        f.set(mgr, hook);
     }
 
     private static long readTotalBytes(SegmentManager mgr) throws Exception {
