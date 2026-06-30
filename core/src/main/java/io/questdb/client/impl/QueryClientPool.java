@@ -305,6 +305,31 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
+    /**
+     * Cancels the in-flight query on {@code w} only while its lease generation
+     * still equals {@code gen}, holding the pool lock across both the check and
+     * the wire cancel. acquire() and release() bump the generation under this
+     * same lock, so once this method holds it the generation cannot change: a
+     * cancel whose lease has already gone stale (the worker was released and
+     * re-borrowed) is dropped instead of aborting the new borrower's query. The
+     * cancel itself is non-blocking -- a volatile flag plus an AtomicLong set --
+     * so the lock is held only briefly.
+     */
+    void cancelIfCurrent(QueryWorker w, long gen) {
+        lock.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            if (w.generation() != gen) {
+                return;
+            }
+            w.cancelInFlight();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     void reapIdle() {
         if (closed) {
             return;

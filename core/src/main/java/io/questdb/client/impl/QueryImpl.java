@@ -126,14 +126,20 @@ final class QueryImpl {
     }
 
     void cancel(long gen) {
-        // No-op on a stale lease: the worker may now be running a different
-        // borrower's query, and cancelling here would abort it.
-        if (gen != worker.generation()) {
+        // Fast-path drop of an obviously-stale or already-finished cancel,
+        // without taking the pool lock. This is only a hint -- the
+        // authoritative re-check runs under the pool lock inside
+        // worker.cancelInFlight(gen).
+        if (gen != worker.generation() || done) {
             return;
         }
-        if (!done) {
-            worker.cancelInFlight();
-        }
+        // Re-check the lease generation and issue the wire cancel atomically
+        // under the pool lock (the same lock acquire()/release() bump the
+        // generation under). An unlocked check followed by an unlocked cancel
+        // is a TOCTOU: a cross-thread watchdog can pass the check, get
+        // preempted while this lease is released and the worker re-borrowed by
+        // another caller, then resume and abort that caller's in-flight query.
+        worker.cancelInFlight(gen);
     }
 
     void close(long gen) {
@@ -151,7 +157,7 @@ final class QueryImpl {
         // it returns to the pool -- otherwise the next borrower would inherit a
         // running execute().
         if (!done) {
-            worker.cancelInFlight();
+            worker.cancelInFlight(gen);
             doneLock.lock();
             try {
                 while (!done) {

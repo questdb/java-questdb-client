@@ -106,8 +106,11 @@ public final class QueryWorker {
     }
 
     /**
-     * Cancels the in-flight query on this worker's client. Safe to call from
-     * any thread; harmless if the worker is idle.
+     * Issues an unconditional wire cancel against whatever query this worker's
+     * client is currently running. Callers must already own the worker for the
+     * current lease -- in practice this runs under the pool lock via
+     * {@link QueryClientPool#cancelIfCurrent}, which validates the lease
+     * generation first. Lease code must use {@link #cancelInFlight(long)}.
      */
     void cancelInFlight() {
         try {
@@ -115,6 +118,18 @@ public final class QueryWorker {
         } catch (RuntimeException ignored) {
             // cancel() is best-effort; an already-completed query is fine.
         }
+    }
+
+    /**
+     * Cancels the in-flight query only if this worker's lease generation still
+     * equals {@code gen}. Delegates to the pool so the generation re-check and
+     * the wire cancel happen together under the pool lock that
+     * {@link QueryClientPool#acquire} and {@link QueryClientPool#release} bump
+     * the generation under. That atomicity stops a stale cross-thread cancel
+     * from aborting a later borrower's query on the same worker.
+     */
+    void cancelInFlight(long gen) {
+        pool.cancelIfCurrent(this, gen);
     }
 
     /**
