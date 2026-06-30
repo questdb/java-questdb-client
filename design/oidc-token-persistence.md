@@ -379,11 +379,27 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   acquire budget (~3s); if it still cannot be acquired, **proceed without it** (degrade to
   Layer 1) rather than fail a sign-in. A lock older than a staleness timeout (10 minutes)
   is treated as abandoned and stolen, so a crashed holder cannot wedge others. The window
-  must dominate the worst-case time a live holder can hold the lock: the refresh under the
-  lock runs send + await + parse, plus a body drain on a parse failure, each separately
-  bounded by the HTTP timeout (capped at 120s), so up to ~4×120s = ~480s — never the
-  interactive wait, which is not held under the lock. 10 minutes stays safely above that
-  ~480s.
+  must dominate the worst-case time a live holder can hold the lock. That worst case has two
+  parts: the refresh I/O under the lock — send + await + parse, plus a body drain on a parse
+  failure, each separately bounded by the HTTP timeout (capped at 120s), so up to ~4×120s =
+  ~480s — **plus the connection phase that precedes the send** — DNS resolution, the TCP
+  connect, and the TLS handshake — which is **not** bounded by the HTTP timeout (the OS bounds
+  the connect instead; a black-holed connect can run to the OS TCP-connect timeout, commonly
+  ~2 minutes). So size the window above ~4×HTTP-timeout **plus a generous connection-stall
+  allowance**, never just ~4×HTTP-timeout; the interactive wait is never held under the lock.
+  10 minutes clears ~480s with ample headroom for a typical connection stall; a client that
+  raises the HTTP timeout must raise this window in step. A client MUST NOT advertise a tighter
+  guarantee than this (an earlier draft claimed ~480s alone, omitting the connection phase).
+- **An empty/unstamped lock is reclaimable on a short grace, not the full staleness window.**
+  Acquire is exclusive-create followed by a separate stamp write, so a holder that crashes
+  between the two leaves an empty `<hex>.lock` whose mtime is fresh — which the staleness check
+  would protect for the whole window, wedging peers into lock-free refreshes. Treat a lock that
+  carries no readable owner stamp as stealable once it is older than a short grace (a few
+  seconds) instead of the full window. The grace MUST comfortably exceed the create→stamp gap
+  (microseconds) so a peer momentarily between its create and its stamp is never pre-empted —
+  pre-empting it would steal a lock its rightful owner is about to hold and force that owner to
+  degrade. The capture-then-verify steal below still aborts if the lock acquires a stamp in the
+  gap. The Python client MUST mirror this empty-lock grace.
 - **Release verifies ownership.** A holder releases by re-reading the lock and deleting it
   **only when it still carries that holder's own owner stamp**, never by bare path. Should
   a hold ever outrun the staleness window and be stolen and recreated by a peer, the

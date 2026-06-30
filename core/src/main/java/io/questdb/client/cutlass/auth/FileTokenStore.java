@@ -91,14 +91,26 @@ public final class FileTokenStore implements TokenStore {
     // treat a lock older than this as abandoned by a crashed holder and steal it. Must stay comfortably
     // above the longest a live holder can hold it (one refresh under the lock) so a live holder is never
     // stolen from. That refresh runs send + await + parse, plus a body drain on a parse failure, each
-    // separately bounded by the client's HTTP timeout, so up to ~4x it; OidcDeviceAuth caps that timeout at
-    // 120s, so the worst-case hold is ~480s and this 10-minute window stays safely above it
+    // separately bounded by the client's HTTP timeout (so up to ~4x it; OidcDeviceAuth caps that timeout at
+    // 120s, hence ~480s), PLUS the connection phase (DNS + TCP connect + TLS handshake), which the HTTP
+    // timeout does NOT bound and which the OS bounds instead (a black-holed connect is ~tcp-connect-timeout,
+    // commonly ~2 minutes on Linux). This 10-minute window leaves ample headroom above ~480s + a typical
+    // connection stall; a pathological DNS/connection hang longer than that headroom can still let a peer
+    // steal a live holder's lock, degrading (best-effort) to a re-prompt on a rotating-refresh-token IdP
     private static final long DEFAULT_LOCK_STALE_MILLIS = 600_000L;
     private static final FileAttribute<Set<PosixFilePermission>> DIR_ATTRS =
             PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"));
     // the same owner-only directory permissions as DIR_ATTRS, in the form setPosixFilePermissions wants, so
     // ensureDirectory can re-assert them on a directory that already exists with looser permissions
     private static final Set<PosixFilePermission> DIR_PERMS = PosixFilePermissions.fromString("rwx------");
+    // steal an empty/unstamped lock once it has existed at least this long. A validly held lock always
+    // carries an owner stamp (acquireLock stamps it immediately after the exclusive create); an empty lock is
+    // therefore either a peer momentarily between its create and its stamp - microseconds, far below this
+    // grace - or one a holder abandoned by crashing in that tiny window. Stealing on this short grace instead
+    // of the full staleness window keeps a post-crash empty lock from wedging peers (into lock-free refreshes)
+    // for the whole staleness window, while the grace stays well above the create->stamp gap so a peer
+    // mid-stamp is never pre-empted (which would force the rightful holder to degrade)
+    private static final long EMPTY_LOCK_STEAL_GRACE_MILLIS = 5_000L;
     private static final FileAttribute<Set<PosixFilePermission>> FILE_ATTRS =
             PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"));
     private static final char[] HEX = "0123456789abcdef".toCharArray();
@@ -141,14 +153,20 @@ public final class FileTokenStore implements TokenStore {
      *                                 and at most 30_000 (30s): {@code getToken()} can wait it out on the
      *                                 latency-sensitive flush path, so it is kept short
      * @param lockStaleMillis          a lock older than this is treated as abandoned by a crashed holder and
-     *                                 stolen. It MUST exceed the longest a live holder can hold the lock: one
-     *                                 refresh under the lock runs send + await + parse plus a body drain, each
-     *                                 bounded by the {@code OidcDeviceAuth} httpTimeoutMillis, so up to ~4x it
-     *                                 (~480s at the 120s timeout cap). Set it below that and a peer can steal a
-     *                                 live holder's lock mid-refresh, reopening the cross-process refresh race
-     *                                 this lock exists to prevent. The store cannot see the client's timeout,
-     *                                 so sizing this correctly is the caller's responsibility; the default is
-     *                                 600_000 (safely above the ~480s worst case).
+     *                                 stolen. It MUST exceed the longest a live holder can hold the lock, which
+     *                                 is the under-lock refresh PLUS the connection phase that precedes it: the
+     *                                 refresh runs send + await + parse plus a body drain, each bounded by the
+     *                                 {@code OidcDeviceAuth} httpTimeoutMillis (so up to ~4x it, ~480s at the
+     *                                 120s timeout cap), but establishing the connection - DNS resolution, the
+     *                                 TCP connect, and the TLS handshake - is NOT bounded by httpTimeoutMillis;
+     *                                 the OS bounds it instead (a black-holed connect runs to the OS TCP-connect
+     *                                 timeout, commonly ~2 minutes). Size this window above ~4x httpTimeoutMillis
+     *                                 plus a generous connection-stall allowance, or a peer can judge a live but
+     *                                 connection-stalled holder stale and steal its lock mid-refresh, reopening
+     *                                 the cross-process refresh race this lock exists to prevent. The store
+     *                                 cannot see the client's timeout, so sizing this correctly is the caller's
+     *                                 responsibility; the default is 600_000 (~480s worst-case refresh plus
+     *                                 ample headroom for a typical connection stall).
      */
     public FileTokenStore(Path directory, long lockAcquireBudgetMillis, long lockStaleMillis) {
         if (directory == null) {
@@ -591,7 +609,7 @@ public final class FileTokenStore implements TokenStore {
         // stamp the lock with the owner nonce. Unlike the staleness mtime (which only needs to be recent),
         // this content is what releaseLock checks before deleting, so it must be written reliably; report a
         // failure so acquireLock drops an unverifiable lock rather than hold one it cannot safely release.
-        // Writing also refreshes the mtime, which is what isStale reads
+        // Writing also refreshes the mtime, which is what the staleness age check reads
         try {
             Files.write(lock, nonce.getBytes(StandardCharsets.UTF_8), StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
             return true;
@@ -663,10 +681,10 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
-    private boolean isStale(Path lock) {
+    private boolean isOlderThan(Path lock, long thresholdMillis) {
         try {
             FileTime modified = Files.getLastModifiedTime(lock);
-            return System.currentTimeMillis() - modified.toMillis() > lockStaleMillis;
+            return System.currentTimeMillis() - modified.toMillis() > thresholdMillis;
         } catch (IOException e) {
             return false; // cannot determine the age; do not steal
         }
@@ -685,16 +703,27 @@ public final class FileTokenStore implements TokenStore {
         // NoSuchFileException and fall back to the wait), then verify what we captured carries the same stamp
         // we judged stale. If a peer had already replaced it with a live lock we grabbed that instead, so we
         // put it back rather than steal it. This mirrors releaseLock's own-stamp check and shrinks the
-        // residual race from the whole isStale->delete gap to the gap between the two renames.
+        // residual race from the whole age-check->delete gap to the gap between the two renames.
         final byte[] before;
         try {
             before = readLockHolder(lock);
         } catch (IOException e) {
             return; // gone or unreadable; nothing to steal here - the create attempt or a peer settles it
         }
-        // read the stamp first, then check staleness: if a peer replaces the stale lock with a fresh one in
-        // between, isStale reads the fresh mtime and returns false, so we never proceed against a live lock
-        if (!isStale(lock)) {
+        // read the stamp first, then check age: if a peer replaces the lock with a fresh one in between, the
+        // age check reads the fresh mtime and returns false, so we never proceed against a live lock.
+        if (before != null) {
+            // a stamped lock is a (claimed) live holder: steal only once it outlives the full staleness window
+            if (!isOlderThan(lock, lockStaleMillis)) {
+                return;
+            }
+        } else if (!isOlderThan(lock, Math.min(EMPTY_LOCK_STEAL_GRACE_MILLIS, lockStaleMillis))) {
+            // an empty/unreadable lock is never a validly-held lock (a holder stamps right after creating): it
+            // is a peer mid-create/stamp (recovers on its own in microseconds) or one a crash orphaned in that
+            // gap. Steal it on the short empty-lock grace rather than the full staleness window, so a crash
+            // orphan stops wedging peers for the whole window; the grace dwarfs the create->stamp gap, so a
+            // peer mid-stamp is never pre-empted. The capture-verify below still confirms the lock is unchanged
+            // before completing the steal.
             return;
         }
         final Path captured = lock.resolveSibling(lock.getFileName().toString() + '.' + UUID.randomUUID() + ".tmp");
@@ -722,8 +751,13 @@ public final class FileTokenStore implements TokenStore {
         // we captured a live lock a peer recreated in the gap: put it back rather than steal it. Use a plain
         // move (not ATOMIC_MOVE, which maps to rename(2) and would replace the target): if a third party
         // claimed the now-free path during our capture window, FileAlreadyExistsException leaves their lock
-        // intact and we drop our captured copy rather than clobber it; a stray .tmp is reclaimed by
-        // sweepStaleTempFiles on a later save.
+        // intact and we drop our captured copy rather than clobber it. That drop loses the recreating peer's
+        // lock file while it still believes it holds the lock, so for that one refresh two holders can run
+        // concurrently - the inherent residual of stealing with a lock file: a filesystem has no atomic
+        // "delete/rename only if the content is still X", so the capture-verify shrinks the window to this
+        // multi-actor race (our steal, a peer recreating, AND a third party claiming the freed path, all
+        // overlapping) but cannot close it. Best-effort by design: it degrades to one extra refresh - a
+        // re-prompt on a rotating-refresh-token IdP - never a torn or forged credential (Layer 1 still holds).
         try {
             Files.move(captured, lock);
         } catch (IOException e) {
@@ -740,6 +774,16 @@ public final class FileTokenStore implements TokenStore {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory, hashPrefix + "*.tmp")) {
             final long now = System.currentTimeMillis();
             for (Path tmp : stream) {
+                // never sweep a steal-captured lock (<hash>.lock.<uuid>.tmp): it is a cross-process steal in
+                // progress, not an orphaned write temp, and ATOMIC_MOVE preserves the stale lock's old mtime
+                // onto it, so the age guard below would judge an in-flight capture sweepable and delete it -
+                // destroying a lock the stealer may be about to restore to its live owner. A save write temp is
+                // <hash><random>.tmp and never contains ".lock.", so this only excludes captures. A capture
+                // orphaned by a crash mid-steal is rare and harmless (the canonical lock path is left free), so
+                // it is deliberately not reclaimed here.
+                if (tmp.getFileName().toString().contains(".lock.")) {
+                    continue;
+                }
                 try {
                     if (now - Files.getLastModifiedTime(tmp).toMillis() > lockStaleMillis) {
                         Files.deleteIfExists(tmp);

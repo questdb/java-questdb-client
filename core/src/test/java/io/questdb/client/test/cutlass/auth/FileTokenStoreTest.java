@@ -307,6 +307,36 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testEmptyLockStolenAfterGraceWithinStaleWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            // a holder that crashed between creating its lock and stamping it leaves an empty, unstamped lock.
+            // It must be reclaimable on the short empty-lock grace, not held un-stealable until the full
+            // staleness window elapses: here the staleness window is large (60s) but the empty lock is backdated
+            // only past the grace, so a steal here can only come from the empty-lock-grace path. Without that
+            // path the empty lock would not be stale (10s < 60s) and would wedge this acquirer into a lock-free
+            // degrade, leaving the lock in place.
+            FileTokenStore store = new FileTokenStore(dir, 2000, 60_000);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            Files.createFile(lock); // empty, unstamped
+            Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 10_000));
+
+            AtomicBoolean ran = new AtomicBoolean();
+            boolean result = store.inLock(key, () -> {
+                ran.set(true);
+                return true;
+            });
+
+            Assert.assertTrue("the action must run", ran.get());
+            Assert.assertTrue(result);
+            Assert.assertFalse("an empty (unstamped) lock past the grace must be stolen and acquired (then released),"
+                    + " not wedge the acquirer for the full staleness window", Files.exists(lock));
+        });
+    }
+
+    @Test
     public void testEnsureDirectoryTightensPreExistingDirPerms() throws Exception {
         Assume.assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
         assertMemoryLeak(() -> {
@@ -830,6 +860,29 @@ public class FileTokenStoreTest {
             Assert.assertFalse("a stale orphan temp must be swept on save", Files.exists(staleTmp));
             Assert.assertTrue("a fresh temp (a concurrent writer's) must not be swept", Files.exists(freshTmp));
             Assert.assertNotNull("the save must still succeed", store.load(key));
+        });
+    }
+
+    @Test
+    public void testSweepDoesNotDeleteStealCapturedLock() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            // a 1s staleness window so an old file is well past it
+            FileTokenStore store = new FileTokenStore(dir, 3_000, 1_000);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-0", "REFRESH-0")); // create the directory
+            // a steal in another process captures a stale lock by atomically renaming it to
+            // <hash>.lock.<uuid>.tmp; ATOMIC_MOVE preserves the stale lock's old mtime onto the capture. Even
+            // though that name matches the <hash>*.tmp write-temp glob and is past the staleness window, the
+            // save's temp-sweep must NOT delete it - it is a live cross-process steal in progress, and deleting
+            // it would destroy a lock the stealer may be about to restore to its live owner.
+            Path capture = dir.resolve(key.hash() + ".lock." + java.util.UUID.randomUUID() + ".tmp");
+            Files.write(capture, "stale-owner-stamp".getBytes(StandardCharsets.UTF_8));
+            Files.setLastModifiedTime(capture, FileTime.fromMillis(System.currentTimeMillis() - 10_000));
+
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1")); // runs sweepStaleTempFiles
+
+            Assert.assertTrue("the temp-sweep must not delete an in-flight steal-captured lock", Files.exists(capture));
         });
     }
 

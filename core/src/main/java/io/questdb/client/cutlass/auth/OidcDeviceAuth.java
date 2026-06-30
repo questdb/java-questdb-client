@@ -132,10 +132,12 @@ public class OidcDeviceAuth implements QuietCloseable {
     // tokens fail to parse with "String is too long".
     private static final int JSON_LEXER_CACHE_SIZE = 1024;
     private static final int JSON_LEXER_MAX_VALUE_BYTES = 1 << 20;
-    // the worst case a coordinated refresh can hold a FileTokenStore cross-process lock, as a multiple of
-    // httpTimeoutMillis: one refresh under the lock runs send + await + parse, plus a body drain on a parse
-    // failure, each separately bounded by httpTimeoutMillis. build() rejects a FileTokenStore whose
-    // lock-staleness window does not exceed this, so a peer never judges a live holder's lock stale mid-refresh
+    // the I/O portion of a coordinated refresh, as a multiple of httpTimeoutMillis: the refresh under the lock
+    // runs send + await + parse, plus a body drain on a parse failure, each separately bounded by
+    // httpTimeoutMillis. NOTE this multiple does NOT cover the connection phase that precedes the send - DNS
+    // resolution, the TCP connect, and the TLS handshake are NOT bounded by httpTimeoutMillis (the OS bounds the
+    // connect instead). build() requires the FileTokenStore staleness window to exceed this multiple as a floor;
+    // the default window adds ample headroom for a typical connection stall on top of it (see build())
     private static final int LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE = 4;
     // upper bound on the device code lifetime (the device authorization response's expires_in), so a
     // hostile or buggy provider cannot make the client poll for an absurd duration; matches the Python client
@@ -143,10 +145,12 @@ public class OidcDeviceAuth implements QuietCloseable {
     // upper bound on the token cache lifetime (the token response's expires_in), so an absurd or hostile
     // value cannot overflow the timing arithmetic or make the client trust a token for absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
-    // upper bound on the configurable HTTP request timeout. A token-endpoint round-trip never needs longer,
-    // and bounding it keeps a refresh held under the FileTokenStore cross-process lock (send + await + parse,
-    // plus a body drain on a parse failure - each separately bounded by this, so up to ~4x this) safely
-    // shorter than that store's lock-staleness window, so a slow refresh's live lock is not stolen by a peer
+    // upper bound on the configurable HTTP request timeout. A token-endpoint round-trip never needs longer, and
+    // bounding it keeps the I/O portion of a refresh held under the FileTokenStore cross-process lock (send +
+    // await + parse, plus a body drain on a parse failure - each separately bounded by this, so up to ~4x this)
+    // a known, bounded multiple, so the store's staleness window can be sized to dominate it. The connection
+    // phase (DNS + TCP connect + TLS) is bounded by the OS, not by this, and the default staleness window
+    // leaves headroom for it (see Builder.build())
     private static final int MAX_HTTP_TIMEOUT_MILLIS = 120_000;
     // upper bound on the poll interval, both the initial value and the growth after a slow_down or 429, so
     // a hostile or buggy provider cannot stall the poll loop; matches the Python client
@@ -1585,11 +1589,15 @@ public class OidcDeviceAuth implements QuietCloseable {
             validateEndpointOrigins(parsedTokenEndpoint, deviceEndpoint, issuerEndpoint);
             ClientTlsConfiguration tls = tlsConfig != null ? tlsConfig : defaultTlsConfig();
             // a FileTokenStore steals a lock older than its staleness window, presuming a crashed holder; that
-            // window must exceed the worst-case time a live refresh holds the lock (the refresh under the lock is
-            // bounded by httpTimeoutMillis, up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE times it), or a peer could steal
-            // a live holder's lock mid-refresh and reopen the rotating-refresh-token race the lock prevents. The
-            // store cannot see this client's timeout, so enforce the invariant here, where both are known, rather
-            // than leave the caller to size it by hand. A non-coordinating TokenStore is exempt - it takes no lock.
+            // window must exceed the worst-case time a live refresh holds the lock, or a peer could steal a live
+            // holder's lock mid-refresh and reopen the rotating-refresh-token race the lock prevents. Enforce the
+            // bounded part of that worst case here, where both values are known: the refresh I/O under the lock is
+            // up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE x httpTimeoutMillis. This is a FLOOR, not the whole story - the
+            // connection phase (DNS + TCP connect + TLS) that precedes the send is bounded by the OS, not by
+            // httpTimeoutMillis, so the staleness window must also clear a connection stall on top of this floor.
+            // The default 600s window leaves ~120s of headroom over the floor even at the 120s timeout cap, which
+            // covers a typical connection stall; a caller raising httpTimeoutMillis should raise lockStaleMillis
+            // to keep that headroom. A non-coordinating TokenStore is exempt - it takes no lock.
             if (tokenStore instanceof FileTokenStore) {
                 long minStaleMillis = (long) LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE * httpTimeoutMillis;
                 long staleMillis = ((FileTokenStore) tokenStore).getLockStaleMillis();
