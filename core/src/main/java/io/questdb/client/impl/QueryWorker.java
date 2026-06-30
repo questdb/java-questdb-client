@@ -269,7 +269,18 @@ public final class QueryWorker {
     }
 
     private void runLoop() {
-        while (!shuttingDown) {
+        // Loop unconditionally -- do NOT hoist the shuttingDown check up here as
+        // while (!shuttingDown). The sole exit is the "if (shuttingDown) return"
+        // inside the signalLock block below, which strands a pending current
+        // before returning. Exiting at the top instead would skip that strand on
+        // the busy-worker path: when a reused lease's submit() -> dispatch() sets
+        // current between the terminal callback and this check, and shutdown()
+        // then flips shuttingDown, the worker would return straight after
+        // runOn() without re-inspecting current -- the job is dropped, never
+        // run, never signalled, and its caller's await() hangs forever.
+        // Re-entering the lock every lap funnels every shutdown ordering through
+        // the single strand point.
+        while (true) {
             QueryImpl q;
             signalLock.lock();
             try {
