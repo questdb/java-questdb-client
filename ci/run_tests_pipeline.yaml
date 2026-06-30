@@ -28,7 +28,7 @@ stages:
           - checkout: self
             fetchDepth: 0
             lfs: false
-            submodules: false
+            submodules: recursive
           - bash: |
               git fetch origin $(System.PullRequest.SourceBranch)
               git checkout FETCH_HEAD
@@ -58,7 +58,7 @@ stages:
               imageName: "macos-15"
               poolName: "Azure Pipelines"
               jdkArch: "x64"
-            windows-msvc-2022-x64:
+            windows-mingw-2022-x64:
               imageName: "windows-2022"
               poolName: "Azure Pipelines"
               jdkArch: "x64"
@@ -70,7 +70,7 @@ stages:
           - checkout: self
             fetchDepth: 1
             lfs: false
-            submodules: false
+            submodules: recursive
           - template: setup.yaml
           - bash: echo "##vso[task.setvariable variable=HOME]$USERPROFILE"
             displayName: "Set HOME on Windows"
@@ -139,7 +139,7 @@ stages:
           - checkout: self
             fetchDepth: 1
             lfs: false
-            submodules: false
+            submodules: recursive
             persistCredentials: true
           - template: setup.yaml
           - task: Cache@2

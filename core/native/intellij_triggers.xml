@@ -1,0 +1,36 @@
+<project name="questdb-client-native" default="questdb-client-native-build" basedir="..">
+    <description>
+        IntelliJ integration to trigger the Maven steps that build the QuestDB Java client native library.
+
+        To build the native library from IntelliJ before every test run:
+        * View -> Tool Windows -> Ant
+        * Add this file as an Ant build file
+        * Right click on "questdb-client-native-build" and select "Execute on"
+        * Select "Before Compilation"
+
+        If the build fails, run "mvn package" from the command line to see the full Maven and CMake output.
+    </description>
+
+    <condition property="isWindows">
+        <os family="windows"/>
+    </condition>
+
+    <condition property="isUnix">
+        <os family="unix"/>
+    </condition>
+
+    <target name="set-mvn-path-windows" if="isWindows">
+        <property name="maven.executable" value="mvn.cmd"/>
+    </target>
+
+    <target name="set-mvn-path-unix" if="isUnix">
+        <property name="maven.executable" value="mvn"/>
+    </target>
+
+    <target name="questdb-client-native-build" depends="set-mvn-path-windows, set-mvn-path-unix">
+        <exec executable="${maven.executable}">
+            <arg value="org.codehaus.mojo:exec-maven-plugin:exec@configure-native"/>
+            <arg value="org.codehaus.mojo:exec-maven-plugin:exec@build-native"/>
+        </exec>
+    </target>
+</project>
