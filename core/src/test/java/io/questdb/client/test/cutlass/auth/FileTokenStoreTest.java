@@ -38,11 +38,13 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -179,6 +181,62 @@ public class FileTokenStoreTest {
             // just to run the now-locked delete
             store.clear(sampleKey());
             Assert.assertFalse("clear must not create the store directory", Files.exists(dir));
+        });
+    }
+
+    @Test
+    public void testConcurrentStealContentionPreservesMutualExclusion() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            TokenStoreKey key = sampleKey();
+            // a lock abandoned by a crashed holder, backdated well past the staleness window
+            Path lock = lockFile(dir, key);
+            Files.write(lock, "crashed-holder-stamp".getBytes(StandardCharsets.UTF_8));
+            Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 600_000));
+
+            // several "processes" race to steal the one abandoned lock. The staleness window (60s) far exceeds
+            // each ~100ms hold, so a live holder's lock is never judged stale: only the abandoned lock is
+            // stealable, and the atomic, stamp-verified steal must admit exactly one holder at a time. This is a
+            // mutual-exclusion invariant guard under steal contention: it exercises the steal path concurrently
+            // and fails on any gross loss of exclusion. It does not deterministically reproduce the narrow
+            // isStale->delete race the atomic steal closes - that needs a timing seam this final class does not
+            // expose - so the fix itself rests on the atomic capture + stamp re-check, not on this test alone.
+            final int threads = 4;
+            AtomicInteger inside = new AtomicInteger();
+            AtomicInteger maxInside = new AtomicInteger();
+            AtomicInteger overlaps = new AtomicInteger();
+            AtomicInteger ran = new AtomicInteger();
+            TokenStore.CriticalSection section = () -> {
+                int now = inside.incrementAndGet();
+                maxInside.accumulateAndGet(now, Math::max);
+                if (now > 1) {
+                    overlaps.incrementAndGet();
+                }
+                Os.sleep(100);
+                inside.decrementAndGet();
+                ran.incrementAndGet();
+                return true;
+            };
+
+            Thread[] ts = new Thread[threads];
+            for (int i = 0; i < threads; i++) {
+                // a generous acquire budget so a contender waits for the lock rather than degrading to a
+                // lock-free run (a degraded action runs without the lock and could legitimately overlap)
+                FileTokenStore store = new FileTokenStore(dir, 30_000, 60_000);
+                ts[i] = new Thread(() -> store.inLock(key, section));
+            }
+            for (Thread t : ts) {
+                t.start();
+            }
+            for (Thread t : ts) {
+                t.join();
+            }
+
+            Assert.assertEquals("every contender must run its critical section", threads, ran.get());
+            Assert.assertEquals("the steal must never admit two holders at once", 0, overlaps.get());
+            Assert.assertEquals("at most one holder at a time", 1, maxInside.get());
+            assertNoCaptureTempFiles(dir, key);
         });
     }
 
@@ -581,6 +639,36 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testOversizedStaleLockIsStolen() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore store = new FileTokenStore(dir, 2000, 100);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            // a corrupt/hostile lock far larger than the read cap, backdated past the staleness window. The
+            // steal reads the owner stamp with a hard cap (not Files.readAllBytes, which on an attacker-grown
+            // lock could OutOfMemoryError on the refresh path): a bounded read reports an oversized lock as
+            // unreadable, which the steal treats as abandoned junk - it must still acquire, not wedge.
+            byte[] huge = new byte[64 * 1024];
+            Arrays.fill(huge, (byte) 'x');
+            Files.write(lock, huge);
+            Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 10_000));
+
+            AtomicBoolean ran = new AtomicBoolean();
+            boolean result = store.inLock(key, () -> {
+                ran.set(true);
+                return true;
+            });
+
+            Assert.assertTrue("an oversized stale lock must be stolen, not wedge acquisition", ran.get());
+            Assert.assertTrue(result);
+            Assert.assertFalse("the acquired (stolen) lock must be released", Files.exists(lock));
+            assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
     public void testPerFieldFingerprintMismatchReturnsNull() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -817,6 +905,16 @@ public class FileTokenStoreTest {
 
     private static PersistedToken sampleToken(String access, String refresh) {
         return new PersistedToken(access, null, refresh, System.currentTimeMillis() + 300_000L, 300_000L);
+    }
+
+    private void assertNoCaptureTempFiles(Path dir, TokenStoreKey key) throws Exception {
+        // a successful steal deletes its atomic-capture file and a restore moves it back; neither must leak a
+        // <hash>.lock.<uuid>.tmp behind (an orphan is otherwise only reclaimed by a later save's sweep)
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, key.hash() + "*.tmp")) {
+            for (Path p : stream) {
+                Assert.fail("a steal must not leak a capture temp file: " + p.getFileName());
+            }
+        }
     }
 
     private Path lockFile(Path dir, TokenStoreKey key) {

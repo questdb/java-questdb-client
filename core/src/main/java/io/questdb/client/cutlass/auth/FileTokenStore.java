@@ -52,6 +52,7 @@ import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Arrays;
 import java.util.Set;
 import java.util.UUID;
 
@@ -113,6 +114,10 @@ public final class FileTokenStore implements TokenStore {
     // to a lock-free refresh (Layer 1 still guards integrity). Stays well below DEFAULT_LOCK_STALE_MILLIS so a
     // waiter degrades long before it could begin stealing live locks.
     private static final long MAX_LOCK_ACQUIRE_BUDGET_MILLIS = 30_000L;
+    // reject a lock file larger than this before reading it: the <hash>.lock file sits in the same
+    // attacker-writable directory as the token file, and a real owner stamp (pid@host + millis + UUID) is a
+    // few hundred bytes, so anything past this cap is corrupt or hostile and is not read into memory
+    private static final int MAX_LOCK_FILE_BYTES = 1 << 12;
     private static final int SCHEMA_VERSION = 1;
     // set once if the platform cannot enforce owner-only POSIX permissions on the token files (e.g. Windows),
     // so the at-rest protection falls back to the directory's inherited ACL; warns the user once
@@ -295,6 +300,16 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
+    private static void deleteCapturedLock(Path captured) {
+        // best-effort cleanup of a lock we atomically captured during a steal; a leftover .tmp is reclaimed by
+        // sweepStaleTempFiles on a later save
+        try {
+            Files.deleteIfExists(captured);
+        } catch (IOException ignore) {
+            // reclaimed by sweepStaleTempFiles later
+        }
+    }
+
     private static String newLockNonce() {
         // a per-acquisition owner stamp: the pid@host and the acquire time are human-readable debugging aids,
         // and the random UUID guarantees two acquisitions never share a stamp even within one pid and one
@@ -453,20 +468,49 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
+    private static byte[] readLockHolder(Path lock) throws IOException {
+        // read the lock's owner stamp with a hard cap rather than Files.readAllBytes: the <hash>.lock file
+        // sits in the same attacker-writable directory as the token file, so an inflated lock would otherwise
+        // make readAllBytes allocate without bound and throw OutOfMemoryError - an Error the best-effort
+        // RuntimeException guards on the getToken()/signIn() refresh path would not catch, aborting the
+        // sign-in (the same reason readBounded caps the token file). A real owner stamp is a few hundred
+        // bytes; anything past the cap is corrupt or hostile, so report it as unreadable (null) rather than
+        // read it into memory. Returns the exact bytes present, or null for an empty/oversized lock.
+        try (FileChannel channel = FileChannel.open(lock, StandardOpenOption.READ)) {
+            long size = channel.size();
+            if (size <= 0 || size > MAX_LOCK_FILE_BYTES) {
+                return null;
+            }
+            ByteBuffer buffer = ByteBuffer.allocate((int) size);
+            while (buffer.hasRemaining() && channel.read(buffer) >= 0) {
+                // read until EOF or the buffer fills
+            }
+            int read = buffer.position();
+            if (read == 0) {
+                return null;
+            }
+            byte[] bytes = new byte[read];
+            buffer.flip();
+            buffer.get(bytes);
+            return bytes;
+        }
+    }
+
     private static void releaseLock(Path lock, String nonce) {
-        // release our own lock only: re-read it and delete it solely when it still carries our nonce. A hold
-        // that outran lockStaleMillis may have been judged stale and stolen (deleted and recreated) by a peer;
-        // deleting by bare path would then remove the peer's live lock and admit a third acquirer alongside it,
-        // defeating the mutual exclusion this lock exists to provide. A microscopic window remains if a steal
-        // lands between the read and the delete, but that is bounded to one syscall gap rather than the whole
-        // hold, so a misconfigured staleness window degrades to at most the documented double-refresh rather
-        // than corrupting a peer's lock state.
+        // release our own lock only: re-read it (bounded - see readLockHolder) and delete it solely when it
+        // still carries our nonce. A hold that outran lockStaleMillis may have been judged stale and stolen
+        // (captured and recreated) by a peer; deleting by bare path would then remove the peer's live lock and
+        // admit a third acquirer alongside it, defeating the mutual exclusion this lock exists to provide. A
+        // microscopic window remains if a steal lands between the read and the delete, but that is bounded to
+        // one syscall gap rather than the whole hold, so a misconfigured staleness window degrades to at most
+        // the documented double-refresh rather than corrupting a peer's lock state.
         try {
-            byte[] content = Files.readAllBytes(lock);
-            if (nonce.equals(new String(content, StandardCharsets.UTF_8))) {
+            byte[] content = readLockHolder(lock);
+            if (content != null && nonce.equals(new String(content, StandardCharsets.UTF_8))) {
                 Files.deleteIfExists(lock);
             }
-            // otherwise a peer now owns this lock file; leave it for that owner (or staleness) to reclaim
+            // otherwise a peer now owns this lock file, or it is unreadable/oversized; leave it for that owner
+            // (or the staleness steal) to reclaim
         } catch (NoSuchFileException e) {
             // already gone (stolen and not yet recreated, or removed elsewhere); nothing to release
         } catch (IOException ignore) {
@@ -578,16 +622,11 @@ public final class FileTokenStore implements TokenStore {
                 }
                 return null;
             } catch (FileAlreadyExistsException e) {
-                if (isStale(lock)) {
-                    // a crashed holder left the lock behind; steal it
-                    try {
-                        Files.deleteIfExists(lock);
-                    } catch (IOException ignore) {
-                        // another acquirer may have removed it; the next createLockFile settles the race
-                    }
-                    // fall through to the bounded wait below rather than retry immediately: a steal contest
-                    // between several acquirers (or a misconfigured tiny lockStaleMillis) must not hot-spin
-                }
+                // the lock exists; if a crashed holder abandoned it, steal it - atomically and stamp-verified,
+                // so a stealer never removes a peer's freshly-created live lock (see stealIfStale). Then fall
+                // through to the bounded wait below rather than retry immediately: a steal contest between
+                // several acquirers (or a misconfigured tiny lockStaleMillis) must not hot-spin.
+                stealIfStale(lock);
                 if (System.currentTimeMillis() >= deadline) {
                     return null; // give up and run without the lock rather than stall a sign-in
                 }
@@ -635,6 +674,61 @@ public final class FileTokenStore implements TokenStore {
 
     private Path lockFile(TokenStoreKey key) {
         return directory.resolve(key.hash() + ".lock");
+    }
+
+    private void stealIfStale(Path lock) {
+        // Steal a lock abandoned by a crashed holder, but never remove a peer's freshly-created LIVE lock. A
+        // bare deleteIfExists(lock) removes whatever sits at the path at that instant - including a fresh lock
+        // a peer created in the gap since we judged the old one stale - and would admit two holders at once.
+        // Instead: read the current owner stamp, confirm the lock is stale, then capture it atomically into a
+        // private name (rename is atomic, so among racing stealers exactly one captures it; the losers get
+        // NoSuchFileException and fall back to the wait), then verify what we captured carries the same stamp
+        // we judged stale. If a peer had already replaced it with a live lock we grabbed that instead, so we
+        // put it back rather than steal it. This mirrors releaseLock's own-stamp check and shrinks the
+        // residual race from the whole isStale->delete gap to the gap between the two renames.
+        final byte[] before;
+        try {
+            before = readLockHolder(lock);
+        } catch (IOException e) {
+            return; // gone or unreadable; nothing to steal here - the create attempt or a peer settles it
+        }
+        // read the stamp first, then check staleness: if a peer replaces the stale lock with a fresh one in
+        // between, isStale reads the fresh mtime and returns false, so we never proceed against a live lock
+        if (!isStale(lock)) {
+            return;
+        }
+        final Path captured = lock.resolveSibling(lock.getFileName().toString() + '.' + UUID.randomUUID() + ".tmp");
+        try {
+            Files.move(lock, captured, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            // NoSuchFile: a peer already stole/removed it; AtomicMoveNotSupported or other IO: degrade and
+            // leave the lock for the staleness path. Either way we have not removed a peer's live lock.
+            return;
+        }
+        byte[] after = null;
+        try {
+            after = readLockHolder(captured);
+        } catch (IOException ignore) {
+            // captured but cannot re-read; treated as a non-match below, so we restore rather than steal
+        }
+        // confirm we captured the same stamp we judged stale (or the same unreadable/empty junk), not a live
+        // lock a peer recreated in the gap
+        final boolean confirmedStale = before == null ? after == null : Arrays.equals(before, after);
+        if (confirmedStale) {
+            // genuinely the abandoned lock: drop it, so the next createLockFile can claim a fresh one
+            deleteCapturedLock(captured);
+            return;
+        }
+        // we captured a live lock a peer recreated in the gap: put it back rather than steal it. Use a plain
+        // move (not ATOMIC_MOVE, which maps to rename(2) and would replace the target): if a third party
+        // claimed the now-free path during our capture window, FileAlreadyExistsException leaves their lock
+        // intact and we drop our captured copy rather than clobber it; a stray .tmp is reclaimed by
+        // sweepStaleTempFiles on a later save.
+        try {
+            Files.move(captured, lock);
+        } catch (IOException e) {
+            deleteCapturedLock(captured);
+        }
     }
 
     private void sweepStaleTempFiles(String hashPrefix) {
