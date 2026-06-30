@@ -95,6 +95,7 @@ final class QueryImpl {
     }
 
     void await(long gen) throws InterruptedException {
+        rejectHandlerReentry("await");
         checkLive(gen);
         doneLock.lock();
         try {
@@ -108,6 +109,7 @@ final class QueryImpl {
     }
 
     boolean await(long gen, long timeout, TimeUnit unit) throws InterruptedException {
+        rejectHandlerReentry("await");
         checkLive(gen);
         long remaining = unit.toNanos(timeout);
         doneLock.lock();
@@ -143,6 +145,7 @@ final class QueryImpl {
     }
 
     void close(long gen) {
+        rejectHandlerReentry("close");
         // A stale generation means this lease was already released and the
         // worker may now be owned by another borrower. Dropping the call is
         // what keeps close() idempotent without releasing someone else's
@@ -226,6 +229,22 @@ final class QueryImpl {
     private void checkLive(long gen) {
         if (gen != worker.generation()) {
             throw new IllegalStateException("query handle is not borrowed (closed or never leased)");
+        }
+    }
+
+    private void rejectHandlerReentry(String op) {
+        // Result handlers (onBatch/onEnd/onError) run inline on the worker's
+        // dispatch thread. A blocking lease op called from there would wait for
+        // a terminal event that only this same thread can deliver -- a
+        // permanent, uninterruptible self-deadlock plus a leaked worker. Fail
+        // loudly at the call site instead. cancel() is the non-blocking stop.
+        if (worker.isCurrentThreadWorker()) {
+            throw new IllegalStateException(
+                    op + "() must not be called from a result handler. Handlers "
+                            + "(onBatch/onEnd/onError) run on the worker thread, so " + op
+                            + "() would block forever waiting for a terminal event that only "
+                            + "this same thread can deliver. To stop a query from inside a "
+                            + "handler, call cancel() (non-blocking).");
         }
     }
 

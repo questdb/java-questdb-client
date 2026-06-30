@@ -26,12 +26,15 @@ package io.questdb.client.test.impl;
 
 import io.questdb.client.Completion;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.impl.QueryClientPool;
 import io.questdb.client.impl.QueryWorker;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -154,5 +157,89 @@ public class QueryWorkerTest {
                 + "The caller's Completion.await() hangs forever.", doneF.getBoolean(queryImpl));
         Assert.assertNotNull("signalUnexpected must record the closed-handle error",
                 unexpectedF.get(queryImpl));
+    }
+
+    /**
+     * Result handlers (onBatch/onEnd/onError) run inline on the worker's
+     * dispatch thread. The blocking lease ops -- {@code close()} and the two
+     * {@code await()} variants -- would there wait on a terminal event that
+     * only this same thread can deliver, a permanent self-deadlock. The
+     * reentrancy guard must turn that into an immediate IllegalStateException.
+     * <p>
+     * The guard compares {@code Thread.currentThread()} to the worker's
+     * dispatch thread, so this test points that field at the test thread (the
+     * worker is never started) to stand in for a reentrant in-handler call.
+     * Without the guard, {@code close()}/{@code await()} would park forever and
+     * the method-level timeout would fail the test.
+     */
+    @Test(timeout = 30_000)
+    public void testCloseAndAwaitFromWorkerThreadThrowInsteadOfDeadlocking() throws Exception {
+        Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
+        Field queryF = QueryWorker.class.getDeclaredField("query");
+        queryF.setAccessible(true);
+        Field threadF = QueryWorker.class.getDeclaredField("thread");
+        threadF.setAccessible(true);
+        Field doneF = queryImplClass.getDeclaredField("done");
+        doneF.setAccessible(true);
+        Method bump = QueryWorker.class.getDeclaredMethod("bumpGeneration");
+        bump.setAccessible(true);
+        Method isWorker = QueryWorker.class.getDeclaredMethod("isCurrentThreadWorker");
+        isWorker.setAccessible(true);
+        Method close = queryImplClass.getDeclaredMethod("close", long.class);
+        close.setAccessible(true);
+        Method awaitNoTimeout = queryImplClass.getDeclaredMethod("await", long.class);
+        awaitNoTimeout.setAccessible(true);
+        Method awaitTimed = queryImplClass.getDeclaredMethod("await", long.class, long.class, TimeUnit.class);
+        awaitTimed.setAccessible(true);
+
+        QueryClientPool pool = new QueryClientPool(
+                "ws::addr=localhost:9000;",
+                /*minSize*/ 0, /*maxSize*/ 2,
+                /*acquireTimeoutMillis*/ 1_000L,
+                /*idleTimeoutMillis*/ Long.MAX_VALUE,
+                /*maxLifetimeMillis*/ Long.MAX_VALUE);
+        QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000);
+        try {
+            QueryWorker w = new QueryWorker(client, pool, 0);
+            bump.invoke(w); // generation -> 1: a live lease
+            Object impl = queryF.get(w);
+            doneF.setBoolean(impl, false); // a submit is in flight, as during a handler
+
+            // Off the worker thread the guard must NOT fire.
+            Assert.assertFalse("guard must not fire on a normal caller thread",
+                    (Boolean) isWorker.invoke(w));
+
+            // Stand in for a reentrant call from inside a result handler: the
+            // guard compares Thread.currentThread() to the worker's dispatch
+            // thread, so point that field at this thread.
+            threadF.set(w, Thread.currentThread());
+            Assert.assertTrue((Boolean) isWorker.invoke(w));
+
+            assertThrowsHandlerReentry("close", () -> close.invoke(impl, 1L));
+            assertThrowsHandlerReentry("await", () -> awaitNoTimeout.invoke(impl, 1L));
+            assertThrowsHandlerReentry("await(timeout)",
+                    () -> awaitTimed.invoke(impl, 1L, 5L, TimeUnit.SECONDS));
+        } finally {
+            client.close();
+            pool.close();
+        }
+    }
+
+    private static void assertThrowsHandlerReentry(String op, ReflectiveCall call) throws Exception {
+        try {
+            call.run();
+            Assert.fail(op + "() from the worker thread must throw, not block/deadlock");
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            Assert.assertTrue(op + "(): expected IllegalStateException, was " + cause,
+                    cause instanceof IllegalStateException);
+            Assert.assertTrue(op + "(): message must point at cancel(), was: " + cause.getMessage(),
+                    cause.getMessage().contains("cancel()"));
+        }
+    }
+
+    @FunctionalInterface
+    private interface ReflectiveCall {
+        void run() throws Exception;
     }
 }

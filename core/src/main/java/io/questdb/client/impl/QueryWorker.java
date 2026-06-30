@@ -40,7 +40,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * The pooled query client's own I/O thread continues to drive the wire; the
  * worker thread exists only to keep {@code execute()} off the application's
  * submitting thread. Handler callbacks ({@code onBatch}, {@code onEnd},
- * {@code onError}) still run on the client's I/O thread.
+ * {@code onError}) run on this worker's own dispatch thread, which consumes the
+ * I/O thread's event queue inline -- not on the I/O thread itself. A handler
+ * must therefore never call the lease's blocking {@code close()}/{@code await()}
+ * (it would self-deadlock waiting for a terminal event only this thread can
+ * deliver); use the non-blocking {@code cancel()} to stop from inside a handler.
  */
 public final class QueryWorker {
 
@@ -99,6 +103,17 @@ public final class QueryWorker {
 
     long idleSinceMillis() {
         return idleSinceMillis;
+    }
+
+    /**
+     * True when the calling thread is this worker's own dispatch thread -- i.e.
+     * a reentrant call from inside a result handler, which runs inline on this
+     * thread. Blocking lease operations ({@link QueryImpl#close}/
+     * {@link QueryImpl#await}) use this to fail loudly instead of
+     * self-deadlocking.
+     */
+    boolean isCurrentThreadWorker() {
+        return Thread.currentThread() == thread;
     }
 
     void markIdleAt(long nowMillis) {

@@ -68,14 +68,24 @@ public interface Query extends Closeable {
      * in flight, {@code close()} cancels it and waits for the terminal event
      * before returning the client. A real disconnect only happens at
      * {@link QuestDB#close()}. Idempotent.
+     * <p>
+     * Must NOT be called from a result handler: handlers run on the worker
+     * thread, so {@code close()} would block forever waiting for a terminal
+     * event that only that thread can deliver. Calling it there throws
+     * {@link IllegalStateException}. Use {@link #cancel()} (non-blocking) to
+     * stop a query from inside a handler.
      */
     @Override
     void close();
 
     /**
-     * Sets the result-batch handler. The handler is invoked on the pooled
-     * query client's I/O thread; if it touches caller state, it is
-     * responsible for its own synchronization.
+     * Sets the result-batch handler. The handler is invoked on the worker
+     * (dispatch) thread that drives {@code execute()} -- it consumes the pooled
+     * query client's I/O-thread event queue inline, it does NOT run on the I/O
+     * thread. If it touches caller state, it is responsible for its own
+     * synchronization. A handler must not call the blocking {@link #close()} or
+     * {@link Completion#await()} (they would self-deadlock on the worker
+     * thread); use {@link #cancel()} to stop from inside a handler.
      */
     Query handler(QwpColumnBatchHandler handler);
 
