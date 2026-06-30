@@ -306,17 +306,42 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_connectAddrInfo
 // caller can read it via Os.errno()), or com_questdb_network_Net_ECONNTIMEOUT
 // on timeout.
 static jint awaitConnectComplete(int fd, jint timeout_millis) {
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    // Fix a single absolute deadline up front. Recomputing the remaining budget
+    // against a moving baseline on each EINTR (reset start = now, then subtract
+    // whole milliseconds) lets a high-frequency signal storm extend the timeout:
+    // under sub-millisecond interrupts every interval truncates to 0 ms, the
+    // budget never decrements, and poll is re-armed with the full budget each
+    // time. A fixed deadline is immune to interrupt frequency -- the remaining
+    // time can only ever decrease.
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    long budget_millis = timeout_millis > 0 ? timeout_millis : 0;
+    deadline.tv_sec += budget_millis / 1000L;
+    deadline.tv_nsec += (budget_millis % 1000L) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
 
     for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        // Remaining time until the deadline, truncated to whole milliseconds for
+        // poll(). Truncation only ever under-shoots by < 1 ms (it never extends
+        // the wait), which keeps the timeout a strict upper bound.
+        long remaining_millis = (deadline.tv_sec - now.tv_sec) * 1000L
+                                + (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        if (remaining_millis <= 0) {
+            errno = ETIMEDOUT;
+            return com_questdb_network_Net_ECONNTIMEOUT;
+        }
+
         struct pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLOUT;
         pfd.revents = 0;
 
-        int wait_millis = timeout_millis > 0 ? timeout_millis : 0;
-        int rc = poll(&pfd, 1, wait_millis);
+        int rc = poll(&pfd, 1, (int) remaining_millis);
         if (rc > 0) {
             // The connect attempt has finished one way or another; the only
             // authoritative result is SO_ERROR (POLLOUT alone does not mean
@@ -339,18 +364,8 @@ static jint awaitConnectComplete(int fd, jint timeout_millis) {
         if (errno != EINTR) {
             return -1;
         }
-        // Interrupted by a signal: recompute the remaining budget against a
-        // monotonic clock so EINTR storms cannot extend the timeout, and retry.
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed = (now.tv_sec - start.tv_sec) * 1000L
-                       + (now.tv_nsec - start.tv_nsec) / 1000000L;
-        start = now;
-        timeout_millis = (jint) (timeout_millis - elapsed);
-        if (timeout_millis <= 0) {
-            errno = ETIMEDOUT;
-            return com_questdb_network_Net_ECONNTIMEOUT;
-        }
+        // Interrupted by a signal: loop and recompute the remaining time against
+        // the fixed deadline. EINTR storms cannot extend the timeout.
     }
 }
 
