@@ -62,12 +62,13 @@ public final class QuestDBImpl implements QuestDB {
             long idleTimeoutMillis,
             long maxLifetimeMillis,
             long housekeeperIntervalMillis,
+            long queryCloseTimeoutMillis,
             SenderErrorHandler errorHandler,
             SenderConnectionListener connectionListener
     ) {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
-                housekeeperIntervalMillis, null, null, errorHandler, connectionListener);
+                housekeeperIntervalMillis, queryCloseTimeoutMillis, null, null, errorHandler, connectionListener);
     }
 
     // Test-only constructor exposing the senderFactory and connectHook seams:
@@ -93,7 +94,8 @@ public final class QuestDBImpl implements QuestDB {
     ) {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
-                housekeeperIntervalMillis, senderFactory, connectHook, null, null);
+                housekeeperIntervalMillis, QueryClientPool.DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS,
+                senderFactory, connectHook, null, null);
     }
 
     // Full constructor adding the ingest-side errorHandler/connectionListener,
@@ -111,6 +113,7 @@ public final class QuestDBImpl implements QuestDB {
             long idleTimeoutMillis,
             long maxLifetimeMillis,
             long housekeeperIntervalMillis,
+            long queryCloseTimeoutMillis,
             IntFunction<Sender> senderFactory,
             Consumer<QwpQueryClient> connectHook,
             SenderErrorHandler errorHandler,
@@ -131,6 +134,7 @@ public final class QuestDBImpl implements QuestDB {
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
                     idleTimeoutMillis, maxLifetimeMillis, connectHook);
+            builtQueryPool.closeQueryTimeoutMillis(queryCloseTimeoutMillis);
             builtHousekeeper = new PoolHousekeeper(builtSenderPool, builtQueryPool, housekeeperIntervalMillis);
             builtHousekeeper.start();
         } catch (Throwable e) {

@@ -58,6 +58,7 @@ public final class QuestDBBuilder {
     static final long DEFAULT_MAX_LIFETIME_MILLIS = 30 * 60_000L;
     static final int DEFAULT_POOL_MAX = 4;
     static final int DEFAULT_POOL_MIN = 1;
+    static final long DEFAULT_QUERY_CLOSE_TIMEOUT_MILLIS = 5_000;
 
     // Every valid pool value is >= 0, so -1 unambiguously marks "not set
     // explicitly". The public pool setters are the only writers of these
@@ -73,6 +74,7 @@ public final class QuestDBBuilder {
     private String config;
     private long idleTimeoutMillis = UNSET;
     private long maxLifetimeMillis = UNSET;
+    private long queryCloseTimeoutMillis = UNSET;
     private int queryPoolMax = UNSET;
     private int queryPoolMin = UNSET;
     private int senderPoolMax = UNSET;
@@ -91,6 +93,21 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException("acquireTimeoutMillis must be >= 0");
         }
         this.acquireTimeoutMillis = millis;
+        return this;
+    }
+
+    /**
+     * Maximum time {@link Query#close()} waits for an in-flight query to drain
+     * (after issuing a cancel) before discarding the leased query client and
+     * letting the pool grow a fresh one. Bounds the close of a handle whose
+     * {@code submit()} is still running -- e.g. when the caller's own
+     * {@code await(timeout)} expired and they gave up. Defaults to 5000ms.
+     */
+    public QuestDBBuilder queryCloseTimeoutMillis(long millis) {
+        if (millis < 0) {
+            throw new IllegalArgumentException("queryCloseTimeoutMillis must be >= 0");
+        }
+        this.queryCloseTimeoutMillis = millis;
         return this;
     }
 
@@ -174,6 +191,7 @@ public final class QuestDBBuilder {
         resolvePoolInt(queryPoolMin, "query_pool_min", view, lazyConnect ? 0 : DEFAULT_POOL_MIN, this::queryPoolMin);
         resolvePoolInt(queryPoolMax, "query_pool_max", view, DEFAULT_POOL_MAX, this::queryPoolMax);
         resolvePoolLong(acquireTimeoutMillis, "acquire_timeout_ms", view, DEFAULT_ACQUIRE_TIMEOUT_MILLIS, this::acquireTimeoutMillis);
+        resolvePoolLong(queryCloseTimeoutMillis, "query_close_timeout_ms", view, DEFAULT_QUERY_CLOSE_TIMEOUT_MILLIS, this::queryCloseTimeoutMillis);
         resolvePoolLong(idleTimeoutMillis, "idle_timeout_ms", view, DEFAULT_IDLE_TIMEOUT_MILLIS, this::idleTimeoutMillis);
         resolvePoolLong(maxLifetimeMillis, "max_lifetime_ms", view, DEFAULT_MAX_LIFETIME_MILLIS, this::maxLifetimeMillis);
         resolvePoolLong(housekeeperIntervalMillis, "housekeeper_interval_ms", view, DEFAULT_HOUSEKEEPER_INTERVAL_MILLIS, this::housekeeperIntervalMillis);
@@ -189,6 +207,7 @@ public final class QuestDBBuilder {
                 idleTimeoutMillis,
                 maxLifetimeMillis,
                 housekeeperIntervalMillis,
+                queryCloseTimeoutMillis,
                 errorHandler,
                 connectionListener
         );
@@ -372,6 +391,7 @@ public final class QuestDBBuilder {
         m.put("query_pool_min", queryPoolMin);
         m.put("query_pool_max", queryPoolMax);
         m.put("acquire_timeout_ms", acquireTimeoutMillis);
+        m.put("query_close_timeout_ms", queryCloseTimeoutMillis);
         m.put("idle_timeout_ms", idleTimeoutMillis);
         m.put("max_lifetime_ms", maxLifetimeMillis);
         m.put("housekeeper_interval_ms", housekeeperIntervalMillis);

@@ -109,6 +109,7 @@ public final class ConfigSchema {
         intRange("query_pool_min", Side.POOL, OPEN, OPEN_MAX, false, false);
         intRange("query_pool_max", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("acquire_timeout_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
+        longRange("query_close_timeout_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("idle_timeout_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("max_lifetime_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("housekeeper_interval_ms", Side.POOL, OPEN, OPEN_MAX, false, false);

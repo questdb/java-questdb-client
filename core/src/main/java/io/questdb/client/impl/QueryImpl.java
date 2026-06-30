@@ -155,19 +155,24 @@ final class QueryImpl {
         if (gen != worker.generation()) {
             return;
         }
-        // If a submit is still in flight (the caller did not await), cancel it
-        // and wait for the terminal event so the leased worker is idle before
-        // it returns to the pool -- otherwise the next borrower would inherit a
-        // running execute().
+        // If a submit is still in flight (the caller did not await, or its
+        // await timed out), cancel it and wait for the terminal event so the
+        // leased worker is idle before it returns to the pool -- otherwise the
+        // next borrower would inherit a running execute().
+        //
+        // The wait is bounded (closeQueryTimeoutMillis) and interruptible, so a
+        // caller that bounded its own await() is never pinned to the full
+        // remaining query duration here. If the query does NOT drain in time (a
+        // server slow to honor the cancel, or the caller interrupting), the
+        // worker is still running execute() on a connection whose protocol state
+        // is now uncertain -- a late RESULT_* for the abandoned query could
+        // corrupt the next borrower's stream -- so it is discarded rather than
+        // returned. The pool grows a fresh worker on the next borrow.
         if (!done) {
             worker.cancelInFlight(gen);
-            doneLock.lock();
-            try {
-                while (!done) {
-                    doneCondition.awaitUninterruptibly();
-                }
-            } finally {
-                doneLock.unlock();
+            if (!awaitDone(worker.closeQueryTimeoutMillis())) {
+                worker.discardFromPool(gen);
+                return;
             }
         }
         worker.releaseToPool(gen);
@@ -223,6 +228,34 @@ final class QueryImpl {
         QwpBindSetter setter = userBinds;
         if (setter != null) {
             setter.apply(binds);
+        }
+    }
+
+    /**
+     * Waits up to {@code timeoutMillis} for the in-flight query's terminal
+     * event. Returns {@code true} once {@code done} is set, {@code false} on
+     * timeout or interrupt. Unlike an uninterruptible drain, an interrupt aborts
+     * the wait and re-raises the thread's interrupt flag, so {@code close()}
+     * stays responsive to a caller that wants to give up.
+     */
+    private boolean awaitDone(long timeoutMillis) {
+        long remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        doneLock.lock();
+        try {
+            while (!done) {
+                if (remaining <= 0) {
+                    return false;
+                }
+                try {
+                    remaining = doneCondition.awaitNanos(remaining);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            doneLock.unlock();
         }
     }
 

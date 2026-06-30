@@ -64,14 +64,24 @@ public interface Query extends Closeable {
 
     /**
      * Releases the leased pooled query client back to the pool. The caller
-     * MUST call this (typically via try-with-resources). If a submit is still
-     * in flight, {@code close()} cancels it and waits for the terminal event
-     * before returning the client. A real disconnect only happens at
-     * {@link QuestDB#close()}. Idempotent.
+     * MUST call this (typically via try-with-resources). A real disconnect only
+     * happens at {@link QuestDB#close()}. Idempotent.
+     * <p>
+     * If a submit is still in flight (the caller never awaited, or its
+     * {@code await(timeout)} expired), {@code close()} cancels it and waits for
+     * the terminal event so the client is idle before it returns to the pool.
+     * That wait is bounded by {@code query_close_timeout_ms} (default 5000ms,
+     * see {@link QuestDBBuilder#queryCloseTimeoutMillis(long)}) and is
+     * interruptible -- interrupting the calling thread aborts it. If the query
+     * does not drain within the budget, the client is discarded rather than
+     * returned (its connection may carry late frames for the abandoned query),
+     * and the pool grows a fresh one on the next borrow. {@code close()}
+     * therefore never blocks the caller unbounded, even when the server is slow
+     * to honor the cancel.
      * <p>
      * Must NOT be called from a result handler: handlers run on the worker
-     * thread, so {@code close()} would block forever waiting for a terminal
-     * event that only that thread can deliver. Calling it there throws
+     * thread, so {@code close()} would block waiting for a terminal event that
+     * only that thread can deliver. Calling it there throws
      * {@link IllegalStateException}. Use {@link #cancel()} (non-blocking) to
      * stop a query from inside a handler.
      */

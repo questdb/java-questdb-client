@@ -50,6 +50,12 @@ import java.util.function.Consumer;
  */
 public final class QueryClientPool implements AutoCloseable {
 
+    // Default upper bound, in milliseconds, on how long Query.close() waits for
+    // an in-flight query to drain (after issuing a cancel) before discarding the
+    // worker. Mirrors the ingest side's close_flush_timeout_millis default so a
+    // close() can never block the caller unbounded. Tunable per pool via
+    // closeQueryTimeoutMillis(long).
+    static final long DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS = 5_000;
     private final long acquireTimeoutMillis;
     private final ArrayList<QueryWorker> all;
     private final ArrayDeque<QueryWorker> available;
@@ -76,6 +82,10 @@ public final class QueryClientPool implements AutoCloseable {
     private final AtomicInteger nextSlotIndex = new AtomicInteger();
     private final Condition workerReleased;
     private volatile boolean closed;
+    // Upper bound on the Query.close() drain wait; see
+    // DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS. Volatile because QuestDBImpl sets it
+    // once at build time on a different thread than the borrowers that read it.
+    private volatile long closeQueryTimeoutMillis = DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS;
     private int inFlightCreations;
 
     public QueryClientPool(
@@ -327,6 +337,62 @@ public final class QueryClientPool implements AutoCloseable {
             w.cancelInFlight();
         } finally {
             lock.unlock();
+        }
+    }
+
+    long closeQueryTimeoutMillis() {
+        return closeQueryTimeoutMillis;
+    }
+
+    void closeQueryTimeoutMillis(long millis) {
+        this.closeQueryTimeoutMillis = millis;
+    }
+
+    /**
+     * Evicts a worker whose lease {@link QueryImpl#close(long)} could not drain
+     * the in-flight query within {@link #closeQueryTimeoutMillis} (the cancel
+     * was not honored in time, or the caller was interrupted). The worker's
+     * connection is left in an unknown protocol state -- a late {@code RESULT_*}
+     * frame for the abandoned query could corrupt the next borrower's stream --
+     * so it must NOT return to the pool. Removes it from {@code all} (freeing
+     * capacity for a fresh worker) and tears it down outside the lock via
+     * {@link QueryWorker#shutdown()}, which interrupts the dispatch thread so a
+     * stuck {@code execute()} returns promptly.
+     * <p>
+     * Bails when the pool is already closed: {@link #close()} owns the teardown
+     * of every worker via its snapshot loop, so mutating {@code all} here would
+     * race that iteration on a non-thread-safe {@code ArrayList}. Also bails on a
+     * stale generation -- the worker was already released/discarded and possibly
+     * re-borrowed, so discarding it would evict a worker a different borrower now
+     * owns. Mirrors {@link SenderPool#discardBroken} on the ingest side.
+     */
+    void discard(QueryWorker w, long gen) {
+        lock.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            if (w.generation() != gen) {
+                return;
+            }
+            // Invalidate the lease so a duplicate close()/release with the same
+            // generation is dropped and the in-flight handle can no longer drive
+            // this worker.
+            w.bumpGeneration();
+            all.remove(w);
+            // Capacity freed -- a waiter in acquire() may now create a fresh
+            // worker in this slot's place.
+            workerReleased.signal();
+        } finally {
+            lock.unlock();
+        }
+        // Tear down outside the lock so a slow join doesn't keep the pool
+        // latched. shutdown() is best-effort and idempotent.
+        try {
+            w.shutdown();
+        } catch (Throwable ignored) {
+            // Best-effort: a teardown Error (e.g. an -ea AssertionError) must
+            // not propagate out of Query.close().
         }
     }
 

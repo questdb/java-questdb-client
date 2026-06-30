@@ -54,6 +54,7 @@ public class PoolConfigHonoredTest {
         expected.put("query_pool_min", 0);
         expected.put("query_pool_max", 5);
         expected.put("acquire_timeout_ms", 1234L);
+        expected.put("query_close_timeout_ms", 2468L);
         expected.put("idle_timeout_ms", 4321L);
         expected.put("max_lifetime_ms", 98765L);
         expected.put("housekeeper_interval_ms", 222L);

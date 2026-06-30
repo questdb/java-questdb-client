@@ -170,6 +170,21 @@ public final class QueryWorker {
         return new QueryLease(query, generation);
     }
 
+    long closeQueryTimeoutMillis() {
+        return pool.closeQueryTimeoutMillis();
+    }
+
+    /**
+     * Discards this worker from the pool instead of returning it. Called by
+     * {@link QueryImpl#close(long)} when the in-flight query could not be
+     * drained within the close budget, leaving the connection in an unknown
+     * protocol state. The captured lease {@code gen} lets the pool reject a
+     * stale discard whose worker has already been re-borrowed.
+     */
+    void discardFromPool(long gen) {
+        pool.discard(this, gen);
+    }
+
     /**
      * Returns this worker to the pool. Called by {@link QueryImpl#close(long)}
      * when the borrowed lease is released; the captured lease {@code gen} lets
@@ -188,10 +203,19 @@ public final class QueryWorker {
             signalLock.unlock();
         }
         try {
-            // If a query is in flight on this worker, ask the client to abort so
-            // execute() returns promptly and the thread can exit before join
-            // times out. cancel() is documented as thread-safe and is a no-op
-            // when idle.
+            // If a query is in flight on this worker, force execute() to return
+            // promptly so the dispatch thread exits before the join below times
+            // out. Two nudges, strongest first:
+            //   1. Interrupt the dispatch thread. takeEvent() (QwpSpscQueue.take)
+            //      is interrupt-aware, and executeOnce() turns the resulting
+            //      InterruptedException into a terminal event -> signalDone. This
+            //      releases a caller parked in Query.close() even when the I/O
+            //      thread is wedged and client.close()'s synthetic terminal
+            //      (closePool()) never runs -- the race that would otherwise
+            //      strand the caller forever.
+            //   2. Ask the client to cancel on the wire so the server stops work.
+            //      Best-effort and a no-op when idle.
+            thread.interrupt();
             try {
                 client.cancel();
             } catch (Throwable ignored) {
