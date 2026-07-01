@@ -1059,11 +1059,16 @@ public class OidcDeviceAuth implements QuietCloseable {
         long maxTokenLifeMillis = MAX_EXPIRES_IN_SECONDS * 1000L;
         long now = System.currentTimeMillis();
         expiresAtMillis = Math.max(0L, Math.min(token.getExpiresAtMillis(), now + maxTokenLifeMillis));
-        // derive the trusted lifetime from the clamped absolute expiry, not the file's separately-stored ttl, so
-        // a tampered file cannot make the two disagree and throw off effectiveSkewMillis (which caps the skew at
-        // half the lifetime); for a legitimate file the two already agree, and the expiry clamp bounds this to
-        // [0, maxLife]
-        tokenTtlMillis = Math.max(0L, expiresAtMillis - now);
+        // Trust the file's stored ISSUED lifetime (bounded to [0, maxLife] against a tampered value), NOT the
+        // remaining span expiresAtMillis - now. effectiveSkewMillis() caps the clock-skew margin at half the
+        // lifetime - a guard meant only for a genuinely short-issued (< 60s) token - so deriving it from the
+        // shrinking remaining span would collapse the 30s skew toward zero as a normal token nears expiry and
+        // let getToken() serve a near-expired token on the flush path instead of refreshing. A tampered ttl can
+        // only shrink the skew (never inflate it past CLOCK_SKEW_MILLIS), exactly as the remaining-span form
+        // could, so trusting the stored value is no less safe; a file that carries no ttl (0) yields the full
+        // skew via effectiveSkewMillis()'s <= 0 branch. storeTokens() stores this same full issued lifetime, so
+        // both paths now give tokenTtlMillis one meaning.
+        tokenTtlMillis = Math.max(0L, Math.min(token.getTokenTtlMillis(), maxTokenLifeMillis));
         // track what the file actually carried (which is null when it had no refresh_token but we kept a live
         // one above), so a later non-rotating refresh does not rewrite an unchanged on-disk token, yet a token
         // we kept that the file did not carry is not mistaken for already-persisted and can be re-saved

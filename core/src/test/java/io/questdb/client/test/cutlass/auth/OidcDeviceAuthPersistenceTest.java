@@ -57,30 +57,53 @@ public class OidcDeviceAuthPersistenceTest {
     public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
 
     @Test(timeout = 30_000)
-    public void testAdoptDerivesTtlFromExpiry() throws Exception {
+    public void testAdoptTrustsStoredIssuedTtlNotRemainingSpan() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();
             AtomicInteger token = new AtomicInteger();
             MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-FRESH", "REFRESH-FRESH", "ACCESS-2", "REFRESH-2");
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 FakeTokenStore fake = new FakeTokenStore();
-                // a (tampered) entry whose stored ttl (5m) disagrees with its absolute expiry (now + 10m).
-                // adopt() must derive the trusted lifetime from the authoritative expiry, not the stored ttl, so
-                // the effectiveSkewMillis basis matches the real remaining lifetime
+                // a token issued for 5m (stored ttl) loaded with only ~100s of life left. adopt() must set
+                // tokenTtlMillis from the stored ISSUED lifetime (5m), NOT the remaining span (~100s): the
+                // remaining-span form shrinks the effectiveSkewMillis basis as a token ages and collapses the
+                // clock-skew margin near expiry (guarded by testAdoptedTokenNearExpiryStillRefreshesOnFlushPath).
+                // A tampered ttl can only shrink the skew (never inflate it past CLOCK_SKEW_MILLIS) and the server
+                // still enforces the real expiry, so trusting the stored value is no less safe.
                 long now = System.currentTimeMillis();
-                fake.loadReturns = new PersistedToken("ACCESS-1", null, "REFRESH-1", now + 600_000, 300_000);
+                fake.loadReturns = new PersistedToken("ACCESS-1", null, "REFRESH-1", now + 100_000, 300_000);
                 try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
                     Assert.assertEquals("the still-valid persisted token is served", "ACCESS-1", auth.signIn());
                     long ttl = readPrivateLong(auth, "tokenTtlMillis");
-                    long expiry = readPrivateLong(auth, "expiresAtMillis");
-                    Assert.assertTrue("ttl must be derived from the ~10m expiry, not the stored 5m: " + ttl,
-                            ttl >= 9 * 60_000L);
-                    Assert.assertTrue("ttl must not exceed the clamped 1h lifetime: " + ttl, ttl <= 60 * 60_000L);
-                    Assert.assertTrue("ttl must match expiresAtMillis - now within tolerance",
-                            Math.abs(ttl - (expiry - now)) < 5_000L);
+                    Assert.assertEquals("tokenTtlMillis must be the stored 5m issued lifetime, not the ~100s remaining span",
+                            300_000L, ttl);
                 }
                 Assert.assertEquals("no device flow for a valid persisted token", 0, device.get());
                 Assert.assertEquals("no refresh for a valid persisted token", 0, token.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testAdoptedTokenNearExpiryStillRefreshesOnFlushPath() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-1", "REFRESH-1", "ACCESS-REFRESHED", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // a token issued for 5m (stored ttl) but loaded with only ~20s of life left. The 30s clock-skew
+                // margin exceeds the remaining life, so getToken() (the flush path) must silently refresh rather
+                // than serve a token that would expire mid-request. Deriving the skew basis from the remaining
+                // span (the pre-fix bug) collapses the margin to ~10s and serves the near-expired token instead.
+                long now = System.currentTimeMillis();
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-1", now + 20_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("a token inside the clock-skew margin must be refreshed, not served",
+                            "ACCESS-REFRESHED", auth.getToken());
+                }
+                Assert.assertEquals("device flow must not run; a silent refresh suffices", 0, device.get());
+                Assert.assertTrue("the token endpoint must be hit for the refresh", token.get() >= 1);
             }
         });
     }
