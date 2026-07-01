@@ -463,6 +463,147 @@ public class BackgroundDrainerDurableAckRetryTest {
         assertEquals(BackgroundDrainer.DrainOutcome.STOPPED, drainer.outcome());
     }
 
+    @Test
+    public void testRoleRejectChurnDoesNotConsumeCapabilityGapBudgetInvariantB() {
+        // Rolling-upgrade interleave: a long all-replica window (role rejects),
+        // then an old-build node is promoted and upgrades WITHOUT durable ack
+        // (genuine capability gap). The transient window must not consume the
+        // 16-attempt settle budget -- the gap phase gets the full budget.
+        int roleRejects = 20; // > the attempt cap: under the bug the first gap attempt escalates
+        int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+        CountingListener listener = new CountingListener();
+        AtomicInteger sweeps = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+            if (sweeps.incrementAndGet() <= roleRejects) {
+                return new QwpIngressRoleRejectedException(
+                        QwpIngressRoleRejectedException.ROLE_REPLICA, "127.0.0.1", 9000);
+            }
+            return new QwpDurableAckMismatchException("h", 1234, "primary");
+        });
+        // 60s wall budget: only the attempt cap can fire in this test.
+        BackgroundDrainer drainer = newDrainer(factory);
+        drainer.setListener(listener);
+        WebSocketClient out = drainer.connectWithDurableAckRetry();
+        assertNull(out);
+        assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+        assertEquals(1, listener.persistentFailures.get());
+        assertEquals("escalation must count capability-gap attempts only",
+                cap, listener.lastPersistentTotalAttempts.get());
+        assertEquals("full settle budget must be granted after the transient window",
+                roleRejects + cap, factory.attempts());
+        // Per-mode attempt numbering: 1..20 for the transient window, then a
+        // fresh 1..15 for the gap episode (the 16th fires persistent-failure).
+        assertEquals(roleRejects + cap - 1, listener.unavailableAttempts.size());
+        for (int i = 0; i < roleRejects; i++) {
+            assertEquals(Integer.valueOf(i + 1), listener.unavailableAttempts.get(i));
+        }
+        for (int i = 0; i < cap - 1; i++) {
+            assertEquals(Integer.valueOf(i + 1), listener.unavailableAttempts.get(roleRejects + i));
+        }
+        assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+    }
+
+    @Test
+    public void testFailoverWindowDoesNotBurnCapabilityGapWallClockInvariantB() {
+        // The wall-clock half of the settle budget must be anchored at the
+        // FIRST capability-gap error, not at connect entry: an all-replica
+        // window that outlives reconnectMaxDurationMillis must not cause the
+        // first genuine capability-gap attempt to escalate on an already-
+        // expired deadline. Catches the partial fix (separate counter but
+        // entry-anchored deadline) that the attempt-cap test cannot see.
+        int roleRejects = 20;
+        long budgetMillis = 1_000L;
+        int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+        CountingListener listener = new CountingListener();
+        AtomicInteger sweeps = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+            if (sweeps.incrementAndGet() <= roleRejects) {
+                // Burn well past the wall-clock budget inside the transient
+                // window: 20 * 60ms = 1200ms of sleep alone >> 1000ms budget.
+                try {
+                    Thread.sleep(60);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+                return new QwpIngressRoleRejectedException(
+                        QwpIngressRoleRejectedException.ROLE_REPLICA, "127.0.0.1", 9000);
+            }
+            return new QwpDurableAckMismatchException("h", 1234, "primary");
+        });
+        BackgroundDrainer drainer = newDrainerWithBudgets(
+                factory, budgetMillis, /*backoffInit*/ 1L, /*backoffMax*/ 2L);
+        drainer.setListener(listener);
+        WebSocketClient out = drainer.connectWithDurableAckRetry();
+        assertNull(out);
+        assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+        assertEquals(1, listener.persistentFailures.get());
+        assertEquals("first gap attempt must not observe a deadline burned by the "
+                        + "transient window -- full attempt budget expected",
+                cap, listener.lastPersistentTotalAttempts.get());
+        assertEquals(roleRejects + cap, factory.attempts());
+        assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+    }
+
+    @Test
+    public void testRoleRejectResetsCapabilityGapEpisode() {
+        // An intervening role reject proves the topology changed (the node
+        // that produced earlier gap errors is gone), so the settle budget
+        // restarts: 15 gap errors, one role reject, then gaps again -- the
+        // second episode gets the full 16 attempts, it does not inherit the
+        // first episode's 15.
+        int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+        CountingListener listener = new CountingListener();
+        AtomicInteger sweeps = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+            if (sweeps.incrementAndGet() == cap) { // 16th sweep: role reject between the gap runs
+                return new QwpIngressRoleRejectedException(
+                        QwpIngressRoleRejectedException.ROLE_REPLICA, "127.0.0.1", 9000);
+            }
+            return new QwpDurableAckMismatchException("h", 1234, "primary");
+        });
+        BackgroundDrainer drainer = newDrainer(factory);
+        drainer.setListener(listener);
+        WebSocketClient out = drainer.connectWithDurableAckRetry();
+        assertNull(out);
+        assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+        assertEquals(1, listener.persistentFailures.get());
+        assertEquals("second episode must get the full budget after the reset",
+                cap, listener.lastPersistentTotalAttempts.get());
+        // 15 gap + 1 role reject + 16 gap = 32 sweeps total.
+        assertEquals(2 * cap, factory.attempts());
+        assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+    }
+
+    @Test
+    public void testTransportErrorDoesNotResetCapabilityGapEpisode() {
+        // A transport blip between gap attempts does not prove promotion
+        // churn: it must neither consume the budget (no increment) nor
+        // restart it (no reset) -- otherwise a flaky-but-misconfigured
+        // cluster would evade the cap forever. 15 gaps, one transport error,
+        // one gap: escalates on that 16th gap attempt.
+        int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+        CountingListener listener = new CountingListener();
+        AtomicInteger sweeps = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+            if (sweeps.incrementAndGet() == cap) { // 16th sweep: transport error between the gap runs
+                return new LineSenderException("Failed to connect: all 2 endpoint(s) "
+                        + "unreachable; last=127.0.0.1:9000");
+            }
+            return new QwpDurableAckMismatchException("h", 1234, "primary");
+        });
+        BackgroundDrainer drainer = newDrainer(factory);
+        drainer.setListener(listener);
+        WebSocketClient out = drainer.connectWithDurableAckRetry();
+        assertNull(out);
+        assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+        assertEquals(1, listener.persistentFailures.get());
+        assertEquals("transport blip must not restart the episode",
+                cap, listener.lastPersistentTotalAttempts.get());
+        // 15 gap + 1 transport + 1 gap = 17 sweeps total.
+        assertEquals(cap + 1, factory.attempts());
+        assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+    }
+
     private BackgroundDrainer newDrainer(ScriptedFactory factory) {
         return newDrainerWithBudgets(
                 factory, FAST_RECONNECT_MAX_DURATION_MILLIS,

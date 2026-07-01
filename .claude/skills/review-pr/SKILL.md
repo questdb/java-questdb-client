@@ -346,6 +346,18 @@ loses data and never hard-fails on a transient outage.
   delay between attempts), but the RETRY LOOP ITSELF must be unbounded. Flag a
   capped total retry duration or an attempt-count cap on the steady-state
   drainer.
+- **Sanctioned terminals (orphan-slot drainer only).** The orphan drainer
+  (`BackgroundDrainer`) MAY quarantine its slot (`.failed` sentinel,
+  human-in-the-loop) on conditions that are terminal by design: auth failure,
+  a non-421 upgrade reject, and a genuine cluster-wide durable-ack capability
+  gap that exhausted its documented settle budget (16 consecutive
+  capability-gap sweeps, or a wall-clock budget anchored at the FIRST
+  capability-gap error of the episode — whichever is hit first). These are
+  NOT violations of the no-budget rule above. The settle budget applies ONLY
+  to consecutive capability-gap attempts: transient classes (role reject,
+  transport error) must never increment it or burn its wall clock — a
+  transient state consuming the terminal budget (shared attempt counter,
+  entry-anchored deadline) IS a Critical violation of this checklist.
 
 **Pool startup — two modes; the mode decides who sees connectivity errors.**
 - `lazy_connect=true`: `build()` MUST succeed with **no server present**. The

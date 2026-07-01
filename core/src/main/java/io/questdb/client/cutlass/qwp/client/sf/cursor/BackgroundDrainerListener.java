@@ -43,27 +43,34 @@ public interface BackgroundDrainerListener {
 
     /**
      * Fired when the drainer has retried past its budget on consecutive
-     * durable-ack-unavailable failures. The drainer drops a {@code .failed}
-     * sentinel and exits. Treat as cluster-wide misconfiguration and
-     * surface to operators.
+     * durable-ack capability-gap failures. The drainer drops a
+     * {@code .failed} sentinel and exits. Treat as cluster-wide
+     * misconfiguration and surface to operators.
      *
      * @param slotPath      slot the drainer was processing
-     * @param totalAttempts how many connect attempts hit the same failure
-     * @param elapsedMillis wall time spent on this failure mode
+     * @param totalAttempts capability-gap attempts in the final episode;
+     *                      transient sweeps (role reject, transport) are
+     *                      never counted
+     * @param elapsedMillis wall time of the final capability-gap episode,
+     *                      anchored at its first capability-gap error
      */
     void onDurableAckPersistentFailure(String slotPath, int totalAttempts, long elapsedMillis);
 
     /**
-     * Fired when {@code clientFactory.reconnect()} threw
-     * {@code QwpDurableAckMismatchException} — i.e. every endpoint in the
-     * current sweep failed to advertise durable ack. The drainer will
-     * back off and retry; this callback is purely observability. Source
-     * data stays pinned regardless because the loop runs in
-     * {@code durableAckMode=true} and only trims on STATUS_DURABLE_ACK.
+     * Fired when a connect sweep found durable ack unavailable — either a
+     * genuine capability gap ({@code QwpDurableAckMismatchException}: an
+     * endpoint upgrades but does not advertise durable ack) or a transient
+     * all-replica failover window (role reject). The drainer will back off
+     * and retry; this callback is purely observability. Source data stays
+     * pinned regardless because the loop runs in {@code durableAckMode=true}
+     * and only trims on STATUS_DURABLE_ACK.
      *
      * @param slotPath      slot the drainer is processing
-     * @param attemptNumber 1-based count of consecutive durable-ack-unavailable
-     *                      failures for this drainer
+     * @param attemptNumber 1-based attempt count within the current mode:
+     *                      the running role-reject count for a transient
+     *                      window, or the attempt number within the current
+     *                      capability-gap episode (restarts when a role
+     *                      reject resets the episode)
      */
     void onDurableAckUnavailable(String slotPath, int attemptNumber);
 }
