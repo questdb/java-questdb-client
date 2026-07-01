@@ -108,6 +108,11 @@ jobs:
           mkdir -p src/main/resources/io/questdb/client/bin/linux-x86-64/
           mkdir -p src/main/bin/linux-x86-64/
           cp target/classes/io/questdb/client/bin-local/libquestdb.so src/main/resources/io/questdb/client/bin/linux-x86-64/
+      - name: Assert GLIBC floor (2.14)
+        # Never commit a library whose glibc floor regressed above 2.14.
+        run: |
+          bash ./.github/scripts/check-glibc-floor.sh \
+            core/src/main/resources/io/questdb/client/bin/linux-x86-64/libquestdb.so 2.14
       - name: Save linux-x86-64 Libraries to Cache
         uses: actions/cache/save@v3
         with:
@@ -143,6 +148,11 @@ jobs:
           mkdir -p src/main/resources/io/questdb/client/bin/linux-aarch64/
           mkdir -p src/main/bin/linux-aarch64/
           cp target/classes/io/questdb/client/bin-local/libquestdb.so src/main/resources/io/questdb/client/bin/linux-aarch64/
+      - name: Assert GLIBC floor (2.17)
+        # 2.17 is the lowest floor glibc offers on aarch64.
+        run: |
+          bash ./.github/scripts/check-glibc-floor.sh \
+            core/src/main/resources/io/questdb/client/bin/linux-aarch64/libquestdb.so 2.17
       - name: Save linux-aarch64 Libraries to Cache
         uses: actions/cache/save@v3
         with:

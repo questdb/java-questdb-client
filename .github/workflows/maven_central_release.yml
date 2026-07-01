@@ -295,6 +295,8 @@ jobs:
             echo "::error::libquestdb.so has unresolved dependencies."
             exit 1
           fi
+          # Refuse to ship if a symbol raised the glibc floor above 2.14.
+          ./.github/scripts/check-glibc-floor.sh "$lib" 2.14
           cat > LoadCheck.java <<'EOF'
           public class LoadCheck {
               public static void main(String[] args) {
@@ -360,6 +362,8 @@ jobs:
             echo "::error::libquestdb.so has unresolved dependencies."
             exit 1
           fi
+          # 2.17 is the lowest floor glibc offers on aarch64.
+          ./.github/scripts/check-glibc-floor.sh "$lib" 2.17
           cat > LoadCheck.java <<'EOF'
           public class LoadCheck {
               public static void main(String[] args) {
