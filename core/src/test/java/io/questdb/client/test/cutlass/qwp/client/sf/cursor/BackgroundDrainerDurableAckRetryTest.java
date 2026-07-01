@@ -28,6 +28,7 @@ import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -325,6 +326,75 @@ public class BackgroundDrainerDurableAckRetryTest {
                 total < BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS);
         assertTrue(total >= 1);
         assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+    }
+
+    @Test
+    public void testAllReplicaWindowNeverEscalatesInvariantB() throws Exception {
+        // INVARIANT B (orphan drainer): a store-and-forward drainer must NEVER
+        // quarantine a slot just because every reachable endpoint is a REPLICA.
+        // A replica is promotable and a primary will reappear, so an all-replica
+        // window is a TRANSIENT failover state -- the drainer must keep retrying
+        // (capped backoff) until a primary is reachable, stopRequested, or SF
+        // exhaustion. NEITHER the 16-attempt cap NOR the wall-clock reconnect
+        // budget may escalate it to a .failed sentinel.
+        //
+        // Distinct from testEscalatesAfterMaxAttemptsAndDropsSentinel /
+        // testWallTimeBudgetEscalatesBeforeAttemptCap, which use a genuine
+        // durable-ack CAPABILITY gap (QwpDurableAckMismatchException -- a server
+        // upgrades but does not advertise durable ack): that is a real config
+        // problem and stays terminal. This test uses a role reject (every
+        // endpoint is a replica right now), which must NOT be terminal.
+        //
+        // Red-first: connectWithDurableAckRetry() currently lumps role rejects in
+        // with the durable-ack-mismatch give-up, so after the 16-attempt cap /
+        // the budget it markFailed()s and returns -> the helper thread dies. Goes
+        // green once the drainer treats an all-replica window as retry-forever
+        // (split the catch: role reject -> retry; capability gap -> quarantine).
+        CountingListener listener = new CountingListener();
+        AtomicInteger attempts = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+            attempts.incrementAndGet();
+            return new QwpIngressRoleRejectedException(
+                    QwpIngressRoleRejectedException.ROLE_REPLICA, "127.0.0.1", 9000);
+        });
+        // SHORT budget + tiny backoff so BOTH give-up triggers (the 16-attempt
+        // cap and the 200ms wall clock) would fire promptly under the bug.
+        BackgroundDrainer drainer = newDrainerWithBudgets(
+                factory, /*reconnectMaxDurationMillis*/ 200L, /*backoffInit*/ 1L, /*backoffMax*/ 2L);
+        drainer.setListener(listener);
+        Thread t = new Thread(drainer::connectWithDurableAckRetry, "invariant-b-orphan-drainer");
+        t.setDaemon(true);
+        t.start();
+
+        // Observe well past BOTH the 200ms budget and the 16-attempt cap. Under
+        // the bug the drainer escalates (within the cap time) and the helper
+        // thread dies; a contract-honoring drainer is still retrying here.
+        long observeUntilNanos = System.nanoTime() + 600_000_000L; // 600ms >> 200ms budget
+        while (System.nanoTime() < observeUntilNanos && t.isAlive()) {
+            Thread.sleep(10);
+        }
+
+        try {
+            assertTrue("orphan drainer gave up on a transient all-replica window (attempts="
+                            + attempts.get() + ", outcome=" + drainer.outcome() + "): Invariant B "
+                            + "forbids quarantining a slot on the 16-attempt cap or the wall-clock "
+                            + "reconnect budget -- a replica is promotable, so the drainer must keep "
+                            + "retrying until a primary reappears or SF is exhausted",
+                    t.isAlive());
+            assertEquals("must not escalate a transient all-replica window to FAILED",
+                    BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
+            assertEquals("must not fire persistent-failure on an all-replica window",
+                    0, listener.persistentFailures.get());
+            assertFalse("must not quarantine (.failed sentinel) an all-replica window",
+                    Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertTrue("must have retried past the 16-attempt cap (got " + attempts.get() + ")",
+                    attempts.get() > BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS);
+        } finally {
+            drainer.requestStop();
+            t.join(5_000);
+        }
+        assertFalse("helper must exit after stop", t.isAlive());
+        assertEquals(BackgroundDrainer.DrainOutcome.STOPPED, drainer.outcome());
     }
 
     private BackgroundDrainer newDrainer(ScriptedFactory factory) {
