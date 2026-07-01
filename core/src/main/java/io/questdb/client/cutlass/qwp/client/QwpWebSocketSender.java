@@ -2862,10 +2862,11 @@ public class QwpWebSocketSender implements Sender {
             }
             cursorSendLoop.setProgressDispatcher(progressDispatcher);
             // Connection-event dispatcher: lets the cursor I/O loop fire
-            // DISCONNECTED on outage entry and RECONNECT_BUDGET_EXHAUSTED on
-            // budget exit. Sender-side fire points (buildAndConnect) write
-            // directly to connectionDispatcher; this getter just shares the
-            // same instance with the loop.
+            // DISCONNECTED on outage entry. Sender-side fire points
+            // (buildAndConnect) write directly to connectionDispatcher; this
+            // getter just shares the same instance with the loop. (Invariant B:
+            // the loop no longer fires a terminal budget-exhaustion event -- it
+            // retries indefinitely.)
             cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
             cursorSendLoop.start();
         } catch (Throwable t) {
