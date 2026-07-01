@@ -416,9 +416,10 @@ public class JsonLexer implements Mutable, Closeable {
                     }
                     break;
                 default:
-                    // unknown escape: keep the backslash and the escaped character verbatim (lenient), so a
-                    // literal backslash in non-conformant input (e.g. a Windows path in an error body) is not
-                    // dropped
+                    // an unrecognized escape letter: keep the backslash and the char verbatim (lenient), so a
+                    // stray '\' before a non-escape char in non-conformant input survives rather than being
+                    // dropped. A '\' before a RECOGNIZED escape letter (" \ / b f n r t u) is still decoded by
+                    // the cases above - standard JSON unescape - so only genuinely unknown sequences reach here.
                     unescapeSink.put('\\').put(esc);
                     i += 2;
                     break;

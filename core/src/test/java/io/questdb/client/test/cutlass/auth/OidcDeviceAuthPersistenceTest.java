@@ -596,6 +596,33 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testTamperedEmptyServedTokenRejectedOnLoad() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // a tampered persisted entry with an EMPTY served token passes hasOnlyTokenChars vacuously but
+                // would be served as a blank "Bearer " header; adopt() must reject it (not serve "") and fall
+                // back to the device flow, exactly like a control-char token
+                fake.loadReturns = new PersistedToken("", null, "REFRESH-1", System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    String result = auth.signIn();
+                    Assert.assertEquals("ACCESS-FRESH", result);
+                    Assert.assertNotEquals("", result);
+                }
+                Assert.assertTrue("a rejected empty persisted token must fall back to the device flow", device.get() >= 1);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTamperedFarFutureExpiryIsBoundedNotTrustedForever() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();

@@ -653,32 +653,22 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static boolean endpointPathHasEncodedSeparator(String rawEndpointPath) {
-        // Scan for a literal backslash (decodePathSegments folds it to '/') or a percent-encoded path
-        // separator - %2f ('/'), %5c ('\'), or an encoded percent %25 that gates a split or double encoding
-        // such as %2%66 or %252f - at every decode level, not just the raw string. A separator that only
-        // emerges after the server unescapes more than once would pass a single-pass scan yet split one
-        // segment in two, letting .../realms/acme%2%66evil/token slip the issuer-path scope. A real OIDC
-        // endpoint path encodes none of these. Bounded like decodePathSegments; a real path needs 0-1 passes.
-        String decoded = rawEndpointPath;
-        for (int pass = 0; pass < 10; pass++) {
-            for (int i = 0, n = decoded.length(); i < n; i++) {
-                char c = decoded.charAt(i);
-                if (c == '\\') {
-                    return true;
-                }
-                if (c == '%' && i + 2 < n) {
-                    char a = decoded.charAt(i + 1);
-                    char b = decoded.charAt(i + 2);
-                    if ((a == '2' && (b == 'f' || b == 'F' || b == '5')) || (a == '5' && (b == 'c' || b == 'C'))) {
-                        return true;
-                    }
-                }
+        // A real OIDC endpoint path is plain ASCII with no percent-encoding and no backslash, so reject either
+        // outright rather than try to out-decode the server. Percent-encoding is exactly where a tampered
+        // /settings hides a path separator ('/', '\') or a '..' that only surfaces once the server unescapes -
+        // and not only the forms this client's byte-oriented percentDecodeOnce resolves (%2f, %5c, %25, %252f,
+        // %2%66), but ones it deliberately does NOT: an overlong-UTF-8 %c0%ae or %e0%80%ae, or an IIS-style
+        // %u002e, which a permissive server decodes to '/' or '.' yet a single-byte decode leaves as high bytes
+        // or literal text - so they would sail past the segment scan in isEndpointUnderIssuerPath and, sitting
+        // past the issuer prefix, slip the scope. A literal backslash likewise folds to '/' on some proxies.
+        // Failing closed on any '%' or '\' keeps the issuer-path scope airtight against every encoding trick; a
+        // provider that genuinely percent-encodes its endpoint path must be configured explicitly with
+        // OidcDeviceAuth.builder(), which pins the origin only.
+        for (int i = 0, n = rawEndpointPath.length(); i < n; i++) {
+            char c = rawEndpointPath.charAt(i);
+            if (c == '%' || c == '\\') {
+                return true;
             }
-            String next = percentDecodeOnce(decoded);
-            if (next.equals(decoded)) {
-                break;
-            }
-            decoded = next;
         }
         return false;
     }
@@ -1032,9 +1022,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
         // the file is attacker-writable, so treat the served token (the one getToken() puts verbatim into an
         // Authorization header or a PG-wire password) as untrusted: reject a control/non-ASCII char - and the
-        // whole entry - rather than route a tampered credential onto the wire. A null served token is unusable.
+        // whole entry - rather than route a tampered credential onto the wire. A null OR empty served token is
+        // unusable: an empty string passes hasOnlyTokenChars vacuously but would be served as a blank
+        // "Bearer " header that only draws a 401, so reject it here and fall through to a refresh or sign-in.
         String servedToken = groupsInToken ? token.getIdToken() : token.getAccessToken();
-        if (servedToken == null || !hasOnlyTokenChars(servedToken)) {
+        if (servedToken == null || servedToken.isEmpty() || !hasOnlyTokenChars(servedToken)) {
             return false;
         }
         accessToken = token.getAccessToken();
@@ -2016,8 +2008,16 @@ public class OidcDeviceAuth implements QuietCloseable {
             int port;
             if (colon >= 0) {
                 host = hostPort.substring(0, colon);
+                String portStr = hostPort.substring(colon + 1);
+                // reject a leading '+': Integer.parseInt would read ":+443" as 443 and slip the range check,
+                // but a real authority port is bare digits. A leading '-' or any non-digit still flows to
+                // parseInt below, which rejects it (a negative fails the 1..65535 range check, a non-number
+                // throws NumberFormatException) - so only the '+' that parseInt silently accepts is caught here
+                if (portStr.isEmpty() || portStr.charAt(0) == '+') {
+                    throw new OidcAuthException().put("invalid url, could not parse the port [url=").put(url).put(']');
+                }
                 try {
-                    port = Integer.parseInt(hostPort.substring(colon + 1));
+                    port = Integer.parseInt(portStr);
                 } catch (NumberFormatException e) {
                     throw new OidcAuthException().put("invalid url, could not parse the port [url=").put(url).put(']');
                 }
@@ -2038,8 +2038,15 @@ public class OidcDeviceAuth implements QuietCloseable {
             // advertised by a tampered /settings could otherwise pass the pin against the issuer. LDH ASCII
             // hosts, punycode (xn--...) and dotted IPv4 are all ASCII and unaffected.
             for (int i = 0, n = host.length(); i < n; i++) {
-                if (host.charAt(i) > 0x7f) {
+                char hc = host.charAt(i);
+                if (hc > 0x7f) {
                     throw new OidcAuthException().put("invalid url, the host contains a non-ASCII character [url=").put(url).put(']');
+                }
+                // reject a backslash in the host: the WHATWG URL spec folds '\' to '/', so a host like
+                // good.com\.evil.com could be re-split by a lenient consumer into a different authority. The OS
+                // resolver this client hands the host to never resolves such a name anyway, so fail closed.
+                if (hc == '\\') {
+                    throw new OidcAuthException().put("invalid url, the host contains a backslash [url=").put(url).put(']');
                 }
             }
             return new Endpoint(host, port, path, isTls);

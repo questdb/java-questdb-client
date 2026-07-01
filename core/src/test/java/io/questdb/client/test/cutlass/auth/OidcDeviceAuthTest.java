@@ -1075,6 +1075,9 @@ public class OidcDeviceAuthTest {
         assertBuildFails("https://idp:0/d", "https://idp/t", "between 1 and 65535");
         assertBuildFails("https://idp:-1/d", "https://idp/t", "between 1 and 65535");
         assertBuildFails("https://idp/d", "https://idp:70000/t", "between 1 and 65535");
+        // a leading '+' on the port is rejected: Integer.parseInt would read ":+443" as 443, but a real
+        // authority port is bare digits (a leading '-' is already caught by the range check above)
+        assertBuildFails("https://idp:+443/d", "https://idp/t", "could not parse the port");
         // a host carrying control characters or whitespace (e.g. a smuggled CR/LF that would inject into the
         // outbound Host header) is rejected rather than passed verbatim to the transport
         assertBuildFails("https://ho\r\nst/d", "https://idp/t", "illegal character");
@@ -1105,6 +1108,9 @@ public class OidcDeviceAuthTest {
         // U+212A -> k, ...), so a homoglyph host could otherwise pass the origin pin against a pinned issuer
         assertBuildFails("https://\u0130dp/d", "https://idp/t", "non-ASCII"); // U+0130, folds to i
         assertBuildFails("https://idp/d", "https://\u212Aelvin/t", "non-ASCII"); // U+212A Kelvin, folds to k
+        // a backslash in the host is rejected: the WHATWG URL spec folds '\' to '/', so a lenient consumer
+        // could re-split good.com\.evil.com into a different authority
+        assertBuildFails("https://good.com\\.evil.com/d", "https://idp/t", "backslash");
     }
 
     @Test(timeout = 30_000)
@@ -1934,6 +1940,12 @@ public class OidcDeviceAuthTest {
         // rejects it at the encoded level too, before decodePathSegments would fold it to '/'
         Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%5cevil/token", issuer));
         Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%5Cevil/token", issuer));
+        // overlong-UTF-8 (%c0%ae, %e0%80%ae) and an IIS-style %u002e encode a '.'/'/' that a permissive server
+        // resolves but a byte-oriented percent decode leaves as high bytes or literal text; sitting past the
+        // issuer prefix they would slip the '..'/segment scan, so any '%' in an endpoint path is rejected
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/%c0%ae%c0%ae/evil/token", issuer));
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/%e0%80%ae%e0%80%ae/evil/token", issuer));
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/%u002e%u002e/evil/token", issuer));
     }
 
     @Test(timeout = 30_000)
