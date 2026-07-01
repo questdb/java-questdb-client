@@ -855,16 +855,10 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static String pathOnly(String url) {
-        // the path component only (drop any ?query / #fragment); a ;matrix parameter stays part of the path,
-        // so a traversal hidden in it (.../token;..%2f..) is still scanned
-        String path = Endpoint.parse(url).path;
-        for (int i = 0, n = path.length(); i < n; i++) {
-            char c = path.charAt(i);
-            if (c == '?' || c == '#') {
-                return path.substring(0, i);
-            }
-        }
-        return path;
+        // the path component only; Endpoint.parse rejects a url carrying a ?query or #fragment up front, so the
+        // returned path never contains one. A ;matrix parameter, by contrast, stays part of the path, so a
+        // traversal hidden in it (.../token;..%2f..) is still scanned by the issuer-path check.
+        return Endpoint.parse(url).path;
     }
 
     private static String percentDecodeOnce(String s) {
@@ -1334,11 +1328,17 @@ public class OidcDeviceAuth implements QuietCloseable {
         // entry and skip the network when it already yields a valid token; otherwise refresh with the freshest
         // known refresh token (the one just adopted, so a rotated token is not replayed).
         //
-        // Only re-read when the in-memory refresh token still matches what we last persisted. If they differ,
-        // a previous save failed (persistence is best-effort), so the in-memory token is newer than the
-        // on-disk one; re-adopting would regress it to the stale - and, on a rotating identity provider,
-        // already-revoked - on-disk token and force a needless re-prompt. In that case keep the in-memory
-        // token and refresh with it.
+        // Only re-read when the in-memory refresh token still matches what we last persisted. A mismatch no
+        // longer strictly means "in-memory is a newer unsaved token": it covers two cases, and re-adopting
+        // would regress in both, so keep the in-memory token and refresh with it. (1) A previous save failed
+        // (persistence is best-effort), so the in-memory token is genuinely newer than the on-disk one;
+        // re-adopting would regress it to the stale - and, on a rotating identity provider, already-revoked -
+        // on-disk token and force a needless re-prompt. (2) adopt() kept a live in-memory token that the loaded
+        // file did not carry (a cross-language peer that never received a refresh_token), leaving
+        // lastPersistedRefreshToken null; here the trade-off is that if a rotating-IdP peer has since revoked
+        // our token and written a fresher one, we skip that fresher on-disk token this round and fall back to an
+        // interactive re-prompt. Both are benign (never a stale/wrong served token; the pre-fix alternative in
+        // case 2 was an uncaught urlEncode(null) NPE) and cross-process-only.
         if (Objects.equals(refreshToken, lastPersistedRefreshToken)) {
             PersistedToken fresh;
             try {
@@ -1982,27 +1982,20 @@ public class OidcDeviceAuth implements QuietCloseable {
                 throw new OidcAuthException().put("invalid url, expected http or https [url=").put(url).put(']');
             }
             int hostStart = schemeEnd + 3;
-            // the authority ([userinfo@]host[:port]) ends at the first '/', '?' or '#'; splitting only on
-            // '/' (as before) folded a query/fragment - or userinfo - into the host on a path-less url
+            // the authority ([userinfo@]host[:port]) ends at the first '/', or at the end of the url for a
+            // path-less endpoint. A ?query or #fragment was already rejected above, so neither can fold into the
+            // host or the path here (this used to also split on '?'/'#' to guard that, now handled up front).
             int authorityEnd = url.length();
             for (int i = hostStart, n = url.length(); i < n; i++) {
-                char c = url.charAt(i);
-                if (c == '/' || c == '?' || c == '#') {
+                if (url.charAt(i) == '/') {
                     authorityEnd = i;
                     break;
                 }
             }
             String hostPort = url.substring(hostStart, authorityEnd);
-            // a path-less url uses '/'; a query/fragment with no path is prefixed with '/' so the request
-            // line stays well-formed (a '/'-terminated authority already carries its own leading slash)
-            String path;
-            if (authorityEnd == url.length()) {
-                path = "/";
-            } else if (url.charAt(authorityEnd) == '/') {
-                path = url.substring(authorityEnd);
-            } else {
-                path = "/" + url.substring(authorityEnd);
-            }
+            // a path-less url uses '/'; otherwise the authority is '/'-terminated and the path starts at that
+            // slash, which already carries its own leading slash
+            String path = authorityEnd == url.length() ? "/" : url.substring(authorityEnd);
             if (hostPort.indexOf('@') >= 0) {
                 // userinfo (user[:pass]@host) is unsupported: the HTTP layer would connect to the literal
                 // "user@host". Reject it clearly rather than mis-resolve it or surface a misleading port error

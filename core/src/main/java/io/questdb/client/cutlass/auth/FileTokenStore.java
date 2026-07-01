@@ -647,11 +647,14 @@ public final class FileTokenStore implements TokenStore {
             // acquireLock created this lock empty; if it already carries a stamp, a peer judged it stale and
             // stole+restamped it in the create->stamp gap (a long GC/suspend pause between the two syscalls, or
             // a cross-machine clock skew wider than the empty-lock grace). A plain WRITE|TRUNCATE_EXISTING has no
-            // exclusivity and would overwrite the peer's stamp, leaving two processes each believing they hold
-            // the lock. Refuse instead - honouring releaseLock's own-stamp ownership rule - so acquireLock
-            // degrades to a lock-free refresh (the documented best-effort residual) rather than clobber a live
-            // peer's stamp. A readLockHolder that throws (our file was moved away during the peer's steal) is
-            // caught below and likewise fails the stamp.
+            // exclusivity and would overwrite that stamp, leaving two processes each believing they hold the
+            // lock, so refuse when a stamp is already present - honouring releaseLock's own-stamp ownership rule.
+            // This read-then-write is two syscalls, so like releaseLock's own read-then-delete it only NARROWS
+            // the clobber window (a steal landing between the read and the write is still overwritten); it does
+            // not close it. There is no atomic "write-only-if-still-empty" primitive to close it with. The
+            // residual degrades to at most the documented double-refresh (a re-prompt on a rotating IdP), never
+            // a torn or forged credential - Layer-1's atomic rename holds regardless. A readLockHolder that
+            // throws (our file was moved away during the peer's steal) is caught below and likewise fails the stamp.
             if (readLockHolder(lock) != null) {
                 return false;
             }
@@ -679,7 +682,10 @@ public final class FileTokenStore implements TokenStore {
                 // created and degrade to a lock-free refresh rather than hold an unverifiable lock. Remove it
                 // only while it is still the empty file we created: writeLockHolder also returns false when a
                 // peer stole and restamped this path in the create->stamp gap, and deleting that peer's non-empty
-                // live lock by bare path would admit a third holder (mirrors releaseLock's own-stamp rule).
+                // live lock by bare path would admit a third holder (mirrors releaseLock's own-stamp rule). Like
+                // writeLockHolder's read-then-write, this size-check-then-delete is two syscalls, so it narrows
+                // but does not fully close that window; the residual degrades to the documented double-refresh,
+                // never a torn credential.
                 try {
                     if (Files.size(lock) == 0) {
                         Files.deleteIfExists(lock);

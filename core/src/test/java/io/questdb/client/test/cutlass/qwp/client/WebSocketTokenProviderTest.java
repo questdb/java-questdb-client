@@ -178,6 +178,107 @@ public class WebSocketTokenProviderTest {
     }
 
     @Test
+    public void testThrowingProviderOnReconnectIsRetriedAndRecovers() throws Exception {
+        assertMemoryLeak(() -> {
+            // The riskiest token-provider path: a throw on the BACKGROUND I/O thread during a reconnect. The
+            // server ACKs the first frame then drops the socket, forcing a reconnect; on that reconnect the
+            // provider throws once (a transient failed silent refresh), then succeeds. connectWithRetry must
+            // catch the (non-terminal) throw and retry within the reconnect budget - re-querying the provider -
+            // so the sender recovers and batch 2 still lands, rather than the throw killing the I/O thread or
+            // being silently swallowed. A regression narrowing that catch (so the throw is not retried) fails here.
+            AtomicInteger calls = new AtomicInteger();
+            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .httpTokenProvider(() -> {
+                            int n = calls.incrementAndGet();
+                            // n==1 initial connect (ok); n==2 first reconnect attempt (transient throw);
+                            // n>=3 reconnect retry (ok)
+                            if (n == 2) {
+                                throw new OidcAuthException("transient: a silent refresh failed");
+                            }
+                            return "TOKEN-" + n;
+                        })
+                        .build()) {
+                    Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+
+                    // batch 1 lands and is ACKed, then the server drops the socket -> background reconnect
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+
+                    // the reconnect's first pull threw; connectWithRetry retries, re-querying the provider, and
+                    // the retry's token reaches the upgrade (the throwing attempt never connected, so TOKEN-2 is
+                    // never seen on the wire)
+                    Assert.assertEquals("Bearer TOKEN-3", server.pollAuthorizationHeader(10, TimeUnit.SECONDS));
+
+                    // batch 2 goes through on the recovered connection: the reconnect throw did not terminate it
+                    sender.table("foo").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 2, 10_000);
+                    Assert.assertTrue("the provider must be re-queried on the reconnect retry (>=3 pulls), got " + calls.get(),
+                            calls.get() >= 3);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPersistentlyThrowingProviderOnReconnectTerminatesTheSender() throws Exception {
+        assertMemoryLeak(() -> {
+            // The complement to the recover-on-transient case: a provider that keeps throwing on every reconnect
+            // must NOT be silently swallowed on the background I/O thread - once the (short here) reconnect
+            // budget is exhausted the sender terminates, and a subsequent send/flush must surface the failure
+            // rather than block forever or silently drop data. A cap on the reconnect duration keeps this fast.
+            AtomicInteger calls = new AtomicInteger();
+            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .reconnectInitialBackoffMillis(20)
+                        .reconnectMaxBackoffMillis(20)
+                        .reconnectMaxDurationMillis(300) // short budget so persistent failure terminates quickly
+                        .httpTokenProvider(() -> {
+                            int n = calls.incrementAndGet();
+                            if (n == 1) {
+                                return "TOKEN-1"; // initial connect succeeds
+                            }
+                            throw new OidcAuthException("persistent: not signed in"); // every reconnect pull fails
+                        })
+                        .build()) {
+                    Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+
+                    // batch 1 lands and is ACKed, then the server drops the socket -> the reconnect keeps failing
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+
+                    // once the reconnect budget exhausts, the terminated sender must surface the failure on a
+                    // later send/flush (never a silent success), so drive rows until one throws
+                    waitFor(() -> {
+                        try {
+                            sender.table("foo").longColumn("v", 2L).atNow();
+                            sender.flush();
+                            return false; // not terminated yet - the reconnect is still within budget
+                        } catch (Exception e) {
+                            return true; // terminated: the persistent provider failure surfaced, as intended
+                        }
+                    }, 15_000);
+                    Assert.assertTrue("the provider must have been re-queried on the failing reconnect, got " + calls.get(),
+                            calls.get() >= 2);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testUsernamePasswordStillSuppliedOverWebSocket() throws Exception {
         assertMemoryLeak(() -> {
             // regression guard for the supplier refactor: username/password still becomes the Basic header

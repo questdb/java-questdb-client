@@ -2043,24 +2043,49 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testMalformedEndpointDoesNotLeakNativeMemory() {
-        // build() parses the endpoints up front (for the co-location / issuer-pin checks) and throws on
-        // this malformed url before the constructor allocates the native JSON lexer, so the never-returned
-        // instance cannot leak it. Measure the parser tag directly - the module's assertMemoryLeak does not
-        // flag a single-tag growth.
+    public void testRejectedBuildDoesNotLeakNativeMemory() {
+        // A build rejected during validation must not leak. build() parses and validates every endpoint
+        // BEFORE the constructor runs, and the constructor allocates the native JSON lexer LAST (after
+        // urlEncode and the TokenStoreKey build, either of which can throw), so a rejected build never
+        // allocates the lexer and the never-returned instance cannot be closed to free it. Use a
+        // parseable-but-rejected config - endpoints that parse cleanly but fail the https requirement - so the
+        // rejection lands AFTER endpoint parsing, exercising more of build() than a syntactically bad url
+        // would. testSuccessfulBuildAndCloseDoNotLeakNativeMemory covers the complementary lexer-allocated
+        // path. Measure the parser tag directly; the module's assertMemoryLeak does not flag a single-tag growth.
         long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
         try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
                 .clientId("c")
-                .deviceAuthorizationEndpoint("not-a-url")
+                .deviceAuthorizationEndpoint("http://idp.example/device") // parses fine, but plaintext http to a non-loopback host
                 .tokenEndpoint("https://idp.example/token")
-                .allowInsecureTransport(true)
+                .allowInsecureTransport(false)
                 .build()
         ) {
-            Assert.fail("expected Endpoint.parse to reject the malformed url");
+            Assert.fail("expected the https requirement to reject the plaintext device endpoint");
         } catch (OidcAuthException e) {
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("expected a scheme"));
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("use an https url"));
         }
-        Assert.assertEquals("the JSON lexer native buffer leaked",
+        Assert.assertEquals("a rejected build must not leak the JSON lexer native buffer",
+                parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
+    }
+
+    @Test(timeout = 30_000)
+    public void testSuccessfulBuildAndCloseDoNotLeakNativeMemory() {
+        // The complement to the rejected-build case: a SUCCESSFUL build is the only path that allocates the
+        // native JSON lexer, so this is the block that actually exercises a lexer-allocated instance, and
+        // close() must free it. Loop a few build->close cycles so any per-cycle leak accrues, then assert the
+        // parser tag returns to its baseline. build() does no network I/O (discovery is separate), so valid
+        // co-located https endpoints construct offline.
+        long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
+        for (int i = 0; i < 4; i++) {
+            try (OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("https://idp.example/device")
+                    .tokenEndpoint("https://idp.example/token")
+                    .build()) {
+                Assert.assertNotNull(auth);
+            }
+        }
+        Assert.assertEquals("close() must free the JSON lexer native buffer allocated by a successful build",
                 parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
     }
 
@@ -2498,6 +2523,45 @@ public class OidcDeviceAuthTest {
                 // the refresh is rejected, so the flow re-runs the interactive sign-in
                 Assert.assertEquals("ACCESS-2", auth.signIn());
                 Assert.assertEquals("the interactive flow must run twice (initial + fallback)", 2, deviceCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testRefreshedTokenWithControlCharFallsBackToInteractiveFlow() throws Exception {
+        assertMemoryLeak(() -> {
+            // A silent refresh whose 200 response carries a served token with a control character - here an
+            // escaped \r that JsonLexer now decodes into a real CR byte - must be rejected by storeTokens ->
+            // validateTokenChars, and tryRefresh must SWALLOW that rejection and fall back to the interactive
+            // device flow rather than let it propagate out of signIn()/getToken(). Guards the tryRefresh
+            // storeTokens try/catch: without it, this signIn() throws instead of returning the fallback token.
+            AtomicInteger deviceCalls = new AtomicInteger();
+            AtomicInteger deviceCodeGrants = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    deviceCalls.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    // valid-JSON 200, but the access_token carries an escaped CR (\r on the wire); the served
+                    // kind is validated, so validateTokenChars must reject it before it is cached
+                    return MockOidcServer.json(200, tokenJson("ACCESS\\r2", null, "REFRESH-2", 3600));
+                }
+                // the initial device-code grant uses a short TTL so the next signIn() triggers a refresh
+                if (deviceCodeGrants.getAndIncrement() == 0) {
+                    return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 1));
+                }
+                // the fallback interactive grant, after the poisoned refresh is rejected
+                return MockOidcServer.json(200, tokenJson("ACCESS-3", null, "REFRESH-3", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-1", auth.signIn());
+                expireCachedToken(auth);
+                // the refresh returns a control-char token -> rejected -> fall back to a fresh interactive sign-in
+                Assert.assertEquals("ACCESS-3", auth.signIn());
+                Assert.assertEquals("the interactive flow must run twice (initial + fallback after the rejected refresh)",
+                        2, deviceCalls.get());
             }
         });
     }
@@ -3306,7 +3370,7 @@ public class OidcDeviceAuthTest {
         });
     }
 
-    @Test
+    @Test(timeout = 30_000)
     public void testShortAllDigitStatusNotTreatedAsTransientOrTerminal() throws Exception {
         // a real HTTP status is exactly 3 digits. A malformed 1-digit "5" must not be read as a transient 5xx
         // (which would poll on to the device-code deadline), nor a 1-digit "4" as a terminal 4xx, by the leading
