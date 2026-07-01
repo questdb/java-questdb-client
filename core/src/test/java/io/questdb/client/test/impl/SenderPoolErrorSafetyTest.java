@@ -25,10 +25,12 @@
 package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
+import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -95,6 +97,13 @@ public class SenderPoolErrorSafetyTest {
 
         try (SenderPool pool = newPool(CFG, 1, 1, 1_000, factory)) {
             Sender first = pool.borrow();
+            // Capture the underlying slot before close(): borrow() always hands
+            // out a FRESH PooledSender wrapper, so assertNotSame(first, second)
+            // on the wrappers is vacuously true and proves nothing -- it stays
+            // true whether or not the broken slot was discarded. The pool
+            // recycles slots, not wrappers, so a broken slot leaking back to
+            // the next borrower shows up as the SAME slot. Assert on the slot.
+            Object firstSlot = slotOf(first);
             try {
                 first.close();
                 Assert.fail("close() must propagate the Error thrown by flush()");
@@ -106,7 +115,7 @@ public class SenderPoolErrorSafetyTest {
             try {
                 Assert.assertNotSame(
                         "a sender whose flush() exited with an Error must be discarded, not recycled",
-                        first, second);
+                        firstSlot, slotOf(second));
             } finally {
                 // second's flush() also throws on close(); swallow on teardown.
                 try {
@@ -116,6 +125,12 @@ public class SenderPoolErrorSafetyTest {
                 }
             }
         }
+    }
+
+    private static Object slotOf(Sender pooledWrapper) throws Exception {
+        Field f = PooledSender.class.getDeclaredField("slot");
+        f.setAccessible(true);
+        return f.get(pooledWrapper);
     }
 
     // Like fakeSender(), but flush() throws an Error to drive the
