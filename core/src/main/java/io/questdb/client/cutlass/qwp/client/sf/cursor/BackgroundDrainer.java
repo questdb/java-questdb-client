@@ -25,6 +25,8 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
+import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
@@ -172,6 +174,7 @@ public final class BackgroundDrainer implements Runnable {
         // window can last minutes and (Invariant B) is retried indefinitely, so
         // per-attempt logging would flood. Mirrors CursorWebSocketSendLoop.
         long lastReplicaWarnNanos = 0L;
+        long lastTransportWarnNanos = 0L;
         while (!stopRequested) {
             // True only for a genuine durable-ack CAPABILITY gap, which is
             // bounded by the settle budget / attempt cap. A transient all-replica
@@ -181,6 +184,17 @@ public final class BackgroundDrainer implements Runnable {
             boolean boundedByBudget = false;
             try {
                 return clientFactory.reconnect();
+            } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
+                // Genuinely non-retriable across the cluster (auth 401/403, or a
+                // non-421 upgrade reject): waiting will not fix it, so quarantine
+                // immediately -- exactly as the live sender's background loop
+                // (CursorWebSocketSendLoop.connectLoop) halts on these errors.
+                String msg = e.getMessage();
+                LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
+                lastErrorMessage = msg;
+                OrphanScanner.markFailed(slotPath, "auth/upgrade: " + msg);
+                outcome = DrainOutcome.FAILED;
+                return null;
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
                 // INVARIANT B: every reachable endpoint is a REPLICA right now.
                 // A replica is promotable and a primary will reappear, so this is
@@ -248,12 +262,21 @@ public final class BackgroundDrainer implements Runnable {
                 LOG.warn("drainer slot {} attempt {}: durable-ack unavailable, retrying after backoff",
                         slotPath, mismatchAttempts);
             } catch (Throwable t) {
-                String msg = t.getMessage();
-                LOG.error("drainer initial connect failed for slot {}: {}", slotPath, msg);
-                lastErrorMessage = msg;
-                OrphanScanner.markFailed(slotPath, "initial connect: " + msg);
-                outcome = DrainOutcome.FAILED;
-                return null;
+                // INVARIANT B: a transport failure -- the whole cluster is
+                // unreachable right now (server down, network partition) -- is
+                // TRANSIENT, exactly as the live sender's background loop treats
+                // it. The server will come back; keep retrying (capped backoff)
+                // until it does, stopRequested, or SF exhaustion. NEVER quarantine
+                // the slot on a transport error. Genuine terminals (auth /
+                // non-421 upgrade / durable-ack capability gap) are handled by the
+                // catches above and still fail fast.
+                lastErrorMessage = t.getMessage();
+                long nowWarn = System.nanoTime();
+                if (nowWarn - lastTransportWarnNanos >= 5_000_000_000L) {
+                    LOG.warn("drainer slot {}: cluster unreachable ({}), retrying after backoff",
+                            slotPath, t.getMessage());
+                    lastTransportWarnNanos = nowWarn;
+                }
             }
             // Backoff before the next sweep. Honor stopRequested by parking in
             // small chunks rather than a single long park so close() doesn't

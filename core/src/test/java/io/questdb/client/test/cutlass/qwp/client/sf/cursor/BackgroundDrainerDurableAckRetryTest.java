@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
@@ -40,7 +41,6 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -211,10 +211,15 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test
-    public void testNonDurableAckExceptionMarksFailedImmediately() {
+    public void testTerminalUpgradeMarksFailedImmediately() {
         CountingListener listener = new CountingListener();
+        // A genuinely non-retriable upgrade error (non-421 5xx upgrade reject) is
+        // terminal -- waiting will not fix it -- so the drainer quarantines on the
+        // first attempt, exactly like the live sender's background loop halts on
+        // auth/upgrade. A TRANSPORT error, by contrast, is transient and is
+        // retried (see testTransportErrorNeverQuarantinesInvariantB).
         ScriptedFactory factory = ScriptedFactory.alwaysFailing(
-                () -> new IOException("transport down"));
+                () -> new WebSocketUpgradeException(500, null, "server error during upgrade"));
         BackgroundDrainer drainer = newDrainer(factory);
         drainer.setListener(listener);
         WebSocketClient out = drainer.connectWithDurableAckRetry();
@@ -223,10 +228,10 @@ public class BackgroundDrainerDurableAckRetryTest {
         // Listener must not have been touched — this path doesn't fire either callback.
         assertEquals(0, listener.unavailableAttempts.size());
         assertEquals(0, listener.persistentFailures.get());
-        // Sentinel reason should reflect the non-DA path (initial connect: ...).
+        // Sentinel dropped for a genuine terminal.
         String sentinel = slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME;
         assertTrue(Files.exists(sentinel));
-        // The factory must have been invoked exactly once — no retry on this path.
+        // The factory must have been invoked exactly once — no retry on a terminal.
         assertEquals(1, factory.attempts());
     }
 
