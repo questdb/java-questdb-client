@@ -824,12 +824,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         LOG.warn("cursor I/O loop entering {} loop: {}",
                 phase, initial.getMessage());
         long outageStartNanos = System.nanoTime();
-        long deadlineNanos = outageStartNanos + reconnectMaxDurationMillis * 1_000_000L;
+        // INVARIANT B: a store-and-forward drainer must NEVER terminate on a
+        // wall-clock reconnect budget. A replica-only / all-endpoints-replica
+        // window is TRANSIENT -- a replica gets promoted, a primary reappears --
+        // so this background loop retries for as long as it is running, backing
+        // off between attempts. The ONLY terminal conditions are a genuinely
+        // non-retriable upgrade (auth / non-421 upgrade / durable-ack capability
+        // gap), which return directly below, or the sender being stopped. SF
+        // exhaustion is surfaced to the PRODUCER as append backpressure, never
+        // here. reconnect_max_duration_millis is intentionally NOT consulted: it
+        // bounds only the blocking (non-lazy) initial connect in
+        // QwpWebSocketSender.buildAndConnect, never this background loop.
         long backoffMillis = reconnectInitialBackoffMillis;
         int attempts = 0;
         long lastLogNanos = 0L;
         Throwable lastReconnectError = initial;
-        while (running && System.nanoTime() < deadlineNanos) {
+        while (running) {
             attempts++;
             totalReconnectAttempts.incrementAndGet();
             try {
@@ -905,12 +915,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 backoffMillis = reconnectInitialBackoffMillis;
                 lastReconnectError = e;
                 if (running) {
-                    long remainingNanos = deadlineNanos - System.nanoTime();
-                    if (remainingNanos <= 0L) {
-                        break;
-                    }
-                    long parkNanos = Math.min(reconnectInitialBackoffMillis * 1_000_000L, remainingNanos);
-                    LockSupport.parkNanos(parkNanos);
+                    // Failover usually clears within seconds -- retry at the
+                    // initial interval. No wall-clock deadline (Invariant B): a
+                    // replica is promotable, so keep retrying until it is.
+                    LockSupport.parkNanos(reconnectInitialBackoffMillis * 1_000_000L);
                 }
                 continue;
             } catch (Throwable e) {
@@ -924,73 +932,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (running) {
                 long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
                 long sleepMillis = backoffMillis + jitter;
-                long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
-                if (remainingMillis <= 0) {
-                    break;
-                }
-                if (sleepMillis > remainingMillis) {
-                    sleepMillis = remainingMillis;
-                }
                 LockSupport.parkNanos(sleepMillis * 1_000_000L);
                 backoffMillis = Math.min(backoffMillis * 2, reconnectMaxBackoffMillis);
             }
         }
+        // The loop exits ONLY because running == false, i.e. the sender is
+        // closing / stopping. Under Invariant B this is NOT a budget give-up
+        // (there is no wall-clock terminal): we retried until asked to stop, so
+        // we return quietly and let close() drive shutdown. Un-acked rows remain
+        // in on-disk SF for this sender's next run or an orphan drainer to ship.
         long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
-        String lastMsg = lastReconnectError.getMessage();
-        LOG.error("cursor I/O loop giving up {} after {}ms, {} attempts; last error: {}",
+        String lastMsg = lastReconnectError == null ? "n/a" : lastReconnectError.getMessage();
+        LOG.info("cursor I/O loop {} stopped after {}ms, {} attempts (sender closing); "
+                        + "un-acked rows remain in SF for retry; last error: {}",
                 phase, elapsedMs, attempts, lastMsg);
-        long fromFsn = engine.ackedFsn() + 1L;
-        long toFsn = Math.max(fromFsn, engine.publishedFsn());
-        // Disambiguate by what the sender saw on the wire: if we never got
-        // a successful upgrade, the user is most likely looking at a config
-        // problem (typo in addr, wrong port, firewall, server not deployed
-        // yet); if we connected at least once and then exhausted the budget,
-        // it's a transient connectivity issue (server down, network flap).
-        // Tag and free-text hint encode the same signal so both grep-the-logs
-        // and read-the-message users get it without parsing.
-        String connectivityTag;
-        String connectivityHint;
-        if (hasEverConnected) {
-            connectivityTag = "connection-lost-budget-exhausted";
-            connectivityHint = "server unreachable since last connect (transient)";
-        } else {
-            connectivityTag = "never-connected-budget-exhausted";
-            connectivityHint = "never reached the server (check addr/port/firewall)";
-        }
-        SenderError err = new SenderError(
-                SenderError.Category.PROTOCOL_VIOLATION,
-                SenderError.Policy.HALT,
-                SenderError.NO_STATUS_BYTE,
-                connectivityTag + ": " + elapsedMs + "ms / " + attempts
-                        + " attempts; " + connectivityHint
-                        + "; last error: " + lastMsg,
-                SenderError.NO_MESSAGE_SEQUENCE,
-                fromFsn,
-                toFsn,
-                null,
-                System.nanoTime()
-        );
-        totalServerErrors.incrementAndGet();
-        // recordFatal MUST run before dispatchError so the producer-observable
-        // terminal error is latched before the handler is invoked.
-        recordFatal(new LineSenderServerException(err));
-        dispatchError(err);
-        // Surface the terminal classification through the connection-event
-        // dispatcher too. Listeners learn about budget exhaustion without
-        // having to also subscribe to SenderError. Fire AFTER recordFatal so
-        // a listener that immediately checks the producer-side terminal state
-        // sees a consistent picture.
-        SenderConnectionDispatcher cd = connectionDispatcher;
-        if (cd != null) {
-            cd.offer(new SenderConnectionEvent(
-                    SenderConnectionEvent.Kind.RECONNECT_BUDGET_EXHAUSTED,
-                    null, SenderConnectionEvent.NO_PORT,
-                    null, SenderConnectionEvent.NO_PORT,
-                    attempts,
-                    SenderConnectionEvent.NO_ROUND_NUMBER,
-                    lastReconnectError,
-                    System.currentTimeMillis()));
-        }
     }
 
     /**
