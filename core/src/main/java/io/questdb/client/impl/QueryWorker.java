@@ -57,6 +57,17 @@ public final class QueryWorker {
     private final ReentrantLock signalLock = new ReentrantLock();
     private final Thread thread;
     private volatile QueryImpl current;
+    // Test-only deterministic barrier for the busy-worker shutdown-drop race
+    // fixed in df6f7ca (while (!shuttingDown) -> while (true)). Null in
+    // production -- the only cost is the null check in runLoop(). A regression
+    // test installs a hook that runs ON THE WORKER THREAD right after a job
+    // returns from runOn() and before the loop re-enters the strand check, to
+    // re-arm current with a re-dispatched job and flip shuttingDown -- exactly
+    // the window where the old top-of-loop check dropped a pending job. The
+    // classes involved (QueryWorker, QueryImpl) are final and QwpQueryClient
+    // has no test seam, so this is the only race-free reproduction point. See
+    // QueryWorkerTest.testBusyWorkerShutdownStrandsReDispatchedCurrent.
+    volatile Runnable busyWorkerTestHook;
     // Monotonic lease id. Mutated only under the QueryClientPool lock
     // (bumped once in acquire() when the worker is handed out and once in
     // release() when it is returned), so successive borrows of the same
@@ -318,6 +329,12 @@ public final class QueryWorker {
                 q.runOn(client);
             } catch (Throwable t) {
                 q.signalUnexpected(t);
+            }
+            // Test-only barrier: deterministically reproduce the busy-worker
+            // shutdown-drop race (df6f7ca) at its exact site. Null in production.
+            Runnable hook = busyWorkerTestHook;
+            if (hook != null) {
+                hook.run();
             }
         }
     }

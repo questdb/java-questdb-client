@@ -36,6 +36,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -173,6 +174,108 @@ public class QueryWorkerTest {
                 + "The caller's Completion.await() hangs forever.", doneF.getBoolean(queryImpl));
         Assert.assertNotNull("signalUnexpected must record the closed-handle error",
                 unexpectedF.get(queryImpl));
+    }
+
+    /**
+     * Busy-worker variant of the shutdown-drop race fixed in df6f7ca
+     * ({@code while (!shuttingDown)} -> {@code while (true)} in
+     * {@link QueryWorker}'s run loop). Unlike
+     * {@link #testShutdownRacingDispatchMustNotStrandCaller()} -- which only
+     * drives the PARKED-worker branch (worker blocked in
+     * {@code awaitUninterruptibly} before {@code shuttingDown} flips) and stays
+     * green even with the fix reverted -- this test forces the worker THROUGH a
+     * job's {@code runOn()} and then, on the worker thread at the exact instant
+     * that job returns, reproduces a reused lease re-dispatching
+     * ({@code current = q2}) racing a shutdown ({@code shuttingDown = true}),
+     * both set before the loop re-enters the strand check.
+     * <p>
+     * With the fix the loop re-enters the {@code signalLock} block, observes
+     * {@code shuttingDown}, and strands q2 (signalling its caller). With the bug
+     * the loop exits at the top without re-reading {@code current}, so q2 is
+     * dropped -- never run, never signalled -- and its caller's
+     * {@code Completion.await()} would hang forever. The assertion on
+     * {@code q2.done} fails if the fix is reverted.
+     * <p>
+     * The interleaving is made deterministic with a test-only worker-thread
+     * barrier ({@code QueryWorker.busyWorkerTestHook}) instead of a sleep:
+     * {@link QueryWorker} and {@code QueryImpl} are final and
+     * {@code QwpQueryClient} has no test seam, so pausing between
+     * {@code runOn()} and the loop check is the only race-free reproduction.
+     * {@code client}/{@code pool} are null -- {@code q1.runOn(null)} throws an
+     * NPE that {@code runLoop} catches and turns into q1's terminal signal, a
+     * fast stand-in for a real job returning from {@code runOn()}.
+     */
+    @Test(timeout = 30_000)
+    public void testBusyWorkerShutdownStrandsReDispatchedCurrent() throws Exception {
+        Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
+
+        Field lockF = QueryWorker.class.getDeclaredField("signalLock");
+        Field currentF = QueryWorker.class.getDeclaredField("current");
+        Field shuttingF = QueryWorker.class.getDeclaredField("shuttingDown");
+        Field threadF = QueryWorker.class.getDeclaredField("thread");
+        Field hookF = QueryWorker.class.getDeclaredField("busyWorkerTestHook");
+        for (Field f : new Field[]{lockF, currentF, shuttingF, threadF, hookF}) {
+            f.setAccessible(true);
+        }
+
+        Field doneF = queryImplClass.getDeclaredField("done");
+        Field unexpectedF = queryImplClass.getDeclaredField("unexpectedError");
+        doneF.setAccessible(true);
+        unexpectedF.setAccessible(true);
+
+        // client == null: q1.runOn(null) throws NPE, which runLoop catches and
+        // turns into q1's terminal signal -- a fast, deterministic stand-in for
+        // a real job returning from runOn(). pool == null is never touched here.
+        QueryWorker worker = new QueryWorker(null, null, 0);
+
+        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(QueryWorker.class);
+        ctor.setAccessible(true);
+        Object q1 = ctor.newInstance(new Object[]{worker});
+        Object q2 = ctor.newInstance(new Object[]{worker});
+        doneF.setBoolean(q1, false);
+        doneF.setBoolean(q2, false);
+
+        ReentrantLock lock = (ReentrantLock) lockF.get(worker);
+        AtomicBoolean fired = new AtomicBoolean(false);
+
+        // The busy-worker barrier: the FIRST time the worker returns from a
+        // job's runOn(), simulate submit() -> dispatch() re-arming current with
+        // q2 while shutdown() flips shuttingDown -- both set, under signalLock,
+        // before the loop re-checks. Runs on the worker thread.
+        Runnable hook = () -> {
+            if (fired.compareAndSet(false, true)) {
+                lock.lock();
+                try {
+                    currentF.set(worker, q2);
+                    shuttingF.setBoolean(worker, true);
+                } catch (IllegalAccessException e) {
+                    throw new RuntimeException(e);
+                } finally {
+                    lock.unlock();
+                }
+            }
+        };
+        hookF.set(worker, hook);
+
+        // Pre-arm current with q1 so the worker consumes it immediately on
+        // start (no need to wait for the await park); start() establishes the
+        // happens-before that publishes current and the hook to the worker.
+        currentF.set(worker, q1);
+
+        Thread t = (Thread) threadF.get(worker);
+        t.start();
+
+        t.join(5_000);
+        Assert.assertFalse("worker thread must exit after shuttingDown=true", t.isAlive());
+
+        Assert.assertTrue(
+                "BUG (df6f7ca regressed): the busy worker returned from runOn() with a "
+                        + "re-dispatched current!=null and shuttingDown=true, then exited the loop "
+                        + "without stranding it. q2 was never signalled; its caller's await() hangs "
+                        + "forever.",
+                doneF.getBoolean(q2));
+        Assert.assertNotNull("the stranded busy-path job must record the closed-handle error",
+                unexpectedF.get(q2));
     }
 
     /**
