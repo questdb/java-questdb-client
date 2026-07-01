@@ -683,6 +683,32 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testLongFieldsSerializeAsDigitsNotBareNull() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            // the two long fields are present, non-nullable integers, so Long.MIN_VALUE must serialize as its
+            // digits. serialize() reserves an omitted member (not a bare null) for an absent value, so a null
+            // here would be indistinguishable from absent and breaks the frozen cross-language contract; the
+            // reader would also round-trip that null back to 0 (parseLongOrZero), a silent corruption.
+            store.save(key, new PersistedToken("ACCESS-1", null, "REFRESH-1", Long.MIN_VALUE, Long.MIN_VALUE));
+
+            String json = new String(Files.readAllBytes(tokenFile(dir, key)), StandardCharsets.UTF_8);
+            Assert.assertTrue("expires_at_millis must be written as digits, not a bare null [json=" + json + ']',
+                    json.contains("\"expires_at_millis\":-9223372036854775808"));
+            Assert.assertTrue("token_ttl_millis must be written as digits, not a bare null [json=" + json + ']',
+                    json.contains("\"token_ttl_millis\":-9223372036854775808"));
+
+            // and the extreme value round-trips verbatim rather than collapsing to 0 on read
+            PersistedToken loaded = store.load(key);
+            Assert.assertNotNull(loaded);
+            Assert.assertEquals(Long.MIN_VALUE, loaded.getExpiresAtMillis());
+            Assert.assertEquals(Long.MIN_VALUE, loaded.getTokenTtlMillis());
+        });
+    }
+
+    @Test
     public void testNoLeftoverTempFileAfterSave() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();

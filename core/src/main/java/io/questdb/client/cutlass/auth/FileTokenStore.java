@@ -402,7 +402,12 @@ public final class FileTokenStore implements TokenStore {
     private static void putLongMember(StringSink sink, String name, long value) {
         sink.put(',');
         putName(sink, name);
-        sink.put(value);
+        // write the digits unconditionally. sink.put(long) routes through Numbers.append(..., checkNaN=true),
+        // which renders Long.MIN_VALUE as the literal JSON null - a bare null for a present, non-nullable
+        // integer field would break the frozen cross-language contract (serialize() OMITS absent fields rather
+        // than writing null, so a null here is indistinguishable from absent) and round-trips back to 0 via
+        // parseLongOrZero. checkNaN=false emits the full number, so every long value round-trips verbatim.
+        Numbers.append(sink, value, false);
     }
 
     private static void putName(StringSink sink, String name) {
