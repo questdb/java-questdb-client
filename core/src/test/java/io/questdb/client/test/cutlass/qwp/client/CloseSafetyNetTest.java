@@ -30,6 +30,7 @@ import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -62,47 +63,59 @@ public class CloseSafetyNetTest {
     public final TemporaryFolder sfDir = TemporaryFolder.builder().assureDeletion().build();
 
     @Test(timeout = 30_000)
-    public void testCloseRethrowsUnsurfacedTerminalWithoutCustomHandler() {
-        // No server, no handler, tight reconnect budget: the I/O thread
-        // latches a never-connected budget-exhaustion terminal that nothing
-        // has surfaced to the user. close() must throw it.
-        Sender sender = Sender.fromConfig(cfg());
-        boolean closed = false;
-        try {
-            awaitLatchedTerminal((QwpWebSocketSender) sender);
+    public void testCloseRethrowsUnsurfacedTerminalWithoutCustomHandler() throws Exception {
+        // A 401 server, no handler: the I/O thread latches a genuine auth
+        // terminal (ws-upgrade-failed / SECURITY_ERROR) that nothing has
+        // surfaced to the user. close() must throw it. (Under Invariant B a
+        // mere connection error would retry forever and never latch -- only a
+        // genuine terminal like auth does.)
+        try (TestWebSocketServer server = new TestWebSocketServer(NOOP_HANDLER)) {
+            server.setRejectWithStatus(401, "Unauthorized");
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            Sender sender = Sender.fromConfig(cfg(server.getPort()));
+            boolean closed = false;
             try {
-                closed = true;
-                sender.close();
-                Assert.fail("close() must rethrow a terminal error that no synchronous "
-                        + "caller and no custom handler has seen");
-            } catch (LineSenderException e) {
-                String msg = e.getMessage() == null ? "" : e.getMessage();
-                Assert.assertTrue("close() must rethrow the latched terminal: " + msg,
-                        msg.contains("never-connected-budget-exhausted"));
-                Assert.assertTrue("the latched instance is the typed server exception",
-                        e instanceof LineSenderServerException);
-            }
-        } finally {
-            if (!closed) {
-                sender.close();
+                awaitLatchedTerminal((QwpWebSocketSender) sender);
+                try {
+                    closed = true;
+                    sender.close();
+                    Assert.fail("close() must rethrow a terminal error that no synchronous "
+                            + "caller and no custom handler has seen");
+                } catch (LineSenderException e) {
+                    String msg = e.getMessage() == null ? "" : e.getMessage();
+                    Assert.assertTrue("close() must rethrow the latched terminal: " + msg,
+                            msg.contains("ws-upgrade-failed") || msg.contains("401"));
+                    Assert.assertTrue("the latched instance is the typed server exception",
+                            e instanceof LineSenderServerException);
+                }
+            } finally {
+                if (!closed) {
+                    sender.close();
+                }
             }
         }
     }
 
     @Test(timeout = 30_000)
     public void testCloseStaysSilentWhenCustomHandlerAlreadyDelivered() throws Exception {
-        // Same terminal, but the user installed a custom error handler and
+        // Same auth terminal, but the user installed a custom error handler and
         // the dispatcher delivered the error to it. close() must NOT
         // double-signal.
-        ErrorInbox inbox = new ErrorInbox();
-        Sender sender = Sender.builder(cfg())
-                .errorHandler(inbox)
-                .build();
-        Assert.assertTrue("terminal must reach the custom handler within 10s",
-                inbox.await(10, TimeUnit.SECONDS));
-        Assert.assertNotNull(inbox.get());
-        // The handler owns the error now; a rethrow here would double-signal.
-        sender.close();
+        try (TestWebSocketServer server = new TestWebSocketServer(NOOP_HANDLER)) {
+            server.setRejectWithStatus(401, "Unauthorized");
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            ErrorInbox inbox = new ErrorInbox();
+            Sender sender = Sender.builder(cfg(server.getPort()))
+                    .errorHandler(inbox)
+                    .build();
+            Assert.assertTrue("terminal must reach the custom handler within 10s",
+                    inbox.await(10, TimeUnit.SECONDS));
+            Assert.assertNotNull(inbox.get());
+            // The handler owns the error now; a rethrow here would double-signal.
+            sender.close();
+        }
     }
 
     /**
@@ -120,8 +133,8 @@ public class CloseSafetyNetTest {
         }
     }
 
-    private String cfg() {
-        return "ws::addr=localhost:" + TestPorts.findUnusedPort()
+    private String cfg(int port) {
+        return "ws::addr=localhost:" + port
                 + ";sf_dir=" + sfDir.getRoot().getAbsolutePath()
                 + ";initial_connect_retry=async"
                 + ";reconnect_max_duration_millis=400"
@@ -129,6 +142,13 @@ public class CloseSafetyNetTest {
                 + ";reconnect_max_backoff_millis=50"
                 + ";close_flush_timeout_millis=0;";
     }
+
+    private static final TestWebSocketServer.WebSocketServerHandler NOOP_HANDLER =
+            new TestWebSocketServer.WebSocketServerHandler() {
+                @Override
+                public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+                }
+            };
 
     private static class ErrorInbox implements SenderErrorHandler {
         private final CountDownLatch latch = new CountDownLatch(1);

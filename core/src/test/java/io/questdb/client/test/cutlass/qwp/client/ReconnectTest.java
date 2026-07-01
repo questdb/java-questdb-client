@@ -101,33 +101,34 @@ public class ReconnectTest {
     }
 
     @Test
-    public void testReconnectGivesUpAfterCap() throws Exception {
-        // Server is up at first (initial connect succeeds + ACKs batch 1),
-        // then we tear it down — subsequent reconnect attempts get TCP
-        // connection-refused and accumulate against the budget. With a
-        // 500ms cap, the loop should give up well inside the test's 5s
-        // poll window and the next user-thread flush() must throw.
+    public void testReconnectNeverGivesUpInvariantB() throws Exception {
+        // INVARIANT B: server is up at first (initial connect + ACK), then torn
+        // down. The I/O loop enters reconnect and must retry FOREVER -- flush()
+        // must keep succeeding (publishing to on-disk SF), never surface a
+        // give-up / budget terminal. The rows are safe in SF and the server may
+        // return, so reconnect_max_duration_millis is ignored as a give-up
+        // deadline.
         try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
             int port = server.getPort();
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
             String cfg = "ws::addr=localhost:" + port
-                    + ";reconnect_max_duration_millis=500"
+                    + ";reconnect_max_duration_millis=300"
                     + ";reconnect_initial_backoff_millis=10"
                     + ";reconnect_max_backoff_millis=50"
                     + ";close_flush_timeout_millis=0;";
+            Throwable observed = null;
             try (Sender sender = Sender.fromConfig(cfg)) {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
 
-                // Tear down the server: existing client connection gets
-                // EOF, the I/O loop tries to reconnect, every attempt
-                // hits TCP refused → budget exhausts.
+                // Tear down the server: the I/O loop gets EOF and enters
+                // reconnect; every attempt hits TCP refused but must keep
+                // retrying past the (ignored) 300ms budget.
                 server.close();
 
-                Throwable observed = null;
-                long deadline = System.currentTimeMillis() + 5_000;
+                long deadline = System.currentTimeMillis() + 2_000;
                 long iter = 0;
                 while (System.currentTimeMillis() < deadline) {
                     iter++;
@@ -140,21 +141,14 @@ public class ReconnectTest {
                     }
                     Thread.sleep(50);
                 }
-                Assert.assertNotNull(
-                        "sender should have surfaced the terminal reconnect-cap error",
-                        observed);
-                String msg = observed.getMessage() == null ? "" : observed.getMessage();
-                Assert.assertTrue(
-                        "error message must mention the give-up: " + msg,
-                        msg.contains("reconnect failed")
-                                || msg.contains("I/O thread failed")
-                                || msg.contains("Failed to connect"));
-            } catch (LineSenderException ignored) {
+            } catch (Exception ignored) {
+                // close() teardown noise -- the contract under test is the flush
+                // loop above, captured in `observed`.
             }
-            // close() rethrows the latched terminal reconnect-cap error
-            // (commit 052f6ee). Already observed and asserted above.
-        } catch (Exception ignored) {
-            // already closed
+            Assert.assertNull(
+                    "mid-stream reconnect must retry forever, not surface a terminal "
+                            + "(Invariant B); flush() threw: " + observed,
+                    observed);
         }
     }
 

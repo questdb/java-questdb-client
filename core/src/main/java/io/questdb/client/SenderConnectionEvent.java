@@ -96,8 +96,8 @@ public final class SenderConnectionEvent {
     /**
      * The classified cause of the event, or {@code null} for success/info
      * events ({@link Kind#CONNECTED}, {@link Kind#FAILED_OVER},
-     * {@link Kind#RECONNECTED}). For terminal kinds
-     * ({@link Kind#AUTH_FAILED}, {@link Kind#RECONNECT_BUDGET_EXHAUSTED}) this
+     * {@link Kind#RECONNECTED}). For the terminal kind
+     * ({@link Kind#AUTH_FAILED}) this
      * carries the typed exception that caused the sender to halt.
      */
     @Nullable
@@ -234,14 +234,6 @@ public final class SenderConnectionEvent {
          * producer-thread API call surfaces a {@code LineSenderException}.
          * {@link #getCause()} carries the {@code QwpAuthFailedException}.
          */
-        AUTH_FAILED,
-
-        /**
-         * Terminal: the configured reconnect time budget was exhausted without
-         * a successful reconnect. The sender will halt; the next producer-thread
-         * API call surfaces a {@code LineSenderException}. {@link #getCause()}
-         * carries the last observed reconnect error.
-         */
-        RECONNECT_BUDGET_EXHAUSTED
+        AUTH_FAILED
     }
 }

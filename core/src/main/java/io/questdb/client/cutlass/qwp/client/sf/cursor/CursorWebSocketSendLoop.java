@@ -177,11 +177,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // alike) is offered to the dispatcher for async delivery to the user's
     // handler. Null disables async delivery entirely; the producer-side
     // typed-throw path is unaffected.
-    // Optional: when non-null, RECONNECT_BUDGET_EXHAUSTED is offered to the
-    // dispatcher for async delivery to the user's listener at the moment
-    // connectLoop gives up. Sender-side fire points (CONNECTED, FAILED_OVER,
-    // ENDPOINT_ATTEMPT_FAILED, AUTH_FAILED, ALL_ENDPOINTS_UNREACHABLE) write
-    // directly to the same dispatcher from QwpWebSocketSender.
+    // Optional: when non-null, sender-side connection events (CONNECTED,
+    // FAILED_OVER, ENDPOINT_ATTEMPT_FAILED, AUTH_FAILED, ALL_ENDPOINTS_UNREACHABLE)
+    // are written to this dispatcher from QwpWebSocketSender. connectLoop itself
+    // no longer emits a terminal budget-exhaustion event (Invariant B: it retries
+    // indefinitely and never gives up on a wall-clock budget).
     private volatile SenderConnectionDispatcher connectionDispatcher;
     private volatile SenderErrorDispatcher errorDispatcher;
     // The send cursor has two coordinate systems:
@@ -667,10 +667,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Plug an async-delivery sink for {@link SenderConnectionEvent}
-     * notifications. The loop fires {@code RECONNECT_BUDGET_EXHAUSTED}
-     * through this sink when {@code connectLoop} gives up; other connection
-     * events fire from {@code QwpWebSocketSender.buildAndConnect} directly
-     * into the same dispatcher. Same lifecycle contract as
+     * notifications. Connection events fire from
+     * {@code QwpWebSocketSender.buildAndConnect} directly into this dispatcher;
+     * {@code connectLoop} no longer emits a terminal budget-exhaustion event
+     * (Invariant B: it retries indefinitely). Same lifecycle contract as
      * {@link #setErrorDispatcher}.
      */
     public void setConnectionDispatcher(SenderConnectionDispatcher dispatcher) {

@@ -30,6 +30,7 @@ import io.questdb.client.SenderConnectionListener;
 import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.test.cutlass.qwp.client.TestPorts;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
 import org.junit.Test;
@@ -51,6 +52,13 @@ import java.util.concurrent.atomic.AtomicReference;
  * under test. No server is required.
  */
 public class QuestDBFacadeCallbacksTest {
+
+    private static final TestWebSocketServer.WebSocketServerHandler NOOP_HANDLER =
+            new TestWebSocketServer.WebSocketServerHandler() {
+                @Override
+                public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+                }
+            };
 
     @Test
     public void testFacadeConnectionListenerReceivesEvents() throws Exception {
@@ -74,16 +82,24 @@ public class QuestDBFacadeCallbacksTest {
 
     @Test
     public void testFacadeErrorHandlerReceivesAsyncIngestError() throws Exception {
-        int port = TestPorts.findUnusedPort();
-        ErrorInbox inbox = new ErrorInbox();
-        try (QuestDB ignored = QuestDB.builder()
-                .fromConfig(config(port))
-                .errorHandler(inbox)
-                .build()) {
-            Assert.assertTrue(
-                    "facade-wired errorHandler must receive the async budget-exhaustion SenderError",
-                    inbox.await(5, TimeUnit.SECONDS));
-            Assert.assertNotNull("a SenderError must be delivered", inbox.get());
+        // A 401 server produces a genuine auth terminal that surfaces even in
+        // async mode; the facade-wired errorHandler must receive it. (Under
+        // Invariant B a mere connection error would retry forever and never
+        // surface -- only a genuine terminal like auth does.)
+        try (TestWebSocketServer server = new TestWebSocketServer(NOOP_HANDLER)) {
+            server.setRejectWithStatus(401, "Unauthorized");
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            ErrorInbox inbox = new ErrorInbox();
+            try (QuestDB ignored = QuestDB.builder()
+                    .fromConfig(config(server.getPort()))
+                    .errorHandler(inbox)
+                    .build()) {
+                Assert.assertTrue(
+                        "facade-wired errorHandler must receive the async auth-terminal SenderError",
+                        inbox.await(5, TimeUnit.SECONDS));
+                Assert.assertNotNull("a SenderError must be delivered", inbox.get());
+            }
         }
     }
 
