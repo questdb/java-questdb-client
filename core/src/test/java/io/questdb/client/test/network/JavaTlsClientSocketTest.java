@@ -212,6 +212,10 @@ public class JavaTlsClientSocketTest {
             try (JavaTlsClientSocket socket = newSocket()) {
                 invoke(socket, "prepareInternalBuffers");
                 setField(socket, "sslEngine", new StallingUnwrapSslEngine());
+                // Mark the session as TLS so try-with-resources close() frees the internal buffers
+                // allocated above. Without this the socket stays STATE_EMPTY and close() returns early,
+                // leaking the 3x256KB NATIVE_TLS_RSS buffers.
+                setIntField(socket, "state", 2);
 
                 Method runHandshake = JavaTlsClientSocket.class.getDeclaredMethod(
                         "runHandshake", SocketReadinessWaiter.class);
@@ -260,6 +264,10 @@ public class JavaTlsClientSocketTest {
             try (JavaTlsClientSocket socket = newSocket()) {
                 invoke(socket, "prepareInternalBuffers");
                 setField(socket, "sslEngine", new ProgressingUnwrapSslEngine());
+                // Mark the session as TLS so try-with-resources close() frees the internal buffers
+                // allocated above. Without this the socket stays STATE_EMPTY and close() returns early,
+                // leaking the 3x256KB NATIVE_TLS_RSS buffers.
+                setIntField(socket, "state", 2);
 
                 Method runHandshake = JavaTlsClientSocket.class.getDeclaredMethod(
                         "runHandshake", SocketReadinessWaiter.class);
