@@ -475,7 +475,7 @@ public abstract class AbstractLineHttpSender implements Sender {
                 flush0(true);
             }
         } finally {
-            Misc.free(jsonErrorParser);
+            jsonErrorParser = Misc.free(jsonErrorParser);
             closed = true;
             client = Misc.free(client);
         }

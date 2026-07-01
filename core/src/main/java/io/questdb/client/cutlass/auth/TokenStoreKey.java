@@ -72,8 +72,6 @@ public final class TokenStoreKey {
     ) {
         // the identity fields are required; reject a null up front with a clear error rather than letting it
         // surface later as a raw NullPointerException deep inside a TokenStore's serialize/fingerprint path
-        // the identity fields are required; reject a null up front with a clear error rather than letting it
-        // surface later as a raw NullPointerException deep inside a TokenStore's serialize/fingerprint path
         if (clientId == null || tokenEndpoint == null || deviceAuthorizationEndpoint == null || scope == null) {
             throw new OidcAuthException(
                     "clientId, tokenEndpoint, deviceAuthorizationEndpoint and scope are required for a token store key");

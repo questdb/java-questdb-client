@@ -110,6 +110,7 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
      * that rely on {@link #isAscii()} should not use this overload for ascii-only content.
      */
     public DirectUtf8Sink put(byte[] src, int lo, int hi) {
+        assert lo >= 0 && hi <= src.length && lo <= hi : "put(byte[]) range out of bounds";
         final int len = hi - lo;
         if (len > 0) {
             setAscii(false);

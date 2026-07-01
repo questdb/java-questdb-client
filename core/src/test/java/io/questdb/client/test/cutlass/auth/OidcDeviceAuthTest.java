@@ -214,6 +214,23 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testBuilderIssuerPinAcceptsHostCasingAndImplicitPort() throws Exception {
+        assertMemoryLeak(() -> {
+            // the origin pin (isSameOrigin) folds host case (ASCII) and treats an implicit https port as 443, so
+            // an endpoint differing from the issuer only in host case or an explicit :443 is still same-origin
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("https://IDP.Example:443/as/device")
+                    .tokenEndpoint("https://idp.example/as/token")
+                    .issuer("https://Idp.Example")
+                    .build()
+            ) {
+                // accepted: host-case and implicit-vs-explicit 443 differences do not defeat the origin pin
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testBuilderIssuerPinAcceptsMatchingOrigin() throws Exception {
         assertMemoryLeak(() -> {
             // endpoints that belong to the pinned issuer origin are accepted; only the origin is pinned, so
@@ -1025,6 +1042,23 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testEndpointParseAcceptsUppercaseScheme() throws Exception {
+        assertMemoryLeak(() -> {
+            // RFC 3986 schemes are case-insensitive, so HTTPS/Http must build - matching BrowserLauncher's
+            // case-insensitive scheme allowlist. (Endpoint.parse lower-cases only ASCII, so a homoglyph scheme
+            // is still rejected as "expected http or https".)
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("HTTPS://idp.example/device")
+                    .tokenEndpoint("Https://idp.example/token")
+                    .build()
+            ) {
+                // accepted: build() did not reject the mixed-case https scheme
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testEndpointParseRejectsMalformedUrls() {
         // Endpoint.parse rejects malformed endpoint URLs at build time
         assertBuildFails("ftp://idp/d", "https://idp/t", "expected http or https");
@@ -1058,6 +1092,11 @@ public class OidcDeviceAuthTest {
         assertBuildFails("https://idp/realms/acme#/../other/device", "https://idp/realms/acme/token", "fragment");
         assertBuildFails("https://idp/d", "https://idp/realms/acme#/../other/token", "fragment");
         assertBuildFails("https://idp/d#", "https://idp/t", "fragment");
+        // a non-ASCII host is rejected: it would not resolve (the HTTP layer sends the host to the OS resolver
+        // as raw UTF-8, no IDNA), and equalsIgnoreCase folds several non-ASCII letters onto ASCII (U+0130 -> i,
+        // U+212A -> k, ...), so a homoglyph host could otherwise pass the origin pin against a pinned issuer
+        assertBuildFails("https://\u0130dp/d", "https://idp/t", "non-ASCII"); // U+0130, folds to i
+        assertBuildFails("https://idp/d", "https://\u212Aelvin/t", "non-ASCII"); // U+212A Kelvin, folds to k
     }
 
     @Test(timeout = 30_000)

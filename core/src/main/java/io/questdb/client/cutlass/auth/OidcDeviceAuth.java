@@ -360,10 +360,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         // still applies to every endpoint, enforced by validateEndpointOrigins in build().
         if (resolvedIssuer != null) {
             Endpoint pin = Endpoint.parse(resolvedIssuer);
-            if (tokenEndpointFromSettings && !sameOrigin(Endpoint.parse(tokenEndpoint), pin)) {
+            if (tokenEndpointFromSettings && !isSameOrigin(Endpoint.parse(tokenEndpoint), pin)) {
                 throw endpointOriginNotPinned("token endpoint", tokenEndpoint, originOf(pin));
             }
-            if (deviceEndpointFromSettings && !sameOrigin(Endpoint.parse(deviceAuthorizationEndpoint), pin)) {
+            if (deviceEndpointFromSettings && !isSameOrigin(Endpoint.parse(deviceAuthorizationEndpoint), pin)) {
                 throw endpointOriginNotPinned("device authorization endpoint", deviceAuthorizationEndpoint, originOf(pin));
             }
         }
@@ -810,6 +810,14 @@ public class OidcDeviceAuth implements QuietCloseable {
         return host != null && (host.equalsIgnoreCase("localhost") || (host.startsWith("127.") && isDottedIpv4(host)));
     }
 
+    private static boolean isSameOrigin(Endpoint a, Endpoint b) {
+        // scheme (via isTls), host and port - the security origin; path is deliberately not compared, the
+        // token and device endpoints legitimately differ in path on one authorization server. Endpoint.parse
+        // rejects a non-ASCII host, so this equalsIgnoreCase host compare only ever folds ASCII case - no
+        // non-ASCII homoglyph can fold onto a pinned issuer host here.
+        return a.isTls == b.isTls && a.port == b.port && a.host.equalsIgnoreCase(b.host);
+    }
+
     private static String originOf(Endpoint endpoint) {
         return (endpoint.isTls ? "https://" : "http://") + endpoint.host + ':' + endpoint.port;
     }
@@ -917,12 +925,6 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
-    private static boolean sameOrigin(Endpoint a, Endpoint b) {
-        // scheme (via isTls), host and port - the security origin; path is deliberately not compared, the
-        // token and device endpoints legitimately differ in path on one authorization server
-        return a.isTls == b.isTls && a.port == b.port && a.host.equalsIgnoreCase(b.host);
-    }
-
     private static String sanitizeForDisplay(String value) {
         if (value == null) {
             return null;
@@ -984,20 +986,20 @@ public class OidcDeviceAuth implements QuietCloseable {
         // the issuer origin must then be configured without an issuer. fromQuestDB pins differently: it
         // origin-pins only the /settings-advertised endpoints itself (a discovered endpoint is trusted), so
         // it passes no issuer here and relies on this method only for the co-location check.
-        if (!sameOrigin(tokenEndpoint, deviceAuthorizationEndpoint)) {
+        if (!isSameOrigin(tokenEndpoint, deviceAuthorizationEndpoint)) {
             throw new OidcAuthException()
                     .put("the OIDC token and device authorization endpoints are on different origins (")
                     .put(originOf(tokenEndpoint)).put(" vs ").put(originOf(deviceAuthorizationEndpoint))
                     .put("); refusing to send credentials. This indicates a misconfigured or tampered OIDC configuration");
         }
         if (issuer != null) {
-            if (!sameOrigin(tokenEndpoint, issuer)) {
+            if (!isSameOrigin(tokenEndpoint, issuer)) {
                 throw new OidcAuthException()
                         .put("the OIDC token endpoint origin (").put(originOf(tokenEndpoint))
                         .put(") does not match the issuer origin (").put(originOf(issuer))
                         .put("); refusing to send credentials to an endpoint outside the trusted issuer");
             }
-            if (!sameOrigin(deviceAuthorizationEndpoint, issuer)) {
+            if (!isSameOrigin(deviceAuthorizationEndpoint, issuer)) {
                 throw new OidcAuthException()
                         .put("the OIDC device authorization endpoint origin (").put(originOf(deviceAuthorizationEndpoint))
                         .put(") does not match the issuer origin (").put(originOf(issuer))
@@ -1946,7 +1948,10 @@ public class OidcDeviceAuth implements QuietCloseable {
                 throw new OidcAuthException().put("invalid url, expected a scheme [url=").put(url).put(']');
             }
             boolean isTls;
-            String scheme = url.substring(0, schemeEnd);
+            // lower-case the scheme before matching: RFC 3986 schemes are case-insensitive, so HTTPS/Http are
+            // valid. toLowerCase(Locale.ROOT) folds only ASCII case, so a homoglyph scheme (a long-s for the s,
+            // say) does NOT fold onto http/https and still falls through to the reject below.
+            String scheme = url.substring(0, schemeEnd).toLowerCase(Locale.ROOT);
             if ("https".equals(scheme)) {
                 isTls = true;
             } else if ("http".equals(scheme)) {
@@ -2005,6 +2010,17 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             if (host.isEmpty()) {
                 throw new OidcAuthException().put("invalid url, the host is empty [url=").put(url).put(']');
+            }
+            // reject a non-ASCII host. The HTTP layer hands the host to the OS resolver as raw UTF-8 with no
+            // IDNA, so a non-ASCII name would not resolve anyway; and a non-ASCII code point makes the origin-pin
+            // host compare (isSameOrigin -> String.equalsIgnoreCase) unsafe, because equalsIgnoreCase folds
+            // several non-ASCII letters (U+0130, U+0131, U+017F, U+212A, ...) onto ASCII - so a homoglyph host
+            // advertised by a tampered /settings could otherwise pass the pin against the issuer. LDH ASCII
+            // hosts, punycode (xn--...) and dotted IPv4 are all ASCII and unaffected.
+            for (int i = 0, n = host.length(); i < n; i++) {
+                if (host.charAt(i) > 0x7f) {
+                    throw new OidcAuthException().put("invalid url, the host contains a non-ASCII character [url=").put(url).put(']');
+                }
             }
             return new Endpoint(host, port, path, isTls);
         }

@@ -52,8 +52,11 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
             final int cp = Character.codePointAt(nonPrintable, i);
             final int count = Character.charCount(cp);
             if (DisplaySafe.isDisplaySafe(cp)) {
-                for (int j = 0; j < count; j++) {
-                    put(nonPrintable.charAt(i + j));
+                if (count == 1) {
+                    put((char) cp); // BMP: cp already is the char, so skip the redundant charAt re-read
+                } else {
+                    put(nonPrintable.charAt(i));
+                    put(nonPrintable.charAt(i + 1));
                 }
             } else {
                 DisplaySafe.putUnicodeEscape(this, cp);

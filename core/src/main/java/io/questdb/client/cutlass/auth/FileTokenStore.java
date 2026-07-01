@@ -39,6 +39,7 @@ import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
@@ -130,6 +131,12 @@ public final class FileTokenStore implements TokenStore {
     // attacker-writable directory as the token file, and a real owner stamp (pid@host + millis + UUID) is a
     // few hundred bytes, so anything past this cap is corrupt or hostile and is not read into memory
     private static final int MAX_LOCK_FILE_BYTES = 1 << 12;
+    // Windows can fail the atomic token-file rename with a transient AccessDeniedException (a sharing violation)
+    // when a concurrent reader in any process holds the target open; retry the rename this many times on a short
+    // backoff before giving up, so a routine read/write overlap does not needlessly degrade persistence. Kept
+    // small - persistence is best-effort and the in-memory token is valid regardless.
+    private static final int REPLACE_MAX_ATTEMPTS = 5;
+    private static final long REPLACE_RETRY_SLEEP_MILLIS = 20L;
     private static final int SCHEMA_VERSION = 1;
     // set once if the platform cannot enforce owner-only POSIX permissions on the token files (e.g. Windows),
     // so the at-rest protection falls back to the directory's inherited ACL; warns the user once
@@ -286,12 +293,7 @@ public final class FileTokenStore implements TokenStore {
             boolean moved = false;
             try {
                 writeAndFlush(tmp, content);
-                try {
-                    Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                } catch (AtomicMoveNotSupportedException e) {
-                    // a rare filesystem without atomic rename; a plain replace still beats a partial write
-                    Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
-                }
+                replaceTarget(tmp, target);
                 moved = true;
             } finally {
                 if (!moved) {
@@ -534,6 +536,31 @@ public final class FileTokenStore implements TokenStore {
         } catch (IOException ignore) {
             // best-effort release; a leftover lock goes stale and the next acquirer steals it
         }
+    }
+
+    private static void replaceTarget(Path tmp, Path target) throws IOException {
+        // atomically rename tmp over target. On Windows a concurrent reader in any process holding target open
+        // can make the rename fail transiently with AccessDeniedException (a sharing violation); retry a few
+        // times on a short backoff before giving up, so a routine read/write overlap does not needlessly degrade
+        // persistence (best-effort - the in-memory token is still valid). POSIX rename over an open file never
+        // hits this. AtomicMoveNotSupported (a rare filesystem) falls back to a plain replace, which still beats
+        // leaving a partial write.
+        AccessDeniedException lastDenied = null;
+        for (int attempt = 0; attempt < REPLACE_MAX_ATTEMPTS; attempt++) {
+            if (attempt > 0) {
+                Os.sleep(REPLACE_RETRY_SLEEP_MILLIS);
+            }
+            try {
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                return;
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+                return;
+            } catch (AccessDeniedException e) {
+                lastDenied = e;
+            }
+        }
+        throw lastDenied;
     }
 
     private static void restrictToOwner(Path directory) {
