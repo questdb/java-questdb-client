@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.network.PlainSocketFactory;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
@@ -388,6 +389,66 @@ public class BackgroundDrainerDurableAckRetryTest {
             assertFalse("must not quarantine (.failed sentinel) an all-replica window",
                     Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
             assertTrue("must have retried past the 16-attempt cap (got " + attempts.get() + ")",
+                    attempts.get() > BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS);
+        } finally {
+            drainer.requestStop();
+            t.join(5_000);
+        }
+        assertFalse("helper must exit after stop", t.isAlive());
+        assertEquals(BackgroundDrainer.DrainOutcome.STOPPED, drainer.outcome());
+    }
+
+    @Test
+    public void testTransportErrorNeverQuarantinesInvariantB() throws Exception {
+        // INVARIANT B (orphan drainer): a fully-unreachable cluster (server down,
+        // network partition -- every endpoint refuses / times out) is TRANSIENT,
+        // not terminal. The server will come back; the drainer must keep retrying
+        // (capped backoff) until it does, stopRequested, or SF exhaustion -- it
+        // must NEVER quarantine the slot on the first failed sweep. This is the
+        // exact behaviour of the live sender's background loop
+        // (CursorWebSocketSendLoop.connectLoop: a transport error backs off and
+        // retries), which the orphan drainer must match.
+        //
+        // Red-first: connectWithDurableAckRetry() currently routes any non-role,
+        // non-durable-ack Throwable (including "all endpoints unreachable") to an
+        // IMMEDIATE markFailed / .failed sentinel on the first attempt. Green once
+        // transport errors are retried indefinitely like connectLoop. (Genuine
+        // terminals -- auth / non-421 upgrade -- must still fail fast.)
+        CountingListener listener = new CountingListener();
+        AtomicInteger attempts = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+            attempts.incrementAndGet();
+            return new LineSenderException(
+                    "Failed to connect: all 2 endpoint(s) unreachable; last=127.0.0.1:9000");
+        });
+        BackgroundDrainer drainer = newDrainerWithBudgets(
+                factory, /*reconnectMaxDurationMillis*/ 200L, /*backoffInit*/ 1L, /*backoffMax*/ 2L);
+        drainer.setListener(listener);
+        Thread t = new Thread(drainer::connectWithDurableAckRetry, "invariant-b-transport-drainer");
+        t.setDaemon(true);
+        t.start();
+
+        // Observe well past the 200ms budget: the drainer must still be retrying.
+        long observeUntilNanos = System.nanoTime() + 600_000_000L; // 600ms >> 200ms budget
+        while (System.nanoTime() < observeUntilNanos && t.isAlive()) {
+            Thread.sleep(10);
+        }
+
+        try {
+            assertTrue("orphan drainer quarantined a fully-unreachable (server-down) cluster "
+                            + "(attempts=" + attempts.get() + ", outcome=" + drainer.outcome()
+                            + "): Invariant B says a down server is transient -- the drainer must "
+                            + "retry indefinitely (exactly like the live background loop), never "
+                            + "quarantine on a transport error",
+                    t.isAlive());
+            assertEquals("must not escalate a transient transport error to FAILED",
+                    BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
+            assertEquals("transport retry must not fire a persistent-failure escalation",
+                    0, listener.persistentFailures.get());
+            assertFalse("must not quarantine (.failed sentinel) a down server",
+                    Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertTrue("must have retried the down server well past the first sweep (got "
+                            + attempts.get() + ")",
                     attempts.get() > BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS);
         } finally {
             drainer.requestStop();
