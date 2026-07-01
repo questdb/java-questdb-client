@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.auth.OidcAuthException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -131,6 +132,47 @@ public class WebSocketTokenProviderTest {
                     sender.table("foo").longColumn("v", 1L).atNow();
                     sender.flush();
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testThrowingProviderResolvedOncePerConnectRound() throws Exception {
+        assertMemoryLeak(() -> {
+            // A token-provider failure (a failed silent refresh, or not signed in) is cluster-wide, not a
+            // per-endpoint transport fault. The credential is resolved once before the endpoint walk, so the
+            // provider is queried exactly once per connect round even across a multi-endpoint failover, and the
+            // provider's own error reaches the caller instead of being masked as "all endpoints unreachable".
+            AtomicInteger calls = new AtomicInteger();
+            try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // two endpoints at the same reachable server (distinct host strings, so not rejected as
+                // duplicates) - a pre-fix per-endpoint pull would query the provider twice for one connect
+                try {
+                    Sender.builder(Sender.Transport.WEBSOCKET)
+                            .address("localhost:" + port)
+                            .address("127.0.0.1:" + port)
+                            .httpTokenProvider(() -> {
+                                calls.incrementAndGet();
+                                throw new OidcAuthException("no token has been obtained yet; call signIn()");
+                            })
+                            .build();
+                    Assert.fail("expected build() to fail when the token provider throws");
+                } catch (OidcAuthException e) {
+                    // the provider's own error surfaces directly, not wrapped as a transport failure
+                    String msg = e.getMessage();
+                    Assert.assertTrue("expected the provider's message, got: " + msg,
+                            msg.contains("no token has been obtained yet"));
+                    Assert.assertFalse("a provider failure must not be mislabeled as unreachable, got: " + msg,
+                            msg.contains("unreachable"));
+                } catch (Exception e) {
+                    Assert.fail("expected the provider's OidcAuthException to surface, got: " + e);
+                }
+                // queried once per connect round, not once per endpoint (pre-fix this would be 2)
+                Assert.assertEquals(1, calls.get());
             }
         });
     }

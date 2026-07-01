@@ -139,8 +139,9 @@ public class QwpWebSocketSender implements Sender {
     // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
     // so the initial connect and every reconnect re-handshake carry the current token. May be null
-    // when no auth is configured. Evaluated inside buildAndConnect's per-endpoint try, so a throwing
-    // provider (e.g. a failed silent refresh) is handled as a connect failure rather than escaping.
+    // when no auth is configured. Evaluated once per (re)connect round in buildAndConnect, before the
+    // endpoint walk (not once per endpoint); a throwing provider propagates to the connectWithRetry
+    // reconnect wrapper, which retries it within the reconnect budget and surfaces the provider's message.
     private final Supplier<String> authorizationHeaderSupplier;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
@@ -2433,6 +2434,22 @@ public class QwpWebSocketSender implements Sender {
         HttpClientException terminalUpgradeError = null;
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
+        // Honor a close/stop that raced this (re)connect before doing any work - a token pull can make a
+        // blocking network call - mirroring the per-endpoint check at the top of the walk below.
+        if (cursorSendLoop == null ? closed : !cursorSendLoop.isRunning()) {
+            throw new LineSenderException("sender closed during connect");
+        }
+        // Resolve the Authorization header ONCE per (re)connect round, before the endpoint walk. For an
+        // httpTokenProvider this queries the provider a single time - a fresh token per handshake round, as the
+        // javadoc documents - NOT once per endpoint: a token-provider failure is cluster-wide (a failed silent
+        // refresh, or not signed in), not a per-endpoint transport fault, so re-querying it per endpoint would
+        // hammer the token endpoint with the same dead credential and mislabel the failure as "all endpoints
+        // unreachable". A throw here propagates to the connectWithRetry reconnect wrapper, which retries it
+        // within the reconnect budget like any other connect failure and surfaces the provider's own message,
+        // so a transient failed refresh recovers and only a persistent one terminates the sender (this
+        // transport's documented reconnect model). Mirrors QwpQueryClient, which likewise resolves the
+        // credential once before its endpoint walk.
+        final String authHeader = authorizationHeaderSupplier == null ? null : authorizationHeaderSupplier.get();
         while (true) {
             if (cursorSendLoop == null ? closed : !cursorSendLoop.isRunning()) {
                 throw new LineSenderException("sender closed during connect");
@@ -2451,11 +2468,9 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpRequestDurableAck(requestDurableAck);
                 newClient.connect(ep.host, ep.port);
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
-                // Pull the current Authorization header for this handshake. For an httpTokenProvider
-                // this re-queries the provider, so a reconnect presents a freshly refreshed token. A
-                // provider that throws here (a failed silent refresh) is caught below as a connect
-                // failure for this endpoint and retried within the reconnect budget.
-                String authHeader = authorizationHeaderSupplier == null ? null : authorizationHeaderSupplier.get();
+                // Present the header resolved once above for this handshake. On a failover to a later endpoint
+                // the same round's token is reused (a token is cluster-wide), so the provider is queried once
+                // per reconnect round, not once per endpoint.
                 newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authHeader);
             } catch (HttpClientException e) {
                 HttpClientException classified = QwpUpgradeFailures.classify(newClient, ep.host, ep.port, e);

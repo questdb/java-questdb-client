@@ -87,8 +87,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * lifetime (up to 30 minutes), so a concurrent {@link #signIn()} or {@link #clearCache()} blocks
  * behind it - but {@link #getToken()} never waits behind an interactive sign-in: it fails fast with an
  * {@link OidcAuthException} rather than stall a request/flush path (a needed silent refresh still runs,
- * bounded by {@link Builder#httpTimeoutMillis(int)} plus, with a coordinating {@link TokenStore}, a brief
- * cross-process lock wait - see {@link #getToken()}). To abort a waiting sign-in, call
+ * each HTTP round-trip phase bounded by {@link Builder#httpTimeoutMillis(int)} - though an unreachable
+ * endpoint's connect is bounded by the OS, not by it - plus, with a coordinating {@link TokenStore}, a brief
+ * cross-process lock wait; see {@link #getToken()}). To abort a waiting sign-in, call
  * {@link #close()} from another thread; it signals the flow to stop, which then fails with an
  * {@link OidcAuthException} rather than polling until the device code expires. Cancellation is seen
  * between polls (within ~100ms while waiting out an interval); a poll already in flight is not
@@ -468,12 +469,16 @@ public class OidcDeviceAuth implements QuietCloseable {
      * It does not wait behind an interactive {@link #signIn()} running on another thread (which would stall
      * the flush for the whole device-code lifetime): if such a sign-in holds the lock it fails fast, and the
      * caller should retry once the sign-in completes. It is not, however, instantaneous - when the cached
-     * token has expired it makes one synchronous refresh round-trip to the token endpoint, bounded by
-     * {@link Builder#httpTimeoutMillis(int)} (30s by default); when a {@link TokenStore} coordinates the
-     * refresh across processes it may first wait briefly to acquire the store's per-identity lock (a few
-     * seconds at most for {@link FileTokenStore}, then it proceeds without the lock) before that round-trip.
-     * That is the "quick silent refresh" the {@code HttpTokenProvider} contract permits on the flush path,
-     * not an unbounded interactive wait.
+     * token has expired it makes one synchronous refresh round-trip to the token endpoint (and, with a
+     * coordinating {@link TokenStore}, may first wait briefly to acquire the store's per-identity lock - a few
+     * seconds at most for {@link FileTokenStore}, then it proceeds without the lock - before that round-trip).
+     * The send, response wait and body parse of that round-trip are each bounded by
+     * {@link Builder#httpTimeoutMillis(int)} (30s by default); the connection phase that precedes them - DNS
+     * resolution, the TCP connect and the TLS handshake - is bounded by the OS, not by httpTimeoutMillis, so an
+     * unreachable (black-holed) token endpoint can stall this refresh for the OS TCP-connect timeout (commonly
+     * ~2 minutes on Linux) rather than 30s. That is the "quick silent refresh" the {@code HttpTokenProvider}
+     * contract permits on the flush path, not an unbounded interactive wait - but a producer sizing backpressure
+     * against this call should expect that OS-bounded connect stall, not a hard 30s cap.
      *
      * @return a non-null, non-empty token
      * @throws OidcAuthException if no token has been obtained yet, if the cached token expired and could
