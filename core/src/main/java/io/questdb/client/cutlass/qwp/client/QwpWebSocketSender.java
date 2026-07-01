@@ -1019,10 +1019,13 @@ public class QwpWebSocketSender implements Sender {
                     terminalError = captureCloseError(terminalError, e);
                 }
             }
-            // Drainer pool runs after the foreground I/O loop is wound
-            // down — drainers don't share state with the foreground, so
-            // ordering doesn't matter for correctness, just predictable
-            // shutdown.
+            // Drainer pool closes after the foreground I/O loop is wound
+            // down. Drainers share buildAndConnect (endpoints, hostTracker,
+            // connection-event dispatcher) with the foreground, but their
+            // connect gate is their own stop flag — NOT the foreground
+            // loop's liveness — so the pool's graceful-drain window below
+            // still lets in-flight drainers finish (including reconnects)
+            // even though cursorSendLoop is already stopped.
             if (drainerPool != null) {
                 try {
                     drainerPool.close();
@@ -2141,15 +2144,36 @@ public class QwpWebSocketSender implements Sender {
         }
         for (int i = 0, n = orphanSlotPaths.size(); i < n; i++) {
             String slot = orphanSlotPaths.get(i);
+            // The drainer's connects must NOT be gated on the foreground
+            // sender's lifecycle: close() stops the foreground I/O loop
+            // BEFORE the drainer pool's graceful-drain window, so a
+            // foreground-gated factory would reject every drainer
+            // (re)connect with "sender closed during connect" during that
+            // window, leaving the orphan slot un-drained (and Invariant B
+            // forbids quarantining it on a transport-shaped error). Gate
+            // each drainer's factory on the drainer's OWN stop flag
+            // instead. The one-element array breaks the construction cycle
+            // (the factory needs the drainer, the drainer's constructor
+            // needs the factory); the ref write happens-before the drainer
+            // runs because submit() publishes the task afterwards.
+            final io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer[] ref =
+                    new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer[1];
+            ReconnectSupplier factory = new ReconnectSupplier(
+                    () -> {
+                        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer d = ref[0];
+                        return d != null && d.isStopRequested();
+                    },
+                    "drainer stop requested during connect");
             io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
                     new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
                             slot, segmentSizeBytes, sfMaxTotalBytes,
-                            newReconnectFactory(),
+                            factory,
                             reconnectMaxDurationMillis,
                             reconnectInitialBackoffMillis,
                             reconnectMaxBackoffMillis,
                             requestDurableAck,
                             durableAckKeepaliveIntervalMillis);
+            ref[0] = drainer;
             drainerPool.submit(drainer);
         }
     }
@@ -2429,8 +2453,8 @@ public class QwpWebSocketSender implements Sender {
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
         while (true) {
-            if (cursorSendLoop == null ? closed : !cursorSendLoop.isRunning()) {
-                throw new LineSenderException("sender closed during connect");
+            if (ctx.isAborted()) {
+                throw new LineSenderException(ctx.abortMessage());
             }
             int idx = hostTracker.pickNext();
             if (idx < 0) break;
@@ -3335,7 +3359,37 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private final class ReconnectSupplier implements CursorWebSocketSendLoop.ReconnectFactory {
+        /**
+         * Optional caller-owned liveness gate. {@code null} means this factory
+         * serves the foreground sender and aborts when the foreground I/O loop
+         * stops. Non-null means the factory serves a {@code BackgroundDrainer}:
+         * the drainer must be able to (re)connect during the sender's close
+         * sequence (the drainer pool's graceful-drain window runs AFTER the
+         * foreground loop is stopped), so its gate is the drainer's own stop
+         * flag, supplied here, instead of the foreground loop's state.
+         */
+        private final java.util.function.BooleanSupplier abortCheck;
+        private final String abortMessage;
         private int previousIdx = -1;
+
+        private ReconnectSupplier() {
+            this(null, null);
+        }
+
+        private ReconnectSupplier(java.util.function.BooleanSupplier abortCheck, String abortMessage) {
+            this.abortCheck = abortCheck;
+            this.abortMessage = abortMessage;
+        }
+
+        String abortMessage() {
+            return abortCheck != null ? abortMessage : "sender closed during connect";
+        }
+
+        boolean isAborted() {
+            return abortCheck != null
+                    ? abortCheck.getAsBoolean()
+                    : (cursorSendLoop == null ? closed : !cursorSendLoop.isRunning());
+        }
 
         @Override
         public WebSocketClient reconnect() {

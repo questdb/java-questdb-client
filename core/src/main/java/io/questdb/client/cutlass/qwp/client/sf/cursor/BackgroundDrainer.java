@@ -81,6 +81,14 @@ public final class BackgroundDrainer implements Runnable {
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainer.class);
     /** How often to wake and re-check ackedFsn vs target. */
     private static final long POLL_NANOS = 50_000_000L; // 50 ms
+    /**
+     * Upper bound on a single backoff park so {@link #requestStop()} is
+     * honored promptly even without the unpark (e.g. a permit consumed by
+     * an earlier spurious wakeup). Keeps the pool's post-stop grace window
+     * ({@code BackgroundDrainerPool.STOP_GRACE_MILLIS}) meaningful: a
+     * stopping drainer wakes at least every 50ms to re-check the flag.
+     */
+    private static final long STOP_CHECK_PARK_CHUNK_NANOS = 50_000_000L; // 50 ms
     private final CursorWebSocketSendLoop.ReconnectFactory clientFactory;
     private final long durableAckKeepaliveIntervalMillis;
     private final long reconnectInitialBackoffMillis;
@@ -102,6 +110,13 @@ public final class BackgroundDrainer implements Runnable {
      */
     private volatile BackgroundDrainerListener listener;
     private volatile DrainOutcome outcome = DrainOutcome.PENDING;
+    /**
+     * Thread currently executing {@link #run()} (or a direct
+     * {@link #connectWithDurableAckRetry()} call from tests). Lets
+     * {@link #requestStop()} unpark a drainer sleeping in a backoff or
+     * poll park instead of waiting for the park to elapse.
+     */
+    private volatile Thread runnerThread;
     private volatile boolean stopRequested;
 
     public BackgroundDrainer(
@@ -166,6 +181,10 @@ public final class BackgroundDrainer implements Runnable {
      */
     @TestOnly
     public WebSocketClient connectWithDurableAckRetry() {
+        // run() already set runnerThread; setting it again here is a no-op
+        // on that path but wires up direct @TestOnly calls so requestStop()
+        // can unpark them too.
+        runnerThread = Thread.currentThread();
         long startNanos = System.nanoTime();
         long deadlineNanos = startNanos + reconnectMaxDurationMillis * 1_000_000L;
         long backoffMillis = reconnectInitialBackoffMillis;
@@ -291,7 +310,12 @@ public final class BackgroundDrainer implements Runnable {
                         Math.max(0L, (deadlineNanos - System.nanoTime()) / 1_000_000L));
             }
             if (sleepMillis > 0L && !stopRequested) {
-                LockSupport.parkNanos(sleepMillis * 1_000_000L);
+                long parkDeadlineNanos = System.nanoTime() + sleepMillis * 1_000_000L;
+                long remaining;
+                while (!stopRequested
+                        && (remaining = parkDeadlineNanos - System.nanoTime()) > 0L) {
+                    LockSupport.parkNanos(Math.min(remaining, STOP_CHECK_PARK_CHUNK_NANOS));
+                }
             }
             backoffMillis = Math.min(backoffMillis * 2L, reconnectMaxBackoffMillis);
         }
@@ -318,10 +342,24 @@ public final class BackgroundDrainer implements Runnable {
 
     public void requestStop() {
         stopRequested = true;
+        // Wake the drainer out of any backoff/poll park immediately so the
+        // pool's bounded stop-grace window is spent unwinding (release slot
+        // lock, close engine), not sleeping out the remainder of a capped
+        // exponential backoff.
+        Thread t = runnerThread;
+        if (t != null) {
+            LockSupport.unpark(t);
+        }
+    }
+
+    /** True once {@link #requestStop()} has been called. */
+    public boolean isStopRequested() {
+        return stopRequested;
     }
 
     @Override
     public void run() {
+        runnerThread = Thread.currentThread();
         CursorSendEngine engine = null;
         WebSocketClient client = null;
         CursorWebSocketSendLoop loop = null;
@@ -430,6 +468,9 @@ public final class BackgroundDrainer implements Runnable {
                 } catch (Throwable ignored) {
                 }
             }
+            // Don't let a later requestStop() unpark an unrelated task that
+            // the pool's executor may have scheduled onto this same thread.
+            runnerThread = null;
         }
     }
 
