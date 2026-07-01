@@ -1,6 +1,7 @@
 package io.questdb.client.test.example;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.auth.FileTokenStore;
 import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
@@ -15,7 +16,9 @@ public class OIDCAuthExample {
         // Discover the client id, scope and endpoints from the QuestDB server's /settings:
         try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
                 "http://localhost:9000",
-                new OidcDeviceAuth.DiscoveryOptions().allowInsecureTransport(true)
+                new OidcDeviceAuth.DiscoveryOptions()
+                        .allowInsecureTransport(true)
+                        .tokenStore(FileTokenStore.atDefaultLocation())
         )) {
             // one-time interactive sign-in; caches token + refresh token
             auth.signIn();
