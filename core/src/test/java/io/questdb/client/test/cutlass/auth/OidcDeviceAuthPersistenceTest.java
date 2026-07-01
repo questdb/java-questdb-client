@@ -311,6 +311,37 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testRefreshUnderLockKeepsLiveRefreshTokenWhenPeerEntryOmitsIt() throws Exception {
+        // regression: a peer (or cross-language client, or a tampered file) persists a valid-but-expired served
+        // token with NO refresh_token while we hold a live refresh token in memory. The coordinated re-read must
+        // keep our refresh token, not null it - nulling it made tryRefresh() urlEncode(null) and throw an
+        // uncaught NPE that aborted getToken()/signIn() instead of degrading. With the fix REFRESH-1 is kept and
+        // the refresh succeeds.
+        assertMemoryLeak(() -> {
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (path.startsWith(DEVICE_PATH)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                // the token endpoint honours the kept refresh token and returns a fresh access token
+                return MockOidcServer.json(200, tokenJson("REFRESHED-ACCESS", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                long now = System.currentTimeMillis();
+                // our own entry, adopted on load: an expired served token carrying REFRESH-1
+                fake.stored = new PersistedToken("OLD-ACCESS", null, "REFRESH-1", now - 60_000, 300_000);
+                // a peer overwrites the file with a valid-but-expired served token and NO refresh_token (the
+                // frozen on-disk format permits omitting it) while we hold the cross-process lock
+                fake.peerInstallsOnLock = new PersistedToken("PEER-ACCESS", null, null, now - 60_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("the live refresh token must be kept and used, not nulled into an NPE",
+                            "REFRESHED-ACCESS", auth.getToken());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testRestartRefreshesExpiredTokenSkippingDeviceFlow() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();

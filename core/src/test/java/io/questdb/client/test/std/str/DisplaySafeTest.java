@@ -72,6 +72,19 @@ public class DisplaySafeTest {
     }
 
     @Test
+    public void testLineAndParagraphSeparatorsAreUnsafe() {
+        // U+2028 LINE SEPARATOR (Zl) and U+2029 PARAGRAPH SEPARATOR (Zp) are Unicode line breaks that split a
+        // rendered log line in ECMAScript/GUI/JSON log consumers, yet are neither ISO control nor Cf format,
+        // so a tampered field could otherwise forge an apparent extra log line
+        int[] unsafe = {0x2028, 0x2029};
+        for (int cp : unsafe) {
+            String hex = "0x" + Integer.toHexString(cp);
+            Assert.assertTrue("separator " + hex + " must be unsafe", DisplaySafe.isUnsafeForDisplay(cp));
+            Assert.assertFalse("separator " + hex + " must be unsafe", DisplaySafe.isDisplaySafe(cp));
+        }
+    }
+
+    @Test
     public void testLoneSurrogatesAreUnsafe() {
         // a lone surrogate half has no displayable meaning; the code-point classifier must reject it
         int[] surrogates = {0xD800, 0xDBFF, 0xDC00, 0xDFFF};

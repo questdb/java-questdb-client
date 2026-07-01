@@ -1037,7 +1037,15 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
         accessToken = token.getAccessToken();
         idToken = token.getIdToken();
-        refreshToken = token.getRefreshToken();
+        // keep the current refresh token when the file carries none, mirroring storeTokens(). A file with a
+        // valid served token but no refresh_token - a cross-language peer that never received one, or a
+        // tampered file - must not null a live in-memory refresh token: doing so would make a later
+        // tryRefresh() urlEncode(null) and throw an uncaught NPE (aborting the sign-in) instead of refreshing
+        // with the token we still hold or degrading to an interactive sign-in.
+        String fileRefreshToken = token.getRefreshToken();
+        if (fileRefreshToken != null) {
+            refreshToken = fileRefreshToken;
+        }
         // the file is attacker-writable (and may have been written under a skewed clock), so bound how long
         // the loaded token is trusted exactly as storeTokens() bounds a token from the wire: never past
         // MAX_EXPIRES_IN_SECONDS from now. Clamp the expiry to [0, now + maxLife]: the ceiling stops a tampered
@@ -1054,8 +1062,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         // half the lifetime); for a legitimate file the two already agree, and the expiry clamp bounds this to
         // [0, maxLife]
         tokenTtlMillis = Math.max(0L, expiresAtMillis - now);
-        // it is already on disk, so a later non-rotating refresh must not rewrite the file
-        lastPersistedRefreshToken = refreshToken;
+        // track what the file actually carried (which is null when it had no refresh_token but we kept a live
+        // one above), so a later non-rotating refresh does not rewrite an unchanged on-disk token, yet a token
+        // we kept that the file did not carry is not mistaken for already-persisted and can be re-saved
+        lastPersistedRefreshToken = fileRefreshToken;
         return true;
     }
 
@@ -1463,6 +1473,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private boolean tryRefresh() {
+        if (refreshToken == null) {
+            // nothing to present: degrade to the interactive flow rather than urlEncode(null) and throw.
+            // adopt() keeps a live refresh token, so this only fires if a caller reaches here with none.
+            return false;
+        }
         formSink.clear();
         formSink.putAscii("grant_type=").putAscii(GRANT_TYPE_REFRESH_TOKEN_ENCODED);
         appendParam(formSink, "refresh_token", refreshToken);

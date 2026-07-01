@@ -42,7 +42,8 @@ public final class DisplaySafe {
      * Returns {@code true} when {@code cp} can be shown verbatim, {@code false} when it must be escaped or
      * stripped. A code point is unsafe if it is a control char (C0/C1, DEL), a Unicode format char (bidi
      * embeddings/overrides/isolates, LRM/RLM marks, zero-width joiners, the BOM, supplementary-plane tag
-     * chars) or a surrogate (a lone half, with no displayable meaning).
+     * chars), a Unicode line/paragraph separator (U+2028/U+2029, which break a rendered log line), or a
+     * surrogate (a lone half, with no displayable meaning).
      */
     public static boolean isDisplaySafe(int cp) {
         // Printable ASCII is the overwhelmingly common case and is never a control, format or surrogate char,
@@ -54,7 +55,12 @@ public final class DisplaySafe {
             return false;
         }
         final int type = Character.getType(cp);
-        if (type == Character.FORMAT || type == Character.SURROGATE) {
+        // FORMAT covers bidi/zero-width/joiners/BOM/tag chars; SURROGATE a lone half. LINE_SEPARATOR (U+2028)
+        // and PARAGRAPH_SEPARATOR (U+2029) are Unicode line breaks that split a rendered log line in
+        // ECMAScript/GUI/JSON log consumers, yet they are neither C0/C1 (isISOControl) nor FORMAT, so catch
+        // them here rather than let a tampered field forge an apparent extra log line.
+        if (type == Character.FORMAT || type == Character.SURROGATE
+                || type == Character.LINE_SEPARATOR || type == Character.PARAGRAPH_SEPARATOR) {
             return false;
         }
         // The explicit bidi/BOM set is redundant with the FORMAT category on a conformant JDK, but kept as

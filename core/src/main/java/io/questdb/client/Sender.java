@@ -2026,8 +2026,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * refreshed token is presented each time the link is (re)established; an already-established WebSocket
          * is not re-authenticated mid-stream. The two transports differ on a sustained token outage: over HTTP
          * a failed pull is retried on the next row, but over WebSocket a pull that keeps failing past the
-         * reconnect budget terminates the sender for good, like any persistent reconnect failure. A
-         * lazily-signing-in provider can therefore be wired before the interactive sign-in completes over HTTP,
+         * reconnect budget terminates the sender for good, like any persistent reconnect failure.
+         * <br>
+         * Over HTTP the token is pulled once per request and written into the request buffer ahead of the
+         * buffered rows, so a token refresh is picked up on the next new batch after a successful flush. A
+         * failed flush preserves the buffer - token included - for a later retry and re-sends it verbatim
+         * rather than re-pulling the token, so a flush that keeps failing until the already-pulled token
+         * expires is then rejected (for example a {@code 401}); recover by discarding the buffered rows (close
+         * and rebuild the sender) so the next request pulls a fresh token.
+         * <br>
+         * A lazily-signing-in provider can therefore be wired before the interactive sign-in completes over HTTP,
          * where the first pull is deferred to the first row; over WebSocket a token must already be obtainable
          * when {@code build()} runs, since the initial handshake pulls it - otherwise that {@code build()} (or,
          * over HTTP, the first row) fails. Running on the send/flush and reconnect paths, the provider must
