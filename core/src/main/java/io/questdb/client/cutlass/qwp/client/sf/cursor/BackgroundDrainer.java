@@ -52,22 +52,28 @@ import java.util.concurrent.locks.LockSupport;
  *   <li>Close everything in reverse order; release the lock.</li>
  * </ol>
  * <p>
- * On terminal failure (auth-rejection on reconnect, reconnect-budget
- * exhaustion, recovery error), the drainer drops a
- * {@link OrphanScanner#FAILED_SENTINEL_NAME} sentinel into the slot
- * before exiting. Future scans skip the slot until an operator clears
- * the sentinel — bounded automatic retry, then human-in-the-loop.
+ * On terminal failure (auth-rejection on reconnect, a cluster-wide durable-ack
+ * capability gap that exhausts its settle budget, recovery error), the drainer
+ * drops a {@link OrphanScanner#FAILED_SENTINEL_NAME} sentinel into the slot
+ * before exiting. Future scans skip the slot until an operator clears the
+ * sentinel — bounded automatic retry, then human-in-the-loop. A transient
+ * all-replica failover window is NOT terminal: it is retried indefinitely
+ * (Invariant B), never quarantined on a wall-clock budget or attempt cap.
  */
 public final class BackgroundDrainer implements Runnable {
 
     /**
      * Cap on consecutive {@link QwpDurableAckMismatchException} attempts at
      * initial connect before the drainer escalates to a {@code .failed}
-     * sentinel. The wall-clock budget {@code reconnectMaxDurationMillis}
-     * also caps the same loop; whichever is hit first triggers escalation.
-     * 16 attempts gives the cluster room to settle through a rolling
-     * upgrade (each attempt walks every endpoint internally) without
-     * letting a genuine cluster-wide misconfig hang the drainer forever.
+     * sentinel. Applies ONLY to a genuine cluster-wide durable-ack capability
+     * gap (a server that upgrades but does not advertise durable ack); a
+     * transient all-replica failover window (role reject) is retried
+     * indefinitely and is never subject to this cap (Invariant B). The
+     * wall-clock budget {@code reconnectMaxDurationMillis} also caps this
+     * capability-gap loop; whichever is hit first triggers escalation. 16
+     * attempts gives the cluster room to settle through a rolling upgrade
+     * (each attempt walks every endpoint internally) without letting a genuine
+     * cluster-wide misconfig hang the drainer forever.
      */
     public static final int DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS = 16;
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainer.class);

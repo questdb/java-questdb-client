@@ -61,10 +61,11 @@ import java.util.concurrent.locks.LockSupport;
  *       cumulative wire sequence {@code N}, calls
  *       {@code engine.acknowledge(fsnAtZero + N)} so the segment manager
  *       can trim fully-acked segments.</li>
- *   <li>On wire failure, runs the configured reconnect policy: backoff
- *       with jitter up to {@code reconnect_max_duration_millis}, with
- *       auth-style failures (401/403/non-101 upgrade reject) treated as
- *       terminal. On reconnect success, repositions the cursor at
+ *   <li>On wire failure, runs the configured reconnect policy: capped
+ *       exponential backoff with jitter, retried indefinitely (Invariant B --
+ *       a store-and-forward drainer never gives up on a wall-clock budget),
+ *       with only auth-style failures (401/403/non-101 upgrade reject) treated
+ *       as terminal. On reconnect success, repositions the cursor at
  *       {@code ackedFsn+1} and replays.</li>
  * </ol>
  * No locks on the steady-state path. The producer thread (user) writes
@@ -140,6 +141,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final ReconnectFactory reconnectFactory;
     private final long reconnectInitialBackoffMillis;
     private final long reconnectMaxBackoffMillis;
+    // Retained for constructor symmetry and passed in by callers, but NOT
+    // consulted by the background loop: Invariant B removed the wall-clock
+    // give-up from connectLoop. The budget still bounds the blocking (non-lazy)
+    // initial connect via QwpWebSocketSender -> connectWithRetry, which takes it
+    // as an explicit argument rather than reading this field.
     private final long reconnectMaxDurationMillis;
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
@@ -1019,12 +1025,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Surface a wire failure. With reconnect plumbing wired (factory +
-     * listener both non-null), enters the per-outage retry loop:
-     * exponential backoff with jitter, time-capped at
-     * {@code reconnectMaxDurationMillis}, terminal on auth/upgrade
-     * rejections (so the budget isn't burned on errors that won't fix
-     * themselves). On the first successful reconnect within the budget,
-     * the I/O loop resumes with reset wire state and replays from
+     * listener both non-null), enters the per-outage retry loop: capped
+     * exponential backoff with jitter, retried for as long as the loop is
+     * running -- there is NO wall-clock give-up (Invariant B: a store-and-
+     * forward drainer only terminates on SF exhaustion or a genuinely non-
+     * retriable auth/upgrade reject). On the first successful reconnect the
+     * I/O loop resumes with reset wire state and replays from
      * {@code engine.ackedFsn() + 1}.
      * <p>
      * Without reconnect plumbing, the failure is immediately terminal
