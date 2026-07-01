@@ -395,11 +395,19 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   between the two leaves an empty `<hex>.lock` whose mtime is fresh — which the staleness check
   would protect for the whole window, wedging peers into lock-free refreshes. Treat a lock that
   carries no readable owner stamp as stealable once it is older than a short grace (a few
-  seconds) instead of the full window. The grace MUST comfortably exceed the create→stamp gap
-  (microseconds) so a peer momentarily between its create and its stamp is never pre-empted —
-  pre-empting it would steal a lock its rightful owner is about to hold and force that owner to
-  degrade. The capture-then-verify steal below still aborts if the lock acquires a stamp in the
-  gap. The Python client MUST mirror this empty-lock grace.
+  seconds) instead of the full window. The grace normally dwarfs the create→stamp gap
+  (microseconds), but cannot be guaranteed to: a pause wider than the grace (a long GC/safepoint
+  or a process suspend landing between the two syscalls) or a cross-machine clock skew (the age
+  check compares the local clock against the file's mtime) can make a freshly-created empty lock
+  look stale and let a peer pre-empt a holder mid-stamp. This never forges or tears a credential —
+  Layer 1's atomic replacement always holds — it degrades to a concurrent refresh (a re-prompt on
+  a rotating-refresh-token IdP), the same best-effort residual as running lock-free. To keep that
+  residual bounded, the **stamp write and the stamp-failure cleanup verify ownership** the way
+  release does: a holder stamps only a lock still empty (never overwriting a stamp a peer wrote
+  while the holder was pre-empted), and on a stamp failure drops only a lock still empty (never a
+  peer's non-empty live lock by bare path). The capture-then-verify steal below still aborts if
+  the lock acquires a stamp in the gap. The Python client MUST mirror this empty-lock grace, and
+  SHOULD mirror the ownership-verified stamp write.
 - **Release verifies ownership.** A holder releases by re-reading the lock and deleting it
   **only when it still carries that holder's own owner stamp**, never by bare path. Should
   a hold ever outrun the staleness window and be stolen and recreated by a peer, the

@@ -27,9 +27,11 @@ package io.questdb.client.test.cutlass.line;
 import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.test.cutlass.auth.MockOidcServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -42,10 +44,12 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * {@code .httpTokenProvider(auth::getToken)} - be wired before the interactive sign-in
  * has completed.
  * <p>
- * An explicit {@code protocol_version} keeps {@link Sender.LineSenderBuilder#build()} from probing
- * the server, and auto-flush is disabled, so rows can be buffered against a port nobody listens on
- * without ever opening a connection. Each test runs under {@code assertMemoryLeak} so the sender's
- * native buffers are proven freed on close.
+ * The deferral tests pin an explicit {@code protocol_version} to keep {@link Sender.LineSenderBuilder#build()}
+ * from probing the server, and disable auto-flush, so rows buffer against a port nobody listens on without
+ * opening a connection. The end-to-end tests instead flush against a {@link MockOidcServer} and assert the
+ * pulled token actually reaches the {@code Authorization: Bearer} header on the wire, is re-queried per
+ * request as a rotating provider refreshes, and is re-sent verbatim (not re-pulled) on a retry. Each test
+ * runs under {@code assertMemoryLeak} so the sender's native buffers are proven freed on close.
  */
 public class LineHttpSenderTokenProviderTest {
 
@@ -98,6 +102,38 @@ public class LineHttpSenderTokenProviderTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testFailedFlushReSendsSameTokenWithoutRePull() throws Exception {
+        assertMemoryLeak(() -> {
+            // a failed flush preserves the buffered request - token included - and re-sends it verbatim on retry
+            // rather than re-pulling the provider (the documented contract on httpTokenProvider()). Here the first
+            // send gets a retryable 500 and the retry must carry the SAME baked token, with the provider queried
+            // only once - so a rotating provider does not change the credential mid-retry of one buffered batch.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) ->
+                    requests.incrementAndGet() == 1
+                            ? MockOidcServer.chunkedJson(500, "boom") // first send: retryable server error
+                            : MockOidcServer.json(204, ""))) {        // retry: success
+                AtomicInteger calls = new AtomicInteger();
+                HttpTokenProvider provider = () -> "TOKEN-" + calls.incrementAndGet();
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .httpTokenProvider(provider)
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush(); // first send 500 -> retry -> 204
+                }
+                Assert.assertEquals("the provider must be pulled once, not re-pulled on retry", 1, calls.get());
+                List<String> auth = server.requestAuthHeaders();
+                Assert.assertEquals("the failed send plus its retry must be two requests", 2, auth.size());
+                Assert.assertEquals("the first send carries the pulled token", "Bearer TOKEN-1", auth.get(0));
+                Assert.assertEquals("the retry must re-send the same baked token", "Bearer TOKEN-1", auth.get(1));
+            }
+        });
+    }
+
     @Test
     public void testNullOrEmptyProviderTokenIsRejected() throws Exception {
         assertMemoryLeak(() -> {
@@ -132,6 +168,34 @@ public class LineHttpSenderTokenProviderTest {
                 // a second row in the same un-flushed batch reuses the same request, so it does not re-pull
                 sender.table("t").longColumn("v", 2L).atNow();
                 Assert.assertEquals("provider must not be re-queried within the same batch", 1, calls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testTokenReachesAuthorizationHeaderAndRotatesPerFlush() throws Exception {
+        assertMemoryLeak(() -> {
+            // end-to-end against a real socket: the pulled token must reach the "Authorization: Bearer" header
+            // on the wire (not merely be pulled), and a rotating provider must be re-queried per request so a
+            // long-lived sender follows token refreshes rather than sending a token captured once.
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
+                AtomicInteger calls = new AtomicInteger();
+                HttpTokenProvider provider = () -> "TOKEN-" + calls.incrementAndGet();
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .httpTokenProvider(provider)
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    sender.table("t").longColumn("v", 2L).atNow();
+                    sender.flush();
+                }
+                List<String> auth = server.requestAuthHeaders();
+                Assert.assertEquals("two flushes must send two requests", 2, auth.size());
+                Assert.assertEquals("the first request must carry the first pulled token", "Bearer TOKEN-1", auth.get(0));
+                Assert.assertEquals("the second flush must re-query the provider and carry the rotated token", "Bearer TOKEN-2", auth.get(1));
             }
         });
     }

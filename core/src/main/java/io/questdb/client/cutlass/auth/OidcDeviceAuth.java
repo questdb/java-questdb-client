@@ -1928,6 +1928,14 @@ public class OidcDeviceAuth implements QuietCloseable {
                 }
                 i += Character.charCount(cp);
             }
+            // reject a fragment (#...): it has no meaning in an endpoint url (RFC 3986 fragments are client-side
+            // only, never sent to a server), and folding it into the path opens a pin-bypass - pathOnly() strips
+            // it before the issuer-path check while postForm sends endpoint.path verbatim on the wire, so a
+            // lenient server that normalizes a '..' hidden past the '#' (POST /realms/acme#/../other/token) could
+            // resolve the request-target to a path the issuer-path pin never validated. Fail closed instead.
+            if (url.indexOf('#') >= 0) {
+                throw new OidcAuthException().put("invalid url, a fragment (#) is not supported [url=").put(url).put(']');
+            }
             int schemeEnd = url.indexOf("://");
             if (schemeEnd < 0) {
                 throw new OidcAuthException().put("invalid url, expected a scheme [url=").put(url).put(']');

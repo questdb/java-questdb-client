@@ -611,6 +611,17 @@ public final class FileTokenStore implements TokenStore {
         // failure so acquireLock drops an unverifiable lock rather than hold one it cannot safely release.
         // Writing also refreshes the mtime, which is what the staleness age check reads
         try {
+            // acquireLock created this lock empty; if it already carries a stamp, a peer judged it stale and
+            // stole+restamped it in the create->stamp gap (a long GC/suspend pause between the two syscalls, or
+            // a cross-machine clock skew wider than the empty-lock grace). A plain WRITE|TRUNCATE_EXISTING has no
+            // exclusivity and would overwrite the peer's stamp, leaving two processes each believing they hold
+            // the lock. Refuse instead - honouring releaseLock's own-stamp ownership rule - so acquireLock
+            // degrades to a lock-free refresh (the documented best-effort residual) rather than clobber a live
+            // peer's stamp. A readLockHolder that throws (our file was moved away during the peer's steal) is
+            // caught below and likewise fails the stamp.
+            if (readLockHolder(lock) != null) {
+                return false;
+            }
             Files.write(lock, nonce.getBytes(StandardCharsets.UTF_8), StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
             return true;
         } catch (Exception e) {
@@ -632,11 +643,16 @@ public final class FileTokenStore implements TokenStore {
                 }
                 // the exclusive create won the lock but the owner nonce could not be stamped, so releaseLock
                 // could not later prove ownership and would risk deleting a peer's lock; drop the file we just
-                // created and degrade to a lock-free refresh rather than hold an unverifiable lock
+                // created and degrade to a lock-free refresh rather than hold an unverifiable lock. Remove it
+                // only while it is still the empty file we created: writeLockHolder also returns false when a
+                // peer stole and restamped this path in the create->stamp gap, and deleting that peer's non-empty
+                // live lock by bare path would admit a third holder (mirrors releaseLock's own-stamp rule).
                 try {
-                    Files.deleteIfExists(lock);
+                    if (Files.size(lock) == 0) {
+                        Files.deleteIfExists(lock);
+                    }
                 } catch (IOException ignore) {
-                    // another acquirer may have removed it; the next createLockFile settles the race
+                    // gone (a peer moved it during its steal) or unreadable; another acquirer settles the race
                 }
                 return null;
             } catch (FileAlreadyExistsException e) {
@@ -721,9 +737,14 @@ public final class FileTokenStore implements TokenStore {
             // an empty/unreadable lock is never a validly-held lock (a holder stamps right after creating): it
             // is a peer mid-create/stamp (recovers on its own in microseconds) or one a crash orphaned in that
             // gap. Steal it on the short empty-lock grace rather than the full staleness window, so a crash
-            // orphan stops wedging peers for the whole window; the grace dwarfs the create->stamp gap, so a
-            // peer mid-stamp is never pre-empted. The capture-verify below still confirms the lock is unchanged
-            // before completing the steal.
+            // orphan stops wedging peers for the whole window. The grace normally dwarfs the create->stamp gap,
+            // but a pause wider than the grace (a long GC/safepoint or a suspend landing between the two
+            // syscalls) or a cross-machine clock skew (isOlderThan compares the local clock to the file mtime)
+            // can still make a freshly-created empty lock look stale and pre-empt a peer mid-stamp. That never
+            // forges or tears a credential - Layer-1 atomic rename holds, and the pre-empted peer's
+            // writeLockHolder refuses to overwrite this stamp - it degrades to a concurrent refresh (a re-prompt
+            // on a rotating-refresh-token IdP), the same best-effort residual inLock already accepts. The
+            // capture-verify below still confirms the lock is unchanged before completing the steal.
             return;
         }
         final Path captured = lock.resolveSibling(lock.getFileName().toString() + '.' + UUID.randomUUID() + ".tmp");

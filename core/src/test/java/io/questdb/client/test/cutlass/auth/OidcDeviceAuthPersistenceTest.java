@@ -342,6 +342,41 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testRefreshUnderLockResavesKeptRefreshTokenWhenPeerEntryOmitsIt() throws Exception {
+        // the other half of the NPE fix: when the coordinated re-read adopts a peer entry that omits the refresh
+        // token, adopt() keeps the live refresh token AND records that the file carried none
+        // (lastPersistedRefreshToken=null). The refresh that follows must therefore RE-SAVE the kept token, so a
+        // restart still finds it on disk. If adopt() instead marked the kept token as already-persisted, the save
+        // would be skipped and the refresh token would silently vanish from disk, forcing a needless re-prompt.
+        assertMemoryLeak(() -> {
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (path.startsWith(DEVICE_PATH)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                // non-rotating refresh: the same REFRESH-1 comes back, so ONLY the null-vs-REFRESH-1 lastPersisted
+                // bookkeeping (not a token change) decides whether persistIfRotated re-saves
+                return MockOidcServer.json(200, tokenJson("REFRESHED-ACCESS", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                long now = System.currentTimeMillis();
+                // our own entry, adopted on load: an expired served token carrying REFRESH-1
+                fake.stored = new PersistedToken("OLD-ACCESS", null, "REFRESH-1", now - 60_000, 300_000);
+                // a peer overwrites the file with an expired served token and NO refresh_token while we hold the
+                // lock; the re-read adopts it, keeps REFRESH-1, and records that the file carried no refresh token
+                fake.peerInstallsOnLock = new PersistedToken("PEER-ACCESS", null, null, now - 60_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("REFRESHED-ACCESS", auth.getToken());
+                }
+                Assert.assertTrue("the kept refresh token must be re-saved (the file carried none), not skipped as already-persisted",
+                        fake.saves.get() >= 1);
+                Assert.assertNotNull("the re-saved entry must exist", fake.stored);
+                Assert.assertEquals("the re-saved entry must carry the kept refresh token", "REFRESH-1", fake.stored.getRefreshToken());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testRestartRefreshesExpiredTokenSkippingDeviceFlow() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();

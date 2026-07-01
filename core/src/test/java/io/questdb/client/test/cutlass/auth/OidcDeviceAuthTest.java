@@ -1052,6 +1052,12 @@ public class OidcDeviceAuthTest {
         assertBuildFails("https://idp/devic\r\ne", "https://idp/t", "illegal character");
         assertBuildFails("https://idp/d", "https://idp/toke\r\nX-Injected:1", "illegal character");
         assertBuildFails("https://idp/d", "https://idp/t?a=b\nc", "illegal character");
+        // a fragment (#...) is rejected: pathOnly() strips it before the issuer-path pin while postForm sends
+        // endpoint.path verbatim on the wire, so folding a "#/../other/token" past the '#' would let a lenient
+        // server that normalizes '..' resolve the request-target to a path the pin never validated. Fail closed
+        assertBuildFails("https://idp/realms/acme#/../other/device", "https://idp/realms/acme/token", "fragment");
+        assertBuildFails("https://idp/d", "https://idp/realms/acme#/../other/token", "fragment");
+        assertBuildFails("https://idp/d#", "https://idp/t", "fragment");
     }
 
     @Test(timeout = 30_000)
