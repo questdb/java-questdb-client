@@ -2567,21 +2567,23 @@ public class QwpWebSocketSender implements Sender {
             throw terminalUpgradeError;
         }
         if (lastRoleReject != null) {
-            // When the client opted into durable ack but every endpoint
-            // role-rejected the /write/v4 upgrade (typically a misconfigured
-            // address list pointing at replicas only), a primary that can
-            // serve durable ack will not appear by retrying. Throw the typed
-            // QwpDurableAckMismatchException -- the cursor send loop's terminal
-            // classifier recognises it by instanceof and suppresses retry, so
-            // the SYNC/ASYNC connect paths fail fast instead of burning the
-            // full reconnect_max_duration_millis budget walking the same
-            // replicas.
-            if (requestDurableAck) {
-                QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
-                        lastRoleReject.getHost(), lastRoleReject.getPort(), lastRoleReject.getRole());
-                ackErr.initCause(lastRoleReject);
-                throw ackErr;
-            }
+            // Every endpoint role-rejected the /write/v4 upgrade: right now the
+            // reachable nodes are all replicas (or primary-catchup). That is a
+            // TRANSIENT failover window, not a terminal condition -- a replica
+            // can be promoted and a primary will reappear. Surface it as a
+            // retriable QwpRoleMismatchException so the SYNC/ASYNC connect and
+            // reconnect loops keep the rows in store-and-forward and retry
+            // within reconnect_max_duration_millis (for an SF sender the only
+            // terminal condition is SF exhaustion).
+            //
+            // This holds even when durable ack was requested: a replica that
+            // gets promoted serves durable ack, so an all-replica window must
+            // NOT be reported as a durable-ack mismatch. Doing so conflated a
+            // transient role state with a permanent capability gap and hard-
+            // failed HA senders that should have recovered on promotion. A
+            // genuine capability gap -- an endpoint that upgrades but does not
+            // advertise durable ack -- is still terminal: it is raised as
+            // terminalUpgradeError above, before this block.
             QwpRoleMismatchException ex = new QwpRoleMismatchException(
                     QwpIngressRoleRejectedException.ROLE_PRIMARY,
                     null,

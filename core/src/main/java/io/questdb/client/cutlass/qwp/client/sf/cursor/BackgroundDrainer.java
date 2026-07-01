@@ -26,6 +26,8 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
+import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -163,7 +165,15 @@ public final class BackgroundDrainer implements Runnable {
         while (!stopRequested) {
             try {
                 return clientFactory.reconnect();
-            } catch (QwpDurableAckMismatchException e) {
+            } catch (QwpDurableAckMismatchException | QwpRoleMismatchException
+                     | QwpIngressRoleRejectedException e) {
+                // An all-replica window (every endpoint role-rejected the
+                // upgrade) is handled exactly like a durable-ack-unavailable
+                // cluster: give it a budget to settle, then quarantine. A
+                // replica can be promoted, so the drainer must not quarantine an
+                // orphaned slot on the first sweep just because no primary is
+                // reachable yet. Behaviour is unchanged from when buildAndConnect
+                // surfaced this same condition as QwpDurableAckMismatchException.
                 mismatchAttempts++;
                 long now = System.nanoTime();
                 long elapsedMs = (now - startNanos) / 1_000_000L;
