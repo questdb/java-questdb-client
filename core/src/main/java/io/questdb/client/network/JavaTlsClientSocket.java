@@ -514,7 +514,12 @@ public final class JavaTlsClientSocket implements Socket {
      */
     private void runHandshake(SocketReadinessWaiter waiter) throws SSLException, TlsSessionInitFailedException {
         SSLEngineResult.HandshakeStatus handshakeStatus = sslEngine.getHandshakeStatus();
-        while (handshakeStatus != SSLEngineResult.HandshakeStatus.FINISHED) {
+        // Exit on NOT_HANDSHAKING as well as FINISHED: getHandshakeStatus() (used by the NEED_TASK
+        // branch) never returns FINISHED per the JSSE contract -- it returns NOT_HANDSHAKING once the
+        // handshake completes. Without this, a delegated task that is the terminal step would leave the
+        // loop on NOT_HANDSHAKING, match no case, and busy-spin forever with no deadline escape.
+        while (handshakeStatus != SSLEngineResult.HandshakeStatus.FINISHED
+                && handshakeStatus != SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING) {
             switch (handshakeStatus) {
                 case NEED_TASK:
                     Runnable task;
