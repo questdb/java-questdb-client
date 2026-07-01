@@ -170,10 +170,14 @@ public class QwpQueryClientWalkTrackerTest {
         // The exception type is HttpClientException (transport-only
         // failure mode) -- distinct from QwpRoleMismatchException which
         // would falsely suggest a topology issue.
-        int port1 = TestPorts.findUnusedPort();
-        int port2 = TestPorts.findUnusedPort();
+        // findUnusedPorts (plural) holds both probe sockets open at once so
+        // the two ports are guaranteed distinct — two separate
+        // findUnusedPort() calls can return the SAME port (bind-close-return
+        // lets the kernel recycle it immediately), which fails the config's
+        // duplicate-addr validation before the walk under test even runs.
+        int[] ports = TestPorts.findUnusedPorts(2);
         try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                "ws::addr=localhost:" + port1 + ",localhost:" + port2 + ";auth_timeout_ms=300;")) {
+                "ws::addr=localhost:" + ports[0] + ",localhost:" + ports[1] + ";auth_timeout_ms=300;")) {
             try {
                 client.connect();
                 Assert.fail("expected HttpClientException on unreachable hosts");
