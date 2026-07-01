@@ -83,6 +83,7 @@ public abstract class AbstractLineHttpSender implements Sender {
     private final CharSequence questDBVersion;
     private final Rnd rnd;
     private final StringSink sink = new StringSink();
+    private final String userAgent;
     private final String username;
     protected HttpClient.Request request;
     private HttpClient client;
@@ -203,6 +204,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                     : HttpClientFactory.newPlainTextInstance(clientConfiguration);
         }
         this.questDBVersion = new BuildInformationHolder().getSwVersion();
+        // precompute the User-Agent header value once: newRequest() runs on every flush (and twice per flush
+        // for a token provider), so concatenating it there would allocate a String each time
+        this.userAgent = "QuestDB/java/" + questDBVersion;
         this.request = newRequest();
         this.maxNameLength = maxNameLength;
         this.rnd = rnd;
@@ -760,7 +764,7 @@ public abstract class AbstractLineHttpSender implements Sender {
         HttpClient.Request r = client.newRequest(currentHost(), currentPort())
                 .POST()
                 .url(path)
-                .header("User-Agent", "QuestDB/java/" + questDBVersion);
+                .header("User-Agent", userAgent);
         if (username != null) {
             r.authBasic(username, password);
         } else if (httpTokenProvider != null) {

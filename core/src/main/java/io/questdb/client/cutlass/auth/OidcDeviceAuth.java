@@ -199,13 +199,14 @@ public class OidcDeviceAuth implements QuietCloseable {
     // clock skew at half of this so a short-lived token is not treated as expired the instant it is issued
     private long tokenTtlMillis;
 
-    private OidcDeviceAuth(Builder builder, ClientTlsConfiguration tlsConfig) {
+    private OidcDeviceAuth(Builder builder, ClientTlsConfiguration tlsConfig, Endpoint deviceAuthorizationEndpoint, Endpoint tokenEndpoint) {
         String clientId = builder.clientId;
         // pre-encode the invariant form params once here, so the poll loop and silent refresh do not
         // re-run URLEncoder on every request (mirrors the pre-encoded GRANT_TYPE_* constants)
         this.clientIdEncoded = urlEncode(clientId);
-        this.deviceAuthorizationEndpoint = Endpoint.parse(builder.deviceAuthorizationEndpoint);
-        this.tokenEndpoint = Endpoint.parse(builder.tokenEndpoint);
+        // build() already parsed and validated these endpoints; reuse them rather than re-parse the raw strings
+        this.deviceAuthorizationEndpoint = deviceAuthorizationEndpoint;
+        this.tokenEndpoint = tokenEndpoint;
         String scope = builder.scope;
         this.scopeEncoded = urlEncode(scope);
         String audience = builder.audience;
@@ -226,7 +227,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 audience != null && !audience.isEmpty() ? audience : null,
                 this.groupsInToken
         );
-        // allocate the native lexer last: an Endpoint.parse above can throw on a malformed url, and
+        // allocate the native lexer last: urlEncode and the TokenStoreKey construction above can throw, and
         // the half-built instance is never returned, so close() could not free an earlier alloc
         this.jsonLexer = new JsonLexer(JSON_LEXER_CACHE_SIZE, JSON_LEXER_MAX_VALUE_BYTES);
     }
@@ -1517,7 +1518,17 @@ public class OidcDeviceAuth implements QuietCloseable {
                 && isHttpStatusSuccess()
                 && tokenParser.error.length() == 0;
         if (hasRequiredToken) {
-            storeTokens(tokenParser);
+            try {
+                storeTokens(tokenParser);
+            } catch (OidcAuthException e) {
+                // storeTokens -> validateTokenChars rejects a refreshed served token carrying a control or
+                // non-ASCII char (reachable now that JsonLexer decodes an escaped \r/\n in the response into a
+                // real byte). Fall back to the interactive flow like the transport/parse-failure arms above,
+                // rather than let the rejection propagate out of getToken()/signIn() past the runDeviceFlow()
+                // fallback the caller expects. validateTokenChars runs before any state mutation, so the cached
+                // token and refresh token are left intact for that fallback.
+                return false;
+            }
             return true;
         }
         // the refresh token expired or was revoked, or did not return the token we need; fall back to the
@@ -1631,7 +1642,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                             .put("), otherwise a slow refresh's live cross-process lock could be stolen by a peer mid-refresh");
                 }
             }
-            return new OidcDeviceAuth(this, tls);
+            return new OidcDeviceAuth(this, tls, deviceEndpoint, parsedTokenEndpoint);
         }
 
         public Builder clientId(String clientId) {
@@ -1942,6 +1953,17 @@ public class OidcDeviceAuth implements QuietCloseable {
             // resolve the request-target to a path the issuer-path pin never validated. Fail closed instead.
             if (url.indexOf('#') >= 0) {
                 throw new OidcAuthException().put("invalid url, a fragment (#) is not supported [url=").put(url).put(']');
+            }
+            // reject a query (?...) for the same pin-bypass reason as the fragment above: pathOnly() strips it
+            // before the issuer-path check, yet postForm sends endpoint.path - query included - verbatim on the
+            // wire, so a tampered /settings could advertise an endpoint carrying a query the issuer-path pin
+            // never validated (and a lenient server could even normalize a '..' hidden past the '?'). An OIDC
+            // device/token endpoint carries its parameters in the request body (application/x-www-form-urlencoded),
+            // never the url query - RFC 6749 3.2 permits a query component but no real provider uses one here - so
+            // fail closed. The user-facing verification url, which legitimately carries the user code as a query,
+            // is parsed by BrowserLauncher (java.net.URI), not this method, so it is unaffected.
+            if (url.indexOf('?') >= 0) {
+                throw new OidcAuthException().put("invalid url, a query (?) is not supported [url=").put(url).put(']');
             }
             int schemeEnd = url.indexOf("://");
             if (schemeEnd < 0) {

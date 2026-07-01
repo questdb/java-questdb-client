@@ -752,11 +752,12 @@ public class JsonLexerTest {
             assertDecodedValue("{\"v\":\"a" + bs + "bb" + bs + "fc\"}",
                     "a" + ((char) 8) + "b" + ((char) 12) + "c");
             // the lexer is deliberately lenient (not RFC 8259-strict) about malformed or unknown escapes:
-            // it drops the backslash and keeps the following text rather than failing the parse. These pin
-            // that behavior and cover the lenient arms that otherwise carry most of the file's coverage:
-            assertDecodedValue("{\"v\":\"a" + bs + "xb\"}", "axb");          // unknown escape -> drop backslash
-            assertDecodedValue("{\"v\":\"a" + bs + "uZZZZb\"}", "auZZZZb");  // non-hex unicode escape -> literal
-            assertDecodedValue("{\"v\":\"ab" + bs + "u12\"}", "abu12");      // too few hex digits -> literal
+            // it keeps the backslash and the following text verbatim rather than failing the parse, so a
+            // literal backslash in non-conformant input is not silently lost. These pin that behavior and
+            // cover the lenient arms that otherwise carry most of the file's coverage:
+            assertDecodedValue("{\"v\":\"a" + bs + "xb\"}", "a" + bs + "xb");         // unknown escape -> kept verbatim
+            assertDecodedValue("{\"v\":\"a" + bs + "uZZZZb\"}", "a" + bs + "uZZZZb"); // non-hex unicode escape -> literal
+            assertDecodedValue("{\"v\":\"ab" + bs + "u12\"}", "ab" + bs + "u12");     // too few hex digits -> literal
             // a lone (unpaired) high surrogate is emitted as-is, not dropped or replaced
             assertDecodedValue("{\"v\":\"x" + bs + "uD83Dy\"}", "x" + ((char) 0xD83D) + "y");
         });

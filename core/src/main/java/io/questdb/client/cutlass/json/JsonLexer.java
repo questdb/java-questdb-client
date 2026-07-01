@@ -409,14 +409,17 @@ public class JsonLexer implements Mutable, Closeable {
                         unescapeSink.put((char) cp);
                         i += 6;
                     } else {
-                        // malformed unicode escape: drop the backslash, keep the following character
-                        unescapeSink.put(esc);
+                        // malformed unicode escape: keep the backslash and the 'u' verbatim (lenient), so a
+                        // non-conformant server's literal text survives rather than silently losing a byte
+                        unescapeSink.put('\\').put(esc);
                         i += 2;
                     }
                     break;
                 default:
-                    // unknown escape: drop the backslash, keep the escaped character (lenient)
-                    unescapeSink.put(esc);
+                    // unknown escape: keep the backslash and the escaped character verbatim (lenient), so a
+                    // literal backslash in non-conformant input (e.g. a Windows path in an error body) is not
+                    // dropped
+                    unescapeSink.put('\\').put(esc);
                     i += 2;
                     break;
             }

@@ -1,7 +1,11 @@
 # OIDC device-flow token persistence
 
-Status: **draft v1**, follow-on to PR #52 (`OidcDeviceAuth`, RFC 8628 device flow).
-Targets branch `ia_oidc_device_flow`.
+Status: **implemented** in PR #52 (`OidcDeviceAuth`, RFC 8628 device flow) on branch
+`ia_oidc_device_flow` — both the `TokenStore` SPI and the default `FileTokenStore` (Layer 1
+atomic replace and Layer 2 lock-file critical section) shipped together. This document remains
+the frozen cross-language on-disk contract (file name, JSON schema, atomic-write and lock-file
+protocols) that other clients (e.g. Python) mirror; the design discussion below is retained as
+the rationale of record. Code line references are indicative and may drift from the current source.
 
 ## Problem
 
@@ -456,11 +460,11 @@ Resolved:
 - **Frozen on-disk contract** (path, hash, schema, atomic write, lock-file protocol),
   because the Python client will mirror it.
 
-Still to confirm:
-1. **Layer 2 (lock file) now or fast-follow?** Layer 1 (atomic replace) is mandatory and
-   small; Layer 2 only matters for rotating-refresh-token IdPs. Either way the protocol is
-   frozen in the spec above. Recommendation: ship both together — the rotating case is
-   realistic and the lock-file code is modest.
+Resolved (shipped in PR #52):
+- **Layer 2 (lock file) shipped together with Layer 1.** `FileTokenStore` implements both the
+  mandatory atomic-replace integrity layer and the `O_CREAT|O_EXCL` lock-file critical section
+  for rotating-refresh-token IdPs, as recommended — the rotating case is realistic and the
+  lock-file code is modest.
 
 ## Testing strategy
 

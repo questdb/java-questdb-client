@@ -110,7 +110,12 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
      * that rely on {@link #isAscii()} should not use this overload for ascii-only content.
      */
     public DirectUtf8Sink put(byte[] src, int lo, int hi) {
-        assert lo >= 0 && hi <= src.length && lo <= hi : "put(byte[]) range out of bounds";
+        // a real check, not an assert: this is public API doing an unchecked Unsafe.copyMemory, and client apps
+        // typically run without -ea, so a bad range must fail with a clear exception rather than a native
+        // out-of-bounds read that corrupts memory or crashes the JVM
+        if (lo < 0 || hi > src.length || lo > hi) {
+            throw new IndexOutOfBoundsException("put(byte[]) range out of bounds [lo=" + lo + ", hi=" + hi + ", len=" + src.length + ']');
+        }
         final int len = hi - lo;
         if (len > 0) {
             setAscii(false);

@@ -122,6 +122,43 @@ public class DirectUtf8SinkTest extends AbstractTest {
     }
 
     @Test
+    public void testPutByteArrayRange() {
+        try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
+            final byte[] src = "abcdefgh".getBytes(StandardCharsets.UTF_8);
+
+            // a partial range [2, 5) copies exactly "cde" and grows the sink past its initial capacity
+            sink.put(src, 2, 5);
+            Assert.assertEquals(3, sink.size());
+            TestUtils.assertEquals("cde".getBytes(StandardCharsets.UTF_8), sink);
+            // the bulk overload sets the ascii hint to false conservatively, even for ascii bytes
+            Assert.assertFalse(sink.isAscii());
+
+            // an empty range [3, 3) is a no-op
+            final int sizeBefore = sink.size();
+            sink.put(src, 3, 3);
+            Assert.assertEquals(sizeBefore, sink.size());
+
+            // a full range [0, len) appends the whole array
+            sink.clear();
+            sink.put(src, 0, src.length);
+            Assert.assertEquals(src.length, sink.size());
+            TestUtils.assertEquals(src, sink);
+        }
+    }
+
+    @Test
+    public void testPutByteArrayRangeRejectsBadBounds() {
+        try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
+            final byte[] src = {1, 2, 3};
+            // a bad range must throw rather than run an unchecked native copy (asserts are off in client apps)
+            assertBadRange(sink, src, -1, 2); // lo < 0
+            assertBadRange(sink, src, 0, 4);  // hi > len
+            assertBadRange(sink, src, 2, 1);  // lo > hi
+            Assert.assertEquals("a rejected put must not advance the sink", 0, sink.size());
+        }
+    }
+
+    @Test
     public void testPutUtf8Sequence() {
         try (DirectUtf8Sink sink = new DirectUtf8Sink(1)) {
             final String str = "こんにちは世界";
@@ -205,6 +242,15 @@ public class DirectUtf8SinkTest extends AbstractTest {
             sink.put(str);
             final byte[] expectedBytes = str.getBytes(StandardCharsets.UTF_8);
             TestUtils.assertEquals(expectedBytes, sink);
+        }
+    }
+
+    private static void assertBadRange(DirectUtf8Sink sink, byte[] src, int lo, int hi) {
+        try {
+            sink.put(src, lo, hi);
+            Assert.fail("expected IndexOutOfBoundsException for lo=" + lo + ", hi=" + hi);
+        } catch (IndexOutOfBoundsException expected) {
+            // ok: the public overload range-checks before the native copy
         }
     }
 

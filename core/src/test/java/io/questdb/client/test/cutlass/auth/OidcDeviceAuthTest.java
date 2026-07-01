@@ -1092,6 +1092,14 @@ public class OidcDeviceAuthTest {
         assertBuildFails("https://idp/realms/acme#/../other/device", "https://idp/realms/acme/token", "fragment");
         assertBuildFails("https://idp/d", "https://idp/realms/acme#/../other/token", "fragment");
         assertBuildFails("https://idp/d#", "https://idp/t", "fragment");
+        // a query (?...) is rejected for the same pin-bypass reason: pathOnly() strips it before the issuer-path
+        // pin while postForm sends endpoint.path - query included - verbatim, so a "?..." the pin never validated
+        // would still reach the wire. An OIDC device/token endpoint carries its parameters in the request body,
+        // never the url query, so fail closed (the user-facing verification url may carry one, but it is parsed
+        // by BrowserLauncher, not Endpoint.parse)
+        assertBuildFails("https://idp/realms/acme/device?x=/../other", "https://idp/realms/acme/token", "query");
+        assertBuildFails("https://idp/d", "https://idp/realms/acme/token?client_id=evil", "query");
+        assertBuildFails("https://idp/d?a=b", "https://idp/t", "query");
         // a non-ASCII host is rejected: it would not resolve (the HTTP layer sends the host to the OS resolver
         // as raw UTF-8, no IDNA), and equalsIgnoreCase folds several non-ASCII letters onto ASCII (U+0130 -> i,
         // U+212A -> k, ...), so a homoglyph host could otherwise pass the origin pin against a pinned issuer
@@ -3296,6 +3304,48 @@ public class OidcDeviceAuthTest {
                 }
             }
         });
+    }
+
+    @Test
+    public void testShortAllDigitStatusNotTreatedAsTransientOrTerminal() throws Exception {
+        // a real HTTP status is exactly 3 digits. A malformed 1-digit "5" must not be read as a transient 5xx
+        // (which would poll on to the device-code deadline), nor a 1-digit "4" as a terminal 4xx, by the leading
+        // digit alone; both fall through to the fast terminal reject rather than an infinite poll.
+        for (String shortStatus : new String[]{"5", "4"}) {
+            assertMemoryLeak(() -> {
+                String tokenBody = tokenJson("SHOULD-NOT-ACCEPT", null, null, 3600);
+                String rawToken = "HTTP/1.1 " + shortStatus + " X\r\n"
+                        + "Content-Type: application/json\r\n"
+                        + "Transfer-Encoding: chunked\r\n\r\n"
+                        + Integer.toHexString(tokenBody.length()) + "\r\n" + tokenBody + "\r\n"
+                        + "0\r\n\r\n";
+                MockOidcServer.Handler handler = (method, path, body) -> {
+                    if (DEVICE_PATH.equals(path)) {
+                        return MockOidcServer.json(200, "{"
+                                + "\"device_code\":\"DEV\","
+                                + "\"user_code\":\"WDJB-MJHT\","
+                                + "\"verification_uri\":\"https://verify.example/device\","
+                                + "\"expires_in\":300,"
+                                + "\"interval\":1"
+                                + "}");
+                    }
+                    return MockOidcServer.raw(rawToken);
+                };
+                try (MockOidcServer server = new MockOidcServer(handler);
+                     OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                    try {
+                        auth.signIn();
+                        Assert.fail("expected malformed 1-digit status '" + shortStatus + "' to be rejected fast");
+                    } catch (OidcAuthException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("rejected the request") || msg.contains("refusing to keep polling"));
+                        // must NOT have polled to the device-code deadline (that would be a mis-classified transient)
+                        Assert.assertFalse(msg, msg.contains("device code expired"));
+                        Assert.assertFalse("the unaccepted token must not leak: " + msg, msg.contains("SHOULD-NOT-ACCEPT"));
+                    }
+                }
+            });
+        }
     }
 
     // Forces the cached access/id token to look expired WITHOUT dropping the refresh token, so the next

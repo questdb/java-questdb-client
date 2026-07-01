@@ -40,7 +40,7 @@ import io.questdb.client.std.str.StringSink;
 public interface DeviceCodePrompt {
 
     /**
-     * Prints the sign-in instructions to {@code System.out} as plain ASCII, without opening a browser.
+     * Prints the sign-in instructions to {@code System.out} as display-safe text, without opening a browser.
      * The default prompt is {@link #openBrowser()}; use this to opt out of the browser launch.
      */
     DeviceCodePrompt SYSTEM_OUT = challenge -> {

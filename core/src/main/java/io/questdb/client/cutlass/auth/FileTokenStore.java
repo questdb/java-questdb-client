@@ -56,6 +56,7 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Arrays;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The default {@link TokenStore}: one plaintext JSON file per identity under a directory, with the
@@ -139,8 +140,9 @@ public final class FileTokenStore implements TokenStore {
     private static final long REPLACE_RETRY_SLEEP_MILLIS = 20L;
     private static final int SCHEMA_VERSION = 1;
     // set once if the platform cannot enforce owner-only POSIX permissions on the token files (e.g. Windows),
-    // so the at-rest protection falls back to the directory's inherited ACL; warns the user once
-    private static volatile boolean warnedNoPosixPerms;
+    // so the at-rest protection falls back to the directory's inherited ACL; warns the user exactly once
+    // (compareAndSet, so a race between two threads still prints a single warning)
+    private static final AtomicBoolean warnedNoPosixPerms = new AtomicBoolean();
     private final Path directory;
     private final long lockAcquireBudgetMillis;
     private final long lockStaleMillis;
@@ -610,10 +612,9 @@ public final class FileTokenStore implements TokenStore {
         // best-effort, once per JVM: the token store could not enforce 0600/0700, so the persisted refresh
         // token is protected only by the directory's inherited ACL. ASCII-only, and never includes a path or
         // token byte (a path could itself carry terminal-spoofing characters)
-        if (warnedNoPosixPerms) {
+        if (!warnedNoPosixPerms.compareAndSet(false, true)) {
             return;
         }
-        warnedNoPosixPerms = true;
         System.err.println("questdb client: the OIDC token store could not enforce owner-only (0600/0700) "
                 + "permissions on this filesystem; the persisted refresh token is protected only by the "
                 + "directory's default ACL. Back the store with an OS keychain for at-rest encryption.");
