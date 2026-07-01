@@ -162,18 +162,50 @@ public final class BackgroundDrainer implements Runnable {
         long deadlineNanos = startNanos + reconnectMaxDurationMillis * 1_000_000L;
         long backoffMillis = reconnectInitialBackoffMillis;
         int mismatchAttempts = 0;
+        // Throttle the all-replica retry WARN to one per 5s: a real failover
+        // window can last minutes and (Invariant B) is retried indefinitely, so
+        // per-attempt logging would flood. Mirrors CursorWebSocketSendLoop.
+        long lastReplicaWarnNanos = 0L;
         while (!stopRequested) {
+            // True only for a genuine durable-ack CAPABILITY gap, which is
+            // bounded by the settle budget / attempt cap. A transient all-replica
+            // failover window (role reject) is retried indefinitely under
+            // Invariant B and leaves this false, so its backoff is never clamped
+            // to the deadline (which would otherwise busy-loop once past it).
+            boolean boundedByBudget = false;
             try {
                 return clientFactory.reconnect();
-            } catch (QwpDurableAckMismatchException | QwpRoleMismatchException
-                     | QwpIngressRoleRejectedException e) {
-                // An all-replica window (every endpoint role-rejected the
-                // upgrade) is handled exactly like a durable-ack-unavailable
-                // cluster: give it a budget to settle, then quarantine. A
-                // replica can be promoted, so the drainer must not quarantine an
-                // orphaned slot on the first sweep just because no primary is
-                // reachable yet. Behaviour is unchanged from when buildAndConnect
-                // surfaced this same condition as QwpDurableAckMismatchException.
+            } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
+                // INVARIANT B: every reachable endpoint is a REPLICA right now.
+                // A replica is promotable and a primary will reappear, so this is
+                // a TRANSIENT failover window, NOT a capability gap. The drainer
+                // must keep retrying (capped backoff) until a primary is reachable,
+                // stopRequested, or SF exhaustion -- it must NEVER quarantine the
+                // slot on a wall-clock budget or an attempt cap. Surface the
+                // per-attempt observability callback, then back off and retry.
+                mismatchAttempts++;
+                BackgroundDrainerListener l = listener;
+                if (l != null) {
+                    try {
+                        l.onDurableAckUnavailable(slotPath, mismatchAttempts);
+                    } catch (Throwable cb) {
+                        LOG.warn("drainer listener onDurableAckUnavailable threw: {}",
+                                cb.getMessage());
+                    }
+                }
+                long nowWarn = System.nanoTime();
+                if (nowWarn - lastReplicaWarnNanos >= 5_000_000_000L) {
+                    LOG.warn("drainer slot {} attempt {}: all endpoints are replicas "
+                            + "(transient failover window), retrying after backoff",
+                            slotPath, mismatchAttempts);
+                    lastReplicaWarnNanos = nowWarn;
+                }
+            } catch (QwpDurableAckMismatchException e) {
+                // Genuine cluster-wide durable-ack CAPABILITY gap: a server
+                // upgraded but does not advertise durable ack. Unlike a role
+                // reject this will not clear by waiting for a promotion, so it
+                // stays terminal for the drainer -- give the cluster a bounded
+                // settle budget (rolling upgrade), then quarantine the slot.
                 mismatchAttempts++;
                 long now = System.nanoTime();
                 long elapsedMs = (now - startNanos) / 1_000_000L;
@@ -198,6 +230,7 @@ public final class BackgroundDrainer implements Runnable {
                     outcome = DrainOutcome.FAILED;
                     return null;
                 }
+                boundedByBudget = true;
                 if (l != null) {
                     try {
                         l.onDurableAckUnavailable(slotPath, mismatchAttempts);
@@ -218,10 +251,16 @@ public final class BackgroundDrainer implements Runnable {
             }
             // Backoff before the next sweep. Honor stopRequested by parking in
             // small chunks rather than a single long park so close() doesn't
-            // wait for a full sleep to elapse.
+            // wait for a full sleep to elapse. Only the bounded (capability-gap)
+            // path clamps to the remaining budget so it escalates promptly at the
+            // deadline; the transient failover path retries indefinitely and just
+            // backs off (capped exponential), never busy-looping past a deadline.
             long jitter = ThreadLocalRandom.current().nextLong(Math.max(1L, backoffMillis));
-            long sleepMillis = Math.min(backoffMillis + jitter,
-                    Math.max(0L, (deadlineNanos - System.nanoTime()) / 1_000_000L));
+            long sleepMillis = backoffMillis + jitter;
+            if (boundedByBudget) {
+                sleepMillis = Math.min(sleepMillis,
+                        Math.max(0L, (deadlineNanos - System.nanoTime()) / 1_000_000L));
+            }
             if (sleepMillis > 0L && !stopRequested) {
                 LockSupport.parkNanos(sleepMillis * 1_000_000L);
             }
